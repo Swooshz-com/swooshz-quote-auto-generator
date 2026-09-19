@@ -392,7 +392,10 @@ PRICING_AUTHORITY_CONTEXT_FIELDS = (
     "unit",
     "pricing_keyword",
 )
-PRICING_AUTHORITY_DECIMAL_RE = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
+PRICING_AUTHORITY_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+PRICING_AUTHORITY_WHITESPACE_RE = re.compile(
+    r"[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+"
+)
 PRICING_REFERENCE_DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 
@@ -402,7 +405,7 @@ def pricing_authority_context(value: Any) -> dict[str, str]:
         "source_basis_line_id": canonical_pricing_authority_text(row.get("source_basis_line_id")),
         "section": canonical_pricing_authority_text(row.get("section")) or "General",
         "description": canonical_pricing_authority_text(row.get("description")),
-        "unit": normalize_unit(canonical_pricing_authority_text(row.get("unit"))),
+        "unit": canonical_pricing_authority_unit(row.get("unit")),
         "pricing_keyword": canonical_pricing_authority_text(row.get("pricing_keyword")),
     }
 
@@ -410,7 +413,30 @@ def pricing_authority_context(value: Any) -> dict[str, str]:
 def canonical_pricing_authority_text(value: Any) -> str:
     if value is None:
         return ""
-    return unicodedata.normalize("NFC", re.sub(r"\s+", " ", str(value)).strip())
+    text = unicodedata.normalize("NFC", str(value))
+    return PRICING_AUTHORITY_WHITESPACE_RE.sub(" ", text).strip(" ")
+
+
+def canonical_pricing_authority_unit(value: Any) -> str:
+    text = canonical_pricing_authority_text(value)
+    lower = text.lower().strip(". ")
+    if lower in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+        return "sqm"
+    if lower in {"m run", "m. run"}:
+        return "m run"
+    if lower in {"m length", "m. length"}:
+        return "m length"
+    if lower in {"nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"}:
+        return "nos"
+    if lower in {"lot", "lots"}:
+        return "lot"
+    if lower in {"set", "sets"}:
+        return "sets"
+    return text
+
+
+def pricing_authority_version_is_valid(value: Any) -> bool:
+    return type(value) is int and value == PRICING_AUTHORITY_VERSION
 
 
 def pricing_authority_number(value: Any) -> float | None:
@@ -467,7 +493,7 @@ def normalize_pricing_authority(
 ) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
-    if raw.get("schema") != PRICING_AUTHORITY_SCHEMA or raw.get("version") != PRICING_AUTHORITY_VERSION:
+    if raw.get("schema") != PRICING_AUTHORITY_SCHEMA or not pricing_authority_version_is_valid(raw.get("version")):
         return None
     if not isinstance(raw.get("variant"), str):
         return None
@@ -501,7 +527,7 @@ def normalize_pricing_authority(
         "source_basis_line_id": canonical_pricing_authority_text(supplied_context.get("source_basis_line_id")),
         "section": canonical_pricing_authority_text(supplied_context.get("section")) or "General",
         "description": canonical_pricing_authority_text(supplied_context.get("description")),
-        "unit": normalize_unit(canonical_pricing_authority_text(supplied_context.get("unit"))),
+        "unit": canonical_pricing_authority_unit(supplied_context.get("unit")),
         "pricing_keyword": canonical_pricing_authority_text(supplied_context.get("pricing_keyword")),
     }
     if canonical_supplied != context:
@@ -549,16 +575,16 @@ def normalize_pricing_authority(
             or price != match.sale_unit_price
             or canonical_pricing_authority_text(raw.get("catalog_section")) != (canonical_pricing_authority_text(match.section) or "General")
             or canonical_pricing_authority_text(raw.get("catalog_description")) != canonical_pricing_authority_text(match.description)
-            or normalize_unit(canonical_pricing_authority_text(raw.get("catalog_unit"))) != normalize_unit(canonical_pricing_authority_text(match.unit_hint))
+            or canonical_pricing_authority_unit(raw.get("catalog_unit")) != canonical_pricing_authority_unit(match.unit_hint)
         ):
             return None
         normalized.update({
             "catalog_source": catalog_source,
             "catalog_item_id": item_id,
             "catalog_digest": catalog_digest,
-            "catalog_section": clean_text(match.section),
-            "catalog_description": clean_text(match.description),
-            "catalog_unit": normalize_unit(match.unit_hint),
+            "catalog_section": canonical_pricing_authority_text(match.section) or "General",
+            "catalog_description": canonical_pricing_authority_text(match.description),
+            "catalog_unit": canonical_pricing_authority_unit(match.unit_hint),
         })
     return normalized
 
@@ -844,6 +870,11 @@ def prepare_lines(
             price_mode = "Included" if display_price.lower() == "included" else "Priced"
         unit_price_override = item.get("unit_price_override")
         unit_price_override_num = as_float(unit_price_override, 0.0) if unit_price_override not in (None, "") else None
+        strict_manual_price = (
+            pricing_authority_number(unit_price_override)
+            if unit_price_override not in (None, "")
+            else None
+        )
         pricing_keyword = clean_text(item.get("pricing_keyword"))
         query = pricing_keyword or clean_text(item.get("description") or "")
         quantity = item.get("quantity")
@@ -901,9 +932,15 @@ def prepare_lines(
                 amount = 0.0
                 display_price = "Included"
                 match = None
-            elif unit_price_override_num is not None:
+            elif unit_price_override_num is not None and strict_manual_price is not None:
                 status = "manual-price"
-                amount = round_commercial_cents((quantity_num or 0.0) * unit_price_override_num)
+                unit_price_override_num = strict_manual_price
+                amount = round_commercial_cents((quantity_num or 0.0) * strict_manual_price)
+                match = None
+            elif unit_price_override_num is not None:
+                status = "unmatched"
+                unit_price_override_num = None
+                amount = None
                 match = None
             elif display_price:
                 status = "manual-display"

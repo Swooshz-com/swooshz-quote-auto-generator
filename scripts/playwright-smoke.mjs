@@ -490,7 +490,7 @@ async function prepareRefreshRecoveryQuote(page) {
     state.outputRows = [];
     state.originalOutputRows = [];
     state.outputErrors = [];
-    state.lineItems = [normalizeLineItem({
+    const recoveryLineItem = normalizeLineItem({
       section: "Floor Design",
       description: "sqm refresh recovery flooring",
       quantity: 1,
@@ -501,7 +501,8 @@ async function prepareRefreshRecoveryQuote(page) {
       catalog_unit_price: 50,
       amount: 50,
       pricing_keyword: "floor-design-refresh-recovery-flooring",
-    })];
+    });
+    state.lineItems = [synchronizeOwnedOutputRowPrice(recoveryLineItem, 50, { force: true })];
     state.quoteBasisSections = [{
       id: "floor-design",
       title: "Floor Design",
@@ -1065,6 +1066,10 @@ async function verifyExpiredQuoteJobsDoNotResume(page) {
           ...(candidate.type === "generate_pdf" ? { viewPdf: true } : {}),
         };
         window.localStorage.setItem(storageKey, JSON.stringify(saved));
+        if (candidate.type !== "basis_chat" && !candidate.wrongScope && typeof candidate.startedAt === "string" && candidate.startedAt) {
+          state.activeJob = saved.activeJob;
+          saveSessionState();
+        }
         return { quoteState, currentScope };
       }, testCase);
       const requestCountBefore = observedRequests.length;
@@ -1747,6 +1752,168 @@ async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
   }
 }
 
+async function verifyRun639PricingAuthorityRestorationAndPresentation(page) {
+  const result = await page.evaluate(() => {
+    const original = {
+      pricingReferences: state.pricingReferences,
+      pricingReferenceId: state.pricingReferenceId,
+      pricingReferenceSource: state.pricingReferenceSource,
+    };
+    const reference = {
+      id: "synthetic-exhibition-fixture-pricing",
+      source: "local",
+      currency: "SGD",
+      digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+      items: [{
+        id: "synthetic-floors-synthetic-carpet-tile",
+        section: "Synthetic Floors",
+        description: "sqm synthetic carpet tile",
+        unit_hint: "sqm",
+        sale_unit_price: 14.4,
+      }],
+    };
+    const item = reference.items[0];
+    try {
+      state.pricingReferences = [reference];
+      state.pricingReferenceId = reference.id;
+      state.pricingReferenceSource = reference.source;
+      const catalogContext = {
+        source_basis_line_id: "",
+        section: item.section,
+        description: `[ ${item.description} ]`,
+        unit: item.unit_hint,
+        pricing_keyword: item.id,
+      };
+      const catalogAuthority = buildPricingAuthority("catalog", catalogContext, {
+        reference,
+        catalogItem: item,
+        price: item.sale_unit_price,
+      });
+      const rawCatalog = {
+        ...catalogContext,
+        description: item.description,
+        quantity: 2,
+        pricing_reference_description: item.description,
+        catalog_description: item.description,
+        pricing_authority: catalogAuthority,
+        unit_price_override: 999,
+        effective_unit_price: 999,
+        catalog_unit_price: 999,
+      };
+      const normalizedCatalog = normalizeOutputRow(rawCatalog);
+      const restoredCatalog = normalizeRestoredPricingRow({ ...rawCatalog, unit_price_override: 999 }, normalizeOutputRow);
+      if (
+        normalizedCatalog.pricing_authority?.variant !== "catalog"
+        || normalizedCatalog.effective_unit_price !== 14.4
+        || normalizedCatalog.amount !== 28.8
+        || restoredCatalog.pricing_authority?.variant !== "catalog"
+        || restoredCatalog.effective_unit_price !== 14.4
+        || restoredCatalog.amount !== 28.8
+      ) {
+        throw new Error(`Catalog authority did not survive presentation/restoration: ${JSON.stringify({ normalizedCatalog, restoredCatalog })}.`);
+      }
+      const staleCatalog = normalizeOutputRow({
+        ...rawCatalog,
+        pricing_authority: { ...catalogAuthority, catalog_item_id: "missing-item" },
+      });
+      if (staleCatalog.pricing_authority?.variant !== "historical" || effectiveOutputUnitPrice(staleCatalog) !== null) {
+        throw new Error(`Stale catalog authority was not fail-closed: ${JSON.stringify(staleCatalog)}.`);
+      }
+
+      const manualRow = {
+        source_basis_line_id: "",
+        section: "Custom",
+        description: "Operator-approved custom row",
+        quantity: 1,
+        unit: "lot",
+        pricing_keyword: "",
+      };
+      const manualAuthority = buildPricingAuthority("manual", manualRow, { reference, price: 77 });
+      for (const override of [77, 999, "0x10", [999]]) {
+        const restored = normalizeRestoredPricingRow({
+          ...manualRow,
+          pricing_authority: manualAuthority,
+          unit_price_override: override,
+          effective_unit_price: override,
+          pricing_basis_amount: 999,
+        }, normalizeOutputRow);
+        if (
+          restored.pricing_authority?.variant !== "manual"
+          || restored.unit_price_override !== 77
+          || restored.effective_unit_price !== 77
+          || restored.amount !== 77
+        ) {
+          throw new Error(`Manual restoration was overridden by numeric residue ${JSON.stringify(override)}: ${JSON.stringify(restored)}.`);
+        }
+      }
+      const explicitEdit = synchronizeOwnedOutputRowPrice(
+        { ...manualRow, unit_price_override: "77" },
+        "77",
+        { force: true },
+      );
+      if (explicitEdit.pricing_authority?.variant !== "manual" || explicitEdit.unit_price_override !== 77) {
+        throw new Error(`Explicit manual price creation did not use the strict authority boundary: ${JSON.stringify(explicitEdit)}.`);
+      }
+      const rejectedEdit = synchronizeOwnedOutputRowPrice(
+        { ...manualRow, unit_price_override: "0x10" },
+        "0x10",
+        { force: true },
+      );
+      if (Object.prototype.hasOwnProperty.call(rejectedEdit, "pricing_authority")) {
+        throw new Error(`Invalid explicit manual price created authority: ${JSON.stringify(rejectedEdit)}.`);
+      }
+      const legacy = normalizeRestoredPricingRow({
+        ...manualRow,
+        unit_price_override: 999,
+        effective_unit_price: 999,
+        pricing_basis_amount: 999,
+      }, normalizeOutputRow);
+      if (
+        legacy.pricing_authority?.variant !== "historical"
+        || effectiveOutputUnitPrice(legacy) !== null
+        || legacy.amount !== ""
+      ) {
+        throw new Error(`Legacy numeric residue was trusted during restoration: ${JSON.stringify(legacy)}.`);
+      }
+      const includedAuthority = buildPricingAuthority("included", { ...manualRow, price_mode: "Included" }, { reference });
+      const included = normalizeRestoredPricingRow({
+        ...manualRow,
+        price_mode: "Included",
+        display_price: "Included",
+        pricing_authority: includedAuthority,
+        unit_price_override: 999,
+        effective_unit_price: 999,
+      }, normalizeOutputRow);
+      if (
+        included.pricing_authority?.variant !== "included"
+        || included.amount !== 0
+        || included.unit_price_override !== ""
+        || Object.prototype.hasOwnProperty.call(included, "effective_unit_price")
+      ) {
+        throw new Error(`Included restoration was not preserved: ${JSON.stringify(included)}.`);
+      }
+      if (
+        pricingAuthorityVersionIsValid(true)
+        || pricingAuthorityNumber("1٢") !== null
+        || pricingAuthorityNumber("77%") !== null
+        || canonicalPricingAuthorityText("a\u001cb") !== "a b"
+        || canonicalPricingAuthorityText("a\ufeffb") !== "a b"
+        || canonicalPricingAuthorityText("e\u0301  item") !== "é item"
+      ) {
+        throw new Error("Browser authority schema, decimal, or whitespace contract diverged.");
+      }
+      return { catalogPrice: normalizedCatalog.effective_unit_price, catalogAmount: normalizedCatalog.amount };
+    } finally {
+      state.pricingReferences = original.pricingReferences;
+      state.pricingReferenceId = original.pricingReferenceId;
+      state.pricingReferenceSource = original.pricingReferenceSource;
+    }
+  });
+  if (result.catalogPrice !== 14.4 || result.catalogAmount !== 28.8) {
+    throw new Error(`Run-639 browser authority smoke returned an unexpected result: ${JSON.stringify(result)}.`);
+  }
+}
+
 async function verifyRecoveredTemplateOwnerFailsClosed(page) {
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
@@ -2208,7 +2375,7 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
       }],
     }]);
     state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
-    state.lineItems = [normalizeLineItem({
+    const smokeLineItem = normalizeLineItem({
       section: "Floor Design",
       description: "Needle punch carpet in colour",
       quantity: 2,
@@ -2217,7 +2384,8 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
       price_mode: "Priced",
       unit_price_override: 15,
       catalog_unit_price: 15,
-    })];
+    });
+    state.lineItems = [synchronizeOwnedOutputRowPrice(smokeLineItem, 15, { force: true })];
     refreshOutputRowsFromLineItems();
     state.originalOutputRows = snapshotOutputRows(state.outputRows);
     state.basisConfirmed = true;
@@ -3549,6 +3717,7 @@ async function main() {
     await installMockProfiles(page);
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
+    await verifyRun639PricingAuthorityRestorationAndPresentation(page);
     await verifyServerPricingReferenceReviewDurability(page);
     if (args.includes("--recovery-only")) {
       await page.goto(baseUrl, { waitUntil: "domcontentloaded" });

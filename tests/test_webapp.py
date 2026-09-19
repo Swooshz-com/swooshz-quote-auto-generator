@@ -3510,6 +3510,9 @@ const DEFAULT_TAX_RATE = 0.09;
 const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const DEFAULT_CURRENCY_LABEL = "SGD";
+const PRICING_AUTHORITY_SCHEMA = "swooshz.pricing-authority.v1";
+const PRICING_AUTHORITY_VERSION = 1;
+const PRICING_AUTHORITY_TRUSTED_VARIANTS = new Set(["manual", "catalog", "included"]);
 const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS = new Set(["new_quote", "captured", "session_recovery", "explicit_initialization", "explicit_reselection"]);
@@ -3562,6 +3565,7 @@ const state = {
 };
 const document = { activeElement: null, querySelectorAll() { return []; } };
 function currentPricingReference() { return state.pricingReferences.find((item) => item.id === state.pricingReferenceId && item.source === state.pricingReferenceSource) || null; }
+function pricingReferenceCatalogItem() { return null; }
 function selectedPricingReferenceTax() { const ref = currentPricingReference(); return { label: normalizeTaxLabel(ref?.tax?.label), rate: normalizeTaxRate(ref?.tax?.rate, DEFAULT_TAX_RATE) }; }
 function selectedPricingReferenceCurrency() { return normalizeCurrencyLabel(currentPricingReference()?.currency); }
 function sanitizeRichTextHtml(value) { return String(value || ""); }
@@ -3581,6 +3585,47 @@ function pricingReferenceLineText(value) { return String(value || "").trim(); }
 function bracketedCatalogReferenceParts() { return null; }
 function outputCatalogDescription() { return ""; }
 function normalizeUnit(value) { return String(value || "").trim(); }
+function pricingAuthorityContext(row = {}) {
+  return {
+    source_basis_line_id: String(row.source_basis_line_id || ""),
+    section: String(row.section || "") || "General",
+    description: String(row.description || ""),
+    unit: String(row.unit || ""),
+    pricing_keyword: String(row.pricing_keyword || ""),
+  };
+}
+function buildPricingAuthority(variant = "none", row = {}, options = {}) {
+  const authority = {
+    schema: PRICING_AUTHORITY_SCHEMA,
+    version: PRICING_AUTHORITY_VERSION,
+    variant,
+    context: pricingAuthorityContext(row),
+  };
+  if (PRICING_AUTHORITY_TRUSTED_VARIANTS.has(variant)) {
+    authority.price = variant === "included" ? 0 : options.price;
+    authority.currency = "SGD";
+  }
+  return authority;
+}
+function normalizeOutputPricingAuthority(raw, row = {}) {
+  if (!raw || raw.variant !== "manual" || raw.schema !== PRICING_AUTHORITY_SCHEMA || raw.version !== PRICING_AUTHORITY_VERSION) return null;
+  return JSON.stringify(raw.context) === JSON.stringify(pricingAuthorityContext(row)) ? raw : null;
+}
+function pricingAuthorityPrice(authority) {
+  return authority?.variant === "manual" && Number.isFinite(Number(authority.price)) ? Number(authority.price) : null;
+}
+function applyPricingAuthorityProjection(row = {}, authority = null) {
+  const price = pricingAuthorityPrice(authority);
+  if (price === null) return row;
+  row.unit_price_override = price;
+  row.effective_unit_price = price;
+  const quantity = numberOrNull(row.quantity);
+  if (quantity !== null && quantity > 0) {
+    row.pricing_basis_amount = roundCommercialCents(quantity * price);
+    row.approved_quote_amount = quoteAmountValue(row.pricing_basis_amount);
+  }
+  return row;
+}
 function renderHeaderLogoPreview() {}
 function renderPresetStatus() {}
 function syncQuoteCommercialContextPills() {}
@@ -3597,7 +3642,7 @@ eval([
   "quoteCommercialReviewRequired",
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
-  "quoteFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "unitPriceEditKind", "numberOrNull", "orderNumber",
+  "quoteFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
   "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
   "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
@@ -3656,7 +3701,7 @@ applyQuoteDetails(saved, { includeLogo: true, clearLogo: true });
 assert.strictEqual(elements.taxRate.value, "9");
 assert.strictEqual(elements.quoteTaxRate.value, "9");
 
-const edited = normalizeOutputRow({ ...state.outputRows[0], unit_price_override: 120 });
+const edited = normalizeOutputRow(synchronizeOwnedOutputRowPrice({ ...state.outputRows[0], unit_price_override: 120 }, 120, { force: true }));
 assert.strictEqual(edited.effective_unit_price, 120);
 assert.strictEqual(edited.unit_price_override, 120);
 assert.strictEqual(edited.pricing_basis_amount, 240);
@@ -3674,10 +3719,10 @@ assert.deepStrictEqual(dashboardCommercialsFromState(), {
 });
 
 elements.quoteExchangeRate.value = "1";
-const halfCent = normalizeOutputRow({
+const halfCent = normalizeOutputRow(synchronizeOwnedOutputRowPrice({
   section: "Boundary", description: "Half-cent boundary", quantity: 1, unit: "lot",
   price_mode: "Priced", unit_price_override: 10.625,
-});
+}, 10.625, { force: true }));
 assert.strictEqual(halfCent.amount, 10.63);
 assert.strictEqual(halfCent.pricing_basis_amount, 10.63);
 assert.strictEqual(halfCent.approved_quote_amount, 10.63);
@@ -19435,6 +19480,7 @@ eval(extractFunction("effectiveOutputUnitPrice"));
 eval(extractFunction("roundCommercialCents"));
 eval(extractFunction("recalculateOutputRow"));
 eval(extractFunction("normalizeOutputRow"));
+eval(extractFunction("pricingAuthorityNumber"));
 eval(extractFunction("unitPriceEditKind"));
 eval(extractFunction("synchronizeOwnedOutputRowPrice"));
 eval(extractFunction("outputRowsValid"));
@@ -24058,6 +24104,7 @@ eval([
   "outputCatalogDescription",
   "numberOrNull",
   "orderNumber",
+  "pricingAuthorityNumber",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
   "roundCommercialCents",
@@ -24572,6 +24619,7 @@ function escapeHtml(value = "") {
 
 eval([
   "numberOrNull",
+  "pricingAuthorityNumber",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
   "roundCommercialCents",
@@ -24742,6 +24790,7 @@ function extractFunction(name) {
 
 eval([
   "numberOrNull",
+  "pricingAuthorityNumber",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
   "roundCommercialCents",
@@ -29711,6 +29760,7 @@ eval([
   "outputCatalogDescription",
   "numberOrNull",
   "orderNumber",
+  "pricingAuthorityNumber",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
   "formatAmount",
@@ -29920,6 +29970,7 @@ eval([
   "normalizedLineTextQuantityParts",
   "normalizeLineItem",
   "numberOrNull",
+  "pricingAuthorityNumber",
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
   "formatAmount",
@@ -39866,6 +39917,378 @@ process.stdout.write("ok");
             webapp.pricing_authority_context({"section": "é item"}),
         )
 
+    def test_run639_server_final_authority_restoration_contract(self):
+        payload = valid_payload()
+        payload["pricing_reference"]["items"] = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))["items"]
+        reference = webapp.exact_pricing_reference_authority(payload)
+        lookup = {item["id"]: item for item in payload["pricing_reference"]["items"]}
+
+        self.assertTrue(webapp.pricing_authority_version_is_valid(1))
+        self.assertFalse(webapp.pricing_authority_version_is_valid(True))
+        for value in ("1\u0662", "77%", "0x10", [], [77], True):
+            self.assertIsNone(webapp.pricing_authority_number(value), repr(value))
+        for value in ("a\u001cb", "a\ufeffb", "a\t  b", "e\u0301  item", "é item"):
+            expected = "a b" if value.startswith("a") else "é item"
+            self.assertEqual(webapp.canonical_pricing_authority_text(value), expected)
+        self.assertEqual(
+            webapp.pricing_authority_context({"section": "a\u001cb"}),
+            webapp.pricing_authority_context({"section": "a b"}),
+        )
+
+        manual_row = {
+            "source_basis_line_id": "",
+            "section": "Custom",
+            "quantity": 2,
+            "unit": "lot",
+            "description": "Operator-approved custom row",
+            "pricing_keyword": "",
+            "price_mode": "Priced",
+        }
+        manual_authority = webapp.build_pricing_authority(
+            "manual",
+            manual_row,
+            price=77,
+            reference_authority=reference,
+        )
+        self.assertEqual(manual_authority["variant"], "manual")
+        for override in (77, 999, "0x10", [999]):
+            restored = webapp.normalize_owned_line_item(
+                {
+                    **manual_row,
+                    "pricing_authority": manual_authority,
+                    "unit_price_override": override,
+                    "effective_unit_price": override,
+                    "pricing_basis_amount": 999,
+                },
+                reference_authority=reference,
+                catalog_lookup=lookup,
+            )
+            self.assertEqual(restored["pricing_authority"]["variant"], "manual", repr(override))
+            self.assertEqual(restored["effective_unit_price"], 77, repr(override))
+            self.assertEqual(restored["unit_price_override"], 77, repr(override))
+            self.assertEqual(restored["pricing_basis_amount"], 154, repr(override))
+
+        included_authority = webapp.build_pricing_authority(
+            "included",
+            {**manual_row, "price_mode": "Included"},
+            reference_authority=reference,
+        )
+        included = webapp.normalize_owned_line_item(
+            {
+                **manual_row,
+                "price_mode": "Included",
+                "pricing_authority": included_authority,
+                "unit_price_override": 999,
+                "effective_unit_price": 999,
+                "pricing_basis_amount": 999,
+            },
+            reference_authority=reference,
+            catalog_lookup=lookup,
+        )
+        self.assertEqual(included["pricing_authority"]["variant"], "included")
+        self.assertEqual(included["approved_quote_amount"], 0)
+        self.assertNotIn("effective_unit_price", included)
+        self.assertNotIn("unit_price_override", included)
+
+        historical = webapp.normalize_owned_line_item(
+            {
+                **manual_row,
+                "pricing_authority": webapp.build_pricing_authority("historical", manual_row),
+                "unit_price_override": 999,
+                "effective_unit_price": 999,
+                "pricing_basis_amount": 999,
+            },
+            reference_authority=reference,
+            catalog_lookup=lookup,
+        )
+        self.assertEqual(historical["pricing_authority"]["variant"], "historical")
+        self.assertNotIn("effective_unit_price", historical)
+        self.assertIsNone(historical.get("unit_price_override"))
+        self.assertNotIn("pricing_basis_amount", historical)
+
+        invalid_payload = copy.deepcopy(payload)
+        invalid_payload["line_items"] = [{
+            **manual_row,
+            "unit_price_override": "77%",
+        }]
+        [invalid] = webapp.normalize_line_items(invalid_payload)
+        self.assertEqual(invalid["pricing_authority"]["variant"], "historical")
+        self.assertEqual(invalid["status"], "unmatched")
+        self.assertNotIn("effective_unit_price", invalid)
+
+        catalog_payload = copy.deepcopy(payload)
+        catalog_payload["line_items"] = [{
+            "section": "Synthetic Floors",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "sqm synthetic carpet tile",
+            "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+        }]
+        [catalog] = webapp.normalize_line_items(catalog_payload)
+        catalog_authority = catalog["pricing_authority"]
+        catalog_item = lookup[catalog_authority["catalog_item_id"]]
+        catalog_raw = {
+            **catalog,
+            "pricing_authority": catalog_authority,
+            "unit_price_override": 999,
+            "effective_unit_price": 999,
+            "catalog_unit_price": 999,
+            "pricing_basis_amount": 999,
+        }
+        restored_catalog = webapp.normalize_owned_line_item(
+            catalog_raw,
+            reference_authority=reference,
+            catalog_lookup=lookup,
+        )
+        self.assertEqual(restored_catalog["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(restored_catalog["effective_unit_price"], 14.4)
+        self.assertEqual(restored_catalog["pricing_basis_amount"], 28.8)
+
+        stale_catalog = copy.deepcopy(catalog_raw)
+        stale_catalog["pricing_authority"]["catalog_item_id"] = "missing-item"
+        [stale_normalized] = webapp.normalize_line_items({**catalog_payload, "line_items": [stale_catalog]})
+        self.assertEqual(stale_normalized["pricing_authority"]["variant"], "historical")
+        self.assertEqual(stale_normalized["status"], "unmatched")
+        self.assertNotIn("effective_unit_price", stale_normalized)
+
+        for field, value in (
+            ("catalog_source", "company"),
+            ("catalog_digest", "sha256:" + "a" * 64),
+            ("currency", "USD"),
+            ("catalog_item_id", "different-item"),
+            ("catalog_section", "Changed section"),
+            ("catalog_description", "Changed description"),
+            ("catalog_unit", "lot"),
+            ("price", 99),
+        ):
+            candidate = copy.deepcopy(catalog_authority)
+            candidate[field] = value
+            self.assertIsNone(
+                webapp.normalize_pricing_authority(
+                    candidate,
+                    catalog,
+                    reference_authority=reference,
+                    catalog_item=catalog_item,
+                ),
+                field,
+            )
+        changed_context = copy.deepcopy(catalog_authority)
+        changed_context["context"]["description"] = "Changed context"
+        self.assertIsNone(
+            webapp.normalize_pricing_authority(
+                changed_context,
+                catalog,
+                reference_authority=reference,
+                catalog_item=catalog_item,
+            )
+        )
+        bad_version = copy.deepcopy(manual_authority)
+        bad_version["version"] = True
+        self.assertIsNone(
+            webapp.normalize_pricing_authority(bad_version, manual_row, reference_authority=reference)
+        )
+
+    def test_run639_browser_final_authority_contract_and_presentation_projection(self):
+        node = require_node(self)
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+function extractFunction(name) {
+  const marker = `function ${name}`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing function ${name}`);
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Unclosed function ${name}`);
+}
+const PRICING_AUTHORITY_SCHEMA = "swooshz.pricing-authority.v1";
+const PRICING_AUTHORITY_VERSION = 1;
+const PRICING_AUTHORITY_VARIANTS = new Set(["none", "historical", "manual", "catalog", "included"]);
+const PRICING_AUTHORITY_TRUSTED_VARIANTS = new Set(["manual", "catalog", "included"]);
+const PRICING_AUTHORITY_CONTEXT_FIELDS = ["source_basis_line_id", "section", "description", "unit", "pricing_keyword"];
+const PRICING_AUTHORITY_WHITESPACE_RE = /[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+/gu;
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
+const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+const DEFAULT_CURRENCY_LABEL = "SGD";
+const digest = "sha256:" + "c".repeat(64);
+const item = {
+  id: "synthetic-floors-synthetic-carpet-tile",
+  section: "Synthetic Floors",
+  description: "sqm synthetic carpet tile",
+  unit_hint: "sqm",
+  sale_unit_price: 14.4,
+};
+const reference = {
+  id: "synthetic-exhibition-fixture-pricing",
+  source: "local",
+  currency: "SGD",
+  digest_sha256: digest,
+  items: [item],
+};
+const state = {
+  pricingReferenceId: reference.id,
+  pricingReferenceSource: reference.source,
+  pricingReferences: [reference],
+};
+function currentPricingReference() {
+  return state.pricingReferences[0];
+}
+function normalizeUnit(value = "") {
+  const text = String(value ?? "").normalize("NFC").replace(/\s+/g, " ").trim().toLowerCase();
+  if (["m2", "m^2", "sq m", "square metre", "square meter"].includes(text)) return "sqm";
+  if (["nos", "no", "pcs", "piece", "pieces"].includes(text)) return "nos";
+  if (["lot", "lots"].includes(text)) return "lot";
+  return text;
+}
+function normalizeCurrencyLabel(value = "") { return String(value || "").trim().toUpperCase(); }
+function roundCommercialCents(value) { return Math.round(Number(value) * 100) / 100; }
+function numberOrNull(value) { const number = Number(value); return Number.isFinite(number) ? number : null; }
+function quoteAmountValue(value) { return roundCommercialCents(value); }
+eval([
+  "cleanCustomerQuoteLineText",
+  "bracketedCatalogReferenceParts",
+  "canonicalPricingAuthorityText",
+  "canonicalPricingAuthorityUnit",
+  "pricingAuthorityVersionIsValid",
+  "pricingAuthorityContext",
+  "pricingAuthorityContextMatches",
+  "pricingAuthorityNumber",
+  "pricingReferenceAuthorityBasis",
+  "pricingReferenceCatalogItem",
+  "pricingAuthorityCatalogDescription",
+  "normalizePricingAuthority",
+  "pricingAuthorityPresentationRow",
+  "normalizeOutputPricingAuthority",
+  "pricingAuthorityPrice",
+  "applyPricingAuthorityProjection",
+].map(extractFunction).join("\n"));
+
+assert.strictEqual(pricingAuthorityVersionIsValid(1), true);
+assert.strictEqual(pricingAuthorityVersionIsValid(true), false);
+for (const value of ["1٢", "77%", "0x10", [], [77], true]) {
+  assert.strictEqual(pricingAuthorityNumber(value), null, JSON.stringify(value));
+}
+for (const [value, expected] of [["a\u001cb", "a b"], ["a\ufeffb", "a b"], ["a\t  b", "a b"], ["e\u0301  item", "é item"], ["é item", "é item"]]) {
+  assert.strictEqual(canonicalPricingAuthorityText(value), expected);
+}
+assert.deepStrictEqual(
+  pricingAuthorityContext({ section: "a\u001cb" }),
+  pricingAuthorityContext({ section: "a b" }),
+);
+
+const catalogContext = {
+  source_basis_line_id: "",
+  section: item.section,
+  description: `[ ${item.description} ]`,
+  unit: item.unit_hint,
+  pricing_keyword: item.id,
+};
+const catalogAuthority = {
+  schema: PRICING_AUTHORITY_SCHEMA,
+  version: PRICING_AUTHORITY_VERSION,
+  variant: "catalog",
+  context: pricingAuthorityContext(catalogContext),
+  price: item.sale_unit_price,
+  currency: "SGD",
+  catalog_source: "local",
+  catalog_item_id: item.id,
+  catalog_digest: digest,
+  catalog_section: item.section,
+  catalog_description: item.description,
+  catalog_unit: item.unit_hint,
+};
+const displayRow = {
+  ...catalogContext,
+  description: item.description,
+  quantity: 2,
+  pricing_reference_description: item.description,
+  catalog_description: item.description,
+  unit_price_override: 999,
+  effective_unit_price: 999,
+};
+const normalizedCatalog = normalizeOutputPricingAuthority(catalogAuthority, displayRow, { reference, catalogItem: item });
+assert.strictEqual(normalizedCatalog?.variant, "catalog");
+assert.strictEqual(pricingAuthorityPrice(normalizedCatalog), 14.4);
+const projectedCatalog = applyPricingAuthorityProjection({ ...displayRow }, normalizedCatalog);
+assert.strictEqual(projectedCatalog.unit_price_override, 14.4);
+assert.strictEqual(projectedCatalog.effective_unit_price, 14.4);
+assert.strictEqual(projectedCatalog.pricing_basis_amount, 28.8);
+assert.strictEqual(projectedCatalog.catalog_unit_price, 14.4);
+
+for (const field of ["catalog_source", "catalog_digest", "currency", "catalog_item_id", "catalog_section", "catalog_description", "catalog_unit", "price"]) {
+  const stale = { ...catalogAuthority, [field]: field === "price" ? 99 : field === "currency" ? "USD" : "stale" };
+  assert.strictEqual(normalizeOutputPricingAuthority(stale, displayRow, { reference, catalogItem: item }), null, field);
+}
+assert.strictEqual(
+  normalizeOutputPricingAuthority(
+    { ...catalogAuthority, context: { ...catalogAuthority.context, description: "Changed context" } },
+    displayRow,
+    { reference, catalogItem: item },
+  ),
+  null,
+);
+
+const manualRow = {
+  source_basis_line_id: "",
+  section: "Custom",
+  description: "Operator-approved custom row",
+  unit: "lot",
+  pricing_keyword: "",
+  quantity: 1,
+};
+const manualAuthority = {
+  schema: PRICING_AUTHORITY_SCHEMA,
+  version: PRICING_AUTHORITY_VERSION,
+  variant: "manual",
+  context: pricingAuthorityContext(manualRow),
+  price: 77,
+  currency: "SGD",
+};
+for (const override of [77, 999, "0x10", [999]]) {
+  const row = { ...manualRow, pricing_authority: manualAuthority, unit_price_override: override, effective_unit_price: override };
+  const authority = normalizeOutputPricingAuthority(manualAuthority, row, { reference });
+  assert.strictEqual(authority?.variant, "manual", JSON.stringify(override));
+  const projected = applyPricingAuthorityProjection(row, authority);
+  assert.strictEqual(projected.unit_price_override, 77, JSON.stringify(override));
+  assert.strictEqual(projected.effective_unit_price, 77, JSON.stringify(override));
+}
+const includedAuthority = {
+  schema: PRICING_AUTHORITY_SCHEMA,
+  version: PRICING_AUTHORITY_VERSION,
+  variant: "included",
+  context: pricingAuthorityContext(manualRow),
+  price: 0,
+  currency: "SGD",
+};
+const included = applyPricingAuthorityProjection(
+  { ...manualRow, pricing_authority: includedAuthority, unit_price_override: 999, effective_unit_price: 999 },
+  normalizeOutputPricingAuthority(includedAuthority, manualRow, { reference }),
+);
+assert.strictEqual(included.price_mode, "Included");
+assert.strictEqual(included.approved_quote_amount, 0);
+assert.strictEqual(included.unit_price_override, "");
+assert.strictEqual(Object.prototype.hasOwnProperty.call(included, "effective_unit_price"), false);
+process.stdout.write("ok");
+'''
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(completed.stdout, "ok")
+
     def test_run637_browser_rejects_unproven_catalog_authority(self):
         node = require_node(self)
         script = r'''
@@ -39892,6 +40315,7 @@ const PRICING_AUTHORITY_VERSION = 1;
 const PRICING_AUTHORITY_VARIANTS = new Set(["none", "historical", "manual", "catalog", "included"]);
 const PRICING_AUTHORITY_TRUSTED_VARIANTS = new Set(["manual", "catalog", "included"]);
 const PRICING_AUTHORITY_CONTEXT_FIELDS = ["source_basis_line_id", "section", "description", "unit", "pricing_keyword"];
+const PRICING_AUTHORITY_WHITESPACE_RE = /[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+/gu;
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
 const DEFAULT_CURRENCY_LABEL = "SGD";
@@ -39922,7 +40346,11 @@ function roundCommercialCents(value) { return Math.round(Number(value) * 100) / 
 function numberOrNull(value) { const number = Number(value); return Number.isFinite(number) ? number : null; }
 function quoteCommercialStateIsOwned() { return false; }
 eval([
+  "cleanCustomerQuoteLineText",
+  "bracketedCatalogReferenceParts",
   "canonicalPricingAuthorityText",
+  "canonicalPricingAuthorityUnit",
+  "pricingAuthorityVersionIsValid",
   "pricingAuthorityContext",
   "pricingAuthorityContextMatches",
   "pricingAuthorityNumber",
@@ -39930,6 +40358,8 @@ eval([
   "pricingReferenceCatalogItem",
   "pricingAuthorityCatalogDescription",
   "normalizePricingAuthority",
+  "pricingAuthorityPresentationRow",
+  "normalizeOutputPricingAuthority",
   "pricingAuthorityPrice",
   "effectiveOutputUnitPrice",
 ].map(extractFunction).join("\n"));

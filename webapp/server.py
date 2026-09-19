@@ -357,7 +357,10 @@ PRICING_AUTHORITY_CONTEXT_FIELDS = (
     "pricing_keyword",
 )
 PRICING_AUTHORITY_TRUSTED_VARIANTS = {"manual", "catalog", "included"}
-PRICING_AUTHORITY_DECIMAL_RE = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
+PRICING_AUTHORITY_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+PRICING_AUTHORITY_WHITESPACE_RE = re.compile(
+    r"[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+"
+)
 QUOTE_SESSION_ID_RE = re.compile(r"^quote-[A-Za-z0-9_-]{3,64}$")
 QUOTE_SESSION_DIR_NAME = "quote-sessions"
 QUOTE_SESSION_METADATA_FILENAME = "quote-session.json"
@@ -6219,7 +6222,30 @@ def canonical_pricing_authority_text(value: Any) -> str:
     """Canonical text shared by every pricing-authority consumer."""
     if value is None:
         return ""
-    return unicodedata.normalize("NFC", re.sub(r"\s+", " ", str(value)).strip())
+    text = unicodedata.normalize("NFC", str(value))
+    return PRICING_AUTHORITY_WHITESPACE_RE.sub(" ", text).strip(" ")
+
+
+def canonical_pricing_authority_unit(value: Any) -> str:
+    text = canonical_pricing_authority_text(value)
+    lower = text.lower().strip(". ")
+    if lower in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+        return "sqm"
+    if lower in {"m run", "m. run"}:
+        return "m run"
+    if lower in {"m length", "m. length"}:
+        return "m length"
+    if lower in {"nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"}:
+        return "nos"
+    if lower in {"lot", "lots"}:
+        return "lot"
+    if lower in {"set", "sets"}:
+        return "sets"
+    return text
+
+
+def pricing_authority_version_is_valid(value: Any) -> bool:
+    return type(value) is int and value == PRICING_AUTHORITY_VERSION
 
 
 def pricing_authority_context(value: Any) -> dict[str, str]:
@@ -6229,7 +6255,7 @@ def pricing_authority_context(value: Any) -> dict[str, str]:
         "source_basis_line_id": canonical_pricing_authority_text(row.get("source_basis_line_id")),
         "section": canonical_pricing_authority_text(row.get("section")) or "General",
         "description": canonical_pricing_authority_text(row.get("description")),
-        "unit": normalize_pricing_unit(canonical_pricing_authority_text(row.get("unit"))),
+        "unit": canonical_pricing_authority_unit(row.get("unit")),
         "pricing_keyword": canonical_pricing_authority_text(row.get("pricing_keyword")),
     }
 
@@ -6246,7 +6272,7 @@ def pricing_authority_context_matches(authority: Any, row: Any) -> bool:
         return False
     return {
         key: (
-            normalize_pricing_unit(canonical_pricing_authority_text(supplied.get(key)))
+            canonical_pricing_authority_unit(supplied.get(key))
             if key == "unit"
             else (canonical_pricing_authority_text(supplied.get(key)) or "General" if key == "section" else canonical_pricing_authority_text(supplied.get(key)))
         )
@@ -6314,7 +6340,7 @@ def build_pricing_authority(
                 "catalog_digest": digest,
                 "catalog_section": canonical_pricing_authority_text((catalog_item or {}).get("section")) or "General",
                 "catalog_description": canonical_pricing_authority_text((catalog_item or {}).get("description")),
-                "catalog_unit": normalize_pricing_unit(canonical_pricing_authority_text(catalog_item_unit_hint(catalog_item))),
+                "catalog_unit": canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)),
             })
             if not source or not reference_id or not digest or not item_id:
                 raise ValueError("Catalog pricing authority is incomplete.")
@@ -6331,7 +6357,7 @@ def normalize_pricing_authority(
     """Validate a persisted/client authority against the current row and catalog."""
     if not isinstance(raw, dict):
         return None
-    if raw.get("schema") != PRICING_AUTHORITY_SCHEMA or raw.get("version") != PRICING_AUTHORITY_VERSION:
+    if raw.get("schema") != PRICING_AUTHORITY_SCHEMA or not pricing_authority_version_is_valid(raw.get("version")):
         return None
     if not isinstance(raw.get("variant"), str):
         return None
@@ -6388,7 +6414,7 @@ def normalize_pricing_authority(
         actual_id = clean_text((catalog_item or {}).get("id"))
         actual_price = pricing_reference_sale_unit_price(catalog_item or {})
         actual_description = canonical_pricing_authority_text((catalog_item or {}).get("description"))
-        actual_unit = normalize_pricing_unit(canonical_pricing_authority_text(catalog_item_unit_hint(catalog_item)))
+        actual_unit = canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item))
         actual_section = canonical_pricing_authority_text((catalog_item or {}).get("section")) or "General"
         if (
             catalog_item is None
@@ -6401,7 +6427,7 @@ def normalize_pricing_authority(
             or price != actual_price
             or canonical_pricing_authority_text(raw.get("catalog_section")) != actual_section
             or canonical_pricing_authority_text(raw.get("catalog_description")) != actual_description
-            or normalize_pricing_unit(canonical_pricing_authority_text(raw.get("catalog_unit"))) != actual_unit
+            or canonical_pricing_authority_unit(raw.get("catalog_unit")) != actual_unit
         ):
             return None
         normalized.update({
@@ -19256,12 +19282,13 @@ def normalize_owned_line_item(
             item["catalog_unit_price"] = catalog_unit_price
     else:
         item["unit_price_override"] = None
-    for key in ("pricing_basis_amount", "approved_quote_amount"):
-        value = parse_float_or_none(raw.get(key))
-        if key == "pricing_basis_amount" and value is None:
-            value = basis_amount
-        if value is not None:
-            item[key] = 0 if price_mode == "Included" and key == "approved_quote_amount" else value
+    if not authority_is_untrusted:
+        for key in ("pricing_basis_amount", "approved_quote_amount"):
+            value = parse_float_or_none(raw.get(key))
+            if key == "pricing_basis_amount" and value is None:
+                value = basis_amount
+            if value is not None:
+                item[key] = 0 if price_mode == "Included" and key == "approved_quote_amount" else value
     if not item["source_basis_line_id"]:
         item.pop("source_basis_line_id", None)
     normalized_exchange_rate = parse_float_or_none(exchange_rate)
@@ -19446,7 +19473,17 @@ def normalize_line_items(
             price_mode = "Included"
         if price_mode not in {"Priced", "Included"}:
             price_mode = "Included" if display_price.lower() == "included" else "Priced"
-        unit_price_override = None if price_mode == "Included" else parse_float_or_none(raw.get("unit_price_override"))
+        raw_override_supplied = raw.get("unit_price_override") not in (None, "")
+        manual_authority_price = (
+            pricing_authority_number(raw.get("unit_price_override"))
+            if price_mode != "Included" and raw_override_supplied
+            else None
+        )
+        unit_price_override = (
+            None
+            if price_mode == "Included" or (raw_override_supplied and manual_authority_price is None)
+            else parse_float_or_none(raw.get("unit_price_override"))
+        )
         catalog_unit_price = parse_float_or_none(catalog_item.get("sale_unit_price")) if catalog_item else None
         if not description and not display_price and not pricing_keyword:
             continue
@@ -19493,7 +19530,11 @@ def normalize_line_items(
             )
             item["status"] = match_status
             raw_override_text = clean_text(raw.get("unit_price_override"))
-            raw_override = parse_float_or_none(raw.get("unit_price_override"))
+            raw_override = (
+                pricing_authority_number(raw.get("unit_price_override"))
+                if raw_override_text
+                else None
+            )
             effective = None if raw_override_text and raw_override is None else (raw_override if raw_override is not None else catalog_unit_price)
             if effective is not None and effective >= 0:
                 item["effective_unit_price"] = effective
@@ -19548,11 +19589,11 @@ def normalize_line_items(
                 item,
                 reference_authority=authority,
             )
-        elif unit_price_override is not None and unit_price_override >= 0 and bool(description) and bool(unit):
+        elif manual_authority_price is not None and bool(description) and bool(unit):
             normalized_authority = build_pricing_authority(
                 "manual",
                 item,
-                price=unit_price_override,
+                price=manual_authority_price,
                 reference_authority=authority,
             )
         elif (
@@ -19613,6 +19654,8 @@ def normalize_line_items(
                 "pricing_basis_digest",
             ):
                 item.pop(stale_key, None)
+        elif raw_override_supplied and manual_authority_price is None:
+            item["status"] = "unmatched"
         if not item["source_basis_line_id"]:
             item.pop("source_basis_line_id", None)
         if display_price:

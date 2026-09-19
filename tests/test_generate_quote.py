@@ -3625,5 +3625,66 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             quote.pricing_authority_context({"section": "é item"})["section"],
         )
 
+    def test_run639_generator_uses_final_strict_authority_contract(self):
+        self.assertTrue(quote.pricing_authority_version_is_valid(1))
+        self.assertFalse(quote.pricing_authority_version_is_valid(True))
+        for value in ("1\u0662", "77%", "0x10", [], [77], True):
+            self.assertIsNone(quote.pricing_authority_number(value), repr(value))
+
+        for value in ("a\u001cb", "a\ufeffb", "a\t  b", "e\u0301  item", "é item"):
+            self.assertEqual(quote.canonical_pricing_authority_text(value), "a b" if value.startswith("a") else "é item")
+        self.assertEqual(
+            quote.pricing_authority_context({"section": "a\u001cb"}),
+            quote.pricing_authority_context({"section": "a b"}),
+        )
+
+        for price in (77, 0, "0.00"):
+            brief = commercial_test_brief({
+                "line_items": [{
+                    "section": "Custom",
+                    "quantity": 2,
+                    "unit": "lot",
+                    "description": "Operator-approved custom row",
+                    "pricing_keyword": "",
+                    "unit_price_override": price,
+                    "price_mode": "Priced",
+                }],
+            })
+            [line] = quote.prepare_lines(brief, [], allow_ambiguous=True)
+            self.assertEqual(line.match_status, "manual-price")
+            self.assertEqual(line.unit_price_override, 0 if float(price) == 0 else 77)
+            self.assertEqual(line.amount, 0 if float(price) == 0 else 154)
+
+        included_brief = commercial_test_brief({
+            "line_items": [{
+                "section": "Services",
+                "quantity": 1,
+                "unit": "lot",
+                "description": "Included coordination",
+                "pricing_keyword": "",
+                "price_mode": "Included",
+                "unit_price_override": 999,
+            }],
+        })
+        [included] = quote.prepare_lines(included_brief, [], allow_ambiguous=True)
+        self.assertEqual(included.match_status, "included")
+        self.assertEqual(included.amount, 0)
+
+        invalid_brief = commercial_test_brief({
+            "line_items": [{
+                "section": "Custom",
+                "quantity": 2,
+                "unit": "lot",
+                "description": "Operator-approved custom row",
+                "pricing_keyword": "",
+                "unit_price_override": "77%",
+                "price_mode": "Priced",
+            }],
+        })
+        [invalid] = quote.prepare_lines(invalid_brief, [], allow_ambiguous=True)
+        self.assertEqual(invalid.match_status, "unmatched")
+        self.assertIsNone(invalid.unit_price_override)
+        self.assertIsNone(invalid.amount)
+
 if __name__ == "__main__":
     unittest.main()
