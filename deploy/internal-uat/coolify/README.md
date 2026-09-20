@@ -23,7 +23,8 @@ Recommended app settings:
   Nixpacks to select Node as a production provider. The `nixpacks.toml`
   `providers = ["python"]` declaration enforces Python-only production builds.
 - Port: value supplied by `PORT`
-- Healthcheck path: `/api/health`
+- Healthcheck path: `/api/health` (process-only liveness; deploy startup keeps
+  its dependency-readiness gate internal)
 - Instance count: `1`
 - Storage posture: `SQAG_STORAGE_MODE=database` and
   `SQAG_ARTIFACT_STORAGE_MODE=object` with the canonical

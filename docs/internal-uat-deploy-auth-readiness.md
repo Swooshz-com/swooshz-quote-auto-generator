@@ -252,9 +252,16 @@ while checking env values.
 - [ ] Confirm generated artifact bytes require object storage for
       hosted/protected/deploy readiness and are not credited from DB/BLOB mode.
 - [ ] Confirm the app refuses unsafe or incomplete deploy-auth configuration.
-- [ ] Confirm `/api/health` returns HTTP 200 only after the generator, required
-      database schema, object-artifact metadata schema, and object-storage
-      bucket probe pass; dependency failure must return metadata-only HTTP 503.
+- [ ] Confirm public `GET /api/health` returns HTTP 200 with
+      `{"status":"ok"}` as process-only liveness and performs no dependency
+      or warm-up call.
+- [ ] Confirm deploy startup performs exactly one internal forced dependency
+      readiness probe before listener construction and refuses to bind when it
+      is blocked; no public readiness endpoint exists.
+- [ ] Confirm accepted Platform launch/finalization admission may trigger only
+      the bounded advisory runtime-database warm attempt, using the configured
+      `sqag_runtime` PostgreSQL target and exactly `SELECT 1`, without changing
+      auth, session, or readiness truth.
 - [ ] Confirm unauthenticated users are blocked or redirected.
 - [ ] Confirm launch consume registers a hashed short-lived finalization handle,
       exact-origin browser finalization sets only the host-only SQAG cookie, and

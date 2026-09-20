@@ -193,9 +193,13 @@ Source of truth: `.github/workflows/ci.yml`
   no schema or external lock service. CI proves the SQL order and deterministic
   SQLite interleavings with synthetic adapters only; live Postgres concurrency
   remains hosted evidence.
-- `/api/health` returns HTTP 200 only while required dependencies are ready and
-  returns metadata-only HTTP 503 otherwise. A short cache bounds repeated
-  unauthenticated health probes.
+- `/api/health` is process-only liveness: it returns HTTP 200 with
+  `{"status":"ok"}` and performs no dependency, provider, or warm-up call.
+  Deploy startup keeps one forced internal dependency-readiness probe before
+  listener construction; readiness is not exposed as a public endpoint.
+- After valid Platform launch or finalization admission, one short-lived
+  advisory runtime-database warm attempt may run with the runtime role and
+  exactly `SELECT 1`; it cannot change auth, readiness, or response status.
 - CI exercises these boundaries with synthetic/mocked dependencies only and
   requires no database, object-storage, Platform, OIDC, or deployment secrets.
 - Internal-alpha requires a second PDF export path: an explicit PDF request
