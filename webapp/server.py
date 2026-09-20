@@ -11632,6 +11632,7 @@ def postgres_runtime_warm_connection_factory():
             database_url,
             row_factory=dict_row,
             connect_timeout=5,
+            autocommit=True,
             options="-c search_path=public,pg_catalog -c statement_timeout=5000",
         )
 
@@ -11708,8 +11709,11 @@ def trigger_runtime_database_warm() -> bool:
         if not runtime_database_warm_target_is_authorized(database_url):
             return False
         target_key = runtime_database_warm_target_key(database_url)
-        now = time.monotonic()
         with RUNTIME_DATABASE_WARM_LOCK:
+            now = time.monotonic()
+            for cooldown_target_key, cooldown_until in tuple(RUNTIME_DATABASE_WARM_COOLDOWNS.items()):
+                if cooldown_until <= now:
+                    del RUNTIME_DATABASE_WARM_COOLDOWNS[cooldown_target_key]
             if RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN is not None:
                 return False
             cooldown_until = RUNTIME_DATABASE_WARM_COOLDOWNS.get(target_key, 0.0)
