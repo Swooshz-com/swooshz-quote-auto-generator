@@ -38,7 +38,9 @@ storage for generated artifact bytes:
   only the exact Coolify/Traefik proxy network CIDRs that connect directly to
   SQAG. A trust-all network is not permitted.
 - The object-storage credential must permit the read-only bucket probe used by
-  startup and `/api/health`, plus runtime read, write, and delete operations.
+  deploy startup readiness, plus runtime read, write, and delete operations.
+  Public `/api/health` is process-only liveness and does not call object
+  storage.
   A provider delete failure returns HTTP 503 and keeps the profile, pricing
   reference, or quote session available for a later retry instead of reporting
   false deletion.
@@ -83,9 +85,11 @@ This repo owns only the app-specific shape:
 
 - Build provider contract: `nixpacks.toml` and `.python-version`.
 - Start command: `python webapp/server.py`.
-- Health/readiness path: `/api/health`. It returns HTTP 200 only after the
-  generator, required database schemas, and read-only object bucket probe pass;
-  required dependency failure returns metadata-only HTTP 503.
+- Health path: `/api/health` is process-only liveness and returns HTTP 200 with
+  `{"status":"ok"}` without probing dependencies. Deploy startup performs
+  one internal forced dependency-readiness probe before constructing the
+  listener and refuses to start when that probe is blocked; readiness is not a
+  public endpoint.
 - Deploy-mode environment variable names.
 - Metadata-only validation commands.
 - SQAG private-data and tenant-import guardrails.
@@ -204,8 +208,14 @@ bytes, host IPs, or private paths into issue/PR output.
 
 - App build completes.
 - App starts with the documented start command.
-- `/api/health` returns metadata-only JSON and HTTP 200 only while the database
-  schema, object-artifact metadata schema, and object bucket are usable.
+- `/api/health` returns process-only `{"status":"ok"}` JSON and HTTP 200.
+- Deploy startup's internal readiness probe confirms the database schema,
+  object-artifact metadata schema, and object bucket before the listener is
+  constructed.
+- After accepted Platform launch or finalization admission, the app may start
+  one short-lived advisory runtime-database warm attempt using only the
+  configured runtime database role and `SELECT 1`; it cannot satisfy readiness
+  or change auth/session outcomes.
 - Unauthenticated protected routes block or redirect.
 - Platform/workspace launch reaches the app.
 - Cross-subdomain finalization permits only the exact Platform origin, sets

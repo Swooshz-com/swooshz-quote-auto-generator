@@ -469,6 +469,12 @@ PLATFORM_REQUEST_TIMEOUT_SECONDS_MIN = 1
 PLATFORM_REQUEST_TIMEOUT_SECONDS_MAX = 30
 PLATFORM_LAUNCH_MAX_FUTURE_SECONDS = 10 * 60
 PLATFORM_FINALIZATION_TTL_SECONDS = 2 * 60
+RUNTIME_DATABASE_WARM_CONNECT_TIMEOUT_SECONDS = 5
+RUNTIME_DATABASE_WARM_STATEMENT_TIMEOUT_MS = 5000
+RUNTIME_DATABASE_WARM_COOLDOWN_SECONDS = 30.0
+RUNTIME_DATABASE_WARM_LOCK = threading.Lock()
+RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN: object | None = None
+RUNTIME_DATABASE_WARM_COOLDOWNS: dict[str, float] = {}
 PRODUCTION_PLATFORM_ORIGIN = "https://swooshz.com"
 PRODUCTION_SQAG_ORIGIN = "https://quote.swooshz.com"
 PLATFORM_LAUNCH_PROVIDER_MAX_RESPONSE_BYTES = 64 * 1024
@@ -11608,6 +11614,125 @@ def postgres_driver_connection_factory():
         )
 
     return connect
+
+
+def postgres_runtime_warm_connection_factory():
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise SqagStorageAccessError(
+            "SQAG Postgres database driver is not available.",
+            status=503,
+            reason="storage_postgres_driver_unavailable",
+        ) from exc
+
+    def connect(database_url: str):
+        return psycopg.connect(
+            database_url,
+            row_factory=dict_row,
+            connect_timeout=5,
+            options="-c search_path=public,pg_catalog -c statement_timeout=5000",
+        )
+
+    return connect
+
+
+def runtime_database_warm_target_key(database_url: str) -> str:
+    return hashlib.sha256(clean_text(database_url).encode("utf-8")).hexdigest()
+
+
+def runtime_database_warm_target_is_authorized(database_url: str) -> bool:
+    cleaned_database_url = clean_text(database_url)
+    try:
+        if database_family_from_url(cleaned_database_url) != "postgres_compatible":
+            return False
+        parsed = urlparse(cleaned_database_url)
+        decoded_username = unquote(parsed.username or "")
+    except (TypeError, ValueError):
+        return False
+    return decoded_username == SQAG_RUNTIME_DATABASE_ROLE
+
+
+def _runtime_database_warm_log(reason: str) -> None:
+    try:
+        write_local_log(
+            "runtime_database_warm",
+            {"reason": clean_text(reason) or "unavailable"},
+        )
+    except Exception:
+        pass
+
+
+def _perform_runtime_database_warm(database_url: str) -> None:
+    raw_connection = None
+    try:
+        connect = postgres_runtime_warm_connection_factory()
+        raw_connection = connect(database_url)
+        connection_info = getattr(raw_connection, "info", None)
+        authenticated_role = clean_text(getattr(connection_info, "user", ""))
+        if authenticated_role != SQAG_RUNTIME_DATABASE_ROLE:
+            raise RuntimeError("runtime database session role mismatch")
+        cursor = raw_connection.execute("SELECT 1")
+        cursor.fetchone()
+    finally:
+        if raw_connection is not None:
+            raw_connection.close()
+
+
+def _finish_runtime_database_warm(attempt_token: object) -> None:
+    global RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN
+    with RUNTIME_DATABASE_WARM_LOCK:
+        if RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN is attempt_token:
+            RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN = None
+
+
+def _run_runtime_database_warm(
+    database_url: str,
+    target_key: str,
+    attempt_token: object,
+) -> None:
+    del target_key
+    try:
+        _perform_runtime_database_warm(database_url)
+    except Exception:
+        _runtime_database_warm_log("attempt_failed")
+    finally:
+        _finish_runtime_database_warm(attempt_token)
+
+
+def trigger_runtime_database_warm() -> bool:
+    global RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN
+    try:
+        database_url = clean_text(configured_database_url())
+        if not runtime_database_warm_target_is_authorized(database_url):
+            return False
+        target_key = runtime_database_warm_target_key(database_url)
+        now = time.monotonic()
+        with RUNTIME_DATABASE_WARM_LOCK:
+            if RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN is not None:
+                return False
+            cooldown_until = RUNTIME_DATABASE_WARM_COOLDOWNS.get(target_key, 0.0)
+            if now < cooldown_until:
+                return False
+            attempt_token = object()
+            RUNTIME_DATABASE_WARM_COOLDOWNS[target_key] = now + RUNTIME_DATABASE_WARM_COOLDOWN_SECONDS
+            RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN = attempt_token
+        try:
+            worker = threading.Thread(
+                target=_run_runtime_database_warm,
+                args=(database_url, target_key, attempt_token),
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            _finish_runtime_database_warm(attempt_token)
+            _runtime_database_warm_log("worker_start_failed")
+            return False
+        return True
+    except Exception:
+        _runtime_database_warm_log("configuration_unavailable")
+        return False
 
 
 @contextlib.contextmanager
@@ -28532,8 +28657,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_static_file(STATIC_DIR / relative)
             return
         if path == "/api/health":
-            status = health_status()
-            self.send_json(status, status=200 if status.get("status") == "ok" else 503)
+            self.send_json({"status": "ok"})
             return
         if path == "/api/session":
             session = self.current_auth_session()
@@ -29704,6 +29828,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if not intended_sqag_origin:
             self.send_json({"status": "blocked", "errors": ["Platform launch could not be completed."]}, status=403)
             return
+        trigger_runtime_database_warm()
         finalization_handle = secrets.token_urlsafe(32)
         handle_hash = hashlib.sha256(finalization_handle.encode("utf-8")).hexdigest()
         try:
@@ -29808,6 +29933,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         finally:
             raw_handle = ""
+        trigger_runtime_database_warm()
         session_cookie_value = signed_cookie_value(
             {
                 "auth_mode": "platform",

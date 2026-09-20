@@ -158,6 +158,16 @@ to `POST /api/auth/platform/finalize`; SQAG consumes it with Platform and only
 then sets its host-only cookie. The handle never enters URLs, bodies, DOM,
 storage, cookies, logs, or telemetry.
 
+After launch admission and before finalization registration, and again after a
+valid finalization-handle consume and before cookie issue, SQAG may start one
+short-lived advisory runtime-database warm attempt. It uses only the cleaned
+configured `SQAG_DATABASE_URL` when it is PostgreSQL-compatible and names the
+decoded `sqag_runtime` user, then authenticates the connected role from
+connection metadata and fetches exactly `SELECT 1`. One process-local in-flight
+attempt and per-target cooldown bound the work. Failure is privacy-safe and
+cannot change launch/finalization authority, session creation, or startup
+readiness; no public warm endpoint or recurring keepalive exists.
+
 Each authenticated SQAG API request sends the non-secret grant ID and
 `{workspaceId, appKey: "sqag"}` to Platform's validation route under
 `X-SQAG-Service-Authorization`. Timeout, transport, non-2xx, malformed, invalid,

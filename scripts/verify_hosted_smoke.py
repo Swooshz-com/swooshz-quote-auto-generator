@@ -565,10 +565,8 @@ def health_check(base_url: str) -> bool:
     text = json.dumps(body, sort_keys=True)
     return (
         status == 200
-        and body.get("status") == "ok"
-        and isinstance(body.get("generator_available"), bool)
-        and "generator" not in body
-        and "scripts/generate_quote.py" not in text
+        and body == {"status": "ok"}
+        and text == '{"status": "ok"}'
         and not contains_sensitive_value(text)
     )
 
