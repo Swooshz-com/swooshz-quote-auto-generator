@@ -919,6 +919,11 @@ class WebappServerTest(unittest.TestCase):
             if hasattr(webapp, "RATE_LIMIT_LAST_PRUNE_AT"):
                 webapp.RATE_LIMIT_LAST_PRUNE_AT = 0.0
 
+    def reset_runtime_database_warm_state(self):
+        with webapp.RUNTIME_DATABASE_WARM_LOCK:
+            webapp.RUNTIME_DATABASE_WARM_COOLDOWNS.clear()
+            webapp.RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN = None
+
     def test_local_mutable_storage_defaults_stay_inside_repo(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
@@ -7140,8 +7145,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             with LocalRunnerServer() as runner:
                 health = json.loads(urllib.request.urlopen(f"{runner.base_url}/api/health", timeout=3).read().decode("utf-8"))
                 self.assertEqual(health["status"], "ok")
-                self.assertTrue(health["generator_available"])
-                self.assertNotIn("generator", health)
+                self.assertEqual(health, {"status": "ok"})
 
                 with self.assertRaises(urllib.error.HTTPError) as root_error:
                     opener.open(f"{runner.base_url}/", timeout=3)
@@ -7472,6 +7476,108 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         for private_field in ("email", "displayName", "status", "workspaceSlug", "workspaceName", "appName"):
             self.assertNotIn(private_field, serialized_cookie)
 
+    def test_platform_launch_warms_after_admission_before_finalization_registration(self):
+        env = self.platform_launch_env()
+        events = []
+        context = webapp.safe_platform_launch_context(self.platform_consume_payload())
+
+        def mark_origin(_host):
+            events.append("origin")
+            return env["SQAG_PUBLIC_BASE_URL"]
+
+        def mark_token(_length):
+            events.append("handle")
+            return "synthetic-finalization-handle"
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "consume_platform_launch_token", side_effect=lambda _token: events.append("consume") or context),
+            mock.patch.object(webapp, "request_sqag_origin", side_effect=mark_origin),
+            mock.patch.object(webapp, "trigger_runtime_database_warm", side_effect=lambda: events.append("warm")),
+            mock.patch.object(webapp.secrets, "token_urlsafe", side_effect=mark_token),
+            mock.patch.object(webapp, "register_platform_finalization", side_effect=lambda *args, **kwargs: events.append("register") or "expiry"),
+        ):
+            with LocalRunnerServer(canonical_origin=False) as runner:
+                response = self.http_json(
+                    runner,
+                    "POST",
+                    webapp.PLATFORM_LAUNCH_ENDPOINT,
+                    headers={
+                        webapp.PLATFORM_LAUNCH_TOKEN_HEADER: "synthetic-launch-token",
+                        webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                    },
+                )
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(events, ["consume", "origin", "warm", "handle", "register"])
+
+    def test_platform_launch_registration_failure_keeps_one_advisory_warm(self):
+        env = self.platform_launch_env()
+        context = webapp.safe_platform_launch_context(self.platform_consume_payload())
+        registration_error = webapp.PlatformLaunchError(
+            "synthetic registration failure",
+            status=502,
+            reason="synthetic_finalization_registration_failed",
+        )
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "consume_platform_launch_token", return_value=context),
+            mock.patch.object(webapp, "request_sqag_origin", return_value=env["SQAG_PUBLIC_BASE_URL"]),
+            mock.patch.object(webapp, "trigger_runtime_database_warm", return_value=False) as warm,
+            mock.patch.object(webapp.secrets, "token_urlsafe", return_value="synthetic-finalization-handle"),
+            mock.patch.object(webapp, "register_platform_finalization", side_effect=registration_error) as register,
+            mock.patch.object(webapp, "write_local_log"),
+        ):
+            with LocalRunnerServer(canonical_origin=False) as runner:
+                response = self.http_json(
+                    runner,
+                    "POST",
+                    webapp.PLATFORM_LAUNCH_ENDPOINT,
+                    headers={
+                        webapp.PLATFORM_LAUNCH_TOKEN_HEADER: "synthetic-launch-token",
+                        webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                    },
+                )
+
+        self.assertEqual(response["status"], 502)
+        self.assertEqual(
+            response["body"],
+            {"status": "blocked", "errors": ["Platform launch could not be completed."]},
+        )
+        warm.assert_called_once_with()
+        register.assert_called_once()
+
+    def test_platform_finalization_warms_after_valid_handle_before_cookie_issue(self):
+        env = self.platform_launch_env()
+        events = []
+        context = webapp.safe_platform_launch_context(self.platform_consume_payload())
+
+        def mark_origin(_host):
+            events.append("host")
+            return env["SQAG_PUBLIC_BASE_URL"]
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "request_sqag_origin", side_effect=mark_origin),
+            mock.patch.object(webapp, "platform_finalization_context", side_effect=lambda *args, **kwargs: events.append("consume") or context),
+            mock.patch.object(webapp, "trigger_runtime_database_warm", side_effect=lambda: events.append("warm")),
+            mock.patch.object(webapp, "signed_cookie_value", side_effect=lambda _payload: events.append("sign") or "synthetic-cookie"),
+            mock.patch.object(webapp, "cookie_header_value", side_effect=lambda *args, **kwargs: events.append("cookie") or "swooshz_quote_session=synthetic-cookie"),
+        ):
+            with LocalRunnerServer(canonical_origin=False) as runner:
+                response = self.http_json(
+                    runner,
+                    "POST",
+                    webapp.PLATFORM_FINALIZATION_ENDPOINT,
+                    headers={
+                        "Origin": env["SQAG_PLATFORM_BASE_URL"],
+                        webapp.PLATFORM_FINALIZATION_HANDLE_HEADER: "synthetic-finalization-handle",
+                    },
+                )
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(events, ["host", "consume", "warm", "sign", "cookie"])
+
     def test_platform_launch_rate_limit_isolates_clients_behind_trusted_proxy(self):
         env = self.platform_launch_env()
         captured_requests: list[urllib.request.Request] = []
@@ -7564,6 +7670,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(webapp, "MAX_RATE_LIMIT_BUCKETS", 4),
             mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen),
+            mock.patch.object(webapp, "trigger_runtime_database_warm") as warm,
         ):
             with LocalRunnerServer() as runner:
                 for index in range(3):
@@ -7626,6 +7733,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             len(webapp.RATE_LIMIT_OVERFLOW_BUCKETS[webapp.PLATFORM_LAUNCH_ENDPOINT]),
             webapp.POST_RATE_LIMITS[webapp.PLATFORM_LAUNCH_ENDPOINT],
         )
+        warm.assert_called_once_with()
 
     def test_platform_launch_rate_limit_does_not_trust_forwarded_ip_from_direct_client(self):
         env = self.platform_launch_env(SQAG_TRUSTED_PROXY_CIDRS='192.0.2.0/24')
@@ -8372,37 +8480,40 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(factory.call_count, 2)
         self.assertEqual(backend.readiness_probe.call_count, 2)
 
-    def test_health_route_returns_503_when_required_dependencies_are_blocked(self):
-        blocked = {
-            "status": "blocked",
-            "generator_available": True,
-            "checks": [{"name": "database_metadata_schema", "ok": False}],
-        }
-        with mock.patch.object(webapp, "health_status", return_value=blocked):
-            with LocalRunnerServer() as runner:
-                with self.assertRaises(urllib.error.HTTPError) as health_error:
-                    urllib.request.urlopen(f"{runner.base_url}/api/health", timeout=3)
-                body = json.loads(health_error.exception.read().decode("utf-8"))
+    def test_health_route_is_process_liveness_without_dependency_calls(self):
+        with (
+            mock.patch.object(webapp, "health_status", side_effect=AssertionError("public liveness must not probe readiness")) as health,
+            mock.patch.object(webapp, "trigger_runtime_database_warm", side_effect=AssertionError("public liveness must not warm the database")) as warm,
+            LocalRunnerServer(allow_any_host=False, canonical_origin=False) as runner,
+        ):
+            response = self.http_json(
+                runner,
+                "GET",
+                "/api/health?probe=process-only",
+                headers={"Host": "untrusted.example.test"},
+            )
 
-        self.assertEqual(health_error.exception.code, 503)
-        self.assertEqual(body, blocked)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["body"], {"status": "ok"})
+        health.assert_not_called()
+        warm.assert_not_called()
 
     def test_exact_health_get_accepts_localhost_host_after_host_gate_repair(self):
         runtime_root = Path(tempfile.gettempdir()) / f"sqag-health-host-positive-{time.time_ns()}"
         env = self.platform_launch_env(QUOTE_LOG_ROOT=str(runtime_root / "logs"))
         with (
             mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(webapp, "health_status", return_value={"status": "ok"}) as health,
+            mock.patch.object(webapp, "health_status", side_effect=AssertionError("public liveness must not probe readiness")) as health,
             LocalRunnerServer(allow_any_host=False, canonical_origin=False) as runner,
         ):
             response = self.http_json(runner, "GET", "/api/health", headers={"Host": "localhost"})
 
         self.assertEqual(response["status"], 200)
         self.assertEqual(response["body"], {"status": "ok"})
-        health.assert_called_once_with()
+        health.assert_not_called()
 
     def test_exact_health_route_host_matrix_preserves_non_health_admission(self):
-        health_payload = {"status": "ok", "generator_available": True, "checks": []}
+        health_payload = {"status": "ok"}
         runtime_root = Path(tempfile.gettempdir()) / f"sqag-health-host-matrix-{time.time_ns()}"
         env = self.platform_launch_env(QUOTE_LOG_ROOT=str(runtime_root / "logs"))
 
@@ -8422,7 +8533,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         with (
             mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(webapp, "health_status", return_value=health_payload) as health,
+            mock.patch.object(webapp, "health_status", side_effect=AssertionError("public liveness must not probe readiness")) as health,
             LocalRunnerServer(allow_any_host=False, canonical_origin=False) as runner,
         ):
             for host in ("localhost", "localhost:8765", "127.0.0.1:8765", "[::1]:8765", "quote.swooshz.com"):
@@ -8458,7 +8569,370 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertEqual(raw_get_status(runner, "/api/session", "quote.swooshz.com:bad"), 403)
             self.assertEqual(raw_get_status(runner, "/api/session", "localhost", "localhost"), 403)
 
-        self.assertEqual(health.call_count, 6)
+        health.assert_not_called()
+
+    def test_runtime_database_warm_uses_only_runtime_role_and_selects_once(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        cursor = mock.Mock()
+        cursor.fetchone.return_value = (1,)
+        raw_connection = mock.Mock()
+        raw_connection.info = types.SimpleNamespace(user="sqag_runtime")
+        raw_connection.execute.return_value = cursor
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value=f"  {database_url}  "),
+            mock.patch.object(webapp, "postgres_runtime_warm_connection_factory", return_value=lambda _url: raw_connection),
+            mock.patch.object(webapp.threading, "Thread", ImmediateThread),
+            mock.patch.object(webapp, "write_local_log") as write_log,
+        ):
+            self.assertTrue(webapp.trigger_runtime_database_warm())
+
+        raw_connection.execute.assert_called_once_with("SELECT 1")
+        cursor.fetchone.assert_called_once_with()
+        raw_connection.close.assert_called_once_with()
+        write_log.assert_not_called()
+        target_key = hashlib.sha256(database_url.encode("utf-8")).hexdigest()
+        self.assertIn(target_key, webapp.RUNTIME_DATABASE_WARM_COOLDOWNS)
+
+    def test_runtime_database_warm_rejects_non_runtime_targets_before_thread_creation(self):
+        urls = (
+            "sqlite:///synthetic.sqlite3",
+            "postgresql://sqag_migrator@db.example.test/sqag",
+            "postgresql://sqag_maintenance@db.example.test/sqag",
+            "postgresql://admin@db.example.test/sqag",
+        )
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with mock.patch.object(webapp, "threading") as threading_module:
+            for database_url in urls:
+                with self.subTest(database_url=database_url.split(":", 1)[0]):
+                    with mock.patch.object(webapp, "configured_database_url", return_value=database_url):
+                        self.assertFalse(webapp.trigger_runtime_database_warm())
+        threading_module.Thread.assert_not_called()
+
+    def test_runtime_database_warm_requires_authenticated_runtime_role_before_sql(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        raw_connection = mock.Mock()
+        raw_connection.info = types.SimpleNamespace(user="sqag_migrator")
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value=database_url),
+            mock.patch.object(webapp, "postgres_runtime_warm_connection_factory", return_value=lambda _url: raw_connection),
+            mock.patch.object(webapp.threading, "Thread", ImmediateThread),
+            mock.patch.object(webapp, "write_local_log") as write_log,
+        ):
+            self.assertTrue(webapp.trigger_runtime_database_warm())
+
+        raw_connection.execute.assert_not_called()
+        raw_connection.close.assert_called_once_with()
+        self.assertNotIn(database_url, json.dumps(write_log.call_args_list, default=str))
+        self.assertNotIn("sqag_migrator", json.dumps(write_log.call_args_list, default=str))
+
+    def test_runtime_database_warm_cooldown_uses_reservation_time_and_boundary(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value=database_url),
+            mock.patch.object(webapp, "_perform_runtime_database_warm") as perform,
+            mock.patch.object(webapp.threading, "Thread", ImmediateThread),
+            mock.patch.object(webapp.time, "monotonic", side_effect=(100.0, 129.999, 130.0)),
+        ):
+            self.assertTrue(webapp.trigger_runtime_database_warm())
+            self.assertFalse(webapp.trigger_runtime_database_warm())
+            self.assertTrue(webapp.trigger_runtime_database_warm())
+
+        self.assertEqual(perform.call_count, 2)
+
+    def test_runtime_database_warm_cooldown_starts_after_lock_reservation(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        real_thread = threading.Thread
+
+        class ObservableLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.acquire_attempted = threading.Event()
+
+            def acquire(self, *args, **kwargs):
+                self.acquire_attempted.set()
+                return self._lock.acquire(*args, **kwargs)
+
+            def release(self):
+                self._lock.release()
+
+            def locked(self):
+                return self._lock.locked()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.release()
+                return False
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        class FakeClock:
+            def __init__(self, value):
+                self.value = value
+
+            def __call__(self):
+                return self.value
+
+        coordinator = ObservableLock()
+        coordinator._lock.acquire()
+        clock = FakeClock(100.0)
+        completed = threading.Event()
+        result = {}
+
+        def trigger():
+            result["value"] = webapp.trigger_runtime_database_warm()
+            completed.set()
+
+        caller = real_thread(target=trigger, daemon=True)
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "RUNTIME_DATABASE_WARM_LOCK", coordinator),
+            mock.patch.object(webapp, "configured_database_url", return_value=database_url),
+            mock.patch.object(webapp.time, "monotonic", side_effect=clock),
+            mock.patch.object(webapp, "_perform_runtime_database_warm") as perform,
+            mock.patch.object(webapp.threading, "Thread", ImmediateThread),
+        ):
+            caller.start()
+            try:
+                self.assertTrue(coordinator.acquire_attempted.wait(5))
+                clock.value = 200.0
+                coordinator.release()
+                self.assertTrue(completed.wait(5))
+                caller.join(timeout=5)
+                self.assertFalse(caller.is_alive())
+
+                target_key = hashlib.sha256(database_url.encode("utf-8")).hexdigest()
+                self.assertTrue(result["value"])
+                self.assertEqual(webapp.RUNTIME_DATABASE_WARM_COOLDOWNS[target_key], 230.0)
+
+                clock.value = 229.999
+                self.assertFalse(webapp.trigger_runtime_database_warm())
+                clock.value = 230.0
+                self.assertTrue(webapp.trigger_runtime_database_warm())
+                self.assertEqual(perform.call_count, 2)
+            finally:
+                if coordinator.locked():
+                    coordinator.release()
+                caller.join(timeout=5)
+
+    def test_runtime_database_warm_prunes_expired_target_cooldowns(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        retained_key = hashlib.sha256(b"postgresql://sqag_runtime@db.example.test/retained").hexdigest()
+        expired_keys = {
+            hashlib.sha256(
+                f"postgresql://sqag_runtime@historical-{index}.example.test/sqag".encode("utf-8")
+            ).hexdigest()
+            for index in range(64)
+        }
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        self.reset_runtime_database_warm_state()
+        with webapp.RUNTIME_DATABASE_WARM_LOCK:
+            for key in expired_keys:
+                webapp.RUNTIME_DATABASE_WARM_COOLDOWNS[key] = 100.0
+            webapp.RUNTIME_DATABASE_WARM_COOLDOWNS[retained_key] = 1000.0
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value=database_url),
+            mock.patch.object(webapp, "_perform_runtime_database_warm") as perform,
+            mock.patch.object(webapp.threading, "Thread", ImmediateThread),
+            mock.patch.object(webapp.time, "monotonic", side_effect=(100.0, 100.0, 130.0)),
+        ):
+            self.assertTrue(webapp.trigger_runtime_database_warm())
+            self.assertFalse(webapp.trigger_runtime_database_warm())
+            self.assertTrue(webapp.trigger_runtime_database_warm())
+
+        target_key = hashlib.sha256(database_url.encode("utf-8")).hexdigest()
+        for key in expired_keys:
+            self.assertNotIn(key, webapp.RUNTIME_DATABASE_WARM_COOLDOWNS)
+        self.assertIn(retained_key, webapp.RUNTIME_DATABASE_WARM_COOLDOWNS)
+        self.assertEqual(set(webapp.RUNTIME_DATABASE_WARM_COOLDOWNS), {retained_key, target_key})
+        self.assertEqual(webapp.RUNTIME_DATABASE_WARM_COOLDOWNS[target_key], 160.0)
+        self.assertEqual(perform.call_count, 2)
+
+    def test_runtime_database_warm_start_failure_clears_inflight_but_keeps_cooldown(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        constructed = []
+
+        class FailingThread:
+            def __init__(self, target, args, daemon):
+                constructed.append((target, args, daemon))
+
+            def start(self):
+                raise RuntimeError("synthetic thread start detail")
+
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value=database_url),
+            mock.patch.object(webapp.threading, "Thread", FailingThread),
+            mock.patch.object(webapp.time, "monotonic", side_effect=(100.0, 129.999, 130.0)),
+            mock.patch.object(webapp, "write_local_log") as write_log,
+        ):
+            self.assertFalse(webapp.trigger_runtime_database_warm())
+            self.assertFalse(webapp.trigger_runtime_database_warm())
+            self.assertFalse(webapp.trigger_runtime_database_warm())
+
+        self.assertEqual(len(constructed), 2)
+        with webapp.RUNTIME_DATABASE_WARM_LOCK:
+            self.assertIsNone(webapp.RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN)
+        serialized_logs = json.dumps(write_log.call_args_list, default=str)
+        self.assertIn("worker_start_failed", serialized_logs)
+        self.assertNotIn("synthetic thread start detail", serialized_logs)
+        self.assertNotIn(database_url, serialized_logs)
+
+    def test_runtime_database_warm_constructor_failure_clears_inflight_but_keeps_cooldown(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+
+        class FailingThread:
+            def __init__(self, target, args, daemon):
+                raise RuntimeError("synthetic thread construction detail")
+
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value=database_url),
+            mock.patch.object(webapp.threading, "Thread", FailingThread),
+            mock.patch.object(webapp.time, "monotonic", return_value=100.0),
+            mock.patch.object(webapp, "write_local_log") as write_log,
+        ):
+            self.assertFalse(webapp.trigger_runtime_database_warm())
+
+        with webapp.RUNTIME_DATABASE_WARM_LOCK:
+            self.assertIsNone(webapp.RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN)
+        serialized_logs = json.dumps(write_log.call_args_list, default=str)
+        self.assertIn("worker_start_failed", serialized_logs)
+        self.assertNotIn("synthetic thread construction detail", serialized_logs)
+        self.assertNotIn(database_url, serialized_logs)
+
+    def test_runtime_database_warm_has_one_global_inflight_attempt_without_sleep(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        entered = threading.Event()
+        barrier = threading.Barrier(2)
+        first_done = threading.Event()
+        first_result = {}
+
+        def blocking_warm(_database_url):
+            entered.set()
+            barrier.wait(timeout=5)
+
+        def first_trigger():
+            first_result["value"] = webapp.trigger_runtime_database_warm()
+            first_done.set()
+
+        self.reset_runtime_database_warm_state()
+        self.addCleanup(self.reset_runtime_database_warm_state)
+        with (
+            mock.patch.object(webapp, "configured_database_url", return_value=database_url),
+            mock.patch.object(webapp, "_perform_runtime_database_warm", side_effect=blocking_warm),
+        ):
+            caller = threading.Thread(target=first_trigger, daemon=True)
+            caller.start()
+            self.assertTrue(entered.wait(5))
+            self.assertFalse(webapp.trigger_runtime_database_warm())
+            barrier.wait(timeout=5)
+            self.assertTrue(first_done.wait(5))
+            caller.join(timeout=5)
+
+        self.assertFalse(caller.is_alive())
+        self.assertTrue(first_result["value"])
+
+    def test_runtime_database_warm_factory_uses_libpq_statement_timeout_option(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        fake_connection = mock.Mock()
+        connect = mock.Mock(return_value=fake_connection)
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = connect
+        fake_rows = types.ModuleType("psycopg.rows")
+        fake_rows.dict_row = object()
+        with mock.patch.dict(
+            sys.modules,
+            {"psycopg": fake_psycopg, "psycopg.rows": fake_rows},
+        ):
+            warm_connect = webapp.postgres_runtime_warm_connection_factory()
+            self.assertIs(warm_connect(database_url), fake_connection)
+
+        connect.assert_called_once_with(
+            database_url,
+            row_factory=fake_rows.dict_row,
+            connect_timeout=5,
+            autocommit=True,
+            options="-c search_path=public,pg_catalog -c statement_timeout=5000",
+        )
+
+    def test_runtime_database_default_factory_contract_stays_unchanged(self):
+        database_url = "postgresql://sqag_runtime@db.example.test/sqag"
+        fake_connection = mock.Mock()
+        connect = mock.Mock(return_value=fake_connection)
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = connect
+        fake_rows = types.ModuleType("psycopg.rows")
+        fake_rows.dict_row = object()
+        with mock.patch.dict(
+            sys.modules,
+            {"psycopg": fake_psycopg, "psycopg.rows": fake_rows},
+        ):
+            default_connect = webapp.postgres_driver_connection_factory()
+            self.assertIs(default_connect(database_url), fake_connection)
+
+        connect.assert_called_once_with(
+            database_url,
+            row_factory=fake_rows.dict_row,
+            options="-c search_path=public,pg_catalog",
+        )
 
     def test_deploy_main_probes_dependencies_before_server_construction(self):
         env = self.platform_launch_env()
@@ -8484,7 +8958,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         env = self.platform_launch_env()
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+            with (
+                mock.patch.object(webapp.urllib.request, "urlopen") as urlopen,
+                mock.patch.object(webapp, "trigger_runtime_database_warm") as warm,
+            ):
                 with LocalRunnerServer() as runner:
                     request = urllib.request.Request(
                         f"{runner.base_url}/api/platform/launch",
@@ -8502,6 +8979,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(body["status"], "blocked")
         self.assertIn("Platform launch could not be completed.", body["errors"])
         urlopen.assert_not_called()
+        warm.assert_not_called()
 
     def test_platform_launch_requires_single_matching_service_credential_before_token_use(self):
         env = self.platform_launch_env()
@@ -8529,6 +9007,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(webapp, "consume_platform_launch_token") as consume,
             mock.patch.object(webapp, "register_platform_finalization") as register,
+            mock.patch.object(webapp, "trigger_runtime_database_warm") as warm,
             mock.patch.object(webapp.urllib.request, "urlopen") as urlopen,
             mock.patch.object(webapp.secrets, "token_urlsafe") as generate_handle,
             mock.patch.object(webapp, "write_local_log") as write_log,
@@ -8560,6 +9039,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         consume.assert_not_called()
         register.assert_not_called()
+        warm.assert_not_called()
         urlopen.assert_not_called()
         generate_handle.assert_not_called()
         logged = repr(write_log.call_args_list) + "".join(written_stderr)
@@ -8575,7 +9055,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with (
+                mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen),
+                mock.patch.object(webapp, "trigger_runtime_database_warm") as warm,
+            ):
                 with LocalRunnerServer() as runner:
                     request = urllib.request.Request(
                         f"{runner.base_url}/api/platform/launch",
@@ -8594,6 +9077,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(body["status"], "blocked")
         self.assertIn("Platform launch context is not valid for SQAG.", body["errors"])
         self.assertNotIn(self.synthetic_platform_launch_token(), json.dumps(body))
+        warm.assert_not_called()
 
     def test_platform_launch_rejects_failed_consume_safely(self):
         env = self.platform_launch_env()
@@ -8609,7 +9093,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with (
+                mock.patch.object(webapp.urllib.request, "urlopen", side_effect=fake_urlopen),
+                mock.patch.object(webapp, "trigger_runtime_database_warm") as warm,
+            ):
                 with LocalRunnerServer() as runner:
                     request = urllib.request.Request(
                         f"{runner.base_url}/api/platform/launch",
@@ -8629,6 +9116,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Platform request could not be verified.", body["errors"])
         self.assertNotIn("private", json.dumps(body))
         self.assertNotIn(self.synthetic_platform_launch_token(), json.dumps(body))
+        warm.assert_not_called()
 
     def test_platform_launch_rejects_missing_identity_workspace_role_and_expired_context(self):
         base_payload = self.platform_consume_payload()
@@ -8749,7 +9237,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         env = self.platform_launch_env()
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+            with (
+                mock.patch.object(webapp.urllib.request, "urlopen") as urlopen,
+                mock.patch.object(webapp, "trigger_runtime_database_warm") as warm,
+            ):
                 with LocalRunnerServer() as runner:
                     request = urllib.request.Request(
                         f"{runner.base_url}{webapp.PLATFORM_FINALIZATION_ENDPOINT}",
@@ -8764,6 +9255,28 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                         opener.open(request, timeout=3)
         self.assertEqual(error.exception.code, 403)
         urlopen.assert_not_called()
+        warm.assert_not_called()
+
+    def test_platform_launch_rejects_disallowed_host_without_warm(self):
+        env = self.platform_launch_env()
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "trigger_runtime_database_warm") as warm,
+        ):
+            with LocalRunnerServer(allow_any_host=False, canonical_origin=False) as runner:
+                response = self.http_json(
+                    runner,
+                    "POST",
+                    webapp.PLATFORM_LAUNCH_ENDPOINT,
+                    headers={
+                        "Host": "quote.swooshz.com:444",
+                        webapp.PLATFORM_LAUNCH_TOKEN_HEADER: self.synthetic_platform_launch_token(),
+                        webapp.PLATFORM_SERVICE_AUTHORIZATION_HEADER: env["SQAG_PLATFORM_SERVICE_SECRET"],
+                    },
+                )
+
+        self.assertEqual(response["status"], 403)
+        warm.assert_not_called()
 
     def test_platform_security_singleton_headers_reject_duplicates(self):
         env = self.platform_launch_env()
@@ -9073,23 +9586,25 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_platform_launch_mode_disabled_keeps_local_session_behavior(self):
         with mock.patch.dict(os.environ, {"APP_MODE": "local"}, clear=True):
             self.assertFalse(webapp.auth_required())
-            with LocalRunnerServer() as runner:
-                session_body = json.loads(urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3).read().decode("utf-8"))
-                request = urllib.request.Request(
-                    f"{runner.base_url}/api/platform/launch",
-                    data=b"",
-                    headers={"X-App-Launch-Token": self.synthetic_platform_launch_token()},
-                    method="POST",
-                )
-                with self.assertRaises(urllib.error.HTTPError) as error:
-                    urllib.request.urlopen(request, timeout=3)
-                body = json.loads(error.exception.read().decode("utf-8"))
+            with mock.patch.object(webapp, "trigger_runtime_database_warm") as warm:
+                with LocalRunnerServer() as runner:
+                    session_body = json.loads(urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3).read().decode("utf-8"))
+                    request = urllib.request.Request(
+                        f"{runner.base_url}/api/platform/launch",
+                        data=b"",
+                        headers={"X-App-Launch-Token": self.synthetic_platform_launch_token()},
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(request, timeout=3)
+                    body = json.loads(error.exception.read().decode("utf-8"))
 
         self.assertFalse(session_body["auth_required"])
         self.assertFalse(session_body["authenticated"])
         self.assertEqual(session_body["permissions"]["role"], "admin")
         self.assertEqual(error.exception.code, 404)
         self.assertEqual(body["error"], "Not found")
+        warm.assert_not_called()
 
     def test_deploy_logout_is_never_state_changing_get_and_external_redirect_is_rejected(self):
         env = self.deploy_auth_env(OIDC_LOGOUT_URL="https://issuer.example/logout")

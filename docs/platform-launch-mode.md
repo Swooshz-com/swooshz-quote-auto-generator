@@ -32,10 +32,11 @@ treats them as unauthenticated and grants no permissions. Platform mode rejects
 the OIDC callback before provider calls; logout still clears the rejected
 cookie and returns to the validated Platform base URL.
 
-Before binding a deploy server, SQAG also performs read-only checks for the
-required database schema, object-artifact metadata schema, and configured
-object-storage bucket. `/api/health` returns HTTP 503 with metadata-only check
-results while any required dependency is unavailable.
+Before binding a deploy server, SQAG performs one forced internal readiness
+probe for the required database schema, object-artifact metadata schema, and
+configured object-storage bucket. A blocked probe prevents listener creation.
+Public `GET /api/health` is process-only liveness and always returns HTTP 200
+with `{"status":"ok"}` without calling those dependencies.
 
 ## Enable Platform Launch Mode
 
@@ -99,6 +100,17 @@ The same shared service-secret value must be entered separately and securely
 in Platform and SQAG runtime configuration. SQAG requires at least 32
 characters in deploy mode. Never place the value in a repository, log,
 screenshot, report, or chat.
+
+After a valid launch context and intended SQAG origin are admitted, SQAG may
+start one short-lived advisory runtime-database warm attempt before registering
+the finalization handle. After a valid finalization handle is consumed, it may
+start the same warm attempt before issuing the SQAG cookie. The coordinator
+uses only the configured PostgreSQL-compatible `SQAG_DATABASE_URL` with the
+decoded `sqag_runtime` role, a bounded connection, and exactly `SELECT 1`.
+It has one in-flight attempt and a per-target cooldown. Warm-up failures are
+privacy-safe and cannot grant authority, register finalization, issue a cookie,
+or satisfy or change readiness. There is no public warm endpoint or recurring
+keepalive.
 
 Production routing is exact: Platform is `https://swooshz.com`,
 `https://www.swooshz.com` permanently redirects to the apex, and SQAG is

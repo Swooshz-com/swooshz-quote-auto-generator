@@ -371,13 +371,25 @@ class RuntimeDependencyHealthDeployGateTest(unittest.TestCase):
             output_root = Path(temporary) / "output"
             tmp_root = Path(temporary) / "tmp"
             patches = self.common_deploy_patches(all_ok)
+            events = []
             server = mock.Mock()
             server.serve_forever.side_effect = KeyboardInterrupt
             with contextlib.ExitStack() as stack:
                 for patcher in patches:
                     stack.enter_context(patcher)
                 health = stack.enter_context(
-                    mock.patch.object(webapp, "health_status", return_value=all_ok)
+                    mock.patch.object(
+                        webapp,
+                        "health_status",
+                        side_effect=lambda **kwargs: events.append("readiness") or all_ok,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        webapp,
+                        "trigger_runtime_database_warm",
+                        side_effect=AssertionError("startup readiness must not use advisory warm-up"),
+                    )
                 )
                 stack.enter_context(
                     mock.patch.object(
@@ -393,11 +405,16 @@ class RuntimeDependencyHealthDeployGateTest(unittest.TestCase):
                     )
                 )
                 server_factory = stack.enter_context(
-                    mock.patch.object(webapp, "ThreadingHTTPServer", return_value=server)
+                    mock.patch.object(
+                        webapp,
+                        "ThreadingHTTPServer",
+                        side_effect=lambda *args, **kwargs: events.append("listener") or server,
+                    )
                 )
                 self.assertEqual(webapp.main(), 0)
 
             health.assert_called_once_with(force_dependency_probe=True)
+            self.assertEqual(events, ["readiness", "listener"])
             server_factory.assert_called_once()
             server.serve_forever.assert_called_once_with()
             server.server_close.assert_called_once_with()
