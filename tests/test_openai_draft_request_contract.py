@@ -132,6 +132,48 @@ class DraftRequestContractTest(unittest.TestCase):
             else:
                 self.capture()
 
+    def test_input_file_aggregate_bytes_boundaries_and_five_pdf_reproducer(self):
+        decoded_pdf_bytes = len(base64.b64decode(self.pdf.split(",", 1)[1]))
+        payload = self.payload(self.pdf, self.pdf)
+        for limit in (2 * decoded_pdf_bytes - 1, 2 * decoded_pdf_bytes, 2 * decoded_pdf_bytes + 1):
+            with self.subTest(limit=limit):
+                with mock.patch.object(server, "MAX_DRAFT_INPUT_FILE_TOTAL_BYTES", limit):
+                    if 2 * decoded_pdf_bytes > limit:
+                        self.assert_rejected(payload)
+                    else:
+                        self.capture(payload)
+
+        # The accepted G4 reproducer is five valid PDFs whose aggregate bytes
+        # exceed the final input_file ceiling before the mocked transport.
+        with mock.patch.object(server, "MAX_DRAFT_INPUT_FILE_TOTAL_BYTES", 4 * decoded_pdf_bytes):
+            self.assert_rejected(self.payload(*([self.pdf] * 5)))
+
+    def test_gpt_55_invalid_reasoning_effort_rejects_before_mocked_transport(self):
+        def dotenv(name):
+            if name == server.OPENAI_DRAFT_MODEL_ENV_NAME:
+                return "gpt-5.5"
+            if name == server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME:
+                return "minimal"
+            return ""
+
+        with mock.patch.object(server, "read_dotenv_value", side_effect=dotenv):
+            self.assert_rejected(self.payload())
+
+    def test_gpt_55_supported_reasoning_efforts_remain_valid(self):
+        for effort in ("none", "low", "high", "xhigh"):
+            with self.subTest(effort=effort):
+                def dotenv(name):
+                    if name == server.OPENAI_DRAFT_MODEL_ENV_NAME:
+                        return "gpt-5.5"
+                    if name == server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME:
+                        return effort
+                    return ""
+
+                with mock.patch.object(server, "read_dotenv_value", side_effect=dotenv):
+                    body = self.capture()
+                self.assertEqual(body["model"], "gpt-5.5")
+                self.assertEqual(body["reasoning"], {"effort": effort})
+
     def test_decoded_byte_and_encoded_length_boundaries(self):
         for url, constant in [(self.image, "MAX_IMAGE_BYTES"), (self.pdf, "MAX_PDF_BYTES")]:
             length = len(base64.b64decode(url.split(",")[1]))

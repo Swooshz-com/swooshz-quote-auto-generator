@@ -202,6 +202,10 @@ MAX_PDF_BYTES = 12 * 1024 * 1024
 MAX_REFERENCE_IMAGES = 8
 MAX_RENDERED_PDF_PAGES = 12
 MAX_RENDERED_PDF_PAGE_BYTES = 1024 * 1024
+# OpenAI documents a 50 MB combined input-file limit. Use decimal MB and
+# decoded file bytes so the boundary is deterministic and independent of
+# base64 transport overhead.
+MAX_DRAFT_INPUT_FILE_TOTAL_BYTES = 50_000_000
 PDF_RENDER_TARGET_LONG_EDGE_PX = 1600
 # 4K-axis inputs and fewer than 9 million pixels cover DCI 4K quote/reference
 # images while bounding decoded RGB/RGBA buffers to about 26/35 MiB, well below
@@ -646,6 +650,9 @@ OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_REASONING_EFFORT"
 OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
 OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
 OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+OPENAI_MODEL_REASONING_EFFORTS = {
+    "gpt-5.5": frozenset({"none", "low", "high", "xhigh"}),
+}
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
@@ -18344,6 +18351,10 @@ def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STA
     return OPENAI_DRAFT_REASONING_EFFORT
 
 
+def supported_openai_draft_reasoning_efforts(model: str) -> set[str] | frozenset[str]:
+    return OPENAI_MODEL_REASONING_EFFORTS.get(model, OPENAI_REASONING_EFFORTS)
+
+
 def configured_openai_basis_line_model() -> str:
     return safe_segment(read_dotenv_value(OPENAI_BASIS_LINE_MODEL_ENV_NAME), OPENAI_BASIS_LINE_MODEL)
 
@@ -22794,9 +22805,13 @@ def validate_draft_responses_envelope(body: Any, analysis_mode: str) -> tuple[by
     """Exact Responses oracle and shape-only hash; no value-derived hashes."""
     if not isinstance(body, dict) or set(body) != {"model", "input", "reasoning"}:
         draft_request_invalid()
-    if body["model"] != configured_openai_draft_model(analysis_mode):
+    configured_model = configured_openai_draft_model(analysis_mode)
+    configured_effort = configured_openai_draft_reasoning_effort(analysis_mode)
+    if body["model"] != configured_model:
         draft_request_invalid()
-    if body["reasoning"] != {"effort": configured_openai_draft_reasoning_effort(analysis_mode)}:
+    if body["reasoning"] != {"effort": configured_effort}:
+        draft_request_invalid()
+    if configured_effort not in supported_openai_draft_reasoning_efforts(configured_model):
         draft_request_invalid()
     messages = body["input"]
     if not isinstance(messages, list) or len(messages) != 1:
@@ -22808,6 +22823,7 @@ def validate_draft_responses_envelope(body: Any, analysis_mode: str) -> tuple[by
     if not isinstance(content, list) or not content or len(content) > 1 + MAX_REFERENCE_IMAGES * 2 + MAX_RENDERED_PDF_PAGES + 1 + MAX_PROMPT_CATALOG_VISUAL_IMAGES:
         draft_request_invalid()
     shape = []
+    input_file_bytes = 0
     files = high_images = low_images = 0
     for part in content:
         if not isinstance(part, dict):
@@ -22829,13 +22845,25 @@ def validate_draft_responses_envelope(body: Any, analysis_mode: str) -> tuple[by
         elif kind == "input_file":
             if set(part) != {"type", "filename", "file_data"} or not isinstance(part["filename"], str) or not part["filename"].strip():
                 draft_request_invalid()
-            if validate_draft_media(part["file_data"]) != "application/pdf":
+            file_data = part["file_data"]
+            if validate_draft_media(file_data) != "application/pdf":
+                draft_request_invalid()
+            try:
+                input_file_bytes += len(base64.b64decode(file_data.partition(",")[2], validate=True))
+            except (binascii.Error, TypeError, ValueError):
                 draft_request_invalid()
             files += 1
             shape.append(["input_file", "filename:string", "file_data:string", "application/pdf"])
         else:
             draft_request_invalid()
-    if content[0].get("type") != "input_text" or not files + high_images or files > MAX_REFERENCE_IMAGES or high_images + files > MAX_REFERENCE_IMAGES + (MAX_RENDERED_PDF_PAGES if files else 0) or low_images > MAX_PROMPT_CATALOG_VISUAL_IMAGES:
+    if (
+        content[0].get("type") != "input_text"
+        or not files + high_images
+        or files > MAX_REFERENCE_IMAGES
+        or high_images + files > MAX_REFERENCE_IMAGES + (MAX_RENDERED_PDF_PAGES if files else 0)
+        or low_images > MAX_PROMPT_CATALOG_VISUAL_IMAGES
+        or input_file_bytes > MAX_DRAFT_INPUT_FILE_TOTAL_BYTES
+    ):
         draft_request_invalid()
     try:
         encoded = json.dumps(body, allow_nan=False).encode("utf-8")
