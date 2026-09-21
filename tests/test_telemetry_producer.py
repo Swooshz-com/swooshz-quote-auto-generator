@@ -35,6 +35,27 @@ def connection_with_telemetry() -> sqlite3.Connection:
 
 
 class TelemetryProducerTest(unittest.TestCase):
+    def test_draft_failure_metadata_retains_only_safe_param_and_shape_hash(self):
+        diagnostics = server.draft_provider_error_diagnostics({"error": {
+            "type": "invalid_request_error", "code": "invalid_value",
+            "param": "input[0].content[1].file_data",
+            "message": "PRIVATE_PROVIDER_BODY customer@example.invalid",
+        }})
+        diagnostics.update({
+            "failure_boundary": "provider_http", "attempt_number": 1,
+            "request_shape_sha256": "a" * 64,
+            "prompt": "PRIVATE_PROMPT", "headers": "PRIVATE_AUTHORIZATION",
+            "data_url": "PRIVATE_MEDIA", "filename": "PRIVATE_FILENAME",
+        })
+        error = server.OpenAIAnalysisError("OpenAI analysis failed with HTTP 400.", diagnostics=diagnostics)
+        metadata = server.ai_failure_metadata(error, provider="openai", error_reference="ERR-ABCDEF12")
+        self.assertEqual(metadata["provider_error_param"], "input[0].content[1].file_data")
+        self.assertEqual(metadata["request_shape_sha256"], "a" * 64)
+        self.assertEqual(metadata["attempt_number"], 1)
+        self.assertNotIn("PRIVATE", json.dumps(metadata))
+        for invalid in ("input[0].private_customer", "https://private.invalid", "a" * 101):
+            self.assertNotIn("provider_error_param", server.safe_ai_output_diagnostics({"provider_error_param": invalid}))
+
     def setUp(self):
         self.connection = connection_with_telemetry()
         self.store = ForensicStore(self.connection, "workspace-alpha", "pid-v1-alpha")

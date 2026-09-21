@@ -54,6 +54,36 @@ npm run playwright:smoke
 
 ## Regression Standard
 
+### Full-draft Responses contract
+
+Run `python -m unittest tests.test_openai_draft_request_contract` for full-draft
+request changes. This suite uses synthetic in-memory JPEG/PNG/WEBP/PDF media,
+mocked transport, and a socket-level outbound-network denial backstop. No live
+provider call is part of this validation.
+
+Invalid supplied references reject the entire draft before filtering, and the
+assembled Responses envelope is checked immediately before sending. Original
+PDF attachments, rendered-page order/budget, catalog visuals, configured model
+and reasoning, and prompt semantics remain unchanged for valid inputs. Full
+drafts have one provider-send budget; unrelated routes retain their retry rules.
+Draft PDF rendering does not retain local debug images.
+
+Failure diagnostics permit only enumerated provider classifications and bounded
+structural `error.param` paths supplied by the provider. Paths are never inferred
+from messages. `request_shape_sha256` hashes a versioned structural projection:
+field/type markers, ordered content discriminators, detail levels, and MIME
+classes. Prompt text, filenames, media/base64, private identifiers/URLs, model
+configuration values, credentials, headers, and raw provider bodies are excluded.
+The fingerprint is not evidence of historical failure causation.
+
+Contract coverage includes exact Responses field sets, invalid envelopes, whole
+request rejection, one-send failures, privacy canaries, and N-1/N/N+1 boundaries
+for reference/catalog counts, decoded media/derived-image bytes, dimensions,
+pixels, page budgets, and inbound/outbound JSON. Byte/pixel/JSON boundary tests
+use scaled ceilings to exercise exact equality without oversized fixtures.
+Hosted acceptance remains a separate gate requiring explicit live-operation
+authority; deterministic local validation does not establish live acceptance.
+
 A fix is not complete until the failing behavior has a regression test at the right layer:
 
 - Unit tests for deterministic parsing, normalization, pricing, persistence serialization, and XLSX generation.
