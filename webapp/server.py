@@ -202,6 +202,10 @@ MAX_PDF_BYTES = 12 * 1024 * 1024
 MAX_REFERENCE_IMAGES = 8
 MAX_RENDERED_PDF_PAGES = 12
 MAX_RENDERED_PDF_PAGE_BYTES = 1024 * 1024
+# OpenAI documents a 50 MB combined input-file limit. Use decimal MB and
+# decoded file bytes so the boundary is deterministic and independent of
+# base64 transport overhead.
+MAX_DRAFT_INPUT_FILE_TOTAL_BYTES = 50_000_000
 PDF_RENDER_TARGET_LONG_EDGE_PX = 1600
 # 4K-axis inputs and fewer than 9 million pixels cover DCI 4K quote/reference
 # images while bounding decoded RGB/RGBA buffers to about 26/35 MiB, well below
@@ -235,6 +239,10 @@ MAX_PRICING_REFERENCE_VISUALS = 80
 MAX_PRICING_REFERENCE_VISUAL_BYTES = 512 * 1024
 MAX_PRICING_REFERENCE_VISUALS_PER_ITEM = 3
 MAX_PROMPT_CATALOG_VISUAL_IMAGES = 8
+MAX_DRAFT_RESPONSES_BYTES = MAX_JOB_REQUEST_BYTES + 4 * (
+    (MAX_RENDERED_PDF_PAGES * MAX_RENDERED_PDF_PAGE_BYTES
+     + MAX_PROMPT_CATALOG_VISUAL_IMAGES * MAX_PRICING_REFERENCE_VISUAL_BYTES + 2) // 3
+)
 MAX_PRICING_METADATA_BATCH_ITEMS = 20
 PRICING_REFERENCE_ASSETS_DIR_NAME = "pricing-reference-assets"
 SECTIONED_WORKBOOK_COL_SECTION_NO = 0
@@ -642,6 +650,9 @@ OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_REASONING_EFFORT"
 OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
 OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
 OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+OPENAI_MODEL_REASONING_EFFORTS = {
+    "gpt-5.5": frozenset({"none", "low", "high", "xhigh"}),
+}
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
@@ -18331,13 +18342,13 @@ def configured_openai_draft_model(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> s
 def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
     if mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
         raw = clean_text(read_dotenv_value(OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME)).lower()
-        if raw in OPENAI_REASONING_EFFORTS:
-            return raw
-        return OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
+        return raw or OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
     raw = clean_text(read_dotenv_value(OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME)).lower()
-    if raw in OPENAI_REASONING_EFFORTS:
-        return raw
-    return OPENAI_DRAFT_REASONING_EFFORT
+    return raw or OPENAI_DRAFT_REASONING_EFFORT
+
+
+def supported_openai_draft_reasoning_efforts(model: str) -> set[str] | frozenset[str]:
+    return OPENAI_MODEL_REASONING_EFFORTS.get(model, OPENAI_REASONING_EFFORTS)
 
 
 def configured_openai_basis_line_model() -> str:
@@ -18822,7 +18833,7 @@ def extract_pdf_embedded_page_images(pdf_bytes: bytes, source_name: str, max_pag
     return select_embedded_pdf_page_images(page_candidates, max_pages)
 
 
-def pdf_reference_page_images(entry: dict[str, Any], max_pages: int = MAX_RENDERED_PDF_PAGES) -> list[dict[str, Any]]:
+def pdf_reference_page_images(entry: dict[str, Any], max_pages: int = MAX_RENDERED_PDF_PAGES, *, retain_debug: bool = True) -> list[dict[str, Any]]:
     if reference_file_mime_type(entry) != "application/pdf":
         return []
     try:
@@ -18855,9 +18866,11 @@ def pdf_reference_page_images(entry: dict[str, Any], max_pages: int = MAX_RENDER
             if data_url_inline_image(clean_text(image.get("data_url"))) is not None
         ]
         if valid_images:
+            if not retain_debug:
+                return valid_images
             source_digest = hashlib.sha256(pdf_bytes).hexdigest()
             return persist_pdf_page_debug_images(valid_images, source_name, source_digest)
-    if errors:
+    if errors and retain_debug:
         write_local_log("pdf_page_render_unavailable", {
             "filename": source_name,
             "errors": safe_error_messages(errors, limit=160),
@@ -20238,6 +20251,8 @@ SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS = {
 
 
 SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
+    "provider_error_param",
+    "request_shape_sha256",
     "failure_boundary",
     "http_status",
     "http_status_class",
@@ -20260,6 +20275,15 @@ def safe_ai_output_diagnostics(value: Any) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {}
     for key in SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS | SAFE_AI_FAILURE_DIAGNOSTIC_KEYS:
         item = value.get(key)
+        if key == "provider_error_param":
+            param = safe_draft_error_param(item)
+            if param:
+                diagnostics[key] = param
+            continue
+        if key == "request_shape_sha256":
+            if isinstance(item, str) and re.fullmatch(r"[a-f0-9]{64}", item):
+                diagnostics[key] = item
+            continue
         if isinstance(item, bool):
             diagnostics[key] = item
         elif isinstance(item, int) and 0 <= item <= 10_000_000:
@@ -22697,18 +22721,196 @@ def normalize_ai_draft(
     }
 
 
+def draft_request_invalid() -> None:
+    raise OpenAIAnalysisError(
+        "AI draft request contains invalid or unsupported media or request fields.",
+        diagnostics={"failure_boundary": "request_validation", "attempt_number": 0},
+    )
+
+
+def validate_draft_media(data_url: Any, max_bytes: int | None = None) -> str:
+    """Validate in memory; never normalize or retain supplied media or parser errors."""
+    if not isinstance(data_url, str):
+        draft_request_invalid()
+    prefix, separator, encoded = data_url.partition(",")
+    mime_by_prefix = {
+        "data:image/jpeg;base64": "image/jpeg",
+        "data:image/png;base64": "image/png",
+        "data:image/webp;base64": "image/webp",
+        "data:application/pdf;base64": "application/pdf",
+    }
+    mime = mime_by_prefix.get(prefix)
+    if not separator or not mime:
+        draft_request_invalid()
+    limit = max_bytes if max_bytes is not None else (MAX_PDF_BYTES if mime == "application/pdf" else MAX_IMAGE_BYTES)
+    if not encoded or len(encoded) > 4 * ((limit + 2) // 3):
+        draft_request_invalid()
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        if not raw or len(raw) > limit or base64.b64encode(raw).decode("ascii") != encoded:
+            draft_request_invalid()
+        if mime == "application/pdf":
+            if not looks_like_complete_pdf(raw):
+                draft_request_invalid()
+            import pypdfium2 as pdfium
+
+            document = pdfium.PdfDocument(io.BytesIO(raw))
+            try:
+                if len(document) < 1:
+                    draft_request_invalid()
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        if any(not math.isfinite(dimension) or dimension <= 0 for dimension in page.get_size()):
+                            draft_request_invalid()
+                    finally:
+                        page.close()
+            finally:
+                document.close()
+        else:
+            if image_mime_type_from_bytes(raw) != mime:
+                draft_request_invalid()
+            from PIL import Image
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
+                    if image.format != PROMPT_IMAGE_PIL_FORMAT_BY_MIME[mime] or not prompt_image_dimensions_are_allowed(image.size):
+                        draft_request_invalid()
+                    image.verify()
+                with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
+                    image.load()
+    except Exception:
+        # Parser exceptions may contain supplied content; do not chain or log them.
+        draft_request_invalid()
+    return mime
+
+
+def validate_draft_references(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = payload.get("images")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_REFERENCE_IMAGES:
+        draft_request_invalid()
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"].strip():
+            draft_request_invalid()
+        validate_draft_media(entry.get("data_url"))
+    return entries
+
+
+def validate_draft_responses_envelope(body: Any, analysis_mode: str) -> tuple[bytes, str]:
+    """Exact Responses oracle and shape-only hash; no value-derived hashes."""
+    if not isinstance(body, dict) or set(body) != {"model", "input", "reasoning"}:
+        draft_request_invalid()
+    configured_model = configured_openai_draft_model(analysis_mode)
+    configured_effort = configured_openai_draft_reasoning_effort(analysis_mode)
+    if body["model"] != configured_model:
+        draft_request_invalid()
+    if body["reasoning"] != {"effort": configured_effort}:
+        draft_request_invalid()
+    if configured_effort not in supported_openai_draft_reasoning_efforts(configured_model):
+        draft_request_invalid()
+    messages = body["input"]
+    if not isinstance(messages, list) or len(messages) != 1:
+        draft_request_invalid()
+    message = messages[0]
+    if not isinstance(message, dict) or set(message) != {"role", "content"} or message["role"] != "user":
+        draft_request_invalid()
+    content = message["content"]
+    if not isinstance(content, list) or not content or len(content) > 1 + MAX_REFERENCE_IMAGES * 2 + MAX_RENDERED_PDF_PAGES + 1 + MAX_PROMPT_CATALOG_VISUAL_IMAGES:
+        draft_request_invalid()
+    shape = []
+    input_file_bytes = 0
+    files = high_images = low_images = 0
+    for part in content:
+        if not isinstance(part, dict):
+            draft_request_invalid()
+        kind = part.get("type")
+        if kind == "input_text":
+            if set(part) != {"type", "text"} or not isinstance(part["text"], str) or not part["text"].strip():
+                draft_request_invalid()
+            shape.append(["input_text", "text:string"])
+        elif kind == "input_image":
+            if set(part) != {"type", "image_url", "detail"} or part["detail"] not in ("high", "low"):
+                draft_request_invalid()
+            mime = validate_draft_media(part["image_url"], MAX_PRICING_REFERENCE_VISUAL_BYTES if part["detail"] == "low" else MAX_IMAGE_BYTES)
+            if not mime.startswith("image/"):
+                draft_request_invalid()
+            high_images += part["detail"] == "high"
+            low_images += part["detail"] == "low"
+            shape.append(["input_image", "image_url:string", part["detail"], mime])
+        elif kind == "input_file":
+            if set(part) != {"type", "filename", "file_data"} or not isinstance(part["filename"], str) or not part["filename"].strip():
+                draft_request_invalid()
+            file_data = part["file_data"]
+            if validate_draft_media(file_data) != "application/pdf":
+                draft_request_invalid()
+            try:
+                input_file_bytes += len(base64.b64decode(file_data.partition(",")[2], validate=True))
+            except (binascii.Error, TypeError, ValueError):
+                draft_request_invalid()
+            files += 1
+            shape.append(["input_file", "filename:string", "file_data:string", "application/pdf"])
+        else:
+            draft_request_invalid()
+    if (
+        content[0].get("type") != "input_text"
+        or not files + high_images
+        or files > MAX_REFERENCE_IMAGES
+        or high_images + files > MAX_REFERENCE_IMAGES + (MAX_RENDERED_PDF_PAGES if files else 0)
+        or low_images > MAX_PROMPT_CATALOG_VISUAL_IMAGES
+        or input_file_bytes > MAX_DRAFT_INPUT_FILE_TOTAL_BYTES
+    ):
+        draft_request_invalid()
+    try:
+        encoded = json.dumps(body, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        draft_request_invalid()
+    # Original references plus bounded derived pages/catalog visuals and prompt overhead.
+    if len(encoded) > MAX_DRAFT_RESPONSES_BYTES:
+        draft_request_invalid()
+    canonical = ["responses-v1", "model:string", "reasoning:effort:string", "input:list", "role:user", shape]
+    fingerprint = hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode("ascii")).hexdigest()
+    return encoded, fingerprint
+
+
+def safe_draft_error_param(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 100:
+        return ""
+    if value in {"model", "input", "reasoning", "reasoning.effort"}:
+        return value
+    if re.fullmatch(r"input(?:\[0\]|\.0)(?:\.(?:role|content)(?:(?:\[[0-9]{1,2}\]|\.[0-9]{1,2})(?:\.(?:type|text|image_url|detail|filename|file_data))?)?)?", value):
+        return value
+    return ""
+
+
+def draft_provider_error_diagnostics(value: Any) -> dict[str, str]:
+    error = value.get("error") if isinstance(value, dict) else None
+    if not isinstance(error, dict):
+        return {}
+    result = {}
+    for key, allowed in {
+        "type": {"invalid_request_error", "server_error", "rate_limit_error", "authentication_error", "permission_error"},
+        "code": {"invalid_value", "invalid_parameter", "invalid_type", "invalid_image", "invalid_file", "unsupported_value", "context_length_exceeded", "rate_limit_exceeded", "insufficient_quota"},
+    }.items():
+        if isinstance(error.get(key), str) and error[key] in allowed:
+            result["provider_error_class" if key == "type" else "provider_error_code"] = error[key]
+    param = safe_draft_error_param(error.get("param"))
+    if param:
+        result["provider_error_param"] = param
+    return result
+
+
 def request_openai_quote_basis(
     payload: dict[str, Any],
     api_key: str,
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    references = validate_draft_references(payload)
     prompt = build_quote_draft_prompt(payload, auth_session=auth_session)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     rendered_pdf_pages_remaining = MAX_RENDERED_PDF_PAGES
-    for image in image_entries(payload)[:MAX_REFERENCE_IMAGES]:
-        data_url = clean_text(image.get("data_url"))
-        if not data_url:
-            continue
+    for image in references:
+        data_url = image["data_url"]
         mime_type = reference_file_mime_type(image)
         if mime_type == "application/pdf":
             filename = safe_segment(clean_text(image.get("name")) or "reference.pdf", "reference.pdf")
@@ -22718,7 +22920,7 @@ def request_openai_quote_basis(
                 "file_data": data_url,
             })
             if rendered_pdf_pages_remaining > 0:
-                rendered_pages = pdf_reference_page_images(image, max_pages=rendered_pdf_pages_remaining)
+                rendered_pages = pdf_reference_page_images(image, max_pages=rendered_pdf_pages_remaining, retain_debug=False)
                 rendered_pages = rendered_pages[:rendered_pdf_pages_remaining]
                 if rendered_pages:
                     page_numbers = ", ".join(str(page.get("page")) for page in rendered_pages if page.get("page"))
@@ -22732,11 +22934,18 @@ def request_openai_quote_basis(
                         ),
                     })
                     for page in rendered_pages:
+                        if validate_draft_media(page.get("data_url"), MAX_RENDERED_PDF_PAGE_BYTES) == "application/pdf":
+                            draft_request_invalid()
                         content.append({"type": "input_image", "image_url": page["data_url"], "detail": "high"})
                     rendered_pdf_pages_remaining -= len(rendered_pages)
         elif mime_type.startswith("image/"):
             content.append({"type": "input_image", "image_url": data_url, "detail": "high"})
     catalog_visuals = catalog_visual_image_entries_for_payload(payload, auth_session=auth_session)
+    if not isinstance(catalog_visuals, list) or len(catalog_visuals) > MAX_PROMPT_CATALOG_VISUAL_IMAGES:
+        draft_request_invalid()
+    for image in catalog_visuals:
+        if not isinstance(image, dict) or validate_draft_media(image.get("data_url"), MAX_PRICING_REFERENCE_VISUAL_BYTES) == "application/pdf":
+            draft_request_invalid()
     catalog_visual_prompt = catalog_visual_prompt_text(catalog_visuals)
     if catalog_visual_prompt:
         content.append({"type": "input_text", "text": catalog_visual_prompt})
@@ -22749,59 +22958,51 @@ def request_openai_quote_basis(
         "input": [{"role": "user", "content": content}],
         "reasoning": {"effort": configured_openai_draft_reasoning_effort(analysis_mode)},
     }
+    encoded_body, shape_fingerprint = validate_draft_responses_envelope(body, analysis_mode)
     request = urllib.request.Request(
         OPENAI_RESPONSES_URL,
-        data=json.dumps(body).encode("utf-8"),
+        data=encoded_body,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         method="POST",
     )
-    retry_delays = list(OPENAI_RETRY_DELAYS_SECONDS)
-    for attempt in range(len(retry_delays) + 1):
+    send_diagnostics = {"attempt_number": 1, "request_shape_sha256": shape_fingerprint}
+    try:
+        with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
         try:
-            with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as exc:
-            if attempt < len(retry_delays) and is_transient_openai_error(exc):
-                time.sleep(retry_delays[attempt])
-                continue
-            message = openai_http_error_message(exc)
-            diagnostics: dict[str, Any] = {
-                "failure_boundary": "provider_http",
-                "attempt_number": attempt + 1,
-            }
-            if isinstance(exc.code, int) and 100 <= exc.code <= 599:
-                diagnostics.update({
-                    "http_status": exc.code,
-                    "http_status_class": f"{exc.code // 100}xx",
-                })
-            diagnostics.update(getattr(exc, "_sqag_provider_error_diagnostics", {}))
-            raise OpenAIAnalysisError(message, diagnostics=diagnostics) from exc
-        except PROVIDER_CONNECTION_EXCEPTIONS as exc:
-            if attempt < len(retry_delays) and is_transient_openai_error(exc):
-                time.sleep(retry_delays[attempt])
-                continue
-            raise OpenAIAnalysisError(
-                provider_connection_error_message("OpenAI", exc),
-                diagnostics={
-                    "failure_boundary": "provider_transport",
-                    "attempt_number": attempt + 1,
-                },
-            ) from exc
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise OpenAIAnalysisError(
-                "OpenAI analysis returned invalid JSON.",
-                diagnostics={
-                    "failure_boundary": "provider_response_json",
-                    "attempt_number": attempt + 1,
-                },
-            ) from exc
+            error_body = json.loads(exc.read(128 * 1024).decode("utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            error_body = None
+        diagnostics = {**send_diagnostics, "failure_boundary": "provider_http"}
+        if isinstance(exc.code, int) and 100 <= exc.code <= 599:
+            diagnostics.update({"http_status": exc.code, "http_status_class": f"{exc.code // 100}xx"})
+        diagnostics.update(draft_provider_error_diagnostics(error_body))
+        raise OpenAIAnalysisError(f"OpenAI analysis failed with HTTP {exc.code}.", diagnostics=diagnostics) from None
+    except PROVIDER_CONNECTION_EXCEPTIONS as exc:
+        raise OpenAIAnalysisError(
+            "OpenAI analysis failed due to network timeout." if is_timeout_exception(exc) else "OpenAI analysis failed due to connection error.",
+            diagnostics={**send_diagnostics, "failure_boundary": "provider_transport"},
+        ) from None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise OpenAIAnalysisError(
+            "OpenAI analysis returned invalid JSON.",
+            diagnostics={**send_diagnostics, "failure_boundary": "provider_response_json"},
+        ) from None
 
     response_diagnostics = openai_response_failure_diagnostics(data)
-    response_diagnostics["attempt_number"] = attempt + 1
+    for key in ("provider_error_class", "provider_error_code"):
+        response_diagnostics.pop(key, None)
+    response_diagnostics.update(draft_provider_error_diagnostics(data))
+    if response_diagnostics.get("responses_status") not in {"completed", "failed", "incomplete", "in_progress", "queued", "cancelled"}:
+        response_diagnostics.pop("responses_status", None)
+    if response_diagnostics.get("incomplete_reason") not in {"max_output_tokens", "content_filter"}:
+        response_diagnostics.pop("incomplete_reason", None)
+    response_diagnostics["request_shape_sha256"] = shape_fingerprint
+    response_diagnostics["attempt_number"] = 1
     if (
         not isinstance(data, dict)
         or response_diagnostics.get("failure_boundary") == "provider_response_shape"
@@ -23314,6 +23515,7 @@ def log_protected_ai_draft_block(
 
 
 def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    validate_draft_references(payload)
     pricing_reference_error = pricing_reference_authority_error(
         payload,
         auth_session=auth_session,
@@ -23426,6 +23628,8 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             )
             return result
         except OpenAIAnalysisError as exc:
+            if exc.diagnostics.get("failure_boundary") == "request_validation":
+                raise
             openai_error = str(exc)
             remote_errors.append(openai_error)
             error_reference = new_error_reference()

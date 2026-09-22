@@ -54,6 +54,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import build_pricing_catalog as pricing_catalog
 import verify_internal_uat_deploy_template as deploy_template
 from webapp import server as webapp
+from tests.test_openai_draft_request_contract import synthetic_image, synthetic_pdf
 
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
 
@@ -169,7 +170,7 @@ def valid_payload():
             {
                 "name": "booth-render.jpg",
                 "type": "image/jpeg",
-                "data_url": "data:image/jpeg;base64,ZmFrZS1pbWFnZQ==",
+                "data_url": synthetic_image("JPEG"),
             }
         ],
         "profile_id": "synthetic-exhibition-fixture-template",
@@ -907,6 +908,17 @@ class WebappServerTest(unittest.TestCase):
             mock.patch.object(webapp, "bundled_pricing_references_root", return_value=self._empty_bundled_pricing_root),
         ]
         for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        if self._testMethodName.startswith(("test_openai_", "test_ai_requests_", "test_protected_draft_", "test_run410_")) and self._testMethodName != "test_openai_request_resolves_bundled_catalog_visual_paths":
+            # Transport tests need decodable catalog media; the historical tiny PNG
+            # fixture has an invalid IDAT checksum. Keep resolver tests independent.
+            catalog_entries = webapp.catalog_visual_image_entries_for_payload
+
+            def synthetic_catalog_entries(*args, **kwargs):
+                return [{**entry, "data_url": synthetic_image()} for entry in catalog_entries(*args, **kwargs)]
+
+            patcher = mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", side_effect=synthetic_catalog_entries)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -4741,6 +4753,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "http_status_class",
             "provider_error_class",
             "provider_error_code",
+            "provider_error_param",
+            "request_shape_sha256",
             "responses_status",
             "incomplete_reason",
             "refusal_present",
@@ -5222,7 +5236,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 ):
                     self.assertNotIn(private_value, serialized)
 
-    def test_protected_draft_terminal_retry_uses_terminal_attempt_and_shared_reference(self):
+    def test_protected_draft_single_attempt_uses_shared_reference(self):
         payload = valid_payload()
         log_root = test_temp_root() / f"draft-protected-terminal-retry-{time.time_ns()}"
         first_error = webapp.urllib.error.HTTPError(
@@ -5278,10 +5292,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
-        self.assertEqual(diagnostics["failure_kind"], "http_error")
+        self.assertEqual(diagnostics["failure_kind"], "upstream_unavailable")
         self.assertEqual(diagnostics["failure_boundary"], "provider_http")
-        self.assertEqual(diagnostics["http_status"], 400)
-        self.assertEqual(diagnostics["attempt_number"], 2)
+        self.assertEqual(diagnostics["http_status"], 500)
+        self.assertEqual(diagnostics["attempt_number"], 1)
         self.assertEqual(attempt_details["error_reference"], result["error_reference"])
         self.assertEqual(diagnostics["error_reference"], result["error_reference"])
         self.assertEqual(blocked["details"]["error_reference"], result["error_reference"])
@@ -12439,7 +12453,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "output_text": json.dumps({"quote_basis": {}, "line_items": []})
         }).encode("utf-8")
 
-        with mock.patch.object(webapp, "read_dotenv_value", return_value="gpt-custom-model"):
+        def dotenv(name):
+            if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
+                return "gpt-custom-model"
+            return ""
+
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
             with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
                 webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
 
@@ -12603,9 +12622,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "name": f"ref-{index}.jpg",
                 "type": "image/jpeg",
                 "size": 4,
-                "data_url": "data:image/jpeg;base64,ZmFrZQ==",
+                "data_url": synthetic_image("JPEG"),
             }
-            for index in range(9)
+            for index in range(8)
         ]
 
         with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
@@ -12621,6 +12640,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Internal catalog reference images follow", json.dumps(content))
 
     def test_ai_requests_send_pdf_references_as_input_files(self):
+        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({
             "output_text": json.dumps({"quote_basis": {}, "line_items": []})
@@ -12631,13 +12651,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "name": "kent-group.pdf",
                 "type": "application/pdf",
                 "size": 16,
-                "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
+                "data_url": synthetic_pdf(),
             },
             {
                 "name": "ref.jpg",
                 "type": "image/jpeg",
                 "size": 4,
-                "data_url": "data:image/jpeg;base64,ZmFrZQ==",
+                "data_url": synthetic_image("JPEG"),
             },
         ]
 
@@ -12648,7 +12668,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         input_files = [item for item in content if item.get("type") == "input_file"]
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
-        self.assertEqual(input_files[0]["file_data"], "data:application/pdf;base64,JVBERi0xLjQK")
+        self.assertEqual(input_files[0]["file_data"], synthetic_pdf())
         self.assertEqual(len(uploaded_images), 1)
 
     def test_ai_requests_send_rendered_pdf_pages_as_high_detail_images(self):
@@ -12662,18 +12682,18 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "name": "kent-group.pdf",
                 "type": "application/pdf",
                 "size": 16,
-                "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
+                "data_url": synthetic_pdf(),
             },
             {
                 "name": "ref.jpg",
                 "type": "image/jpeg",
                 "size": 4,
-                "data_url": "data:image/jpeg;base64,ZmFrZQ==",
+                "data_url": synthetic_image("JPEG"),
             },
         ]
         rendered_pages = [
-            {"name": "kent-group-page-1.jpg", "page": 1, "data_url": "data:image/jpeg;base64,cGFnZTE="},
-            {"name": "kent-group-page-2.jpg", "page": 2, "data_url": "data:image/jpeg;base64,cGFnZTI="},
+            {"name": "kent-group-page-1.jpg", "page": 1, "data_url": synthetic_image("JPEG", color="red")},
+            {"name": "kent-group-page-2.jpg", "page": 2, "data_url": synthetic_image("JPEG", color="blue")},
         ]
 
         with (
@@ -12686,13 +12706,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         input_files = [item for item in content if item.get("type") == "input_file"]
         high_detail_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
-        self.assertEqual(input_files[0]["file_data"], "data:application/pdf;base64,JVBERi0xLjQK")
+        self.assertEqual(input_files[0]["file_data"], synthetic_pdf())
         self.assertEqual(
             [item["image_url"] for item in high_detail_images],
             [
-                "data:image/jpeg;base64,cGFnZTE=",
-                "data:image/jpeg;base64,cGFnZTI=",
-                "data:image/jpeg;base64,ZmFrZQ==",
+                synthetic_image("JPEG", color="red"),
+                synthetic_image("JPEG", color="blue"),
+                synthetic_image("JPEG"),
             ],
         )
         self.assertIn("Rendered PDF page images follow", json.dumps(content))
@@ -12709,20 +12729,20 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "name": "long-deck.pdf",
                 "type": "application/pdf",
                 "size": 16,
-                "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
+                "data_url": synthetic_pdf(),
             },
             *[
                 {
                     "name": f"ref-{index}.jpg",
                     "type": "image/jpeg",
                     "size": 4,
-                    "data_url": f"data:image/jpeg;base64,aW1hZ2Ut{index}",
+                    "data_url": synthetic_image("JPEG", color="black"),
                 }
                 for index in range(webapp.MAX_REFERENCE_IMAGES - 1)
             ],
         ]
         rendered_pages = [
-            {"name": f"long-deck-page-{index}.jpg", "page": index, "data_url": f"data:image/jpeg;base64,cGFnZS0{index}"}
+            {"name": f"long-deck-page-{index}.jpg", "page": index, "data_url": synthetic_image("JPEG", color="white")}
             for index in range(webapp.MAX_RENDERED_PDF_PAGES + 4)
         ]
 
@@ -12734,12 +12754,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
         high_detail_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
-        rendered_urls = [item["image_url"] for item in high_detail_images if "cGFnZS0" in item["image_url"]]
-        uploaded_urls = [item["image_url"] for item in high_detail_images if "aW1hZ2Ut" in item["image_url"]]
+        rendered_urls = [item["image_url"] for item in high_detail_images if item["image_url"] == synthetic_image("JPEG", color="white")]
+        uploaded_urls = [item["image_url"] for item in high_detail_images if item["image_url"] == synthetic_image("JPEG", color="black")]
         self.assertEqual(len(rendered_urls), webapp.MAX_RENDERED_PDF_PAGES)
         self.assertEqual(len(uploaded_urls), webapp.MAX_REFERENCE_IMAGES - 1)
 
     def test_ai_requests_send_pdf_only_as_input_file_even_when_type_is_stale(self):
+        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({
             "output_text": json.dumps({"quote_basis": {}, "line_items": []})
@@ -12750,7 +12771,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "name": "kent-group.pdf",
                 "type": "image/png",
                 "size": 16,
-                "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
+                "data_url": synthetic_pdf(),
             },
         ]
 
@@ -12762,10 +12783,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(len(input_files), 1)
         self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
-        self.assertEqual(input_files[0]["file_data"], "data:application/pdf;base64,JVBERi0xLjQK")
+        self.assertEqual(input_files[0]["file_data"], synthetic_pdf())
         self.assertEqual(uploaded_images, [])
 
     def test_ai_requests_send_pdf_and_images_with_data_url_mime_precedence(self):
+        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({
             "output_text": json.dumps({"quote_basis": {}, "line_items": []})
@@ -12776,13 +12798,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "name": "kent-group.pdf",
                 "type": "image/png",
                 "size": 16,
-                "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
+                "data_url": synthetic_pdf(),
             },
             {
                 "name": "ref.jpg",
                 "type": "image/jpeg",
                 "size": 4,
-                "data_url": "data:image/jpeg;base64,ZmFrZQ==",
+                "data_url": synthetic_image("JPEG"),
             },
         ]
 
@@ -12794,7 +12816,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(len(input_files), 1)
         self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
-        self.assertEqual([item["image_url"] for item in uploaded_images], ["data:image/jpeg;base64,ZmFrZQ=="])
+        self.assertEqual([item["image_url"] for item in uploaded_images], [synthetic_image("JPEG")])
 
     def test_openai_request_ignores_local_catalog_visuals(self):
         response = mock.MagicMock()
@@ -12837,7 +12859,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             reference_dir = Path(tmp)
             image_path = reference_dir / "pricing-catalog-images" / "chair.png"
             image_path.parent.mkdir(parents=True)
-            image_path.write_bytes(b"fake-chair")
+            image_path.write_bytes(base64.b64decode(synthetic_image().split(",")[1]))
             catalog_path = reference_dir / "pricing-catalog.json"
             catalog_path.write_text(json.dumps({
                 "schema_version": 1,
@@ -12874,7 +12896,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
         self.assertIn("Internal catalog reference images follow", content[-2]["text"])
-        self.assertEqual(content[-1]["image_url"], "data:image/png;base64,ZmFrZS1jaGFpcg==")
+        self.assertEqual(content[-1]["image_url"], synthetic_image())
 
     def test_openai_prompt_uses_compact_profile_context_without_logo_or_presets(self):
         prompt = webapp.build_quote_draft_prompt(valid_payload())
@@ -12903,10 +12925,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         message = str(error.exception)
         self.assertIn("HTTP 400", message)
-        self.assertIn("Unsupported parameter: temperature", message)
+        self.assertNotIn("Unsupported parameter: temperature", message)
         self.assertNotIn("sk-test-redacted", message)
 
-    def test_openai_transient_http_error_is_retried_once(self):
+    def test_openai_transient_http_error_has_one_send_budget(self):
         http_error = webapp.urllib.error.HTTPError(
             url=webapp.OPENAI_RESPONSES_URL,
             code=503,
@@ -12930,11 +12952,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[http_error, response]) as urlopen:
             with mock.patch.object(webapp.time, "sleep") as sleep:
-                result = webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
+                with self.assertRaises(webapp.OpenAIAnalysisError):
+                    webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
 
-        self.assertEqual(urlopen.call_count, 2)
-        sleep.assert_called_once()
-        self.assertEqual(result["quote_basis"]["surfaces"], "Confirm: AI surfaces after retry")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
 
     def test_openai_transient_http_error_message_explains_retry(self):
         http_error = webapp.urllib.error.HTTPError(
@@ -12952,8 +12974,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         message = str(error.exception)
         self.assertIn("HTTP 503", message)
-        self.assertIn("upstream connect error", message)
-        self.assertIn("temporary upstream timeout", message)
+        self.assertNotIn("upstream connect error", message)
+        self.assertEqual(message, "OpenAI analysis failed with HTTP 503.")
 
     def test_openai_socket_timeout_is_not_retried(self):
         with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=TimeoutError("timed out")) as urlopen:
@@ -12977,7 +12999,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         sleep.assert_not_called()
         message = str(error.exception)
         self.assertIn("OpenAI analysis failed due to connection error", message)
-        self.assertIn("Remote end closed connection without response", message)
+        self.assertNotIn("Remote end closed connection without response", message)
         self.assertNotIn("sk-test-redacted", message)
 
     def test_basis_chat_prompt_requires_structured_ai_response(self):
