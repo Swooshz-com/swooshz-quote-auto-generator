@@ -102,12 +102,16 @@ class FakeLivePostgresConnection:
         fail_object_cleanup: bool = False,
         fail_tombstone_commit: bool = False,
         fail_terminal_read: bool = False,
+        fail_artifact_read_after_insert: bool = False,
+        fail_object_insert_commit: bool = False,
         tombstone_rowcount: int | None = None,
     ):
         self.leak_workspace_reads = leak_workspace_reads
         self.fail_object_cleanup = fail_object_cleanup
         self.fail_tombstone_commit = fail_tombstone_commit
         self.fail_terminal_read = fail_terminal_read
+        self.fail_artifact_read_after_insert = fail_artifact_read_after_insert
+        self.fail_object_insert_commit = fail_object_insert_commit
         self.tombstone_rowcount = tombstone_rowcount
         self.queries = []
         self.commits = 0
@@ -119,6 +123,9 @@ class FakeLivePostgresConnection:
         self._tombstone_pending = False
         self._tombstone_committed = False
         self._tombstone_before = None
+        self._artifact_inserted = False
+        self._artifact_read_failed = False
+        self._object_insert_pending = False
 
     def _rows_for_workspace(self, collection, workspace_id):
         return [
@@ -129,6 +136,13 @@ class FakeLivePostgresConnection:
 
     def _select_object_rows(self, normalized, params):
         if "where workspace_id = ? and artifact_id = ?" in normalized:
+            if (
+                self.fail_artifact_read_after_insert
+                and self._artifact_inserted
+                and not self._artifact_read_failed
+            ):
+                self._artifact_read_failed = True
+                raise RuntimeError("private post-insert read canary")
             if self.fail_terminal_read and self._tombstone_committed:
                 raise RuntimeError("private post-commit read canary")
             workspace_id, artifact_id = params[:2]
@@ -138,6 +152,13 @@ class FakeLivePostgresConnection:
                 if row["workspace_id"] == workspace_id and row["artifact_id"] == artifact_id
             ]
             return rows
+        if "where artifact_id = ?" in normalized and "workspace_id = ?" not in normalized:
+            artifact_id = params[0]
+            return [
+                row
+                for row in self.object_artifacts.values()
+                if row["artifact_id"] == artifact_id
+            ]
         if (
             "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?"
             in normalized
@@ -307,6 +328,8 @@ class FakeLivePostgresConnection:
                 raise RuntimeError("synthetic object collision")
             self.object_artifacts[key] = row
             self.object_artifact_insert_snapshots.append(dict(row))
+            self._artifact_inserted = True
+            self._object_insert_pending = True
             return FakeLivePostgresCursor(rowcount=1)
         if normalized.startswith("select ") and "from sqag_object_artifacts" in normalized:
             return FakeLivePostgresCursor(self._select_object_rows(normalized, params))
@@ -366,6 +389,10 @@ class FakeLivePostgresConnection:
     def commit(self):
         if self._tombstone_pending and self.fail_tombstone_commit:
             raise RuntimeError("private tombstone commit canary")
+        if self._object_insert_pending:
+            self._object_insert_pending = False
+            if self.fail_object_insert_commit:
+                raise RuntimeError("private object insert commit canary")
         self.commits += 1
         if self._tombstone_pending:
             self._tombstone_pending = False
@@ -593,6 +620,36 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
             next(iter(read_connection.object_artifacts.values()))["status"],
             "deleted",
         )
+
+    def test_uncertain_object_insert_is_reconciled_by_strict_cleanup(self):
+        cases = (
+            {"fail_artifact_read_after_insert": True},
+            {"fail_object_insert_commit": True},
+        )
+        for failure in cases:
+            with self.subTest(failure=failure):
+                connection = FakeLivePostgresConnection(**failure)
+                report = run_live_database_report(connection)
+                operations = report["live_metadata_operations"]
+
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(operations["cleanup_state"], "passed")
+                self.assertNotIn("postgres_cleanup_failed", report["blockers"])
+                self.assertEqual(operations["object_artifact_tombstone_count"], 1)
+                self.assertFalse(
+                    any(
+                        row["status"] == "active"
+                        and row["retention_status"] == "active"
+                        and row["deleted_at"] is None
+                        for row in connection.object_artifacts.values()
+                    )
+                )
+
+    def test_missing_uncertain_object_insert_is_verified_as_absent(self):
+        connection = FakeLivePostgresConnection()
+        ids = verifier._synthetic_ids()
+        expected = verifier._synthetic_object_artifact_spec(ids, "a")
+        self.assertEqual(self._tombstone_row(connection, expected), ("passed", 0))
 
     def test_constructor_failure_is_sanitized_and_unobserved(self):
         connection = FakeLivePostgresConnection()

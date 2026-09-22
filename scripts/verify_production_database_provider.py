@@ -750,6 +750,14 @@ def _tombstone_synthetic_object_artifact(
                 ),
                 owner_params,
             ).fetchall()
+            if not rows:
+                artifact_rows = connection.execute(
+                    _object_artifact_select_sql("where artifact_id = ?"),
+                    (expected["artifact_id"],),
+                ).fetchall()
+                if not artifact_rows:
+                    return "passed", 0
+                return "failed", 0
             if len(rows) != 1:
                 return "failed", 0
             current = rows[0]
@@ -891,9 +899,12 @@ def live_metadata_operations_status(database_url: str) -> dict[str, object]:
             )
         for side in ("a", "b"):
             expected = _synthetic_object_artifact_spec(ids, side)
+            # The insert commits before its read-back. Track the candidate before
+            # attempting that read so an uncertain insert can be reconciled by
+            # strict fingerprint during cleanup.
+            created_artifact_specs.append((side, expected))
             if not _insert_synthetic_object_artifact(storages[side], expected):
                 raise RuntimeError("Synthetic object metadata ownership collision.")
-            created_artifact_specs.append((side, expected))
             operations["insert_count"] = int(operations["insert_count"]) + 1
         initialized = True
     except Exception:
