@@ -265,15 +265,23 @@ class DraftRequestContractTest(unittest.TestCase):
                             )
 
     def test_normalized_unsupported_reasoning_values_are_not_exposed(self):
-        for raw in (" BoGuS ", "max", "ultra", "PRIVATE_CANARY_R704"):
-            with self.subTest(value=raw):
-                values = {
-                    server.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-5.5",
-                    server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: raw,
-                }
-                forbidden = (raw, raw.strip(), raw.strip().lower())
-                with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(values)):
-                    self.assert_rejected(self.payload(), forbidden_values=forbidden)
+        branches = (
+            ("standard", server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME, None),
+            ("high_quality", server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME, "high_quality"),
+        )
+        for branch_name, selected_name, analysis_mode in branches:
+            for raw in (" BoGuS ", "max", "ultra", "PRIVATE_CANARY_R704"):
+                with self.subTest(branch=branch_name, value=raw):
+                    values = {
+                        server.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-5.5",
+                        selected_name: raw,
+                    }
+                    payload = self.payload()
+                    if analysis_mode is not None:
+                        payload["analysis_mode"] = analysis_mode
+                    forbidden = (raw, raw.strip(), raw.strip().lower())
+                    with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(values)):
+                        self.assert_rejected(payload, forbidden_values=forbidden)
 
     def test_high_quality_aliases_use_only_the_high_quality_variable(self):
         for alias in ("high_quality", "xhigh", "high_accuracy"):
@@ -293,30 +301,34 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.assertEqual(body["reasoning"], {"effort": "none"})
 
     def test_reader_precedence_and_dotenv_values_are_isolated(self):
-        env_name = server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME
-        dotenv_path = mock.Mock()
-        dotenv_path.exists.return_value = True
-        with mock.patch.dict(server.os.environ, {}, clear=True):
-            dotenv_path.read_text.return_value = "OTHER_KEY=low\n"
-            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "")
+        for env_name in (
+            server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME,
+            server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME,
+        ):
+            with self.subTest(env_name=env_name):
+                dotenv_path = mock.Mock()
+                dotenv_path.exists.return_value = True
+                with mock.patch.dict(server.os.environ, {}, clear=True):
+                    dotenv_path.read_text.return_value = "OTHER_KEY=low\n"
+                    self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "")
 
-            server.os.environ[env_name] = ""
-            dotenv_path.read_text.return_value = f"{env_name}=low\n"
-            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "low")
+                    server.os.environ[env_name] = ""
+                    dotenv_path.read_text.return_value = f"{env_name}=low\n"
+                    self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "low")
 
-            server.os.environ[env_name] = " \t\r\n "
-            dotenv_path.read_text.reset_mock()
-            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), " \t\r\n ")
-            dotenv_path.read_text.assert_not_called()
+                    server.os.environ[env_name] = " \t\r\n "
+                    dotenv_path.read_text.reset_mock()
+                    self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), " \t\r\n ")
+                    dotenv_path.read_text.assert_not_called()
 
-            server.os.environ.pop(env_name)
-            dotenv_path.read_text.return_value = f"{env_name}=bogus\n"
-            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "bogus")
+                    server.os.environ.pop(env_name)
+                    dotenv_path.read_text.return_value = f"{env_name}=bogus\n"
+                    self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "bogus")
 
-            server.os.environ[env_name] = " HIGH "
-            dotenv_path.read_text.reset_mock()
-            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), " HIGH ")
-            dotenv_path.read_text.assert_not_called()
+                    server.os.environ[env_name] = " HIGH "
+                    dotenv_path.read_text.reset_mock()
+                    self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), " HIGH ")
+                    dotenv_path.read_text.assert_not_called()
 
     def test_final_envelope_validation_remains_the_request_boundary(self):
         branches = (
