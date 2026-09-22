@@ -95,15 +95,88 @@ class FakeLivePostgresCursor:
 
 
 class FakeLivePostgresConnection:
-    def __init__(self, *, leak_workspace_reads: bool = False, fail_object_cleanup: bool = False):
+    def __init__(
+        self,
+        *,
+        leak_workspace_reads: bool = False,
+        fail_object_cleanup: bool = False,
+        fail_tombstone_commit: bool = False,
+        fail_terminal_read: bool = False,
+        tombstone_rowcount: int | None = None,
+    ):
         self.leak_workspace_reads = leak_workspace_reads
         self.fail_object_cleanup = fail_object_cleanup
+        self.fail_tombstone_commit = fail_tombstone_commit
+        self.fail_terminal_read = fail_terminal_read
+        self.tombstone_rowcount = tombstone_rowcount
         self.queries = []
         self.commits = 0
         self.profiles = {}
         self.pricing_references = {}
         self.quote_sessions = {}
         self.object_artifacts = {}
+        self.object_artifact_insert_snapshots = []
+        self._tombstone_pending = False
+        self._tombstone_committed = False
+        self._tombstone_before = None
+
+    def _rows_for_workspace(self, collection, workspace_id):
+        return [
+            value
+            for (stored_workspace, _), value in sorted(collection.items())
+            if self.leak_workspace_reads or stored_workspace == workspace_id
+        ]
+
+    def _select_object_rows(self, normalized, params):
+        if "where workspace_id = ? and artifact_id = ?" in normalized:
+            if self.fail_terminal_read and self._tombstone_committed:
+                raise RuntimeError("private post-commit read canary")
+            workspace_id, artifact_id = params[:2]
+            rows = [
+                row
+                for row in self.object_artifacts.values()
+                if row["workspace_id"] == workspace_id and row["artifact_id"] == artifact_id
+            ]
+            return rows
+        if (
+            "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?"
+            in normalized
+        ):
+            workspace_id, owner_type, owner_id, artifact_kind = params[:4]
+            rows = [
+                row
+                for row in self.object_artifacts.values()
+                if row["workspace_id"] == workspace_id
+                and row["owner_type"] == owner_type
+                and row["owner_id"] == owner_id
+                and row["artifact_kind"] == artifact_kind
+            ]
+            if "status = ?" in normalized:
+                status, retention_status = params[4:6]
+                rows = [
+                    row
+                    for row in rows
+                    if row["status"] == status
+                    and row["retention_status"] == retention_status
+                    and row["deleted_at"] is None
+                ]
+            return rows
+        workspace_id = params[0]
+        rows = [
+            row
+            for row in self.object_artifacts.values()
+            if self.leak_workspace_reads or row["workspace_id"] == workspace_id
+        ]
+        if "status = ?" in normalized:
+            status, retention_status = params[1:3]
+            rows = [
+                row
+                for row in rows
+                if row["status"] == status
+                and row["retention_status"] == retention_status
+                and row["deleted_at"] is None
+            ]
+        return rows
 
     def execute(self, sql, params=None):
         params = tuple(params or ())
@@ -115,41 +188,81 @@ class FakeLivePostgresConnection:
             column_map = runtime_required_metadata_tables()
             rows = []
             for table in sorted(set(params)):
-                rows.extend({"table_name": table, "column_name": column} for column in sorted(column_map.get(table, set())))
+                rows.extend(
+                    {"table_name": table, "column_name": column}
+                    for column in sorted(column_map.get(table, set()))
+                )
             return FakeLivePostgresCursor(rows)
         if normalized.startswith("insert into sqag_profiles"):
             workspace_id, profile_id, payload_json, created_at, updated_at = params
-            self.profiles[(workspace_id, profile_id)] = {"payload_json": payload_json, "created_at": created_at, "updated_at": updated_at}
+            key = (workspace_id, profile_id)
+            if key in self.profiles:
+                raise RuntimeError("synthetic profile collision")
+            self.profiles[key] = {
+                "payload_json": payload_json,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
             return FakeLivePostgresCursor(rowcount=1)
         if normalized.startswith("select payload_json from sqag_profiles"):
             workspace_id = params[0]
-            if "profile_id" in normalized and len(params) > 1:
+            if "profile_id = ?" in normalized:
                 row = self.profiles.get((workspace_id, params[1]))
                 return FakeLivePostgresCursor([row] if row else [])
-            rows = [value for (stored_workspace, _), value in sorted(self.profiles.items()) if self.leak_workspace_reads or stored_workspace == workspace_id]
-            return FakeLivePostgresCursor(rows)
+            return FakeLivePostgresCursor(self._rows_for_workspace(self.profiles, workspace_id))
+        if normalized.startswith("select 1 from sqag_profiles"):
+            row = self.profiles.get((params[0], params[1]))
+            return FakeLivePostgresCursor([{"present": 1}] if row else [])
+        if normalized.startswith("update sqag_profiles"):
+            payload_json, updated_at, workspace_id, profile_id = params
+            row = self.profiles.get((workspace_id, profile_id))
+            if not row:
+                return FakeLivePostgresCursor(rowcount=0)
+            row.update({"payload_json": payload_json, "updated_at": updated_at})
+            return FakeLivePostgresCursor(rowcount=1)
         if normalized.startswith("delete from sqag_profiles"):
             workspace_id, profile_id = params[:2]
             existed = self.profiles.pop((workspace_id, profile_id), None) is not None
             return FakeLivePostgresCursor(rowcount=1 if existed else 0)
         if normalized.startswith("insert into sqag_pricing_references"):
             workspace_id, reference_id, payload_json, created_at, updated_at = params
-            self.pricing_references[(workspace_id, reference_id)] = {"payload_json": payload_json, "created_at": created_at, "updated_at": updated_at}
+            key = (workspace_id, reference_id)
+            if key in self.pricing_references:
+                raise RuntimeError("synthetic pricing collision")
+            self.pricing_references[key] = {
+                "payload_json": payload_json,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
             return FakeLivePostgresCursor(rowcount=1)
         if normalized.startswith("select payload_json from sqag_pricing_references"):
             workspace_id = params[0]
-            if "reference_id" in normalized and len(params) > 1:
+            if "reference_id = ?" in normalized:
                 row = self.pricing_references.get((workspace_id, params[1]))
                 return FakeLivePostgresCursor([row] if row else [])
-            rows = [value for (stored_workspace, _), value in sorted(self.pricing_references.items()) if self.leak_workspace_reads or stored_workspace == workspace_id]
-            return FakeLivePostgresCursor(rows)
+            return FakeLivePostgresCursor(
+                self._rows_for_workspace(self.pricing_references, workspace_id)
+            )
+        if normalized.startswith("select 1 from sqag_pricing_references"):
+            row = self.pricing_references.get((params[0], params[1]))
+            return FakeLivePostgresCursor([{"present": 1}] if row else [])
+        if normalized.startswith("update sqag_pricing_references"):
+            payload_json, updated_at, workspace_id, reference_id = params
+            row = self.pricing_references.get((workspace_id, reference_id))
+            if not row:
+                return FakeLivePostgresCursor(rowcount=0)
+            row.update({"payload_json": payload_json, "updated_at": updated_at})
+            return FakeLivePostgresCursor(rowcount=1)
         if normalized.startswith("delete from sqag_pricing_references"):
             workspace_id, reference_id = params[:2]
             existed = self.pricing_references.pop((workspace_id, reference_id), None) is not None
             return FakeLivePostgresCursor(rowcount=1 if existed else 0)
         if normalized.startswith("insert into sqag_quote_sessions"):
             workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at = params
-            self.quote_sessions[(workspace_id, session_id)] = {
+            key = (workspace_id, session_id)
+            if key in self.quote_sessions:
+                raise RuntimeError("synthetic session collision")
+            self.quote_sessions[key] = {
                 "metadata_json": metadata_json,
                 "draft_files_json": draft_files_json,
                 "created_at": created_at,
@@ -160,58 +273,114 @@ class FakeLivePostgresConnection:
             workspace_id, session_id = params[:2]
             row = self.quote_sessions.get((workspace_id, session_id))
             return FakeLivePostgresCursor([row] if row else [])
+        if normalized.startswith("select metadata_json from sqag_quote_sessions"):
+            workspace_id = params[0]
+            if "session_id = ?" in normalized:
+                row = self.quote_sessions.get((workspace_id, params[1]))
+                return FakeLivePostgresCursor([row] if row else [])
+            return FakeLivePostgresCursor(
+                self._rows_for_workspace(self.quote_sessions, workspace_id)
+            )
+        if normalized.startswith("select 1 from sqag_quote_sessions"):
+            row = self.quote_sessions.get((params[0], params[1]))
+            return FakeLivePostgresCursor([{"present": 1}] if row else [])
         if normalized.startswith("select session_id from sqag_quote_sessions"):
             workspace_id, session_id = params[:2]
             row = self.quote_sessions.get((workspace_id, session_id))
-            return FakeLivePostgresCursor(
-                [{"session_id": session_id}] if row else []
-            )
-        if normalized.startswith("select metadata_json from sqag_quote_sessions"):
-            workspace_id = params[0]
-            rows = [value for (stored_workspace, _), value in sorted(self.quote_sessions.items()) if self.leak_workspace_reads or stored_workspace == workspace_id]
-            return FakeLivePostgresCursor(rows)
+            return FakeLivePostgresCursor([{"session_id": session_id}] if row else [])
+        if normalized.startswith("update sqag_quote_sessions"):
+            metadata_json, updated_at, workspace_id, session_id = params
+            row = self.quote_sessions.get((workspace_id, session_id))
+            if not row:
+                return FakeLivePostgresCursor(rowcount=0)
+            row.update({"metadata_json": metadata_json, "updated_at": updated_at})
+            return FakeLivePostgresCursor(rowcount=1)
         if normalized.startswith("delete from sqag_quote_sessions"):
             workspace_id, session_id = params[:2]
             existed = self.quote_sessions.pop((workspace_id, session_id), None) is not None
             return FakeLivePostgresCursor(rowcount=1 if existed else 0)
         if normalized.startswith("insert into sqag_object_artifacts"):
-            fields = (
-                "artifact_id", "workspace_id", "owner_type", "owner_id", "platform_user_id", "session_id", "job_id",
-                "artifact_kind", "filename", "content_type", "size_bytes", "checksum_sha256", "object_provider_type",
-                "object_key_ref", "status", "retention_status", "created_at", "updated_at", "deleted_at",
-            )
+            fields = tuple(verifier.OBJECT_ARTIFACT_COLUMNS)
             row = dict(zip(fields, params))
-            self.object_artifacts[(row["workspace_id"], row["owner_type"], row["owner_id"], row["artifact_kind"])] = row
+            key = (row["workspace_id"], row["owner_type"], row["owner_id"], row["artifact_kind"])
+            if key in self.object_artifacts:
+                raise RuntimeError("synthetic object collision")
+            self.object_artifacts[key] = row
+            self.object_artifact_insert_snapshots.append(dict(row))
             return FakeLivePostgresCursor(rowcount=1)
-        if normalized.startswith("select artifact_id") and "from sqag_object_artifacts" in normalized:
-            workspace_id = params[0]
-            rows = []
-            if len(params) >= 6:
-                _workspace_id, owner_type, owner_id, artifact_kind, status, retention_status = params[:6]
-                row = self.object_artifacts.get((workspace_id, owner_type, owner_id, artifact_kind))
-                if row and row.get("status") == status and row.get("retention_status") == retention_status and row.get("deleted_at") is None:
-                    rows.append(row)
-            else:
-                for (stored_workspace, _owner_type, _owner_id, _kind), row in sorted(self.object_artifacts.items()):
-                    if self.leak_workspace_reads or stored_workspace == workspace_id:
-                        rows.append(row)
-            return FakeLivePostgresCursor(rows)
-        if normalized.startswith("delete from sqag_object_artifacts"):
+        if normalized.startswith("select ") and "from sqag_object_artifacts" in normalized:
+            return FakeLivePostgresCursor(self._select_object_rows(normalized, params))
+        if normalized.startswith("update sqag_object_artifacts"):
             if self.fail_object_cleanup:
                 raise RuntimeError("synthetic cleanup failed")
-            workspace_ids = set(params)
-            before = len(self.object_artifacts)
-            self.object_artifacts = {
-                key: row for key, row in self.object_artifacts.items() if row.get("workspace_id") not in workspace_ids
+            artifact_id = params[5]
+            workspace_id = params[4]
+            row = next(
+                (
+                    value
+                    for value in self.object_artifacts.values()
+                    if value["workspace_id"] == workspace_id
+                    and value["artifact_id"] == artifact_id
+                ),
+                None,
+            )
+            if not row:
+                return FakeLivePostgresCursor(rowcount=0)
+            expected_values = {
+                "owner_type": params[8],
+                "owner_id": params[9],
+                "artifact_kind": params[10],
+                "filename": params[11],
+                "content_type": params[12],
+                "object_provider_type": params[13],
+                "platform_user_id": params[14],
+                "session_id": params[15],
+                "job_id": params[16],
+                "object_key_ref": params[17],
+                "checksum_sha256": params[18],
+                "size_bytes": params[19],
+                "created_at": params[20],
+                "updated_at": params[21],
             }
-            return FakeLivePostgresCursor(rowcount=before - len(self.object_artifacts))
-        return FakeLivePostgresCursor()
+            if any(row[field] != value for field, value in expected_values.items()):
+                return FakeLivePostgresCursor(rowcount=0)
+            if row["status"] != "active" or row["retention_status"] != "active" or row["deleted_at"] is not None:
+                return FakeLivePostgresCursor(rowcount=0)
+            if self.tombstone_rowcount is not None:
+                return FakeLivePostgresCursor(rowcount=self.tombstone_rowcount)
+            self._tombstone_before = dict(row)
+            row.update(
+                {
+                    "status": params[0],
+                    "retention_status": params[1],
+                    "updated_at": params[2],
+                    "deleted_at": params[3],
+                }
+            )
+            self._tombstone_pending = True
+            return FakeLivePostgresCursor(rowcount=1)
+        if normalized.startswith("delete from sqag_object_artifacts"):
+            raise AssertionError("forbidden object-artifact DELETE")
+        raise AssertionError(f"unknown SQL operation: {normalized}")
 
     def commit(self):
+        if self._tombstone_pending and self.fail_tombstone_commit:
+            raise RuntimeError("private tombstone commit canary")
         self.commits += 1
+        if self._tombstone_pending:
+            self._tombstone_pending = False
+            self._tombstone_committed = True
+            self._tombstone_before = None
 
     def rollback(self):
-        return None
+        if self._tombstone_pending and self._tombstone_before is not None:
+            artifact_id = self._tombstone_before["artifact_id"]
+            for key, row in self.object_artifacts.items():
+                if row["artifact_id"] == artifact_id:
+                    self.object_artifacts[key] = dict(self._tombstone_before)
+                    break
+        self._tombstone_pending = False
+        self._tombstone_before = None
 
 
 class FakeLivePostgresContext:
@@ -261,6 +430,185 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
                 "db_blob_artifact_rows_written": 0,
             },
         )
+
+    def _database_storage(self, connection, workspace_id):
+        return verifier.webapp.DatabaseSqagStorage(
+            POSTGRES_URL,
+            workspace_id,
+            role="admin",
+            user_id=workspace_id + "-user",
+            expected_session_role=verifier.webapp.SQAG_RUNTIME_DATABASE_ROLE,
+        )
+
+    def _seed_object_row(self, connection, row):
+        key = (
+            row["workspace_id"],
+            row["owner_type"],
+            row["owner_id"],
+            row["artifact_kind"],
+        )
+        connection.object_artifacts[key] = dict(row)
+
+    def _tombstone_row(self, connection, expected):
+        storage = self._database_storage(connection, expected["workspace_id"])
+        patcher = mock.patch.object(
+            verifier.webapp,
+            "postgres_storage_connection",
+            return_value=FakeLivePostgresContext(connection),
+        )
+        patcher.start()
+        try:
+            return verifier._tombstone_synthetic_object_artifact(storage, expected)
+        finally:
+            patcher.stop()
+
+    def test_runtime_acl_and_fake_sql_reject_object_artifact_delete(self):
+        contract = json.loads(
+            (ROOT / "docs" / "runtime-privilege-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        privileges = set(
+            contract["runtime_tables"]["sqag_object_artifacts"]["privileges"]
+        )
+        self.assertEqual(privileges, {"SELECT", "INSERT", "UPDATE"})
+        connection = FakeLivePostgresConnection()
+        with self.assertRaises(AssertionError):
+            connection.execute("delete from sqag_object_artifacts where workspace_id = ?", ("w",))
+        with self.assertRaises(AssertionError):
+            connection.execute("vacuum sqag_object_artifacts")
+
+    def test_test_injected_results_cannot_masquerade_as_live_evidence(self):
+        report = verifier.run_verification(
+            env={
+                "SQAG_DATABASE_URL": POSTGRES_URL,
+                "SQAG_LIVE_DATABASE_EVIDENCE": "1",
+            },
+            driver_available=True,
+            schema_validator=lambda _database_url: {"schema_available": True},
+            live_operations_validator=lambda _database_url: {
+                "workspace_isolation": True,
+                "crud_verified": True,
+                "object_artifact_metadata_pairing": True,
+                "cleanup_completed": True,
+                "test_injected_backend": True,
+            },
+        )
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["test_injected_backend"])
+        self.assertIn("test_injected_backend_not_live_evidence", report["blockers"])
+        self.assertFalse(report["live_database_evidence_supported"])
+
+    def test_unobserved_and_error_states_use_not_verified_blockers(self):
+        report = verifier.run_verification(
+            env={
+                "SQAG_DATABASE_URL": POSTGRES_URL,
+                "SQAG_LIVE_DATABASE_EVIDENCE": "1",
+            },
+            driver_available=True,
+            schema_validator=lambda _database_url: {"schema_available": True},
+            live_operations_validator=lambda _database_url: {
+                "observation_states": {
+                    "workspace_isolation": "not_observed",
+                    "metadata_crud": "error",
+                    "object_artifact_metadata_pairing": "passed",
+                    "cleanup": "error",
+                },
+                "operational_exception": True,
+            },
+        )
+        self.assertIn("postgres_workspace_isolation_not_verified", report["blockers"])
+        self.assertIn("postgres_metadata_crud_not_verified", report["blockers"])
+        self.assertNotIn("postgres_object_artifact_metadata_not_verified", report["blockers"])
+        self.assertIn("postgres_cleanup_failed", report["blockers"])
+        self.assertIn("postgres_live_metadata_operations_failed", report["blockers"])
+
+    def test_tombstone_transition_is_terminal_snapshot_guarded_and_idempotent(self):
+        connection = FakeLivePostgresConnection()
+        ids = verifier._synthetic_ids()
+        expected = verifier._synthetic_object_artifact_spec(ids, "a")
+        self._seed_object_row(connection, expected)
+
+        self.assertEqual(self._tombstone_row(connection, expected), ("passed", 1))
+        row = next(iter(connection.object_artifacts.values()))
+        self.assertEqual(row["status"], "deleted")
+        self.assertEqual(row["retention_status"], "deleted")
+        self.assertTrue(row["deleted_at"])
+        self.assertEqual(row["updated_at"], row["deleted_at"])
+        for field in verifier.OBJECT_ARTIFACT_IMMUTABLE_COLUMNS:
+            self.assertEqual(row[field], expected[field])
+
+        self.assertEqual(self._tombstone_row(connection, expected), ("passed", 0))
+        self.assertEqual(connection.commits, 1)
+
+    def test_tombstone_rejects_collisions_malformed_state_and_snapshot_mismatch(self):
+        ids = verifier._synthetic_ids()
+        expected = verifier._synthetic_object_artifact_spec(ids, "a")
+        mutations = (
+            ("wrong token prefix", {"artifact_id": f"{ids['prefix']}-other-run-artifact"}),
+            ("wrong side", {"owner_id": ids["session_b"]}),
+            ("misleading prefix", {"artifact_id": "sqagldb-misleading-artifact"}),
+            ("immutable change", {"checksum_sha256": "b" * 64}),
+            ("snapshot mismatch", {"updated_at": "2026-01-02T00:00:00Z"}),
+            ("malformed lifecycle", {"retention_status": "pending_delete"}),
+        )
+        for name, changes in mutations:
+            with self.subTest(name=name):
+                connection = FakeLivePostgresConnection()
+                row = dict(expected)
+                row.update(changes)
+                self._seed_object_row(connection, row)
+                state, count = self._tombstone_row(connection, expected)
+                self.assertEqual(state, "failed")
+                self.assertEqual(count, 0)
+                self.assertEqual(next(iter(connection.object_artifacts.values()))["status"], row["status"])
+
+    def test_tombstone_rowcount_commit_and_post_commit_read_fail_closed(self):
+        ids = verifier._synthetic_ids()
+        expected = verifier._synthetic_object_artifact_spec(ids, "a")
+
+        wrong_count_connection = FakeLivePostgresConnection(tombstone_rowcount=2)
+        self._seed_object_row(wrong_count_connection, expected)
+        self.assertEqual(
+            self._tombstone_row(wrong_count_connection, expected),
+            ("error", 0),
+        )
+        self.assertEqual(
+            next(iter(wrong_count_connection.object_artifacts.values()))["status"],
+            "active",
+        )
+
+        commit_connection = FakeLivePostgresConnection(fail_tombstone_commit=True)
+        self._seed_object_row(commit_connection, expected)
+        self.assertEqual(self._tombstone_row(commit_connection, expected), ("error", 0))
+        self.assertEqual(
+            next(iter(commit_connection.object_artifacts.values()))["status"],
+            "active",
+        )
+
+        read_connection = FakeLivePostgresConnection(fail_terminal_read=True)
+        self._seed_object_row(read_connection, expected)
+        self.assertEqual(self._tombstone_row(read_connection, expected), ("error", 0))
+        self.assertEqual(
+            next(iter(read_connection.object_artifacts.values()))["status"],
+            "deleted",
+        )
+
+    def test_constructor_failure_is_sanitized_and_unobserved(self):
+        connection = FakeLivePostgresConnection()
+        with mock.patch.object(
+            verifier.webapp.DatabaseSqagStorage,
+            "__init__",
+            side_effect=RuntimeError("private constructor canary"),
+        ):
+            report = run_live_database_report(connection)
+        text = json.dumps(report, sort_keys=True)
+        self.assertIn("postgres_live_metadata_operations_failed", report["blockers"])
+        self.assertIn("postgres_workspace_isolation_not_verified", report["blockers"])
+        self.assertIn("postgres_metadata_crud_not_verified", report["blockers"])
+        self.assertIn("postgres_object_artifact_metadata_not_verified", report["blockers"])
+        self.assertIn("postgres_cleanup_failed", report["blockers"])
+        self.assertNotIn("private constructor canary", text)
 
     def test_missing_database_url_fails_closed(self):
         report = verifier.run_verification(env={}, driver_available=False)
@@ -472,11 +820,39 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         self.assertTrue(report["live_metadata_operations"]["crud_verified"])
         self.assertTrue(report["live_metadata_operations"]["object_artifact_metadata_pairing"])
         self.assertTrue(report["live_metadata_operations"]["cleanup_completed"])
+        self.assertEqual(report["live_metadata_operations"]["observation_states"], {
+            "workspace_isolation": "passed",
+            "metadata_crud": "passed",
+            "object_artifact_metadata_pairing": "passed",
+            "cleanup": "passed",
+        })
+        self.assertEqual(report["live_metadata_operations"]["delete_count"], 6)
+        self.assertEqual(report["live_metadata_operations"]["ordinary_delete_count"], 6)
+        self.assertEqual(report["live_metadata_operations"]["object_artifact_tombstone_count"], 2)
         self.assertEqual(report["live_metadata_operations"]["db_blob_artifact_rows_written"], 0)
         self.assertFalse(connection.profiles)
         self.assertFalse(connection.pricing_references)
         self.assertFalse(connection.quote_sessions)
-        self.assertFalse(connection.object_artifacts)
+        self.assertEqual(len(connection.object_artifacts), 2)
+        original_rows = {
+            row["artifact_id"]: row
+            for row in connection.object_artifact_insert_snapshots
+        }
+        for row in connection.object_artifacts.values():
+            self.assertEqual(row["status"], "deleted")
+            self.assertEqual(row["retention_status"], "deleted")
+            self.assertTrue(row["deleted_at"])
+            self.assertEqual(row["updated_at"], row["deleted_at"])
+            self.assertEqual(
+                {
+                    field: row[field]
+                    for field in verifier.OBJECT_ARTIFACT_IMMUTABLE_COLUMNS
+                },
+                {
+                    field: original_rows[row["artifact_id"]][field]
+                    for field in verifier.OBJECT_ARTIFACT_IMMUTABLE_COLUMNS
+                },
+            )
         self.assertNotIn(POSTGRES_URL, text)
         self.assertNotIn("redacted-object-key-ref", text)
         self.assertNotIn("content_blob", "\n".join(query.lower() for query, _params in connection.queries))
@@ -517,8 +893,19 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         self.assertFalse(report["live_database_evidence_supported"])
         self.assertFalse(report["production_database_evidence_supported"])
         self.assertFalse(report["live_metadata_operations"]["cleanup_completed"])
+        self.assertEqual(
+            report["live_metadata_operations"]["observation_states"],
+            {
+                "workspace_isolation": "passed",
+                "metadata_crud": "passed",
+                "object_artifact_metadata_pairing": "passed",
+                "cleanup": "error",
+            },
+        )
+        self.assertIn("postgres_live_metadata_operations_failed", report["blockers"])
         self.assertNotIn(POSTGRES_URL, text)
         self.assertNotIn("synthetic cleanup failed", text)
+
     def test_live_opt_in_connection_failure_is_sanitized(self):
         def fail_schema(_database_url):
             raise RuntimeError("private connection details must not leak")
