@@ -18342,13 +18342,9 @@ def configured_openai_draft_model(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> s
 def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
     if mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
         raw = clean_text(read_dotenv_value(OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME)).lower()
-        if raw in OPENAI_REASONING_EFFORTS:
-            return raw
-        return OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
+        return raw or OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
     raw = clean_text(read_dotenv_value(OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME)).lower()
-    if raw in OPENAI_REASONING_EFFORTS:
-        return raw
-    return OPENAI_DRAFT_REASONING_EFFORT
+    return raw or OPENAI_DRAFT_REASONING_EFFORT
 
 
 def supported_openai_draft_reasoning_efforts(model: str) -> set[str] | frozenset[str]:

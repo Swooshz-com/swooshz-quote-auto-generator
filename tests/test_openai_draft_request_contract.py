@@ -14,6 +14,8 @@ import pypdfium2 as pdfium
 
 from webapp import server
 
+MISSING = object()
+
 
 @functools.lru_cache(maxsize=32)
 def synthetic_image(format="PNG", size=(2, 2), color="white"):
@@ -38,6 +40,7 @@ def synthetic_pdf(pages=1):
 
 class DraftRequestContractTest(unittest.TestCase):
     def setUp(self):
+        self.real_read_dotenv_value = server.read_dotenv_value
         self.enterContext(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Outbound network denied")))
         self.enterContext(mock.patch.object(socket, "create_connection", side_effect=AssertionError("Outbound network denied")))
         self.enterContext(mock.patch.object(server, "read_dotenv_value", return_value=""))
@@ -62,12 +65,34 @@ class DraftRequestContractTest(unittest.TestCase):
         self.assertEqual(request.method, "POST")
         return json.loads(request.data)
 
-    def assert_rejected(self, payload):
+    def assert_rejected(self, payload, forbidden_values=()):
         self.send.reset_mock()
+        self.send.side_effect = None
         with self.assertRaises(server.OpenAIAnalysisError) as error:
             server.request_openai_quote_basis(payload, "synthetic-key")
+        self.assertEqual(error.exception.diagnostics["failure_boundary"], "request_validation")
         self.assertEqual(error.exception.diagnostics["attempt_number"], 0)
+        diagnostic_text = str(error.exception) + json.dumps(error.exception.diagnostics, sort_keys=True)
+        for value in forbidden_values:
+            self.assertNotIn(value, diagnostic_text)
         self.send.assert_not_called()
+
+    @staticmethod
+    def dotenv_reader(values):
+        return lambda name: values.get(name, "")
+
+    def envelope(self, model="gpt-5.5", effort="high"):
+        return {
+            "model": model,
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Synthetic prompt"},
+                    {"type": "input_image", "image_url": self.image, "detail": "high"},
+                ],
+            }],
+            "reasoning": {"effort": effort},
+        }
 
     def test_valid_exact_envelopes_and_media_order(self):
         for urls in [(self.image,), (self.pdf,), (self.image, self.pdf), (self.pdf, self.image)]:
@@ -173,6 +198,198 @@ class DraftRequestContractTest(unittest.TestCase):
                     body = self.capture()
                 self.assertEqual(body["model"], "gpt-5.5")
                 self.assertEqual(body["reasoning"], {"effort": effort})
+
+    def test_reasoning_configuration_matrix_is_explicit_and_fail_closed(self):
+        matrix = (
+            ("absent", MISSING, MISSING),
+            ("empty", "", MISSING),
+            ("whitespace", " \t\r\n ", MISSING),
+            ("none", "none", "none"),
+            ("low", "low", "low"),
+            ("high", "high", "high"),
+            ("normalized high", " HIGH ", "high"),
+            ("xhigh", "xhigh", "xhigh"),
+            ("minimal", "minimal", None),
+            ("medium", "medium", None),
+            ("bogus", "bogus", None),
+        )
+        branches = (
+            (
+                "standard",
+                server.DRAFT_ANALYSIS_MODE_STANDARD,
+                server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_REASONING_EFFORT,
+            ),
+            (
+                "high_quality",
+                server.DRAFT_ANALYSIS_MODE_HIGH_QUALITY,
+                server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT,
+            ),
+        )
+        for branch_name, mode, selected_name, unselected_name, default in branches:
+            for label, configured, expected in matrix:
+                with self.subTest(branch=branch_name, value=label):
+                    values = {
+                        server.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-5.5",
+                        unselected_name: "bogus",
+                    }
+                    if configured is not MISSING:
+                        values[selected_name] = configured
+                    payload = self.payload()
+                    if mode == server.DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
+                        payload["analysis_mode"] = "high_quality"
+                    self.send.reset_mock()
+                    self.send.side_effect = None
+                    with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(values)):
+                        if expected is None:
+                            forbidden = (str(configured).strip(), str(configured).strip().lower())
+                            self.assert_rejected(payload, forbidden_values=forbidden)
+                        else:
+                            body = self.capture(payload)
+                            self.send.assert_called_once()
+                            self.assertEqual(body["model"], "gpt-5.5")
+                            expected_effort = default if expected is MISSING else expected
+                            self.assertEqual(body["reasoning"], {"effort": expected_effort})
+                            self.assertEqual(
+                                body["input"],
+                                [{
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "input_text", "text": "Synthetic prompt"},
+                                        {"type": "input_image", "image_url": self.image, "detail": "high"},
+                                    ],
+                                }],
+                            )
+
+    def test_normalized_unsupported_reasoning_values_are_not_exposed(self):
+        for raw in (" BoGuS ", "max", "ultra", "PRIVATE_CANARY_R704"):
+            with self.subTest(value=raw):
+                values = {
+                    server.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-5.5",
+                    server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: raw,
+                }
+                forbidden = (raw, raw.strip(), raw.strip().lower())
+                with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(values)):
+                    self.assert_rejected(self.payload(), forbidden_values=forbidden)
+
+    def test_high_quality_aliases_use_only_the_high_quality_variable(self):
+        for alias in ("high_quality", "xhigh", "high_accuracy"):
+            with self.subTest(alias=alias):
+                values = {
+                    server.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-5.5",
+                    server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: "bogus",
+                    server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "none",
+                }
+                payload = self.payload()
+                payload["analysis_mode"] = alias
+                self.send.reset_mock()
+                self.send.side_effect = None
+                with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(values)):
+                    body = self.capture(payload)
+                self.send.assert_called_once()
+                self.assertEqual(body["reasoning"], {"effort": "none"})
+
+    def test_reader_precedence_and_dotenv_values_are_isolated(self):
+        env_name = server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME
+        dotenv_path = mock.Mock()
+        dotenv_path.exists.return_value = True
+        with mock.patch.dict(server.os.environ, {}, clear=True):
+            dotenv_path.read_text.return_value = "OTHER_KEY=low\n"
+            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "")
+
+            server.os.environ[env_name] = ""
+            dotenv_path.read_text.return_value = f"{env_name}=low\n"
+            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "low")
+
+            server.os.environ[env_name] = " \t\r\n "
+            dotenv_path.read_text.reset_mock()
+            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), " \t\r\n ")
+            dotenv_path.read_text.assert_not_called()
+
+            server.os.environ.pop(env_name)
+            dotenv_path.read_text.return_value = f"{env_name}=bogus\n"
+            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), "bogus")
+
+            server.os.environ[env_name] = " HIGH "
+            dotenv_path.read_text.reset_mock()
+            self.assertEqual(self.real_read_dotenv_value(env_name, env_path=dotenv_path), " HIGH ")
+            dotenv_path.read_text.assert_not_called()
+
+    def test_final_envelope_validation_remains_the_request_boundary(self):
+        branches = (
+            (
+                "standard",
+                server.DRAFT_ANALYSIS_MODE_STANDARD,
+                server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME,
+                "high",
+            ),
+            (
+                "high_quality",
+                server.DRAFT_ANALYSIS_MODE_HIGH_QUALITY,
+                server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME,
+                "xhigh",
+            ),
+        )
+        for branch_name, mode, selected_name, unselected_name, accepted in branches:
+            for case, configured, body_effort, body_model in (
+                ("unsupported configured and body effort", "bogus", "bogus", "gpt-5.5"),
+                ("accepted configured and body mismatch", accepted, "none", "gpt-5.5"),
+                ("model mismatch", accepted, accepted, "gpt-other-model"),
+            ):
+                with self.subTest(branch=branch_name, case=case):
+                    values = {
+                        server.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-5.5",
+                        selected_name: configured,
+                        unselected_name: "bogus",
+                    }
+                    with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(values)):
+                        self.send.reset_mock()
+                        with self.assertRaises(server.OpenAIAnalysisError) as error:
+                            server.validate_draft_responses_envelope(self.envelope(body_model, body_effort), mode)
+                    self.assertEqual(error.exception.diagnostics["failure_boundary"], "request_validation")
+                    self.assertEqual(error.exception.diagnostics["attempt_number"], 0)
+                    self.send.assert_not_called()
+
+    def test_draft_wrapper_propagates_request_validation_without_local_fallback(self):
+        for mode, selected_name, unselected_name, analysis_mode in (
+            (
+                server.DRAFT_ANALYSIS_MODE_STANDARD,
+                server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME,
+                "standard",
+            ),
+            (
+                server.DRAFT_ANALYSIS_MODE_HIGH_QUALITY,
+                server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME,
+                server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME,
+                "high_quality",
+            ),
+        ):
+            with self.subTest(mode=mode):
+                values = {
+                    server.OPENAI_API_KEY_ENV_NAME: "synthetic-key",
+                    server.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-5.5",
+                    selected_name: "bogus",
+                    unselected_name: "",
+                }
+                payload = self.payload()
+                if analysis_mode != "standard":
+                    payload["analysis_mode"] = analysis_mode
+                self.send.reset_mock()
+                with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(values)):
+                    with mock.patch.object(server, "pricing_reference_authority_error", return_value=""):
+                        with mock.patch.object(server, "default_quote_basis") as fallback:
+                            with self.assertRaises(server.OpenAIAnalysisError) as error:
+                                server.draft_quote_basis(payload)
+                self.assertEqual(error.exception.diagnostics["failure_boundary"], "request_validation")
+                self.assertEqual(error.exception.diagnostics["attempt_number"], 0)
+                self.send.assert_not_called()
+                fallback.assert_not_called()
 
     def test_decoded_byte_and_encoded_length_boundaries(self):
         for url, constant in [(self.image, "MAX_IMAGE_BYTES"), (self.pdf, "MAX_PDF_BYTES")]:

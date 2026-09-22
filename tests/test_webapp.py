@@ -12453,7 +12453,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "output_text": json.dumps({"quote_basis": {}, "line_items": []})
         }).encode("utf-8")
 
-        with mock.patch.object(webapp, "read_dotenv_value", return_value="gpt-custom-model"):
+        def dotenv(name):
+            if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
+                return "gpt-custom-model"
+            return ""
+
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
             with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
                 webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
 
