@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -77,6 +78,8 @@ class FakeDatabaseConnection:
         for table, rows in self.storage.database_rows.items():
             if table in query:
                 return FakeDatabaseResult(rows)
+        if "sqag_object_artifacts" in query:
+            return FakeDatabaseResult(list(self.storage.object_artifacts.values()))
         return FakeDatabaseResult([])
 
 
@@ -162,19 +165,26 @@ class FakeStorage:
         if self.pairing_mismatch:
             checksum = "0" * 64
         self.object_artifacts[(session_id, kind)] = {
+            "artifact_id": f"fake-{session_id}-{kind}",
             "workspace_id": self.workspace_id,
             "owner_type": "generated_quote",
             "owner_id": session_id,
+            "platform_user_id": f"synthetic-user-{self.label}",
             "session_id": session_id,
+            "job_id": "synthetic-job",
             "artifact_kind": kind,
             "filename": filename,
             "content_type": content_type,
             "size_bytes": metadata.size_bytes,
             "checksum_sha256": checksum,
+            "object_provider_type": "s3_compatible",
             "object_key_ref": metadata.storage_key,
             "status": "active",
             "retention_status": "active",
+            "created_at": metadata.created_at,
+            "updated_at": metadata.updated_at,
             "deleted_at": None,
+            "_metadata": metadata,
         }
 
     def list_company_profiles(self) -> list[dict[str, object]]:
@@ -206,6 +216,22 @@ class FakeStorage:
             return None
         return row
 
+    def tombstone_object_quote_artifacts(self, session_id: str) -> int:
+        backend = load_verifier().webapp.configured_object_storage_backend()
+        tombstoned = 0
+        for key, row in self.object_artifacts.items():
+            if key[0] != session_id or row.get("status") != "active":
+                continue
+            metadata = row["_metadata"]
+            if not backend.delete_artifact(metadata, workspace_id=self.workspace_id):
+                raise RuntimeError("synthetic maintenance object deletion failed")
+            row["status"] = "deleted"
+            row["retention_status"] = "deleted"
+            row["updated_at"] = "2026-01-01T00:00:00Z"
+            row["deleted_at"] = "2026-01-01T00:00:00Z"
+            tombstoned += 1
+        return tombstoned
+
     def delete_profile(self, profile_id: str) -> bool:
         self.events.append(("storage-delete", self.label, "profile", profile_id))
         self.delete_calls.append(("profile", profile_id))
@@ -222,9 +248,12 @@ class FakeStorage:
         self.events.append(("storage-delete", self.label, "quote_session", session_id))
         self.delete_calls.append(("quote_session", session_id))
         self._maybe_fail("cleanup")
-        self.object_artifacts = {
-            key: value for key, value in self.object_artifacts.items() if key[0] != session_id
-        }
+        for key, row in self.object_artifacts.items():
+            if key[0] == session_id:
+                row["status"] = "deleted"
+                row["retention_status"] = "deleted"
+                row["updated_at"] = "2026-01-01T00:00:00Z"
+                row["deleted_at"] = "2026-01-01T00:00:00Z"
         return self.sessions.pop(session_id, None) is not None
 
 
@@ -351,6 +380,164 @@ class FakeBackend:
         return True
 
 
+class SyntheticS3Error(Exception):
+    def __init__(self, code: str, status: int):
+        super().__init__(code)
+        self.response = {
+            "Error": {"Code": code},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        }
+
+
+class SyntheticS3Transport:
+    """Bounded S3 transport with provider-shaped missing-object responses."""
+
+    def __init__(self):
+        self.objects: dict[tuple[str, str], tuple[bytes, dict[str, str], str]] = {}
+        self.delete_calls: list[tuple[str, str]] = []
+        self.head_calls: list[tuple[str, str]] = []
+        self.missing_head_calls: list[tuple[str, str]] = []
+        self.noop_delete_calls: set[int] = set()
+        self.get_failure = ""
+        self.head_failure = ""
+        self.corrupt_get = False
+        self.after_first_delete_corrupt_get = False
+        self.after_first_delete_get_failure = ""
+
+    def _raise_failure(self, failure: str) -> None:
+        failures = {
+            "access_denied": ("AccessDenied", 403),
+            "transport": ("RequestTimeout", 500),
+        }
+        if failure in failures:
+            code, status = failures[failure]
+            raise SyntheticS3Error(code, status)
+
+    def head_bucket(self, *, Bucket):
+        _ = Bucket
+        return {}
+
+    def put_object(self, *, Bucket, Key, Body, ContentType, Metadata):
+        self.objects[(Bucket, Key)] = (bytes(Body), dict(Metadata), ContentType)
+        return {"ETag": "synthetic-etag"}
+
+    def get_object(self, *, Bucket, Key):
+        self._raise_failure(self.get_failure)
+        value = self.objects.get((Bucket, Key))
+        if value is None:
+            raise SyntheticS3Error("NoSuchKey", 404)
+        content, metadata, content_type = value
+        if self.corrupt_get:
+            content = content[:-1] + bytes([(content[-1] + 1) % 256])
+        return {
+            "Body": io.BytesIO(content),
+            "Metadata": dict(metadata),
+            "ContentLength": len(content),
+            "ContentType": content_type,
+        }
+
+    def head_object(self, *, Bucket, Key):
+        target = (Bucket, Key)
+        self.head_calls.append(target)
+        self._raise_failure(self.head_failure)
+        value = self.objects.get(target)
+        if value is None:
+            self.missing_head_calls.append(target)
+            raise SyntheticS3Error("NoSuchKey", 404)
+        content, metadata, _content_type = value
+        return {"Metadata": dict(metadata), "ContentLength": len(content)}
+
+    def delete_object(self, *, Bucket, Key):
+        target = (Bucket, Key)
+        self.delete_calls.append(target)
+        if len(self.delete_calls) not in self.noop_delete_calls:
+            self.objects.pop(target, None)
+        if len(self.delete_calls) == 1 and self.after_first_delete_get_failure:
+            self.get_failure = self.after_first_delete_get_failure
+        if len(self.delete_calls) == 1 and self.after_first_delete_corrupt_get:
+            self.corrupt_get = True
+        return {"DeleteMarker": False}
+
+
+def seed_real_s3_quote_artifact(
+    verifier,
+    root: Path,
+    operation: str,
+    workspace_id: str,
+    owner_id: str,
+    *,
+    storage=None,
+    backend=None,
+    client=None,
+):
+    if storage is None:
+        database_path = root / f"{operation}.sqlite"
+        storage = verifier.webapp.DatabaseSqagStorage(
+            f"sqlite:///{database_path.as_posix()}",
+            workspace_id,
+            role="admin",
+            user_id=f"synthetic-{operation}-{workspace_id}",
+        )
+        with storage.connection() as connection:
+            connection.executescript(verifier.webapp.SQAG_OBJECT_ARTIFACT_METADATA_SQL)
+            connection.commit()
+    if client is None:
+        client = SyntheticS3Transport()
+    if backend is None:
+        backend = verifier.S3CompatibleObjectStorageBackend(
+            bucket=f"{operation}-bucket", client=client
+        )
+    content = f"synthetic xlsx bytes for {operation} {workspace_id}".encode("ascii")
+    metadata = backend.store_artifact(
+        workspace_id=workspace_id,
+        owner_type="generated_quote",
+        owner_id=owner_id,
+        artifact_kind="xlsx",
+        filename=verifier.SYNTHETIC_FILENAME,
+        content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+        content=content,
+    )
+    row = {
+        "artifact_id": f"synthetic-artifact-{operation}-{workspace_id}",
+        "workspace_id": workspace_id,
+        "owner_type": "generated_quote",
+        "owner_id": owner_id,
+        "platform_user_id": f"synthetic-user-{operation}-{workspace_id}",
+        "session_id": owner_id,
+        "job_id": "synthetic-job",
+        "artifact_kind": "xlsx",
+        "filename": metadata.filename,
+        "content_type": metadata.content_type,
+        "size_bytes": metadata.size_bytes,
+        "checksum_sha256": metadata.checksum_sha256,
+        "object_provider_type": "s3_compatible",
+        "object_key_ref": metadata.storage_key,
+        "status": "active",
+        "retention_status": "active",
+        "created_at": metadata.created_at,
+        "updated_at": metadata.updated_at,
+        "deleted_at": None,
+    }
+    with storage.connection() as connection:
+        columns = ", ".join(row)
+        placeholders = ", ".join("?" for _ in row)
+        connection.execute(
+            f"insert into sqag_object_artifacts ({columns}) values ({placeholders})",
+            tuple(row.values()),
+        )
+        connection.commit()
+    return storage, backend, client, metadata, row
+
+
+def read_real_s3_quote_artifact_row(storage, workspace_id: str, owner_id: str):
+    with storage.connection() as connection:
+        row = connection.execute(
+            "select * from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+            (workspace_id, "generated_quote", owner_id, "xlsx"),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def run_injected_drill(
     verifier,
     *,
@@ -377,22 +564,21 @@ def run_injected_drill(
 ):
     storages: dict[tuple[str, str], FakeStorage] = {}
     backends: dict[str, FakeBackend] = {}
-    storage_states: dict[str, dict[str, dict[object, dict[str, object]]]] = {}
+    storage_states: dict[object, dict[str, dict[object, dict[str, object]]]] = {}
     backend_state: dict[str, dict[str, object]] | None = {"objects": {}, "metadata": {}} if shared_backend_state else None
 
     def storage_factory(label: str):
         def factory(_database_url: str, workspace_id: str, **_kwargs):
-            state = None
-            if shared_storage_state:
-                state = storage_states.setdefault(
-                    workspace_id,
-                    {
-                        "profiles": {},
-                        "pricing": {},
-                        "sessions": {},
-                        "object_artifacts": {},
-                    },
-                )
+            state_key = workspace_id if shared_storage_state else (label, workspace_id)
+            state = storage_states.setdefault(
+                state_key,
+                {
+                    "profiles": {},
+                    "pricing": {},
+                    "sessions": {},
+                    "object_artifacts": {},
+                },
+            )
             storage = FakeStorage(
                 label=label,
                 workspace_id=workspace_id,
@@ -484,6 +670,292 @@ class TupleArtifactRow:
 
 
 class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
+    def test_real_s3_maintenance_cleanup_is_absence_proven_active_restore_and_workspace_scoped(self):
+        verifier = load_verifier()
+        immutable_fields = (
+            "artifact_id",
+            "workspace_id",
+            "owner_type",
+            "owner_id",
+            "platform_user_id",
+            "session_id",
+            "job_id",
+            "artifact_kind",
+            "filename",
+            "content_type",
+            "size_bytes",
+            "checksum_sha256",
+            "object_provider_type",
+            "object_key_ref",
+            "created_at",
+        )
+        cleanup_results = {}
+        cleanup_diagnostics = {}
+        operation_state = {}
+
+        with tempfile.TemporaryDirectory() as temporary_root:
+            root = Path(temporary_root)
+            for operation in ("active", "restore"):
+                workspace_a = f"workspace-{operation}-a"
+                workspace_b = f"workspace-{operation}-b"
+                owner_a = f"quote-{operation}-a"
+                owner_b = f"quote-{operation}-b"
+                storage, backend, client, metadata_a, original_a = seed_real_s3_quote_artifact(
+                    verifier,
+                    root,
+                    operation,
+                    workspace_a,
+                    owner_a,
+                )
+                _same_storage, _same_backend, _same_client, metadata_b, original_b = seed_real_s3_quote_artifact(
+                    verifier,
+                    root,
+                    operation,
+                    workspace_b,
+                    owner_b,
+                    storage=storage,
+                    backend=backend,
+                    client=client,
+                )
+                resource_key = f"{operation}/workspace_a/generated_xlsx"
+                journal = verifier.ResourceJournal(
+                    verifier._planned_resource_specs(verifier._synthetic_ids())
+                )
+                journal.mark_attempted(resource_key, "test-dispatch")
+                journal.mark_touched(resource_key, "test-receipt")
+                context = verifier.CleanupContext(
+                    operation=operation,
+                    workspace_identity=workspace_a,
+                    workspace_label="workspace_a",
+                    database_family="sqlite",
+                    artifact_storage_mode="object",
+                    storage=storage,
+                    maintenance_storage=storage,
+                    backend=backend,
+                    backend_origin="synthetic-s3-transport",
+                    backend_state="available",
+                    resource_keys=(resource_key,),
+                    captured_artifacts=(metadata_a,),
+                    capture_complete=True,
+                    destructive_cleanup_eligible=True,
+                )
+
+                cleanup_results[operation] = verifier._cleanup_object_resource(
+                    context=context,
+                    journal=journal,
+                    key=resource_key,
+                    metadata=metadata_a,
+                    maintenance=True,
+                )
+                row_a = read_real_s3_quote_artifact_row(storage, workspace_a, owner_a)
+                row_b = read_real_s3_quote_artifact_row(storage, workspace_b, owner_b)
+                with self.assertRaises(verifier.ObjectStorageNotFoundError):
+                    backend.retrieve_artifact(metadata_a, workspace_id=workspace_a)
+                self.assertEqual(len(client.delete_calls), 1)
+                self.assertEqual(client.delete_calls, [(backend.bucket, metadata_a.storage_key)])
+                self.assertEqual(client.missing_head_calls, [])
+                self.assertIsNotNone(row_a)
+                self.assertIsNotNone(row_b)
+                self.assertTrue(
+                    all(row_a[field] == original_a[field] for field in immutable_fields)
+                )
+                self.assertEqual(row_a["status"], "deleted")
+                self.assertEqual(row_a["retention_status"], "deleted")
+                self.assertTrue(row_a["deleted_at"])
+                self.assertTrue(verifier._canonical_tombstone_timestamp(row_a["deleted_at"]))
+                self.assertTrue(
+                    all(row_b[field] == original_b[field] for field in immutable_fields)
+                )
+                self.assertEqual(row_b["status"], "active")
+                self.assertEqual(row_b["retention_status"], "active")
+                self.assertIsNone(row_b["deleted_at"])
+                self.assertEqual(
+                    backend.retrieve_artifact(metadata_b, workspace_id=workspace_b),
+                    f"synthetic xlsx bytes for {operation} {workspace_b}".encode("ascii"),
+                )
+                self.assertEqual(journal.state(resource_key), verifier.JOURNAL_CLEANED if cleanup_results[operation] else verifier.JOURNAL_CLEANUP_FAILED)
+                cleanup_diagnostics[operation] = {
+                    "cleanup_result": cleanup_results[operation],
+                    "provider_delete_calls": list(client.delete_calls),
+                    "missing_head_calls": list(client.missing_head_calls),
+                    "row_status": row_a["status"],
+                }
+                operation_state[operation] = (storage, backend, metadata_a)
+
+            active_backend = operation_state["active"][1]
+            restore_backend = operation_state["restore"][1]
+            active_metadata = operation_state["active"][2]
+            restore_metadata = operation_state["restore"][2]
+            with self.assertRaises(verifier.ObjectStorageNotFoundError):
+                active_backend.retrieve_artifact(restore_metadata, workspace_id=restore_metadata.workspace_id)
+            with self.assertRaises(verifier.ObjectStorageNotFoundError):
+                restore_backend.retrieve_artifact(active_metadata, workspace_id=active_metadata.workspace_id)
+            self.assertNotEqual(
+                operation_state["active"][0].database_url,
+                operation_state["restore"][0].database_url,
+            )
+
+        self.assertEqual(
+            cleanup_results,
+            {"active": True, "restore": True},
+            "expected maintenance cleanup to pass after proving the generated XLSX absent; "
+            "pre-repair duplicate-delete diagnostics: "
+            + repr(cleanup_diagnostics),
+        )
+
+    def test_real_s3_cleanup_fails_closed_for_unproven_absence_and_metadata_postconditions(self):
+        verifier = load_verifier()
+
+        def run_case(
+            name: str,
+            *,
+            row_change: tuple[str, object] | None = None,
+            missing_row: bool = False,
+            absence_failure: str = "",
+            integrity_failure: bool = False,
+            residue: bool = False,
+            query_failure: bool = False,
+            maintenance_failure: bool = False,
+        ):
+            with tempfile.TemporaryDirectory() as temporary_root:
+                workspace_id = f"workspace-negative-{name}"
+                owner_id = f"quote-negative-{name}"
+                storage, backend, client, metadata, _original_row = seed_real_s3_quote_artifact(
+                    verifier,
+                    Path(temporary_root),
+                    "active",
+                    workspace_id,
+                    owner_id,
+                )
+                if missing_row:
+                    with storage.connection() as connection:
+                        connection.execute(
+                            "delete from sqag_object_artifacts where workspace_id = ? and owner_id = ?",
+                            (workspace_id, owner_id),
+                        )
+                        connection.commit()
+                if absence_failure:
+                    client.after_first_delete_get_failure = absence_failure
+                if integrity_failure:
+                    client.noop_delete_calls = {1}
+                    client.after_first_delete_corrupt_get = True
+                if residue:
+                    client.noop_delete_calls = {1, 2}
+
+                original_tombstone = storage.tombstone_object_quote_artifacts
+
+                def mutate_row_after_tombstone(session_id: str) -> int:
+                    result = original_tombstone(session_id)
+                    if row_change is not None:
+                        column, value = row_change
+                        with storage.connection() as connection:
+                            connection.execute(
+                                f"update sqag_object_artifacts set {column} = ? where workspace_id = ? and owner_id = ?",
+                                (value, workspace_id, owner_id),
+                            )
+                            connection.commit()
+                    return result
+
+                def fail_maintenance(_session_id: str) -> int:
+                    raise RuntimeError("synthetic maintenance failure")
+
+                if not missing_row and not maintenance_failure and row_change is not None:
+                    storage.tombstone_object_quote_artifacts = mutate_row_after_tombstone
+                if maintenance_failure:
+                    storage.tombstone_object_quote_artifacts = fail_maintenance
+
+                resource_key = "active/workspace_a/generated_xlsx"
+                journal = verifier.ResourceJournal(
+                    verifier._planned_resource_specs(verifier._synthetic_ids())
+                )
+                journal.mark_attempted(resource_key, "test-dispatch")
+                journal.mark_touched(resource_key, "test-receipt")
+                snapshot = verifier._object_artifact_row_snapshot(storage, metadata)
+                context = verifier.CleanupContext(
+                    operation="active",
+                    workspace_identity=workspace_id,
+                    workspace_label="workspace_a",
+                    database_family="sqlite",
+                    artifact_storage_mode="object",
+                    storage=storage,
+                    maintenance_storage=storage,
+                    backend=backend,
+                    backend_origin="synthetic-s3-transport",
+                    backend_state="available",
+                    resource_keys=(resource_key,),
+                    captured_artifacts=(metadata,),
+                    capture_complete=True,
+                    destructive_cleanup_eligible=True,
+                    object_artifact_snapshots={resource_key: snapshot} if snapshot else {},
+                )
+
+                if query_failure:
+                    original_rows = verifier._database_rows
+
+                    def query_rows(target, query, params):
+                        if target is storage and "sqag_object_artifacts" in query:
+                            return False
+                        return original_rows(target, query, params)
+
+                    with mock.patch.object(verifier, "_database_rows", side_effect=query_rows):
+                        cleanup_result = verifier._cleanup_object_resource(
+                            context=context,
+                            journal=journal,
+                            key=resource_key,
+                            metadata=metadata,
+                            maintenance=True,
+                        )
+                else:
+                    cleanup_result = verifier._cleanup_object_resource(
+                        context=context,
+                        journal=journal,
+                        key=resource_key,
+                        metadata=metadata,
+                        maintenance=True,
+                    )
+                return {
+                    "cleanup": cleanup_result,
+                    "journal_state": journal.state(resource_key),
+                    "delete_calls": len(client.delete_calls),
+                    "object_present": (backend.bucket, metadata.storage_key) in client.objects,
+                    "row": read_real_s3_quote_artifact_row(storage, workspace_id, owner_id),
+                }
+
+        cases = (
+            ("delete-success-residue", {"residue": True}, 2, True),
+            ("absence-access-denied", {"absence_failure": "access_denied"}, 1, False),
+            ("absence-transport-failure", {"absence_failure": "transport"}, 1, False),
+            ("absence-integrity-failure", {"integrity_failure": True}, 2, False),
+            ("metadata-missing", {"missing_row": True}, 1, False),
+            ("metadata-active", {"row_change": ("status", "active")}, 1, False),
+            ("metadata-malformed-tombstone", {"row_change": ("deleted_at", "not-a-canonical-timestamp")}, 1, False),
+            ("metadata-immutable-drift", {"row_change": ("platform_user_id", "changed-user")}, 1, False),
+            ("metadata-query-failure", {"query_failure": True}, 1, False),
+            ("maintenance-failure", {"maintenance_failure": True}, 1, False),
+        )
+        results = {}
+        for name, options, expected_deletes, object_present in cases:
+            with self.subTest(name=name):
+                result = run_case(name, **options)
+                results[name] = result
+                self.assertFalse(result["cleanup"])
+                self.assertEqual(result["journal_state"], verifier.JOURNAL_CLEANUP_FAILED)
+                self.assertEqual(result["delete_calls"], expected_deletes)
+                self.assertEqual(result["object_present"], object_present)
+
+        self.assertIsNone(results["metadata-missing"]["row"])
+        self.assertEqual(results["metadata-active"]["row"]["status"], "active")
+        self.assertEqual(
+            results["metadata-malformed-tombstone"]["row"]["deleted_at"],
+            "not-a-canonical-timestamp",
+        )
+        self.assertEqual(
+            results["metadata-immutable-drift"]["row"]["platform_user_id"],
+            "changed-user",
+        )
+        self.assertEqual(results["metadata-query-failure"]["row"]["status"], "deleted")
+        self.assertEqual(results["maintenance-failure"]["row"]["status"], "active")
+
     def test_missing_env_reports_blocked_preflight_without_values(self):
         verifier = load_verifier()
         report = verifier.run_verification(env={})
@@ -1699,13 +2171,28 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
             label="active",
             object_key_fn=verifier.webapp.object_artifact_key,
         )
+        storage = FakeStorage(label="active", workspace_id=ids["workspace_a"])
+        storage._upsert_object_quote_artifact(
+            metadata.owner_id,
+            metadata.artifact_kind,
+            metadata.filename,
+            metadata.content_type,
+            metadata,
+        )
+        storage.object_artifacts[(metadata.owner_id, metadata.artifact_kind)].update(
+            {
+                "status": "deleted",
+                "retention_status": "deleted",
+                "deleted_at": "2026-01-01T00:00:00Z",
+            }
+        )
         context = verifier.CleanupContext(
             operation="active",
             workspace_identity=ids["workspace_a"],
             workspace_label="workspace_a",
             database_family="sqlite",
             artifact_storage_mode="object",
-            storage=FakeStorage(label="active", workspace_id=ids["workspace_a"]),
+            storage=storage,
             maintenance_storage=None,
             backend=backend,
             backend_origin="test-backend",

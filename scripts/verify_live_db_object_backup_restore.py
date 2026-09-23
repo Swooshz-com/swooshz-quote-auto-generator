@@ -15,6 +15,7 @@ dump, or restore dump is printed.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import importlib
 import json
@@ -349,6 +350,7 @@ class CleanupContext(NamedTuple):
     captured_artifacts: tuple[ObjectArtifactMetadata, ...]
     capture_complete: bool
     destructive_cleanup_eligible: bool
+    object_artifact_snapshots: Mapping[str, Mapping[str, object]] | None = None
 
     def report(self) -> dict[str, object]:
         return {
@@ -1462,19 +1464,68 @@ def _database_rows(
         return False
 
 
+def _object_artifact_row_snapshot(
+    storage: object,
+    metadata: ObjectArtifactMetadata,
+) -> dict[str, object] | None:
+    rows = _database_rows(
+        storage,
+        "select * from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+        (
+            metadata.workspace_id,
+            metadata.owner_type,
+            metadata.owner_id,
+            metadata.artifact_kind,
+        ),
+    )
+    if rows is None or rows is False or len(rows) != 1:
+        return None
+    return {
+        field: _row_value(rows[0], field)
+        for field in OBJECT_ARTIFACT_ROW_FIELDS
+    }
+
+
+def _canonical_tombstone_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() == dt.timedelta(0)
+        and parsed.isoformat().replace("+00:00", "Z") == value
+    )
+
+
 def _backend_artifact_absent(
     backend: ObjectStorageBackend,
     metadata: ObjectArtifactMetadata,
     *,
     workspace_id: str,
 ) -> bool:
+    return _backend_artifact_presence(
+        backend,
+        metadata,
+        workspace_id=workspace_id,
+    ) == "absent"
+
+
+def _backend_artifact_presence(
+    backend: ObjectStorageBackend,
+    metadata: ObjectArtifactMetadata,
+    *,
+    workspace_id: str,
+) -> str:
     try:
         backend.retrieve_artifact(metadata, workspace_id=workspace_id)
     except (ObjectStorageNotFoundError, KeyError):
-        return True
+        return "absent"
     except Exception:
-        return False
-    return False
+        return "unverified"
+    return "present"
 
 
 def _delete_backend_artifact_and_verify(
@@ -1805,6 +1856,21 @@ def _build_cleanup_contexts(
             workspace_label=workspace_label,
             known_artifacts=tuple(known),
         )
+        object_artifact_snapshots: dict[str, Mapping[str, object]] = {}
+        if storage is not None:
+            for key in resource_keys:
+                if not key.endswith("/generated_xlsx"):
+                    continue
+                metadata = artifact_metadata.get(key)
+                if metadata is None:
+                    descriptor = expected_artifacts.get(key)
+                    candidate = descriptor.get("metadata") if descriptor else None
+                    metadata = candidate if isinstance(candidate, ObjectArtifactMetadata) else None
+                if metadata is None:
+                    continue
+                snapshot = _object_artifact_row_snapshot(storage, metadata)
+                if snapshot is not None:
+                    object_artifact_snapshots[key] = snapshot
         touched = any(journal.state(key) == JOURNAL_TOUCHED for key in resource_keys)
         eligible = bool(
             touched
@@ -1829,6 +1895,7 @@ def _build_cleanup_contexts(
             captured_artifacts=captured,
             capture_complete=capture_complete,
             destructive_cleanup_eligible=eligible,
+            object_artifact_snapshots=object_artifact_snapshots,
         )
         contexts.append(context)
         evidence[f"{operation}/{workspace_label}"] = context.report()
@@ -2116,20 +2183,44 @@ def _object_postconditions(
     )
     if rows is None or rows is False:
         return False
-    for row in rows:
-        if not all(
-            (
-                _clean(_row_value(row, "workspace_id")) == metadata.workspace_id,
-                _clean(_row_value(row, "owner_type")) == metadata.owner_type,
-                _clean(_row_value(row, "owner_id")) == metadata.owner_id,
-                _clean(_row_value(row, "artifact_kind")) == metadata.artifact_kind,
-                _clean(_row_value(row, "filename")) == metadata.filename,
-                _clean(_row_value(row, "checksum_sha256")) == metadata.checksum_sha256,
-                _clean(_row_value(row, "object_key_ref")) == metadata.storage_key,
-            )
-        ):
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    if not all(
+        (
+            _row_value(row, "workspace_id") == metadata.workspace_id,
+            _row_value(row, "owner_type") == metadata.owner_type,
+            _row_value(row, "owner_id") == metadata.owner_id,
+            _row_value(row, "artifact_kind") == metadata.artifact_kind,
+            _row_value(row, "filename") == metadata.filename,
+            _row_value(row, "content_type") == metadata.content_type,
+            _row_value(row, "size_bytes") == metadata.size_bytes,
+            _row_value(row, "checksum_sha256") == metadata.checksum_sha256,
+            _row_value(row, "object_key_ref") == metadata.storage_key,
+            _row_value(row, "created_at") == metadata.created_at,
+            _row_value(row, "status") == "deleted",
+            _row_value(row, "retention_status") == "deleted",
+            _canonical_tombstone_timestamp(_row_value(row, "deleted_at")),
+        )
+    ):
+        return False
+    resource_key = f"{context.operation}/{context.workspace_label}/generated_xlsx"
+    snapshots = context.object_artifact_snapshots
+    if snapshots is not None:
+        snapshot = snapshots.get(resource_key)
+        if snapshot is None:
             return False
-    return _object_rows_are_deleted(rows)
+        for field in (
+            "artifact_id",
+            "platform_user_id",
+            "session_id",
+            "job_id",
+            "object_provider_type",
+            "created_at",
+        ):
+            if _row_value(row, field) != snapshot.get(field):
+                return False
+    return True
 
 
 def _resource_cleanup_is_eligible(
@@ -2216,16 +2307,28 @@ def _cleanup_object_resource(
             except Exception:
                 ok = False
                 journal.record_receipt(key, "cleanup-receipt:quote-maintenance-tombstone-failed")
-    journal.mark_destructive_cleanup_attempt(key, "object-delete")
+    absence_state = "present"
+    if journal.entry(key).spec.resource_kind == "generated_xlsx":
+        absence_state = _backend_artifact_presence(
+            context.backend,  # type: ignore[arg-type]
+            metadata,
+            workspace_id=metadata.workspace_id,
+        )
+    already_absent = absence_state == "absent"
+    journal.mark_destructive_cleanup_attempt(
+        key,
+        "object-already-absent" if already_absent else "object-delete",
+    )
     try:
-        deleted = _delete_backend_artifact_and_verify(
+        deleted = already_absent or _delete_backend_artifact_and_verify(
             context.backend,  # type: ignore[arg-type]
             metadata,
             workspace_id=metadata.workspace_id,
         )
     except Exception:
         deleted = False
-    if not deleted or not _object_postconditions(context, metadata):
+    postconditions_ok = _object_postconditions(context, metadata) if deleted else False
+    if not deleted or not postconditions_ok or absence_state == "unverified":
         journal.mark_cleanup_failed(key, "destructive-cleanup:object-residue")
         return False
     if not ok:
