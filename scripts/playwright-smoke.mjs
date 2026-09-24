@@ -48,50 +48,96 @@ function pythonCommand() {
   return "python";
 }
 
-async function healthOk() {
+async function healthOk(url = baseUrl) {
   try {
-    const response = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1200) });
+    const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(1200) });
     return response.ok;
   } catch {
     return false;
   }
 }
 
-async function waitForHealth(timeoutMs = 15000) {
+async function waitForHealth(timeoutMs = 15000, url = baseUrl) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (await healthOk()) return true;
+    if (await healthOk(url)) return true;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
 }
 
-function startServer() {
+function startServer({
+  host = options.host,
+  port = options.port,
+  dataRoot = process.env.QUOTE_DATA_ROOT || quoteDataRoot,
+  syntheticRoot = null,
+  logRoot = null,
+} = {}) {
   const server = spawn(
     pythonCommand(),
-    ["webapp/server.py", "--host", options.host, "--port", String(options.port)],
+    ["webapp/server.py", "--host", host, "--port", String(port)],
     {
       cwd: root,
-      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: "1",
+        APP_MODE: "local",
+        QUOTE_DATA_ROOT: dataRoot,
+        ...(syntheticRoot ? {
+          QUOTE_OUTPUT_ROOT: path.join(syntheticRoot, "output"),
+          QUOTE_TMP_ROOT: path.join(syntheticRoot, "tmp"),
+          SQAG_LOCAL_PRICING_REFERENCES_ROOT: path.join(syntheticRoot, "pricing-references"),
+          QUOTE_LOG_ROOT: logRoot,
+        } : {}),
+      },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },
   );
   const output = [];
+  let endpointResolve;
+  let endpointReject;
+  let endpointFound = false;
+  let endpointBuffer = "";
+  const endpointPromise = port === 0 ? new Promise((resolve, reject) => {
+    endpointResolve = resolve;
+    endpointReject = reject;
+  }) : null;
+  let closeResolve;
+  const closePromise = new Promise((resolve) => { closeResolve = resolve; });
+  server.once("error", (error) => {
+    if (!endpointFound && endpointReject) endpointReject(error);
+  });
+  server.once("close", (code, signal) => {
+    closeResolve({ code, signal });
+    if (!endpointFound && endpointReject) {
+      endpointReject(new Error(`The isolated smoke server exited before reporting its endpoint (code=${code}, signal=${signal || ""}).`));
+    }
+  });
   const collect = (chunk) => {
-    output.push(String(chunk));
+    const text = String(chunk);
+    output.push(text);
     if (output.join("").length > 8000) output.shift();
+    if (!endpointFound && endpointResolve) {
+      endpointBuffer = `${endpointBuffer}${text}`.slice(-2048);
+      const match = endpointBuffer.match(/(?:^|\r?\n)SQAG_SERVER_ENDPOINT=(https?:\/\/[^\s]+)/);
+      if (match) {
+        endpointFound = true;
+        endpointResolve(match[1]);
+      }
+    }
   };
   server.stdout.on("data", collect);
   server.stderr.on("data", collect);
-  return { server, output };
+  return { server, output, closePromise, endpointPromise };
 }
 
-async function stopServer(serverInfo) {
-  if (!serverInfo || options.keepServer) return;
-  if (serverInfo.server.killed) return;
-  serverInfo.server.kill();
-  await new Promise((resolve) => serverInfo.server.once("exit", resolve));
+async function stopServer(serverInfo, { force = false } = {}) {
+  if (!serverInfo || (!force && options.keepServer)) return;
+  if (serverInfo.server.exitCode === null && serverInfo.server.signalCode === null) {
+    serverInfo.server.kill();
+  }
+  await serverInfo.closePromise;
 }
 
 async function screenshot(page, name) {
@@ -1765,6 +1811,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page) 
   const pageErrors = [];
   const apiFailures = [];
   const jobResponses = [];
+  const quoteSessionResponses = [];
   const renderName = "sqag212-synthetic-render.png";
   const renderBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64");
   const profileFixtureDir = path.join(root, "tests", "fixtures", "quote-generator", "profiles", "synthetic-exhibition-fixture-template");
@@ -1792,6 +1839,9 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page) 
     browserPage.on("pageerror", (error) => pageErrors.push(error.message));
     browserPage.on("response", (response) => {
       const pathName = new URL(response.url()).pathname;
+      if (pathName === "/api/quote-sessions" || pathName.startsWith("/api/quote-sessions/")) {
+        quoteSessionResponses.push({ method: response.request().method(), status: response.status() });
+      }
       if (pathName.startsWith("/api/jobs")) {
         response.json().then((body) => jobResponses.push({
           method: response.request().method(),
@@ -2110,6 +2160,12 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page) 
     if (!pdfResponse.ok() || pdfBytes.subarray(0, 4).toString("ascii") !== "%PDF") {
       throw new Error("SQAG #212 explicit PDF download did not contain a PDF document.");
     }
+    return {
+      quoteSessionPostStatuses: quoteSessionResponses
+        .filter((response) => response.method === "POST")
+        .map((response) => response.status),
+      quoteSessionResponseCount: quoteSessionResponses.length,
+    };
   } catch (error) {
     let browserState = null;
     if (browserPage) {
@@ -2153,6 +2209,101 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page) 
     }
     await isolatedContext.close().catch(() => {});
   }
+}
+
+async function runSqag212RegressionInIsolatedServer(page, downstreamServerInfo, downstreamUrl) {
+  const syntheticRoot = path.join(os.tmpdir(), `playwright-sqag212-${process.pid}`);
+  const isolatedDataRoot = syntheticRoot;
+  const isolatedLogRoot = path.join(root, "_logs", "server", `playwright-smoke-sqag212-${process.pid}`);
+  const previousBaseUrl = baseUrl;
+  let serverInfo = null;
+  let isolatedUrl = "";
+  let traffic = null;
+  try {
+    await fs.rm(syntheticRoot, { recursive: true, force: true });
+    await fs.rm(isolatedLogRoot, { recursive: true, force: true });
+    serverInfo = startServer({
+      host: options.host,
+      port: 0,
+      dataRoot: isolatedDataRoot,
+      syntheticRoot,
+      logRoot: isolatedLogRoot,
+    });
+    isolatedUrl = await serverInfo.endpointPromise;
+    if (!isolatedUrl || isolatedUrl === downstreamUrl) {
+      throw new Error("SQAG #212 isolated server did not receive a distinct loopback endpoint.");
+    }
+    if (path.resolve(isolatedDataRoot) === path.resolve(process.env.QUOTE_DATA_ROOT || quoteDataRoot)) {
+      throw new Error("SQAG #212 isolated data root overlaps the downstream smoke data root.");
+    }
+    if (
+      downstreamServerInfo?.server.pid
+      && serverInfo.server.pid
+      && downstreamServerInfo.server.pid === serverInfo.server.pid
+    ) {
+      throw new Error("SQAG #212 server process is shared with the downstream smoke process.");
+    }
+    baseUrl = isolatedUrl;
+    if (!(await waitForHealth(15000, isolatedUrl))) {
+      const serverOutput = serverInfo.output.join("").trim();
+      throw new Error(`Could not start the isolated SQAG #212 server.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+    }
+    traffic = await verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page);
+    if (!traffic.quoteSessionPostStatuses.some((status) => status >= 200 && status < 300)) {
+      throw new Error(`SQAG #212 isolated flow did not record a successful quote-session POST: ${JSON.stringify(traffic)}.`);
+    }
+    if (traffic.quoteSessionPostStatuses.includes(429)) {
+      throw new Error(`SQAG #212 isolated flow hit the quote-session rate limit: ${JSON.stringify(traffic)}.`);
+    }
+  } finally {
+    baseUrl = previousBaseUrl;
+    try {
+      await stopServer(serverInfo, { force: true });
+    } finally {
+      await fs.rm(syntheticRoot, { recursive: true, force: true });
+      await fs.rm(isolatedLogRoot, { recursive: true, force: true });
+    }
+  }
+
+  if (fsSync.existsSync(syntheticRoot) || fsSync.existsSync(isolatedLogRoot)) {
+    throw new Error("SQAG #212 isolated synthetic storage was not cleaned up.");
+  }
+  if (await healthOk(isolatedUrl)) {
+    throw new Error("SQAG #212 isolated server remained reachable after cleanup.");
+  }
+  return {
+    isolatedServerPid: serverInfo.server.pid || null,
+    downstreamServerPid: downstreamServerInfo?.server.pid || null,
+    isolatedPort: new URL(isolatedUrl).port,
+    downstreamPort: new URL(downstreamUrl).port,
+    isolatedProcessAndDataRoot: true,
+    quoteSessionPostStatuses: traffic.quoteSessionPostStatuses,
+    isolatedServerStopped: true,
+    isolatedStorageCleaned: true,
+  };
+}
+
+function verifyDownstreamQuoteSessionAccounting(responses, baselineCount) {
+  const downstreamResponses = responses.slice(baselineCount);
+  const downstreamPosts = downstreamResponses.filter((response) => response.method === "POST");
+  const firstPost = downstreamPosts[0];
+  if (!firstPost) {
+    throw new Error("Downstream smoke fixtures did not issue a quote-session POST after the isolated SQAG #212 prelude.");
+  }
+  if (firstPost.status === 429) {
+    throw new Error("The first downstream quote-session POST was rate limited after the isolated SQAG #212 prelude.");
+  }
+  const firstSuccessfulPost = downstreamPosts.find((response) => response.status >= 200 && response.status < 300);
+  if (!firstSuccessfulPost) {
+    throw new Error("Downstream smoke fixtures did not successfully save a quote session after the isolated SQAG #212 prelude.");
+  }
+  return {
+    responseCountBeforePrelude: baselineCount,
+    firstPostStatusAfterPrelude: firstPost.status,
+    firstSuccessfulPostStatusAfterPrelude: firstSuccessfulPost.status,
+    downstreamPostStatuses: downstreamPosts.map((response) => response.status),
+    downstreamRateLimitedResponseCount: downstreamResponses.filter((response) => response.status === 429).length,
+  };
 }
 
 async function verifyRun639PricingAuthorityRestorationAndPresentation(page) {
@@ -4091,9 +4242,10 @@ async function main() {
     await run573LoadedAppTwice();
     return;
   }
+  const sqag212Only = args.includes("--sqag212-only");
   let serverInfo = null;
-  const hasExistingServer = await healthOk();
-  if (!hasExistingServer) {
+  const hasExistingServer = sqag212Only ? false : await healthOk();
+  if (!sqag212Only && !hasExistingServer) {
     await fs.rm(quoteDataRoot, { recursive: true, force: true });
     serverInfo = startServer();
     if (!(await waitForHealth())) {
@@ -4115,17 +4267,36 @@ async function main() {
   page.on("response", (response) => {
     if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
   });
+  const mainQuoteSessionResponses = [];
+  context.on("response", (response) => {
+    const pathName = new URL(response.url()).pathname;
+    if (pathName === "/api/quote-sessions" || pathName.startsWith("/api/quote-sessions/")) {
+      mainQuoteSessionResponses.push({ method: response.request().method(), status: response.status() });
+    }
+  });
+  let sqag212Isolation = null;
 
   try {
-    if (args.includes("--sqag212-only")) {
-      await verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page);
-      console.log(JSON.stringify({ status: "ok", regression: "sqag212-analysis-confirmation-save-reload-xlsx-pdf" }, null, 2));
+    if (sqag212Only) {
+      sqag212Isolation = await runSqag212RegressionInIsolatedServer(page, serverInfo, baseUrl);
+      console.log(JSON.stringify({
+        status: "ok",
+        regression: "sqag212-analysis-confirmation-save-reload-xlsx-pdf",
+        isolation: sqag212Isolation,
+      }, null, 2));
       return;
     }
     await installMockProfiles(page);
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
-    await verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page);
+    const downstreamResponseBaseline = mainQuoteSessionResponses.length;
+    const downstreamUrl = baseUrl;
+    sqag212Isolation = await runSqag212RegressionInIsolatedServer(page, serverInfo, downstreamUrl);
+    if (mainQuoteSessionResponses.length !== downstreamResponseBaseline) {
+      throw new Error("SQAG #212 quote-session traffic reached the downstream smoke process during its isolated prelude.");
+    }
+    sqag212Isolation.downstreamResponseCountAtPreludeStart = downstreamResponseBaseline;
+    sqag212Isolation.downstreamResponseCountAtPreludeEnd = mainQuoteSessionResponses.length;
     await verifyRun639PricingAuthorityRestorationAndPresentation(page);
     await verifyServerPricingReferenceReviewDurability(page);
     if (args.includes("--recovery-only")) {
@@ -4137,9 +4308,14 @@ async function main() {
       await verifyGenerationTerminalRecoveryAfterRefresh(page);
       await verifyExpiredQuoteJobsDoNotResume(page);
       await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
+      sqag212Isolation.downstreamRequestAccounting = verifyDownstreamQuoteSessionAccounting(
+        mainQuoteSessionResponses,
+        downstreamResponseBaseline,
+      );
       console.log(JSON.stringify({
         status: "ok",
         mode: "recovery-only",
+        sqag212Isolation,
         consoleProblems,
         networkProblems,
       }, null, 2));
@@ -4933,6 +5109,10 @@ async function main() {
     await verifyConfirmBasisSurvivesImmediateRefresh(page);
     await verifyGenerationLoadingModalSurvivesRefresh(page);
     await verifyGenerationTerminalRecoveryAfterRefresh(page);
+    sqag212Isolation.downstreamRequestAccounting = verifyDownstreamQuoteSessionAccounting(
+      mainQuoteSessionResponses,
+      downstreamResponseBaseline,
+    );
 
     console.log(JSON.stringify({
       status: "ok",
@@ -4947,6 +5127,7 @@ async function main() {
         dashboardSelectedMobileShot,
         dashboardDeleteModalShot,
       ].filter(Boolean),
+      sqag212Isolation,
       consoleProblems,
       networkProblems,
     }, null, 2));
