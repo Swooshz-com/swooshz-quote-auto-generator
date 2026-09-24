@@ -15,6 +15,7 @@ import copy
 import csv
 import datetime as dt
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import functools
 import html
 import hashlib
 import hmac
@@ -375,6 +376,8 @@ QUOTE_SESSION_METADATA_FILENAME = "quote-session.json"
 QUOTE_SESSION_DRAFT_FILES_FILENAME = "draft-files.json"
 QUOTE_SESSION_EXPORT_DIR_NAME = "exports"
 QUOTE_SESSION_PUBLICATIONS_DIR_NAME = "publications"
+QUOTE_SESSION_RETIRED_MARKER_FILENAME = ".retired-session-ids.json"
+QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION = 1
 QUOTE_SESSION_PUBLICATION_ID_RE = re.compile(r"^pub-[0-9a-f]{32}$")
 QUOTE_SESSION_EXPORT_KINDS = {
     "xlsx": "quotation.xlsx",
@@ -659,6 +662,7 @@ SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
+QUOTE_SESSION_RETIRED_MESSAGE = "This quote session is no longer available. Please start a new quote. Contact support if this keeps happening."
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
 DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
@@ -725,6 +729,10 @@ MAX_PROMPT_CATALOG_MATCH_TERMS = 6
 # and pricing-reference storage partitioned by authenticated user/account.
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+QUOTE_SESSION_MUTATION_LOCKS_LOCK = threading.Lock()
+QUOTE_SESSION_MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+QUOTE_SESSION_RETIREMENT_LOCKS_LOCK = threading.Lock()
+QUOTE_SESSION_RETIREMENT_LOCKS: dict[str, threading.RLock] = {}
 
 
 class RequestBodyError(ValueError):
@@ -11943,12 +11951,16 @@ def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
     message = (
-        QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE
-        if exc.reason in {"protected_local_artifact_storage_unavailable", "object_artifact_storage_unavailable", "object_draft_recovery_required", "storage_object_artifact_database_not_migrated"}
+        QUOTE_SESSION_RETIRED_MESSAGE
+        if exc.reason == "quote_session_retired"
         else (
-            QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
-            if exc.reason == "protected_local_quote_session_storage_unavailable"
-            else "SQAG storage is not available for this workspace."
+            QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE
+            if exc.reason in {"protected_local_artifact_storage_unavailable", "object_artifact_storage_unavailable", "object_draft_recovery_required", "storage_object_artifact_database_not_migrated"}
+            else (
+                QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
+                if exc.reason == "protected_local_quote_session_storage_unavailable"
+                else "SQAG storage is not available for this workspace."
+            )
         )
     )
     payload = {"status": "blocked" if exc.status < 500 else "failed", "errors": [message], "error_reference": error_reference}
@@ -12052,7 +12064,7 @@ class LocalSqagStorage:
     def quote_session_export_file_path(self, session_id: str, kind: str) -> Path | None:
         safe_id = safe_quote_session_id(session_id, "")
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(clean_text(kind).lower())
-        if not safe_id or not expected_filename:
+        if not safe_id or not expected_filename or quote_session_is_retired(safe_id):
             return None
         metadata = read_quote_session_metadata(safe_id)
         if not quote_session_has_current_v2_publication(metadata):
@@ -23880,6 +23892,135 @@ def quote_sessions_root() -> Path:
     return configured_data_root() / QUOTE_SESSION_DIR_NAME
 
 
+def quote_session_retired_marker_path() -> Path:
+    """Return the minimal retirement ledger outside every session directory."""
+    return quote_sessions_root().resolve().parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
+
+
+def _quote_session_storage_root() -> Path:
+    return quote_sessions_root().resolve()
+
+
+def _quote_session_mutation_lock(session_id: str) -> threading.RLock:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        raise ValueError("Quote session id is required and may only contain safe generated characters.")
+    root_key = str(_quote_session_storage_root()).casefold()
+    identity = (root_key, safe_id)
+    with QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+        lock = QUOTE_SESSION_MUTATION_LOCKS.get(identity)
+        if lock is None:
+            lock = threading.RLock()
+            QUOTE_SESSION_MUTATION_LOCKS[identity] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def quote_session_mutation(session_id: str):
+    """Serialize one local session's complete persistence transaction."""
+    lock = _quote_session_mutation_lock(session_id)
+    with lock:
+        yield
+
+
+def _quote_session_retirement_lock(root: Path) -> threading.RLock:
+    root_key = str(root).casefold()
+    with QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+        lock = QUOTE_SESSION_RETIREMENT_LOCKS.get(root_key)
+        if lock is None:
+            lock = threading.RLock()
+            QUOTE_SESSION_RETIREMENT_LOCKS[root_key] = lock
+        return lock
+
+
+def _read_retired_quote_session_ids(root: Path) -> set[str]:
+    marker_path = root.parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
+    try:
+        raw = marker_path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_read_failed",
+        ) from exc
+    try:
+        marker = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_invalid",
+        ) from exc
+    if not isinstance(marker, dict) or marker.get("schema_version") != QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION:
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_invalid",
+        )
+    raw_ids = marker.get("session_ids")
+    if not isinstance(raw_ids, list):
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_invalid",
+        )
+    retired: set[str] = set()
+    for value in raw_ids:
+        safe_id = safe_quote_session_id(value, "")
+        if not isinstance(value, str) or not safe_id or safe_id != value:
+            raise SqagStorageAccessError(
+                "Quote session retirement state is unavailable.",
+                status=503,
+                reason="quote_session_retirement_invalid",
+            )
+        retired.add(safe_id)
+    return retired
+
+
+def quote_session_is_retired(session_id: str) -> bool:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        return False
+    root = _quote_session_storage_root()
+    with _quote_session_retirement_lock(root):
+        return safe_id in _read_retired_quote_session_ids(root)
+
+
+def retire_quote_session_id(session_id: str) -> bool:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        raise ValueError("Quote session id is required and may only contain safe generated characters.")
+    root = _quote_session_storage_root()
+    marker_path = root.parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
+    with _quote_session_retirement_lock(root):
+        retired = _read_retired_quote_session_ids(root)
+        if safe_id in retired:
+            return False
+        retired.add(safe_id)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            atomic_write_text(
+                marker_path,
+                json.dumps(
+                    {
+                        "schema_version": QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION,
+                        "session_ids": sorted(retired),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+        except OSError as exc:
+            raise SqagStorageAccessError(
+                "Quote session retirement state could not be saved.",
+                status=503,
+                reason="quote_session_retirement_write_failed",
+            ) from exc
+        return True
+
+
 def quote_session_dir(session_id: str) -> Path:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
@@ -25966,6 +26107,54 @@ def cleanup_uncommitted_local_quote_publication(
         shutil.rmtree(final_dir)
 
 
+def coordinated_local_quote_session_mutation(function):
+    """Admit local saves before any session read or rollback snapshot."""
+    @functools.wraps(function)
+    def coordinated(
+        payload: dict[str, Any],
+        result: dict[str, Any] | None = None,
+        output_dir: Path | None = None,
+        session_id: str | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        persistence_review = quote_commercial_persistence_preflight(payload)
+        if persistence_review:
+            error = QuoteCommercialStateError(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+            error.quote_commercial_review = persistence_review
+            raise error
+        patch = quote_session_patch_payload(payload)
+        raw_session_id = (
+            session_id
+            or patch.get("session_id")
+            or (payload.get("session_id") if isinstance(payload, dict) else "")
+        )
+        requested_session_id = safe_quote_session_id(raw_session_id, "")
+        explicit_session_id = bool(requested_session_id)
+        while True:
+            candidate_session_id = requested_session_id or new_quote_session_id()
+            with quote_session_mutation(candidate_session_id):
+                if quote_session_is_retired(candidate_session_id):
+                    if explicit_session_id:
+                        raise SqagStorageAccessError(
+                            QUOTE_SESSION_RETIRED_MESSAGE,
+                            status=409,
+                            reason="quote_session_retired",
+                        )
+                    continue
+                return function(
+                    payload,
+                    result,
+                    output_dir,
+                    candidate_session_id,
+                    *args,
+                    **kwargs,
+                )
+
+    return coordinated
+
+
+@coordinated_local_quote_session_mutation
 def create_or_update_quote_session(
     payload: dict[str, Any],
     result: dict[str, Any] | None = None,
@@ -26286,6 +26475,8 @@ def committed_quote_session_downloads(
 
 
 def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> dict[str, Any] | None:
+    if quote_session_is_retired(session_id):
+        return None
     metadata = read_quote_session_metadata(session_id)
     if not metadata:
         return None
@@ -26330,10 +26521,20 @@ def delete_quote_session(session_id: str) -> bool:
         session_dir.relative_to(root)
     except ValueError:
         return False
-    if session_dir.name != safe_id or not session_dir.exists() or not session_dir.is_dir():
+    if session_dir.name != safe_id:
         return False
-    shutil.rmtree(session_dir)
-    return True
+    with quote_session_mutation(safe_id):
+        retired = quote_session_is_retired(safe_id)
+        if not session_dir.exists():
+            return retired
+        if not session_dir.is_dir():
+            return False
+        if not retired:
+            retire_quote_session_id(safe_id)
+        shutil.rmtree(session_dir)
+        if session_dir.exists():
+            raise OSError("Quote session directory removal did not complete.")
+        return True
 
 
 def file_data_url(path: Path) -> str:

@@ -17355,6 +17355,251 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertNotIn(str(data_root), response_text)
                 self.assertNotIn(str(Path(tmp)), response_text)
 
+    def test_local_quote_session_publication_owns_transaction_before_delete(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-g3-publication-first"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-publication\n%%EOF\n",
+                variant="publication",
+            )
+            initial_payload = copy.deepcopy(payload)
+            initial_payload["quote_session"]["status"] = {"quote_generated": False}
+            publication_entered = threading.Event()
+            publication_release = threading.Event()
+            delete_started = threading.Event()
+            delete_done = threading.Event()
+            results = {}
+            original_stage = webapp.stage_local_quote_publication
+
+            def paused_stage(*args, **kwargs):
+                publication_entered.set()
+                if not publication_release.wait(5):
+                    raise AssertionError("Timed out waiting to release publication staging.")
+                return original_stage(*args, **kwargs)
+
+            def publish():
+                try:
+                    results["publication"] = webapp.create_or_update_quote_session(
+                        payload,
+                        result=result,
+                        output_dir=output_dir,
+                    )
+                except Exception as exc:  # pragma: no cover - assertion below reports the failure
+                    results["publication"] = exc
+
+            def delete():
+                delete_started.set()
+                try:
+                    results["delete"] = webapp.delete_quote_session(session_id)
+                except Exception as exc:  # pragma: no cover - assertion below reports the failure
+                    results["delete"] = exc
+                finally:
+                    delete_done.set()
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                webapp.create_or_update_quote_session(initial_payload)
+                with mock.patch.object(webapp, "stage_local_quote_publication", side_effect=paused_stage):
+                    publication_thread = threading.Thread(target=publish)
+                    publication_thread.start()
+                    self.assertTrue(publication_entered.wait(5), "Publication did not reach the staging boundary.")
+
+                    delete_thread = threading.Thread(target=delete)
+                    delete_thread.start()
+                    self.assertTrue(delete_started.wait(5), "Delete thread did not start.")
+                    self.assertFalse(delete_done.is_set(), "Delete completed while publication owned the session transaction.")
+
+                    publication_release.set()
+                    publication_thread.join(timeout=5)
+                    delete_thread.join(timeout=5)
+
+                self.assertFalse(publication_thread.is_alive(), "Publication thread remained blocked.")
+                self.assertFalse(delete_thread.is_alive(), "Delete thread remained blocked.")
+                self.assertEqual(results["publication"]["status"]["quote_generated"], True)
+                self.assertIs(results["delete"], True)
+                self.assertTrue(webapp.quote_session_retired_marker_path().is_file())
+                marker = json.loads(webapp.quote_session_retired_marker_path().read_text(encoding="utf-8"))
+                self.assertEqual(marker["schema_version"], webapp.QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION)
+                self.assertEqual(marker["session_ids"], [session_id])
+                self.assertFalse((data_root / "quote-sessions" / session_id).exists())
+                self.assertIsNone(webapp.get_quote_session(session_id))
+                self.assertIsNone(webapp.LocalSqagStorage().quote_session_export_file_path(session_id, "xlsx"))
+
+    def test_local_quote_session_delete_first_blocks_late_save_after_coordinator_restart(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-g3-delete-first"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-delete-first\n%%EOF\n",
+                variant="late",
+            )
+            publication_ready = threading.Event()
+            publication_release = threading.Event()
+            results = {}
+
+            def delayed_publication():
+                publication_ready.set()
+                publication_release.wait(5)
+                try:
+                    results["publication"] = webapp.create_or_update_quote_session(
+                        payload,
+                        result=result,
+                        output_dir=output_dir,
+                    )
+                except Exception as exc:
+                    results["publication"] = exc
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                draft = copy.deepcopy(payload)
+                draft["quote_session"]["status"] = {"quote_generated": False}
+                webapp.create_or_update_quote_session(draft)
+                self.assertTrue(webapp.delete_quote_session(session_id))
+
+                publication_thread = threading.Thread(target=delayed_publication)
+                publication_thread.start()
+                self.assertTrue(publication_ready.wait(5))
+                publication_release.set()
+                publication_thread.join(timeout=5)
+                self.assertFalse(publication_thread.is_alive(), "Late publication thread remained blocked.")
+                self.assertIsInstance(results["publication"], webapp.SqagStorageAccessError)
+                self.assertEqual(results["publication"].status, 409)
+                self.assertEqual(results["publication"].reason, "quote_session_retired")
+                self.assertFalse((data_root / "quote-sessions" / session_id).exists())
+
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as retry:
+                    webapp.create_or_update_quote_session(draft)
+                self.assertEqual(retry.exception.status, 409)
+                self.assertEqual(retry.exception.reason, "quote_session_retired")
+
+                fresh = copy.deepcopy(draft)
+                fresh["quote_session"]["session_id"] = "quote-g3-fresh-after-delete"
+                saved = webapp.create_or_update_quote_session(fresh)
+                self.assertEqual(saved["session_id"], "quote-g3-fresh-after-delete")
+
+                with LocalRunnerServer() as runner:
+                    rejected = self._post_local_quote_session(runner, draft)
+                self.assertEqual(rejected["status"], 409)
+                self.assertEqual(rejected["body"]["status"], "blocked")
+                self.assertRegex(rejected["body"]["error_reference"], r"^ERR-[A-F0-9]{8}$")
+                self.assertEqual(len(rejected["body"]["errors"]), 1)
+                self.assertNotIn(session_id, json.dumps(rejected["body"]))
+
+    def test_local_quote_session_retirement_failure_is_non_success_and_retryable(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-g3-delete-retry"
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": session_id}
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                webapp.create_or_update_quote_session(payload)
+                session_dir = data_root / "quote-sessions" / session_id
+                marker_path = webapp.quote_session_retired_marker_path()
+
+                with mock.patch.object(webapp, "atomic_write_text", side_effect=OSError("synthetic retirement write failure")):
+                    with self.assertRaises(webapp.SqagStorageAccessError):
+                        webapp.delete_quote_session(session_id)
+                self.assertTrue(session_dir.is_dir())
+                self.assertFalse(marker_path.exists())
+
+                with mock.patch.object(webapp.shutil, "rmtree", side_effect=OSError("synthetic tree removal failure")):
+                    with self.assertRaises(OSError):
+                        webapp.delete_quote_session(session_id)
+                self.assertTrue(session_dir.is_dir())
+                self.assertTrue(webapp.quote_session_is_retired(session_id))
+
+                self.assertTrue(webapp.delete_quote_session(session_id))
+                self.assertFalse(session_dir.exists())
+                self.assertTrue(marker_path.is_file())
+                self.assertFalse(webapp.quote_session_is_retired("quote-g3-never-created"))
+
+    def test_local_quote_session_mutation_locks_are_independent_per_session(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            held_id = "quote-g3-held-session"
+            independent_id = "quote-g3-independent"
+            held_payload, held_result, held_output = self._local_publication_case(
+                root,
+                held_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-held\n%%EOF\n",
+                variant="held",
+            )
+            independent_payload, independent_result, independent_output = self._local_publication_case(
+                root,
+                independent_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-independent\n%%EOF\n",
+                variant="independent",
+            )
+            held_entered = threading.Event()
+            held_release = threading.Event()
+            independent_done = threading.Event()
+            results = {}
+            original_stage = webapp.stage_local_quote_publication
+
+            def pause_only_held(session_id, *args, **kwargs):
+                if session_id == held_id:
+                    held_entered.set()
+                    if not held_release.wait(5):
+                        raise AssertionError("Timed out waiting to release held session.")
+                return original_stage(session_id, *args, **kwargs)
+
+            def run_independent():
+                try:
+                    results["independent"] = webapp.create_or_update_quote_session(
+                        independent_payload,
+                        result=independent_result,
+                        output_dir=independent_output,
+                    )
+                except Exception as exc:
+                    results["independent"] = exc
+                finally:
+                    independent_done.set()
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), mock.patch.object(
+                webapp,
+                "stage_local_quote_publication",
+                side_effect=pause_only_held,
+            ):
+                held_thread = threading.Thread(
+                    target=lambda: results.setdefault(
+                        "held",
+                        webapp.create_or_update_quote_session(
+                            held_payload,
+                            result=held_result,
+                            output_dir=held_output,
+                        ),
+                    )
+                )
+                held_thread.start()
+                self.assertTrue(held_entered.wait(5), "Held session did not reach its staging boundary.")
+
+                independent_thread = threading.Thread(target=run_independent)
+                independent_thread.start()
+                self.assertTrue(independent_done.wait(5), "Independent session was blocked by another session's mutation.")
+                self.assertIsInstance(results["independent"], dict)
+
+                held_release.set()
+                held_thread.join(timeout=5)
+                independent_thread.join(timeout=5)
+            self.assertFalse(held_thread.is_alive(), "Held session thread remained blocked.")
+            self.assertFalse(independent_thread.is_alive(), "Independent session thread remained blocked.")
+            self.assertIsInstance(results["held"], dict)
+
     def test_protected_deploy_quote_session_routes_block_local_runtime_storage(self):
         root = test_temp_root() / f"quote-session-protected-deploy-{time.time_ns()}"
         data_root = root / "data"
