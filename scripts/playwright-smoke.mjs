@@ -45,6 +45,7 @@ const quoteSessionFixtureHeader = "x-sqag-smoke-fixture";
 const quoteSessionOperationNameHeader = "x-sqag-smoke-operation";
 const quoteSessionSessionHeader = "x-sqag-smoke-session-id";
 const quoteSessionPersistenceClassHeader = "x-sqag-smoke-persistence-class";
+const quoteSessionCorrelationHeader = "x-sqag-smoke-correlation-token";
 const quoteSessionOperationStorageKey = "__sqag_smoke_quote_session_operation_v1";
 const quoteSessionSaveResultsKey = "__sqagSmokeQuoteSessionSaveResults";
 
@@ -78,10 +79,261 @@ function quoteSessionValueContains(actual, expected) {
   return Object.is(actual, expected);
 }
 
+const relayHopByHopHeaders = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+function readRelayRequestBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    request.once("end", () => resolve(Buffer.concat(chunks)));
+    request.once("error", reject);
+    request.once("aborted", () => reject(new Error("relay client request aborted before upstream dispatch")));
+  });
+}
+
+function relayForwardHeaders(request, upstreamUrl) {
+  const headers = {};
+  for (const [name, value] of Object.entries(request.headers || {})) {
+    const lowerName = name.toLowerCase();
+    if (relayHopByHopHeaders.has(lowerName) || lowerName === "content-length") continue;
+    headers[name] = value;
+  }
+  const upstreamOrigin = new URL(upstreamUrl).origin;
+  const upstreamHost = new URL(upstreamUrl).host;
+  if (request.headers?.host) headers.host = upstreamHost;
+  if (request.headers?.origin) headers.origin = upstreamOrigin;
+  if (request.headers?.referer) {
+    try {
+      const referer = new URL(request.headers.referer);
+      headers.referer = `${upstreamOrigin}${referer.pathname}${referer.search}${referer.hash}`;
+    } catch {
+      delete headers.referer;
+    }
+  }
+  return headers;
+}
+
+function relayResponseHeaders(response, body) {
+  const headers = {};
+  for (const [name, value] of response.headers) {
+    const lowerName = name.toLowerCase();
+    if (relayHopByHopHeaders.has(lowerName) || lowerName === "content-length" || lowerName === "content-encoding") continue;
+    headers[name] = value;
+  }
+  if (typeof response.headers.getSetCookie === "function") {
+    const setCookies = response.headers.getSetCookie();
+    if (setCookies.length) headers["set-cookie"] = setCookies;
+  }
+  headers["content-length"] = String(body.length);
+  return headers;
+}
+
+async function createSqag212LoopbackRelay(upstreamUrl) {
+  const registrations = new Map();
+  const server = createServer((request, response) => {
+    void (async () => {
+      const requestUrl = new URL(request.url || "/", "http://sqag212-relay.invalid");
+      const correlationToken = String(request.headers[quoteSessionCorrelationHeader] || "");
+      const registration = correlationToken ? registrations.get(correlationToken) : null;
+      if (registration) {
+        const expected = registration.expected;
+        const actual = {
+          method: String(request.method || "").toUpperCase(),
+          path: requestUrl.pathname,
+          operationId: String(request.headers[quoteSessionOperationHeader] || ""),
+          sessionId: String(request.headers[quoteSessionSessionHeader] || ""),
+          correlationToken,
+        };
+        if (
+          actual.method !== expected.method
+          || actual.path !== expected.path
+          || actual.operationId !== expected.operationId
+          || actual.sessionId !== expected.sessionId
+          || actual.correlationToken !== expected.correlationToken
+        ) {
+          const error = new Error(`Relay request identity mismatch: ${JSON.stringify({ expected, actual })}`);
+          registration.failure = error;
+          registration.readyReject(error);
+          response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+          response.end("relay request identity mismatch");
+          return;
+        }
+        const transaction = {
+          registration,
+          relayRequest: request,
+          relayResponse: response,
+          applicationRequest: {
+            method: actual.method,
+            path: actual.path,
+            operationId: actual.operationId,
+            sessionId: actual.sessionId,
+            correlationToken: actual.correlationToken,
+          },
+          clientCloseObserved: false,
+          clientCloseAt: 0,
+          clientCloseResolve: registration.clientCloseResolve,
+          clientClosePromise: registration.clientClose,
+          hold: registration.hold,
+          responseCompleted: false,
+        };
+        registration.transaction = transaction;
+        const markClientClose = () => {
+          if (transaction.responseCompleted || transaction.clientCloseObserved) return;
+          transaction.clientCloseObserved = true;
+          transaction.clientCloseAt = Date.now();
+          transaction.clientCloseResolve(transaction);
+        };
+        request.once("aborted", markClientClose);
+        response.once("close", markClientClose);
+        try {
+          const body = await readRelayRequestBody(request);
+          const target = new URL(`${requestUrl.pathname}${requestUrl.search}`, upstreamUrl);
+          const upstreamResponse = await fetch(target, {
+            method: actual.method,
+            headers: relayForwardHeaders(request, upstreamUrl),
+            body: ["GET", "HEAD"].includes(actual.method) ? undefined : body,
+          });
+          const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+          transaction.upstreamResponse = {
+            status: upstreamResponse.status,
+            headers: Object.fromEntries(upstreamResponse.headers.entries()),
+            body: upstreamBody,
+            bodyText: upstreamBody.toString("utf8"),
+            bodyBytes: upstreamBody,
+          };
+          if (registration.validateUpstream) {
+            await registration.validateUpstream(transaction.upstreamResponse, transaction);
+          }
+          registration.readyResolve(transaction);
+          if (registration.hold) {
+            await Promise.race([transaction.clientClosePromise, registration.release]);
+          }
+          if (transaction.clientCloseObserved) return;
+          response.writeHead(
+            transaction.upstreamResponse.status,
+            relayResponseHeaders(upstreamResponse, upstreamBody),
+          );
+          transaction.responseCompleted = true;
+          response.end(upstreamBody);
+        } catch (error) {
+          registration.failure = registration.failure || error;
+          registration.readyReject(error);
+          if (!response.writableEnded && !transaction.clientCloseObserved) {
+            response.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+            response.end("relay upstream failure");
+          }
+        }
+        return;
+      }
+
+      try {
+        const body = await readRelayRequestBody(request);
+        const target = new URL(`${requestUrl.pathname}${requestUrl.search}`, upstreamUrl);
+        const upstreamResponse = await fetch(target, {
+          method: String(request.method || "GET").toUpperCase(),
+          headers: relayForwardHeaders(request, upstreamUrl),
+          body: ["GET", "HEAD"].includes(String(request.method || "GET").toUpperCase()) ? undefined : body,
+        });
+        const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+        response.writeHead(upstreamResponse.status, relayResponseHeaders(upstreamResponse, upstreamBody));
+        response.end(upstreamBody);
+      } catch (error) {
+        if (!response.writableEnded) {
+          response.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+          response.end("relay upstream failure");
+        }
+      }
+    })();
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("SQAG #212 relay did not expose a loopback address.");
+  }
+
+  const register = ({ method, pathName, operationId, sessionId, correlationToken, validateUpstream, hold = true }) => {
+    if (!correlationToken || registrations.has(correlationToken)) {
+      throw new Error("SQAG #212 relay registration requires a unique correlation token.");
+    }
+    let readyResolve;
+    let readyReject;
+    let clientCloseResolve;
+    let releaseResolve;
+    const registration = {
+      expected: {
+        method,
+        path: pathName,
+        operationId,
+        sessionId,
+        correlationToken,
+      },
+      hold,
+      validateUpstream,
+      ready: new Promise((resolve, reject) => {
+        readyResolve = resolve;
+        readyReject = reject;
+      }),
+      clientClose: new Promise((resolve) => { clientCloseResolve = resolve; }),
+      release: new Promise((resolve) => { releaseResolve = resolve; }),
+      readyResolve,
+      readyReject,
+      clientCloseResolve,
+      releaseResolve,
+      released: false,
+      readyResolved: false,
+      browserRequest: null,
+      browserRequestBoundAt: 0,
+      transaction: null,
+      failure: null,
+    };
+    registrations.set(correlationToken, registration);
+    return {
+      registration,
+      ready: registration.ready,
+      clientClose: registration.clientClose,
+      release: (value = "release") => {
+        registration.released = true;
+        registration.releaseResolve(value);
+      },
+      unregister: () => registrations.delete(correlationToken),
+    };
+  };
+
+  const bindBrowserRequest = (request) => {
+    const correlationToken = String(request.headers()[quoteSessionCorrelationHeader] || "");
+    if (!correlationToken) return;
+    const registration = registrations.get(correlationToken);
+    if (!registration) return;
+    registration.browserRequest = request;
+    registration.browserRequestBoundAt = Date.now();
+  };
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    register,
+    bindBrowserRequest,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
 function quoteSessionExpectedFields(payload) {
   const draft = payload?.draft_state && typeof payload.draft_state === "object" ? payload.draft_state : {};
   const draftFields = {};
-  for (const key of ["workflowStage", "basisConfirmed", "outputRevision", "quoteCommercialLifecycle", "quoteCommercialReview"]) {
+  for (const key of ["workflowStage", "basisConfirmed", "outputRevision", "quoteCommercialLifecycle", "quoteCommercialReview", "outputRows"]) {
     if (Object.prototype.hasOwnProperty.call(draft, key) && draft[key] != null) draftFields[key] = draft[key];
   }
   return {
@@ -99,7 +351,7 @@ function quoteSessionActualFields(session) {
   const value = session && typeof session === "object" ? session : {};
   const draft = value.draft_state && typeof value.draft_state === "object" ? value.draft_state : {};
   const draftFields = {};
-  for (const key of ["workflowStage", "basisConfirmed", "outputRevision", "quoteCommercialLifecycle", "quoteCommercialReview"]) {
+  for (const key of ["workflowStage", "basisConfirmed", "outputRevision", "quoteCommercialLifecycle", "quoteCommercialReview", "outputRows"]) {
     if (Object.prototype.hasOwnProperty.call(draft, key)) draftFields[key] = draft[key];
   }
   return {
@@ -122,8 +374,20 @@ function createQuoteSessionDrainTracker(group) {
   const pendingResponseBodies = new Set();
   const pendingReadbacks = new Set();
   const pendingSavePromises = new Set();
+  const pendingRequiredJobs = new Set();
+  const pendingQueuedSaveWork = new Map();
   const issues = [];
+  const progressWaiters = new Set();
+  const drainWaitingWaiters = new Set();
+  let drainWaiting = false;
+  let progressGeneration = 0;
   let operationSequence = 0;
+
+  const notifyProgress = () => {
+    progressGeneration += 1;
+    for (const waiter of [...progressWaiters]) waiter.resolve(progressGeneration);
+    progressWaiters.clear();
+  };
 
   const addIssue = (record, reason) => {
     issues.push({
@@ -132,6 +396,102 @@ function createQuoteSessionDrainTracker(group) {
       operation: record?.operation || "quote-session-drain",
       reason,
     });
+    notifyProgress();
+  };
+
+  const trackRequiredJob = (promise, identity) => {
+    const job = {
+      identity: String(identity || `${group}/required-job-${Date.now()}-${operationSequence + 1}`),
+      promise,
+      producer: promise,
+    };
+    pendingRequiredJobs.add(job);
+    if (!promise) {
+      notifyProgress();
+      return job;
+    }
+    Promise.resolve(promise).catch((error) => {
+      addIssue({ operationId: job.identity, fixture: group, operation: "required-job" }, `required job failed: ${error?.message || error}`);
+    }).finally(() => {
+      pendingRequiredJobs.delete(job);
+      notifyProgress();
+    });
+    return job;
+  };
+
+  const registerQueuedSaveWork = (snapshot) => {
+    const timerIdentity = String(snapshot?.timerIdentity || "");
+    if (!timerIdentity || !snapshot?.options || typeof snapshot.options !== "object") {
+      addIssue({ operationId: "<queued-save>", fixture: group, operation: "queued-save" }, "pending quote-session save timer has no captured options or identity");
+      return null;
+    }
+    let entry = pendingQueuedSaveWork.get(timerIdentity);
+    if (!entry) {
+      entry = {
+        identity: `${group}/queued-save/${timerIdentity}`,
+        snapshot,
+        producer: null,
+      };
+      pendingQueuedSaveWork.set(timerIdentity, entry);
+      notifyProgress();
+    }
+    return entry;
+  };
+
+  const attachQueuedSaveProducer = (entry, promise) => {
+    if (!entry || !promise) return;
+    entry.producer = promise;
+    Promise.resolve(promise).catch((error) => {
+      addIssue({ operationId: entry.identity, fixture: group, operation: "queued-save" }, `queued quote-session save failed: ${error?.message || error}`);
+    }).finally(() => {
+      pendingQueuedSaveWork.delete(String(entry.snapshot.timerIdentity));
+      notifyProgress();
+    });
+    notifyProgress();
+  };
+
+  const createProgressWaiter = (timeoutMs) => {
+    let timer;
+    let resolveWaiter;
+    const promise = new Promise((resolve) => { resolveWaiter = resolve; });
+    const waiter = {
+      promise,
+      resolve: (generation) => {
+        if (timer) clearTimeout(timer);
+        resolveWaiter({ type: "progress", generation });
+      },
+      cancel: () => {
+        if (timer) clearTimeout(timer);
+        progressWaiters.delete(waiter);
+      },
+    };
+    timer = setTimeout(() => {
+      progressWaiters.delete(waiter);
+      resolveWaiter({ type: "deadline" });
+    }, Math.max(0, timeoutMs));
+    progressWaiters.add(waiter);
+    return waiter;
+  };
+
+  const waitForDrainWaiting = (timeoutMs = 5000) => {
+    if (drainWaiting) return Promise.resolve({ waiting: true });
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        drainWaitingWaiters.delete(waiter);
+        reject(new Error("Required drain did not reach its deferred waiting state."));
+      }, Math.max(0, timeoutMs));
+      drainWaitingWaiters.add(waiter);
+    });
+  };
+
+  const notifyDrainWaiting = () => {
+    drainWaiting = true;
+    for (const waiter of [...drainWaitingWaiters]) {
+      clearTimeout(waiter.timer);
+      drainWaitingWaiters.delete(waiter);
+      waiter.resolve({ waiting: true });
+    }
   };
 
   const readPayload = (request) => {
@@ -201,6 +561,7 @@ function createQuoteSessionDrainTracker(group) {
       return null;
     } finally {
       pendingReadbacks.delete(record);
+      notifyProgress();
     }
   };
 
@@ -213,6 +574,7 @@ function createQuoteSessionDrainTracker(group) {
       try { body = JSON.parse(responseText); } catch { body = null; }
     } finally {
       pendingResponseBodies.delete(record);
+      notifyProgress();
     }
     record.httpStatus = response.status();
     record.bodyStatus = String(body?.status || "");
@@ -222,6 +584,7 @@ function createQuoteSessionDrainTracker(group) {
       ? responseSession.status.quote_generated : null;
     if (record.kind === "list") {
       pendingRequiredRequests.delete(record);
+      notifyProgress();
       if (record.httpStatus !== 200) {
         addIssue(record, `required quote-session list returned HTTP ${record.httpStatus}`);
       }
@@ -238,6 +601,7 @@ function createQuoteSessionDrainTracker(group) {
     }
     if (record.kind === "detail") {
       pendingRequiredRequests.delete(record);
+      notifyProgress();
       if (record.httpStatus !== 200) {
         addIssue(record, `required quote-session detail returned HTTP ${record.httpStatus}`);
       }
@@ -254,6 +618,7 @@ function createQuoteSessionDrainTracker(group) {
     record.clientResult = clientResult;
     pendingRequiredRequests.delete(record);
     pendingSavePromises.delete(record);
+    notifyProgress();
     if (record.httpStatus < 200 || record.httpStatus >= 300) addIssue(record, `required save returned HTTP ${record.httpStatus}`);
     if (record.bodyStatus !== "saved") addIssue(record, "required save response body status was not saved");
     if (!responseSession || record.responseSessionId !== record.expectedSessionId) {
@@ -265,7 +630,20 @@ function createQuoteSessionDrainTracker(group) {
     if (!clientResult || clientResult.nonNull !== true || clientResult.sessionId !== record.expectedSessionId) {
       addIssue(record, "initiating application save promise did not return the exact saved session");
     }
-    await durableReadback(record.request, record);
+    const readbackPromise = durableReadback(record.request, record);
+    record.readbackProducer = readbackPromise;
+    await readbackPromise;
+  };
+
+  const queuedSaveMatchesRecord = (entry, record) => {
+    const snapshot = entry?.snapshot || {};
+    if (snapshot.sessionId && snapshot.sessionId !== record.expectedSessionId) return false;
+    const expectedQuoteGenerated = snapshot.options?.quoteGenerated;
+    if (typeof expectedQuoteGenerated === "boolean" && expectedQuoteGenerated !== record.expectedQuoteGenerated) return false;
+    if (snapshot.draftState && record.payloadDraftState) {
+      return JSON.stringify(stableJson(snapshot.draftState)) === JSON.stringify(stableJson(record.payloadDraftState));
+    }
+    return true;
   };
 
   const observeRequest = (request) => {
@@ -281,9 +659,13 @@ function createQuoteSessionDrainTracker(group) {
       fixture: String(headers[quoteSessionFixtureHeader] || group),
       operation: String(headers[quoteSessionOperationNameHeader] || operationId),
       persistenceClass: String(headers[quoteSessionPersistenceClassHeader] || "REQUIRED_SUCCESS"),
+      correlationToken: String(headers[quoteSessionCorrelationHeader] || ""),
       expectedSessionId: quoteSessionRequestId(request, payload),
       expectedQuoteGenerated: typeof payload?.status?.quote_generated === "boolean" ? payload.status.quote_generated : null,
       expectedFields: quoteSessionExpectedFields(payload),
+      payloadDraftState: payload?.draft_state && typeof payload.draft_state === "object" ? payload.draft_state : null,
+      terminalProducer: "browser-response-or-requestfailed",
+      terminalResolve: null,
       httpStatus: null,
       bodyStatus: "",
       responseSessionId: "",
@@ -293,11 +675,18 @@ function createQuoteSessionDrainTracker(group) {
       transportFailure: false,
       done: false,
     };
+    record.terminalPromise = new Promise((resolve) => { record.terminalResolve = resolve; });
     requestRecords.set(request, record);
     records.push(record);
     if (record.persistenceClass !== "DIAGNOSTIC_ONLY") {
       pendingRequiredRequests.add(record);
       pendingSavePromises.add(record);
+      for (const entry of pendingQueuedSaveWork.values()) {
+        if (!entry.producer && queuedSaveMatchesRecord(entry, record)) {
+          attachQueuedSaveProducer(entry, record.terminalPromise);
+        }
+      }
+      notifyProgress();
     }
   };
 
@@ -317,8 +706,12 @@ function createQuoteSessionDrainTracker(group) {
       fixture: String(headers[quoteSessionFixtureHeader] || group),
       operation: String(headers[quoteSessionOperationNameHeader] || operationId),
       persistenceClass,
+      correlationToken: String(headers[quoteSessionCorrelationHeader] || ""),
       expectedSessionId,
       expectedFields: detailExpectations.get(operationId) || {},
+      payloadDraftState: null,
+      terminalProducer: "browser-response-or-requestfailed",
+      terminalResolve: null,
       httpStatus: null,
       bodyStatus: "",
       responseSessionId: "",
@@ -328,10 +721,12 @@ function createQuoteSessionDrainTracker(group) {
       transportFailure: false,
       done: false,
     };
+    record.terminalPromise = new Promise((resolve) => { record.terminalResolve = resolve; });
     detailExpectations.delete(operationId);
     requestRecords.set(request, record);
     records.push(record);
     pendingRequiredRequests.add(record);
+    notifyProgress();
   };
 
   const observeListRequest = (request) => {
@@ -348,8 +743,12 @@ function createQuoteSessionDrainTracker(group) {
       fixture: String(headers[quoteSessionFixtureHeader] || group),
       operation: String(headers[quoteSessionOperationNameHeader] || operationId),
       persistenceClass,
+      correlationToken: String(headers[quoteSessionCorrelationHeader] || ""),
       expectedSessionId: quoteSessionRequestId(request),
       expectedFields: detailExpectations.get(operationId) || {},
+      payloadDraftState: null,
+      terminalProducer: "browser-response-or-requestfailed",
+      terminalResolve: null,
       httpStatus: null,
       bodyStatus: "",
       responseSessionId: "",
@@ -359,10 +758,12 @@ function createQuoteSessionDrainTracker(group) {
       transportFailure: false,
       done: false,
     };
+    record.terminalPromise = new Promise((resolve) => { record.terminalResolve = resolve; });
     detailExpectations.delete(operationId);
     requestRecords.set(request, record);
     records.push(record);
     pendingRequiredRequests.add(record);
+    notifyProgress();
   };
 
   const observeResponse = (response) => {
@@ -372,8 +773,11 @@ function createQuoteSessionDrainTracker(group) {
       .catch((error) => addIssue(record, `required response/body/save/readback drain failed: ${error?.message || error}`))
       .finally(() => {
         record.done = true;
+        record.terminalResolve?.();
         tasks.delete(task);
+        notifyProgress();
       });
+    record.responseBodyProducer = task;
     tasks.add(task);
   };
 
@@ -381,12 +785,14 @@ function createQuoteSessionDrainTracker(group) {
     const record = requestRecords.get(request);
     if (!record || record.done) return;
     record.done = true;
+    record.terminalResolve?.();
     record.transportFailure = true;
     pendingRequiredRequests.delete(record);
     pendingSavePromises.delete(record);
     if (record.persistenceClass !== "DIAGNOSTIC_ONLY") {
       addIssue(record, `required quote-session save request failed: ${request.failure()?.errorText || "transport failure"}`);
     }
+    notifyProgress();
   };
 
   const install = async (context) => {
@@ -398,6 +804,82 @@ function createQuoteSessionDrainTracker(group) {
       };
       const nextOperationId = (kind) => `${settings.group}/${Date.now()}-${++sequence}/${kind}`;
       window[settings.resultStorageKey] = [];
+      const cloneOptions = (value) => {
+        try {
+          return JSON.parse(JSON.stringify(value && typeof value === "object" ? value : {}));
+        } catch {
+          return null;
+        }
+      };
+      const timerState = window.__sqagSmokeQuoteSessionTimerState || {
+        pending: null,
+        last: null,
+        queueCaptureDepth: 0,
+        queueOptions: null,
+        saveCalls: [],
+      };
+      window.__sqagSmokeQuoteSessionTimerState = timerState;
+      if (!window.__sqagSmokeQuoteSessionTimerHooksInstalled) {
+        const nativeSetTimeout = window.setTimeout.bind(window);
+        const nativeClearTimeout = window.clearTimeout.bind(window);
+        window.setTimeout = (handler, delay, ...args) => {
+          let timerId = null;
+          const wrappedHandler = (...callbackArgs) => {
+            const current = window.__sqagSmokeQuoteSessionTimerState;
+            if (current?.pending && String(current.pending.timerIdentity) === String(timerId)) {
+              current.pending.active = false;
+              current.pending.firedAt = Date.now();
+              current.last = current.pending;
+              current.pending = null;
+            }
+            return handler(...callbackArgs);
+          };
+          timerId = nativeSetTimeout(wrappedHandler, delay, ...args);
+          const current = window.__sqagSmokeQuoteSessionTimerState;
+          if (current?.queueCaptureDepth > 0) {
+            let persistedSessionId = "";
+            try {
+              persistedSessionId = String(JSON.parse(localStorage.getItem("swooshz_quote_session_v1") || "{}").quoteSessionId || "");
+            } catch {
+              persistedSessionId = "";
+            }
+            const snapshot = {
+              timerIdentity: String(timerId),
+              options: cloneOptions(current.queueOptions),
+              sessionId: String(window.state?.quoteSessionId || persistedSessionId),
+              draftState: typeof window.currentQuoteSessionDraftState === "function"
+                ? cloneOptions(window.currentQuoteSessionDraftState()) : null,
+              draftFiles: typeof window.sessionFileRecordsFromDraft === "function"
+                ? cloneOptions(window.sessionFileRecordsFromDraft()) : null,
+              active: true,
+              queuedAt: Date.now(),
+              clearedAt: 0,
+              firedAt: 0,
+            };
+            current.pending = snapshot;
+            current.last = snapshot;
+          }
+          return timerId;
+        };
+        window.clearTimeout = (timerId, ...args) => {
+          const current = window.__sqagSmokeQuoteSessionTimerState;
+          if (current?.pending && String(current.pending.timerIdentity) === String(timerId)) {
+            current.pending.active = false;
+            current.pending.clearedAt = Date.now();
+            current.last = current.pending;
+            current.pending = null;
+          }
+          return nativeClearTimeout(timerId, ...args);
+        };
+        window.__sqagSmokeQuoteSessionTimerHooksInstalled = true;
+      }
+      window.__sqagSmokeGetPendingQuoteSessionDraftSave = () => {
+        const current = window.__sqagSmokeQuoteSessionTimerState || {};
+        return {
+          pending: current.pending ? cloneOptions(current.pending) : null,
+          last: current.last ? cloneOptions(current.last) : null,
+        };
+      };
       const nativeFetch = window.fetch.bind(window);
       window.fetch = (input, init = {}) => {
         let url;
@@ -426,6 +908,7 @@ function createQuoteSessionDrainTracker(group) {
         headers.set(settings.fixtureHeader, String(scope.fixture || settings.group));
         headers.set(settings.operationNameHeader, String(scope.operation || operationId));
         headers.set(settings.sessionHeader, sessionId);
+        if (scope.correlationToken) headers.set(settings.correlationHeader, String(scope.correlationToken));
         headers.set(settings.persistenceClassHeader, method === "POST" && url.pathname === "/api/quote-sessions"
           ? String(scope.persistenceClass || "REQUIRED_SUCCESS")
           : method === "GET" && (url.pathname === "/api/quote-sessions" || /^\/api\/quote-sessions\/[^/]+$/.test(url.pathname))
@@ -436,34 +919,71 @@ function createQuoteSessionDrainTracker(group) {
 
       const installSaveCapture = () => {
         const original = window.saveCurrentQuoteSession;
-        if (typeof original !== "function" || original.__sqagSmokeCaptured === true) return;
-        const wrapped = async function (...args) {
-          const scope = readScope();
-          const callNumber = Number(scope.calls || 0) + 1;
-          scope.calls = callNumber;
-          sessionStorage.setItem(settings.operationStorageKey, JSON.stringify(scope));
-          const options = args[0] && typeof args[0] === "object" ? args[0] : {};
-          const sessionId = String(options.sessionId || window.state?.quoteSessionId || "");
-          const operationId = scope.operationId && callNumber === 1
-            ? String(scope.operationId) : nextOperationId("save");
-          pendingOperations.push({ operationId, sessionId });
-          try {
-            const result = await original.apply(this, args);
-            window[settings.resultStorageKey].push({
-              operationId,
-              nonNull: Boolean(result && typeof result === "object"),
-              sessionId: String(result?.session_id || ""),
-              quoteGenerated: typeof result?.status?.quote_generated === "boolean" ? result.status.quote_generated : null,
-            });
-            return result;
-          } catch (error) {
-            window[settings.resultStorageKey].push({ operationId, nonNull: false, sessionId: "", quoteGenerated: null });
-            throw error;
-          }
-        };
-        Object.defineProperty(wrapped, "__sqagSmokeCaptured", { value: true });
-        window.saveCurrentQuoteSession = wrapped;
+        if (typeof original === "function" && original.__sqagSmokeCaptured !== true) {
+          const wrapped = async function (...args) {
+            const scope = readScope();
+            const callNumber = Number(scope.calls || 0) + 1;
+            scope.calls = callNumber;
+            sessionStorage.setItem(settings.operationStorageKey, JSON.stringify(scope));
+            const options = args[0] && typeof args[0] === "object" ? args[0] : {};
+            const sessionId = String(options.sessionId || window.state?.quoteSessionId || "");
+            const operationId = scope.operationId && callNumber === 1
+              ? String(scope.operationId) : nextOperationId("save");
+            pendingOperations.push({ operationId, sessionId });
+            try {
+              const result = await original.apply(this, args);
+              window[settings.resultStorageKey].push({
+                operationId,
+                nonNull: Boolean(result && typeof result === "object"),
+                sessionId: String(result?.session_id || ""),
+                quoteGenerated: typeof result?.status?.quote_generated === "boolean" ? result.status.quote_generated : null,
+              });
+              return result;
+            } catch (error) {
+              window[settings.resultStorageKey].push({ operationId, nonNull: false, sessionId: "", quoteGenerated: null });
+              throw error;
+            }
+          };
+          Object.defineProperty(wrapped, "__sqagSmokeCaptured", { value: true });
+          window.saveCurrentQuoteSession = wrapped;
+        }
+        const draftSave = window.saveQuoteSessionDraftState;
+        if (typeof draftSave === "function" && draftSave.__sqagSmokeCaptured !== true) {
+          const wrappedDraftSave = async function (...args) {
+            const options = args[0] && typeof args[0] === "object" ? cloneOptions(args[0]) : {};
+            window.__sqagSmokeQuoteSessionTimerState.saveCalls.push({ options, startedAt: Date.now() });
+            return draftSave.apply(this, args);
+          };
+          Object.defineProperty(wrappedDraftSave, "__sqagSmokeCaptured", { value: true });
+          window.saveQuoteSessionDraftState = wrappedDraftSave;
+        }
+        const queueSave = window.queueQuoteSessionDraftStateSave;
+        if (typeof queueSave === "function" && queueSave.__sqagSmokeCaptured !== true) {
+          const wrappedQueueSave = function (...args) {
+            const options = args[0] && typeof args[0] === "object" ? cloneOptions(args[0]) : {};
+            const current = window.__sqagSmokeQuoteSessionTimerState;
+            current.queueOptions = options;
+            current.queueCaptureDepth += 1;
+            try {
+              return queueSave.apply(this, args);
+            } finally {
+              current.queueCaptureDepth -= 1;
+              current.queueOptions = null;
+            }
+          };
+          Object.defineProperty(wrappedQueueSave, "__sqagSmokeCaptured", { value: true });
+          window.queueQuoteSessionDraftStateSave = wrappedQueueSave;
+        }
+        const clearSaveTimer = window.clearQuoteSessionDraftSaveTimer;
+        if (typeof clearSaveTimer === "function" && clearSaveTimer.__sqagSmokeCaptured !== true) {
+          const wrappedClearSaveTimer = function (...args) {
+            return clearSaveTimer.apply(this, args);
+          };
+          Object.defineProperty(wrappedClearSaveTimer, "__sqagSmokeCaptured", { value: true });
+          window.clearQuoteSessionDraftSaveTimer = wrappedClearSaveTimer;
+        }
       };
+      window.__sqagSmokeInstallQuoteSessionCapture = installSaveCapture;
       document.addEventListener("DOMContentLoaded", installSaveCapture, { once: true });
       window.addEventListener("load", installSaveCapture, { once: true });
       setTimeout(installSaveCapture, 0);
@@ -475,6 +995,7 @@ function createQuoteSessionDrainTracker(group) {
       fixtureHeader: quoteSessionFixtureHeader,
       operationNameHeader: quoteSessionOperationNameHeader,
       sessionHeader: quoteSessionSessionHeader,
+      correlationHeader: quoteSessionCorrelationHeader,
       persistenceClassHeader: quoteSessionPersistenceClassHeader,
     });
     const attachPage = (page) => {
@@ -489,10 +1010,13 @@ function createQuoteSessionDrainTracker(group) {
   };
 
   const setPageOperation = async (page, { fixture, operation, operationId, expectedSessionId, persistenceClass = "REQUIRED_SUCCESS" }) => {
+    const correlationToken = `${group}/correlation/${Date.now()}-${++operationSequence}`;
     await page.evaluate(({ key, value }) => sessionStorage.setItem(key, JSON.stringify(value)), {
       key: quoteSessionOperationStorageKey,
-      value: { fixture, operation, operationId, expectedSessionId, persistenceClass, calls: 0 },
+      value: { fixture, operation, operationId, expectedSessionId, persistenceClass, correlationToken, calls: 0 },
     });
+    await page.evaluate(() => window.__sqagSmokeInstallQuoteSessionCapture?.());
+    return correlationToken;
   };
 
   const requiredDetailReadback = async (page, sessionId, expectedFields = {}) => {
@@ -543,29 +1067,111 @@ function createQuoteSessionDrainTracker(group) {
   const setPageDiagnostic = async (page, operation, expectedSessionId = "") => {
     const operationId = typeof operation === "string" ? `${group}/${operation}-${Date.now()}-${++operationSequence}` : String(operation.operationId || `${group}/diagnostic-${Date.now()}-${++operationSequence}`);
     const operationName = typeof operation === "string" ? operation : String(operation.operation || operationId);
+    const correlationToken = `${group}/diagnostic-correlation/${Date.now()}-${++operationSequence}`;
     await page.evaluate(({ key, value }) => sessionStorage.setItem(key, JSON.stringify(value)), {
       key: quoteSessionOperationStorageKey,
-      value: { fixture: group, operation: operationName, operationId, expectedSessionId, persistenceClass: "DIAGNOSTIC_ONLY", calls: 0 },
+      value: { fixture: group, operation: operationName, operationId, expectedSessionId, correlationToken, persistenceClass: "DIAGNOSTIC_ONLY", calls: 0 },
     });
-    return operationId;
+    await page.evaluate(() => window.__sqagSmokeInstallQuoteSessionCapture?.());
+    return { operationId, correlationToken };
   };
 
-  const drain = async (timeoutMs = 30000) => {
+  const readQueuedSaveTimer = async (page) => {
+    if (!page || page.isClosed()) return null;
+    return page.evaluate(() => {
+      if (typeof window.__sqagSmokeGetPendingQuoteSessionDraftSave !== "function") {
+        throw new Error("Quote-session timer instrumentation was not installed.");
+      }
+      return window.__sqagSmokeGetPendingQuoteSessionDraftSave();
+    });
+  };
+
+  const syncQueuedSaveTimer = async (page) => {
+    const state = await readQueuedSaveTimer(page);
+    const snapshot = state?.pending?.active ? state.pending : null;
+    if (!snapshot) return null;
+    return registerQueuedSaveWork(snapshot);
+  };
+
+  const capturePendingQueuedSave = async (page) => {
+    const state = await readQueuedSaveTimer(page);
+    if (!state?.pending) return null;
+    const snapshot = state?.pending;
+    if (
+      snapshot.active !== true
+      || !snapshot.options
+      || typeof snapshot.options !== "object"
+      || typeof snapshot.options.quoteGenerated !== "boolean"
+      || !snapshot.timerIdentity
+      || !snapshot.sessionId
+      || !snapshot.draftState
+      || !Array.isArray(snapshot.draftFiles)
+    ) {
+      throw new Error(`Pending quote-session save timer was not capturable: ${JSON.stringify(state)}.`);
+    }
+    const entry = registerQueuedSaveWork(snapshot);
+    if (!entry) throw new Error("Pending quote-session save timer could not be registered.");
+    return { snapshot, entry };
+  };
+
+  const unproducedQueuedSaveWork = () => [...pendingQueuedSaveWork.values()].find((entry) => !entry.producer) || null;
+
+  const outstandingOperations = () => {
+    const operations = [];
+    for (const task of tasks) operations.push({ identity: `${group}/response-task`, producer: task });
+    for (const record of pendingRequiredRequests) operations.push({ identity: record.operationId, producer: record.terminalProducer ? record.terminalPromise : null });
+    for (const record of pendingResponseBodies) operations.push({ identity: `${record.operationId}/response-body`, producer: record.responseBodyProducer || null });
+    for (const record of pendingReadbacks) operations.push({ identity: `${record.operationId}/durable-readback`, producer: record.readbackProducer || null });
+    for (const record of pendingSavePromises) operations.push({ identity: `${record.operationId}/application-save`, producer: record.terminalProducer ? record.terminalPromise : null });
+    for (const job of pendingRequiredJobs) operations.push({ identity: job.identity, producer: job.producer });
+    for (const entry of pendingQueuedSaveWork.values()) operations.push({ identity: entry.identity, producer: entry.producer });
+    return operations;
+  };
+
+  const drain = async (timeoutMs = 30000, page = null) => {
+    await syncQueuedSaveTimer(page);
     const deadline = Date.now() + timeoutMs;
-    const hasOutstanding = () => tasks.size || pendingRequiredRequests.size || pendingResponseBodies.size || pendingReadbacks.size || pendingSavePromises.size;
-    while (hasOutstanding() && Date.now() < deadline) {
-      const pending = [...tasks];
-      const remaining = deadline - Date.now();
-      await Promise.race([
-        Promise.allSettled(pending),
-        new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 250))),
-      ]);
+    while (true) {
+      const waiter = createProgressWaiter(Math.max(0, deadline - Date.now()));
+      const generation = progressGeneration;
+      const outstanding = outstandingOperations();
+      const missingProducer = outstanding.filter((operation) => !operation.producer);
+      if (missingProducer.length) {
+        waiter.cancel();
+        addIssue(
+          { operationId: "<drain>", fixture: group, operation: "required-drain" },
+          `required operation has no terminal completion producer: ${missingProducer.map((operation) => operation.identity).join(", ")}`,
+        );
+        return false;
+      }
+      if (!outstanding.length) {
+        waiter.cancel();
+        return issues.length === 0;
+      }
+      if (progressGeneration !== generation) {
+        waiter.cancel();
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        waiter.cancel();
+        addIssue(
+          { operationId: "<drain>", fixture: group, operation: "required-drain" },
+          `required drain deadline expired with outstanding operations: ${outstanding.map((operation) => operation.identity).join(", ")}`,
+        );
+        return false;
+      }
+      notifyDrainWaiting();
+      const result = await waiter.promise;
+      drainWaiting = false;
+      if (result.type === "deadline") {
+        const remaining = outstandingOperations();
+        addIssue(
+          { operationId: "<drain>", fixture: group, operation: "required-drain" },
+          `required drain deadline expired with outstanding operations: ${remaining.map((operation) => operation.identity).join(", ")}`,
+        );
+        return false;
+      }
     }
-    if (tasks.size || pendingRequiredRequests.size || pendingResponseBodies.size || pendingReadbacks.size || pendingSavePromises.size) {
-      issues.push({ operationId: "<drain>", fixture: group, operation: "required-drain", reason: "required requests, response bodies, readbacks, or save promises remained outstanding" });
-      return false;
-    }
-    return true;
   };
 
   const assert = async () => {
@@ -586,20 +1192,59 @@ function createQuoteSessionDrainTracker(group) {
       requiredResponseBodies: [...pendingResponseBodies].length,
       requiredDurableReadbacks: [...pendingReadbacks].length,
       requiredSavePromises: [...pendingSavePromises].length,
-      nonterminalRequiredJobs: 0,
+      nonterminalRequiredJobs: [...pendingRequiredJobs].length,
+      queuedRequiredSaves: [...pendingQueuedSaveWork.values()].map((entry) => entry.identity),
+      progressGeneration,
     },
   });
 
-  return { install, setPageOperation, setPageDiagnostic, requiredDetailReadback, requiredDashboardRefresh, drain, assert, summary, records, issues };
+  return {
+    install,
+    setPageOperation,
+    setPageDiagnostic,
+    waitForDrainWaiting,
+    requiredDetailReadback,
+    requiredDashboardRefresh,
+    trackRequiredJob,
+    syncQueuedSaveTimer,
+    capturePendingQueuedSave,
+    unproducedQueuedSaveWork,
+    attachQueuedSaveProducer,
+    drain,
+    assert,
+    summary,
+    records,
+    issues,
+  };
 }
 
 async function flushRequiredQuoteSessionSaves(page, tracker) {
-  await page.evaluate(async () => {
-    clearQuoteSessionDraftSaveTimer();
-    const pending = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
-    await Promise.all(pending);
-  });
-  await tracker.drain();
+  const captured = await tracker.capturePendingQueuedSave(page);
+  const registered = captured || tracker.unproducedQueuedSaveWork?.();
+  if (registered) {
+    const snapshot = captured?.snapshot || registered.snapshot;
+    const entry = captured?.entry || registered;
+    const savePromise = page.evaluate(async (options) => {
+      clearQuoteSessionDraftSaveTimer();
+      return saveQuoteSessionDraftState(options);
+    }, snapshot.options);
+    tracker.attachQueuedSaveProducer(entry, savePromise);
+    await savePromise;
+    await page.evaluate(async () => {
+      const pending = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
+      await Promise.all(pending);
+    });
+    await tracker.drain(30000, page);
+    return;
+  }
+  if (!captured) {
+    await page.evaluate(async () => {
+      const pending = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
+      await Promise.all(pending);
+    });
+    await tracker.drain(30000, page);
+    return;
+  }
 }
 
 function pythonCommand() {
@@ -2378,19 +3023,26 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
   const listenerTasks = new Set();
   const listenerFailures = [];
   const unexpectedRequestFailures = [];
-  const expectedDiagnosticAborts = new Map();
-  const observedDiagnosticAborts = [];
+  let diagnosticRelay = null;
+  const observedDiagnosticNavigations = [];
   let drainSummary = null;
+  let drainControls = null;
+  let timerFlushControls = null;
   let browserNegativeControl = null;
   let drainListenerTasks = async (timeoutMs = 30000) => {
     const deadline = Date.now() + timeoutMs;
-    while (listenerTasks.size && Date.now() < deadline) {
-      await Promise.race([
-        Promise.allSettled([...listenerTasks]),
-        new Promise((resolve) => setTimeout(resolve, 100)),
+    while (listenerTasks.size) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new Error("Asynchronous response listeners remained outstanding.");
+      const snapshot = [...listenerTasks];
+      let timer;
+      const completed = await Promise.race([
+        Promise.allSettled(snapshot).then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), remainingMs); }),
       ]);
+      clearTimeout(timer);
+      if (!completed && listenerTasks.size) throw new Error("Asynchronous response listeners remained outstanding.");
     }
-    if (listenerTasks.size) throw new Error("Asynchronous response listeners remained outstanding.");
     if (listenerFailures.length) throw new Error(`Asynchronous response listener failed: ${JSON.stringify(listenerFailures.slice(0, 8))}`);
     if (unexpectedRequestFailures.length) throw new Error(`Unexpected request failure observed: ${JSON.stringify(unexpectedRequestFailures.slice(0, 8))}`);
   };
@@ -2418,6 +3070,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
   };
   try {
     browserPage = await isolatedContext.newPage();
+    diagnosticRelay = await createSqag212LoopbackRelay(baseUrl);
     browserPage.on("pageerror", (error) => pageErrors.push(error.message));
     const scheduleListenerTask = (label, work) => {
       const task = (async () => {
@@ -2465,21 +3118,13 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       }
     });
     const observeRequestFailure = (request) => {
-      const resolver = expectedDiagnosticAborts.get(request);
-      const failure = {
+      unexpectedRequestFailures.push({
         method: request.method(),
         path: quoteSessionPathForRequest(request),
         operationId: String(request.headers()[quoteSessionOperationHeader] || ""),
         sessionId: quoteSessionRequestId(request),
         errorText: request.failure()?.errorText || "transport failure",
-      };
-      if (resolver) {
-        expectedDiagnosticAborts.delete(request);
-        observedDiagnosticAborts.push(failure);
-        resolver(failure);
-      } else {
-        unexpectedRequestFailures.push(failure);
-      }
+      });
     };
     browserPage.on("requestfailed", observeRequestFailure);
 
@@ -2501,72 +3146,69 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         if (timer) clearTimeout(timer);
       }
     };
-    const runHeldDiagnosticRequest = async ({ page: diagnosticPage, operationId, sessionId: diagnosticSessionId, method, pathName, routePattern, dispatch, validateUpstream }) => {
-      const ready = createBarrier();
-      const release = createBarrier();
-      const settled = createBarrier();
-      const routeAbortCompleted = createBarrier();
-      let heldRequest = null;
-      let upstream = null;
-      let routeError = null;
-      await diagnosticPage.route(routePattern, async (route) => {
-        const request = route.request();
-        const headers = request.headers();
-        if (
-          request.method() !== method
-          || quoteSessionPathForRequest(request) !== pathName
-          || String(headers[quoteSessionOperationHeader] || "") !== operationId
-          || quoteSessionRequestId(request) !== diagnosticSessionId
-        ) {
-          await route.fallback();
-          return;
-        }
-        heldRequest = request;
-        try {
-          const response = await route.fetch();
-          const bodyText = await response.text();
-          let body = null;
-          try { body = JSON.parse(bodyText); } catch { body = null; }
-          upstream = {
-            status: response.status(),
-            headers: response.headers(),
-            bodyText,
-            body,
-          };
-          validateUpstream(upstream);
-        } catch (error) {
-          routeError = error;
-        } finally {
-          ready.resolve();
-        }
-        try {
-          const releaseAction = await release.promise;
-          if (releaseAction === "abort") {
-            try {
-              await route.abort("aborted");
-              routeAbortCompleted.resolve({ ok: true });
-            } catch (error) {
-              routeAbortCompleted.resolve({ ok: false, error: error?.message || String(error) });
-              throw error;
-            }
-          } else if (!routeError && upstream) {
-            await route.fulfill({
-              status: upstream.status,
-              headers: upstream.headers,
-              body: upstream.bodyText,
-            });
+    const runHeldDiagnosticRequest = async ({
+      page: diagnosticPage,
+      operationId,
+      sessionId: diagnosticSessionId,
+      method,
+      pathName,
+      correlationToken,
+      dispatch,
+      validateUpstream,
+      durableReadback,
+      navigate = true,
+      suppressRequestFailure = false,
+    }) => {
+      if (!diagnosticRelay) throw new Error("SQAG #212 diagnostic relay is not available.");
+      const registrationHandle = diagnosticRelay.register({
+        method,
+        pathName,
+        operationId,
+        sessionId: diagnosticSessionId,
+        correlationToken,
+        validateUpstream: async (upstream, transaction) => {
+          try {
+            upstream.body = JSON.parse(upstream.bodyText || "{}");
+          } catch {
+            upstream.body = null;
           }
-        } catch (error) {
-          routeError = routeError || error;
-        } finally {
-          settled.resolve();
-        }
+          validateUpstream(upstream);
+          if (durableReadback) await durableReadback(upstream, transaction);
+        },
+        hold: true,
       });
+      const failureBarrier = createBarrier();
+      let navigationInitiatedAt = 0;
+      let navigationCommittedAt = 0;
+      let observedFailure = null;
+      const onRequest = (request) => diagnosticRelay.bindBrowserRequest(request);
+      const onRequestFailed = (request) => {
+        if (request !== registrationHandle.registration.browserRequest) return;
+        const failure = {
+          method: request.method(),
+          path: quoteSessionPathForRequest(request),
+          operationId: String(request.headers()[quoteSessionOperationHeader] || ""),
+          sessionId: quoteSessionRequestId(request),
+          correlationToken: String(request.headers()[quoteSessionCorrelationHeader] || ""),
+          errorText: request.failure()?.errorText || "",
+          observedAt: Date.now(),
+        };
+        observedFailure = failure;
+        if (!suppressRequestFailure) failureBarrier.resolve(failure);
+      };
+      diagnosticPage.on("request", onRequest);
+      diagnosticPage.on("requestfailed", onRequestFailed);
+      let transaction = null;
       try {
         await dispatch();
-        await waitForBarrier(ready, `${method} ${pathName} diagnostic response`);
-        if (routeError) throw routeError;
-        if (!heldRequest || !upstream) throw new Error(`The exact ${method} ${pathName} diagnostic request was not held.`);
+        transaction = await Promise.race([
+          registrationHandle.ready,
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`${method} ${pathName} diagnostic relay did not complete upstream validation.`)), 15000)),
+        ]);
+        const registration = registrationHandle.registration;
+        if (!registration.browserRequest || !transaction.applicationRequest) {
+          throw new Error(`The ${method} ${pathName} diagnostic request was not bound to both Playwright and application identities.`);
+        }
         const visible = await diagnosticPage.evaluate(() => ({
           sessionId: String(window.__sqagNegativeSessionId || ""),
           settled: window.__sqagNegativeFetchSettled === true,
@@ -2574,60 +3216,113 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         if (visible.sessionId !== diagnosticSessionId || visible.settled) {
           throw new Error(`The diagnostic ${method} request did not prove visible identity plus outstanding work: ${JSON.stringify(visible)}.`);
         }
-        const abort = new Promise((resolve) => expectedDiagnosticAborts.set(heldRequest, resolve));
-        const navigation = diagnosticPage.goto("about:blank", { waitUntil: "commit", timeout: 15000 });
-        release.resolve("abort");
+        if (!navigate) {
+          registrationHandle.release();
+          await diagnosticPage.waitForFunction(() => window.__sqagNegativeFetchSettled === true, null, { timeout: 15000 });
+          if (observedFailure) throw new Error(`The positive diagnostic control unexpectedly emitted requestfailed: ${JSON.stringify(observedFailure)}.`);
+          return {
+            method,
+            path: pathName,
+            operationId,
+            sessionId: diagnosticSessionId,
+            upstreamStatus: transaction.upstreamResponse.status,
+            upstreamBodyStatus: String(transaction.upstreamResponse.body?.status || ""),
+            requestFailedObserved: false,
+            relayClientCloseObserved: false,
+            navigationInitiated: false,
+            navigationCommitted: false,
+            sameCorrelatedRequest: true,
+          };
+        }
+
+        navigationInitiatedAt = Date.now();
+        const navigation = diagnosticPage.goto(diagnosticRelay.baseUrl, { waitUntil: "commit", timeout: 15000 });
+        const clientClosePromise = registrationHandle.clientClose;
         await navigation;
-        const routeAbort = await waitForBarrier(routeAbortCompleted, `${method} ${pathName} exact route abort`);
-        if (!routeAbort.ok) throw new Error(`The exact diagnostic route could not abort: ${routeAbort.error}.`);
-        const abortEvent = await Promise.race([
-          abort.then((failure) => ({ failure })),
-          new Promise((resolve) => setTimeout(() => resolve({ failure: null }), 1000)),
+        navigationCommittedAt = Date.now();
+        const failure = await Promise.race([
+          failureBarrier.promise,
+          new Promise((resolve) => setTimeout(() => resolve(null), 2000)),
         ]);
-        const failure = abortEvent.failure || {
-          method,
-          path: pathName,
-          operationId,
-          sessionId: diagnosticSessionId,
-          errorText: "route.abort(aborted) after navigation",
-          observedBy: "exact-route-abort-after-navigation",
-        };
-        if (failure.method !== method || failure.path !== pathName || failure.operationId !== operationId || failure.sessionId !== diagnosticSessionId) {
-          throw new Error(`The diagnostic navigation abort was not bound to the exact operation/session: ${JSON.stringify(failure)}.`);
+        const clientClose = await Promise.race([
+          clientClosePromise,
+          new Promise((resolve) => setTimeout(() => resolve(null), 2000)),
+        ]);
+        if (suppressRequestFailure) {
+          if (observedFailure) {
+            throw new Error(`Missing requestfailed observation was not accepted: exact event=${JSON.stringify(observedFailure)}.`);
+          }
+          throw new Error("Missing requestfailed observation did not fail the navigation oracle.");
         }
-        release.resolve();
-        await waitForBarrier(settled, `${method} ${pathName} diagnostic settlement`);
-        return {
+        if (!failure || !failure.errorText) {
+          throw new Error(`The exact Playwright Request did not emit real requestfailed evidence for ${method} ${pathName}: ${JSON.stringify({
+            failure,
+            transaction: {
+              clientCloseObserved: transaction.clientCloseObserved,
+              clientCloseAt: transaction.clientCloseAt,
+              responseCompleted: transaction.responseCompleted,
+              hold: transaction.hold,
+              released: transaction.registration.released,
+              upstreamStatus: transaction.upstreamResponse?.status,
+            },
+            navigationInitiatedAt,
+            navigationCommittedAt,
+          })}.`);
+        }
+        if (
+          failure.method !== method
+          || failure.path !== pathName
+          || failure.operationId !== operationId
+          || failure.sessionId !== diagnosticSessionId
+          || failure.correlationToken !== correlationToken
+          || failure.observedAt < navigationInitiatedAt
+        ) {
+          throw new Error(`The real requestfailed evidence was not bound to the exact navigation request: ${JSON.stringify(failure)}.`);
+        }
+        if (
+          !clientClose
+          || !transaction.clientCloseObserved
+          || transaction.clientCloseAt < navigationInitiatedAt
+        ) {
+          throw new Error(`The relay did not observe client closure during the held ${method} response after navigation: ${JSON.stringify({ clientClose, transaction })}.`);
+        }
+        const outcome = {
           method,
           path: pathName,
           operationId,
           sessionId: diagnosticSessionId,
-          upstreamStatus: upstream.status,
-          upstreamBodyStatus: String(upstream.body?.status || ""),
-          abortError: failure.errorText,
-          abortProof: "route.abort(aborted) after navigation",
-          requestFailedObserved: Boolean(abortEvent.failure),
-          routeSettlementError: routeError?.message || "",
+          correlationToken,
+          upstreamStatus: transaction.upstreamResponse.status,
+          upstreamBodyStatus: String(transaction.upstreamResponse.body?.status || ""),
+          requestFailedObserved: true,
+          relayClientCloseObserved: true,
+          navigationInitiated: navigationInitiatedAt > 0,
+          navigationCommitted: navigationCommittedAt > 0,
+          sameCorrelatedRequest: true,
+          requestFailureText: failure.errorText,
         };
+        observedDiagnosticNavigations.push(outcome);
+        return outcome;
       } finally {
-        release.resolve("abort");
-        if (heldRequest && !expectedDiagnosticAborts.has(heldRequest)) {
-          await Promise.race([settled.promise, new Promise((resolve) => setTimeout(resolve, 5000))]);
+        diagnosticPage.off("request", onRequest);
+        diagnosticPage.off("requestfailed", onRequestFailed);
+        if (!transaction?.clientCloseObserved && navigate && !diagnosticPage.isClosed()) {
+          await diagnosticPage.close().catch(() => {});
         }
-        await diagnosticPage.unroute(routePattern);
+        registrationHandle.unregister();
       }
     };
     const runQuoteSessionNavigationAbortNegativeControl = async (payload, diagnosticSessionId) => {
       if (!tracker) return { skipped: true };
       const diagnosticPage = await isolatedContext.newPage();
-      diagnosticPage.on("requestfailed", observeRequestFailure);
       const postOperationId = `sqag212/negative-control-held-save-post/${Date.now()}`;
       const detailOperationId = `sqag212/negative-control-held-detail-get/${Date.now()}`;
       const outcomes = [];
+      let missingObservationRejected = false;
       try {
-        await diagnosticPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+        await diagnosticPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
         await diagnosticPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
-        await tracker.setPageDiagnostic(diagnosticPage, { operationId: postOperationId, operation: "negative-control-held-save-post" }, diagnosticSessionId);
+        const postOperation = await tracker.setPageDiagnostic(diagnosticPage, { operationId: postOperationId, operation: "negative-control-held-save-post" }, diagnosticSessionId);
         const postPayload = JSON.parse(JSON.stringify(payload));
         postPayload.session_id = diagnosticSessionId;
         postPayload.status = { ...(postPayload.status || {}), quote_generated: false };
@@ -2637,7 +3332,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           sessionId: diagnosticSessionId,
           method: "POST",
           pathName: "/api/quote-sessions",
-          routePattern: "**/api/quote-sessions",
+          correlationToken: postOperation.correlationToken,
           dispatch: async () => diagnosticPage.evaluate((value) => {
             window.__sqagNegativeSessionId = value.session_id;
             window.__sqagNegativeFetchSettled = false;
@@ -2662,19 +3357,28 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
               throw new Error("Held save POST returned a different durable session identity.");
             }
           },
+          durableReadback: async () => {
+            const response = await fetch(`${baseUrl}/api/quote-sessions/${encodeURIComponent(diagnosticSessionId)}?__sqag_smoke_relay_readback=${Date.now()}`, {
+              headers: { "cache-control": "no-cache", pragma: "no-cache" },
+            });
+            const body = await response.json();
+            if (response.status !== 200 || String(body?.quote_session?.session_id || "") !== diagnosticSessionId) {
+              throw new Error(`Held save POST durable readback failed: ${JSON.stringify({ status: response.status, body })}.`);
+            }
+          },
         });
         outcomes.push(post);
 
-        await diagnosticPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+        await diagnosticPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
         await diagnosticPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
-        await tracker.setPageDiagnostic(diagnosticPage, { operationId: detailOperationId, operation: "negative-control-held-detail-get" }, diagnosticSessionId);
+        const detailOperation = await tracker.setPageDiagnostic(diagnosticPage, { operationId: detailOperationId, operation: "negative-control-held-detail-get" }, diagnosticSessionId);
         const detail = await runHeldDiagnosticRequest({
           page: diagnosticPage,
           operationId: detailOperationId,
           sessionId: diagnosticSessionId,
           method: "GET",
           pathName: `/api/quote-sessions/${encodeURIComponent(diagnosticSessionId)}`,
-          routePattern: "**/api/quote-sessions/*",
+          correlationToken: detailOperation.correlationToken,
           dispatch: async () => diagnosticPage.evaluate((id) => {
             window.__sqagNegativeSessionId = id;
             window.__sqagNegativeFetchSettled = false;
@@ -2696,26 +3400,405 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
               throw new Error("Held detail GET returned a different durable session identity.");
             }
           },
+          durableReadback: async () => {
+            const response = await fetch(`${baseUrl}/api/quote-sessions/${encodeURIComponent(diagnosticSessionId)}?__sqag_smoke_relay_detail_readback=${Date.now()}`, {
+              headers: { "cache-control": "no-cache", pragma: "no-cache" },
+            });
+            const body = await response.json();
+            if (response.status !== 200 || String(body?.quote_session?.session_id || "") !== diagnosticSessionId) {
+              throw new Error(`Held detail GET durable readback failed: ${JSON.stringify({ status: response.status, body })}.`);
+            }
+          },
         });
         outcomes.push(detail);
-        await diagnosticPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+
+        await diagnosticPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
         await diagnosticPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
-        await tracker.setPageDiagnostic(diagnosticPage, { operationId: `sqag212/negative-control-cleanup/${Date.now()}`, operation: "negative-control-cleanup" }, diagnosticSessionId);
+        const positiveOperation = await tracker.setPageDiagnostic(diagnosticPage, { operationId: `sqag212/positive-control-held-detail/${Date.now()}`, operation: "positive-control-held-detail" }, diagnosticSessionId);
+        const positive = await runHeldDiagnosticRequest({
+          page: diagnosticPage,
+          operationId: positiveOperation.operationId,
+          sessionId: diagnosticSessionId,
+          method: "GET",
+          pathName: `/api/quote-sessions/${encodeURIComponent(diagnosticSessionId)}`,
+          correlationToken: positiveOperation.correlationToken,
+          navigate: false,
+          dispatch: async () => diagnosticPage.evaluate((id) => {
+            window.__sqagNegativeSessionId = id;
+            window.__sqagNegativeFetchSettled = false;
+            window.__sqagNegativeFetchPromise = fetch(`/api/quote-sessions/${encodeURIComponent(id)}`)
+              .then(async (response) => ({ status: response.status, body: await response.text() }))
+              .finally(() => { window.__sqagNegativeFetchSettled = true; });
+          }, diagnosticSessionId),
+          validateUpstream: (response) => {
+            if (response.status !== 200 || !response.body?.quote_session) throw new Error("Positive held detail control did not receive a valid response.");
+          },
+        });
+        outcomes.push(positive);
+
+        await diagnosticPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+        await diagnosticPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+        const suppressedOperation = await tracker.setPageDiagnostic(diagnosticPage, { operationId: `sqag212/missing-requestfailed/${Date.now()}`, operation: "missing-requestfailed-observation" }, diagnosticSessionId);
+        try {
+          await runHeldDiagnosticRequest({
+            page: diagnosticPage,
+            operationId: suppressedOperation.operationId,
+            sessionId: diagnosticSessionId,
+            method: "GET",
+            pathName: `/api/quote-sessions/${encodeURIComponent(diagnosticSessionId)}`,
+            correlationToken: suppressedOperation.correlationToken,
+            suppressRequestFailure: true,
+            dispatch: async () => diagnosticPage.evaluate((id) => {
+              window.__sqagNegativeSessionId = id;
+              window.__sqagNegativeFetchSettled = false;
+              window.__sqagNegativeFetchPromise = fetch(`/api/quote-sessions/${encodeURIComponent(id)}`)
+                .then(async (response) => ({ status: response.status, body: await response.text() }))
+                .finally(() => { window.__sqagNegativeFetchSettled = true; });
+            }, diagnosticSessionId),
+            validateUpstream: (response) => {
+              if (response.status !== 200 || !response.body?.quote_session) throw new Error("Suppressed requestfailed control did not receive a valid response.");
+            },
+          });
+        } catch (error) {
+          if (!String(error?.message || error).includes("Missing requestfailed observation")) throw error;
+          missingObservationRejected = true;
+        }
+        if (!missingObservationRejected) throw new Error("The missing requestfailed observation variant unexpectedly passed.");
+
+        await diagnosticPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+        await diagnosticPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+        const cleanupOperation = await tracker.setPageDiagnostic(diagnosticPage, { operationId: `sqag212/negative-control-cleanup/${Date.now()}`, operation: "negative-control-cleanup" }, diagnosticSessionId);
         const cleanup = await diagnosticPage.evaluate(async (id) => {
           const headers = {};
           if (state.csrfToken) headers[state.csrfHeaderName] = state.csrfToken;
           const response = await fetch(`/api/quote-sessions/${encodeURIComponent(id)}`, { method: "DELETE", headers });
           return { status: response.status, body: await response.text() };
         }, diagnosticSessionId);
-        if (![200, 404].includes(cleanup.status)) {
-          throw new Error(`Negative-control diagnostic session cleanup failed: ${JSON.stringify(cleanup)}.`);
-        }
-        await tracker.drain();
-        return { skipped: false, outcomes, cleanupStatus: cleanup.status };
+        if (![200, 404].includes(cleanup.status)) throw new Error(`Negative-control diagnostic session cleanup failed: ${JSON.stringify(cleanup)}.`);
+        await tracker.drain(30000, diagnosticPage);
+        return { skipped: false, outcomes, cleanupStatus: cleanup.status, missingObservationRejected };
       } finally {
         await diagnosticPage.close();
       }
     };
+
+    const runSqag212DrainControls = async (savedSessionId) => {
+      const c5Page = await isolatedContext.newPage();
+      const operationId = `sqag212/c5-held-detail/${Date.now()}`;
+      let registrationHandle = null;
+      try {
+        await c5Page.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+        await c5Page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+        const correlationToken = await tracker.setPageOperation(c5Page, {
+          fixture: "sqag212",
+          operation: "c5-held-required-detail",
+          operationId,
+          expectedSessionId: savedSessionId,
+          persistenceClass: "REQUIRED_SUCCESS",
+        });
+        registrationHandle = diagnosticRelay.register({
+          method: "GET",
+          pathName: `/api/quote-sessions/${encodeURIComponent(savedSessionId)}`,
+          operationId,
+          sessionId: savedSessionId,
+          correlationToken,
+          validateUpstream: (upstream) => {
+            try {
+              upstream.body = JSON.parse(upstream.bodyText || "{}");
+            } catch {
+              upstream.body = null;
+            }
+            if (
+              upstream.status !== 200
+              || String(upstream.body?.quote_session?.session_id || "") !== savedSessionId
+            ) {
+              throw new Error(`C5 held detail upstream validation failed: ${JSON.stringify(upstream)}.`);
+            }
+          },
+          hold: true,
+        });
+        const requestPromise = c5Page.evaluate(async (id) => {
+          const response = await fetch(`/api/quote-sessions/${encodeURIComponent(id)}`);
+          return { status: response.status, body: await response.json() };
+        }, savedSessionId);
+        const transaction = await registrationHandle.ready;
+        const trackerRecord = tracker.records.find((record) => record.operationId === operationId);
+        if (!trackerRecord) throw new Error("C5 did not observe the real required detail request before drain start.");
+        const drainPromise = tracker.drain(30000, c5Page);
+        try {
+          await tracker.waitForDrainWaiting(5000);
+        } catch (error) {
+          throw new Error(`C5 drain did not reach deferred waiting state: ${error?.message || error}; tracker=${JSON.stringify(tracker.summary())}.`);
+        }
+        registrationHandle.release();
+        const response = await requestPromise;
+        await drainPromise;
+        if (response.status !== 200 || String(response.body?.quote_session?.session_id || "") !== savedSessionId) {
+          throw new Error(`C5 held detail request did not complete successfully: ${JSON.stringify(response)}.`);
+        }
+        return {
+          operationId,
+          releaseExecuted: true,
+          requestCompleted: true,
+          drainCompleted: true,
+          outstanding: tracker.summary().outstanding,
+          upstreamStatus: transaction.upstreamResponse.status,
+        };
+      } finally {
+        registrationHandle?.release();
+        registrationHandle?.unregister();
+        await c5Page.close();
+      }
+    };
+
+    const runSqag212TrackerFailureControls = async () => {
+      const orphanTracker = createQuoteSessionDrainTracker("sqag212-c5-orphan");
+      orphanTracker.trackRequiredJob(null, "sqag212-c5-orphan/no-producer");
+      const orphanDrained = await orphanTracker.drain(1000);
+      const orphanIssue = orphanTracker.issues.find((issue) => issue.reason.includes("no terminal completion producer"));
+
+      const deadlineTracker = createQuoteSessionDrainTracker("sqag212-c5-deadline");
+      deadlineTracker.trackRequiredJob(new Promise(() => {}), "sqag212-c5-deadline/never-settles");
+      const deadlineDrained = await deadlineTracker.drain(50);
+      const deadlineIssue = deadlineTracker.issues.find((issue) => issue.reason.includes("deadline expired"));
+      if (orphanDrained || !orphanIssue || deadlineDrained || !deadlineIssue) {
+        throw new Error(`C5 tracker failure controls were incomplete: ${JSON.stringify({ orphanDrained, orphanIssue, deadlineDrained, deadlineIssue })}.`);
+      }
+      return {
+        orphanProducerFailure: true,
+        orphanOutstandingIdentity: orphanIssue.operationId,
+        deadlineFailure: true,
+        deadlineOutstandingIdentity: deadlineIssue.operationId,
+      };
+    };
+
+    const setSyntheticDraftPrice = async (price) => browserPage.evaluate((value) => {
+      const current = state.outputRows?.[0];
+      if (!current) throw new Error("C6 requires an existing output row.");
+      const priced = synchronizeOwnedOutputRowPrice(current, value, { force: true });
+      state.outputRows[0] = recalculateOutputRow(priced);
+      renderPricingMatches(state.outputRows);
+      saveSessionState();
+      return currentQuoteSessionDraftState();
+    }, price);
+
+    const runSqag212TimerFlushControls = async (savedSessionId) => {
+      const pendingPrice = 19.75;
+      const operationId = `sqag212/c6-pending-timer/${Date.now()}`;
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "c6-pending-timer",
+        operationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      await setSyntheticDraftPrice(pendingPrice);
+      await browserPage.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false }));
+      const captured = await tracker.capturePendingQueuedSave(browserPage);
+      if (!captured || captured.snapshot.options.quoteGenerated !== false) {
+        throw new Error(`C6 did not retain the real pending timer options: ${JSON.stringify(captured?.snapshot || null)}.`);
+      }
+      await flushRequiredQuoteSessionSaves(browserPage, tracker);
+      const c6Records = tracker.records.filter((record) => record.operationId === operationId && record.persistenceClass !== "DIAGNOSTIC_ONLY");
+      if (c6Records.length !== 1) {
+        throw new Error(`C6 pending timer flush dispatched ${c6Records.length} real application saves instead of exactly one.`);
+      }
+      const c6Record = c6Records[0];
+      const persistedPrice = Number(c6Record.readback?.fields?.draft_state?.outputRows?.[0]?.unit_price_override);
+      if (
+        c6Record.httpStatus < 200
+        || c6Record.httpStatus >= 300
+        || c6Record.bodyStatus !== "saved"
+        || c6Record.responseSessionId !== savedSessionId
+        || c6Record.responseQuoteGenerated !== false
+        || c6Record.clientResult?.nonNull !== true
+        || c6Record.clientResult?.sessionId !== savedSessionId
+        || persistedPrice !== pendingPrice
+      ) {
+        throw new Error(`C6 real pending timer flush did not persist the changed draft: ${JSON.stringify({
+          httpStatus: c6Record.httpStatus,
+          bodyStatus: c6Record.bodyStatus,
+          responseSessionId: c6Record.responseSessionId,
+          responseQuoteGenerated: c6Record.responseQuoteGenerated,
+          clientResult: c6Record.clientResult,
+          persistedPrice,
+          expectedPrice: pendingPrice,
+          readback: c6Record.readback,
+        })}.`);
+      }
+
+      const clearOnlyTracker = createQuoteSessionDrainTracker("sqag212-c6-clear-only");
+      const clearOnlyPrice = 19.95;
+      await setSyntheticDraftPrice(clearOnlyPrice);
+      await browserPage.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false }));
+      const clearOnlyCapture = await clearOnlyTracker.capturePendingQueuedSave(browserPage);
+      await browserPage.evaluate(() => clearQuoteSessionDraftSaveTimer());
+      const clearOnlyDrained = await clearOnlyTracker.drain(1000, browserPage);
+      const clearOnlyIssue = clearOnlyTracker.issues.find((issue) => issue.reason.includes("no terminal completion producer"));
+      if (clearOnlyDrained || !clearOnlyIssue) {
+        throw new Error(`C6 clear-only control unexpectedly satisfied the pending save: ${JSON.stringify({ clearOnlyCapture, clearOnlyDrained, clearOnlyIssue })}.`);
+      }
+      await setSyntheticDraftPrice(pendingPrice);
+
+      let missingOptionsRejected = false;
+      await browserPage.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false }));
+      await browserPage.evaluate(() => {
+        const timerState = window.__sqagSmokeQuoteSessionTimerState;
+        if (timerState?.pending) timerState.pending.options = null;
+      });
+      try {
+        await clearOnlyTracker.capturePendingQueuedSave(browserPage);
+      } catch (error) {
+        if (!String(error?.message || error).includes("not capturable")) throw error;
+        missingOptionsRejected = true;
+      } finally {
+        await browserPage.evaluate(() => clearQuoteSessionDraftSaveTimer());
+      }
+      if (!missingOptionsRejected) throw new Error("C6 missing pending-save options did not fail loudly.");
+
+      const joinPrice = 20.25;
+      const joinOperationId = `sqag212/c6-equivalent-join/${Date.now()}`;
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "c6-equivalent-in-flight-join",
+        operationId: joinOperationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      await setSyntheticDraftPrice(joinPrice);
+      let joinRelease = null;
+      let joinPostCount = 0;
+      let joinPostSeenResolve;
+      const joinPostSeen = new Promise((resolve) => { joinPostSeenResolve = resolve; });
+      await browserPage.route("**/api/quote-sessions", async (route) => {
+        if (route.request().method() !== "POST") {
+          await route.fallback();
+          return;
+        }
+        joinPostCount += 1;
+        if (joinPostCount === 1) {
+          joinPostSeenResolve();
+          await new Promise((resolve) => { joinRelease = resolve; });
+        }
+        await route.fallback();
+      });
+      try {
+        const firstJoin = browserPage.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: false }));
+        await Promise.race([
+          joinPostSeen,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("C6 equivalent-join POST was not observed.")), 15000)),
+        ]);
+        const secondJoin = browserPage.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: false }));
+        if (typeof joinRelease !== "function") throw new Error("C6 equivalent-join release authority was not established.");
+        joinRelease();
+        await Promise.all([firstJoin, secondJoin]);
+      } finally {
+        if (typeof joinRelease === "function") joinRelease();
+        await browserPage.unroute("**/api/quote-sessions");
+      }
+      await tracker.drain(30000, browserPage);
+      const joinRecords = tracker.records.filter((record) => record.operationId === joinOperationId && record.persistenceClass !== "DIAGNOSTIC_ONLY");
+      if (joinPostCount !== 1 || joinRecords.length !== 1) {
+        throw new Error(`C6 equivalent in-flight work did not join without a duplicate POST: ${JSON.stringify({ joinPostCount, joinRecords: joinRecords.length })}.`);
+      }
+
+      const priorPrice = 20.5;
+      const changedAfterPriorPrice = 20.75;
+      const changedOperationId = `sqag212/c6-changed-after-prior/${Date.now()}`;
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "c6-changed-draft-after-prior-save",
+        operationId: changedOperationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      await setSyntheticDraftPrice(priorPrice);
+      let changedPostCount = 0;
+      let releasePrior = null;
+      let firstChangedPostSeenResolve;
+      const firstChangedPostSeen = new Promise((resolve) => { firstChangedPostSeenResolve = resolve; });
+      let secondChangedPostSeenResolve;
+      const secondChangedPostSeen = new Promise((resolve) => { secondChangedPostSeenResolve = resolve; });
+      await browserPage.route("**/api/quote-sessions", async (route) => {
+        if (route.request().method() !== "POST") {
+          await route.fallback();
+          return;
+        }
+        changedPostCount += 1;
+        if (changedPostCount === 1) {
+          firstChangedPostSeenResolve();
+          await new Promise((resolve) => { releasePrior = resolve; });
+        } else if (changedPostCount === 2) {
+          secondChangedPostSeenResolve();
+        }
+        await route.fallback();
+      });
+      try {
+        const priorSave = browserPage.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: false }));
+        await Promise.race([
+          firstChangedPostSeen,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("C6 prior-save POST was not observed.")), 15000)),
+        ]);
+        await setSyntheticDraftPrice(changedAfterPriorPrice);
+        const changedSave = browserPage.evaluate(() => {
+          window.__sqagC6SecondSaveStarted = true;
+          return saveQuoteSessionDraftState({ quoteGenerated: false });
+        });
+        await browserPage.waitForFunction(() => window.__sqagC6SecondSaveStarted === true, null, { timeout: 5000 });
+        if (typeof releasePrior !== "function") throw new Error("C6 changed-after-prior release authority was not established.");
+        releasePrior();
+        await Promise.race([
+          secondChangedPostSeen,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("C6 changed draft did not dispatch a follow-up POST.")), 15000)),
+        ]);
+        await Promise.all([priorSave, changedSave]);
+      } finally {
+        if (typeof releasePrior === "function") releasePrior();
+        await browserPage.unroute("**/api/quote-sessions");
+      }
+      await tracker.drain(30000, browserPage);
+      const changedRecords = tracker.records.filter((record) => (
+        record.persistenceClass !== "DIAGNOSTIC_ONLY"
+        && record.expectedSessionId === savedSessionId
+        && Number(record.payloadDraftState?.outputRows?.[0]?.unit_price_override) >= priorPrice
+      ));
+      const finalRecord = changedRecords.at(-1);
+      if (
+        changedPostCount !== 2
+        || changedRecords.length < 2
+        || Number(finalRecord?.readback?.fields?.draft_state?.outputRows?.[0]?.unit_price_override) !== changedAfterPriorPrice
+      ) {
+        throw new Error(`C6 changed draft did not persist after prior save completion: ${JSON.stringify({
+          changedPostCount,
+          changedRecords: changedRecords.map((record) => ({ operationId: record.operationId, price: record.payloadDraftState?.outputRows?.[0]?.unit_price_override, readback: record.readback })),
+        })}.`);
+      }
+      await setSyntheticDraftPrice(changedAfterPriorPrice);
+      await flushRequiredQuoteSessionSaves(browserPage, tracker);
+      const restoreOperationId = `sqag212/c6-restore-original/${Date.now()}`;
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "c6-restore-original-price",
+        operationId: restoreOperationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      await setSyntheticDraftPrice(18.25);
+      await browserPage.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: false }));
+      await tracker.drain(30000, browserPage);
+      return {
+        pendingTimer: {
+          exactlyOneRealSave: true,
+          pendingOptionsPreserved: true,
+          persistedPrice: pendingPrice,
+        },
+        clearOnlyFails: true,
+        missingOptionsRejected,
+        equivalentInFlightJoin: { postCount: joinPostCount, recordCount: joinRecords.length },
+        changedDraftAfterPriorSave: { postCount: changedPostCount, finalPrice: changedAfterPriorPrice },
+      };
+    };
+
     await installMockProfiles(browserPage, { companyProfiles: [companyProfile] });
     await browserPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await browserPage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
@@ -2894,6 +3977,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       operationId: positiveOperationId,
       expectedSessionId: sessionId,
     });
+    await tracker.syncQueuedSaveTimer(browserPage);
     const positiveSave = await browserPage.evaluate(async () => {
       clearQuoteSessionDraftSaveTimer();
       const priorSaves = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
@@ -2934,6 +4018,11 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     if (dashboardSession.session_id !== sessionId) {
       throw new Error(`Dashboard refresh returned a different quote session: ${JSON.stringify(dashboardSession)}.`);
     }
+    drainControls = {
+      ...(await runSqag212TrackerFailureControls()),
+      asyncProgress: await runSqag212DrainControls(sessionId),
+    };
+    timerFlushControls = await runSqag212TimerFlushControls(sessionId);
     await flushRequiredQuoteSessionSaves(browserPage, tracker);
     await drainListenerTasks();
     drainSummary = await tracker.assert();
@@ -2949,11 +4038,19 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     browserNegativeControl = await runQuoteSessionNavigationAbortNegativeControl(negativePayload, negativeSessionId);
     if (
       browserNegativeControl.skipped
-      || browserNegativeControl.outcomes?.length !== 2
-      || browserNegativeControl.outcomes.some((outcome) => !outcome.abortError || !outcome.abortProof)
-      || observedDiagnosticAborts.length > 2
+      || browserNegativeControl.outcomes?.length !== 3
+      || browserNegativeControl.outcomes.slice(0, 2).some((outcome) => (
+        outcome.requestFailedObserved !== true
+        || outcome.relayClientCloseObserved !== true
+        || outcome.navigationInitiated !== true
+        || outcome.navigationCommitted !== true
+        || outcome.sameCorrelatedRequest !== true
+      ))
+      || browserNegativeControl.outcomes[2]?.requestFailedObserved !== false
+      || browserNegativeControl.outcomes[2]?.relayClientCloseObserved !== false
+      || browserNegativeControl.missingObservationRejected !== true
     ) {
-      throw new Error(`SQAG #212 negative navigation-abort control was incomplete: ${JSON.stringify({ browserNegativeControl, observedDiagnosticAborts })}.`);
+      throw new Error(`SQAG #212 real navigation-failure control was incomplete: ${JSON.stringify({ browserNegativeControl, observedDiagnosticNavigations })}.`);
     }
     await drainListenerTasks();
     await tracker.assert();
@@ -3088,6 +4185,8 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         .map((response) => response.status),
       quoteSessionResponseCount: quoteSessionResponses.length,
       quoteSessionDrain: drainSummary,
+      drainControls,
+      timerFlushControls,
       browserNegativeControl,
       unexpectedRequestFailures,
       listenerFailures,
@@ -3116,6 +4215,8 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     const diagnostic = {
       lastJobPostType,
       draftPollCount,
+      drainControls,
+      timerFlushControls,
       draftRequestCaptured: Boolean(capturedDraft),
       uploadedRenderIncluded: Boolean(capturedDraft?.payload?.images?.some((image) => image.name === renderName && image.type === "image/png")),
       browserState,
@@ -3142,6 +4243,10 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         }
       }
       await browserPage.evaluate(() => clearSessionState());
+    }
+    if (diagnosticRelay) {
+      await diagnosticRelay.close().catch(() => {});
+      diagnosticRelay = null;
     }
     await isolatedContext.close();
   }

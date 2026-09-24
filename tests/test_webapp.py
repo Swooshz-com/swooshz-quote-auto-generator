@@ -17600,6 +17600,236 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             self.assertFalse(independent_thread.is_alive(), "Independent session thread remained blocked.")
             self.assertIsInstance(results["held"], dict)
 
+    def test_g3_c1_case_equivalent_deleted_alias_remains_retired_after_restart(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            owner_id = "quote-G3-MixedOwner"
+            alias_id = "quote-" + owner_id[len("quote-"):].swapcase()
+            self.assertNotEqual(owner_id, alias_id)
+            owner_payload = valid_payload()
+            owner_payload["quote_session"] = {"session_id": owner_id}
+            alias_payload = valid_payload()
+            alias_payload["quote_session"] = {"session_id": alias_id}
+            alias_publication_payload, alias_result, alias_output = self._local_publication_case(
+                root,
+                alias_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-c1-alias\n%%EOF\n",
+                variant="alias",
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                capability = webapp._quote_session_filesystem_capability()
+                if not capability["case_insensitive"]:
+                    self.skipTest("C1 requires an actual case-insensitive session-storage filesystem.")
+                webapp.create_or_update_quote_session(owner_payload)
+                self.assertTrue(webapp.delete_quote_session(owner_id))
+                self.assertFalse((data_root / "quote-sessions" / owner_id).exists())
+
+                with self.assertRaises(webapp.SqagStorageAccessError) as save_error:
+                    webapp.create_or_update_quote_session(alias_payload)
+                self.assertEqual(save_error.exception.status, 409)
+                self.assertEqual(save_error.exception.reason, "quote_session_retired")
+                with self.assertRaises(webapp.SqagStorageAccessError) as publish_error:
+                    webapp.create_or_update_quote_session(
+                        alias_publication_payload,
+                        result=alias_result,
+                        output_dir=alias_output,
+                    )
+                self.assertEqual(publish_error.exception.status, 409)
+                self.assertEqual(publish_error.exception.reason, "quote_session_retired")
+                self.assertIsNone(webapp.get_quote_session(alias_id))
+                self.assertFalse((data_root / "quote-sessions" / alias_id).exists())
+
+                marker_path = webapp.quote_session_retired_marker_path()
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                marker["session_ids"].append("quote-G3-HistoricalMixed")
+                marker_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as historical_error:
+                    historical = "quote-" + "quote-G3-HistoricalMixed"[len("quote-"):].swapcase()
+                    historical_payload = valid_payload()
+                    historical_payload["quote_session"] = {"session_id": historical}
+                    webapp.create_or_update_quote_session(historical_payload)
+                self.assertEqual(historical_error.exception.status, 409)
+                self.assertEqual(historical_error.exception.reason, "quote_session_retired")
+
+                with LocalRunnerServer() as runner:
+                    detail = local_http_get_json(runner, f"/api/quote-sessions/{alias_id}")
+                    self.assertEqual(detail[0], 404)
+                    download_status, _download_body = local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/{alias_id}/download/xlsx",
+                    )
+                    self.assertEqual(download_status, 404)
+
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as restarted_error:
+                    webapp.create_or_update_quote_session(alias_payload)
+                self.assertEqual(restarted_error.exception.status, 409)
+                self.assertEqual(restarted_error.exception.reason, "quote_session_retired")
+
+    def test_g3_c2_case_equivalent_active_aliases_serialize_and_reject(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            owner_id = "quote-G3-ActiveOwner"
+            alias_id = "quote-" + owner_id[len("quote-"):].swapcase()
+            owner_payload, owner_result, owner_output = self._local_publication_case(
+                root,
+                owner_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-c2-owner\n%%EOF\n",
+                variant="owner",
+            )
+            alias_payload, alias_result, alias_output = self._local_publication_case(
+                root,
+                alias_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-c2-alias\n%%EOF\n",
+                variant="alias",
+            )
+            owner_entered = threading.Event()
+            owner_release = threading.Event()
+            alias_done = threading.Event()
+            results = {}
+            original_stage = webapp.stage_local_quote_publication
+
+            def hold_owner(session_id, *args, **kwargs):
+                if session_id == owner_id:
+                    owner_entered.set()
+                    if not owner_release.wait(5):
+                        raise AssertionError("Timed out waiting to release the exact owner.")
+                return original_stage(session_id, *args, **kwargs)
+
+            def run_alias():
+                try:
+                    results["alias"] = webapp.create_or_update_quote_session(
+                        alias_payload,
+                        result=alias_result,
+                        output_dir=alias_output,
+                    )
+                except Exception as exc:
+                    results["alias"] = exc
+                finally:
+                    alias_done.set()
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                capability = webapp._quote_session_filesystem_capability()
+                if not capability["case_insensitive"]:
+                    self.skipTest("C2 requires an actual case-insensitive session-storage filesystem.")
+                with mock.patch.object(webapp, "stage_local_quote_publication", side_effect=hold_owner):
+                    owner_thread = threading.Thread(
+                        target=lambda: results.setdefault(
+                            "owner",
+                            webapp.create_or_update_quote_session(
+                                owner_payload,
+                                result=owner_result,
+                                output_dir=owner_output,
+                            ),
+                        )
+                    )
+                    owner_thread.start()
+                    self.assertTrue(owner_entered.wait(5), "Exact owner did not reach the staging barrier.")
+                    alias_thread = threading.Thread(target=run_alias)
+                    alias_thread.start()
+                    self.assertFalse(alias_done.wait(0.25), "Equivalent alias entered mutation before owner release.")
+                    owner_release.set()
+                    owner_thread.join(timeout=5)
+                    alias_thread.join(timeout=5)
+                self.assertFalse(owner_thread.is_alive())
+                self.assertFalse(alias_thread.is_alive())
+                self.assertIsInstance(results["owner"], dict)
+                self.assertIsInstance(results["alias"], webapp.SqagStorageAccessError)
+                self.assertEqual(results["alias"].status, 409)
+                self.assertEqual(results["alias"].reason, "quote_session_alias")
+                self.assertEqual(webapp.read_quote_session_metadata(owner_id)["session_id"], owner_id)
+                self.assertIsNone(webapp.get_quote_session(alias_id))
+
+                first_id = "quote-G3-RaceOwner"
+                second_id = "quote-" + first_id[len("quote-"):].swapcase()
+                first_payload, first_result, first_output = self._local_publication_case(
+                    root,
+                    first_id,
+                    KONCEPT_LAYOUT.read_bytes(),
+                    b"%PDF-1.4\nsynthetic-g3-c2-race-first\n%%EOF\n",
+                    variant="race-first",
+                )
+                second_payload, second_result, second_output = self._local_publication_case(
+                    root,
+                    second_id,
+                    KONCEPT_LAYOUT.read_bytes(),
+                    b"%PDF-1.4\nsynthetic-g3-c2-race-second\n%%EOF\n",
+                    variant="race-second",
+                )
+                race_results = {}
+
+                def run_race(key, payload, result, output):
+                    try:
+                        race_results[key] = webapp.create_or_update_quote_session(
+                            payload,
+                            result=result,
+                            output_dir=output,
+                        )
+                    except Exception as exc:
+                        race_results[key] = exc
+
+                first_thread = threading.Thread(target=run_race, args=("first", first_payload, first_result, first_output))
+                second_thread = threading.Thread(target=run_race, args=("second", second_payload, second_result, second_output))
+                first_thread.start()
+                second_thread.start()
+                first_thread.join(timeout=5)
+                second_thread.join(timeout=5)
+                self.assertFalse(first_thread.is_alive())
+                self.assertFalse(second_thread.is_alive())
+                self.assertEqual(
+                    sum(isinstance(value, dict) for value in race_results.values()),
+                    1,
+                )
+                self.assertEqual(
+                    sum(isinstance(value, webapp.SqagStorageAccessError) and value.reason == "quote_session_alias" for value in race_results.values()),
+                    1,
+                )
+
+    def test_g3_c3_public_spelling_and_case_sensitive_compatibility(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            data_root = Path(tmp) / "data"
+            exact_id = "quote-G3-PublicSpelling"
+            case_variant = "quote-" + exact_id[len("quote-"):].swapcase()
+            fresh_id = "quote-g3-independent-fresh"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                capability = webapp._quote_session_filesystem_capability()
+                first = valid_payload()
+                first["quote_session"] = {"session_id": exact_id}
+                fresh = valid_payload()
+                fresh["quote_session"] = {"session_id": fresh_id}
+                webapp.create_or_update_quote_session(first)
+                webapp.create_or_update_quote_session(fresh)
+                self.assertEqual(webapp.get_quote_session(exact_id)["session_id"], exact_id)
+                self.assertEqual(webapp.get_quote_session(fresh_id)["session_id"], fresh_id)
+                listed_ids = {item["session_id"] for item in webapp.list_quote_sessions()}
+                self.assertIn(exact_id, listed_ids)
+                self.assertIn(fresh_id, listed_ids)
+                if capability["case_insensitive"]:
+                    variant_payload = valid_payload()
+                    variant_payload["quote_session"] = {"session_id": case_variant}
+                    with self.assertRaises(webapp.SqagStorageAccessError) as alias_error:
+                        webapp.create_or_update_quote_session(variant_payload)
+                    self.assertEqual(alias_error.exception.reason, "quote_session_alias")
+                else:
+                    variant_payload = valid_payload()
+                    variant_payload["quote_session"] = {"session_id": case_variant}
+                    webapp.create_or_update_quote_session(variant_payload)
+                    self.assertEqual(webapp.get_quote_session(case_variant)["session_id"], case_variant)
+                    self.assertEqual(webapp.read_quote_session_metadata(exact_id)["session_id"], exact_id)
+                    self.assertEqual(webapp.read_quote_session_metadata(case_variant)["session_id"], case_variant)
+
     def test_protected_deploy_quote_session_routes_block_local_runtime_storage(self):
         root = test_temp_root() / f"quote-session-protected-deploy-{time.time_ns()}"
         data_root = root / "data"

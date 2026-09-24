@@ -33,6 +33,7 @@ import posixpath
 import re
 import secrets
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -730,9 +731,12 @@ MAX_PROMPT_CATALOG_MATCH_TERMS = 6
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 QUOTE_SESSION_MUTATION_LOCKS_LOCK = threading.Lock()
-QUOTE_SESSION_MUTATION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+QUOTE_SESSION_MUTATION_LOCKS: dict[tuple[tuple[int, int], str], threading.RLock] = {}
 QUOTE_SESSION_RETIREMENT_LOCKS_LOCK = threading.Lock()
 QUOTE_SESSION_RETIREMENT_LOCKS: dict[str, threading.RLock] = {}
+QUOTE_SESSION_FILESYSTEM_CAPABILITY_LOCK = threading.Lock()
+QUOTE_SESSION_FILESYSTEM_CAPABILITIES: dict[tuple[int, int], dict[str, Any]] = {}
+QUOTE_SESSION_FILESYSTEM_PROBE_PREFIX = ".sqag-case-equivalence-probe-"
 
 
 class RequestBodyError(ValueError):
@@ -12064,9 +12068,12 @@ class LocalSqagStorage:
     def quote_session_export_file_path(self, session_id: str, kind: str) -> Path | None:
         safe_id = safe_quote_session_id(session_id, "")
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(clean_text(kind).lower())
-        if not safe_id or not expected_filename or quote_session_is_retired(safe_id):
+        if not safe_id or not expected_filename:
             return None
-        metadata = read_quote_session_metadata(safe_id)
+        state = _read_local_quote_session_state(safe_id)
+        if state["owner"] != safe_id or quote_session_is_retired(safe_id):
+            return None
+        metadata = state["metadata"] if isinstance(state["metadata"], dict) else {}
         if not quote_session_has_current_v2_publication(metadata):
             return None
         export = metadata.get("exports", {}).get(clean_text(kind).lower()) if metadata else None
@@ -23894,19 +23901,143 @@ def quote_sessions_root() -> Path:
 
 def quote_session_retired_marker_path() -> Path:
     """Return the minimal retirement ledger outside every session directory."""
-    return quote_sessions_root().resolve().parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
+    return _quote_session_storage_root().parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
 
 
 def _quote_session_storage_root() -> Path:
     return quote_sessions_root().resolve()
 
 
+def _quote_session_storage_error(reason: str, message: str = "Quote session storage is unavailable.") -> SqagStorageAccessError:
+    return SqagStorageAccessError(message, status=503, reason=reason)
+
+
+def _quote_session_path_is_redirect(path: Path) -> bool:
+    try:
+        file_stat = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if stat.S_ISLNK(file_stat.st_mode):
+        return True
+    return bool(int(getattr(file_stat, "st_file_attributes", 0)) & 0x0400)
+
+
+def _quote_session_root_object_identity(root: Path) -> tuple[int, int]:
+    try:
+        root_stat = root.stat()
+        device = int(root_stat.st_dev)
+        inode = int(root_stat.st_ino)
+    except (OSError, TypeError, ValueError) as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_identity_unavailable") from exc
+    if device <= 0 or inode <= 0:
+        raise _quote_session_storage_error("quote_session_filesystem_identity_unavailable")
+    return device, inode
+
+
+def _ascii_case_swapped(value: str) -> str:
+    swapped = []
+    for character in value:
+        if "a" <= character <= "z":
+            swapped.append(character.upper())
+        elif "A" <= character <= "Z":
+            swapped.append(character.lower())
+        else:
+            swapped.append(character)
+    return "".join(swapped)
+
+
+def _quote_session_filesystem_capability() -> dict[str, Any]:
+    """Probe the actual session-storage filesystem's ASCII case semantics once."""
+    root = _quote_session_storage_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_probe_failed") from exc
+    if _quote_session_path_is_redirect(root) or not root.is_dir():
+        raise _quote_session_storage_error("quote_session_filesystem_probe_failed")
+    root_identity = _quote_session_root_object_identity(root)
+    with QUOTE_SESSION_FILESYSTEM_CAPABILITY_LOCK:
+        cached = QUOTE_SESSION_FILESYSTEM_CAPABILITIES.get(root_identity)
+        cached_root = cached.get("root") if isinstance(cached, dict) else None
+        same_root_path = bool(
+            cached_root is not None
+            and os.path.normcase(os.path.abspath(str(cached_root)))
+            == os.path.normcase(os.path.abspath(str(root)))
+        )
+        if cached is not None and same_root_path:
+            return cached
+
+        probe_path: Path | None = None
+        probe_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        case_insensitive = False
+        for _attempt in range(8):
+            candidate = root / f"{QUOTE_SESSION_FILESYSTEM_PROBE_PREFIX}{secrets.token_hex(12)}Aa"
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                probe_error = exc
+                break
+            probe_path = candidate
+            break
+        if probe_path is None and probe_error is None:
+            probe_error = OSError("Could not allocate a unique filesystem capability probe.")
+        try:
+            if probe_error is None and probe_path is not None:
+                if _quote_session_path_is_redirect(probe_path) or not probe_path.is_dir():
+                    raise OSError("Filesystem capability probe was redirected.")
+                swapped_path = root / _ascii_case_swapped(probe_path.name)
+                if swapped_path.name == probe_path.name:
+                    raise OSError("Filesystem capability probe was not mixed case.")
+                if swapped_path.exists():
+                    if _quote_session_path_is_redirect(swapped_path) or not os.path.samefile(probe_path, swapped_path):
+                        raise OSError("Filesystem capability probe returned contradictory identity.")
+                    case_insensitive = True
+        except (OSError, RuntimeError) as exc:
+            probe_error = probe_error or exc
+        finally:
+            if probe_path is not None:
+                try:
+                    if _quote_session_path_is_redirect(probe_path):
+                        raise OSError("Filesystem capability probe was redirected before cleanup.")
+                    probe_path.rmdir()
+                    if probe_path.exists():
+                        raise OSError("Filesystem capability probe was not removed.")
+                except OSError as exc:
+                    cleanup_error = exc
+        if probe_error is not None or cleanup_error is not None:
+            raise _quote_session_storage_error("quote_session_filesystem_probe_failed") from (cleanup_error or probe_error)
+        capability = {
+            "root": root,
+            "root_identity": root_identity,
+            "case_insensitive": case_insensitive,
+        }
+        QUOTE_SESSION_FILESYSTEM_CAPABILITIES[root_identity] = capability
+        return capability
+
+
+def _quote_session_lifecycle_component(session_id: str, capability: dict[str, Any]) -> str:
+    return session_id.casefold() if capability["case_insensitive"] else session_id
+
+
+def _quote_session_lifecycle_identity(session_id: str, capability: dict[str, Any] | None = None) -> tuple[tuple[int, int], str]:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        raise ValueError("Quote session id is required and may only contain safe generated characters.")
+    capability = capability or _quote_session_filesystem_capability()
+    return capability["root_identity"], _quote_session_lifecycle_component(safe_id, capability)
+
+
 def _quote_session_mutation_lock(session_id: str) -> threading.RLock:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         raise ValueError("Quote session id is required and may only contain safe generated characters.")
-    root_key = str(_quote_session_storage_root()).casefold()
-    identity = (root_key, safe_id)
+    capability = _quote_session_filesystem_capability()
+    identity = _quote_session_lifecycle_identity(safe_id, capability)
     with QUOTE_SESSION_MUTATION_LOCKS_LOCK:
         lock = QUOTE_SESSION_MUTATION_LOCKS.get(identity)
         if lock is None:
@@ -23923,8 +24054,9 @@ def quote_session_mutation(session_id: str):
         yield
 
 
-def _quote_session_retirement_lock(root: Path) -> threading.RLock:
-    root_key = str(root).casefold()
+def _quote_session_retirement_lock(root: Path, capability: dict[str, Any] | None = None) -> threading.RLock:
+    capability = capability or _quote_session_filesystem_capability()
+    root_key = capability["root_identity"]
     with QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
         lock = QUOTE_SESSION_RETIREMENT_LOCKS.get(root_key)
         if lock is None:
@@ -23983,20 +24115,30 @@ def quote_session_is_retired(session_id: str) -> bool:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return False
-    root = _quote_session_storage_root()
-    with _quote_session_retirement_lock(root):
-        return safe_id in _read_retired_quote_session_ids(root)
+    capability = _quote_session_filesystem_capability()
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(safe_id, capability)
+    with _quote_session_retirement_lock(root, capability):
+        return any(
+            _quote_session_lifecycle_component(retired_id, capability) == component
+            for retired_id in _read_retired_quote_session_ids(root)
+        )
 
 
 def retire_quote_session_id(session_id: str) -> bool:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         raise ValueError("Quote session id is required and may only contain safe generated characters.")
-    root = _quote_session_storage_root()
+    capability = _quote_session_filesystem_capability()
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(safe_id, capability)
     marker_path = root.parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
-    with _quote_session_retirement_lock(root):
+    with _quote_session_retirement_lock(root, capability):
         retired = _read_retired_quote_session_ids(root)
-        if safe_id in retired:
+        if any(
+            _quote_session_lifecycle_component(retired_id, capability) == component
+            for retired_id in retired
+        ):
             return False
         retired.add(safe_id)
         marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -24021,11 +24163,58 @@ def retire_quote_session_id(session_id: str) -> bool:
         return True
 
 
+def _read_local_quote_session_state(
+    session_id: str,
+    capability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve one local lifecycle identity without changing its public spelling."""
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        return {"owner": "", "directory": None, "metadata": None}
+    capability = capability or _quote_session_filesystem_capability()
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(safe_id, capability)
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_read_failed") from exc
+    matches: list[Path] = []
+    for entry in entries:
+        if _quote_session_lifecycle_component(entry.name, capability) != component:
+            continue
+        if _quote_session_path_is_redirect(entry) or not entry.is_dir():
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        matches.append(entry)
+    if len(matches) > 1:
+        raise _quote_session_storage_error("quote_session_storage_ambiguous")
+    if not matches:
+        return {"owner": "", "directory": None, "metadata": None}
+    directory = matches[0]
+    try:
+        resolved_directory = directory.resolve(strict=True)
+        resolved_directory.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent") from exc
+    metadata_path = directory / QUOTE_SESSION_METADATA_FILENAME
+    if _quote_session_path_is_redirect(metadata_path) or not metadata_path.is_file():
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent") from exc
+    if not isinstance(metadata, dict):
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    owner = safe_quote_session_id(metadata.get("session_id"), "")
+    if not owner or owner != directory.name:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    return {"owner": owner, "directory": directory, "metadata": metadata}
+
+
 def quote_session_dir(session_id: str) -> Path:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         raise ValueError("Quote session id is required and may only contain safe generated characters.")
-    root = quote_sessions_root()
+    root = _quote_session_filesystem_capability()["root"]
     path = root / safe_id
     resolved_root = root.resolve()
     resolved_path = path.resolve()
@@ -24120,10 +24309,10 @@ def read_quote_session_metadata(session_id: str) -> dict[str, Any]:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return {}
-    data = load_json_file(quote_session_metadata_path(safe_id))
-    if safe_quote_session_id(data.get("session_id"), "") != safe_id:
+    state = _read_local_quote_session_state(safe_id)
+    if state["owner"] != safe_id:
         return {}
-    return data
+    return state["metadata"] if isinstance(state["metadata"], dict) else {}
 
 
 def dashboard_safe_text(value: Any, limit: int = 160) -> str:
@@ -26134,12 +26323,22 @@ def coordinated_local_quote_session_mutation(function):
         while True:
             candidate_session_id = requested_session_id or new_quote_session_id()
             with quote_session_mutation(candidate_session_id):
+                capability = _quote_session_filesystem_capability()
+                state = _read_local_quote_session_state(candidate_session_id, capability)
                 if quote_session_is_retired(candidate_session_id):
                     if explicit_session_id:
                         raise SqagStorageAccessError(
                             QUOTE_SESSION_RETIRED_MESSAGE,
                             status=409,
                             reason="quote_session_retired",
+                        )
+                    continue
+                if state["owner"] and state["owner"] != candidate_session_id:
+                    if explicit_session_id:
+                        raise SqagStorageAccessError(
+                            "Quote session alias is not available.",
+                            status=409,
+                            reason="quote_session_alias",
                         )
                     continue
                 return function(
@@ -26475,9 +26674,14 @@ def committed_quote_session_downloads(
 
 
 def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> dict[str, Any] | None:
-    if quote_session_is_retired(session_id):
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
         return None
-    metadata = read_quote_session_metadata(session_id)
+    capability = _quote_session_filesystem_capability()
+    state = _read_local_quote_session_state(safe_id, capability)
+    if state["owner"] != safe_id or quote_session_is_retired(safe_id):
+        return None
+    metadata = state["metadata"] if isinstance(state["metadata"], dict) else {}
     if not metadata:
         return None
     return public_quote_session(metadata, include_draft_state=include_draft_state)
@@ -26488,7 +26692,7 @@ def iso_timestamp_sort_value(value: Any) -> float:
 
 
 def list_quote_sessions() -> list[dict[str, Any]]:
-    root = quote_sessions_root()
+    root = _quote_session_filesystem_capability()["root"]
     if not root.exists():
         return []
     sessions: list[dict[str, Any]] = []
@@ -26515,20 +26719,21 @@ def delete_quote_session(session_id: str) -> bool:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return False
-    root = quote_sessions_root().resolve()
-    session_dir = quote_session_dir(safe_id)
-    try:
-        session_dir.relative_to(root)
-    except ValueError:
-        return False
-    if session_dir.name != safe_id:
-        return False
     with quote_session_mutation(safe_id):
+        capability = _quote_session_filesystem_capability()
+        state = _read_local_quote_session_state(safe_id, capability)
         retired = quote_session_is_retired(safe_id)
-        if not session_dir.exists():
+        if state["owner"] and state["owner"] != safe_id:
+            if retired:
+                return True
+            raise SqagStorageAccessError(
+                "Quote session alias is not available.",
+                status=409,
+                reason="quote_session_alias",
+            )
+        session_dir = state["directory"]
+        if session_dir is None:
             return retired
-        if not session_dir.is_dir():
-            return False
         if not retired:
             retire_quote_session_id(safe_id)
         shutil.rmtree(session_dir)
