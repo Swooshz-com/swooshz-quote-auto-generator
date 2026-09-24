@@ -1319,7 +1319,7 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
     await page.unroute(savePattern);
   }
 }
-async function installMockProfiles(page) {
+async function installMockProfiles(page, options = {}) {
   await page.route("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**", async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
@@ -1392,6 +1392,7 @@ async function installMockProfiles(page) {
           item_count: 1,
           digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
         }],
+        company_profiles: Array.isArray(options.companyProfiles) ? options.companyProfiles : [],
         default_profile_id: "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
         company_id: "default",
@@ -1749,6 +1750,408 @@ async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
       }, sessionId).catch(() => {});
     }
     await page.evaluate(() => clearSessionState()).catch(() => {});
+  }
+}
+
+async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page) {
+  let stage = "opening the isolated browser session";
+  let sessionId = "";
+  let browserPage = null;
+  const isolatedContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 900 } });
+  const draftJobIds = new Set();
+  let capturedDraft = null;
+  let lastJobPostType = "";
+  let draftPollCount = 0;
+  const pageErrors = [];
+  const apiFailures = [];
+  const jobResponses = [];
+  const renderName = "sqag212-synthetic-render.png";
+  const renderBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64");
+  const profileFixtureDir = path.join(root, "tests", "fixtures", "quote-generator", "profiles", "synthetic-exhibition-fixture-template");
+  const layoutBytes = await fs.readFile(path.join(profileFixtureDir, "quotation-layout.xlsx"));
+  const layoutRules = JSON.parse(await fs.readFile(path.join(profileFixtureDir, "layout-rules.json"), "utf8"));
+  const companyProfile = {
+    id: "sqag212-company-profile",
+    label: "SQAG 212 Synthetic Quote Co Profile",
+    description: "Synthetic local profile for the SQAG #212 browser regression.",
+    defaults: {
+      company: { name: "SQAG 212 Synthetic Quote Co", header_details: "SQAG 212 Synthetic Quote Co\\n1 Synthetic Street" },
+      quote_text: { payment_terms: ["Payment upon confirmation."] },
+      signature: {},
+    },
+    pack: {
+      quotation_layout: {
+        filename: "quotation-layout.xlsx",
+        data_url: `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${layoutBytes.toString("base64")}`,
+      },
+      layout_rules: layoutRules,
+    },
+  };
+  try {
+    browserPage = await isolatedContext.newPage();
+    browserPage.on("pageerror", (error) => pageErrors.push(error.message));
+    browserPage.on("response", (response) => {
+      const pathName = new URL(response.url()).pathname;
+      if (pathName.startsWith("/api/jobs")) {
+        response.json().then((body) => jobResponses.push({
+          method: response.request().method(),
+          httpStatus: response.status(),
+          type: String(body.type || ""),
+          status: String(body.status || ""),
+          resultStatus: String(body.result?.status || ""),
+          errors: Array.isArray(body.errors) ? body.errors.slice(0, 3) : Array.isArray(body.result?.errors) ? body.result.errors.slice(0, 3) : [],
+          error_reference: String(body.error_reference || body.result?.error_reference || ""),
+        })).catch(() => {});
+      }
+      if (response.status() >= 400 && pathName.startsWith("/api/")) {
+        response.json().then((body) => apiFailures.push({
+          status: response.status(),
+          method: response.request().method(),
+          path: pathName,
+          state: String(body.status || ""),
+          errors: Array.isArray(body.errors) ? body.errors.slice(0, 3) : [],
+          error_reference: String(body.error_reference || ""),
+        })).catch(() => apiFailures.push({
+          status: response.status(),
+          method: response.request().method(),
+          path: pathName,
+        }));
+      }
+    });
+    await installMockProfiles(browserPage, { companyProfiles: [companyProfile] });
+    await browserPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await browserPage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+    await browserPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+
+    stage = "saving the synthetic pricing reference";
+    const savedPricing = await saveSmokePricingReference(browserPage, 10);
+    if (!savedPricing.ok || !["saved", "unchanged"].includes(savedPricing.data?.status)) {
+      throw new Error(`Could not prepare the synthetic pricing reference for SQAG #212: ${JSON.stringify(savedPricing.data)}.`);
+    }
+    const savedCompanyProfile = await browserPage.evaluate(async (profile) => postJson("/api/settings/profiles", profile), companyProfile);
+    if (!savedCompanyProfile.ok || savedCompanyProfile.data?.status !== "saved") {
+      throw new Error(`Could not prepare the synthetic company profile for SQAG #212: ${JSON.stringify(savedCompanyProfile.data)}.`);
+    }
+    const emptyNewQuoteButton = browserPage.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+    if (await emptyNewQuoteButton.isVisible()) await emptyNewQuoteButton.click();
+    else await browserPage.locator("#newQuoteButton:not([disabled])").click();
+    await browserPage.locator("#imageIntake.is-active").waitFor({ state: "visible", timeout: 15000 });
+    const initial = await browserPage.evaluate(() => ({
+      snapshot: state.quoteCommercialSnapshot,
+      review: state.quoteCommercialReview,
+      basisConfirmed: state.basisConfirmed,
+      lifecycle: state.quoteCommercialLifecycle,
+    }));
+    if (initial.snapshot || initial.review !== null || initial.basisConfirmed || initial.lifecycle !== "NEW_UNINITIALISED") {
+      throw new Error(`SQAG #212 browser flow did not begin with a fresh quote: ${JSON.stringify(initial)}.`);
+    }
+
+    stage = "uploading the synthetic render";
+    await browserPage.locator("#imageInput").setInputFiles({
+      name: renderName,
+      mimeType: "image/png",
+      buffer: renderBytes,
+    });
+    await browserPage.locator("#fileList .file-item", { hasText: renderName }).waitFor({ state: "visible", timeout: 15000 });
+    await browserPage.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await browserPage.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await browserPage.waitForFunction(() => state.pricingReferenceId === "synthetic-exhibition-fixture-pricing", null, { timeout: 15000 });
+    stage = "entering customer and quote company details";
+    await browserPage.locator("#clientNameEditor").fill("SQAG 212 Synthetic Client");
+    await browserPage.locator("#clientAttentionEditor").fill("Synthetic Contact");
+    await browserPage.locator("#clientTitleEditor").fill("Project Manager");
+    await browserPage.locator("#clientAddressEditor").fill("1 Synthetic Street\nSingapore 000001");
+    await browserPage.locator("#projectTitleEditor").fill("SQAG 212 Render Quote");
+    await browserPage.locator("#showName").fill("SQAG 212 Synthetic Show");
+    await browserPage.locator("#quoteDate").fill("2026-09-24");
+    await browserPage.locator("#projectNumberEditor").fill("SQAG-212-001");
+    await browserPage.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+    await browserPage.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await browserPage.locator("#presetSelect").selectOption("company:sqag212-company-profile");
+    await browserPage.waitForFunction(() => state.selectedPresetValue === "company:sqag212-company-profile", null, { timeout: 15000 });
+    await browserPage.locator("#quoteCompanyNameEditor").fill("SQAG 212 Synthetic Quote Co");
+    await browserPage.locator("#headerDetailsEditor").fill("SQAG 212 Synthetic Quote Co\n1 Synthetic Street");
+    await browserPage.locator("#termsHeadingEditor").fill("Commercial Terms");
+    await browserPage.locator("#paymentTermsEditor").fill("Payment upon confirmation.");
+    await browserPage.locator("#notesHeadingEditor").fill("Notes");
+    await browserPage.locator("#acceptanceTextEditor").fill("We accept this quotation.");
+    await browserPage.locator("#companySignatoryEditor").fill("Synthetic Signatory");
+    await browserPage.locator("#companyTitleEditor").fill("Director");
+    await browserPage.locator("#companyDateLabelEditor").fill("Date:");
+    await browserPage.locator("#personLabelEditor").fill("Authorised person");
+    await browserPage.locator("#stampLabelEditor").fill("Company stamp");
+    await browserPage.locator("#dateLabelEditor").fill("Signed date:");
+
+    stage = "running analysis from the uploaded render";
+    await browserPage.route("**/api/jobs**", async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (request.method() === "POST" && url.pathname === "/api/jobs") {
+        const body = request.postDataJSON();
+        lastJobPostType = String(body.type || "");
+        if (body.type !== "draft") {
+          await route.fallback();
+          return;
+        }
+        capturedDraft = body;
+        const jobId = String(body.job_id || "");
+        if (jobId) draftJobIds.add(jobId);
+        await route.fulfill({
+          status: 202,
+          contentType: "application/json",
+          body: JSON.stringify({
+            job_id: jobId,
+            type: "draft",
+            status: "running",
+            created_at: "2026-09-24T00:00:00Z",
+          }),
+        });
+        return;
+      }
+      const jobId = url.pathname.split("/").pop() || "";
+      if (request.method() === "GET" && draftJobIds.has(jobId)) {
+        draftPollCount += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            job_id: jobId,
+            type: "draft",
+            status: "completed",
+            result: {
+              source: "openai",
+              analysis_mode: "standard",
+              analysis_findings: [{ text: "Synthetic render confirms a compact exhibition booth footprint.", confidence_pct: 99 }],
+              quote_basis: { "sqag212-floor-design": "Confirm: Needle punch carpet in colour" },
+              quote_basis_sections: [{
+                id: "sqag212-floor-design",
+                title: "Floor Design",
+                lines: [{
+                  id: "sqag212-floor-line",
+                  tag: "Confirm",
+                  text: "Needle punch carpet in colour",
+                  include: true,
+                  quantity: 2,
+                  unit: "sqm",
+                  pricing_keyword: "synthetic-floor-needle-punch-carpet",
+                }],
+              }],
+              line_items: [{
+                section: "Floor Design",
+                quantity: 2,
+                unit: "sqm",
+                description: "Needle punch carpet in colour",
+                pricing_keyword: "synthetic-floor-needle-punch-carpet",
+                source_basis_line_id: "sqag212-floor-line",
+              }],
+              project: { booth_width: "3", booth_depth: "3", booth_size: "3m x 3m", dimension_source: "analysis" },
+            },
+          }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await browserPage.locator("#sideNextButton", { hasText: "Start Analysis" }).click();
+    await browserPage.locator("#analysisConfirmModal").waitFor({ state: "visible", timeout: 15000 });
+    await browserPage.locator("#analysisConfirmStartButton").click();
+    await browserPage.locator("#analysisConfirmModal").waitFor({ state: "hidden", timeout: 15000 });
+    await browserPage.waitForFunction(() => state.workflowStage === "basis_review" && !state.isAnalysisRunning, null, { timeout: 30000 });
+    if (
+      !capturedDraft
+      || capturedDraft.type !== "draft"
+      || !capturedDraft.payload?.images?.some((image) => image.name === renderName && image.type === "image/png")
+    ) {
+      throw new Error("SQAG #212 analysis did not use the uploaded synthetic render.");
+    }
+    await browserPage.locator("#quoteBasisPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    stage = "explicitly accepting the analyzed basis line";
+    await browserPage.locator('#basisReviewSurface [data-basis-section="sqag212-floor-design"][data-basis-line-index="0"][data-basis-tag="Include"]').click();
+    await browserPage.waitForFunction(() => (
+      state.quoteBasisSections[0]?.lines[0]?.tag === "Include"
+      && elements.sideNextButton.getAttribute("aria-disabled") !== "true"
+    ), null, { timeout: 15000 });
+    stage = "confirming the analyzed quotation basis";
+    await browserPage.locator("#sideNextButton", { hasText: "Confirm Quotation Basis" }).click();
+    await browserPage.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    stage = "editing the output price";
+    await browserPage.locator('#pricingMatchesBody td[data-output-edit-field="unit_price_override"][data-output-row="0"]').click();
+    const priceEditor = browserPage.locator('input[data-output-editor-field="unit_price_override"][data-output-row="0"]');
+    await priceEditor.waitFor({ state: "visible", timeout: 15000 });
+    await priceEditor.fill("18.25");
+    await priceEditor.press("Enter");
+    await browserPage.waitForFunction(() => (
+      state.outputRows[0]?.pricing_authority?.variant === "manual"
+      && Number(state.outputRows[0]?.unit_price_override) === 18.25
+      && state.quoteCommercialReview === null
+    ), null, { timeout: 15000 });
+    sessionId = await currentQuoteSessionId(browserPage);
+    if (!sessionId) throw new Error("SQAG #212 quote was not saved after basis confirmation.");
+    stage = "waiting for the saved quote session";
+    await browserPage.waitForFunction(async (id) => {
+      const response = await fetch(`/api/quote-sessions/${encodeURIComponent(id)}`);
+      if (!response.ok) return false;
+      const detail = await response.json();
+      const draft = detail.quote_session?.draft_state || {};
+      const row = draft.outputRows?.[0] || {};
+      const snapshot = draft.quoteDetails?.commercial_snapshot;
+      return Number(row.unit_price_override) === 18.25
+        && draft.quoteCommercialReview === null
+        && Boolean(snapshot?.pricing_basis?.digest);
+    }, sessionId, { timeout: 30000 });
+
+    const savedState = await browserPage.evaluate(() => ({
+      snapshot: state.quoteCommercialSnapshot,
+      review: state.quoteCommercialReview,
+      basisConfirmed: state.basisConfirmed,
+    }));
+    stage = "restoring the saved quote after reload";
+    await browserPage.reload({ waitUntil: "domcontentloaded" });
+    await browserPage.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+    await browserPage.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await browserPage.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+    const restoredState = await browserPage.evaluate(() => {
+      const payload = buildPayload();
+      const draft = payload.quote_session?.draft_state || {};
+      return {
+        stateSnapshot: state.quoteCommercialSnapshot,
+        stateReview: state.quoteCommercialReview,
+        stateBasisConfirmed: state.basisConfirmed,
+        restoredPrice: state.outputRows[0]?.unit_price_override,
+        restoredAuthority: state.outputRows[0]?.pricing_authority?.variant,
+        payloadSnapshot: draft.quoteDetails?.commercial_snapshot || null,
+        payloadReview: draft.quoteCommercialReview,
+        payloadPrice: payload.line_items?.[0]?.unit_price_override,
+        payloadAuthority: payload.line_items?.[0]?.pricing_authority?.variant,
+      };
+    });
+    if (
+      JSON.stringify(restoredState.stateSnapshot) !== JSON.stringify(savedState.snapshot)
+      || restoredState.stateReview !== null
+      || restoredState.stateBasisConfirmed !== savedState.basisConfirmed
+      || restoredState.stateBasisConfirmed !== true
+      || restoredState.payloadReview !== null
+      || JSON.stringify(restoredState.payloadSnapshot) !== JSON.stringify(savedState.snapshot)
+      || Number(restoredState.restoredPrice) !== 18.25
+      || restoredState.restoredAuthority !== "manual"
+      || Number(restoredState.payloadPrice) !== 18.25
+      || restoredState.payloadAuthority !== "manual"
+    ) {
+      throw new Error(`SQAG #212 save/reload/buildPayload lost commercial state: ${JSON.stringify(restoredState)}.`);
+    }
+
+    const exportReadiness = await browserPage.evaluate(() => ({
+      buttonDisabled: elements.sideDownloadButton.getAttribute("aria-disabled"),
+      viewPdfDisabled: elements.sideViewPdfButton.getAttribute("aria-disabled"),
+      validation: outputRowsValid(),
+      commercialReviewRequired: quoteCommercialReviewRequired(),
+      isGenerating: state.isGenerating,
+      isPreparingOutput: state.isPreparingOutput,
+      basisConfirmed: state.basisConfirmed,
+      aiFailed: state.aiFailed,
+      missingDetailFields: missingDetailFields(),
+      lineItemCount: state.lineItems.length,
+      workflowStage: state.workflowStage,
+    }));
+    if (exportReadiness.buttonDisabled === "true") {
+      throw new Error(`SQAG #212 export controls were disabled after restore: ${JSON.stringify(exportReadiness)}.`);
+    }
+
+    stage = "generating and checking the XLSX";
+    await browserPage.locator("#sideDownloadButton").click();
+    await browserPage.waitForFunction(() => state.isGenerating || elements.resultStatus?.textContent !== "No job yet", null, { timeout: 5000 });
+    await browserPage.waitForFunction(() => !state.isGenerating, null, { timeout: 60000 });
+    const xlsxReady = await browserPage.evaluate(() => Boolean(state.downloadFile && downloadFileIsFresh(state.downloadFile)));
+    if (!xlsxReady) throw new Error(`XLSX generation did not produce a fresh file. Readiness: ${JSON.stringify(exportReadiness)}. API failures: ${JSON.stringify(apiFailures)}.`);
+    const xlsxResult = await browserPage.evaluate(async (id) => {
+      const response = await fetch(`/api/quote-sessions/${encodeURIComponent(id)}`);
+      const detail = await response.json();
+      return detail.quote_session?.exports?.xlsx || {};
+    }, sessionId);
+    if (xlsxResult.filename !== "quotation.xlsx" || xlsxResult.exists !== true || !xlsxResult.url) {
+      throw new Error(`SQAG #212 did not generate a current XLSX after reload: ${JSON.stringify(xlsxResult)}.`);
+    }
+    const xlsxResponse = await browserPage.request.get(new URL(xlsxResult.url, baseUrl).href);
+    const xlsxBytes = await xlsxResponse.body();
+    if (!xlsxResponse.ok() || xlsxBytes.length < 4 || xlsxBytes[0] !== 0x50 || xlsxBytes[1] !== 0x4b) {
+      throw new Error("SQAG #212 XLSX download was not a valid ZIP-based workbook.");
+    }
+
+    stage = "generating and checking the explicit PDF";
+    const pdfReadiness = await browserPage.evaluate(() => ({
+      buttonDisabled: elements.sideViewPdfButton.getAttribute("aria-disabled"),
+      validation: outputRowsValid(),
+      commercialReviewRequired: quoteCommercialReviewRequired(),
+      basisConfirmed: state.basisConfirmed,
+      aiFailed: state.aiFailed,
+      missingDetailFields: missingDetailFields(),
+      lineItemCount: state.lineItems.length,
+      workflowStage: state.workflowStage,
+    }));
+    if (pdfReadiness.buttonDisabled === "true") {
+      throw new Error(`SQAG #212 PDF control was disabled after XLSX generation: ${JSON.stringify(pdfReadiness)}.`);
+    }
+    await browserPage.locator("#sideViewPdfButton").click();
+    await browserPage.waitForFunction(() => state.isGenerating || elements.resultStatus?.textContent !== "Completed", null, { timeout: 5000 });
+    await browserPage.waitForFunction(() => !state.isGenerating, null, { timeout: 60000 });
+    const pdfReady = await browserPage.evaluate(() => Boolean(state.pdfFile && pdfFileIsFresh(state.pdfFile)));
+    if (!pdfReady) throw new Error(`Explicit PDF generation did not produce a fresh file. Readiness: ${JSON.stringify(pdfReadiness)}. API failures: ${JSON.stringify(apiFailures)}.`);
+    const pdfResult = await browserPage.evaluate(async (id) => {
+      const response = await fetch(`/api/quote-sessions/${encodeURIComponent(id)}`);
+      const detail = await response.json();
+      return detail.quote_session?.exports?.pdf || {};
+    }, sessionId);
+    if (pdfResult.filename !== "quotation.pdf" || pdfResult.exists !== true || !pdfResult.url) {
+      throw new Error(`SQAG #212 explicit PDF action did not generate a current PDF: ${JSON.stringify(pdfResult)}.`);
+    }
+    const pdfResponse = await browserPage.request.get(new URL(pdfResult.url, baseUrl).href);
+    const pdfBytes = await pdfResponse.body();
+    if (!pdfResponse.ok() || pdfBytes.subarray(0, 4).toString("ascii") !== "%PDF") {
+      throw new Error("SQAG #212 explicit PDF download did not contain a PDF document.");
+    }
+  } catch (error) {
+    let browserState = null;
+    if (browserPage) {
+      browserState = await browserPage.evaluate(() => ({
+        workflowStage: state.workflowStage,
+        activeSidePanel: state.activeSidePanel,
+        analysisRunning: state.isAnalysisRunning,
+        activeJobType: state.activeJob?.type || "",
+      activeJobPhase: state.activeJob?.phase || "",
+      basisSectionCount: state.quoteBasisSections.length,
+      outputRowCount: state.outputRows.length,
+      generationStatus: elements.resultStatus?.textContent || "",
+      generating: state.isGenerating,
+      preparingOutput: state.isPreparingOutput,
+      outputValidation: outputRowsValid(),
+      downloadDisabled: elements.sideDownloadButton?.getAttribute("aria-disabled") || "",
+      downloadFilePresent: Boolean(state.downloadFile),
+      downloadFileFresh: Boolean(state.downloadFile && downloadFileIsFresh(state.downloadFile)),
+      downloadFileStatus: state.downloadFile?.status || "",
+      })).catch(() => null);
+    }
+    const diagnostic = {
+      lastJobPostType,
+      draftPollCount,
+      draftRequestCaptured: Boolean(capturedDraft),
+      uploadedRenderIncluded: Boolean(capturedDraft?.payload?.images?.some((image) => image.name === renderName && image.type === "image/png")),
+      browserState,
+      pageErrors,
+      apiFailures,
+      jobResponses,
+    };
+    throw new Error(`SQAG #212 browser flow failed during ${stage}: ${error?.message || error}; ${JSON.stringify(diagnostic)}`, { cause: error });
+  } finally {
+    if (browserPage) {
+      await browserPage.unroute("**/api/jobs**").catch(() => {});
+      sessionId = sessionId || await currentQuoteSessionId(browserPage).catch(() => "");
+      if (sessionId) {
+        await browserPage.evaluate(async (id) => deleteQuoteSessionRecord(id), sessionId).catch(() => {});
+      }
+      await browserPage.evaluate(() => clearSessionState()).catch(() => {});
+    }
+    await isolatedContext.close().catch(() => {});
   }
 }
 
@@ -3714,9 +4117,15 @@ async function main() {
   });
 
   try {
+    if (args.includes("--sqag212-only")) {
+      await verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page);
+      console.log(JSON.stringify({ status: "ok", regression: "sqag212-analysis-confirmation-save-reload-xlsx-pdf" }, null, 2));
+      return;
+    }
     await installMockProfiles(page);
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
+    await verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page);
     await verifyRun639PricingAuthorityRestorationAndPresentation(page);
     await verifyServerPricingReferenceReviewDurability(page);
     if (args.includes("--recovery-only")) {

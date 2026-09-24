@@ -4858,6 +4858,7 @@ def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def quote_commercial_state_errors(
     payload: dict[str, Any],
     state: dict[str, Any] | None = None,
+    auth_session: dict[str, Any] | None = None,
 ) -> list[str]:
     commercial_state = state or quote_commercial_state(payload)
     if commercial_state.get("review_required"):
@@ -4936,7 +4937,12 @@ def quote_commercial_state_errors(
 
     canonical = quote_commercial_payload(payload)
     rows = canonical.get("line_items") if isinstance(canonical.get("line_items"), list) else []
-    validated_rows = normalize_line_items(canonical)
+    if any(
+        isinstance(row, dict) and row.get("_commercial_invalid_unit_price_override") is True
+        for row in rows
+    ):
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    validated_rows = normalize_line_items(canonical, auth_session=auth_session)
     if rows and len(validated_rows) != len(rows):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     rows = validated_rows
@@ -19840,7 +19846,7 @@ def quote_detail_missing_fields(payload: dict[str, Any]) -> list[str]:
 def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> list[str]:
     errors: list[str] = []
     commercial_state = quote_commercial_state(payload)
-    errors.extend(quote_commercial_state_errors(payload, commercial_state))
+    errors.extend(quote_commercial_state_errors(payload, commercial_state, auth_session=auth_session))
     pricing_reference_authority_error_value = pricing_reference_authority_error(
         payload,
         auth_session=auth_session,
@@ -19932,7 +19938,7 @@ def payload_to_brief(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     commercial_state = quote_commercial_state(payload)
-    commercial_errors = quote_commercial_state_errors(payload, commercial_state)
+    commercial_errors = quote_commercial_state_errors(payload, commercial_state, auth_session=auth_session)
     authority_error = pricing_reference_authority_error(payload, auth_session=auth_session)
     if authority_error and authority_error not in commercial_errors:
         commercial_errors.append(authority_error)

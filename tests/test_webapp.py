@@ -30905,6 +30905,221 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                     )
                     self.assertEqual(webapp.normalize_line_items(mismatched, auth_session=workspace_a_session), [])
 
+    def test_sqag212_database_commercial_validation_keeps_requesting_auth_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag212-commercial.sqlite3').as_posix()}"
+            reference_id = "sqag212-company-pricing"
+            profile_id = "sqag212-company-profile"
+            workspace_a_session = self.platform_auth_session("workspace-sqag212-a", membership_role="admin")
+            workspace_b_session = self.platform_auth_session("workspace-sqag212-b", membership_role="admin")
+            env = {
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                workspace_a = webapp.app_storage_for_auth_session(workspace_a_session)
+                workspace_a.save_profile(workspace_profile_with_layout(profile_id))
+                workspace_a.save_pricing_reference(workspace_pricing_reference(reference_id))
+                reference = workspace_a.pricing_reference_detail(reference_id, source="company")
+                self.assertIsNotNone(reference)
+
+                def owned_payload(raw_rows):
+                    payload = payload_with_workspace_pricing(reference_id)
+                    payload["profile_id"] = profile_id
+                    payload["profile_source"] = "company"
+                    payload["quote_company_profile"] = {"id": profile_id, "source": "company"}
+                    payload["pricing_reference"] = {
+                        "id": reference_id,
+                        "source": "company",
+                        "currency": reference["currency"],
+                        "tax": copy.deepcopy(reference["tax"]),
+                    }
+                    payload["line_items"] = copy.deepcopy(raw_rows)
+                    normalized = webapp.normalize_line_items(payload, auth_session=workspace_a_session)
+                    payload["line_items"] = normalized
+                    authority = webapp.exact_pricing_reference_authority(payload, auth_session=workspace_a_session)
+                    self.assertTrue(authority["ok"], authority.get("reason"))
+                    details = {
+                        "quote_date": payload["quote_date"],
+                        "project_number": payload["project_number"],
+                        "client": copy.deepcopy(payload["client"]),
+                        "project": copy.deepcopy(payload["project"]),
+                        "company": copy.deepcopy(payload["company"]),
+                        "currency": reference["currency"],
+                        "exchange_rate": 1,
+                        "tax": copy.deepcopy(reference["tax"]),
+                        "quote_text": copy.deepcopy(payload["quote_text"]),
+                        "signature": copy.deepcopy(payload["signature"]),
+                        "rich_text": copy.deepcopy(payload["rich_text"]),
+                    }
+                    details["commercial_snapshot"] = {
+                        "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+                        "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+                        "owner": "quote",
+                        "lifecycle": "EXISTING",
+                        "origin": "captured",
+                        "presence": {
+                            key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                            for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
+                        },
+                        "pricing_basis": {
+                            "currency": reference["currency"],
+                            "source": "company",
+                            "id": reference_id,
+                            "digest": authority["detail"]["digest_sha256"],
+                        },
+                    }
+                    payload["quote_session"] = {
+                        "session_id": "quote-sqag212-commercial",
+                        "draft_state": {
+                            "quoteCommercialLifecycle": "EXISTING",
+                            "quoteCommercialReview": None,
+                            "quoteDetails": details,
+                        },
+                    }
+                    return payload
+
+                catalog_row = {
+                    "section": "Graphics",
+                    "quantity": 2,
+                    "unit": "sqm",
+                    "description": "Workspace printed graphics",
+                    "pricing_keyword": "workspace-row",
+                }
+                payload = owned_payload([catalog_row])
+                state = webapp.quote_commercial_state(payload)
+                self.assertFalse(state["review_required"])
+                self.assertIsNone(payload["quote_session"]["draft_state"]["quoteCommercialReview"])
+                canonical = webapp.quote_commercial_payload(payload)
+                authenticated_rows = webapp.normalize_line_items(canonical, auth_session=workspace_a_session)
+                sessionless_rows = webapp.normalize_line_items(canonical)
+                self.assertEqual(len(authenticated_rows), 1)
+                self.assertEqual(authenticated_rows[0]["pricing_authority"]["variant"], "catalog")
+                self.assertEqual(sessionless_rows, [])
+                self.assertEqual(webapp.quote_commercial_state_errors(payload, state, auth_session=workspace_a_session), [])
+                self.assertEqual(webapp.validate_generation_payload(payload, auth_session=workspace_a_session), [])
+                brief = webapp.payload_to_brief(payload, auth_session=workspace_a_session)
+                self.assertEqual(brief["line_items"][0]["pricing_authority"]["variant"], "catalog")
+
+                valid_rows = (
+                    ("catalog", catalog_row, "catalog"),
+                    ("manual", {
+                        "section": "Custom",
+                        "quantity": 2,
+                        "unit": "nos",
+                        "description": "Operator-approved custom row",
+                        "pricing_keyword": "custom-not-in-catalog",
+                        "unit_price_override": 37,
+                    }, "manual"),
+                    ("manual zero", {
+                        "section": "Custom",
+                        "quantity": 2,
+                        "unit": "nos",
+                        "description": "Operator-approved zero-price row",
+                        "pricing_keyword": "custom-zero-not-in-catalog",
+                        "unit_price_override": 0,
+                    }, "manual"),
+                    ("included", {
+                        "section": "Custom",
+                        "quantity": 1,
+                        "unit": "lot",
+                        "description": "Included coordination",
+                        "price_mode": "Included",
+                        "unit_price_override": 999,
+                        "catalog_unit_price": 999,
+                    }, "included"),
+                )
+                for label, raw_row, expected_variant in valid_rows:
+                    with self.subTest(label=label):
+                        candidate = owned_payload([raw_row])
+                        [normalized] = webapp.normalize_line_items(
+                            webapp.quote_commercial_payload(candidate),
+                            auth_session=workspace_a_session,
+                        )
+                        self.assertEqual(normalized["pricing_authority"]["variant"], expected_variant)
+                        self.assertEqual(webapp.quote_commercial_state_errors(candidate, auth_session=workspace_a_session), [])
+                        self.assertEqual(webapp.validate_generation_payload(candidate, auth_session=workspace_a_session), [])
+                        webapp.payload_to_brief(candidate, auth_session=workspace_a_session)
+                zero_price = owned_payload([valid_rows[2][1]])
+                self.assertEqual(zero_price["line_items"][0]["pricing_authority"]["price"], 0)
+
+                def assert_blocked(label, candidate, auth_session=workspace_a_session, *, authority_error=False):
+                    with self.subTest(blocked=label):
+                        self.assertIn(
+                            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                            webapp.quote_commercial_state_errors(candidate, auth_session=auth_session),
+                        )
+                        if authority_error:
+                            self.assertEqual(
+                                webapp.pricing_reference_authority_error(candidate, auth_session=auth_session),
+                                webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                            )
+                        self.assertIn(
+                            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                            webapp.validate_generation_payload(candidate, auth_session=auth_session),
+                        )
+                        with self.assertRaises(webapp.QuoteCommercialStateError) as raised:
+                            webapp.payload_to_brief(candidate, auth_session=auth_session)
+                        self.assertEqual(str(raised.exception), webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+
+                unresolved = copy.deepcopy(payload)
+                unresolved["line_items"] = [{"section": "Unresolved", "quantity": 1, "unit": "nos", "description": "Unresolved row"}]
+                assert_blocked("unresolved row", unresolved)
+
+                for variant in ("historical", "none"):
+                    candidate = copy.deepcopy(payload)
+                    row = candidate["line_items"][0]
+                    row["pricing_authority"] = webapp.build_pricing_authority(variant, row)
+                    assert_blocked(f"{variant} authority", candidate)
+
+                malformed_authority = copy.deepcopy(payload)
+                malformed_authority["line_items"][0]["pricing_authority"] = {"schema": "invalid", "version": 1, "variant": "catalog"}
+                assert_blocked("malformed authority", malformed_authority)
+
+                invalid_override = owned_payload([valid_rows[1][1]])
+                invalid_override["line_items"][0]["unit_price_override"] = "0x10"
+                assert_blocked("invalid numeric override", invalid_override)
+
+                missing_snapshot = copy.deepcopy(payload)
+                missing_snapshot["quote_session"]["draft_state"]["quoteDetails"].pop("commercial_snapshot")
+                assert_blocked("missing snapshot", missing_snapshot, authority_error=True)
+                invalid_snapshot = copy.deepcopy(payload)
+                invalid_snapshot["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"] = {"schema": "invalid"}
+                assert_blocked("invalid snapshot", invalid_snapshot, authority_error=True)
+                lifecycle_mismatch = copy.deepcopy(payload)
+                lifecycle_mismatch["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["lifecycle"] = "NEW_UNINITIALISED"
+                assert_blocked("lifecycle mismatch", lifecycle_mismatch, authority_error=True)
+                active_review = copy.deepcopy(payload)
+                basis = active_review["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]
+                active_review["quote_session"]["draft_state"]["quoteCommercialReview"] = webapp.build_quote_commercial_review(
+                    "pricing_reference_digest_mismatch",
+                    pricing_basis=basis,
+                )
+                assert_blocked("active durable review", active_review, authority_error=True)
+
+                wrong_identity = copy.deepcopy(payload)
+                wrong_identity["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["id"] = "other-company-pricing"
+                assert_blocked("wrong pricing identity", wrong_identity, authority_error=True)
+                wrong_source = copy.deepcopy(payload)
+                wrong_source["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["source"] = "local"
+                assert_blocked("wrong pricing source", wrong_source, authority_error=True)
+                wrong_digest = copy.deepcopy(payload)
+                wrong_digest["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["digest"] = "sha256:" + ("0" * 64)
+                assert_blocked("wrong pricing digest", wrong_digest, authority_error=True)
+                wrong_currency = copy.deepcopy(payload)
+                wrong_currency["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["currency"] = "USD"
+                assert_blocked("wrong pricing currency", wrong_currency, authority_error=True)
+
+                self.assertFalse(webapp.exact_pricing_reference_authority(payload, auth_session=None)["ok"])
+                self.assertEqual(webapp.normalize_line_items(canonical, auth_session=None), [])
+                assert_blocked("missing auth session", payload, auth_session=None, authority_error=True)
+                self.assertFalse(webapp.exact_pricing_reference_authority(payload, auth_session=workspace_b_session)["ok"])
+                self.assertEqual(webapp.normalize_line_items(canonical, auth_session=workspace_b_session), [])
+                assert_blocked("different workspace", payload, auth_session=workspace_b_session, authority_error=True)
+
     def test_server_pricing_reference_mismatch_returns_durable_review_only_for_established_basis(self):
         reference_id = "repair-review-pricing"
         payload = valid_payload()
