@@ -40,12 +40,107 @@ function stableJson(value) {
   return value;
 }
 
+function normalizeQueuedDraftValue(value) {
+  if (Array.isArray(value)) return value.map(normalizeQueuedDraftValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizeQueuedDraftValue(item)]));
+  }
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : value;
+}
+
+function queuedDraftStateComparable(value) {
+  const comparable = value && typeof value === "object" ? structuredClone(value) : {};
+  // Match the app's dedupe key and the server's safe-text projection.
+  delete comparable.savedAt;
+  delete comparable.activeAppView;
+  delete comparable.activeSidePanel;
+  if (comparable.quoteCommercialReview == null) delete comparable.quoteCommercialReview;
+  const originalLineItems = comparable.originalAnalysisSnapshot?.line_items;
+  if (Array.isArray(originalLineItems)) {
+    for (const line of originalLineItems) {
+      if (!line || typeof line !== "object") continue;
+      for (const key of ["category_order", "item_order", "basis_order"]) {
+        if (line[key] === "") delete line[key];
+      }
+    }
+  }
+  return stableJson(normalizeQueuedDraftValue(comparable));
+}
+
+function queuedDraftFileContentFingerprint(file) {
+  const savedFingerprint = String(file?.content_fingerprint || "");
+  if (savedFingerprint) return savedFingerprint;
+  const dataUrl = String(file?.data_url || "");
+  const separator = dataUrl.indexOf(",");
+  if (separator < 0) return "";
+  try {
+    const header = dataUrl.slice(0, separator);
+    const body = dataUrl.slice(separator + 1);
+    const bytes = /;base64/i.test(header)
+      ? Buffer.from(body, "base64")
+      : Buffer.from(decodeURIComponent(body), "utf8");
+    return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  } catch {
+    return "";
+  }
+}
+
+function queuedDraftFilesComparable(value) {
+  return (Array.isArray(value) ? value : []).map((file) => ({
+    session_file_key: String(file?.session_file_key || ""),
+    file_role: String(file?.file_role || ""),
+    name: String(file?.name || ""),
+    type: String(file?.type || ""),
+    size: Number.isFinite(Number(file?.size)) ? Number(file.size) : 0,
+    content_fingerprint: queuedDraftFileContentFingerprint(file),
+  }));
+}
+
+function queuedDraftStateLeafDiffs(actual, expected, fieldPath = "", differences = []) {
+  if (differences.length >= 24) return differences;
+  const normalizedActual = normalizeQueuedDraftValue(actual);
+  const normalizedExpected = normalizeQueuedDraftValue(expected);
+  if (JSON.stringify(stableJson(normalizedActual)) === JSON.stringify(stableJson(normalizedExpected))) return differences;
+  if (Array.isArray(normalizedActual) && Array.isArray(normalizedExpected) && normalizedActual.length === normalizedExpected.length) {
+    for (let index = 0; index < normalizedActual.length && differences.length < 24; index += 1) {
+      queuedDraftStateLeafDiffs(normalizedActual[index], normalizedExpected[index], `${fieldPath}[${index}]`, differences);
+    }
+    return differences;
+  }
+  if (
+    normalizedActual && normalizedExpected
+    && typeof normalizedActual === "object" && typeof normalizedExpected === "object"
+    && !Array.isArray(normalizedActual) && !Array.isArray(normalizedExpected)
+  ) {
+    const keys = new Set([...Object.keys(normalizedActual), ...Object.keys(normalizedExpected)]);
+    for (const key of keys) {
+      if (differences.length >= 24) break;
+      queuedDraftStateLeafDiffs(normalizedActual[key], normalizedExpected[key], fieldPath ? `${fieldPath}.${key}` : key, differences);
+    }
+    return differences;
+  }
+  differences.push({
+    path: fieldPath,
+    expected: (JSON.stringify(normalizedExpected) || "undefined").slice(0, 220),
+    actual: (JSON.stringify(normalizedActual) || "undefined").slice(0, 220),
+  });
+  return differences;
+}
+
+function queuedDraftStateDiffKeys(actual, expected) {
+  const actualState = queuedDraftStateComparable(actual);
+  const expectedState = queuedDraftStateComparable(expected);
+  const keys = new Set([...Object.keys(actualState || {}), ...Object.keys(expectedState || {})]);
+  return [...keys].filter((key) => JSON.stringify(actualState?.[key]) !== JSON.stringify(expectedState?.[key]));
+}
+
 const quoteSessionOperationHeader = "x-sqag-smoke-operation-id";
 const quoteSessionFixtureHeader = "x-sqag-smoke-fixture";
 const quoteSessionOperationNameHeader = "x-sqag-smoke-operation";
 const quoteSessionSessionHeader = "x-sqag-smoke-session-id";
 const quoteSessionPersistenceClassHeader = "x-sqag-smoke-persistence-class";
 const quoteSessionCorrelationHeader = "x-sqag-smoke-correlation-token";
+const quoteSessionQueuedSaveHeader = "x-sqag-smoke-queued-save-id";
 const quoteSessionOperationStorageKey = "__sqag_smoke_quote_session_operation_v1";
 const quoteSessionSaveResultsKey = "__sqagSmokeQuoteSessionSaveResults";
 
@@ -376,12 +471,19 @@ function createQuoteSessionDrainTracker(group) {
   const pendingSavePromises = new Set();
   const pendingRequiredJobs = new Set();
   const pendingQueuedSaveWork = new Map();
+  const queuedSaveHistory = new Map();
+  const attachedPages = new Set();
+  const pageIdentities = new WeakMap();
   const issues = [];
   const progressWaiters = new Set();
   const drainWaitingWaiters = new Set();
+  const finalReconciliationBarriers = [];
   let drainWaiting = false;
+  let drainWaitCount = 0;
   let progressGeneration = 0;
   let operationSequence = 0;
+  let pageSequence = 0;
+  const timerEventBinding = `__sqagSmokeTimerEvent_${String(group).replace(/[^A-Za-z0-9_]/g, "_")}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
   const notifyProgress = () => {
     progressGeneration += 1;
@@ -419,34 +521,69 @@ function createQuoteSessionDrainTracker(group) {
     return job;
   };
 
-  const registerQueuedSaveWork = (snapshot) => {
+  const settleQueuedSave = (entry, status, reason = "") => {
+    if (!entry || entry.status !== "pending") return;
+    entry.status = status;
+    entry.terminalReason = reason;
+    entry.completedAt = Date.now();
+    pendingQueuedSaveWork.delete(String(entry.snapshot.timerIdentity));
+    if (status === "failed") {
+      addIssue({ operationId: entry.identity, fixture: group, operation: "queued-save" }, reason || "queued quote-session save failed without persistence proof");
+    }
+    entry.terminalResolve?.({ status, reason });
+    notifyProgress();
+  };
+
+  const registerQueuedSaveWork = (snapshot, supersedes = "") => {
     const timerIdentity = String(snapshot?.timerIdentity || "");
     if (!timerIdentity || !snapshot?.options || typeof snapshot.options !== "object") {
       addIssue({ operationId: "<queued-save>", fixture: group, operation: "queued-save" }, "pending quote-session save timer has no captured options or identity");
       return null;
     }
-    let entry = pendingQueuedSaveWork.get(timerIdentity);
+    let entry = queuedSaveHistory.get(timerIdentity);
     if (!entry) {
+      let terminalResolve;
+      const terminalPromise = new Promise((resolve) => { terminalResolve = resolve; });
       entry = {
         identity: `${group}/queued-save/${timerIdentity}`,
-        snapshot,
-        producer: null,
+        snapshot: structuredClone(snapshot),
+        status: "pending",
+        producer: terminalPromise,
+        terminalPromise,
+        terminalResolve,
+        transitions: [{ type: supersedes ? "replace" : "create", at: Date.now(), supersedes: String(supersedes || "") }],
+        evidence: { postObserved: false, durableReadbackObserved: false },
       };
+      queuedSaveHistory.set(timerIdentity, entry);
       pendingQueuedSaveWork.set(timerIdentity, entry);
+      if (supersedes) {
+        const previous = queuedSaveHistory.get(String(supersedes));
+        if (previous?.status === "pending") {
+          previous.successorIdentity = timerIdentity;
+          previous.transitions.push({ type: "superseded", at: Date.now(), successor: timerIdentity });
+          previous.status = "superseded";
+          previous.terminalReason = "replaced by a newer queued draft save";
+          previous.completedAt = Date.now();
+          pendingQueuedSaveWork.delete(String(supersedes));
+          previous.terminalResolve?.({ status: "superseded", successor: timerIdentity });
+        }
+      }
       notifyProgress();
+    } else if (entry.status === "pending") {
+      entry.snapshot = structuredClone(snapshot);
     }
     return entry;
   };
 
-  const attachQueuedSaveProducer = (entry, promise) => {
-    if (!entry || !promise) return;
-    entry.producer = promise;
-    Promise.resolve(promise).catch((error) => {
-      addIssue({ operationId: entry.identity, fixture: group, operation: "queued-save" }, `queued quote-session save failed: ${error?.message || error}`);
-    }).finally(() => {
-      pendingQueuedSaveWork.delete(String(entry.snapshot.timerIdentity));
-      notifyProgress();
-    });
+  const attachQueuedSaveProducer = (entry, producer, record = null) => {
+    if (!entry || entry.status !== "pending") return;
+    if (record) {
+      entry.persistenceRecord = record;
+      entry.evidence.postObserved = true;
+      entry.producer = record.terminalPromise;
+    } else if (producer) {
+      entry.applicationSaveProducer = producer;
+    }
     notifyProgress();
   };
 
@@ -473,10 +610,10 @@ function createQuoteSessionDrainTracker(group) {
     return waiter;
   };
 
-  const waitForDrainWaiting = (timeoutMs = 5000) => {
-    if (drainWaiting) return Promise.resolve({ waiting: true });
+  const waitForDrainWaiting = (timeoutMs = 5000, afterCount = 0) => {
+    if (drainWaiting && drainWaitCount > afterCount) return Promise.resolve({ waiting: true, count: drainWaitCount });
     return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, timer: null };
+      const waiter = { resolve, reject, afterCount, timer: null };
       waiter.timer = setTimeout(() => {
         drainWaitingWaiters.delete(waiter);
         reject(new Error("Required drain did not reach its deferred waiting state."));
@@ -487,10 +624,12 @@ function createQuoteSessionDrainTracker(group) {
 
   const notifyDrainWaiting = () => {
     drainWaiting = true;
+    drainWaitCount += 1;
     for (const waiter of [...drainWaitingWaiters]) {
+      if (drainWaitCount <= waiter.afterCount) continue;
       clearTimeout(waiter.timer);
       drainWaitingWaiters.delete(waiter);
-      waiter.resolve({ waiting: true });
+      waiter.resolve({ waiting: true, count: drainWaitCount });
     }
   };
 
@@ -547,6 +686,8 @@ function createQuoteSessionDrainTracker(group) {
         httpStatus: response.status,
         sessionId: String(session?.session_id || ""),
         quoteGenerated: typeof session?.status?.quote_generated === "boolean" ? session.status.quote_generated : null,
+        draftState: session?.draft_state && typeof session.draft_state === "object" ? session.draft_state : null,
+        draftFiles: Array.isArray(session?.draft_files) ? session.draft_files : null,
         fields: quoteSessionActualFields(session),
       };
       if (response.status !== 200 || record.readback.sessionId !== record.expectedSessionId) {
@@ -554,6 +695,9 @@ function createQuoteSessionDrainTracker(group) {
       }
       if (!quoteSessionValueContains(record.readback.fields, record.expectedFields)) {
         addIssue(record, "independent durable readback lost expected saved fields");
+      }
+      if (record.kind !== "detail" && record.readback.quoteGenerated !== record.expectedQuoteGenerated) {
+        addIssue(record, "independent durable readback had the wrong quote_generated state");
       }
       return record.readback;
     } catch (error) {
@@ -630,6 +774,9 @@ function createQuoteSessionDrainTracker(group) {
     if (!clientResult || clientResult.nonNull !== true || clientResult.sessionId !== record.expectedSessionId) {
       addIssue(record, "initiating application save promise did not return the exact saved session");
     }
+    if (clientResult?.quoteGenerated !== record.expectedQuoteGenerated) {
+      addIssue(record, "initiating application save promise returned the wrong quote_generated state");
+    }
     const readbackPromise = durableReadback(record.request, record);
     record.readbackProducer = readbackPromise;
     await readbackPromise;
@@ -637,13 +784,14 @@ function createQuoteSessionDrainTracker(group) {
 
   const queuedSaveMatchesRecord = (entry, record) => {
     const snapshot = entry?.snapshot || {};
-    if (snapshot.sessionId && snapshot.sessionId !== record.expectedSessionId) return false;
-    const expectedQuoteGenerated = snapshot.options?.quoteGenerated;
-    if (typeof expectedQuoteGenerated === "boolean" && expectedQuoteGenerated !== record.expectedQuoteGenerated) return false;
-    if (snapshot.draftState && record.payloadDraftState) {
-      return JSON.stringify(stableJson(snapshot.draftState)) === JSON.stringify(stableJson(record.payloadDraftState));
-    }
-    return true;
+    if (snapshot.sessionId !== record.expectedSessionId) return false;
+    if (snapshot.options?.quoteGenerated !== record.expectedQuoteGenerated) return false;
+    if (!snapshot.draftState || !record.payloadDraftState) return false;
+    if (JSON.stringify(queuedDraftStateComparable(snapshot.draftState)) !== JSON.stringify(queuedDraftStateComparable(record.payloadDraftState))) return false;
+    if (!Array.isArray(snapshot.draftFiles)) return false;
+    if (record.payloadDraftFiles === null) return true;
+    if (!Array.isArray(record.payloadDraftFiles)) return false;
+    return JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles)) === JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles));
   };
 
   const observeRequest = (request) => {
@@ -652,9 +800,16 @@ function createQuoteSessionDrainTracker(group) {
     if (requestRecords.has(request)) return;
     const headers = request.headers();
     const payload = readPayload(request);
+    let requestPage = null;
+    try { requestPage = request.frame()?.page() || null; } catch {}
+    const rawQueuedSaveIdentity = String(headers[quoteSessionQueuedSaveHeader] || "");
+    const queuedSaveIdentity = rawQueuedSaveIdentity && requestPage
+      ? normalizeTimerIdentity(requestPage, rawQueuedSaveIdentity) : "";
     const operationId = String(headers[quoteSessionOperationHeader] || `smoke/${group}/save-${++operationSequence}`);
     const record = {
       request,
+      method: request.method(),
+      path: pathname,
       operationId,
       fixture: String(headers[quoteSessionFixtureHeader] || group),
       operation: String(headers[quoteSessionOperationNameHeader] || operationId),
@@ -664,6 +819,8 @@ function createQuoteSessionDrainTracker(group) {
       expectedQuoteGenerated: typeof payload?.status?.quote_generated === "boolean" ? payload.status.quote_generated : null,
       expectedFields: quoteSessionExpectedFields(payload),
       payloadDraftState: payload?.draft_state && typeof payload.draft_state === "object" ? payload.draft_state : null,
+      payloadDraftFiles: Array.isArray(payload?.draft_files) ? payload.draft_files : null,
+      queuedSaveIdentity,
       terminalProducer: "browser-response-or-requestfailed",
       terminalResolve: null,
       httpStatus: null,
@@ -681,9 +838,16 @@ function createQuoteSessionDrainTracker(group) {
     if (record.persistenceClass !== "DIAGNOSTIC_ONLY") {
       pendingRequiredRequests.add(record);
       pendingSavePromises.add(record);
-      for (const entry of pendingQueuedSaveWork.values()) {
-        if (!entry.producer && queuedSaveMatchesRecord(entry, record)) {
-          attachQueuedSaveProducer(entry, record.terminalPromise);
+      const entry = record.queuedSaveIdentity ? queuedSaveHistory.get(record.queuedSaveIdentity) : null;
+      if (record.queuedSaveIdentity && (!entry || !queuedSaveMatchesRecord(entry, record))) {
+        addIssue(record, "queued save request identity did not match its captured session, state, files, and required status");
+        if (entry?.status === "pending") settleQueuedSave(entry, "failed", "correlated POST did not match the captured queued save");
+      } else if (entry?.status === "pending") {
+        attachQueuedSaveProducer(entry, record.terminalPromise, record);
+      }
+      for (const candidate of pendingQueuedSaveWork.values()) {
+        if (candidate.status === "pending" && !candidate.persistenceRecord && queuedSaveMatchesRecord(candidate, record)) {
+          candidate.equivalentRequestRecord = record;
         }
       }
       notifyProgress();
@@ -710,6 +874,8 @@ function createQuoteSessionDrainTracker(group) {
       expectedSessionId,
       expectedFields: detailExpectations.get(operationId) || {},
       payloadDraftState: null,
+      payloadDraftFiles: null,
+      queuedSaveIdentity: "",
       terminalProducer: "browser-response-or-requestfailed",
       terminalResolve: null,
       httpStatus: null,
@@ -747,6 +913,8 @@ function createQuoteSessionDrainTracker(group) {
       expectedSessionId: quoteSessionRequestId(request),
       expectedFields: detailExpectations.get(operationId) || {},
       payloadDraftState: null,
+      payloadDraftFiles: null,
+      queuedSaveIdentity: "",
       terminalProducer: "browser-response-or-requestfailed",
       terminalResolve: null,
       httpStatus: null,
@@ -766,6 +934,63 @@ function createQuoteSessionDrainTracker(group) {
     notifyProgress();
   };
 
+  const queuedSaveMismatchSummary = (entry, record) => {
+    const snapshot = entry?.snapshot || {};
+    const expectedState = queuedDraftStateComparable(snapshot.draftState);
+    const actualState = queuedDraftStateComparable(record.payloadDraftState);
+    const stateKeys = new Set([...Object.keys(expectedState || {}), ...Object.keys(actualState || {})]);
+    const stateDiffKeys = [...stateKeys].filter((key) => (
+      JSON.stringify(stableJson(expectedState?.[key])) !== JSON.stringify(stableJson(actualState?.[key]))
+    ));
+    return {
+      sessionMatch: snapshot.sessionId === record.expectedSessionId,
+      quoteGeneratedMatch: snapshot.options?.quoteGenerated === record.expectedQuoteGenerated,
+      stateDiffKeys,
+      expectedFileCount: Array.isArray(snapshot.draftFiles) ? snapshot.draftFiles.length : null,
+      actualFileCount: Array.isArray(record.payloadDraftFiles) ? record.payloadDraftFiles.length : null,
+      filesMatch: Array.isArray(snapshot.draftFiles)
+        && Array.isArray(record.payloadDraftFiles)
+        && JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles)) === JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles)),
+    };
+  };
+
+  const validateQueuedPersistence = (entry, record) => {
+    const snapshot = entry?.snapshot || {};
+    const failures = [];
+    if (!queuedSaveMatchesRecord(entry, record)) failures.push("request did not match captured session/state/files/status " + JSON.stringify(queuedSaveMismatchSummary(entry, record)));
+    if (record.httpStatus < 200 || record.httpStatus >= 300 || record.bodyStatus !== "saved") failures.push("application response was not a successful saved result");
+    if (record.responseSessionId !== snapshot.sessionId || record.responseQuoteGenerated !== snapshot.options?.quoteGenerated) failures.push("application response session/status did not match the captured save");
+    if (record.clientResult?.nonNull !== true || record.clientResult?.sessionId !== snapshot.sessionId || record.clientResult?.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("application save result did not match the captured session/status");
+    if (record.readback?.httpStatus !== 200 || record.readback?.sessionId !== snapshot.sessionId) failures.push("durable readback did not return the exact saved session");
+    if (record.readback?.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("durable readback did not preserve required quote_generated status");
+    if (!record.readback?.draftState || JSON.stringify(queuedDraftStateComparable(record.readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(snapshot.draftState))) failures.push("durable readback did not match captured draft state");
+    if (!Array.isArray(record.readback?.draftFiles) || JSON.stringify(queuedDraftFilesComparable(record.readback.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles))) failures.push("durable readback did not match captured draft files");
+    return failures;
+  };
+
+  const completeQueuedPersistenceRecord = (record) => {
+    const candidates = [];
+    if (record.queuedSaveIdentity) {
+      const exact = queuedSaveHistory.get(record.queuedSaveIdentity);
+      if (exact) candidates.push(exact);
+    }
+    for (const entry of pendingQueuedSaveWork.values()) {
+      if (!entry.persistenceRecord && entry.equivalentRequestRecord === record && !candidates.includes(entry)) candidates.push(entry);
+    }
+    for (const entry of candidates) {
+      if (entry.status !== "pending") continue;
+      const failures = validateQueuedPersistence(entry, record);
+      if (failures.length) {
+        settleQueuedSave(entry, "failed", `queued save persistence proof failed: ${failures.join("; ")}`);
+      } else {
+        entry.evidence.postObserved = true;
+        entry.evidence.durableReadbackObserved = true;
+        entry.evidence.persistenceRecordId = record.operationId;
+        settleQueuedSave(entry, "succeeded", "validated POST response and exact durable readback");
+      }
+    }
+  };
+
   const observeResponse = (response) => {
     const record = requestRecords.get(response.request());
     if (!record || record.done) return;
@@ -774,6 +999,7 @@ function createQuoteSessionDrainTracker(group) {
       .finally(() => {
         record.done = true;
         record.terminalResolve?.();
+        if (record.persistenceClass !== "DIAGNOSTIC_ONLY") completeQueuedPersistenceRecord(record);
         tasks.delete(task);
         notifyProgress();
       });
@@ -791,11 +1017,179 @@ function createQuoteSessionDrainTracker(group) {
     pendingSavePromises.delete(record);
     if (record.persistenceClass !== "DIAGNOSTIC_ONLY") {
       addIssue(record, `required quote-session save request failed: ${request.failure()?.errorText || "transport failure"}`);
+      const entry = record.queuedSaveIdentity ? queuedSaveHistory.get(record.queuedSaveIdentity) : null;
+      if (entry?.status === "pending") settleQueuedSave(entry, "failed", "correlated queued save request failed before persistence");
     }
     notifyProgress();
   };
 
+  const normalizeTimerIdentity = (page, browserIdentity) => {
+    const pageIdentity = pageIdentities.get(page) || `${group}/page-unregistered`;
+    return `${pageIdentity}/${String(browserIdentity || "")}`;
+  };
+
+  const normalizeTimerSnapshot = (page, snapshot) => {
+    if (!snapshot || typeof snapshot !== "object") return null;
+    const browserTimerIdentity = String(snapshot.timerIdentity || "");
+    if (!browserTimerIdentity) return null;
+    return {
+      ...structuredClone(snapshot),
+      browserTimerIdentity,
+      pageIdentity: pageIdentities.get(page) || `${group}/page-unregistered`,
+      timerIdentity: normalizeTimerIdentity(page, browserTimerIdentity),
+      supersedesTimerIdentity: snapshot.supersedesTimerIdentity
+        ? normalizeTimerIdentity(page, snapshot.supersedesTimerIdentity) : "",
+    };
+  };
+
+  const failQueuedSave = (entry, reason) => settleQueuedSave(entry, "failed", reason);
+
+  const proveQueuedSaveByReadback = async (page, entry) => {
+    if (!page || page.isClosed()) {
+      failQueuedSave(entry, "queued save settled without a POST and its page closed before durable readback");
+      return;
+    }
+    const outcome = entry.saveOutcome || {};
+    const snapshot = entry.snapshot || {};
+    if (outcome.sessionId !== snapshot.sessionId) {
+      failQueuedSave(entry, "queued save dedupe result did not identify the exact captured session");
+      return;
+    }
+    if (typeof outcome.quoteGenerated === "boolean" && outcome.quoteGenerated !== snapshot.options?.quoteGenerated) {
+      failQueuedSave(entry, "queued save dedupe result had a mismatched required quote_generated status");
+      return;
+    }
+    try {
+      const readback = await page.evaluate(async (sessionId) => {
+        const response = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}?__sqag_smoke_equivalent=${Date.now()}`, {
+          cache: "no-store", headers: { "cache-control": "no-cache", pragma: "no-cache" },
+        });
+        let body = null;
+        try { body = await response.json(); } catch {}
+        const session = body?.quote_session && typeof body.quote_session === "object" ? body.quote_session : null;
+        return {
+          httpStatus: response.status,
+          sessionId: String(session?.session_id || ""),
+          quoteGenerated: typeof session?.status?.quote_generated === "boolean" ? session.status.quote_generated : null,
+          draftState: session?.draft_state && typeof session.draft_state === "object" ? session.draft_state : null,
+          draftFiles: Array.isArray(session?.draft_files) ? session.draft_files : null,
+        };
+      }, snapshot.sessionId);
+      entry.evidence.durableReadbackObserved = true;
+      entry.evidence.readback = readback;
+      const failures = [];
+      if (readback.httpStatus !== 200 || readback.sessionId !== snapshot.sessionId) failures.push("durable readback did not return the exact session");
+      if (readback.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("durable readback had the wrong required status");
+      if (!readback.draftState || JSON.stringify(queuedDraftStateComparable(readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(snapshot.draftState))) {
+        failures.push("durable readback state did not match captured state; fields=" + queuedDraftStateDiffKeys(readback.draftState, snapshot.draftState).join(","));
+      }
+      if (!Array.isArray(readback.draftFiles) || JSON.stringify(queuedDraftFilesComparable(readback.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles))) {
+        failures.push("durable readback files did not match captured file identity/content; expected=" + JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles)) + "; actual=" + JSON.stringify(queuedDraftFilesComparable(readback.draftFiles)));
+      }
+      if (failures.length) {
+        failQueuedSave(entry, `equivalent queued-save persistence proof failed: ${failures.join("; ")}`);
+      } else {
+        entry.evidence.equivalentDurableReadback = true;
+        settleQueuedSave(entry, "succeeded", "exact application result plus matching durable readback for equivalent persisted state");
+      }
+    } catch (error) {
+      failQueuedSave(entry, `equivalent queued-save durable readback failed: ${error?.message || error}`);
+    }
+  };
+
+  const handleTimerEvent = async (source, event) => {
+    const page = source?.page;
+    if (!page) return;
+    const type = String(event?.type || "");
+    const rawIdentity = String(event?.snapshot?.timerIdentity || event?.timerIdentity || "");
+    const identity = normalizeTimerIdentity(page, rawIdentity);
+    if (type === "create" || type === "replace") {
+      const snapshot = normalizeTimerSnapshot(page, event.snapshot);
+      const supersedes = type === "replace" ? normalizeTimerIdentity(page, event.supersedes) : "";
+      registerQueuedSaveWork(snapshot, supersedes);
+      return;
+    }
+    const entry = queuedSaveHistory.get(identity);
+    if (!entry || entry.status !== "pending") return;
+    entry.transitions.push({ type, at: Date.now(), reason: String(event?.reason || "") });
+    if (type === "save-start") {
+      const snapshot = normalizeTimerSnapshot(page, event?.snapshot);
+      if (!snapshot || snapshot.timerIdentity !== identity || !snapshot.options || typeof snapshot.options.quoteGenerated !== "boolean") {
+        failQueuedSave(entry, "queued timer save began without an exact session/state/files/options snapshot");
+        return;
+      }
+      entry.snapshot = snapshot;
+      notifyProgress();
+      return;
+    }
+    if (type === "cancel") {
+      if (event.reason === "recovery-transition") {
+        entry.cancelledForRecovery = true;
+        entry.producer = entry.terminalPromise;
+        notifyProgress();
+      } else {
+        failQueuedSave(entry, "queued save timer was cancelled without an accounted successor or persistence");
+      }
+      return;
+    }
+    if (type === "fire" || type === "flush") {
+      entry.dispatchedBy = type;
+      entry.snapshot.active = false;
+      entry.producer = entry.terminalPromise;
+      notifyProgress();
+      return;
+    }
+    if (type !== "save-outcome") return;
+    entry.saveOutcome = {
+      kind: String(event.outcomeKind || ""),
+      sessionId: String(event.sessionId || ""),
+      quoteGenerated: typeof event.quoteGenerated === "boolean" ? event.quoteGenerated : null,
+      reason: String(event.reason || ""),
+    };
+    if (entry.saveOutcome.kind === "null") {
+      failQueuedSave(entry, "real saveQuoteSessionDraftState returned null before persistence");
+      return;
+    }
+    if (entry.saveOutcome.kind === "rejected") {
+      failQueuedSave(entry, `real saveQuoteSessionDraftState rejected: ${entry.saveOutcome.reason || "unknown rejection"}`);
+      return;
+    }
+    if (entry.saveOutcome.sessionId !== entry.snapshot.sessionId) {
+      failQueuedSave(entry, "real queued save result did not identify the captured session");
+      return;
+    }
+    if (typeof entry.saveOutcome.quoteGenerated === "boolean"
+      && entry.saveOutcome.quoteGenerated !== entry.snapshot.options?.quoteGenerated) {
+      failQueuedSave(entry, "real queued save result had mismatched quote_generated status: expected " + String(entry.snapshot.options?.quoteGenerated) + ", received " + String(entry.saveOutcome.quoteGenerated));
+      return;
+    }
+    if (entry.persistenceRecord) {
+      await entry.persistenceRecord.terminalPromise;
+      if (entry.status === "pending") completeQueuedPersistenceRecord(entry.persistenceRecord);
+      if (entry.status === "pending") failQueuedSave(entry, "queued POST completed without validated durable persistence proof");
+      return;
+    }
+    await proveQueuedSaveByReadback(page, entry);
+  };
+
+  const ensurePageIdentity = (page) => {
+    if (!pageIdentities.has(page)) pageIdentities.set(page, `${group}/page-${++pageSequence}`);
+    attachedPages.add(page);
+    return pageIdentities.get(page);
+  };
+
+  const markPageWorkUnresolved = (page, reason) => {
+    const pageIdentity = pageIdentities.get(page);
+    if (!pageIdentity) return;
+    for (const entry of pendingQueuedSaveWork.values()) {
+      if (entry.snapshot.pageIdentity === pageIdentity && entry.status === "pending") {
+        failQueuedSave(entry, reason);
+      }
+    }
+  };
+
   const install = async (context) => {
+    await context.exposeBinding(timerEventBinding, async (source, event) => handleTimerEvent(source, event));
     await context.addInitScript((settings) => {
       const pendingOperations = [];
       let sequence = 0;
@@ -811,14 +1205,58 @@ function createQuoteSessionDrainTracker(group) {
           return null;
         }
       };
+      const stableValue = (value) => {
+        if (Array.isArray(value)) return value.map(stableValue);
+        if (value && typeof value === "object") {
+          return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+        }
+        return value;
+      };
+      const comparableDraftState = (value) => {
+        const comparable = cloneOptions(value);
+        delete comparable.savedAt;
+        delete comparable.activeAppView;
+        delete comparable.activeSidePanel;
+        return stableValue(comparable);
+      };
+      const stableStringify = (value) => JSON.stringify(stableValue(value));
+      const documentId = (() => {
+        try { return crypto.randomUUID(); } catch { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+      })();
       const timerState = window.__sqagSmokeQuoteSessionTimerState || {
         pending: null,
         last: null,
         queueCaptureDepth: 0,
         queueOptions: null,
         saveCalls: [],
+        saveCurrentCalls: [],
+        queuedSaveOperations: [],
+        apiTrace: [],
+        trackQueuedSaves: false,
+        timerSequence: 0,
+        replaceCandidate: null,
       };
+      for (const key of ["saveCalls", "saveCurrentCalls", "queuedSaveOperations", "apiTrace"]) {
+        if (!Array.isArray(timerState[key])) timerState[key] = [];
+      }
+      timerState.pending ??= null;
+      timerState.last ??= null;
+      timerState.queueCaptureDepth = Number(timerState.queueCaptureDepth || 0);
+      timerState.documentId = documentId;
+      timerState.timerSequence = Number(timerState.timerSequence || 0);
       window.__sqagSmokeQuoteSessionTimerState = timerState;
+      const emitTimerEvent = (event) => {
+        try {
+          const pending = window[settings.timerEventBinding]?.({ ...event, documentId: timerState.documentId });
+          timerState.lastEventPromise = pending && typeof pending.then === "function"
+            ? Promise.resolve(pending).catch(() => {})
+            : Promise.resolve();
+          return timerState.lastEventPromise;
+        } catch {
+          return Promise.resolve();
+        }
+      };
+      window.__sqagSmokeEmitQueuedSaveEvent = emitTimerEvent;
       if (!window.__sqagSmokeQuoteSessionTimerHooksInstalled) {
         const nativeSetTimeout = window.setTimeout.bind(window);
         const nativeClearTimeout = window.clearTimeout.bind(window);
@@ -826,17 +1264,24 @@ function createQuoteSessionDrainTracker(group) {
           let timerId = null;
           const wrappedHandler = (...callbackArgs) => {
             const current = window.__sqagSmokeQuoteSessionTimerState;
-            if (current?.pending && String(current.pending.timerIdentity) === String(timerId)) {
-              current.pending.active = false;
-              current.pending.firedAt = Date.now();
-              current.last = current.pending;
+            const fired = current?.pending && String(current.pending.nativeTimerId) === String(timerId)
+              ? current.pending : null;
+            if (fired) {
+              fired.active = false;
+              fired.firedAt = Date.now();
+              current.last = fired;
               current.pending = null;
+              const previousIdentity = current.activeTimerIdentity || "";
+              current.activeTimerIdentity = fired.timerIdentity;
+              emitTimerEvent({ type: "fire", snapshot: cloneOptions(fired) });
+              try { return handler(...callbackArgs); }
+              finally { current.activeTimerIdentity = previousIdentity; }
             }
             return handler(...callbackArgs);
           };
           timerId = nativeSetTimeout(wrappedHandler, delay, ...args);
           const current = window.__sqagSmokeQuoteSessionTimerState;
-          if (current?.queueCaptureDepth > 0) {
+          if (current?.queueCaptureDepth > 0 && current.trackQueuedSaves === true) {
             let persistedSessionId = "";
             try {
               persistedSessionId = String(JSON.parse(localStorage.getItem("swooshz_quote_session_v1") || "{}").quoteSessionId || "");
@@ -844,7 +1289,9 @@ function createQuoteSessionDrainTracker(group) {
               persistedSessionId = "";
             }
             const snapshot = {
-              timerIdentity: String(timerId),
+              timerIdentity: `${settings.group}/doc-${current.documentId}/timer-${++current.timerSequence}`,
+              nativeTimerId: String(timerId),
+              documentId: current.documentId,
               options: cloneOptions(current.queueOptions),
               sessionId: String(window.state?.quoteSessionId || persistedSessionId),
               draftState: typeof window.currentQuoteSessionDraftState === "function"
@@ -855,19 +1302,37 @@ function createQuoteSessionDrainTracker(group) {
               queuedAt: Date.now(),
               clearedAt: 0,
               firedAt: 0,
+              flushedAt: 0,
+              cancelledForRecovery: false,
             };
+            const supersedes = current.replaceCandidate?.timerIdentity || current.pending?.timerIdentity || "";
+            snapshot.supersedesTimerIdentity = supersedes;
+            current.replaceCandidate = null;
             current.pending = snapshot;
             current.last = snapshot;
+            emitTimerEvent({ type: supersedes ? "replace" : "create", supersedes, snapshot: cloneOptions(snapshot) });
           }
           return timerId;
         };
         window.clearTimeout = (timerId, ...args) => {
           const current = window.__sqagSmokeQuoteSessionTimerState;
-          if (current?.pending && String(current.pending.timerIdentity) === String(timerId)) {
-            current.pending.active = false;
-            current.pending.clearedAt = Date.now();
-            current.last = current.pending;
+          if (current?.pending && String(current.pending.nativeTimerId) === String(timerId)) {
+            const cancelled = current.pending;
+            cancelled.active = false;
+            cancelled.clearedAt = Date.now();
+            current.last = cancelled;
             current.pending = null;
+            if (current.queueCaptureDepth > 0) {
+              current.replaceCandidate = cancelled;
+            } else if (current.flushIntentIdentity === cancelled.timerIdentity) {
+              cancelled.flushedAt = Date.now();
+              emitTimerEvent({ type: "flush", snapshot: cloneOptions(cancelled) });
+            } else if (typeof state !== "undefined" && state.isRecoveryScopeTransitioning === true) {
+              cancelled.cancelledForRecovery = true;
+              emitTimerEvent({ type: "cancel", reason: "recovery-transition", snapshot: cloneOptions(cancelled) });
+            } else {
+              emitTimerEvent({ type: "cancel", reason: "application-clear", snapshot: cloneOptions(cancelled) });
+            }
           }
           return nativeClearTimeout(timerId, ...args);
         };
@@ -876,6 +1341,7 @@ function createQuoteSessionDrainTracker(group) {
       window.__sqagSmokeGetPendingQuoteSessionDraftSave = () => {
         const current = window.__sqagSmokeQuoteSessionTimerState || {};
         return {
+          documentId: String(current.documentId || ""),
           pending: current.pending ? cloneOptions(current.pending) : null,
           last: current.last ? cloneOptions(current.last) : null,
         };
@@ -905,6 +1371,7 @@ function createQuoteSessionDrainTracker(group) {
         }
         const headers = new Headers(init.headers || (typeof Request !== "undefined" && input instanceof Request ? input.headers : undefined));
         headers.set(settings.operationHeader, operationId);
+        if (pending?.queuedSaveIdentity) headers.set(settings.queuedSaveHeader, String(pending.queuedSaveIdentity));
         headers.set(settings.fixtureHeader, String(scope.fixture || settings.group));
         headers.set(settings.operationNameHeader, String(scope.operation || operationId));
         headers.set(settings.sessionHeader, sessionId);
@@ -914,6 +1381,10 @@ function createQuoteSessionDrainTracker(group) {
           : method === "GET" && (url.pathname === "/api/quote-sessions" || /^\/api\/quote-sessions\/[^/]+$/.test(url.pathname))
             ? String(scope.persistenceClass || "DIAGNOSTIC_ONLY")
             : "DIAGNOSTIC_ONLY");
+        if (
+          (method === "POST" && url.pathname === "/api/quote-sessions")
+          || (method === "GET" && /^\/api\/quote-sessions\/[^/]+$/.test(url.pathname))
+        ) timerState.apiTrace.push({ method, path: url.pathname, operationId, at: Date.now() });
         return nativeFetch(input, { ...init, headers });
       };
 
@@ -927,9 +1398,36 @@ function createQuoteSessionDrainTracker(group) {
             sessionStorage.setItem(settings.operationStorageKey, JSON.stringify(scope));
             const options = args[0] && typeof args[0] === "object" ? args[0] : {};
             const sessionId = String(options.sessionId || window.state?.quoteSessionId || "");
+            const timerState = window.__sqagSmokeQuoteSessionTimerState;
+            const queuedCandidates = timerState.queuedSaveOperations.map((item) => ({
+              identity: String(item.identity || ""),
+              snapshotSessionId: String(item.snapshot?.sessionId || ""),
+              requestStarted: item.requestStarted === true,
+              sessionMatch: item.snapshot?.sessionId === sessionId,
+              quoteGeneratedMatch: item.options?.quoteGenerated === options.quoteGenerated,
+              draftStateMatch: !options.draftState || stableStringify(comparableDraftState(item.snapshot.draftState)) === stableStringify(comparableDraftState(options.draftState)),
+              draftFilesMatch: !Array.isArray(options.draftFiles) || stableStringify(item.snapshot.draftFiles) === stableStringify(options.draftFiles),
+            }));
+            timerState.saveCurrentCalls.push({
+              sessionId,
+              activeTimerIdentity: String(timerState.activeTimerIdentity || ""),
+              flushIntentIdentity: String(timerState.flushIntentIdentity || ""),
+              queuedCandidates,
+              startedAt: Date.now(),
+            });
+            const queuedSaveMatches = timerState.queuedSaveOperations.filter((item) => (
+              item.requestStarted !== true
+              && (!sessionId || item.snapshot?.sessionId === sessionId)
+              && item.options?.quoteGenerated === options.quoteGenerated
+              && (!options.draftState || stableStringify(comparableDraftState(item.snapshot.draftState)) === stableStringify(comparableDraftState(options.draftState)))
+              && (!Array.isArray(options.draftFiles) || stableStringify(item.snapshot.draftFiles) === stableStringify(options.draftFiles))
+            ));
+            const queuedSaveOperation = queuedSaveMatches.length === 1 ? queuedSaveMatches[0] : null;
+            if (queuedSaveOperation) queuedSaveOperation.requestStarted = true;
             const operationId = scope.operationId && callNumber === 1
               ? String(scope.operationId) : nextOperationId("save");
-            pendingOperations.push({ operationId, sessionId });
+            const queuedSaveIdentity = String(queuedSaveOperation?.identity || timerState.activeTimerIdentity || "");
+            pendingOperations.push({ operationId, sessionId, queuedSaveIdentity });
             try {
               const result = await original.apply(this, args);
               window[settings.resultStorageKey].push({
@@ -950,9 +1448,49 @@ function createQuoteSessionDrainTracker(group) {
         const draftSave = window.saveQuoteSessionDraftState;
         if (typeof draftSave === "function" && draftSave.__sqagSmokeCaptured !== true) {
           const wrappedDraftSave = async function (...args) {
+            const timerState = window.__sqagSmokeQuoteSessionTimerState;
             const options = args[0] && typeof args[0] === "object" ? cloneOptions(args[0]) : {};
-            window.__sqagSmokeQuoteSessionTimerState.saveCalls.push({ options, startedAt: Date.now() });
-            return draftSave.apply(this, args);
+            const timerIdentity = String(timerState.activeTimerIdentity || timerState.flushIntentIdentity || "");
+            const priorSnapshot = timerIdentity
+              ? (timerState.pending?.timerIdentity === timerIdentity
+                ? timerState.pending
+                : (timerState.last?.timerIdentity === timerIdentity ? timerState.last : {}))
+              : {};
+            const saveSnapshot = timerIdentity ? {
+              ...cloneOptions(priorSnapshot),
+              timerIdentity,
+              options,
+              sessionId: String(options.sessionId || window.state?.quoteSessionId || priorSnapshot.sessionId || ""),
+              draftState: cloneOptions(options.draftState || window.currentQuoteSessionDraftState?.()),
+              draftFiles: cloneOptions(Array.isArray(options.draftFiles)
+                ? options.draftFiles
+                : (typeof window.sessionFileRecordsFromDraft === "function" ? window.sessionFileRecordsFromDraft() : [])),
+            } : null;
+            const queuedSaveOperation = timerIdentity
+              ? { identity: timerIdentity, requestStarted: false, options, snapshot: saveSnapshot }
+              : null;
+            if (queuedSaveOperation) timerState.queuedSaveOperations.push(queuedSaveOperation);
+            timerState.saveCalls.push({ options, timerIdentity, startedAt: Date.now() });
+            if (timerIdentity) {
+              await emitTimerEvent({ type: "save-start", timerIdentity, snapshot: saveSnapshot });
+            }
+            try {
+              const result = await draftSave.apply(this, args);
+              if (timerIdentity) emitTimerEvent({
+                type: "save-outcome", timerIdentity, outcomeKind: result ? "value" : "null",
+                sessionId: String(result?.session_id || ""),
+                quoteGenerated: typeof result?.status?.quote_generated === "boolean" ? result.status.quote_generated : null,
+              });
+              return result;
+            } catch (error) {
+              if (timerIdentity) emitTimerEvent({ type: "save-outcome", timerIdentity, outcomeKind: "rejected", reason: String(error?.message || error) });
+              throw error;
+            } finally {
+              if (queuedSaveOperation) {
+                const index = timerState.queuedSaveOperations.indexOf(queuedSaveOperation);
+                if (index >= 0) timerState.queuedSaveOperations.splice(index, 1);
+              }
+            }
           };
           Object.defineProperty(wrappedDraftSave, "__sqagSmokeCaptured", { value: true });
           window.saveQuoteSessionDraftState = wrappedDraftSave;
@@ -997,13 +1535,20 @@ function createQuoteSessionDrainTracker(group) {
       sessionHeader: quoteSessionSessionHeader,
       correlationHeader: quoteSessionCorrelationHeader,
       persistenceClassHeader: quoteSessionPersistenceClassHeader,
+      queuedSaveHeader: quoteSessionQueuedSaveHeader,
+      timerEventBinding,
     });
     const attachPage = (page) => {
+      ensurePageIdentity(page);
       page.on("request", observeRequest);
       page.on("request", observeDetailRequest);
       page.on("request", observeListRequest);
       page.on("response", observeResponse);
       page.on("requestfailed", observeFailure);
+      page.on("close", () => markPageWorkUnresolved(page, "page closed with unresolved queued quote-session save work"));
+      page.on("framenavigated", (frame) => {
+        if (frame === page.mainFrame()) markPageWorkUnresolved(page, "document navigated with unresolved queued quote-session save work");
+      });
     };
     for (const page of context.pages()) attachPage(page);
     context.on("page", attachPage);
@@ -1087,34 +1632,91 @@ function createQuoteSessionDrainTracker(group) {
   };
 
   const syncQueuedSaveTimer = async (page) => {
+    if (!page || page.isClosed()) return null;
     const state = await readQueuedSaveTimer(page);
-    const snapshot = state?.pending?.active ? state.pending : null;
-    if (!snapshot) return null;
-    return registerQueuedSaveWork(snapshot);
+    const snapshot = state?.pending?.active ? normalizeTimerSnapshot(page, state.pending) : null;
+    let entry = snapshot ? registerQueuedSaveWork(snapshot, snapshot.supersedesTimerIdentity) : null;
+    const last = state?.last;
+    if (last?.timerIdentity) {
+      const lastIdentity = normalizeTimerIdentity(page, last.timerIdentity);
+      const prior = queuedSaveHistory.get(lastIdentity);
+      if (prior?.status === "pending" && !last.active && last.clearedAt && !last.firedAt && !last.flushedAt && !last.cancelledForRecovery) {
+        failQueuedSave(prior, "queued save timer disappeared without a flush, firing, successor, or persistence proof");
+      }
+    }
+    if (snapshot && entry?.status === "pending" && state.documentId && snapshot.documentId !== state.documentId) {
+      failQueuedSave(entry, "queued save timer document identity did not match its captured page snapshot");
+    }
+    return entry;
   };
 
   const capturePendingQueuedSave = async (page) => {
     const state = await readQueuedSaveTimer(page);
     if (!state?.pending) return null;
-    const snapshot = state?.pending;
+    const rawSnapshot = state.pending;
     if (
-      snapshot.active !== true
-      || !snapshot.options
-      || typeof snapshot.options !== "object"
-      || typeof snapshot.options.quoteGenerated !== "boolean"
-      || !snapshot.timerIdentity
-      || !snapshot.sessionId
-      || !snapshot.draftState
-      || !Array.isArray(snapshot.draftFiles)
+      rawSnapshot.active !== true
+      || !rawSnapshot.options
+      || typeof rawSnapshot.options !== "object"
+      || typeof rawSnapshot.options.quoteGenerated !== "boolean"
+      || !rawSnapshot.timerIdentity
+      || !rawSnapshot.sessionId
+      || !rawSnapshot.draftState
+      || !Array.isArray(rawSnapshot.draftFiles)
     ) {
       throw new Error(`Pending quote-session save timer was not capturable: ${JSON.stringify(state)}.`);
     }
-    const entry = registerQueuedSaveWork(snapshot);
+    const snapshot = normalizeTimerSnapshot(page, rawSnapshot);
+    const entry = registerQueuedSaveWork(snapshot, snapshot.supersedesTimerIdentity);
     if (!entry) throw new Error("Pending quote-session save timer could not be registered.");
     return { snapshot, entry };
   };
 
   const unproducedQueuedSaveWork = () => [...pendingQueuedSaveWork.values()].find((entry) => !entry.producer) || null;
+
+  const startCapturedQueuedSave = async (page, captured) => {
+    if (!captured?.snapshot?.browserTimerIdentity || !captured?.snapshot?.options) {
+      throw new Error("Captured queued save has no browser timer identity or options.");
+    }
+    await syncQueuedSaveTimer(page);
+    return page.evaluate(({ browserTimerIdentity, options }) => {
+      const timerState = window.__sqagSmokeQuoteSessionTimerState;
+      if (!timerState) return { status: "unavailable", reason: "timer instrumentation is missing" };
+      const pending = timerState.pending?.active ? timerState.pending : null;
+      if (pending && pending.timerIdentity !== browserTimerIdentity) {
+        return { status: "replaced", currentTimerIdentity: String(pending.timerIdentity || "") };
+      }
+      const last = timerState.last;
+      if (!pending && !(last?.timerIdentity === browserTimerIdentity && last.cancelledForRecovery === true)) {
+        return { status: "unavailable", reason: "captured timer is no longer live and has no recovery-transition flush authority" };
+      }
+      if (pending) {
+        timerState.flushIntentIdentity = browserTimerIdentity;
+        clearQuoteSessionDraftSaveTimer();
+        timerState.flushIntentIdentity = "";
+      }
+      const previousIdentity = String(timerState.activeTimerIdentity || "");
+      timerState.activeTimerIdentity = browserTimerIdentity;
+      let savePromise;
+      try {
+        savePromise = saveQuoteSessionDraftState(options);
+      } catch (error) {
+        timerState.activeTimerIdentity = previousIdentity;
+        return { status: "threw", reason: String(error?.message || error) };
+      }
+      timerState.activeTimerIdentity = previousIdentity;
+      timerState.flushPromises ||= Object.create(null);
+      timerState.flushPromises[browserTimerIdentity] = Promise.resolve(savePromise).then(
+        (result) => ({
+          kind: result ? "value" : "null",
+          sessionId: String(result?.session_id || ""),
+          quoteGenerated: typeof result?.status?.quote_generated === "boolean" ? result.status.quote_generated : null,
+        }),
+        (error) => ({ kind: "rejected", reason: String(error?.message || error) }),
+      );
+      return { status: "started", timerIdentity: browserTimerIdentity };
+    }, { browserTimerIdentity: captured.snapshot.browserTimerIdentity, options: captured.snapshot.options });
+  };
 
   const outstandingOperations = () => {
     const operations = [];
@@ -1128,12 +1730,43 @@ function createQuoteSessionDrainTracker(group) {
     return operations;
   };
 
+  const reconcileBrowserTimers = async (page) => {
+    const pages = page ? [page] : [...attachedPages];
+    for (const candidate of pages) {
+      if (!candidate || candidate.isClosed()) continue;
+      await syncQueuedSaveTimer(candidate);
+    }
+  };
+
+  const armFinalReconciliationBarrier = () => {
+    let reachedResolve;
+    let releaseResolve;
+    const reached = new Promise((resolve) => { reachedResolve = resolve; });
+    const gate = new Promise((resolve) => { releaseResolve = resolve; });
+    finalReconciliationBarriers.push({ reachedResolve, gate });
+    return { reached, release: releaseResolve };
+  };
+
+  const pauseAtFinalReconciliation = async () => {
+    const barrier = finalReconciliationBarriers.shift();
+    if (!barrier) return;
+    barrier.reachedResolve({ generation: progressGeneration });
+    await barrier.gate;
+  };
+
   const drain = async (timeoutMs = 30000, page = null) => {
-    await syncQueuedSaveTimer(page);
     const deadline = Date.now() + timeoutMs;
     while (true) {
       const waiter = createProgressWaiter(Math.max(0, deadline - Date.now()));
-      const generation = progressGeneration;
+      const generationBeforeSnapshot = progressGeneration;
+      try {
+        await reconcileBrowserTimers(page);
+      } catch (error) {
+        waiter.cancel();
+        addIssue({ operationId: "<drain>", fixture: group, operation: "required-drain" }, `browser timer reconciliation failed: ${error?.message || error}`);
+        return false;
+      }
+      const generationAfterSnapshot = progressGeneration;
       const outstanding = outstandingOperations();
       const missingProducer = outstanding.filter((operation) => !operation.producer);
       if (missingProducer.length) {
@@ -1144,11 +1777,36 @@ function createQuoteSessionDrainTracker(group) {
         );
         return false;
       }
+      if (Date.now() >= deadline && outstanding.length) {
+        waiter.cancel();
+        addIssue(
+          { operationId: "<drain>", fixture: group, operation: "required-drain" },
+          `required drain deadline expired with outstanding operations: ${outstanding.map((operation) => operation.identity).join(", ")}`,
+        );
+        return false;
+      }
       if (!outstanding.length) {
+        await pauseAtFinalReconciliation();
+        try {
+          await reconcileBrowserTimers(page);
+        } catch (error) {
+          waiter.cancel();
+          addIssue({ operationId: "<drain>", fixture: group, operation: "required-drain" }, `final browser timer reconciliation failed: ${error?.message || error}`);
+          return false;
+        }
+        const finalOutstanding = outstandingOperations();
+        if (progressGeneration !== generationAfterSnapshot || finalOutstanding.length) {
+          waiter.cancel();
+          continue;
+        }
         waiter.cancel();
         return issues.length === 0;
       }
-      if (progressGeneration !== generation) {
+      if (progressGeneration !== generationBeforeSnapshot && generationAfterSnapshot === generationBeforeSnapshot) {
+        waiter.cancel();
+        continue;
+      }
+      if (progressGeneration !== generationAfterSnapshot) {
         waiter.cancel();
         continue;
       }
@@ -1182,11 +1840,23 @@ function createQuoteSessionDrainTracker(group) {
     return summary();
   };
 
+  const queuedSaveStatus = (identity) => queuedSaveHistory.get(String(identity || "")) || null;
+
   const summary = () => ({
     requiredSaveCount: records.filter((record) => record.persistenceClass !== "DIAGNOSTIC_ONLY").length,
     requiredSaveStatuses: records.filter((record) => record.persistenceClass !== "DIAGNOSTIC_ONLY").map((record) => record.httpStatus),
     diagnosticRequestCount: records.filter((record) => record.persistenceClass === "DIAGNOSTIC_ONLY").length,
     issues: [...issues],
+    queuedSaveStates: [...queuedSaveHistory.values()].map((entry) => ({
+      identity: entry.identity,
+      timerIdentity: entry.snapshot.timerIdentity,
+      status: entry.status,
+      successorIdentity: entry.successorIdentity || "",
+      terminalReason: entry.terminalReason || "",
+      postObserved: entry.evidence.postObserved === true,
+      durableReadbackObserved: entry.evidence.durableReadbackObserved === true,
+    })),
+    drainWaitCount,
     outstanding: {
       requiredRequests: [...pendingRequiredRequests].length,
       requiredResponseBodies: [...pendingResponseBodies].length,
@@ -1206,10 +1876,14 @@ function createQuoteSessionDrainTracker(group) {
     requiredDetailReadback,
     requiredDashboardRefresh,
     trackRequiredJob,
+    readQueuedSaveTimer,
     syncQueuedSaveTimer,
     capturePendingQueuedSave,
     unproducedQueuedSaveWork,
     attachQueuedSaveProducer,
+    queuedSaveStatus,
+    startCapturedQueuedSave,
+    armFinalReconciliationBarrier,
     drain,
     assert,
     summary,
@@ -1218,33 +1892,41 @@ function createQuoteSessionDrainTracker(group) {
   };
 }
 
-async function flushRequiredQuoteSessionSaves(page, tracker) {
-  const captured = await tracker.capturePendingQueuedSave(page);
-  const registered = captured || tracker.unproducedQueuedSaveWork?.();
-  if (registered) {
-    const snapshot = captured?.snapshot || registered.snapshot;
-    const entry = captured?.entry || registered;
-    const savePromise = page.evaluate(async (options) => {
-      clearQuoteSessionDraftSaveTimer();
-      return saveQuoteSessionDraftState(options);
-    }, snapshot.options);
-    tracker.attachQueuedSaveProducer(entry, savePromise);
-    await savePromise;
-    await page.evaluate(async () => {
+async function flushRequiredQuoteSessionSaves(page, tracker, capturedOverride = null) {
+  const captured = capturedOverride || await tracker.capturePendingQueuedSave(page);
+  if (captured) {
+    const start = await tracker.startCapturedQueuedSave(page, captured);
+    if (start.status === "replaced") {
+      const successor = await tracker.capturePendingQueuedSave(page);
+      if (successor) return flushRequiredQuoteSessionSaves(page, tracker, successor);
+      const drainedAfterSupersession = await tracker.drain(30000, page);
+      if (!drainedAfterSupersession) {
+        throw new Error(`Captured queued save was superseded but required successor work did not prove persistence: ${JSON.stringify(tracker.summary())}.`);
+      }
+      return { status: "superseded", timerIdentity: captured.snapshot.timerIdentity };
+    }
+    if (start.status !== "started") {
+      throw new Error(`Captured queued save could not be safely flushed: ${JSON.stringify(start)}.`);
+    }
+    const outcome = await page.evaluate(async (identity) => {
+      const timerState = window.__sqagSmokeQuoteSessionTimerState || {};
       const pending = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
       await Promise.all(pending);
-    });
-    await tracker.drain(30000, page);
-    return;
+      return await timerState.flushPromises?.[identity];
+    }, captured.snapshot.browserTimerIdentity);
+    const drained = await tracker.drain(30000, page);
+    if (!drained) {
+      throw new Error(`Required queued save did not reach validated durable persistence (${outcome?.kind || "unknown outcome"}): ${JSON.stringify(tracker.summary())}.`);
+    }
+    return { status: "succeeded", timerIdentity: captured.snapshot.timerIdentity, outcome };
   }
-  if (!captured) {
-    await page.evaluate(async () => {
-      const pending = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
-      await Promise.all(pending);
-    });
-    await tracker.drain(30000, page);
-    return;
-  }
+  await page.evaluate(async () => {
+    const pending = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
+    await Promise.all(pending);
+  });
+  const drained = await tracker.drain(30000, page);
+  if (!drained) throw new Error(`Required quote-session work did not prove durable persistence: ${JSON.stringify(tracker.summary())}.`);
+  return { status: "drained" };
 }
 
 function pythonCommand() {
@@ -3551,6 +4233,256 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       }
     };
 
+
+    const runSqag212DrainRaceControls = async (savedSessionId) => {
+      const sortChoices = await browserPage.evaluate(() => ({
+        original: String(state.outputSortMode || "pricing_reference"),
+        quoteGenerated: Boolean(state.downloadFile && downloadFileIsFresh(state.downloadFile)),
+      }));
+      if (sortChoices.quoteGenerated) {
+        throw new Error("F4 drain-race controls must run before generated outputs exist.");
+      }
+      const sortA = sortChoices.original === "name" ? "category" : "name";
+      const sortB = sortA === "category" ? "name" : "category";
+      const applySort = async (value) => browserPage.evaluate((sort) => {
+        state.outputSortMode = sort;
+        if (elements.outputSortMode) elements.outputSortMode.value = sort;
+        return currentQuoteSessionDraftState();
+      }, value);
+      const validateQueuedRecord = (record, captured, expectedSort, label) => {
+        if (
+          !record
+          || record.httpStatus < 200
+          || record.httpStatus >= 300
+          || record.bodyStatus !== "saved"
+          || record.expectedSessionId !== savedSessionId
+          || record.expectedQuoteGenerated !== false
+          || record.responseSessionId !== savedSessionId
+          || record.responseQuoteGenerated !== false
+          || record.clientResult?.nonNull !== true
+          || record.clientResult?.sessionId !== savedSessionId
+          || record.clientResult?.quoteGenerated !== false
+          || record.payloadDraftState?.outputSortMode !== expectedSort
+          || record.readback?.httpStatus !== 200
+          || record.readback?.sessionId !== savedSessionId
+          || record.readback?.quoteGenerated !== false
+          || record.readback?.draftState?.outputSortMode !== expectedSort
+          || (Array.isArray(record.payloadDraftFiles)
+            && JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles)) !== JSON.stringify(queuedDraftFilesComparable(captured.snapshot.draftFiles)))
+          || JSON.stringify(queuedDraftFilesComparable(record.readback?.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(captured.snapshot.draftFiles))
+          || JSON.stringify(queuedDraftStateComparable(record.payloadDraftState)) !== JSON.stringify(queuedDraftStateComparable(captured.snapshot.draftState))
+          || JSON.stringify(queuedDraftStateComparable(record.readback?.draftState)) !== JSON.stringify(queuedDraftStateComparable(captured.snapshot.draftState))
+        ) {
+          throw new Error(label + " did not validate its POST, client result, and durable readback: " + JSON.stringify({
+            expectedSort,
+            captured: captured.snapshot,
+            record: record && {
+              httpStatus: record.httpStatus,
+              bodyStatus: record.bodyStatus,
+              responseSessionId: record.responseSessionId,
+              responseQuoteGenerated: record.responseQuoteGenerated,
+              clientResult: record.clientResult,
+              payloadSort: record.payloadDraftState?.outputSortMode,
+              readback: record.readback,
+            },
+          }) + ".");
+        }
+      };
+
+      const firstOperationId = "sqag212/f4-timer-during-wait/" + Date.now();
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "f4-timer-during-deferred-drain",
+        operationId: firstOperationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      let releaseHeldJob = null;
+      const heldJob = new Promise((resolve) => { releaseHeldJob = resolve; });
+      tracker.trackRequiredJob(heldJob, firstOperationId + "/held-prior-job");
+      const waitCountBefore = tracker.summary().drainWaitCount;
+      const drainPromise = tracker.drain(30000, browserPage);
+      const firstWait = await tracker.waitForDrainWaiting(5000, waitCountBefore);
+      await applySort(sortA);
+      await browserPage.evaluate(() => {
+        window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
+        const draftState = currentQuoteSessionDraftState();
+        const draftFiles = sessionFileRecordsFromDraft();
+        queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000, draftState, draftFiles });
+      });
+      await tracker.syncQueuedSaveTimer(browserPage);
+      const captured = await tracker.capturePendingQueuedSave(browserPage);
+      if (!captured || captured.snapshot.draftState?.outputSortMode !== sortA) {
+        throw new Error("F4 could not capture its real pending timer during deferred drain: " + JSON.stringify(captured?.snapshot || null) + ".");
+      }
+      const timerWait = await tracker.waitForDrainWaiting(5000, firstWait.count);
+      releaseHeldJob();
+      const afterJobWait = await tracker.waitForDrainWaiting(5000, timerWait.count);
+      let drainFinishedEarly = false;
+      drainPromise.then(() => { drainFinishedEarly = true; });
+      if (drainFinishedEarly) {
+        throw new Error("F4 drain returned while the newly registered timer was still pending after the prior job completed.");
+      }
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "f4-timer-during-deferred-drain",
+        operationId: firstOperationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      let flush;
+      try {
+        flush = await flushRequiredQuoteSessionSaves(browserPage, tracker, captured);
+      } catch (error) {
+        const browserSaveCapture = await browserPage.evaluate(() => {
+          const timerState = window.__sqagSmokeQuoteSessionTimerState || {};
+          return {
+            saveCalls: timerState.saveCalls.map((item) => ({
+              timerIdentity: item.timerIdentity,
+              sessionId: String(item.snapshot?.sessionId || ""),
+              quoteGenerated: item.options?.quoteGenerated,
+              draftFileCount: Array.isArray(item.snapshot?.draftFiles) ? item.snapshot.draftFiles.length : null,
+            })),
+            saveCurrentCalls: timerState.saveCurrentCalls,
+            queuedSaveOperations: timerState.queuedSaveOperations?.map((item) => ({
+              identity: item.identity,
+              sessionId: String(item.snapshot?.sessionId || ""),
+              quoteGenerated: item.options?.quoteGenerated,
+              requestStarted: item.requestStarted,
+            })),
+          };
+        }).catch(() => null);
+        const relatedRecords = tracker.records.filter((record) => record.expectedSessionId === savedSessionId).map((record) => ({
+          operationId: record.operationId,
+          method: record.method,
+          queuedSaveIdentity: record.queuedSaveIdentity,
+          expectedQuoteGenerated: record.expectedQuoteGenerated,
+          payloadDraftKeys: Object.keys(record.payloadDraftState || {}),
+          payloadDraftFileCount: Array.isArray(record.payloadDraftFiles) ? record.payloadDraftFiles.length : null,
+          payloadSortMode: record.payloadDraftState?.outputSortMode,
+          readbackDraftFileCount: Array.isArray(record.readback?.draftFiles) ? record.readback.draftFiles.length : null,
+          readbackSortMode: record.readback?.draftState?.outputSortMode,
+          readbackDiffKeys: record.readback?.draftState
+            ? queuedDraftStateDiffKeys(record.readback.draftState, captured.snapshot.draftState)
+            : [],
+          readbackDiffValues: record.readback?.draftState
+            ? queuedDraftStateDiffKeys(record.readback.draftState, captured.snapshot.draftState).flatMap((key) => (
+              queuedDraftStateLeafDiffs(record.readback.draftState?.[key], captured.snapshot.draftState?.[key], key)
+            ))
+            : [],
+          clientResult: record.clientResult,
+          httpStatus: record.httpStatus,
+          bodyStatus: record.bodyStatus,
+          responseQuoteGenerated: record.responseQuoteGenerated,
+        }));
+        const timerEntry = tracker.queuedSaveStatus(captured.snapshot.timerIdentity);
+        throw new Error("F4 first timer flush failed: " + String(error?.message || error)
+          + "; timerEntry=" + JSON.stringify(timerEntry && {
+            status: timerEntry.status,
+            saveOutcome: timerEntry.saveOutcome,
+            snapshotSortMode: timerEntry.snapshot.draftState?.outputSortMode,
+            transitions: timerEntry.transitions,
+            evidence: timerEntry.evidence,
+          })
+          + "; relatedRequests=" + JSON.stringify(relatedRecords.filter((record) => record.operationId === firstOperationId))
+          + "; browserSaveCapture=" + JSON.stringify(browserSaveCapture));
+      }
+      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
+      const drainPassed = await drainPromise;
+      const firstRecords = tracker.records.filter((record) => record.operationId === firstOperationId && record.method === "POST");
+      const firstStatus = tracker.queuedSaveStatus(captured.snapshot.timerIdentity);
+      if (!drainPassed || firstRecords.length !== 1 || firstStatus?.status !== "succeeded") {
+        throw new Error("F4 deferred drain did not remain pending through exactly one durable timer save: " + JSON.stringify({
+          drainPassed, flush, firstStatus: firstStatus && { status: firstStatus.status, evidence: firstStatus.evidence },
+          records: firstRecords.length, summary: tracker.summary(),
+        }) + ".");
+      }
+      validateQueuedRecord(firstRecords[0], captured, sortA, "F4 deferred-wait timer save");
+
+      await tracker.drain(30000, browserPage);
+      const drainCountBeforeBarrier = tracker.summary().drainWaitCount;
+      const barrier = tracker.armFinalReconciliationBarrier();
+      const finalDrainPromise = tracker.drain(30000, browserPage);
+      await barrier.reached;
+      const zeroSnapshot = tracker.summary().outstanding;
+      if (
+        zeroSnapshot.requiredRequests
+        || zeroSnapshot.requiredResponseBodies
+        || zeroSnapshot.requiredDurableReadbacks
+        || zeroSnapshot.requiredSavePromises
+        || zeroSnapshot.nonterminalRequiredJobs
+        || zeroSnapshot.queuedRequiredSaves.length
+      ) {
+        barrier.release();
+        throw new Error("F4 final-zero barrier was reached with outstanding work: " + JSON.stringify(zeroSnapshot) + ".");
+      }
+      const secondOperationId = "sqag212/f4-timer-during-final-zero/" + Date.now();
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "f4-timer-during-final-zero-reconciliation",
+        operationId: secondOperationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      await applySort(sortB);
+      await browserPage.evaluate(() => {
+        window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
+        const draftState = currentQuoteSessionDraftState();
+        const draftFiles = sessionFileRecordsFromDraft();
+        queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000, draftState, draftFiles });
+      });
+      await tracker.syncQueuedSaveTimer(browserPage);
+      const finalCaptured = await tracker.capturePendingQueuedSave(browserPage);
+      if (!finalCaptured || finalCaptured.snapshot.draftState?.outputSortMode !== sortB) {
+        barrier.release();
+        throw new Error("F4 final-zero barrier did not capture the concurrently registered timer: " + JSON.stringify(finalCaptured?.snapshot || null) + ".");
+      }
+      barrier.release();
+      const finalTimerWait = await tracker.waitForDrainWaiting(5000, drainCountBeforeBarrier);
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "f4-timer-during-final-zero-reconciliation",
+        operationId: secondOperationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      let finalDrainFinishedEarly = false;
+      finalDrainPromise.then(() => { finalDrainFinishedEarly = true; });
+      if (finalDrainFinishedEarly) {
+        throw new Error("F4 final reconciliation returned success without waiting for the timer created inside its zero-work barrier.");
+      }
+      const finalFlush = await flushRequiredQuoteSessionSaves(browserPage, tracker, finalCaptured);
+      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
+      const finalDrainPassed = await finalDrainPromise;
+      const secondRecords = tracker.records.filter((record) => record.operationId === secondOperationId && record.method === "POST");
+      const finalStatus = tracker.queuedSaveStatus(finalCaptured.snapshot.timerIdentity);
+      if (!finalDrainPassed || secondRecords.length !== 1 || finalStatus?.status !== "succeeded") {
+        throw new Error("F4 final-zero drain missed or duplicated its concurrently registered timer: " + JSON.stringify({
+          finalDrainPassed, finalFlush, finalStatus: finalStatus && { status: finalStatus.status, evidence: finalStatus.evidence },
+          records: secondRecords.length, summary: tracker.summary(),
+        }) + ".");
+      }
+      validateQueuedRecord(secondRecords[0], finalCaptured, sortB, "F4 final-zero timer save");
+      return {
+        timerDuringDeferredWait: {
+          priorJobSettled: true,
+          drainStayedPendingUntilTimerPersistence: true,
+          exactlyOnePost: firstRecords.length === 1,
+          durableReadback: firstRecords[0].readback.httpStatus,
+          quoteGenerated: firstRecords[0].readback.quoteGenerated,
+          drainWaitCount: afterJobWait.count,
+        },
+        timerDuringFinalReconciliation: {
+          zeroOutstandingBeforeRegistration: true,
+          drainReconciledAndWaited: true,
+          exactlyOnePost: secondRecords.length === 1,
+          durableReadback: secondRecords[0].readback.httpStatus,
+          quoteGenerated: secondRecords[0].readback.quoteGenerated,
+          finalDrainWaitCount: finalTimerWait.count,
+        },
+      };
+    };
+
     const runSqag212TrackerFailureControls = async () => {
       const orphanTracker = createQuoteSessionDrainTracker("sqag212-c5-orphan");
       orphanTracker.trackRequiredJob(null, "sqag212-c5-orphan/no-producer");
@@ -3570,6 +4502,163 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         deadlineFailure: true,
         deadlineOutstandingIdentity: deadlineIssue.operationId,
       };
+    };
+
+
+    const runSqag212RecoveryNullControl = async (savedSessionId) => {
+      const recoveryTracker = createQuoteSessionDrainTracker("sqag212-f2-recovery-null");
+      const recoveryContext = await isolatedContext.browser().newContext({ viewport: { width: 1365, height: 900 } });
+      let recoveryPage = null;
+      let releaseNavigation = null;
+      let navigationSeenResolve = null;
+      const navigationSeen = new Promise((resolve) => { navigationSeenResolve = resolve; });
+      let navigationAbortedResolve = null;
+      const navigationAborted = new Promise((resolve) => { navigationAbortedResolve = resolve; });
+      try {
+        await recoveryTracker.install(recoveryContext);
+        recoveryPage = await recoveryContext.newPage();
+        await recoveryPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+        await recoveryPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+        if (!await recoveryTracker.drain(15000, recoveryPage)) {
+          throw new Error("F2 recovery-null page did not reach a clean baseline: " + JSON.stringify(recoveryTracker.summary()) + ".");
+        }
+        const recoveryBaseline = await recoveryPage.evaluate(() => ({
+          recoveryScope: String(currentBrowserRecoveryScope() || ""),
+          csrfToken: String(state.csrfToken || ""),
+          csrfHeaderName: String(state.csrfHeaderName || ""),
+        }));
+        if (!recoveryBaseline.recoveryScope || !recoveryBaseline.csrfToken) {
+          throw new Error("F2 recovery-null control lacks a real current recovery scope or CSRF state: " + JSON.stringify(recoveryBaseline) + ".");
+        }
+        const operationId = "sqag212/f2-recovery-transition-null/" + Date.now();
+        await recoveryTracker.setPageOperation(recoveryPage, {
+          fixture: "sqag212",
+          operation: "f2-recovery-transition-null-save",
+          operationId,
+          expectedSessionId: savedSessionId,
+          persistenceClass: "REQUIRED_SUCCESS",
+        });
+        await recoveryPage.evaluate((id) => {
+          state.quoteSessionId = id;
+          state.quoteSessionDraftSaveStarted = true;
+          const timerState = window.__sqagSmokeQuoteSessionTimerState;
+          timerState.trackQueuedSaves = true;
+          timerState.saveCurrentCalls.length = 0;
+          timerState.apiTrace.length = 0;
+          queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
+        }, savedSessionId);
+        const captured = await recoveryTracker.capturePendingQueuedSave(recoveryPage);
+        if (!captured || captured.snapshot.sessionId !== savedSessionId) {
+          throw new Error("F2 did not capture the exact pending timer before recovery transition: " + JSON.stringify(captured?.snapshot || null) + ".");
+        }
+        await recoveryPage.evaluate(() => {
+          const originalPurge = purgeBrowserRecoveryState;
+          window.__sqagF2PurgeReached = false;
+          window.__sqagF2ReleasePurge = null;
+          purgeBrowserRecoveryState = async (...args) => {
+            await originalPurge(...args);
+            window.__sqagF2PurgeReached = true;
+            await new Promise((resolve) => { window.__sqagF2ReleasePurge = resolve; });
+          };
+        });
+        await recoveryPage.route("**/*", async (route) => {
+          const request = route.request();
+          if (request.isNavigationRequest() && request.frame() === recoveryPage.mainFrame()) {
+            navigationSeenResolve(request.url());
+            await new Promise((resolve) => { releaseNavigation = resolve; });
+            await route.abort();
+            navigationAbortedResolve(request.url());
+            return;
+          }
+          await route.fallback();
+        });
+        await recoveryPage.evaluate(({ csrfToken, csrfHeaderName, recoveryScope }) => {
+          window.__sqagF2RecoveryTransition = applySessionData({
+            csrf_token: csrfToken,
+            csrf_header: csrfHeaderName,
+            browser_recovery_scope: recoveryScope + "-sqag212-next",
+          });
+        }, recoveryBaseline);
+        await recoveryPage.waitForFunction(() => window.__sqagF2PurgeReached === true, null, { timeout: 15000 });
+        const transition = await recoveryPage.evaluate(() => ({
+            transitioning: state.isRecoveryScopeTransitioning === true,
+            sessionId: String(state.quoteSessionId || ""),
+            timer: window.__sqagSmokeGetPendingQuoteSessionDraftSave?.(),
+          }));
+        if (!transition.transitioning || transition.sessionId !== savedSessionId) {
+          throw new Error("F2 did not reproduce a real recovery-scope transition while preserving in-memory session identity: " + JSON.stringify(transition) + ".");
+        }
+
+        let flushError = "";
+        try {
+          await flushRequiredQuoteSessionSaves(recoveryPage, recoveryTracker, captured);
+        } catch (error) {
+          flushError = String(error?.message || error);
+        }
+        const repeatedDrain = await recoveryTracker.drain(1000, recoveryPage);
+        const browserEvidence = await recoveryPage.evaluate(() => {
+          const timerState = window.__sqagSmokeQuoteSessionTimerState || {};
+          return {
+            sessionId: String(state.quoteSessionId || ""),
+            transitioning: state.isRecoveryScopeTransitioning === true,
+            saveCurrentCalls: timerState.saveCurrentCalls.length,
+            apiTrace: timerState.apiTrace.map((entry) => ({ method: entry.method, path: entry.path })),
+          };
+        });
+        const entry = recoveryTracker.queuedSaveStatus(captured.snapshot.timerIdentity);
+        const failure = recoveryTracker.issues.find((issue) => issue.operationId === entry?.identity);
+        const postObserved = browserEvidence.apiTrace.some((request) => request.method === "POST" && request.path === "/api/quote-sessions");
+        const durableReadbackObserved = browserEvidence.apiTrace.some((request) => request.method === "GET" && request.path.startsWith("/api/quote-sessions/" + savedSessionId));
+        if (
+          !flushError
+          || repeatedDrain
+          || entry?.status !== "failed"
+          || !String(entry.terminalReason || "").includes("returned null")
+          || !failure
+          || browserEvidence.sessionId !== savedSessionId
+          || browserEvidence.transitioning !== true
+          || browserEvidence.saveCurrentCalls !== 0
+          || postObserved
+          || durableReadbackObserved
+        ) {
+          throw new Error("F2 recovery-transition null result did not fail sticky with zero POST/readback evidence: " + JSON.stringify({
+            flushError, repeatedDrain, entry: entry && { status: entry.status, reason: entry.terminalReason },
+            failure, browserEvidence, postObserved, durableReadbackObserved, summary: recoveryTracker.summary(),
+          }) + ".");
+        }
+        await recoveryPage.evaluate(() => window.__sqagF2ReleasePurge?.());
+        const navigationUrl = await Promise.race([
+          navigationSeen,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("F2 recovery transition did not initiate its real reload navigation.")), 8000)),
+        ]);
+        if (typeof releaseNavigation !== "function") {
+          throw new Error("F2 recovery navigation was observed without an abort release handle.");
+        }
+        releaseNavigation();
+        releaseNavigation = null;
+        const abortedUrl = await Promise.race([
+          navigationAborted,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("F2 recovery reload request did not reach the controlled abort point.")), 5000)),
+        ]);
+        if (abortedUrl !== navigationUrl) {
+          throw new Error("F2 controlled reload abort did not match the observed navigation.");
+        }
+        return {
+          flushResult: "FAIL",
+          stickyFailure: "YES",
+          requiredWorkNotSilentlySatisfied: "YES",
+          postObserved: "NO",
+          durableReadbackObserved: "NO",
+          preservedSessionId: browserEvidence.sessionId,
+          failureReason: entry.terminalReason,
+        };
+      } finally {
+        if (recoveryPage && !recoveryPage.isClosed()) {
+          await recoveryPage.evaluate(() => window.__sqagF2ReleasePurge?.()).catch(() => {});
+        }
+        if (typeof releaseNavigation === "function") releaseNavigation();
+        await recoveryContext.close();
+      }
     };
 
     const setSyntheticDraftPrice = async (price) => browserPage.evaluate((value) => {
@@ -3593,68 +4682,142 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         persistenceClass: "REQUIRED_SUCCESS",
       });
       await setSyntheticDraftPrice(pendingPrice);
-      await browserPage.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false }));
+      await browserPage.evaluate(() => {
+        window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
+        queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+      });
       const captured = await tracker.capturePendingQueuedSave(browserPage);
       if (!captured || captured.snapshot.options.quoteGenerated !== false) {
         throw new Error(`C6 did not retain the real pending timer options: ${JSON.stringify(captured?.snapshot || null)}.`);
       }
       await flushRequiredQuoteSessionSaves(browserPage, tracker);
+      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
       const c6Records = tracker.records.filter((record) => record.operationId === operationId && record.persistenceClass !== "DIAGNOSTIC_ONLY");
       if (c6Records.length !== 1) {
         throw new Error(`C6 pending timer flush dispatched ${c6Records.length} real application saves instead of exactly one.`);
       }
       const c6Record = c6Records[0];
+      await tracker.syncQueuedSaveTimer(browserPage);
+      const c6TimerState = tracker.queuedSaveStatus(captured.snapshot.timerIdentity);
+      const c6BrowserTimer = await tracker.readQueuedSaveTimer(browserPage);
       const persistedPrice = Number(c6Record.readback?.fields?.draft_state?.outputRows?.[0]?.unit_price_override);
-      if (
-        c6Record.httpStatus < 200
-        || c6Record.httpStatus >= 300
-        || c6Record.bodyStatus !== "saved"
-        || c6Record.responseSessionId !== savedSessionId
-        || c6Record.responseQuoteGenerated !== false
-        || c6Record.clientResult?.nonNull !== true
-        || c6Record.clientResult?.sessionId !== savedSessionId
-        || persistedPrice !== pendingPrice
-      ) {
-        throw new Error(`C6 real pending timer flush did not persist the changed draft: ${JSON.stringify({
-          httpStatus: c6Record.httpStatus,
-          bodyStatus: c6Record.bodyStatus,
-          responseSessionId: c6Record.responseSessionId,
-          responseQuoteGenerated: c6Record.responseQuoteGenerated,
-          clientResult: c6Record.clientResult,
-          persistedPrice,
-          expectedPrice: pendingPrice,
-          readback: c6Record.readback,
-        })}.`);
+      const c6Checks = {
+        successfulSavedResponse: c6Record.httpStatus >= 200 && c6Record.httpStatus < 300 && c6Record.bodyStatus === "saved",
+        exactResponseIdentity: c6Record.responseSessionId === savedSessionId,
+        falseGeneratedStatus: c6Record.responseQuoteGenerated === false && c6Record.clientResult?.quoteGenerated === false && c6Record.readback?.quoteGenerated === false,
+        successfulClientResult: c6Record.clientResult?.nonNull === true && c6Record.clientResult?.sessionId === savedSessionId,
+        timerSucceeded: c6TimerState?.status === "succeeded",
+        postAndReadbackEvidence: c6TimerState?.evidence?.postObserved === true && c6TimerState?.evidence?.durableReadbackObserved === true,
+        exactlyOneFlush: c6TimerState?.transitions?.filter((transition) => transition.type === "flush").length === 1,
+        timerCleared: c6BrowserTimer?.pending === null,
+        expectedPriceInPostAndReadback: c6Record.payloadDraftState?.outputRows?.[0]?.unit_price_override === pendingPrice
+          && c6Record.readback?.draftState?.outputRows?.[0]?.unit_price_override === pendingPrice
+          && persistedPrice === pendingPrice,
+        durableDraftPresent: Boolean(c6Record.readback?.draftState),
+        postMatchesCapturedState: JSON.stringify(queuedDraftStateComparable(c6Record.payloadDraftState))
+          === JSON.stringify(queuedDraftStateComparable(captured.snapshot.draftState)),
+        readbackMatchesCapturedState: JSON.stringify(queuedDraftStateComparable(c6Record.readback?.draftState))
+          === JSON.stringify(queuedDraftStateComparable(captured.snapshot.draftState)),
+        postFilesOmittedOrMatchesCaptured: c6Record.payloadDraftFiles === null
+          || (Array.isArray(c6Record.payloadDraftFiles)
+            && JSON.stringify(queuedDraftFilesComparable(c6Record.payloadDraftFiles))
+              === JSON.stringify(queuedDraftFilesComparable(captured.snapshot.draftFiles))),
+        readbackMatchesCapturedFiles: JSON.stringify(queuedDraftFilesComparable(c6Record.readback?.draftFiles))
+          === JSON.stringify(queuedDraftFilesComparable(captured.snapshot.draftFiles)),
+      };
+      if (Object.values(c6Checks).some((passed) => !passed)) {
+        throw new Error(`C6 real pending timer flush did not persist the changed draft: ${JSON.stringify({ c6Checks, httpStatus: c6Record.httpStatus, bodyStatus: c6Record.bodyStatus, responseSessionId: c6Record.responseSessionId, clientResult: c6Record.clientResult, persistedPrice, timerStatus: c6TimerState?.status, timerEvidence: c6TimerState?.evidence, timerTransitions: c6TimerState?.transitions, pendingTimer: c6BrowserTimer?.pending, postPrice: c6Record.payloadDraftState?.outputRows?.[0]?.unit_price_override, readbackPrice: c6Record.readback?.draftState?.outputRows?.[0]?.unit_price_override })}.`);
+      }
+
+      const c6PostCountBeforeFinalReconciliation = tracker.records.filter((record) => record.operationId === operationId && record.method === "POST").length;
+      const c6Barrier = tracker.armFinalReconciliationBarrier();
+      const c6FinalDrain = tracker.drain(30000, browserPage);
+      await c6Barrier.reached;
+      let c6FinalTimer = null;
+      try {
+        await tracker.syncQueuedSaveTimer(browserPage);
+        c6FinalTimer = await tracker.readQueuedSaveTimer(browserPage);
+      } finally {
+        c6Barrier.release();
+      }
+      const c6FinalDrainPassed = await c6FinalDrain;
+      const c6PostCountAfterFinalReconciliation = tracker.records.filter((record) => record.operationId === operationId && record.method === "POST").length;
+      if (!c6FinalDrainPassed || c6FinalTimer?.pending !== null || c6PostCountBeforeFinalReconciliation !== 1 || c6PostCountAfterFinalReconciliation !== 1) {
+        throw new Error("C6 positive control did not stay at one POST with no pending timer through final reconciliation: " + JSON.stringify({
+          c6FinalDrainPassed,
+          c6FinalTimer,
+          c6PostCountBeforeFinalReconciliation,
+          c6PostCountAfterFinalReconciliation,
+          summary: tracker.summary(),
+        }) + ".");
       }
 
       const clearOnlyTracker = createQuoteSessionDrainTracker("sqag212-c6-clear-only");
-      const clearOnlyPrice = 19.95;
-      await setSyntheticDraftPrice(clearOnlyPrice);
-      await browserPage.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false }));
-      const clearOnlyCapture = await clearOnlyTracker.capturePendingQueuedSave(browserPage);
-      await browserPage.evaluate(() => clearQuoteSessionDraftSaveTimer());
-      const clearOnlyDrained = await clearOnlyTracker.drain(1000, browserPage);
-      const clearOnlyIssue = clearOnlyTracker.issues.find((issue) => issue.reason.includes("no terminal completion producer"));
-      if (clearOnlyDrained || !clearOnlyIssue) {
-        throw new Error(`C6 clear-only control unexpectedly satisfied the pending save: ${JSON.stringify({ clearOnlyCapture, clearOnlyDrained, clearOnlyIssue })}.`);
+      const clearOnlyContext = await isolatedContext.browser().newContext({ viewport: { width: 1365, height: 900 } });
+      let clearOnlyPage = null;
+      let clearOnlyCapture = null;
+      let clearOnlyDrained = true;
+      let clearOnlyIssue = null;
+      try {
+        await clearOnlyTracker.install(clearOnlyContext);
+        clearOnlyPage = await clearOnlyContext.newPage();
+        await clearOnlyPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+        await clearOnlyPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+        if (!await clearOnlyTracker.drain(15000, clearOnlyPage)) {
+          throw new Error(`C6 isolated clear-only page had unrelated outstanding work: ${JSON.stringify(clearOnlyTracker.summary())}.`);
+        }
+        await clearOnlyPage.evaluate((id) => {
+          state.quoteSessionId = id;
+          state.quoteSessionDraftSaveStarted = true;
+          window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
+          queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
+        }, savedSessionId);
+        clearOnlyCapture = await clearOnlyTracker.capturePendingQueuedSave(clearOnlyPage);
+        await clearOnlyPage.evaluate(() => clearQuoteSessionDraftSaveTimer());
+        clearOnlyDrained = await clearOnlyTracker.drain(1000, clearOnlyPage);
+        clearOnlyIssue = clearOnlyTracker.issues.find((issue) => issue.reason.includes("cancelled without an accounted successor"));
+        const stillFailed = await clearOnlyTracker.drain(1000, clearOnlyPage);
+        if (clearOnlyDrained || stillFailed || !clearOnlyIssue) {
+          throw new Error(`C6 clear-only control unexpectedly satisfied or forgot pending work: ${JSON.stringify({ clearOnlyCapture, clearOnlyDrained, stillFailed, clearOnlyIssue, summary: clearOnlyTracker.summary() })}.`);
+        }
+      } finally {
+        await clearOnlyContext.close();
       }
-      await setSyntheticDraftPrice(pendingPrice);
 
       let missingOptionsRejected = false;
-      await browserPage.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false }));
-      await browserPage.evaluate(() => {
-        const timerState = window.__sqagSmokeQuoteSessionTimerState;
-        if (timerState?.pending) timerState.pending.options = null;
-      });
+      const missingOptionsTracker = createQuoteSessionDrainTracker("sqag212-c6-missing-options");
+      const missingOptionsContext = await isolatedContext.browser().newContext({ viewport: { width: 1365, height: 900 } });
       try {
-        await clearOnlyTracker.capturePendingQueuedSave(browserPage);
-      } catch (error) {
-        if (!String(error?.message || error).includes("not capturable")) throw error;
-        missingOptionsRejected = true;
+        await missingOptionsTracker.install(missingOptionsContext);
+        const missingOptionsPage = await missingOptionsContext.newPage();
+        await missingOptionsPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+        await missingOptionsPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+        if (!await missingOptionsTracker.drain(15000, missingOptionsPage)) {
+          throw new Error(`C6 isolated missing-options page had unrelated outstanding work: ${JSON.stringify(missingOptionsTracker.summary())}.`);
+        }
+        await missingOptionsPage.evaluate((id) => {
+          state.quoteSessionId = id;
+          state.quoteSessionDraftSaveStarted = true;
+          window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
+          queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
+          const timerState = window.__sqagSmokeQuoteSessionTimerState;
+          if (timerState?.pending) timerState.pending.options = null;
+        }, savedSessionId);
+        try {
+          await missingOptionsTracker.capturePendingQueuedSave(missingOptionsPage);
+        } catch (error) {
+          if (!String(error?.message || error).includes("not capturable")) throw error;
+          missingOptionsRejected = true;
+        } finally {
+          await missingOptionsPage.evaluate(() => clearQuoteSessionDraftSaveTimer());
+        }
+        const missingOptionsDrained = await missingOptionsTracker.drain(1000, missingOptionsPage);
+        if (!missingOptionsRejected || missingOptionsDrained || !missingOptionsTracker.issues.length) {
+          throw new Error(`C6 missing pending-save options were not sticky: ${JSON.stringify({ missingOptionsRejected, missingOptionsDrained, summary: missingOptionsTracker.summary() })}.`);
+        }
       } finally {
-        await browserPage.evaluate(() => clearQuoteSessionDraftSaveTimer());
+        await missingOptionsContext.close();
       }
-      if (!missingOptionsRejected) throw new Error("C6 missing pending-save options did not fail loudly.");
 
       const joinPrice = 20.25;
       const joinOperationId = `sqag212/c6-equivalent-join/${Date.now()}`;
@@ -3790,12 +4953,183 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         pendingTimer: {
           exactlyOneRealSave: true,
           pendingOptionsPreserved: true,
+          timerFlushTransitions: c6TimerState.transitions.filter((transition) => transition.type === "flush").length,
+          durableReadback: c6Record.readback.httpStatus,
+          noPendingTimerAfterFinalReconciliation: c6FinalTimer.pending === null,
+          postCountAfterFinalReconciliation: c6PostCountAfterFinalReconciliation,
           persistedPrice: pendingPrice,
         },
         clearOnlyFails: true,
         missingOptionsRejected,
         equivalentInFlightJoin: { postCount: joinPostCount, recordCount: joinRecords.length },
         changedDraftAfterPriorSave: { postCount: changedPostCount, finalPrice: changedAfterPriorPrice },
+      };
+    };
+
+
+    const runSqag212GeneratedTimerReplacementControl = async (savedSessionId) => {
+      await flushRequiredQuoteSessionSaves(browserPage, tracker);
+      const preflightId = "sqag212/f3-generated-status-preflight/" + Date.now();
+      await tracker.setPageDiagnostic(browserPage, {
+        operationId: preflightId,
+        operation: "f3-generated-status-preflight",
+      }, savedSessionId);
+      const persistedBefore = await browserPage.evaluate(async (id) => {
+        const response = await fetch("/api/quote-sessions/" + encodeURIComponent(id) + "?__sqag_f3_before=" + Date.now(), {
+          cache: "no-store",
+          headers: { "cache-control": "no-cache", pragma: "no-cache" },
+        });
+        const body = await response.json();
+        const session = body?.quote_session || {};
+        return {
+          httpStatus: response.status,
+          sessionId: String(session.session_id || ""),
+          quoteGenerated: session.status?.quote_generated === true,
+          xlsxExists: session.exports?.xlsx?.exists === true,
+          draftState: session.draft_state || null,
+        };
+      }, savedSessionId);
+      await tracker.drain(30000, browserPage);
+      if (
+        persistedBefore.httpStatus !== 200
+        || persistedBefore.sessionId !== savedSessionId
+        || persistedBefore.quoteGenerated !== true
+        || persistedBefore.xlsxExists !== true
+      ) {
+        throw new Error("F3 generated-state control requires the real persisted generated session: " + JSON.stringify(persistedBefore) + ".");
+      }
+      const sortChoice = await browserPage.evaluate(() => ({
+        original: String(state.outputSortMode || "pricing_reference"),
+        fresh: Boolean(state.downloadFile && downloadFileIsFresh(state.downloadFile)),
+      }));
+      if (!sortChoice.fresh) throw new Error("F3 generated-state control lost its fresh browser output before timer setup.");
+      const nextSort = sortChoice.original === "name" ? "category" : "name";
+      const operationId = "sqag212/f3-replaced-generated-timer/" + Date.now();
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "f3-replaced-queued-save-generated-status",
+        operationId,
+        expectedSessionId: savedSessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      await browserPage.evaluate(() => {
+        const timerState = window.__sqagSmokeQuoteSessionTimerState;
+        timerState.apiTrace.length = 0;
+        timerState.saveCurrentCalls.length = 0;
+        timerState.trackQueuedSaves = true;
+        queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
+      });
+      const capturedA = await tracker.capturePendingQueuedSave(browserPage);
+      if (!capturedA || capturedA.snapshot.options.quoteGenerated !== false) {
+        throw new Error("F3 did not capture timer A with its original false status option.");
+      }
+      const drainWaitCount = tracker.summary().drainWaitCount;
+      const drainPromise = tracker.drain(30000, browserPage);
+      const firstWait = await tracker.waitForDrainWaiting(5000, drainWaitCount);
+      await browserPage.evaluate((sort) => {
+        state.outputSortMode = sort;
+        if (elements.outputSortMode) elements.outputSortMode.value = sort;
+        queueQuoteSessionDraftStateSave({ quoteGenerated: true, delay: 60000 });
+      }, nextSort);
+      await tracker.syncQueuedSaveTimer(browserPage);
+      await browserPage.evaluate(async () => {
+        await window.__sqagSmokeQuoteSessionTimerState?.lastEventPromise;
+      });
+      const capturedB = await tracker.capturePendingQueuedSave(browserPage);
+      if (
+        !capturedB
+        || capturedB.snapshot.timerIdentity === capturedA.snapshot.timerIdentity
+        || capturedB.snapshot.options.quoteGenerated !== true
+        || capturedB.snapshot.draftState?.outputSortMode !== nextSort
+      ) {
+        throw new Error("F3 replacement B did not retain a new timer identity, changed draft, and quoteGenerated=true options: " + JSON.stringify({
+          capturedA: capturedA.snapshot,
+          capturedB: capturedB?.snapshot || null,
+        }) + ".");
+      }
+      const secondWait = await tracker.waitForDrainWaiting(5000, firstWait.count);
+      const attemptA = await tracker.startCapturedQueuedSave(browserPage, capturedA);
+      const browserTimer = await tracker.readQueuedSaveTimer(browserPage);
+      let drainFinishedBeforeB = false;
+      drainPromise.then(() => { drainFinishedBeforeB = true; });
+      const statusA = tracker.queuedSaveStatus(capturedA.snapshot.timerIdentity);
+      if (
+        attemptA.status !== "replaced"
+        || browserTimer?.pending?.timerIdentity !== capturedB.snapshot.browserTimerIdentity
+        || browserTimer?.pending?.options?.quoteGenerated !== true
+        || browserTimer?.pending?.draftState?.outputSortMode !== nextSort
+        || statusA?.status !== "superseded"
+        || statusA?.successorIdentity !== capturedB.snapshot.timerIdentity
+        || drainFinishedBeforeB
+      ) {
+        throw new Error("Flushing stale timer A disturbed replacement B or let the drain pass early: " + JSON.stringify({
+          attemptA,
+          browserTimer,
+          statusA: statusA && { status: statusA.status, successorIdentity: statusA.successorIdentity },
+          drainFinishedBeforeB,
+          secondWait,
+        }) + ".");
+      }
+      const flushB = await flushRequiredQuoteSessionSaves(browserPage, tracker, capturedB);
+      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
+      const drainPassed = await drainPromise;
+      const records = tracker.records.filter((record) => record.operationId === operationId && record.method === "POST");
+      const statusB = tracker.queuedSaveStatus(capturedB.snapshot.timerIdentity);
+      const browserEvidence = await browserPage.evaluate(() => ({
+        apiTrace: (window.__sqagSmokeQuoteSessionTimerState?.apiTrace || []).map((entry) => ({ method: entry.method, path: entry.path })),
+        saveCurrentCalls: (window.__sqagSmokeQuoteSessionTimerState?.saveCurrentCalls || []).length,
+        timer: window.__sqagSmokeGetPendingQuoteSessionDraftSave?.(),
+      }));
+      const record = records[0];
+      if (
+        !drainPassed
+        || records.length !== 1
+        || browserEvidence.saveCurrentCalls !== 1
+        || browserEvidence.apiTrace.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length !== 1
+        || statusB?.status !== "succeeded"
+        || statusB?.evidence?.postObserved !== true
+        || statusB?.evidence?.durableReadbackObserved !== true
+        || record?.responseQuoteGenerated !== true
+        || record?.clientResult?.quoteGenerated !== true
+        || record?.readback?.quoteGenerated !== true
+        || record?.readback?.httpStatus !== 200
+        || record?.payloadDraftState?.outputSortMode !== nextSort
+        || record?.readback?.draftState?.outputSortMode !== nextSort
+        || JSON.stringify(queuedDraftStateComparable(record?.payloadDraftState)) !== JSON.stringify(queuedDraftStateComparable(capturedB.snapshot.draftState))
+        || JSON.stringify(queuedDraftStateComparable(record?.readback?.draftState)) !== JSON.stringify(queuedDraftStateComparable(capturedB.snapshot.draftState))
+        || (record?.payloadDraftFiles !== null
+          && JSON.stringify(queuedDraftFilesComparable(record?.payloadDraftFiles)) !== JSON.stringify(queuedDraftFilesComparable(capturedB.snapshot.draftFiles)))
+        || JSON.stringify(queuedDraftFilesComparable(record?.readback?.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(capturedB.snapshot.draftFiles))
+        || record?.expectedSessionId !== savedSessionId
+        || record?.responseSessionId !== savedSessionId
+        || record?.httpStatus < 200
+        || record?.httpStatus >= 300
+        || record?.bodyStatus !== "saved"
+      ) {
+        throw new Error("F3 replacement B did not prove exactly one generated-status POST and matching durable readback: " + JSON.stringify({
+          drainPassed, flushB, records: records.length, statusA: statusA && statusA.status,
+          statusB: statusB && { status: statusB.status, evidence: statusB.evidence },
+          browserEvidence, record: record && {
+            httpStatus: record.httpStatus,
+            bodyStatus: record.bodyStatus,
+            responseSessionId: record.responseSessionId,
+            responseQuoteGenerated: record.responseQuoteGenerated,
+            clientResult: record.clientResult,
+            payloadDraftState: record.payloadDraftState,
+            readback: record.readback,
+          },
+        }) + ".");
+      }
+      return {
+        aToBReplacement: true,
+        staleAWasNotDispatched: statusA.evidence.postObserved !== true,
+        drainWaitedForB: true,
+        exactlyOnePost: records.length,
+        quoteGenerated: record.readback.quoteGenerated,
+        changedDraftField: "outputSortMode",
+        changedDraftValue: nextSort,
+        durableReadback: record.readback.httpStatus,
+        timerCleared: browserEvidence.timer?.pending === null,
       };
     };
 
@@ -3970,14 +5304,13 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     sessionId = await currentQuoteSessionId(browserPage);
     if (!sessionId) throw new Error("SQAG #212 quote was not saved after basis confirmation.");
     stage = "awaiting the initiating application save and positive drain control";
-    const positiveOperationId = `sqag212/positive-control-save/${Date.now()}`;
+    const positiveOperationId = "sqag212/positive-control-save/" + Date.now();
     await tracker.setPageOperation(browserPage, {
       fixture: "sqag212",
       operation: "positive-control-save",
       operationId: positiveOperationId,
       expectedSessionId: sessionId,
     });
-    await tracker.syncQueuedSaveTimer(browserPage);
     const positiveSave = await browserPage.evaluate(async () => {
       clearQuoteSessionDraftSaveTimer();
       const priorSaves = [quoteSessionInitialSavePromise, quoteSessionDraftSavePromise].filter(Boolean);
@@ -3987,6 +5320,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         sessionId: state.quoteSessionId,
         quoteGenerated: false,
         includeDraftState: true,
+        includeDraftFiles: true,
         draftState: currentQuoteSessionDraftState(),
         draftFiles: sessionFileRecordsFromDraft(),
       });
@@ -3996,11 +5330,20 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       };
     });
     if (positiveSave.sessionId !== sessionId || positiveSave.quoteGenerated) {
-      throw new Error(`Positive control initiating save did not return the exact draft session: ${JSON.stringify(positiveSave)}.`);
+      throw new Error("Positive control initiating save did not return the exact draft session: " + JSON.stringify(positiveSave) + ".");
     }
     await flushRequiredQuoteSessionSaves(browserPage, tracker);
     const positiveRecord = tracker.records.find((record) => record.operationId === positiveOperationId && record.persistenceClass !== "DIAGNOSTIC_ONLY");
     if (!positiveRecord) throw new Error("Positive control did not capture its initiating quote-session save request.");
+    if (
+      positiveRecord.clientResult?.sessionId !== positiveSave.sessionId
+      || positiveRecord.clientResult?.quoteGenerated !== false
+    ) {
+      throw new Error("Positive control request and initiating application promise did not agree: " + JSON.stringify({
+        positiveSave,
+        clientResult: positiveRecord.clientResult,
+      }) + ".");
+    }
     const savedDetail = await tracker.requiredDetailReadback(browserPage, sessionId, positiveRecord.expectedFields);
     const savedDraft = savedDetail.quote_session?.draft_state || {};
     const savedRow = savedDraft.outputRows?.[0] || {};
@@ -4021,6 +5364,8 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     drainControls = {
       ...(await runSqag212TrackerFailureControls()),
       asyncProgress: await runSqag212DrainControls(sessionId),
+      ...(await runSqag212DrainRaceControls(sessionId)),
+      recoveryTransitionNull: await runSqag212RecoveryNullControl(sessionId),
     };
     timerFlushControls = await runSqag212TimerFlushControls(sessionId);
     await flushRequiredQuoteSessionSaves(browserPage, tracker);
@@ -4131,6 +5476,8 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     if (!xlsxResponse.ok() || xlsxBytes.length < 4 || xlsxBytes[0] !== 0x50 || xlsxBytes[1] !== 0x4b) {
       throw new Error("SQAG #212 XLSX download was not a valid ZIP-based workbook.");
     }
+
+    timerFlushControls.generatedTimerReplacement = await runSqag212GeneratedTimerReplacementControl(sessionId);
 
     stage = "generating and checking the explicit PDF";
     const pdfReadiness = await browserPage.evaluate(() => ({

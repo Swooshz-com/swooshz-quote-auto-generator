@@ -11,6 +11,7 @@ import argparse
 import base64
 import binascii
 import contextlib
+import contextvars
 import copy
 import csv
 import datetime as dt
@@ -736,6 +737,9 @@ QUOTE_SESSION_RETIREMENT_LOCKS_LOCK = threading.Lock()
 QUOTE_SESSION_RETIREMENT_LOCKS: dict[str, threading.RLock] = {}
 QUOTE_SESSION_FILESYSTEM_CAPABILITY_LOCK = threading.Lock()
 QUOTE_SESSION_FILESYSTEM_CAPABILITIES: dict[tuple[int, int], dict[str, Any]] = {}
+QUOTE_SESSION_TRANSACTION_CONTEXT: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "quote_session_transaction_context", default=None
+)
 QUOTE_SESSION_FILESYSTEM_PROBE_PREFIX = ".sqag-case-equivalence-probe-"
 
 
@@ -12070,8 +12074,11 @@ class LocalSqagStorage:
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(clean_text(kind).lower())
         if not safe_id or not expected_filename:
             return None
-        state = _read_local_quote_session_state(safe_id)
-        if state["owner"] != safe_id or quote_session_is_retired(safe_id):
+        capability = _quote_session_filesystem_capability()
+        if _quote_session_retirement_state(safe_id, capability)[0]:
+            return None
+        state = _read_local_quote_session_state(safe_id, capability)
+        if state["owner"] != safe_id:
             return None
         metadata = state["metadata"] if isinstance(state["metadata"], dict) else {}
         if not quote_session_has_current_v2_publication(metadata):
@@ -24111,18 +24118,26 @@ def _read_retired_quote_session_ids(root: Path) -> set[str]:
     return retired
 
 
-def quote_session_is_retired(session_id: str) -> bool:
+def _quote_session_retirement_state(
+    session_id: str,
+    capability: dict[str, Any] | None = None,
+) -> tuple[bool, set[str]]:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
-        return False
-    capability = _quote_session_filesystem_capability()
+        return False, set()
+    capability = capability or _quote_session_filesystem_capability()
     root = capability["root"]
     component = _quote_session_lifecycle_component(safe_id, capability)
     with _quote_session_retirement_lock(root, capability):
-        return any(
-            _quote_session_lifecycle_component(retired_id, capability) == component
-            for retired_id in _read_retired_quote_session_ids(root)
-        )
+        retired_ids = _read_retired_quote_session_ids(root)
+    return (
+        any(_quote_session_lifecycle_component(value, capability) == component for value in retired_ids),
+        retired_ids,
+    )
+
+
+def quote_session_is_retired(session_id: str) -> bool:
+    return _quote_session_retirement_state(session_id)[0]
 
 
 def retire_quote_session_id(session_id: str) -> bool:
@@ -24296,20 +24311,26 @@ def quote_session_recorded_export_path(
     return quote_session_legacy_export_path(session_id, normalized_kind)
 
 
-def quote_session_export_path(session_id: str, kind: str) -> Path:
+def quote_session_export_path(session_id: str, kind: str) -> Path | None:
     safe_id = safe_quote_session_id(session_id, "")
     if safe_id:
+        capability = _quote_session_filesystem_capability()
+        if _quote_session_retirement_state(safe_id, capability)[0]:
+            return None
         metadata = read_quote_session_metadata(safe_id)
         if metadata:
             return quote_session_recorded_export_path(safe_id, kind, metadata)
-    return quote_session_legacy_export_path(session_id, kind)
+    return quote_session_legacy_export_path(session_id)
 
 
 def read_quote_session_metadata(session_id: str) -> dict[str, Any]:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return {}
-    state = _read_local_quote_session_state(safe_id)
+    capability = _quote_session_filesystem_capability()
+    if _quote_session_retirement_state(safe_id, capability)[0]:
+        return {}
+    state = _read_local_quote_session_state(safe_id, capability)
     if state["owner"] != safe_id:
         return {}
     return state["metadata"] if isinstance(state["metadata"], dict) else {}
@@ -25650,11 +25671,20 @@ def write_quote_session_draft_files(
     destination: Path | None = None,
 ) -> None:
     path = destination or quote_session_draft_files_path(session_id)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
     if destination is None and not records:
         if path.exists():
+            if transaction is not None:
+                transaction.ensure_directory(path.parent)
+                transaction.capture_file(path)
             path.unlink()
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
+    if transaction is not None:
+        transaction.ensure_directory(path.parent)
+        transaction.capture_file(path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         path,
         json.dumps(records, indent=2, sort_keys=True),
@@ -25863,11 +25893,18 @@ def write_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     if not normalized:
         raise ValueError("Quote session metadata is not valid.")
     path = quote_session_metadata_path(normalized["session_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
+    if transaction is not None:
+        transaction.ensure_directory(path.parent)
+        transaction.capture_file(path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         path,
         json.dumps(normalized, indent=2, sort_keys=True),
     )
+    if transaction is not None:
+        transaction.metadata_committed = True
     return normalized
 
 
@@ -25879,6 +25916,9 @@ def atomic_write_text(path: Path, content: str) -> None:
         dir=str(path.parent),
     )
     temporary_path = Path(temporary_name)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
+    if transaction is not None:
+        transaction.track_temporary_file(temporary_path)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
@@ -26081,6 +26121,115 @@ def mark_quote_session_exports_stale(metadata: dict[str, Any], preserve_kinds: s
         metadata["status"]["draft_modified"] = True
 
 
+@dataclass
+class LocalQuoteSessionTransaction:
+    session_id: str
+    session_directory: Path
+    initial_owner: bool
+    created_directories: set[Path] = field(default_factory=set)
+    owned_files: set[Path] = field(default_factory=set)
+    file_snapshots: dict[Path, bytes] = field(default_factory=dict)
+    metadata_committed: bool = False
+
+    def _path_key(self, path: Path) -> Path:
+        return Path(os.path.abspath(str(path)))
+
+    def _inside_session(self, path: Path) -> Path:
+        target = self._path_key(path)
+        root = self._path_key(self.session_directory)
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("Quote-session transaction path escaped its session directory.") from exc
+        return target
+
+    def ensure_directory(self, path: Path) -> None:
+        target = self._inside_session(path)
+        missing: list[Path] = []
+        cursor = target
+        root = self._path_key(self.session_directory)
+        while True:
+            if _quote_session_path_is_redirect(cursor):
+                raise _quote_session_storage_error("quote_session_storage_inconsistent")
+            try:
+                info = cursor.lstat()
+            except FileNotFoundError:
+                missing.append(cursor)
+            else:
+                if not stat.S_ISDIR(info.st_mode):
+                    raise _quote_session_storage_error("quote_session_storage_inconsistent")
+                break
+            if cursor == root:
+                cursor = cursor.parent
+                continue
+            cursor = cursor.parent
+        for directory in reversed(missing):
+            directory.mkdir()
+            self.created_directories.add(directory)
+
+    def capture_file(self, path: Path) -> Path:
+        target = self._inside_session(path)
+        if target in self.owned_files or target in self.file_snapshots:
+            return target
+        if _quote_session_path_is_redirect(target):
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            self.owned_files.add(target)
+            return target
+        if not stat.S_ISREG(info.st_mode):
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        self.file_snapshots[target] = target.read_bytes()
+        return target
+
+    def track_temporary_file(self, path: Path) -> None:
+        target = self._path_key(path)
+        try:
+            target.relative_to(self._path_key(self.session_directory))
+        except ValueError:
+            return
+        self.owned_files.add(target)
+
+    def remap_owned_prefix(self, source: Path, destination: Path) -> None:
+        source_key = self._path_key(source)
+        destination_key = self._path_key(destination)
+        def remap(path: Path) -> Path:
+            try:
+                return destination_key / path.relative_to(source_key)
+            except ValueError:
+                return path
+        self.created_directories = {remap(path) for path in self.created_directories}
+        self.owned_files = {remap(path) for path in self.owned_files}
+        self.file_snapshots = {remap(path): value for path, value in self.file_snapshots.items()}
+
+
+def _remove_uncommitted_quote_session_transaction(transaction: LocalQuoteSessionTransaction) -> None:
+    if transaction.metadata_committed and not transaction.initial_owner:
+        return
+    for path in sorted(transaction.owned_files, key=lambda item: len(item.parts), reverse=True):
+        if _quote_session_path_is_redirect(path):
+            raise OSError("Transaction-owned quote-session file was redirected before rollback.")
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("Transaction-owned quote-session file changed type before rollback.")
+        path.unlink()
+    for path, content in transaction.file_snapshots.items():
+        if _quote_session_path_is_redirect(path):
+            raise OSError("Pre-existing quote-session file was redirected before rollback.")
+        atomic_write_text(path, content.decode("utf-8"))
+    for directory in sorted(transaction.created_directories, key=lambda item: len(item.parts), reverse=True):
+        if _quote_session_path_is_redirect(directory):
+            raise OSError("Transaction-created quote-session directory was redirected before rollback.")
+        try:
+            directory.rmdir()
+        except FileNotFoundError:
+            continue
+
+
 def local_quote_publication_sources(
     result: dict[str, Any] | None,
     output_dir: Path | None,
@@ -26112,16 +26261,18 @@ def stage_local_quote_publication(
     output_dir: Path | None,
     *,
     draft_file_records: list[dict[str, Any]] | None = None,
+    transaction: LocalQuoteSessionTransaction,
 ) -> dict[str, Any] | None:
     sources = local_quote_publication_sources(result, output_dir)
     if not any(kind == "xlsx" for kind, _filename, _source in sources):
         return None
     publication_id = new_quote_publication_id()
     publications_dir = quote_session_publications_dir(session_id)
-    publications_dir.mkdir(parents=True, exist_ok=True)
+    transaction.ensure_directory(publications_dir)
     staging_dir = publications_dir / f".{publication_id}.staging"
     final_dir = quote_session_publication_dir(session_id, publication_id)
-    staging_dir.mkdir(parents=True, exist_ok=False)
+    staging_dir.mkdir(parents=False, exist_ok=False)
+    transaction.created_directories.add(transaction._path_key(staging_dir))
     staged_at = utc_timestamp()
     staged_exports: dict[str, dict[str, Any]] = {}
     try:
@@ -26131,6 +26282,7 @@ def stage_local_quote_publication(
                 raise ValueError(f"Generated quote publication source is empty: {filename}.")
             source_digest = hashlib.sha256(source_bytes).hexdigest()
             target = staging_dir / filename
+            transaction.capture_file(target)
             shutil.copy2(source, target)
             if not target.is_file():
                 raise ValueError(f"Staged quote publication file is missing: {filename}.")
@@ -26168,11 +26320,11 @@ def stage_local_quote_publication(
                 raise ValueError("Staged quote session draft files are invalid.") from exc
             if staged_draft_files != draft_file_records:
                 raise ValueError("Staged quote session draft files validation failed.")
+        if final_dir.exists() or _quote_session_path_is_redirect(final_dir):
+            raise FileExistsError("Quote publication generation already exists.")
         os.replace(staging_dir, final_dir)
+        transaction.remap_owned_prefix(staging_dir, final_dir)
     except Exception:
-        for uncommitted_dir in (staging_dir, final_dir):
-            if uncommitted_dir.exists() and uncommitted_dir.is_dir():
-                shutil.rmtree(uncommitted_dir)
         raise
     return {
         "publication_id": publication_id,
@@ -26244,56 +26396,10 @@ def cleanup_uncommitted_local_quote_publication(
     session_id: str,
     staged_publication: dict[str, Any] | None,
     *,
-    previous_metadata: dict[str, Any] | None = None,
-    previous_metadata_snapshot: str | None = None,
+    transaction: LocalQuoteSessionTransaction,
 ) -> None:
-    if not isinstance(staged_publication, dict):
-        return
-    publication_id = safe_quote_publication_id(
-        staged_publication.get("publication_id"),
-        "",
-    )
-    if not publication_id:
-        return
-    current = read_quote_session_metadata(session_id)
-    current_publication = current.get("publication") if isinstance(current.get("publication"), dict) else {}
-    if safe_quote_publication_id(current_publication.get("active_publication_id"), "") == publication_id:
-        if previous_metadata is None:
-            return
-        metadata_path = quote_session_metadata_path(session_id)
-        if previous_metadata_snapshot is not None:
-            atomic_write_text(metadata_path, previous_metadata_snapshot)
-        elif previous_metadata:
-            restored = normalized_quote_session_metadata(previous_metadata)
-            if not restored:
-                raise ValueError("Previous quote session metadata is not restorable.")
-            atomic_write_text(
-                metadata_path,
-                json.dumps(restored, indent=2, sort_keys=True),
-            )
-        elif metadata_path.exists():
-            metadata_path.unlink()
-        restored_metadata = read_quote_session_metadata(session_id)
-        restored_publication = (
-            restored_metadata.get("publication")
-            if isinstance(restored_metadata.get("publication"), dict)
-            else {}
-        )
-        if safe_quote_publication_id(
-            restored_publication.get("active_publication_id"),
-            "",
-        ) == publication_id:
-            raise RuntimeError("Failed to restore the prior quote publication authority.")
-    final_dir = staged_publication.get("final_dir")
-    if not isinstance(final_dir, Path):
-        return
-    publications_dir = quote_session_publications_dir(session_id).resolve()
-    try:
-        final_dir.resolve().relative_to(publications_dir)
-    except ValueError:
-        return
-    if final_dir.exists() and final_dir.is_dir():
-        shutil.rmtree(final_dir)
+    _ = session_id, staged_publication
+    _remove_uncommitted_quote_session_transaction(transaction)
 
 
 def coordinated_local_quote_session_mutation(function):
@@ -26324,8 +26430,7 @@ def coordinated_local_quote_session_mutation(function):
             candidate_session_id = requested_session_id or new_quote_session_id()
             with quote_session_mutation(candidate_session_id):
                 capability = _quote_session_filesystem_capability()
-                state = _read_local_quote_session_state(candidate_session_id, capability)
-                if quote_session_is_retired(candidate_session_id):
+                if _quote_session_retirement_state(candidate_session_id, capability)[0]:
                     if explicit_session_id:
                         raise SqagStorageAccessError(
                             QUOTE_SESSION_RETIRED_MESSAGE,
@@ -26333,6 +26438,7 @@ def coordinated_local_quote_session_mutation(function):
                             reason="quote_session_retired",
                         )
                     continue
+                state = _read_local_quote_session_state(candidate_session_id, capability)
                 if state["owner"] and state["owner"] != candidate_session_id:
                     if explicit_session_id:
                         raise SqagStorageAccessError(
@@ -26375,13 +26481,11 @@ def create_or_update_quote_session(
         "",
     ) or new_quote_session_id()
     existing = read_quote_session_metadata(resolved_session_id)
-    previous_metadata_snapshot: str | None = None
-    try:
-        metadata_path = quote_session_metadata_path(resolved_session_id)
-        if metadata_path.is_file():
-            previous_metadata_snapshot = metadata_path.read_text(encoding="utf-8")
-    except OSError:
-        previous_metadata_snapshot = None
+    transaction = LocalQuoteSessionTransaction(
+        session_id=resolved_session_id,
+        session_directory=quote_session_dir(resolved_session_id),
+        initial_owner=bool(existing),
+    )
     storage = storage or LocalSqagStorage()
     now = utc_timestamp()
     metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
@@ -26397,7 +26501,11 @@ def create_or_update_quote_session(
     draft_file_records: list[dict[str, Any]] | None = None
     if draft_state_supplied:
         metadata["draft_state"] = quote_session_draft_state(patch)
-        draft_file_records = quote_session_draft_files(patch)
+        draft_file_records = (
+            quote_session_draft_files(patch)
+            if "draft_files" in patch
+            else read_quote_session_draft_files(resolved_session_id, existing)
+        )
     elif result_has_generated_quote(result):
         draft_file_records = read_quote_session_draft_files(
             resolved_session_id,
@@ -26405,50 +26513,57 @@ def create_or_update_quote_session(
         )
     staged_publication: dict[str, Any] | None = None
     committed_publication: dict[str, Any] | None = None
+    transaction_token = QUOTE_SESSION_TRANSACTION_CONTEXT.set(transaction)
     try:
-        staged_publication = stage_local_quote_publication(
-            resolved_session_id,
-            result,
-            output_dir,
-            draft_file_records=draft_file_records,
-        )
-        if staged_publication is not None:
-            metadata["generation_snapshot"] = quote_session_generation_snapshot(
-                payload,
-                patch,
-                created_at=now,
+        try:
+            staged_publication = stage_local_quote_publication(
+                resolved_session_id,
+                result,
+                output_dir,
+                draft_file_records=draft_file_records,
+                transaction=transaction,
             )
-            committed_publication = commit_local_quote_publication(
-                metadata,
-                staged_publication,
-                freshness_proof=quote_session_publication_freshness_proof(patch),
-                patch=patch,
-                authority=(result or {}).get("_publication_authority") or local_publication_authority_for_payload(payload),
-            )
-        else:
-            if draft_state_supplied and draft_file_records is not None:
-                write_quote_session_draft_files(resolved_session_id, draft_file_records)
-                metadata["publication"].pop("draft_files_publication_id", None)
-            mark_quote_session_exports_stale(
-                metadata,
-                quote_session_authoritative_current_export_kinds(
-                    existing,
+            if staged_publication is not None:
+                metadata["generation_snapshot"] = quote_session_generation_snapshot(
+                    payload,
                     patch,
-                    storage=storage,
-                    authority=local_current_publication_authority(payload),
-                ),
-            )
-            committed = write_quote_session_metadata(metadata)
-            metadata.clear()
-            metadata.update(committed)
-    except Exception:
-        cleanup_uncommitted_local_quote_publication(
-            resolved_session_id,
-            staged_publication,
-            previous_metadata=existing,
-            previous_metadata_snapshot=previous_metadata_snapshot,
-        )
-        raise
+                    created_at=now,
+                )
+                committed_publication = commit_local_quote_publication(
+                    metadata,
+                    staged_publication,
+                    freshness_proof=quote_session_publication_freshness_proof(patch),
+                    patch=patch,
+                    authority=(result or {}).get("_publication_authority") or local_publication_authority_for_payload(payload),
+                )
+            else:
+                if draft_state_supplied and draft_file_records is not None:
+                    write_quote_session_draft_files(resolved_session_id, draft_file_records)
+                    metadata["publication"].pop("draft_files_publication_id", None)
+                mark_quote_session_exports_stale(
+                    metadata,
+                    quote_session_authoritative_current_export_kinds(
+                        existing,
+                        patch,
+                        storage=storage,
+                        authority=local_current_publication_authority(payload),
+                    ),
+                )
+                committed = write_quote_session_metadata(metadata)
+                metadata.clear()
+                metadata.update(committed)
+        except Exception as error:
+            try:
+                cleanup_uncommitted_local_quote_publication(
+                    resolved_session_id,
+                    staged_publication,
+                    transaction=transaction,
+                )
+            except Exception as cleanup_error:
+                raise cleanup_error from error
+            raise
+    finally:
+        QUOTE_SESSION_TRANSACTION_CONTEXT.reset(transaction_token)
     try:
         return public_quote_session(metadata)
     except Exception as exc:
@@ -26678,8 +26793,10 @@ def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> 
     if not safe_id:
         return None
     capability = _quote_session_filesystem_capability()
+    if _quote_session_retirement_state(safe_id, capability)[0]:
+        return None
     state = _read_local_quote_session_state(safe_id, capability)
-    if state["owner"] != safe_id or quote_session_is_retired(safe_id):
+    if state["owner"] != safe_id:
         return None
     metadata = state["metadata"] if isinstance(state["metadata"], dict) else {}
     if not metadata:
@@ -26715,17 +26832,75 @@ def list_quote_sessions() -> list[dict[str, Any]]:
     )
 
 
+def _remove_quote_session_tree_without_following_redirects(session_dir: Path) -> None:
+    if _quote_session_path_is_redirect(session_dir):
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    try:
+        entries = list(session_dir.iterdir())
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if _quote_session_path_is_redirect(entry):
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            _remove_quote_session_tree_without_following_redirects(entry)
+        elif stat.S_ISREG(info.st_mode):
+            entry.unlink()
+        else:
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    session_dir.rmdir()
+
+
+def _retired_quote_session_residual_directory(
+    session_id: str,
+    capability: dict[str, Any],
+) -> Path | None:
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(session_id, capability)
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_read_failed") from exc
+    matches = [
+        entry for entry in entries
+        if _quote_session_lifecycle_component(entry.name, capability) == component
+    ]
+    if len(matches) > 1:
+        raise _quote_session_storage_error("quote_session_storage_ambiguous")
+    if not matches:
+        return None
+    residual = matches[0]
+    if _quote_session_path_is_redirect(residual) or not residual.is_dir():
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    try:
+        residual.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent") from exc
+    return residual
+
+
 def delete_quote_session(session_id: str) -> bool:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return False
     with quote_session_mutation(safe_id):
         capability = _quote_session_filesystem_capability()
-        state = _read_local_quote_session_state(safe_id, capability)
-        retired = quote_session_is_retired(safe_id)
-        if state["owner"] and state["owner"] != safe_id:
-            if retired:
+        retired, retired_ids = _quote_session_retirement_state(safe_id, capability)
+        if retired:
+            if safe_id not in retired_ids:
                 return True
+            residual = _retired_quote_session_residual_directory(safe_id, capability)
+            if residual is None or residual.name != safe_id:
+                return True
+            _remove_quote_session_tree_without_following_redirects(residual)
+            return True
+
+        state = _read_local_quote_session_state(safe_id, capability)
+        if state["owner"] and state["owner"] != safe_id:
             raise SqagStorageAccessError(
                 "Quote session alias is not available.",
                 status=409,
@@ -26733,10 +26908,9 @@ def delete_quote_session(session_id: str) -> bool:
             )
         session_dir = state["directory"]
         if session_dir is None:
-            return retired
-        if not retired:
-            retire_quote_session_id(safe_id)
-        shutil.rmtree(session_dir)
+            return False
+        retire_quote_session_id(safe_id)
+        _remove_quote_session_tree_without_following_redirects(session_dir)
         if session_dir.exists():
             raise OSError("Quote session directory removal did not complete.")
         return True

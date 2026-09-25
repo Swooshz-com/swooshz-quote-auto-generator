@@ -16714,6 +16714,309 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     b"run472-persistent-pdf",
                 )
 
+    def test_f1_negative_fresh_owner_commit_failure_rolls_back_and_retries(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            xlsx_bytes = b"synthetic-f1-fresh-xlsx"
+            pdf_bytes = b"%PDF-1.4\nsynthetic-f1-fresh-pdf\n%%EOF\n"
+            payload, result, output_dir = self._local_publication_case(
+                root, "quote-F1-FreshOwner", xlsx_bytes, pdf_bytes, variant="fresh-failure"
+            )
+            draft_records = [{
+                "session_file_key": "f1-fresh-reference",
+                "name": "reference.pdf",
+                "type": "application/pdf",
+                "size": 3,
+                "data_url": "data:application/pdf;base64,UERG",
+            }]
+            payload["quote_session"]["draft_files"] = copy.deepcopy(draft_records)
+            payload["draft_files"] = copy.deepcopy(draft_records)
+            payload["quote_session"]["draft_state"]["images"] = [{
+                "session_file_key": "f1-fresh-reference",
+                "name": "reference.pdf",
+                "type": "application/pdf",
+                "size": 3,
+            }]
+            session_id = payload["quote_session"]["session_id"]
+            session_dir = data_root / "quote-sessions" / session_id
+            metadata_path = session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+            marker_path = (data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME)
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                self.assertFalse(session_dir.exists())
+                self.assertFalse(metadata_path.exists())
+                self.assertFalse(marker_path.exists())
+                original_replace = webapp.os.replace
+
+                def fail_first_metadata_commit(source, destination):
+                    if Path(destination).resolve() == metadata_path.resolve():
+                        raise OSError("synthetic first-owner metadata commit failure")
+                    return original_replace(source, destination)
+
+                with self.assertRaisesRegex(OSError, "first-owner metadata commit failure"):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_first_metadata_commit):
+                        webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+
+                self.assertFalse(session_dir.exists(), "F1 rollback left a transaction-created session container")
+                self.assertFalse(metadata_path.exists(), "F1 rollback created phantom owner metadata")
+                self.assertFalse(marker_path.exists(), "F1 rollback created a retirement record")
+                self.assertEqual(webapp.read_quote_session_metadata(session_id), {})
+                self.assertIsNone(webapp.get_quote_session(session_id))
+                self.assertFalse(webapp.quote_session_is_retired(session_id))
+
+                saved = webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                metadata = webapp.read_quote_session_metadata(session_id)
+                publication_id = metadata["publication"]["active_publication_id"]
+                self.assertEqual(saved["session_id"], session_id)
+                self.assertEqual(metadata["session_id"], session_id)
+                self.assertTrue(webapp.quote_session_has_current_v2_publication(metadata))
+                self.assertEqual(metadata["publication"]["draft_files_publication_id"], publication_id)
+                self.assertEqual(webapp.read_quote_session_draft_files(session_id, metadata), draft_records)
+                for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
+                    export = metadata["exports"][kind]
+                    self.assertEqual(export["publication_id"], publication_id)
+                    self.assertEqual(export["size_bytes"], len(expected))
+                    self.assertEqual(export["sha256"], hashlib.sha256(expected).hexdigest())
+                    self.assertEqual(webapp.quote_session_export_path(session_id, kind).read_bytes(), expected)
+                detail = webapp.get_quote_session(session_id, include_draft_state=True)
+                self.assertEqual(detail["session_id"], session_id)
+                self.assertTrue(detail["status"]["quote_generated"])
+                self._assert_local_pair_downloads(runner, session_id, xlsx_bytes, pdf_bytes)
+
+                alternate_owner_id = "quote-F1-AlternateRetry"
+                alternate_payload, alternate_result, alternate_output = self._local_publication_case(
+                    root, alternate_owner_id, xlsx_bytes, pdf_bytes, variant="alternate-failure"
+                )
+                alternate_payload["quote_session"]["draft_files"] = copy.deepcopy(draft_records)
+                alternate_payload["draft_files"] = copy.deepcopy(draft_records)
+                alternate_payload["quote_session"]["draft_state"]["images"] = copy.deepcopy(payload["quote_session"]["draft_state"]["images"])
+                alternate_session_dir = data_root / "quote-sessions" / alternate_owner_id
+                alternate_metadata_path = alternate_session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+                capability = webapp._quote_session_filesystem_capability()
+                original_replace = webapp.os.replace
+
+                def fail_alternate_metadata_commit(source, destination):
+                    if Path(destination).resolve() == alternate_metadata_path.resolve():
+                        raise OSError("synthetic alternate first-owner metadata commit failure")
+                    return original_replace(source, destination)
+
+                with self.assertRaisesRegex(OSError, "alternate first-owner metadata commit failure"):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_alternate_metadata_commit):
+                        webapp.create_or_update_quote_session(
+                            alternate_payload,
+                            result=alternate_result,
+                            output_dir=alternate_output,
+                        )
+                self.assertFalse(alternate_session_dir.exists())
+                self.assertFalse((data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME).exists())
+                retry_id = (
+                    "quote-" + alternate_owner_id[len("quote-"):].swapcase()
+                    if capability["case_insensitive"] else alternate_owner_id
+                )
+                retry_payload, retry_result, retry_output = self._local_publication_case(
+                    root, retry_id, xlsx_bytes, pdf_bytes, variant="alternate-retry"
+                )
+                retry_payload["quote_session"]["draft_files"] = copy.deepcopy(draft_records)
+                retry_payload["draft_files"] = copy.deepcopy(draft_records)
+                retry_payload["quote_session"]["draft_state"]["images"] = copy.deepcopy(payload["quote_session"]["draft_state"]["images"])
+                retry_saved = webapp.create_or_update_quote_session(
+                    retry_payload,
+                    result=retry_result,
+                    output_dir=retry_output,
+                )
+                self.assertEqual(retry_saved["session_id"], retry_id)
+                self.assertEqual(webapp.read_quote_session_metadata(retry_id)["session_id"], retry_id)
+                if capability["case_insensitive"]:
+                    self.assertIsNone(webapp.get_quote_session(alternate_owner_id))
+                else:
+                    original_payload, original_result, original_output = self._local_publication_case(
+                        root, alternate_owner_id, xlsx_bytes, pdf_bytes, variant="case-distinct-owner"
+                    )
+                    original_saved = webapp.create_or_update_quote_session(
+                        original_payload, result=original_result, output_dir=original_output
+                    )
+                    self.assertEqual(original_saved["session_id"], alternate_owner_id)
+                    self.assertTrue((data_root / "quote-sessions" / retry_id).is_dir())
+                    self.assertTrue((data_root / "quote-sessions" / alternate_owner_id).is_dir())
+
+    def test_f1_positive_fresh_draft_only_failure_removes_owned_draft_and_container(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            data_root = Path(tmp) / "data"
+            session_id = "quote-F1-DraftOnly"
+            payload = valid_payload()
+            payload["quote_session"] = {
+                "session_id": session_id,
+                "draft_state": {"images": [{"session_file_key": "f1-draft", "name": "reference.pdf"}]},
+                "draft_files": [{
+                    "session_file_key": "f1-draft",
+                    "name": "reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }],
+            }
+            session_dir = data_root / "quote-sessions" / session_id
+            draft_path = session_dir / webapp.QUOTE_SESSION_DRAFT_FILES_FILENAME
+            metadata_path = session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+            original_replace = webapp.os.replace
+
+            def fail_metadata_commit(source, destination):
+                if Path(destination).resolve() == metadata_path.resolve():
+                    raise OSError("synthetic draft-only metadata commit failure")
+                return original_replace(source, destination)
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                with self.assertRaisesRegex(OSError, "draft-only metadata commit failure"):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_metadata_commit):
+                        webapp.create_or_update_quote_session(payload)
+                self.assertFalse(draft_path.exists(), "F1 draft-only rollback left transaction-owned draft records")
+                self.assertFalse(session_dir.exists(), "F1 draft-only rollback left an empty owner container")
+                self.assertFalse(metadata_path.exists())
+                self.assertFalse(webapp.quote_session_is_retired(session_id))
+
+    def test_f1_positive_established_owner_rollback(self):
+        self.test_local_publication_f4_metadata_pointer_failure_keeps_parseable_old_state()
+
+    def test_f1_f5_positive_unowned_inconsistent_storage_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            data_root = Path(tmp) / "data"
+            session_id = "quote-F1-UnownedInconsistent"
+            session_dir = data_root / "quote-sessions" / session_id
+            session_dir.mkdir(parents=True)
+            unrelated = session_dir / "unowned-marker.bin"
+            unrelated.write_bytes(b"pre-existing-unowned")
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": session_id}
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                before = unrelated.read_bytes()
+                response = self._post_local_quote_session(runner, payload)
+                self.assertEqual(response["status"], 503)
+                body = response["body"]
+                self.assertEqual(body["status"], "failed")
+                self.assertRegex(body["error_reference"], r"^ERR-[A-F0-9]{8}$")
+                with self.assertRaises(webapp.SqagStorageAccessError) as storage_error:
+                    webapp.create_or_update_quote_session(payload)
+                self.assertEqual(storage_error.exception.status, 503)
+                self.assertEqual(storage_error.exception.reason, "quote_session_storage_inconsistent")
+                self.assertEqual(unrelated.read_bytes(), before)
+                self.assertEqual(sorted(path.name for path in session_dir.iterdir()), [unrelated.name])
+                self.assertFalse(webapp.quote_session_is_retired(session_id))
+                self.assertFalse(webapp.quote_session_metadata_path(session_id).exists())
+
+    def test_f5_negative_interrupted_delete_with_durable_retirement(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-F5-InterruptedOwner"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                b"synthetic-f5-xlsx",
+                b"%PDF-1.4\nsynthetic-f5-pdf\n%%EOF\n",
+                variant="interrupted-delete",
+            )
+            alias_id = "quote-" + session_id[len("quote-"):].swapcase()
+            alias_payload = valid_payload()
+            alias_payload["quote_session"] = {"session_id": alias_id}
+            alias_publication_payload, alias_result, alias_output = self._local_publication_case(
+                root,
+                alias_id,
+                b"synthetic-f5-alias-xlsx",
+                b"%PDF-1.4\nsynthetic-f5-alias-pdf\n%%EOF\n",
+                variant="alias",
+            )
+            session_dir = data_root / "quote-sessions" / session_id
+            metadata_path = session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                capability = webapp._quote_session_filesystem_capability()
+                webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                self.assertTrue(webapp.quote_session_has_current_v2_publication(webapp.read_quote_session_metadata(session_id)))
+                original_cleanup = webapp._remove_quote_session_tree_without_following_redirects
+
+                def remove_metadata_then_interrupt(directory):
+                    self.assertEqual(Path(directory), session_dir)
+                    metadata_path.unlink()
+                    raise OSError("synthetic interruption after metadata removal")
+
+                with self.assertRaisesRegex(OSError, "interruption after metadata removal"):
+                    with mock.patch.object(
+                        webapp,
+                        "_remove_quote_session_tree_without_following_redirects",
+                        side_effect=remove_metadata_then_interrupt,
+                    ):
+                        webapp.delete_quote_session(session_id)
+                self.assertTrue(webapp.quote_session_is_retired(session_id))
+                self.assertFalse(metadata_path.exists())
+                self.assertTrue(session_dir.is_dir())
+                residual_before = {
+                    str(path.relative_to(session_dir)): path.read_bytes()
+                    for path in session_dir.rglob("*") if path.is_file()
+                }
+                if capability["case_insensitive"]:
+                    with self.assertRaises(webapp.SqagStorageAccessError) as save_error:
+                        webapp.create_or_update_quote_session(alias_payload)
+                    self.assertEqual((save_error.exception.status, save_error.exception.reason), (409, "quote_session_retired"))
+                    with self.assertRaises(webapp.SqagStorageAccessError) as publish_error:
+                        webapp.create_or_update_quote_session(
+                            alias_publication_payload,
+                            result=alias_result,
+                            output_dir=alias_output,
+                        )
+                    self.assertEqual((publish_error.exception.status, publish_error.exception.reason), (409, "quote_session_retired"))
+                    self.assertTrue(session_dir.is_dir(), "case-equivalent spelling resolves the same residual owner directory")
+                    self.assertIsNone(webapp.get_quote_session(alias_id))
+                    self.assertIsNone(webapp.get_quote_session(session_id))
+                    self.assertIsNone(webapp.quote_session_export_path(alias_id, "xlsx"))
+                    self.assertIsNone(webapp.LocalSqagStorage().quote_session_export_file_path(session_id, "xlsx"))
+                    self.assertNotIn(session_id, [item["session_id"] for item in webapp.list_quote_sessions()])
+                    for requested_id in (session_id, alias_id):
+                        self.assertEqual(local_http_get_json(runner, f"/api/quote-sessions/{requested_id}")[0], 404)
+                        self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{requested_id}/download/xlsx")[0], 404)
+                    self.assertEqual(
+                        {
+                            str(path.relative_to(session_dir)): path.read_bytes()
+                            for path in session_dir.rglob("*") if path.is_file()
+                        },
+                        residual_before,
+                        "F5 equivalent alias attempts mutated the residual owner tree",
+                    )
+                    with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                        webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                    with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                        webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                    with webapp.QUOTE_SESSION_FILESYSTEM_CAPABILITY_LOCK:
+                        webapp.QUOTE_SESSION_FILESYSTEM_CAPABILITIES.clear()
+                    with self.assertRaises(webapp.SqagStorageAccessError) as reset_error:
+                        webapp.create_or_update_quote_session(alias_payload)
+                    self.assertEqual((reset_error.exception.status, reset_error.exception.reason), (409, "quote_session_retired"))
+                    self.assertEqual(
+                        {
+                            str(path.relative_to(session_dir)): path.read_bytes()
+                            for path in session_dir.rglob("*") if path.is_file()
+                        },
+                        residual_before,
+                    )
+                else:
+                    independent = webapp.create_or_update_quote_session(alias_payload)
+                    self.assertEqual(independent["session_id"], alias_id)
+                    self.assertTrue((data_root / "quote-sessions" / alias_id).is_dir())
+                    self.assertIsNone(webapp.get_quote_session(session_id))
+                    self.assertFalse(webapp.quote_session_is_retired(alias_id))
+                    self.assertTrue(webapp.delete_quote_session(alias_id))
+
+                with mock.patch.object(webapp, "_remove_quote_session_tree_without_following_redirects", wraps=original_cleanup):
+                    self.assertTrue(webapp.delete_quote_session(session_id))
+                self.assertFalse(session_dir.exists())
+                self.assertTrue(webapp.delete_quote_session(session_id))
+                self.assertTrue(webapp.quote_session_is_retired(session_id))
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as final_reuse:
+                    webapp.create_or_update_quote_session(payload)
+                self.assertEqual((final_reuse.exception.status, final_reuse.exception.reason), (409, "quote_session_retired"))
+
     def test_local_publication_f1_xlsx_staging_failure_keeps_old_pair(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
@@ -16998,6 +17301,44 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     migrated["exports"]["pdf"]["publication_id"],
                 )
                 self._assert_local_pair_downloads(runner, session_id, new_xlsx, new_pdf)
+
+    def test_quote_session_state_only_update_preserves_existing_draft_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            session_id = "quote-state-only-preserves-files"
+            initial = valid_payload()
+            initial["quote_session"] = {
+                "session_id": session_id,
+                "draft_state": {"version": 1, "images": [{"session_file_key": "reference-file-key"}]},
+                "draft_files": [{
+                    "session_file_key": "reference-file-key",
+                    "name": "reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }],
+            }
+            state_only = valid_payload()
+            state_only["quote_session"] = {
+                "session_id": session_id,
+                "draft_state": {
+                    "version": 1,
+                    "images": [{"session_file_key": "reference-file-key"}],
+                    "outputSortMode": "name",
+                },
+            }
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                created = webapp.create_or_update_quote_session(initial)
+                self.assertEqual(created["session_id"], session_id)
+                updated = webapp.create_or_update_quote_session(state_only)
+                self.assertEqual(updated["session_id"], session_id)
+                detailed = webapp.get_quote_session(session_id, include_draft_state=True)
+
+            self.assertEqual(detailed["draft_state"]["outputSortMode"], "name")
+            self.assertEqual(len(detailed["draft_files"]), 1)
+            self.assertEqual(detailed["draft_files"][0]["session_file_key"], "reference-file-key")
+            self.assertEqual(detailed["draft_files"][0]["data_url"], "data:application/pdf;base64,UERG")
 
     def test_quote_session_draft_update_marks_existing_exports_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -17506,7 +17847,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
                 webapp.create_or_update_quote_session(payload)
                 session_dir = data_root / "quote-sessions" / session_id
-                marker_path = webapp.quote_session_retired_marker_path()
+                marker_path = data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME
 
                 with mock.patch.object(webapp, "atomic_write_text", side_effect=OSError("synthetic retirement write failure")):
                     with self.assertRaises(webapp.SqagStorageAccessError):
@@ -17514,7 +17855,11 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertTrue(session_dir.is_dir())
                 self.assertFalse(marker_path.exists())
 
-                with mock.patch.object(webapp.shutil, "rmtree", side_effect=OSError("synthetic tree removal failure")):
+                with mock.patch.object(
+                    webapp,
+                    "_remove_quote_session_tree_without_following_redirects",
+                    side_effect=OSError("synthetic tree removal failure"),
+                ):
                     with self.assertRaises(OSError):
                         webapp.delete_quote_session(session_id)
                 self.assertTrue(session_dir.is_dir())
@@ -17641,7 +17986,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertIsNone(webapp.get_quote_session(alias_id))
                 self.assertFalse((data_root / "quote-sessions" / alias_id).exists())
 
-                marker_path = webapp.quote_session_retired_marker_path()
+                marker_path = data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME
                 marker = json.loads(marker_path.read_text(encoding="utf-8"))
                 marker["session_ids"].append("quote-G3-HistoricalMixed")
                 marker_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
@@ -37932,7 +38277,7 @@ main().catch((error) => {
         self.assertNotIn("logo_data_url", resolved_payload["company"])
 
     def test_run_quote_job_uses_explicit_profile_and_local_pricing_reference_roots(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
             profiles_root = root / "profiles"
             pricing_root = root / "pricing-references"
@@ -37956,6 +38301,8 @@ main().catch((error) => {
                 stdout="Wrote quotation.xlsx\nPDF export status: skipped\n",
                 stderr="",
             )
+            expected_catalog_path = str((reference_dir / "pricing-catalog.json").resolve())
+            expected_layout_path = str((profile_dir / "quotation-layout.xlsx").resolve())
             with (
                 mock.patch.object(webapp, "profiles_root", return_value=profiles_root),
                 mock.patch.object(webapp, "pricing_references_root", return_value=pricing_root),
@@ -37965,8 +38312,8 @@ main().catch((error) => {
 
         command = run.call_args.args[0]
         self.assertEqual(result["status"], "completed")
-        self.assertIn(str((reference_dir / "pricing-catalog.json").resolve()), command)
-        self.assertIn(str((profile_dir / "quotation-layout.xlsx").resolve()), command)
+        self.assertEqual(command[command.index("--template") + 1], expected_catalog_path)
+        self.assertEqual(command[command.index("--layout-template") + 1], expected_layout_path)
         self.assertNotIn(str(KONCEPT_CATALOG), command)
         self.assertNotIn(str(KONCEPT_LAYOUT), command)
     def test_exported_quote_company_profile_imports_to_default_company_store(self):
