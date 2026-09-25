@@ -474,6 +474,10 @@ function createQuoteSessionDrainTracker(group) {
   const queuedSaveHistory = new Map();
   const attachedPages = new Set();
   const pageIdentities = new WeakMap();
+  const currentDocumentByPage = new WeakMap();
+  const documentEpisodes = new Map();
+  const timerEventFaults = new WeakMap();
+  const timerEventAckHolds = new WeakMap();
   const observedTimerEventFailures = new Set();
   const issues = [];
   const progressWaiters = new Set();
@@ -484,6 +488,9 @@ function createQuoteSessionDrainTracker(group) {
   let progressGeneration = 0;
   let operationSequence = 0;
   let pageSequence = 0;
+  let drainInvocationSequence = 0;
+  const drainReports = [];
+  const activeDrainRuns = new Map();
   const timerEventBinding = `__sqagSmokeTimerEvent_${String(group).replace(/[^A-Za-z0-9_]/g, "_")}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
   const notifyProgress = () => {
@@ -502,10 +509,12 @@ function createQuoteSessionDrainTracker(group) {
     notifyProgress();
   };
 
-  const createProducerLease = (kind) => {
+  const createProducerLease = (kind, state = "reserved") => {
     let resolve;
     const lease = {
       kind,
+      state,
+      executable: state === "started",
       settled: false,
       promise: new Promise((resolvePromise) => { resolve = resolvePromise; }),
       resolve: (outcome) => {
@@ -526,6 +535,7 @@ function createQuoteSessionDrainTracker(group) {
     entry.producerLease = lease;
     entry.producer = lease ? lease.promise : (producer || null);
     entry.producerKind = String(kind || lease?.kind || "");
+    entry.producerState = lease?.state || (producer ? "started" : "none");
     if (entry.producerKind) entry.lastProducerKind = entry.producerKind;
     entry.transitions?.push({ type: "producer-registered", at: Date.now(), producer: entry.producerKind });
   };
@@ -535,6 +545,18 @@ function createQuoteSessionDrainTracker(group) {
     entry.producerLease = null;
     entry.producer = null;
     entry.producerKind = "";
+    entry.producerState = "terminal";
+  };
+
+  const hasExecutableOwnedFlush = (entry) => {
+    const state = String(entry?.flushOperation?.state || "");
+    const saveStarted = entry?.applicationSaveLease?.state === "started"
+      && entry.applicationSaveLease.executable === true
+      && entry.applicationSaveLease.settled === false;
+    const requestInFlight = Boolean(entry?.persistenceRecord?.terminalPromise)
+      && entry.persistenceRecord.done !== true;
+    return state === "FLUSH_OPERATION_STARTED"
+      && (saveStarted || requestInFlight);
   };
 
   const trackRequiredJob = (promise, identity) => {
@@ -563,7 +585,13 @@ function createQuoteSessionDrainTracker(group) {
     entry.terminalReason = reason;
     entry.completedAt = Date.now();
     entry.transitions.push({ type: status, at: entry.completedAt, reason });
+    if (entry.flushOperation && entry.flushOperation.state !== "FLUSH_OWNERSHIP_ABANDONED") {
+      entry.flushOperation.state = "FLUSH_OPERATION_TERMINAL";
+      entry.flushOperation.terminalStatus = status;
+      entry.flushOperation.terminalAt = entry.completedAt;
+    }
     pendingQueuedSaveWork.delete(String(entry.snapshot.timerIdentity));
+    updateDocumentWork(entry, status, { reason: String(reason || "") });
     if (status === "failed") {
       addIssue({ operationId: entry.identity, fixture: group, operation: "queued-save" }, reason || "queued quote-session save failed without persistence proof");
     }
@@ -622,11 +650,12 @@ function createQuoteSessionDrainTracker(group) {
       return entry;
     }
     if (snapshot.active === true && entry.status === "pending" && !entry.producer) {
-      const nativeTimerLease = createProducerLease("native-timer");
+      const nativeTimerLease = createProducerLease("native-timer", "started");
       entry.nativeTimerLease = nativeTimerLease;
       setQueuedSaveProducer(entry, nativeTimerLease, "native-timer");
       notifyProgress();
     }
+    updateDocumentWork(entry, entry.status, { nativeTimerActive: snapshot.active === true });
     return entry;
   };
 
@@ -635,9 +664,15 @@ function createQuoteSessionDrainTracker(group) {
     if (record) {
       entry.persistenceRecord = record;
       entry.evidence.postObserved = true;
+      entry.applicationSaveProducer = record.terminalPromise;
       entry.applicationSaveLease?.resolve({ status: "transferred", to: "request-response-body-durable-readback" });
       entry.applicationSaveLease = null;
-      setQueuedSaveProducer(entry, record.terminalPromise, "request-response-body-durable-readback");
+      const nativeTimerStillOwns = entry.snapshot?.active === true
+        && entry.nativeTimerLease
+        && entry.nativeTimerLease.settled === false;
+      if (!nativeTimerStillOwns) {
+        setQueuedSaveProducer(entry, record.terminalPromise, "request-response-body-durable-readback");
+      }
     } else if (producer) {
       entry.applicationSaveProducer = producer;
       setQueuedSaveProducer(entry, producer, "application-save");
@@ -645,25 +680,16 @@ function createQuoteSessionDrainTracker(group) {
     notifyProgress();
   };
 
-  const createProgressWaiter = (timeoutMs) => {
-    let timer;
+  const createProgressWaiter = () => {
     let resolveWaiter;
     const promise = new Promise((resolve) => { resolveWaiter = resolve; });
     const waiter = {
       promise,
-      resolve: (generation) => {
-        if (timer) clearTimeout(timer);
-        resolveWaiter({ type: "progress", generation });
-      },
+      resolve: (generation) => resolveWaiter({ type: "progress", generation }),
       cancel: () => {
-        if (timer) clearTimeout(timer);
         progressWaiters.delete(waiter);
       },
     };
-    timer = setTimeout(() => {
-      progressWaiters.delete(waiter);
-      resolveWaiter({ type: "deadline" });
-    }, Math.max(0, timeoutMs));
     progressWaiters.add(waiter);
     return waiter;
   };
@@ -1121,9 +1147,10 @@ function createQuoteSessionDrainTracker(group) {
       || queuedSaveHistory.get(String(captured?.snapshot?.timerIdentity || ""));
     if (!entry || entry.status !== "pending") return null;
     if (entry.ownedFlushLease && !entry.ownedFlushLease.settled) return entry.ownedFlushLease;
-    const lease = createProducerLease("owned-flush");
+    const lease = createProducerLease("owned-flush", "reserved");
     entry.ownedFlushLease = lease;
-    entry.transitions.push({ type: "owned-flush-registered", at: Date.now(), reason: String(reason) });
+    entry.flushOperation = { state: "FLUSH_OWNERSHIP_RESERVED", identity: entry.identity, at: Date.now(), reason: String(reason) };
+    entry.transitions.push({ type: "FLUSH_OWNERSHIP_RESERVED", at: Date.now(), reason: String(reason) });
     notifyProgress();
     return lease;
   };
@@ -1189,6 +1216,8 @@ function createQuoteSessionDrainTracker(group) {
     const page = source?.page;
     if (!page) return;
     const type = String(event?.type || "");
+    const documentId = String(event?.documentId || event?.snapshot?.documentId || "");
+    if (documentId) getDocumentEpisode(page, documentId);
     const rawIdentity = String(event?.snapshot?.timerIdentity || event?.timerIdentity || "");
     const identity = normalizeTimerIdentity(page, rawIdentity);
     if (type === "create" || type === "replace") {
@@ -1206,29 +1235,61 @@ function createQuoteSessionDrainTracker(group) {
         failQueuedSave(entry, "queued timer save began without an exact session/state/files/options snapshot");
         return;
       }
+      if (event.invocationState !== "application-save-promise-established") {
+        failQueuedSave(entry, "ORPHAN_NO_REAL_PRODUCER: timer save-start event arrived before an executable application save promise was established");
+        return;
+      }
       entry.snapshot = snapshot;
-      const applicationSaveLease = createProducerLease("application-save");
-      entry.applicationSaveLease = applicationSaveLease;
-      setQueuedSaveProducer(entry, applicationSaveLease, "application-save");
+      const executableSuccessor = entry.ownedFlushLease || createProducerLease("application-save", "started");
+      executableSuccessor.state = "started";
+      executableSuccessor.executable = true;
+      executableSuccessor.startedAt = Date.now();
+      entry.applicationSaveLease = executableSuccessor;
+      if (entry.ownedFlushLease) {
+        entry.flushOperation = {
+          ...(entry.flushOperation || {}),
+          state: "FLUSH_OPERATION_STARTED",
+          identity: entry.identity,
+          startedAt: executableSuccessor.startedAt,
+          documentId: String(snapshot.documentId || ""),
+        };
+      }
+      const nativeTimerStillOwns = snapshot.active === true
+        && entry.nativeTimerLease
+        && entry.nativeTimerLease.settled === false;
+      if (!nativeTimerStillOwns) {
+        setQueuedSaveProducer(entry, executableSuccessor, entry.ownedFlushLease ? "owned-flush-operation" : "application-save");
+      }
+      updateDocumentWork(entry, "pending", {
+        producerState: nativeTimerStillOwns ? "native-timer-retained-successor-started" : "started",
+      });
       notifyProgress();
       return;
     }
     if (type === "cancel") {
       entry.snapshot.active = false;
+      entry.nativeTimerLease?.resolve({ status: "cancelled" });
+      const executableFlush = hasExecutableOwnedFlush(entry);
       if (event.reason === "recovery-transition") {
         entry.cancelledForRecovery = true;
-        if (entry.ownedFlushLease && !entry.ownedFlushLease.settled) {
-          setQueuedSaveProducer(entry, entry.ownedFlushLease, "owned-flush");
+        if (executableFlush) {
+          entry.flushOperation.ownershipTransfer = "transferred-to-recovery";
+          entry.transitions.push({ type: "native-owner-transferred-to-started-flush", at: Date.now(), identity: entry.identity });
+          setQueuedSaveProducer(entry, entry.applicationSaveProducer || entry.ownedFlushLease, entry.applicationSaveProducer
+            ? "request-response-body-durable-readback" : "owned-flush-operation");
           notifyProgress();
         } else {
-          failQueuedSave(entry, "recovery cancellation orphaned queued save: native timer was removed without a registered real successor or owned flush");
+          failQueuedSave(entry, "ORPHAN_NO_REAL_PRODUCER: recovery cancellation removed native timer ownership while owned flush was only reserved or absent");
         }
-      } else if (entry.ownedFlushLease && !entry.ownedFlushLease.settled) {
+      } else if (executableFlush) {
         entry.cancelledForApplication = true;
-        setQueuedSaveProducer(entry, entry.ownedFlushLease, "owned-flush");
+        entry.flushOperation.ownershipTransfer = "transferred-to-started-flush";
+        entry.transitions.push({ type: "native-owner-transferred-to-started-flush", at: Date.now(), identity: entry.identity });
+        setQueuedSaveProducer(entry, entry.applicationSaveProducer || entry.ownedFlushLease, entry.applicationSaveProducer
+          ? "request-response-body-durable-readback" : "owned-flush-operation");
         notifyProgress();
       } else {
-        failQueuedSave(entry, "queued save timer was cancelled without an accounted successor or persistence");
+        failQueuedSave(entry, "ORPHAN_NO_REAL_PRODUCER: queued save timer was cancelled without an executable successor or persistence");
       }
       return;
     }
@@ -1236,20 +1297,23 @@ function createQuoteSessionDrainTracker(group) {
       entry.dispatchedBy = "fire";
       entry.snapshot.active = false;
       entry.nativeTimerLease?.resolve({ status: "fired" });
-      const callbackLease = createProducerLease("native-timer-callback");
+      const callbackLease = createProducerLease("native-timer-callback", "started");
       entry.timerCallbackLease = callbackLease;
       setQueuedSaveProducer(entry, callbackLease, "native-timer-callback");
+      updateDocumentWork(entry, "pending", { producerState: "timer-callback-started" });
       notifyProgress();
       return;
     }
     if (type === "flush") {
       entry.dispatchedBy = "flush";
       entry.snapshot.active = false;
-      if (!entry.ownedFlushLease || entry.ownedFlushLease.settled) {
-        failQueuedSave(entry, "queued save timer was flushed without a registered owned flush producer");
+      if (!entry.ownedFlushLease || !hasExecutableOwnedFlush(entry)) {
+        failQueuedSave(entry, "ORPHAN_NO_REAL_PRODUCER: queued save timer was flushed before an executable owned flush operation started");
         return;
       }
-      setQueuedSaveProducer(entry, entry.ownedFlushLease, "owned-flush");
+      entry.flushOperation.ownershipTransfer = "transferred-to-started-flush";
+      setQueuedSaveProducer(entry, entry.applicationSaveProducer || entry.ownedFlushLease, entry.applicationSaveProducer
+        ? "request-response-body-durable-readback" : "owned-flush-operation");
       notifyProgress();
       return;
     }
@@ -1292,9 +1356,164 @@ function createQuoteSessionDrainTracker(group) {
     return pageIdentities.get(page);
   };
 
+  const documentEpisodeKey = (pageIdentity, documentId) => `${pageIdentity}/${String(documentId || "<unknown-document>")}`;
+
+  const updateDocumentWork = (entry, state, detail = {}) => {
+    const snapshot = entry?.snapshot || {};
+    if (!snapshot.pageIdentity || !snapshot.documentId) return null;
+    const key = documentEpisodeKey(snapshot.pageIdentity, snapshot.documentId);
+    let episode = documentEpisodes.get(key);
+    if (!episode) {
+      episode = {
+        identity: key,
+        pageIdentity: snapshot.pageIdentity,
+        documentId: String(snapshot.documentId),
+        state: "observed",
+        work: new Map(),
+        deliveryFailures: [],
+        lifecycle: [],
+        zeroProof: null,
+        unknownRequiredWork: false,
+        lastObservedAt: Date.now(),
+      };
+      documentEpisodes.set(key, episode);
+    }
+    episode.work.set(String(snapshot.timerIdentity), {
+      timerIdentity: String(snapshot.timerIdentity),
+      state,
+      at: Date.now(),
+      ...detail,
+    });
+    episode.lastObservedAt = Date.now();
+    if (state === "pending" || state === "unknown" || state === "failed") episode.zeroProof = null;
+    return episode;
+  };
+
+  const retireDocumentEpisode = (episode, reason) => {
+    if (!episode || episode.lifecycle.some((item) => item.reason === reason)) return;
+    episode.lifecycle.push({ type: "document-lost", reason, at: Date.now() });
+    episode.current = false;
+    episode.lastObservedAt = Date.now();
+    const unresolvedEntries = [...pendingQueuedSaveWork.values()].filter((entry) => (
+      entry.status === "pending"
+      && entry.snapshot.pageIdentity === episode.pageIdentity
+      && String(entry.snapshot.documentId || "") === episode.documentId
+    ));
+    for (const entry of unresolvedEntries) {
+      failQueuedSave(entry, `${reason}; required work remained unresolved when its originating document disappeared`);
+      updateDocumentWork(entry, "unknown", { reason });
+    }
+    const unresolvedKnownWork = [...episode.work.values()].some((item) => ["pending", "unknown", "failed"].includes(item.state));
+    const provenTerminalWork = episode.work.size > 0 && [...episode.work.values()].every((item) => (
+      ["succeeded", "superseded"].includes(item.state)
+    ));
+    if (episode.unknownRequiredWork || unresolvedKnownWork) {
+      episode.state = "lost-with-unknown-or-required-work";
+      return;
+    }
+    if (provenTerminalWork) {
+      episode.state = "closed-after-proven-completion";
+      return;
+    }
+    if (episode.zeroProof) {
+      episode.state = "closed-with-proven-zero-work";
+      return;
+    }
+    episode.unknownRequiredWork = true;
+    episode.state = "lost-with-unknown-required-work";
+    addIssue({
+      operationId: `${episode.identity}/lifecycle`,
+      fixture: group,
+      operation: "document-lifecycle",
+    }, `UNKNOWN_REQUIRED_WORK: ${reason}; no independent zero or completion proof existed for ${episode.identity}`);
+  };
+
+  const getDocumentEpisode = (page, documentId) => {
+    const pageIdentity = ensurePageIdentity(page);
+    const normalizedDocumentId = String(documentId || "");
+    if (!normalizedDocumentId) return null;
+    const key = documentEpisodeKey(pageIdentity, normalizedDocumentId);
+    const priorKey = currentDocumentByPage.get(page);
+    if (priorKey && priorKey !== key) {
+      const prior = documentEpisodes.get(priorKey);
+      retireDocumentEpisode(prior, "document was replaced by a committed navigation");
+    }
+    let episode = documentEpisodes.get(key);
+    if (!episode) {
+      episode = {
+        identity: key,
+        pageIdentity,
+        documentId: normalizedDocumentId,
+        state: "observed",
+        work: new Map(),
+        deliveryFailures: [],
+        lifecycle: [],
+        zeroProof: null,
+        unknownRequiredWork: false,
+        lastObservedAt: Date.now(),
+      };
+      documentEpisodes.set(key, episode);
+    }
+    episode.current = true;
+    episode.lastObservedAt = Date.now();
+    currentDocumentByPage.set(page, key);
+    return episode;
+  };
+
+  const recordTimerEventDeliveryFailure = (page, event, reason) => {
+    const pageIdentity = ensurePageIdentity(page);
+    const documentId = String(event?.documentId || event?.snapshot?.documentId || "");
+    const episode = getDocumentEpisode(page, documentId);
+    const type = String(event?.type || "unknown");
+    const rawIdentity = String(event?.snapshot?.timerIdentity || event?.timerIdentity || "");
+    const timerIdentity = rawIdentity ? normalizeTimerIdentity(page, rawIdentity) : "";
+    const failureKey = `${pageIdentity}/${documentId || "<unknown-document>"}/${type}/${rawIdentity}`;
+    if (observedTimerEventFailures.has(failureKey)) return;
+    observedTimerEventFailures.add(failureKey);
+    const failure = { identity: timerIdentity, documentId, type, reason: String(reason || "binding failure"), at: Date.now() };
+    if (episode) {
+      episode.deliveryFailures.push(failure);
+      episode.unknownRequiredWork = true;
+      episode.zeroProof = null;
+      episode.state = "observation-failed";
+      if (timerIdentity) episode.work.set(timerIdentity, { timerIdentity, state: "unknown", source: "timer-event-delivery-failure", at: failure.at });
+    }
+    addIssue({
+      operationId: timerIdentity || `${pageIdentity}/timer-event/${type}`,
+      fixture: group,
+      operation: "queued-save-timer-event",
+    }, `UNKNOWN_REQUIRED_WORK: actual timer-event delivery failed for ${timerIdentity || "unidentified work"} in ${episode?.identity || `${pageIdentity}/<unknown-document>`}: ${failure.reason}`);
+  };
+
+  const faultNextTimerEventDelivery = (page, type = "create") => {
+    timerEventFaults.set(page, { type: String(type || "create"), armed: true });
+  };
+
+  const holdTimerEventAcknowledgement = (page, type) => {
+    let observedResolve;
+    let releaseResolve;
+    const hold = {
+      type: String(type || "create"),
+      held: false,
+      eventIdentity: "",
+      observed: new Promise((resolve) => { observedResolve = resolve; }),
+      released: new Promise((resolve) => { releaseResolve = resolve; }),
+      observe: (eventIdentity) => {
+        hold.held = true;
+        hold.eventIdentity = String(eventIdentity || "");
+        observedResolve({ identity: hold.eventIdentity, type: hold.type });
+      },
+      release: () => releaseResolve(),
+    };
+    timerEventAckHolds.set(page, hold);
+    return hold;
+  };
+
   const markPageWorkUnresolved = (page, reason) => {
     const pageIdentity = pageIdentities.get(page);
     if (!pageIdentity) return;
+    const currentKey = currentDocumentByPage.get(page);
+    if (currentKey) retireDocumentEpisode(documentEpisodes.get(currentKey), reason);
     for (const entry of pendingQueuedSaveWork.values()) {
       if (entry.snapshot.pageIdentity === pageIdentity && entry.status === "pending") {
         failQueuedSave(entry, reason);
@@ -1303,7 +1522,31 @@ function createQuoteSessionDrainTracker(group) {
   };
 
   const install = async (context) => {
-    await context.exposeBinding(timerEventBinding, async (source, event) => handleTimerEvent(source, event));
+    await context.exposeBinding(timerEventBinding, async (source, event) => {
+      const page = source?.page;
+      if (!page) throw new Error("timer event source page is unavailable");
+      ensurePageIdentity(page);
+      const fault = timerEventFaults.get(page);
+      if (fault?.armed && fault.type === String(event?.type || "")) {
+        fault.armed = false;
+        recordTimerEventDeliveryFailure(page, event, "deterministic smoke fault rejected the actual exposed timer-event binding");
+        throw new Error("deterministic smoke fault at timer-event binding");
+      }
+      try {
+        await handleTimerEvent(source, event);
+      } catch (error) {
+        recordTimerEventDeliveryFailure(page, event, error?.message || error);
+        throw error;
+      }
+      const hold = timerEventAckHolds.get(page);
+      if (hold && hold.type === String(event?.type || "") && !hold.held) {
+        const rawIdentity = String(event?.snapshot?.timerIdentity || event?.timerIdentity || "");
+        hold.observe(rawIdentity ? normalizeTimerIdentity(page, rawIdentity) : "");
+        await hold.released;
+        timerEventAckHolds.delete(page);
+      }
+      return { acknowledged: true };
+    });
     await context.addInitScript((settings) => {
       const pendingOperations = [];
       let sequence = 0;
@@ -1359,7 +1602,7 @@ function createQuoteSessionDrainTracker(group) {
         timerSequence: 0,
         replaceCandidate: null,
       };
-      for (const key of ["saveCalls", "saveCurrentCalls", "queuedSaveOperations", "apiTrace", "eventDeliveryFailures"]) {
+      for (const key of ["saveCalls", "saveCurrentCalls", "queuedSaveOperations", "apiTrace", "eventDeliveryFailures", "pendingEventPromises"]) {
         if (!Array.isArray(timerState[key])) timerState[key] = [];
       }
       timerState.pending ??= null;
@@ -1368,6 +1611,15 @@ function createQuoteSessionDrainTracker(group) {
       timerState.documentId = documentId;
       timerState.timerSequence = Number(timerState.timerSequence || 0);
       window.__sqagSmokeQuoteSessionTimerState = timerState;
+      const trackEventPromise = (promise) => {
+        timerState.lastEventPromise = promise;
+        timerState.pendingEventPromises.push(promise);
+        promise.then(() => {
+          const index = timerState.pendingEventPromises.indexOf(promise);
+          if (index >= 0) timerState.pendingEventPromises.splice(index, 1);
+        });
+        return promise;
+      };
       const emitTimerEvent = (event) => {
         const eventIdentity = String(event?.snapshot?.timerIdentity || event?.timerIdentity || "");
         const detail = {
@@ -1378,26 +1630,23 @@ function createQuoteSessionDrainTracker(group) {
         const binding = window[settings.timerEventBinding];
         if (typeof binding !== "function") {
           timerState.eventDeliveryFailures.push({ ...detail, reason: "tracker event binding is unavailable" });
-          timerState.lastEventPromise = Promise.resolve(false);
-          return timerState.lastEventPromise;
+          return trackEventPromise(Promise.resolve(false));
         }
         try {
-          timerState.lastEventPromise = Promise.resolve(binding({ ...event, documentId: timerState.documentId }))
+          return trackEventPromise(Promise.resolve(binding({ ...event, documentId: timerState.documentId }))
             .then(() => true, (error) => {
               timerState.eventDeliveryFailures.push({
                 ...detail,
                 reason: String(error?.message || error || "tracker event binding rejected"),
               });
               return false;
-            });
-          return timerState.lastEventPromise;
+            }));
         } catch (error) {
           timerState.eventDeliveryFailures.push({
             ...detail,
             reason: String(error?.message || error || "tracker event binding threw"),
           });
-          timerState.lastEventPromise = Promise.resolve(false);
-          return timerState.lastEventPromise;
+          return trackEventPromise(Promise.resolve(false));
         }
       };
       window.__sqagSmokeEmitQueuedSaveEvent = emitTimerEvent;
@@ -1470,12 +1719,23 @@ function createQuoteSessionDrainTracker(group) {
             current.pending = null;
             if (current.queueCaptureDepth > 0) {
               current.replaceCandidate = cancelled;
-            } else if (current.flushIntentIdentity === cancelled.timerIdentity) {
-              cancelled.flushedAt = Date.now();
-              emitTimerEvent({ type: "flush", snapshot: cloneOptions(cancelled) });
-            } else if (typeof state !== "undefined" && state.isRecoveryScopeTransitioning === true) {
-              cancelled.cancelledForRecovery = true;
-              emitTimerEvent({ type: "cancel", reason: "recovery-transition", snapshot: cloneOptions(cancelled) });
+          } else if (current.flushIntentIdentity === cancelled.timerIdentity) {
+            cancelled.flushedAt = Date.now();
+            emitTimerEvent({ type: "flush", snapshot: cloneOptions(cancelled) });
+          } else if (typeof state !== "undefined" && state.isRecoveryScopeTransitioning === true) {
+            cancelled.cancelledForRecovery = true;
+            const recoveryContinuation = current.recoveryFlushContinuations?.[cancelled.timerIdentity];
+            if (typeof recoveryContinuation === "function") {
+              delete current.recoveryFlushContinuations[cancelled.timerIdentity];
+              try {
+                current.recoveryContinuationPromises ||= Object.create(null);
+                current.recoveryContinuationPromises[cancelled.timerIdentity] = Promise.resolve(recoveryContinuation());
+              } catch (error) {
+                current.recoveryContinuationErrors ||= Object.create(null);
+                current.recoveryContinuationErrors[cancelled.timerIdentity] = String(error?.message || error);
+              }
+            }
+            emitTimerEvent({ type: "cancel", reason: "recovery-transition", snapshot: cloneOptions(cancelled) });
             } else {
               emitTimerEvent({ type: "cancel", reason: "application-clear", snapshot: cloneOptions(cancelled) });
             }
@@ -1572,7 +1832,7 @@ function createQuoteSessionDrainTracker(group) {
             if (queuedSaveOperation) queuedSaveOperation.requestStarted = true;
             const operationId = scope.operationId && callNumber === 1
               ? String(scope.operationId) : nextOperationId("save");
-            const queuedSaveIdentity = String(queuedSaveOperation?.identity || timerState.activeTimerIdentity || "");
+            const queuedSaveIdentity = String(queuedSaveOperation?.identity || "");
             pendingOperations.push({ operationId, sessionId, queuedSaveIdentity });
             try {
               const result = await original.apply(this, args);
@@ -1620,19 +1880,36 @@ function createQuoteSessionDrainTracker(group) {
               : null;
             if (queuedSaveOperation) timerState.queuedSaveOperations.push(queuedSaveOperation);
             timerState.saveCalls.push({ options, requestedOptions, timerIdentity, startedAt: Date.now() });
+            let savePromise;
+            try {
+              savePromise = draftSave.apply(this, args);
+            } catch (error) {
+              if (timerIdentity) await emitTimerEvent({
+                type: "save-start",
+                timerIdentity,
+                snapshot: saveSnapshot,
+                invocationState: "threw-before-promise",
+              });
+              throw error;
+            }
             if (timerIdentity) {
-              await emitTimerEvent({ type: "save-start", timerIdentity, snapshot: saveSnapshot });
+              await emitTimerEvent({
+                type: "save-start",
+                timerIdentity,
+                snapshot: saveSnapshot,
+                invocationState: "application-save-promise-established",
+              });
             }
             try {
-              const result = await draftSave.apply(this, args);
-              if (timerIdentity) emitTimerEvent({
+              const result = await savePromise;
+              if (timerIdentity) await emitTimerEvent({
                 type: "save-outcome", timerIdentity, outcomeKind: result ? "value" : "null",
                 sessionId: String(result?.session_id || ""),
                 quoteGenerated: typeof result?.status?.quote_generated === "boolean" ? result.status.quote_generated : null,
               });
               return result;
             } catch (error) {
-              if (timerIdentity) emitTimerEvent({ type: "save-outcome", timerIdentity, outcomeKind: "rejected", reason: String(error?.message || error) });
+              if (timerIdentity) await emitTimerEvent({ type: "save-outcome", timerIdentity, outcomeKind: "rejected", reason: String(error?.message || error) });
               throw error;
             } finally {
               if (queuedSaveOperation) {
@@ -1696,7 +1973,11 @@ function createQuoteSessionDrainTracker(group) {
       page.on("requestfailed", observeFailure);
       page.on("close", () => markPageWorkUnresolved(page, "page closed with unresolved queued quote-session save work"));
       page.on("framenavigated", (frame) => {
-        if (frame === page.mainFrame()) markPageWorkUnresolved(page, "document navigated with unresolved queued quote-session save work");
+        if (frame === page.mainFrame()) {
+          const currentKey = currentDocumentByPage.get(page);
+          if (currentKey) retireDocumentEpisode(documentEpisodes.get(currentKey), "document navigated with unresolved queued quote-session save work");
+          markPageWorkUnresolved(page, "document navigated with unresolved queued quote-session save work");
+        }
       });
     };
     for (const page of context.pages()) attachPage(page);
@@ -1770,12 +2051,14 @@ function createQuoteSessionDrainTracker(group) {
     return { operationId, correlationToken };
   };
 
-  const readQueuedSaveTimer = async (page) => {
+  const readQueuedSaveTimer = async (page, deadlineRun = null) => {
     if (!page || page.isClosed()) return null;
-    await page.evaluate(async () => {
-      await window.__sqagSmokeQuoteSessionTimerState?.lastEventPromise;
-    });
-    return page.evaluate(() => {
+    const awaitOperation = (phase, operation) => deadlineRun ? deadlineRun.await(phase, operation) : operation;
+    await awaitOperation("timer-event-delivery-acknowledgement", page.evaluate(async () => {
+      const pending = [...(window.__sqagSmokeQuoteSessionTimerState?.pendingEventPromises || [])];
+      await Promise.all(pending);
+    }));
+    return awaitOperation("page-timer-state-query", page.evaluate(() => {
       if (typeof window.__sqagSmokeGetPendingQuoteSessionDraftSave !== "function") {
         throw new Error("Quote-session timer instrumentation was not installed.");
       }
@@ -1783,22 +2066,20 @@ function createQuoteSessionDrainTracker(group) {
         ...window.__sqagSmokeGetPendingQuoteSessionDraftSave(),
         eventDeliveryFailures: (window.__sqagSmokeQuoteSessionTimerState?.eventDeliveryFailures || []).map((failure) => ({ ...failure })),
       };
-    });
+    }));
   };
 
-  const syncQueuedSaveTimer = async (page) => {
+  const syncQueuedSaveTimer = async (page, deadlineRun = null) => {
     if (!page || page.isClosed()) return null;
-    const state = await readQueuedSaveTimer(page);
+    const state = await readQueuedSaveTimer(page, deadlineRun);
     const pageIdentity = ensurePageIdentity(page);
+    const episode = getDocumentEpisode(page, state?.documentId);
     for (const failure of state?.eventDeliveryFailures || []) {
-      const failureIdentity = `${pageIdentity}/${failure.at}/${failure.type}/${failure.timerIdentity}`;
-      if (observedTimerEventFailures.has(failureIdentity)) continue;
-      observedTimerEventFailures.add(failureIdentity);
-      addIssue({
-        operationId: failure.timerIdentity || "<timer-event>",
-        fixture: group,
-        operation: "queued-save-timer-event",
-      }, `browser timer event delivery failed (${failure.type || "unknown"}): ${failure.reason || "unknown binding failure"}`);
+      recordTimerEventDeliveryFailure(page, {
+        type: failure.type,
+        timerIdentity: failure.timerIdentity,
+        documentId: state?.documentId,
+      }, failure.reason || "unknown binding failure");
     }
     const snapshot = state?.pending?.active ? normalizeTimerSnapshot(page, state.pending) : null;
     let entry = snapshot ? registerQueuedSaveWork(snapshot, snapshot.supersedesTimerIdentity) : null;
@@ -1821,6 +2102,24 @@ function createQuoteSessionDrainTracker(group) {
     }
     if (snapshot && entry?.status === "pending" && state.documentId && snapshot.documentId !== state.documentId) {
       failQueuedSave(entry, "queued save timer document identity did not match its captured page snapshot");
+    }
+    if (episode && !snapshot) {
+      const pendingForDocument = [...pendingQueuedSaveWork.values()].some((candidate) => (
+        candidate.snapshot.pageIdentity === pageIdentity
+        && String(candidate.snapshot.documentId || "") === episode.documentId
+        && candidate.status === "pending"
+      ));
+      const unresolvedEpisodeWork = [...episode.work.values()].some((item) => ["pending", "unknown", "failed"].includes(item.state));
+      if (!episode.unknownRequiredWork && !pendingForDocument && !unresolvedEpisodeWork) {
+        episode.zeroProof = {
+          at: Date.now(),
+          source: "successful-page-timer-reconciliation",
+          noActiveNativeTimer: true,
+          outstandingKnownWork: 0,
+        };
+        episode.state = episode.work.size ? "proven-complete" : "proven-zero-work";
+        episode.lastObservedAt = episode.zeroProof.at;
+      }
     }
     return entry;
   };
@@ -1860,7 +2159,7 @@ function createQuoteSessionDrainTracker(group) {
     !entry.producer || entry.producer === entry.terminalPromise
   )) || null;
 
-  const startCapturedQueuedSave = async (page, captured) => {
+  const startCapturedQueuedSave = async (page, captured, { cancelNativeTimer = true } = {}) => {
     if (!captured?.snapshot?.browserTimerIdentity || !captured?.snapshot?.options) {
       throw new Error("Captured queued save has no browser timer identity or options.");
     }
@@ -1882,7 +2181,7 @@ function createQuoteSessionDrainTracker(group) {
       return { status: "unavailable", reason: "captured queued-save obligation is already terminal" };
     }
     registerOwnedQueuedSaveFlush(captured);
-    const started = await page.evaluate(({ browserTimerIdentity, options }) => {
+    const started = await page.evaluate(async ({ browserTimerIdentity, options, cancelNativeTimer: shouldCancelNativeTimer }) => {
       const timerState = window.__sqagSmokeQuoteSessionTimerState;
       if (!timerState) return { status: "unavailable", reason: "timer instrumentation is missing" };
       const pending = timerState.pending?.active ? timerState.pending : null;
@@ -1892,11 +2191,6 @@ function createQuoteSessionDrainTracker(group) {
       const last = timerState.last;
       if (!pending && !(last?.timerIdentity === browserTimerIdentity && last.cancelledForRecovery === true)) {
         return { status: "unavailable", reason: "captured timer is no longer live and has no recovery-transition flush authority" };
-      }
-      if (pending) {
-        timerState.flushIntentIdentity = browserTimerIdentity;
-        clearQuoteSessionDraftSaveTimer();
-        timerState.flushIntentIdentity = "";
       }
       const previousIdentity = String(timerState.activeTimerIdentity || "");
       timerState.activeTimerIdentity = browserTimerIdentity;
@@ -1917,42 +2211,115 @@ function createQuoteSessionDrainTracker(group) {
         }),
         (error) => ({ kind: "rejected", reason: String(error?.message || error) }),
       );
-      return { status: "started", timerIdentity: browserTimerIdentity };
-    }, { browserTimerIdentity: captured.snapshot.browserTimerIdentity, options: captured.snapshot.options });
+      const startAcknowledged = await timerState.lastEventPromise;
+      if (startAcknowledged !== true) return { status: "delivery-failed", timerIdentity: browserTimerIdentity };
+      if (pending && shouldCancelNativeTimer) {
+        timerState.flushIntentIdentity = browserTimerIdentity;
+        clearQuoteSessionDraftSaveTimer();
+        timerState.flushIntentIdentity = "";
+      }
+      return {
+        status: "started",
+        timerIdentity: browserTimerIdentity,
+        executableSuccessorEstablished: true,
+        nativeTimerRetained: Boolean(pending && !shouldCancelNativeTimer),
+      };
+    }, { browserTimerIdentity: captured.snapshot.browserTimerIdentity, options: captured.snapshot.options, cancelNativeTimer });
     await syncQueuedSaveTimer(page);
     if (started.status !== "started" && entry.status === "pending") {
-      if (entry.producerLease === entry.ownedFlushLease) {
+      if (entry.ownedFlushLease?.state === "reserved") {
         if (entry.nativeTimerLease && !entry.nativeTimerLease.settled) {
-          setQueuedSaveProducer(entry, entry.nativeTimerLease, "native-timer");
+          entry.ownedFlushLease.resolve({ status: "abandoned-before-start" });
+          entry.ownedFlushLease = null;
+          entry.flushOperation = { ...(entry.flushOperation || {}), state: "FLUSH_OWNERSHIP_ABANDONED", at: Date.now() };
         } else {
-          failQueuedSave(entry, "registered queued-save flush did not start the real application save");
+          failQueuedSave(entry, "ORPHAN_NO_REAL_PRODUCER: owned flush reservation failed before a native timer or executable successor remained");
         }
       }
-      entry.ownedFlushLease = null;
     }
     return started;
   };
 
+  const startRecoveryFlushOnActualCancellation = async (page, captured) => {
+    if (!captured?.snapshot?.browserTimerIdentity || !captured?.snapshot?.options) {
+      throw new Error("Recovery flush continuation has no captured browser timer identity or options.");
+    }
+    const entry = captured.entry || queuedSaveHistory.get(String(captured.snapshot.timerIdentity || ""));
+    if (!entry || entry.status !== "pending") return { status: "unavailable", reason: "captured obligation is not pending" };
+    registerOwnedQueuedSaveFlush(captured, "F2 executable recovery-save continuation bound to actual timer cancellation");
+    const armed = await page.evaluate(({ browserTimerIdentity, options }) => {
+      const timerState = window.__sqagSmokeQuoteSessionTimerState;
+      if (!timerState?.pending?.active || timerState.pending.timerIdentity !== browserTimerIdentity) {
+        return { status: "unavailable", reason: "exact native timer is not active" };
+      }
+      timerState.recoveryFlushContinuations ||= Object.create(null);
+      timerState.recoveryFlushContinuations[browserTimerIdentity] = () => {
+        const priorIdentity = String(timerState.activeTimerIdentity || "");
+        timerState.activeTimerIdentity = browserTimerIdentity;
+        let savePromise;
+        try {
+          savePromise = saveQuoteSessionDraftState(options);
+        } finally {
+          timerState.activeTimerIdentity = priorIdentity;
+        }
+        timerState.flushPromises ||= Object.create(null);
+        timerState.flushPromises[browserTimerIdentity] = Promise.resolve(savePromise).then(
+          (result) => ({
+            kind: result ? "value" : "null",
+            sessionId: String(result?.session_id || ""),
+            quoteGenerated: typeof result?.status?.quote_generated === "boolean" ? result.status.quote_generated : null,
+          }),
+          (error) => ({ kind: "rejected", reason: String(error?.message || error) }),
+        );
+        return timerState.flushPromises[browserTimerIdentity];
+      };
+      return {
+        status: "armed",
+        timerIdentity: browserTimerIdentity,
+        actualNativeTimerActive: true,
+        callbackBoundToActualClearTimeout: true,
+      };
+    }, { browserTimerIdentity: captured.snapshot.browserTimerIdentity, options: captured.snapshot.options });
+    if (armed.status === "armed") {
+      entry.recoveryContinuation = {
+        state: "executable-continuation-established",
+        identity: entry.identity,
+        browserTimerIdentity: captured.snapshot.browserTimerIdentity,
+        at: Date.now(),
+      };
+      entry.transitions.push({ type: "recovery-executable-continuation-established", at: Date.now(), identity: entry.identity });
+      notifyProgress();
+    }
+    return armed;
+  };
+
   const outstandingOperations = () => {
     const operations = [];
-    for (const task of tasks) operations.push({ identity: `${group}/response-task`, producer: task });
-    for (const record of pendingRequiredRequests) operations.push({ identity: record.operationId, producer: record.terminalProducer ? record.terminalPromise : null });
-    for (const record of pendingResponseBodies) operations.push({ identity: `${record.operationId}/response-body`, producer: record.responseBodyProducer || null });
-    for (const record of pendingReadbacks) operations.push({ identity: `${record.operationId}/durable-readback`, producer: record.readbackProducer || null });
-    for (const record of pendingSavePromises) operations.push({ identity: `${record.operationId}/application-save`, producer: record.terminalProducer ? record.terminalPromise : null });
-    for (const job of pendingRequiredJobs) operations.push({ identity: job.identity, producer: job.producer });
+    for (const task of tasks) operations.push({ identity: `${group}/response-task`, state: "response-processing", producer: task });
+    for (const record of pendingRequiredRequests) operations.push({ identity: record.operationId, state: "request-pending", producer: record.terminalProducer ? record.terminalPromise : null });
+    for (const record of pendingResponseBodies) operations.push({ identity: `${record.operationId}/response-body`, state: "response-body-pending", producer: record.responseBodyProducer || null });
+    for (const record of pendingReadbacks) operations.push({ identity: `${record.operationId}/durable-readback`, state: "readback-pending", producer: record.readbackProducer || null });
+    for (const record of pendingSavePromises) operations.push({ identity: `${record.operationId}/application-save`, state: "application-save-pending", producer: record.terminalProducer ? record.terminalPromise : null });
+    for (const job of pendingRequiredJobs) operations.push({ identity: job.identity, state: "required-job-pending", producer: job.producer });
     for (const entry of pendingQueuedSaveWork.values()) operations.push({
       identity: entry.identity,
+      timerIdentity: String(entry.snapshot.timerIdentity || ""),
+      documentIdentity: documentEpisodeKey(entry.snapshot.pageIdentity || "<unknown-page>", entry.snapshot.documentId || "<unknown-document>"),
+      state: entry.status,
+      producerKind: entry.producerKind || entry.lastProducerKind || "",
+      producerState: entry.producerState || "none",
+      flushState: entry.flushOperation?.state || "none",
       producer: entry.producer === entry.terminalPromise ? null : entry.producer,
     });
     return operations;
   };
 
-  const reconcileBrowserTimers = async (page) => {
+  const reconcileBrowserTimers = async (page, deadlineRun = null) => {
     const pages = page ? [page] : [...attachedPages];
     for (const candidate of pages) {
       if (!candidate || candidate.isClosed()) continue;
-      await syncQueuedSaveTimer(candidate);
+      const synchronization = syncQueuedSaveTimer(candidate, deadlineRun);
+      await synchronization;
     }
   };
 
@@ -1965,24 +2332,135 @@ function createQuoteSessionDrainTracker(group) {
     return { reached, release: releaseResolve };
   };
 
-  const pauseAtFinalReconciliation = async () => {
+  const pauseAtFinalReconciliation = async (deadlineRun = null) => {
     const barrier = finalReconciliationBarriers.shift();
     if (!barrier) return;
     barrier.reachedResolve({ generation: progressGeneration });
-    await barrier.gate;
+    if (deadlineRun) await deadlineRun.await("final-zero-barrier", barrier.gate);
+    else await barrier.gate;
   };
 
   const drain = async (timeoutMs = 30000, page = null) => {
-    const deadline = Date.now() + timeoutMs;
+    const startedAt = performance.now();
+    const budgetMs = Math.max(0, Number.isFinite(Number(timeoutMs)) ? Number(timeoutMs) : 0);
+    const deadlineAt = startedAt + budgetMs;
+    const deadlineIdentity = `${group}/drain-${++drainInvocationSequence}`;
+    const deadlineError = new Error(`required drain absolute deadline expired (${deadlineIdentity})`);
+    let resolveDeadline;
+    let deadlineTimer;
+    const deadlineSignal = new Promise((resolve) => { resolveDeadline = resolve; });
+    const drainRun = {
+      identity: deadlineIdentity,
+      budgetMs,
+      startedAt,
+      deadlineAt,
+      phase: "initializing",
+      expired: false,
+      completed: false,
+      await: async (phase, operation) => {
+        drainRun.phase = String(phase || "unspecified-await");
+        activeDrainRuns.set(deadlineIdentity, {
+          identity: deadlineIdentity,
+          budgetMs,
+          startedAtMonotonicMs: startedAt,
+          deadlineMonotonicMs: deadlineAt,
+          phase: drainRun.phase,
+        });
+        if (drainRun.expired) throw deadlineError;
+        if (deadlineAt - performance.now() <= 0) {
+          expireDrain();
+          throw deadlineError;
+        }
+        const pending = Promise.resolve(operation).then(
+          (value) => ({ type: "value", value }),
+          (error) => ({ type: "error", error }),
+        );
+        const outcome = await Promise.race([
+          pending,
+          deadlineSignal.then(() => ({ type: "deadline" })),
+        ]);
+        if (outcome.type === "deadline" || drainRun.expired) throw deadlineError;
+        if (outcome.type === "error") throw outcome.error;
+        if (deadlineAt - performance.now() <= 0) {
+          expireDrain();
+          throw deadlineError;
+        }
+        return outcome.value;
+      },
+    };
+    activeDrainRuns.set(deadlineIdentity, {
+      identity: deadlineIdentity,
+      budgetMs,
+      startedAtMonotonicMs: startedAt,
+      deadlineMonotonicMs: deadlineAt,
+      phase: drainRun.phase,
+    });
+    const evidenceForOutstanding = () => outstandingOperations().map((operation) => ({
+      identity: operation.identity,
+      timerIdentity: operation.timerIdentity || "",
+      documentIdentity: operation.documentIdentity || "",
+      state: operation.state || "pending",
+      producerKind: operation.producerKind || "",
+      producerState: operation.producerState || (operation.producer ? "started" : "none"),
+      flushState: operation.flushState || "",
+    }));
+    const finishDrain = (outcome, extra = {}) => {
+      if (drainRun.expired) return false;
+      if (deadlineAt - performance.now() <= 0) {
+        expireDrain();
+        return false;
+      }
+      drainRun.completed = true;
+      activeDrainRuns.delete(deadlineIdentity);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      drainReports.push({
+        identity: deadlineIdentity,
+        outcome,
+        budgetMs,
+        startedAtMonotonicMs: startedAt,
+        deadlineMonotonicMs: deadlineAt,
+        finishedAtMonotonicMs: performance.now(),
+        phase: drainRun.phase,
+        outstanding: evidenceForOutstanding(),
+        ...extra,
+      });
+      return outcome === "success";
+    };
+    const expireDrain = () => {
+      if (drainRun.expired || drainRun.completed) return;
+      drainRun.expired = true;
+      activeDrainRuns.delete(deadlineIdentity);
+      const outstanding = evidenceForOutstanding();
+      const report = {
+        identity: deadlineIdentity,
+        outcome: "deadline-failure",
+        budgetMs,
+        startedAtMonotonicMs: startedAt,
+        deadlineMonotonicMs: deadlineAt,
+        expiredAtMonotonicMs: performance.now(),
+        phase: drainRun.phase,
+        outstanding,
+        deadlineUnchanged: true,
+      };
+      drainReports.push(report);
+      addIssue(
+        { operationId: deadlineIdentity, fixture: group, operation: "required-drain-deadline" },
+        `required drain absolute deadline expired; deadlineIdentity=${deadlineIdentity}; budgetMs=${budgetMs}; phase=${drainRun.phase}; outstanding=${JSON.stringify(outstanding)}`,
+      );
+      resolveDeadline({ type: "deadline", report });
+    };
+    deadlineTimer = setTimeout(expireDrain, budgetMs);
     while (true) {
-      const waiter = createProgressWaiter(Math.max(0, deadline - Date.now()));
+      const waiter = createProgressWaiter();
       const generationBeforeSnapshot = progressGeneration;
       try {
-        await reconcileBrowserTimers(page);
+        drainRun.phase = "browser-reconciliation";
+        await reconcileBrowserTimers(page, drainRun);
       } catch (error) {
         waiter.cancel();
+        if (error === deadlineError || drainRun.expired) return false;
         addIssue({ operationId: "<drain>", fixture: group, operation: "required-drain" }, `browser timer reconciliation failed: ${error?.message || error}`);
-        return false;
+        return finishDrain("failure", { reason: "browser timer reconciliation failed" });
       }
       const generationAfterSnapshot = progressGeneration;
       const outstanding = outstandingOperations();
@@ -1993,24 +2471,19 @@ function createQuoteSessionDrainTracker(group) {
           { operationId: "<drain>", fixture: group, operation: "required-drain" },
           `required operation has no terminal completion producer: ${missingProducer.map((operation) => operation.identity).join(", ")}`,
         );
-        return false;
-      }
-      if (Date.now() >= deadline && outstanding.length) {
-        waiter.cancel();
-        addIssue(
-          { operationId: "<drain>", fixture: group, operation: "required-drain" },
-          `required drain deadline expired with outstanding operations: ${outstanding.map((operation) => operation.identity).join(", ")}`,
-        );
-        return false;
+        return finishDrain("failure", { reason: "required operation had no executable producer" });
       }
       if (!outstanding.length) {
-        await pauseAtFinalReconciliation();
         try {
-          await reconcileBrowserTimers(page);
+          drainRun.phase = "final-zero-barrier";
+          await pauseAtFinalReconciliation(drainRun);
+          drainRun.phase = "final-zero-reconciliation";
+          await reconcileBrowserTimers(page, drainRun);
         } catch (error) {
           waiter.cancel();
+          if (error === deadlineError || drainRun.expired) return false;
           addIssue({ operationId: "<drain>", fixture: group, operation: "required-drain" }, `final browser timer reconciliation failed: ${error?.message || error}`);
-          return false;
+          return finishDrain("failure", { reason: "final-zero reconciliation failed" });
         }
         const finalOutstanding = outstandingOperations();
         if (progressGeneration !== generationAfterSnapshot || finalOutstanding.length) {
@@ -2018,7 +2491,7 @@ function createQuoteSessionDrainTracker(group) {
           continue;
         }
         waiter.cancel();
-        return issues.length === 0;
+        return finishDrain(issues.length === 0 ? "success" : "failure", { reason: issues.length ? "sticky tracker issues remain" : "zero-work barrier completed" });
       }
       if (progressGeneration !== generationBeforeSnapshot && generationAfterSnapshot === generationBeforeSnapshot) {
         waiter.cancel();
@@ -2028,25 +2501,17 @@ function createQuoteSessionDrainTracker(group) {
         waiter.cancel();
         continue;
       }
-      if (Date.now() >= deadline) {
-        waiter.cancel();
-        addIssue(
-          { operationId: "<drain>", fixture: group, operation: "required-drain" },
-          `required drain deadline expired with outstanding operations: ${outstanding.map((operation) => operation.identity).join(", ")}`,
-        );
-        return false;
-      }
       notifyDrainWaiting();
-      const result = await waiter.promise;
-      drainWaiting = false;
-      if (result.type === "deadline") {
-        const remaining = outstandingOperations();
-        addIssue(
-          { operationId: "<drain>", fixture: group, operation: "required-drain" },
-          `required drain deadline expired with outstanding operations: ${remaining.map((operation) => operation.identity).join(", ")}`,
-        );
-        return false;
+      try {
+        await drainRun.await("progress-wait", waiter.promise);
+      } catch (error) {
+        waiter.cancel();
+        drainWaiting = false;
+        if (error === deadlineError || drainRun.expired) return false;
+        addIssue({ operationId: "<drain>", fixture: group, operation: "required-drain" }, `required drain progress wait failed: ${error?.message || error}`);
+        return finishDrain("failure", { reason: "progress wait failed" });
       }
+      drainWaiting = false;
     }
   };
 
@@ -2071,12 +2536,29 @@ function createQuoteSessionDrainTracker(group) {
       status: entry.status,
       producerKind: entry.producerKind || entry.lastProducerKind || "",
       hasProducer: Boolean(entry.producer),
+      producerState: entry.producerState || "none",
       successorIdentity: entry.successorIdentity || "",
+      flushOperation: entry.flushOperation ? { ...entry.flushOperation } : null,
+      transitions: entry.transitions.map((transition) => ({ ...transition })),
       terminalReason: entry.terminalReason || "",
       postObserved: entry.evidence.postObserved === true,
       durableReadbackObserved: entry.evidence.durableReadbackObserved === true,
     })),
     drainWaitCount,
+    drainRuns: drainReports.map((report) => ({ ...report, outstanding: report.outstanding.map((item) => ({ ...item })) })),
+    activeDrainRuns: [...activeDrainRuns.values()].map((run) => ({ ...run })),
+    documentEpisodes: [...documentEpisodes.values()].map((episode) => ({
+      identity: episode.identity,
+      pageIdentity: episode.pageIdentity,
+      documentId: episode.documentId,
+      state: episode.state,
+      current: episode.current === true,
+      zeroProof: episode.zeroProof ? { ...episode.zeroProof } : null,
+      unknownRequiredWork: episode.unknownRequiredWork === true,
+      work: [...episode.work.values()].map((work) => ({ ...work })),
+      deliveryFailures: episode.deliveryFailures.map((failure) => ({ ...failure })),
+      lifecycle: episode.lifecycle.map((event) => ({ ...event })),
+    })),
     outstanding: {
       requiredRequests: [...pendingRequiredRequests].length,
       requiredResponseBodies: [...pendingResponseBodies].length,
@@ -2102,6 +2584,12 @@ function createQuoteSessionDrainTracker(group) {
     unproducedQueuedSaveWork,
     attachQueuedSaveProducer,
     registerOwnedQueuedSaveFlush: registerOwnedQueuedSaveFlush,
+    startRecoveryFlushOnActualCancellation,
+    faultNextTimerEventDelivery,
+    holdTimerEventAcknowledgement,
+    documentEpisodes,
+    drainReports,
+    activeDrainRuns,
     queuedSaveStatus,
     startCapturedQueuedSave,
     armFinalReconciliationBarrier,
@@ -3909,12 +4397,15 @@ async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
   }
 }
 
-async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, tracker = null) {
+async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, tracker = null, verificationOptions = {}) {
   let stage = "opening the isolated browser session";
   let sessionId = "";
   let browserPage = null;
   const isolatedContext = await page.context().browser().newContext({ viewport: { width: 1365, height: 900 } });
-  if (tracker) await tracker.install(isolatedContext);
+  const g3LifecycleOnly = args.includes("--sqag212-g3-lifecycle-only") || verificationOptions.g3LifecycleOnly === true;
+  const g3ControlsOnly = args.includes("--sqag212-g3-controls-only") || verificationOptions.g3ControlsOnly === true;
+  const deferTrackerUntilSessionStable = g3LifecycleOnly || g3ControlsOnly;
+  if (tracker && !deferTrackerUntilSessionStable) await tracker.install(isolatedContext);
   const draftJobIds = new Set();
   let capturedDraft = null;
   let lastJobPostType = "";
@@ -4379,7 +4870,13 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         }, diagnosticSessionId);
         if (![200, 404].includes(cleanup.status)) throw new Error(`Negative-control diagnostic session cleanup failed: ${JSON.stringify(cleanup)}.`);
         await tracker.drain(30000, diagnosticPage);
-        return { skipped: false, outcomes, cleanupStatus: cleanup.status, missingObservationRejected };
+        return {
+          skipped: false,
+          outcomes,
+          cleanupStatus: cleanup.status,
+          missingObservationRejected,
+          noNavigationPositive: "PASS",
+        };
       } finally {
         await diagnosticPage.close();
       }
@@ -4724,6 +5221,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     const runSqag212ThreeFindingControls = async (seedSessionId) => {
       let returnT1 = null;
       let returnT2 = null;
+      let l1SessionSequence = 0;
       const openFixture = async (name, targetSessionId) => {
         const fixtureTracker = createQuoteSessionDrainTracker(name);
         const fixtureContext = await isolatedContext.browser().newContext({ viewport: { width: 1365, height: 900 } });
@@ -4790,8 +5288,9 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         }, sessionId);
       };
       const cleanupSession = async (page, sessionId) => {
-        if (!page || page.isClosed() || !sessionId) return;
-        const cleanup = await page.evaluate(async (id) => {
+        const cleanupPage = browserPage && !browserPage.isClosed() ? browserPage : page;
+        if (!cleanupPage || cleanupPage.isClosed() || !sessionId) return;
+        const cleanup = await cleanupPage.evaluate(async (id) => {
           const headers = {};
           if (state.csrfToken) headers[state.csrfHeaderName] = state.csrfToken;
           const response = await fetch("/api/quote-sessions/" + encodeURIComponent(id), { method: "DELETE", headers });
@@ -4818,6 +5317,106 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         && JSON.stringify(queuedDraftFilesComparable(record.readback?.draftFiles))
           === JSON.stringify(queuedDraftFilesComparable(captured.snapshot.draftFiles))
       );
+      const waitForDrainPhase = async (fixtureTracker, phase, timeoutMs) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const run = fixtureTracker.summary().activeDrainRuns.find((candidate) => candidate.phase === phase);
+          if (run) return run;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error(`Drain did not enter expected ${phase} phase within ${timeoutMs} ms.`);
+      };
+
+      const runL1DeliveryFailureControl = async (name, lifecycleLoss) => {
+        const sessionId = `quote-sqag212-l1-${Date.now()}-${++l1SessionSequence}`;
+        const fixture = await openFixture(name, sessionId);
+        let cleanupPage = fixture.page;
+        try {
+          const operationId = `sqag212/${name}/${Date.now()}`;
+          await prepareSession(fixture, sessionId, operationId, name);
+          fixture.tracker.faultNextTimerEventDelivery(fixture.page, "create");
+          await fixture.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+          const browserEvidence = await fixture.page.evaluate(async () => {
+            const timerState = window.__sqagSmokeQuoteSessionTimerState || {};
+            const acknowledgement = await timerState.lastEventPromise;
+            const timer = window.__sqagSmokeGetPendingQuoteSessionDraftSave?.();
+            const failure = (timerState.eventDeliveryFailures || []).find((item) => item.type === "create") || null;
+            return {
+              acknowledgement,
+              documentId: String(timer?.documentId || ""),
+              timerIdentity: String(timer?.pending?.timerIdentity || ""),
+              nativeTimerActive: timer?.pending?.active === true && Boolean(timer.pending.nativeTimerId),
+              failure,
+            };
+          });
+          const pageEpisode = fixture.tracker.summary().documentEpisodes.find((episode) => (
+            episode.documentId === browserEvidence.documentId
+          ));
+          const normalizedIdentity = pageEpisode
+            ? `${pageEpisode.pageIdentity}/${browserEvidence.timerIdentity}` : "";
+          const noNodeQueuedRecord = Boolean(normalizedIdentity)
+            && fixture.tracker.queuedSaveStatus(normalizedIdentity) === null;
+          const noCorrelatedPost = fixture.tracker.records.filter((record) => (
+            record.operationId === operationId && record.method === "POST"
+          )).length === 0;
+          const failureObservedOutsideDocument = Boolean(pageEpisode?.unknownRequiredWork)
+            && pageEpisode?.work.some((item) => item.timerIdentity === normalizedIdentity && item.state === "unknown")
+            && fixture.tracker.issues.some((issue) => issue.operation === "queued-save-timer-event" && issue.operationId === normalizedIdentity);
+          if (browserEvidence.acknowledgement !== false
+            || !browserEvidence.nativeTimerActive
+            || !browserEvidence.failure
+            || browserEvidence.failure.timerIdentity !== browserEvidence.timerIdentity
+            || !noNodeQueuedRecord
+            || !noCorrelatedPost
+            || !failureObservedOutsideDocument) {
+            throw new Error(`${name} did not prove a real timer binding failure and retain its observed unknown work without a Node queued-save record: ${JSON.stringify({
+              browserEvidence, noNodeQueuedRecord, noCorrelatedPost, pageEpisode, summary: fixture.tracker.summary(),
+            })}.`);
+          }
+
+          let navigationCommitted = false;
+          if (lifecycleLoss === "page-close") {
+            await fixture.page.close();
+          } else if (lifecycleLoss === "navigation") {
+            fixture.page.on("framenavigated", (frame) => {
+              if (frame === fixture.page.mainFrame()) navigationCommitted = true;
+            });
+            const destination = new URL(diagnosticRelay.baseUrl);
+            destination.searchParams.set("sqag212_l1", name);
+            await fixture.page.goto(destination.href, { waitUntil: "commit" });
+          }
+          const drained = await fixture.tracker.drain(1000, fixture.page);
+          const noFalseGreen = !drained
+            && fixture.tracker.issues.length > 0
+            && fixture.tracker.documentEpisodes.get(pageEpisode.identity)?.unknownRequiredWork === true
+            && fixture.tracker.records.filter((record) => record.operationId === operationId && record.method === "POST").length === 0;
+          if (!noFalseGreen || (lifecycleLoss === "navigation" && !navigationCommitted)) {
+            throw new Error(`${name} allowed a false empty-state drain after ${lifecycleLoss}: ${JSON.stringify({
+              drained, navigationCommitted, noFalseGreen, summary: fixture.tracker.summary(),
+            })}.`);
+          }
+          if (lifecycleLoss !== "open") {
+            cleanupPage = await fixture.context.newPage();
+            await cleanupPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+            await cleanupPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+          }
+          await cleanupSession(cleanupPage, sessionId);
+          return {
+            result: "PASS",
+            lifecycleLoss,
+            nativeTimerObserved: browserEvidence.nativeTimerActive,
+            deliveryFailureObserved: true,
+            documentEpisodeIdentity: pageEpisode.identity,
+            timerIdentity: normalizedIdentity,
+            noNodeQueuedRecord,
+            drainedFalse: true,
+            noCorrelatedPost,
+            navigationCommitted: lifecycleLoss === "navigation" ? navigationCommitted : null,
+          };
+        } finally {
+          await fixture.context.close();
+        }
+      };
 
       const t1SessionId = "quote-sqag212-t1-" + Date.now();
       const t1 = await openFixture("sqag212-t1-default-timer", t1SessionId);
@@ -5103,8 +5702,128 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         await t3Negative.context.close();
       }
 
+      const l2NegativeSessionId = "quote-sqag212-l2-reserved-" + Date.now();
+      const l2Negative = await openFixture("sqag212-l2-owned-flush-reserved-only", l2NegativeSessionId);
+      let releaseL2Purge = () => {};
+      let releaseL2Navigation = () => {};
+      let l2NegativeResult = false;
+      try {
+        const operationId = "sqag212/l2-reserved-only/" + Date.now();
+        await prepareSession(l2Negative, l2NegativeSessionId, operationId, "l2-reserved-only-no-successor");
+        await l2Negative.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        await l2Negative.tracker.syncQueuedSaveTimer(l2Negative.page);
+        const captured = await l2Negative.tracker.capturePendingQueuedSave(l2Negative.page);
+        if (!captured || captured.entry.producerKind !== "native-timer") {
+          throw new Error("L2 negative did not begin with a captured native required timer.");
+        }
+        const lease = l2Negative.tracker.registerOwnedQueuedSaveFlush(captured, "L2 negative inert reservation without executable work");
+        const reservationOnly = lease?.state === "reserved"
+          && captured.entry.flushOperation?.state === "FLUSH_OWNERSHIP_RESERVED"
+          && captured.entry.producerKind === "native-timer"
+          && captured.entry.producer === captured.entry.nativeTimerLease.promise;
+        if (!reservationOnly) {
+          throw new Error("L2 negative reservation incorrectly counted as an operational producer: " + JSON.stringify({
+            leaseState: lease?.state,
+            flushState: captured.entry.flushOperation?.state,
+            producerKind: captured.entry.producerKind,
+          }) + ".");
+        }
+        const baseline = await l2Negative.page.evaluate(() => ({
+          recoveryScope: String(currentBrowserRecoveryScope() || ""),
+          csrfToken: String(state.csrfToken || ""),
+          csrfHeaderName: String(state.csrfHeaderName || ""),
+        }));
+        if (!baseline.recoveryScope || !baseline.csrfToken) {
+          throw new Error("L2 negative lacks the current recovery scope or CSRF state required for a real recovery transition.");
+        }
+        await l2Negative.page.evaluate(() => {
+          const originalPurge = purgeBrowserRecoveryState;
+          window.__sqagL2PurgeReached = false;
+          window.__sqagL2ReleasePurge = null;
+          purgeBrowserRecoveryState = async (...args) => {
+            await originalPurge(...args);
+            window.__sqagL2PurgeReached = true;
+            await new Promise((resolve) => { window.__sqagL2ReleasePurge = resolve; });
+          };
+        });
+        await l2Negative.page.route("**/*", async (route) => {
+          if (route.request().isNavigationRequest() && route.request().frame() === l2Negative.page.mainFrame()) {
+            await new Promise((resolve) => { releaseL2Navigation = resolve; });
+            await route.abort();
+            return;
+          }
+          await route.fallback();
+        });
+        const waitCountBeforeCancel = l2Negative.tracker.summary().drainWaitCount;
+        await l2Negative.page.evaluate((context) => {
+          window.__sqagL2RecoveryTransition = applySessionData({
+            csrf_token: context.csrfToken,
+            csrf_header: context.csrfHeaderName,
+            browser_recovery_scope: context.recoveryScope + "-sqag212-l2-negative",
+          });
+        }, baseline);
+        await l2Negative.page.waitForFunction(() => window.__sqagL2PurgeReached === true, null, { timeout: 15000 });
+        const cancellationState = await l2Negative.page.evaluate(() => {
+          const timer = window.__sqagSmokeGetPendingQuoteSessionDraftSave?.();
+          return {
+            transitioning: state.isRecoveryScopeTransitioning === true,
+            pending: timer?.pending || null,
+            last: timer?.last || null,
+          };
+        });
+        await l2Negative.tracker.syncQueuedSaveTimer(l2Negative.page);
+        const entry = l2Negative.tracker.queuedSaveStatus(captured.snapshot.timerIdentity);
+        const orphanIssue = l2Negative.tracker.issues.find((issue) => (
+          issue.operationId === entry?.identity && issue.reason.includes("ORPHAN_NO_REAL_PRODUCER")
+        ));
+        const noCorrelatedPost = l2Negative.tracker.records.filter((record) => (
+          record.operationId === operationId && record.method === "POST"
+        )).length === 0;
+        const immediateOrphan = entry?.status === "failed"
+          && entry.terminalReason.includes("ORPHAN_NO_REAL_PRODUCER")
+          && entry.transitions.some((transition) => transition.type === "FLUSH_OWNERSHIP_RESERVED")
+          && entry.flushOperation?.terminalStatus === "failed"
+          && !entry.producer
+          && Boolean(orphanIssue)
+          && cancellationState.transitioning === true
+          && cancellationState.pending === null
+          && cancellationState.last?.cancelledForRecovery === true
+          && noCorrelatedPost
+          && l2Negative.tracker.summary().drainWaitCount === waitCountBeforeCancel;
+        const drainPassed = await l2Negative.tracker.drain(1000, l2Negative.page);
+        l2NegativeResult = immediateOrphan && !drainPassed
+          && l2Negative.tracker.summary().drainWaitCount === waitCountBeforeCancel;
+        if (!l2NegativeResult) {
+          throw new Error("L2 reserved-only recovery cancellation did not fail immediately as an orphan before a deadline wait: " + JSON.stringify({
+            immediateOrphan, drainPassed, waitCountBeforeCancel, cancellationState,
+            entry: entry && { status: entry.status, terminalReason: entry.terminalReason, flushOperation: entry.flushOperation, transitions: entry.transitions },
+            orphanIssue, noCorrelatedPost, summary: l2Negative.tracker.summary(),
+          }) + ".");
+        }
+        await cleanupSession(l2Negative.page, l2NegativeSessionId);
+      } finally {
+        if (!l2Negative.page.isClosed()) await l2Negative.page.evaluate(() => window.__sqagL2ReleasePurge?.()).catch(() => {});
+        releaseL2Purge();
+        releaseL2Navigation();
+        await l2Negative.context.close();
+      }
+
       const t3PositiveSessionId = "quote-sqag212-t3p-" + Date.now();
       const t3Positive = await openFixture("sqag212-t3-owned-recovery-flush", t3PositiveSessionId);
+      let releaseT3Post = () => {};
+      let t3PostReachedResolve;
+      const t3PostReached = new Promise((resolve) => { t3PostReachedResolve = resolve; });
+      let releaseT3PostResolve;
+      const t3PostGate = new Promise((resolve) => { releaseT3PostResolve = resolve; });
+      releaseT3Post = () => releaseT3PostResolve();
+      let t3RouteError = null;
+      let t3RouteDoneResolve;
+      const t3RouteDone = new Promise((resolve) => { t3RouteDoneResolve = resolve; });
+      let transferredProducer = false;
+      let nativeTimerRemainedReal = false;
+      let t3DrainPendingAtGate = false;
+      let persisted = false;
+      let t3PositiveEvidence = null;
       try {
         const operationId = "sqag212/t3-owned-recovery-flush/" + Date.now();
         await prepareSession(t3Positive, t3PositiveSessionId, operationId, "t3-owned-recovery-flush");
@@ -5116,61 +5835,560 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         }
         const ownedFlush = t3Positive.tracker.registerOwnedQueuedSaveFlush(captured, "T3 registered real save handoff before recovery cancellation");
         if (!ownedFlush || ownedFlush.settled) throw new Error("T3 could not register the real owned flush producer.");
+        const reservationRemainedNonOperational = ownedFlush.state === "reserved"
+          && captured.entry.flushOperation?.state === "FLUSH_OWNERSHIP_RESERVED"
+          && captured.entry.producerKind === "native-timer"
+          && captured.entry.producer === captured.entry.nativeTimerLease.promise;
+        if (!reservationRemainedNonOperational) {
+          throw new Error("T3 flush reservation incorrectly replaced the native timer producer: " + JSON.stringify({
+            leaseState: ownedFlush.state,
+            flushState: captured.entry.flushOperation?.state,
+            producerKind: captured.entry.producerKind,
+          }) + ".");
+        }
+        await t3Positive.page.route("**/api/quote-sessions", async (route) => {
+          try {
+            const response = await route.fetch();
+            t3PostReachedResolve({ status: response.status() });
+            await t3PostGate;
+            await route.fulfill({ response });
+          } catch (error) {
+            t3RouteError = String(error?.message || error);
+          } finally {
+            t3RouteDoneResolve();
+          }
+        });
+        const start = await t3Positive.tracker.startCapturedQueuedSave(t3Positive.page, captured, { cancelNativeTimer: false });
+        if (start.status !== "started" || start.nativeTimerRetained !== true
+          || ownedFlush.state !== "started" || ownedFlush.executable !== true) {
+          throw new Error("T3 did not establish an executable real save while preserving the native timer until transfer: " + JSON.stringify({
+            start, leaseState: ownedFlush.state, executable: ownedFlush.executable,
+          }) + ".");
+        }
+        const heldPost = await Promise.race([
+          t3PostReached,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("T3 real application POST did not reach the held response boundary.")), 10000)),
+        ]);
+        const nativeTimerBeforeTransfer = await t3Positive.tracker.readQueuedSaveTimer(t3Positive.page);
+        const nativeTimerDebug = await t3Positive.page.evaluate(() => ({
+          timer: (() => {
+            const timer = window.__sqagSmokeGetPendingQuoteSessionDraftSave?.();
+            return {
+              pending: timer?.pending ? {
+                timerIdentity: timer.pending.timerIdentity,
+                active: timer.pending.active,
+                nativeTimerId: timer.pending.nativeTimerId,
+              } : null,
+              last: timer?.last ? {
+                timerIdentity: timer.last.timerIdentity,
+                active: timer.last.active,
+                cancelledForRecovery: timer.last.cancelledForRecovery,
+              } : null,
+            };
+          })(),
+          apiTrace: (window.__sqagSmokeQuoteSessionTimerState?.apiTrace || []).map(({ method, path }) => ({ method, path })),
+          saveCalls: (window.__sqagSmokeQuoteSessionTimerState?.saveCalls || []).length,
+          saveCurrentCalls: (window.__sqagSmokeQuoteSessionTimerState?.saveCurrentCalls || []).length,
+          flushPromiseKeys: Object.keys(window.__sqagSmokeQuoteSessionTimerState?.flushPromises || {}),
+        }));
+        nativeTimerRemainedReal = nativeTimerBeforeTransfer?.pending?.active === true
+          && captured.entry.nativeTimerLease.settled === false
+          && t3Positive.tracker.records.some((record) => record.operationId === operationId && record.method === "POST");
+        if (!nativeTimerRemainedReal || heldPost.status < 200 || heldPost.status >= 300) {
+          throw new Error("T3 did not retain its real native timer and real POST at the held response boundary: " + JSON.stringify({
+            nativeTimerRemainedReal,
+            heldPost,
+            timerStateFromBrowser: nativeTimerDebug,
+            nativeTimerLease: { settled: captured.entry.nativeTimerLease?.settled, state: captured.entry.nativeTimerLease?.state },
+            postRecord: t3Positive.tracker.records.filter((record) => record.operationId === operationId && record.method === "POST").map((record) => ({ upstreamStatus: record.upstreamStatus, httpStatus: record.httpStatus, lifecycle: record.lifecycle })),
+          }) + ".");
+        }
+        const waitCountBeforeTransfer = t3Positive.tracker.summary().drainWaitCount;
+        const heldDrain = t3Positive.tracker.drain(15000, t3Positive.page);
+        await t3Positive.tracker.waitForDrainWaiting(5000, waitCountBeforeTransfer);
         await t3Positive.page.evaluate(() => {
           state.isRecoveryScopeTransitioning = true;
           clearQuoteSessionDraftSaveTimer();
           state.isRecoveryScopeTransitioning = false;
         });
         await t3Positive.tracker.syncQueuedSaveTimer(t3Positive.page);
-        const transferredProducer = captured.entry.producerKind === "owned-flush"
-          && captured.entry.producer === ownedFlush.promise
+        transferredProducer = captured.entry.flushOperation?.state === "FLUSH_OPERATION_STARTED"
+          && captured.entry.flushOperation?.ownershipTransfer === "transferred-to-recovery"
+          && captured.entry.producerState === "started"
           && captured.entry.producer !== captured.entry.terminalPromise
           && captured.entry.status === "pending";
         if (!transferredProducer) {
-          throw new Error("T3 registered flush did not own the obligation after native recovery cancellation: " + JSON.stringify({
+          throw new Error("T3 recovery cancellation did not transfer to the already-started real save: " + JSON.stringify({
             status: captured.entry.status, producerKind: captured.entry.producerKind,
-            sameAsBookkeeping: captured.entry.producer === captured.entry.terminalPromise,
+            producerState: captured.entry.producerState,
+            flushOperation: captured.entry.flushOperation,
           }) + ".");
         }
-        const start = await t3Positive.tracker.startCapturedQueuedSave(t3Positive.page, captured);
-        if (start.status !== "started") throw new Error("T3 registered recovery flush did not invoke the real save: " + JSON.stringify(start) + ".");
+        let heldDrainFinishedEarly = false;
+        heldDrain.then(() => { heldDrainFinishedEarly = true; });
+        await Promise.resolve();
+        t3DrainPendingAtGate = !heldDrainFinishedEarly;
+        if (!t3DrainPendingAtGate) throw new Error("T3 drain completed while the real successor response remained held.");
+        releaseT3Post();
         await captured.entry.terminalPromise;
+        if (t3RouteError) throw new Error("T3 held real save response could not complete: " + t3RouteError + ".");
         const record = t3Positive.tracker.records.find((candidate) => candidate.operationId === operationId && candidate.method === "POST");
-        const persisted = captured.entry.status === "succeeded" && queuedRecordIsDurable(record, captured);
-        const drainPassed = await t3Positive.tracker.drain(15000, t3Positive.page);
+        persisted = captured.entry.status === "succeeded" && queuedRecordIsDurable(record, captured);
+        const drainPassed = await heldDrain;
         if (!persisted || !drainPassed || t3Positive.tracker.issues.length) {
-          throw new Error("T3 registered recovery flush did not transfer to real save and durable work: " + JSON.stringify({
-            persisted, drainPassed, entry: { status: captured.entry.status, evidence: captured.entry.evidence },
+          throw new Error("T3 started recovery flush did not transfer, remain accountable while held, and prove durable work: " + JSON.stringify({
+            persisted, drainPassed, heldDrainFinishedEarly, entry: { status: captured.entry.status, evidence: captured.entry.evidence },
             record: record && { httpStatus: record.httpStatus, bodyStatus: record.bodyStatus, readback: record.readback },
             summary: t3Positive.tracker.summary(),
           }) + ".");
         }
-        return {
+        t3PositiveEvidence = {
           T1_RESULT: returnT1.T1_RESULT,
           T1_NEGATIVE_DEFAULT_INSTRUMENTATION_TIMER_VISIBILITY: returnT1.T1_NEGATIVE_DEFAULT_INSTRUMENTATION_TIMER_VISIBILITY,
           T1_POSITIVE_TRUE_ZERO_DEFAULT_INSTALLATION: returnT1.T1_POSITIVE_TRUE_ZERO_DEFAULT_INSTALLATION,
           T1_POSITIVE_DEFAULT_TIMER_NATIVE_COMPLETION: returnT1.T1_POSITIVE_DEFAULT_TIMER_NATIVE_COMPLETION,
           T1_POSITIVE_DEFAULT_TIMER_FLUSH_COMPLETION: returnT1.T1_POSITIVE_DEFAULT_TIMER_FLUSH_COMPLETION,
+          L2_POSITIVE_NATIVE_TIMER_REMAINS_REAL_PRODUCER: nativeTimerRemainedReal ? "PASS" : "FAIL",
           T2_RESULT: returnT2.T2_RESULT,
           T2_NEGATIVE_MISSING_OPTIONS_THEN_SUCCESSFUL_REPLACEMENT: returnT2.T2_NEGATIVE_MISSING_OPTIONS_THEN_SUCCESSFUL_REPLACEMENT,
           T2_POSITIVE_HEALTHY_A_SUPERSEDED_BY_B: returnT2.T2_POSITIVE_HEALTHY_A_SUPERSEDED_BY_B,
           T2_POSITIVE_B_SUCCESS_REMAINS_INDEPENDENT_OF_FAILED_A: returnT2.T2_POSITIVE_B_SUCCESS_REMAINS_INDEPENDENT_OF_FAILED_A,
           T3_RESULT: "PASS",
           T3_NEGATIVE_RECOVERY_CANCEL_WITH_BOOKKEEPING_ONLY_PRODUCER: t3NegativeResult ? "PASS" : "FAIL",
-          T3_POSITIVE_CANCEL_TRANSFERS_TO_REGISTERED_REAL_WORK: "PASS",
+          L2_NEGATIVE_OWNED_FLUSH_LEASE_WITHOUT_EXECUTABLE_WORK: l2NegativeResult ? "PASS" : "FAIL",
+          T3_POSITIVE_CANCEL_TRANSFERS_TO_STARTED_REAL_WORK: "PASS",
           T3_POSITIVE_NATIVE_TIMER_PRODUCER: "PASS",
+          L2_POSITIVE_OWNED_FLUSH_RESERVATION_IS_NOT_PRODUCER: reservationRemainedNonOperational ? "PASS" : "FAIL",
+          L2_POSITIVE_FLUSH_OWNERSHIP_TRANSFERS_TO_STARTED_REAL_SAVE: transferredProducer ? "PASS" : "FAIL",
+          L2_POSITIVE_STARTED_FLUSH_HELD_THEN_COMPLETES: persisted ? "PASS" : "FAIL",
           T1: returnT1,
           T2: returnT2,
           T3: {
             negativeImmediateOrphan: t3NegativeResult,
             cancelTransferredToOwnedFlush: transferredProducer,
+            reservationRemainedNonOperational,
+            nativeTimerRemainedReal,
+            drainHeldPending: t3DrainPendingAtGate,
             realSaveAndReadback: persisted,
           },
         };
       } finally {
+        releaseT3Post();
+        await Promise.race([t3RouteDone, new Promise((resolve) => setTimeout(resolve, 1000))]);
+        await t3Positive.page.unroute("**/api/quote-sessions").catch(() => {});
         await cleanupSession(t3Positive.page, t3PositiveSessionId);
         await t3Positive.context.close();
       }
+
+      const l1PageClose = await runL1DeliveryFailureControl(
+        "l1-negative-delivery-failure-page-close",
+        "page-close",
+      );
+      const l1Navigation = await runL1DeliveryFailureControl(
+        "l1-negative-delivery-failure-document-navigation",
+        "navigation",
+      );
+      const l1OpenPage = await runL1DeliveryFailureControl(
+        "l1-positive-delivery-failure-page-open",
+        "open",
+      );
+
+      const l1CleanCloseSessionId = `quote-sqag212-l1-clean-close-${Date.now()}`;
+      const l1CleanClose = await openFixture("sqag212-l1-clean-close-zero", l1CleanCloseSessionId);
+      let l1CleanCloseZeroProof = false;
+      let l1CleanClosePassed = false;
+      try {
+        const episodeBeforeClose = l1CleanClose.tracker.summary().documentEpisodes.find((episode) => episode.current);
+        l1CleanCloseZeroProof = Boolean(episodeBeforeClose?.zeroProof)
+          && episodeBeforeClose.zeroProof.noActiveNativeTimer === true
+          && episodeBeforeClose.zeroProof.outstandingKnownWork === 0;
+        if (!l1CleanCloseZeroProof) {
+          throw new Error("L1 clean-close positive lacked independent successful zero-work reconciliation: " + JSON.stringify(episodeBeforeClose) + ".");
+        }
+        await l1CleanClose.page.close();
+        l1CleanClosePassed = await l1CleanClose.tracker.drain(1000, l1CleanClose.page);
+        const closedEpisode = l1CleanClose.tracker.documentEpisodes.get(episodeBeforeClose.identity);
+        if (!l1CleanClosePassed || l1CleanClose.tracker.issues.length
+          || closedEpisode?.state !== "closed-with-proven-zero-work"
+          || closedEpisode.unknownRequiredWork) {
+          throw new Error("L1 clean page close after proven zero work was not accepted: " + JSON.stringify({
+            l1CleanClosePassed,
+            closedEpisode: l1CleanClose.tracker.summary().documentEpisodes.find((episode) => episode.identity === episodeBeforeClose.identity),
+            summary: l1CleanClose.tracker.summary(),
+          }) + ".");
+        }
+        const cleanupPage = await l1CleanClose.context.newPage();
+        await cleanupPage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+        await cleanupPage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+        await cleanupSession(cleanupPage, l1CleanCloseSessionId);
+      } finally {
+        await l1CleanClose.context.close();
+      }
+
+      const l1CompletedNavigationSessionId = `quote-sqag212-l1-completed-navigation-${Date.now()}`;
+      const l1CompletedNavigation = await openFixture("sqag212-l1-completed-work-navigation", l1CompletedNavigationSessionId);
+      let l1CompletedPersistence = false;
+      let l1CompletedNavigationPassed = false;
+      let l1CompletedNavigationCommitted = false;
+      try {
+        const operationId = `sqag212/l1-completed-work-navigation/${Date.now()}`;
+        await prepareSession(l1CompletedNavigation, l1CompletedNavigationSessionId, operationId, "l1-completed-work-navigation");
+        await l1CompletedNavigation.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        const captured = await l1CompletedNavigation.tracker.capturePendingQueuedSave(l1CompletedNavigation.page);
+        if (!captured) throw new Error("L1 completed-navigation positive did not observe its real required timer.");
+        await flushRequiredQuoteSessionSaves(l1CompletedNavigation.page, l1CompletedNavigation.tracker, captured);
+        const record = l1CompletedNavigation.tracker.records.find((candidate) => (
+          candidate.operationId === operationId && candidate.method === "POST"
+        ));
+        l1CompletedPersistence = queuedRecordIsDurable(record, captured)
+          && captured.entry.status === "succeeded"
+          && captured.entry.evidence?.durableReadbackObserved === true;
+        if (!l1CompletedPersistence) {
+          throw new Error("L1 completed-navigation positive lacked real POST and durable readback before navigation: " + JSON.stringify({
+            entry: { status: captured.entry.status, evidence: captured.entry.evidence },
+            record: record && { httpStatus: record.httpStatus, bodyStatus: record.bodyStatus, readback: record.readback },
+          }) + ".");
+        }
+        const priorEpisode = l1CompletedNavigation.tracker.documentEpisodes.get(
+          `${captured.snapshot.pageIdentity}/${captured.snapshot.documentId}`,
+        );
+        l1CompletedNavigation.page.on("framenavigated", (frame) => {
+          if (frame === l1CompletedNavigation.page.mainFrame()) l1CompletedNavigationCommitted = true;
+        });
+        const destination = new URL(diagnosticRelay.baseUrl);
+        destination.searchParams.set("sqag212_l1_completed", operationId);
+        await l1CompletedNavigation.page.goto(destination.href, { waitUntil: "commit" });
+        l1CompletedNavigationPassed = await l1CompletedNavigation.tracker.drain(5000, l1CompletedNavigation.page);
+        const retiredEpisode = l1CompletedNavigation.tracker.documentEpisodes.get(priorEpisode.identity);
+        if (!l1CompletedNavigationCommitted || !l1CompletedNavigationPassed
+          || retiredEpisode?.state !== "closed-after-proven-completion"
+          || retiredEpisode.unknownRequiredWork
+          || l1CompletedNavigation.tracker.issues.length) {
+          throw new Error("L1 completed-work navigation did not preserve completion proof: " + JSON.stringify({
+            navigationCommitted: l1CompletedNavigationCommitted,
+            drainPassed: l1CompletedNavigationPassed,
+            retiredEpisode: l1CompletedNavigation.tracker.summary().documentEpisodes.find((episode) => episode.identity === priorEpisode.identity),
+            summary: l1CompletedNavigation.tracker.summary(),
+          }) + ".");
+        }
+        await cleanupSession(l1CompletedNavigation.page, l1CompletedNavigationSessionId);
+      } finally {
+        await l1CompletedNavigation.context.close();
+      }
+
+      const l3AckSessionId = `quote-sqag212-l3-normal-ack-${Date.now()}`;
+      const l3Ack = await openFixture("sqag212-l3-normal-event-ack", l3AckSessionId);
+      let l3NormalAckPassed = false;
+      let l3NormalAckBounded = false;
+      let l3NormalAckPersistence = false;
+      let hold = null;
+      try {
+        const operationId = `sqag212/l3-normal-event-ack/${Date.now()}`;
+        await prepareSession(l3Ack, l3AckSessionId, operationId, "l3-normal-event-ack");
+        hold = l3Ack.tracker.holdTimerEventAcknowledgement(l3Ack.page, "create");
+        await l3Ack.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 350 }));
+        await hold.observed;
+        const capturedEntry = l3Ack.tracker.queuedSaveStatus(hold.eventIdentity);
+        const waitCount = l3Ack.tracker.summary().drainWaitCount;
+        const drainPromise = l3Ack.tracker.drain(10000, l3Ack.page);
+        const activeDrain = await waitForDrainPhase(l3Ack.tracker, "timer-event-delivery-acknowledgement", 3000);
+        hold.release();
+        const drained = await drainPromise;
+        const report = l3Ack.tracker.summary().drainRuns.at(-1);
+        const record = l3Ack.tracker.records.find((candidate) => candidate.operationId === operationId && candidate.method === "POST");
+        l3NormalAckPassed = drained && l3Ack.tracker.issues.length === 0;
+        l3NormalAckBounded = report?.identity === activeDrain.identity
+          && report.budgetMs === 10000
+          && report.outcome === "success";
+        l3NormalAckPersistence = capturedEntry?.status === "succeeded"
+          && queuedRecordIsDurable(record, { snapshot: capturedEntry.snapshot });
+        if (!l3NormalAckPassed || !l3NormalAckBounded || !l3NormalAckPersistence
+          || l3Ack.tracker.summary().drainWaitCount <= waitCount) {
+          throw new Error("L3 normal event acknowledgement did not complete and persist within the original drain budget: " + JSON.stringify({
+            drained, activeDrain, report, l3NormalAckPersistence, summary: l3Ack.tracker.summary(),
+          }) + ".");
+        }
+        await cleanupSession(l3Ack.page, l3AckSessionId);
+      } finally {
+        hold?.release();
+        await l3Ack.context.close();
+      }
+
+      const l3NativeSessionId = `quote-sqag212-l3-native-completion-${Date.now()}`;
+      const l3Native = await openFixture("sqag212-l3-native-timer-completion", l3NativeSessionId);
+      let l3NativePassed = false;
+      let l3NativeBounded = false;
+      let l3NativePersistence = false;
+      try {
+        const operationId = `sqag212/l3-native-timer-completion/${Date.now()}`;
+        await prepareSession(l3Native, l3NativeSessionId, operationId, "l3-native-timer-completion");
+        await l3Native.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 600 }));
+        const captured = await l3Native.tracker.capturePendingQueuedSave(l3Native.page);
+        if (!captured || captured.entry.producerKind !== "native-timer") {
+          throw new Error("L3 native-completion positive did not register the actual timer as its producer.");
+        }
+        const drainPromise = l3Native.tracker.drain(10000, l3Native.page);
+        l3NativePassed = await drainPromise;
+        const report = l3Native.tracker.summary().drainRuns.at(-1);
+        const record = l3Native.tracker.records.find((candidate) => candidate.operationId === operationId && candidate.method === "POST");
+        l3NativeBounded = report?.budgetMs === 10000 && report.outcome === "success";
+        l3NativePersistence = captured.entry.status === "succeeded" && queuedRecordIsDurable(record, captured);
+        if (!l3NativePassed || !l3NativeBounded || !l3NativePersistence) {
+          throw new Error("L3 native timer did not complete through the real application save and durable readback within budget: " + JSON.stringify({
+            l3NativePassed, report, l3NativePersistence, record: record && { httpStatus: record.httpStatus, bodyStatus: record.bodyStatus, readback: record.readback },
+            summary: l3Native.tracker.summary(),
+          }) + ".");
+        }
+        await cleanupSession(l3Native.page, l3NativeSessionId);
+      } finally {
+        await l3Native.context.close();
+      }
+
+      const l3HeldAckSessionId = `quote-sqag212-l3-held-ack-${Date.now()}`;
+      const l3HeldAck = await openFixture("sqag212-l3-held-event-ack", l3HeldAckSessionId);
+      let l3HeldAckFailure = null;
+      let l3HeldAckRetained = false;
+      let l3HeldAckDeadlineIdentity = "";
+      let l3HeldAckBudgetMs = 0;
+      let l3HeldAckOutstandingIdentity = "";
+      let l3HeldAckOutstandingState = "";
+      const heldAck = l3HeldAck.tracker.holdTimerEventAcknowledgement(l3HeldAck.page, "create");
+      try {
+        const operationId = `sqag212/l3-held-event-ack/${Date.now()}`;
+        await prepareSession(l3HeldAck, l3HeldAckSessionId, operationId, "l3-held-event-ack");
+        await l3HeldAck.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        const observedEvent = await heldAck.observed;
+        const entry = l3HeldAck.tracker.queuedSaveStatus(observedEvent.identity);
+        if (!entry || entry.status !== "pending" || entry.producerKind !== "native-timer") {
+          throw new Error("L3 held-ack negative did not register the actual required timer before holding its acknowledgement: " + JSON.stringify({
+            event: observedEvent, entry: entry && { identity: entry.identity, status: entry.status, producerKind: entry.producerKind },
+          }) + ".");
+        }
+        const drainPromise = l3HeldAck.tracker.drain(100, l3HeldAck.page);
+        const heldRun = await waitForDrainPhase(l3HeldAck.tracker, "timer-event-delivery-acknowledgement", 3000);
+        const drainPassed = await drainPromise;
+        const summary = l3HeldAck.tracker.summary();
+        const report = summary.drainRuns.find((candidate) => candidate.identity === heldRun.identity);
+        const issue = summary.issues.find((candidate) => candidate.operationId === heldRun.identity
+          && candidate.operation === "required-drain-deadline");
+        const outstanding = report?.outstanding.find((candidate) => candidate.identity === entry.identity);
+        l3HeldAckDeadlineIdentity = report?.identity || "";
+        l3HeldAckBudgetMs = report?.budgetMs || 0;
+        l3HeldAckOutstandingIdentity = outstanding?.identity || "";
+        l3HeldAckOutstandingState = outstanding?.state || "";
+        l3HeldAckFailure = !drainPassed && report?.outcome === "deadline-failure"
+          && report.phase === "timer-event-delivery-acknowledgement"
+          && report.deadlineUnchanged === true
+          && report.identity === heldRun.identity
+          && report.budgetMs === 100
+          && outstanding?.identity === entry.identity
+          && outstanding?.timerIdentity === entry.snapshot.timerIdentity
+          && outstanding?.state === "pending"
+          && Boolean(issue);
+        if (!l3HeldAckFailure) {
+          throw new Error("L3 held event acknowledgement was not bounded by its own absolute deadline with outstanding identity/state evidence: " + JSON.stringify({
+            drainPassed, heldRun, report, outstanding, issue, summary,
+          }) + ".");
+        }
+        heldAck.release();
+        await l3HeldAck.page.evaluate(() => clearQuoteSessionDraftSaveTimer());
+        l3HeldAckRetained = l3HeldAck.tracker.issues.some((candidate) => candidate.operationId === heldRun.identity)
+          && l3HeldAck.tracker.drainReports.find((candidate) => candidate.identity === heldRun.identity)?.outcome === "deadline-failure";
+        if (!l3HeldAckRetained) {
+          throw new Error("L3 late event acknowledgement erased the first invocation's sticky deadline result.");
+        }
+        await cleanupSession(l3HeldAck.page, l3HeldAckSessionId);
+      } finally {
+        heldAck.release();
+        await l3HeldAck.context.close();
+      }
+
+      const l3FinalInsideSessionId = `quote-sqag212-l3-final-zero-inside-${Date.now()}`;
+      const l3FinalInside = await openFixture("sqag212-l3-final-zero-arrival-inside-budget", l3FinalInsideSessionId);
+      let l3FinalInsideResult = false;
+      let l3FinalInsideDeadlineIdentity = "";
+      let l3FinalInsideBudgetMs = 0;
+      let l3FinalInsidePersistence = false;
+      let l3FinalInsideBarrier = null;
+      try {
+        const operationId = `sqag212/l3-final-zero-inside/${Date.now()}`;
+        l3FinalInsideBarrier = l3FinalInside.tracker.armFinalReconciliationBarrier();
+        const waitCount = l3FinalInside.tracker.summary().drainWaitCount;
+        const drainPromise = l3FinalInside.tracker.drain(10000, l3FinalInside.page);
+        await l3FinalInsideBarrier.reached;
+        const initialRun = l3FinalInside.tracker.summary().activeDrainRuns[0];
+        await prepareSession(l3FinalInside, l3FinalInsideSessionId, operationId, "l3-final-zero-inside");
+        await l3FinalInside.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        const captured = await l3FinalInside.tracker.capturePendingQueuedSave(l3FinalInside.page);
+        if (!captured) throw new Error("L3 final-zero inside-budget case failed to capture arriving required work.");
+        const arrivalRun = l3FinalInside.tracker.summary().activeDrainRuns.find((run) => run.identity === initialRun?.identity);
+        const unchangedBeforeRelease = arrivalRun?.budgetMs === 10000
+          && arrivalRun?.deadlineMonotonicMs === initialRun?.deadlineMonotonicMs;
+        l3FinalInsideBarrier.release();
+        const flush = await flushRequiredQuoteSessionSaves(l3FinalInside.page, l3FinalInside.tracker, captured);
+        l3FinalInsideResult = await drainPromise;
+        const report = l3FinalInside.tracker.summary().drainRuns.find((candidate) => candidate.identity === initialRun?.identity);
+        const record = l3FinalInside.tracker.records.find((candidate) => candidate.operationId === operationId && candidate.method === "POST");
+        l3FinalInsideDeadlineIdentity = report?.identity || "";
+        l3FinalInsideBudgetMs = report?.budgetMs || 0;
+        l3FinalInsidePersistence = flush.status === "succeeded" && queuedRecordIsDurable(record, captured);
+        if (!unchangedBeforeRelease || !l3FinalInsideResult || !l3FinalInsidePersistence
+          || report?.outcome !== "success" || report?.budgetMs !== 10000
+          || l3FinalInside.tracker.summary().drainRuns.filter((candidate) => candidate.identity === initialRun?.identity).length !== 1
+          || l3FinalInside.tracker.summary().drainWaitCount < waitCount) {
+          throw new Error("L3 final-zero arrival inside budget reset the drain or failed to await real durable work: " + JSON.stringify({
+            initialRun, arrivalRun, unchangedBeforeRelease, report, flush, l3FinalInsidePersistence,
+            summary: l3FinalInside.tracker.summary(),
+          }) + ".");
+        }
+        await cleanupSession(l3FinalInside.page, l3FinalInsideSessionId);
+      } finally {
+        l3FinalInsideBarrier?.release();
+        await l3FinalInside.context.close();
+      }
+
+      const l3FinalLateSessionId = `quote-sqag212-l3-final-zero-late-${Date.now()}`;
+      const l3FinalLate = await openFixture("sqag212-l3-final-zero-arrival-held-past-budget", l3FinalLateSessionId);
+      let l3FinalLateFailure = false;
+      let l3FinalLateDeadlineIdentity = "";
+      let l3FinalLateBudgetMs = 0;
+      let l3FinalLateOutstandingIdentity = "";
+      let l3FinalLateOutstandingState = "";
+      let l3FinalLatePersistence = false;
+      let l3FinalLateBarrier = null;
+      let releaseL3FinalPost = () => {};
+      let l3FinalPostReachedResolve;
+      const l3FinalPostReached = new Promise((resolve) => { l3FinalPostReachedResolve = resolve; });
+      let releaseL3FinalPostResolve;
+      const l3FinalPostGate = new Promise((resolve) => { releaseL3FinalPostResolve = resolve; });
+      releaseL3FinalPost = () => releaseL3FinalPostResolve();
+      let l3FinalRouteError = null;
+      let l3FinalRouteDoneResolve;
+      const l3FinalRouteDone = new Promise((resolve) => { l3FinalRouteDoneResolve = resolve; });
+      try {
+        const operationId = `sqag212/l3-final-zero-late/${Date.now()}`;
+        l3FinalLateBarrier = l3FinalLate.tracker.armFinalReconciliationBarrier();
+        const drainPromise = l3FinalLate.tracker.drain(1200, l3FinalLate.page);
+        await l3FinalLateBarrier.reached;
+        const initialRun = l3FinalLate.tracker.summary().activeDrainRuns[0];
+        await prepareSession(l3FinalLate, l3FinalLateSessionId, operationId, "l3-final-zero-late");
+        await l3FinalLate.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        const captured = await l3FinalLate.tracker.capturePendingQueuedSave(l3FinalLate.page);
+        if (!captured) throw new Error("L3 final-zero late case failed to capture arriving required work.");
+        const arrivalRun = l3FinalLate.tracker.summary().activeDrainRuns.find((run) => run.identity === initialRun?.identity);
+        const unchangedBeforeRelease = arrivalRun?.budgetMs === 1200
+          && arrivalRun?.deadlineMonotonicMs === initialRun?.deadlineMonotonicMs;
+        await l3FinalLate.page.route("**/api/quote-sessions", async (route) => {
+          try {
+            const response = await route.fetch();
+            l3FinalPostReachedResolve({ status: response.status() });
+            await l3FinalPostGate;
+            await route.fulfill({ response });
+          } catch (error) {
+            l3FinalRouteError = String(error?.message || error);
+          } finally {
+            l3FinalRouteDoneResolve();
+          }
+        });
+        l3FinalLateBarrier.release();
+        const start = await l3FinalLate.tracker.startCapturedQueuedSave(l3FinalLate.page, captured);
+        if (start.status !== "started") throw new Error("L3 late final-zero case did not start the actual successor save: " + JSON.stringify(start) + ".");
+        const post = await Promise.race([
+          l3FinalPostReached,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("L3 final-zero held save did not reach its real POST response boundary.")), 10000)),
+        ]);
+        if (post.status < 200 || post.status >= 300) throw new Error("L3 final-zero held save had no successful upstream response: " + JSON.stringify(post) + ".");
+        const drainPassed = await drainPromise;
+        const report = l3FinalLate.tracker.summary().drainRuns.find((candidate) => candidate.identity === initialRun?.identity);
+        const outstanding = report?.outstanding.find((candidate) => candidate.identity === captured.entry.identity);
+        l3FinalLateDeadlineIdentity = report?.identity || "";
+        l3FinalLateBudgetMs = report?.budgetMs || 0;
+        l3FinalLateOutstandingIdentity = outstanding?.identity || "";
+        l3FinalLateOutstandingState = outstanding?.state || "";
+        l3FinalLateFailure = !drainPassed && unchangedBeforeRelease
+          && report?.outcome === "deadline-failure"
+          && report.deadlineUnchanged === true
+          && report.identity === initialRun?.identity
+          && report.budgetMs === 1200
+          && outstanding?.identity === captured.entry.identity
+          && outstanding?.timerIdentity === captured.snapshot.timerIdentity
+          && Boolean(outstanding?.state)
+          && l3FinalLate.tracker.issues.some((candidate) => candidate.operationId === initialRun?.identity);
+        if (!l3FinalLateFailure) {
+          releaseL3FinalPost();
+          throw new Error("L3 final-zero arrival held past the original budget did not fail that same drain with retained work: " + JSON.stringify({
+            drainPassed, initialRun, arrivalRun, unchangedBeforeRelease, report, outstanding, summary: l3FinalLate.tracker.summary(),
+          }) + ".");
+        }
+        releaseL3FinalPost();
+        await captured.entry.terminalPromise;
+        if (l3FinalRouteError) throw new Error("L3 late real save response could not complete: " + l3FinalRouteError + ".");
+        const record = l3FinalLate.tracker.records.find((candidate) => candidate.operationId === operationId && candidate.method === "POST");
+        l3FinalLatePersistence = captured.entry.status === "succeeded" && queuedRecordIsDurable(record, captured);
+        const firstReport = l3FinalLate.tracker.drainReports.find((candidate) => candidate.identity === initialRun?.identity);
+        const firstIssue = l3FinalLate.tracker.issues.find((candidate) => candidate.operationId === initialRun?.identity);
+        if (!l3FinalLatePersistence || firstReport?.outcome !== "deadline-failure" || !firstIssue) {
+          throw new Error("L3 late persistence changed the original deadline failure or lacked durable request/readback evidence: " + JSON.stringify({
+            l3FinalLatePersistence, firstReport, firstIssue, summary: l3FinalLate.tracker.summary(),
+          }) + ".");
+        }
+        await l3FinalLate.page.unroute("**/api/quote-sessions");
+        await cleanupSession(l3FinalLate.page, l3FinalLateSessionId);
+      } finally {
+        l3FinalLateBarrier?.release();
+        releaseL3FinalPost();
+        await Promise.race([l3FinalRouteDone, new Promise((resolve) => setTimeout(resolve, 1000))]);
+        await l3FinalLate.page.unroute("**/api/quote-sessions").catch(() => {});
+        await l3FinalLate.context.close();
+      }
+
+      return {
+        ...(t3PositiveEvidence || {}),
+        L1_RESULT: "PASS",
+        L1_NEGATIVE_DELIVERY_FAILURE_THEN_PAGE_CLOSE: l1PageClose,
+        L1_NEGATIVE_DELIVERY_FAILURE_THEN_DOCUMENT_NAVIGATION: l1Navigation,
+        L1_POSITIVE_DELIVERY_FAILURE_PAGE_REMAINS_OPEN: l1OpenPage,
+        L1_POSITIVE_CLEAN_PAGE_CLOSE_WITH_PROVEN_ZERO_WORK: l1CleanClosePassed ? "PASS" : "FAIL",
+        L1_POSITIVE_NAVIGATION_AFTER_REQUIRED_WORK_COMPLETES: l1CompletedNavigationPassed && l1CompletedPersistence ? "PASS" : "FAIL",
+        L2_RESULT: l2NegativeResult && transferredProducer && nativeTimerRemainedReal && persisted ? "PASS" : "FAIL",
+        L3_RESULT: l3HeldAckFailure && l3NormalAckPassed && l3NativePassed && l3FinalInsideResult && l3FinalLateFailure ? "PASS" : "FAIL",
+        L3_NEGATIVE_HELD_EVENT_ACK_BOUNDED_BY_ABSOLUTE_DEADLINE: l3HeldAckFailure ? "PASS" : "FAIL",
+        L3_POSITIVE_NORMAL_EVENT_ACK_WITHIN_BUDGET: l3NormalAckPassed && l3NormalAckBounded && l3NormalAckPersistence ? "PASS" : "FAIL",
+        L3_POSITIVE_REQUIRED_TIMER_NATIVE_COMPLETION_WITHIN_BUDGET: l3NativePassed && l3NativeBounded && l3NativePersistence ? "PASS" : "FAIL",
+        L3_POSITIVE_FINAL_ZERO_ARRIVAL_STILL_BOUNDED: l3FinalInsideResult && l3FinalLateFailure && l3FinalLatePersistence ? "PASS" : "FAIL",
+        L1: {
+          negativePageClose: l1PageClose,
+          negativeDocumentNavigation: l1Navigation,
+          positiveDeliveryFailurePageOpen: l1OpenPage,
+          positiveCleanClose: { passed: l1CleanClosePassed, independentZeroProof: l1CleanCloseZeroProof },
+          positiveCompletedNavigation: { passed: l1CompletedNavigationPassed, committed: l1CompletedNavigationCommitted, persisted: l1CompletedPersistence },
+        },
+        L3: {
+          heldAcknowledgement: {
+            deadlineIdentity: l3HeldAckDeadlineIdentity,
+            budgetMs: l3HeldAckBudgetMs,
+            outstandingIdentity: l3HeldAckOutstandingIdentity,
+            outstandingState: l3HeldAckOutstandingState,
+            lateReleaseRetainedFailure: l3HeldAckRetained,
+          },
+          normalAcknowledgement: { passed: l3NormalAckPassed, deadlineIdentity: l3Ack.tracker.drainReports.at(-1)?.identity || "", durable: l3NormalAckPersistence },
+          nativeCompletion: { passed: l3NativePassed, durable: l3NativePersistence },
+          finalZeroInsideBudget: { passed: l3FinalInsideResult, deadlineIdentity: l3FinalInsideDeadlineIdentity, budgetMs: l3FinalInsideBudgetMs, durable: l3FinalInsidePersistence },
+          finalZeroPastBudget: {
+            failedOnOriginalDeadline: l3FinalLateFailure,
+            deadlineIdentity: l3FinalLateDeadlineIdentity,
+            budgetMs: l3FinalLateBudgetMs,
+            outstandingIdentity: l3FinalLateOutstandingIdentity,
+            outstandingState: l3FinalLateOutstandingState,
+            latePersistenceDidNotEraseFailure: l3FinalLatePersistence,
+          },
+        },
+        equivalentPathReview: {
+          L1: ["delivery-failure", "event-buffer-and-ack", "page-owner", "document-generation", "page-close", "context-close", "committed-navigation", "new-document-installation", "disable-detach", "final-zero", "closed-page-skip"],
+          L2: ["flush-reservation", "flush-start", "flush-failure", "flush-completion", "flush-abandonment", "native-timer-producer", "timer-cancellation", "replacement-transfer", "save-request-body-readback", "producer-cleanup", "orphan-detection", "F2-recovery-caller"],
+          L3: ["event-promises", "browser-state-sync", "page-state-queries", "producer-reconciliation", "progress-waits", "final-zero-barrier", "final-zero-reconciliation", "multi-page-traversal"],
+        },
+      };
     };
 
 
@@ -5219,7 +6437,10 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         if (!captured || captured.snapshot.sessionId !== savedSessionId) {
           throw new Error("F2 did not capture the exact pending timer before recovery transition: " + JSON.stringify(captured?.snapshot || null) + ".");
         }
-        recoveryTracker.registerOwnedQueuedSaveFlush(captured, "F2 recovery transition queued-save handoff");
+        const recoveryContinuation = await recoveryTracker.startRecoveryFlushOnActualCancellation(recoveryPage, captured);
+        if (recoveryContinuation.status !== "armed" || recoveryContinuation.actualNativeTimerActive !== true) {
+          throw new Error("F2 could not establish the executable recovery-save continuation before the real transition: " + JSON.stringify(recoveryContinuation) + ".");
+        }
         await recoveryPage.evaluate(() => {
           const originalPurge = purgeBrowserRecoveryState;
           window.__sqagF2PurgeReached = false;
@@ -5258,6 +6479,10 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           throw new Error("F2 did not reproduce a real recovery-scope transition while preserving in-memory session identity: " + JSON.stringify(transition) + ".");
         }
 
+        const recoveryOutcome = await recoveryPage.evaluate(async (identity) => {
+          const timerState = window.__sqagSmokeQuoteSessionTimerState || {};
+          return timerState.flushPromises?.[identity] || null;
+        }, captured.snapshot.browserTimerIdentity);
         let flushError = "";
         try {
           await flushRequiredQuoteSessionSaves(recoveryPage, recoveryTracker, captured);
@@ -5283,6 +6508,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           || repeatedDrain
           || entry?.status !== "failed"
           || !String(entry.terminalReason || "").includes("returned null")
+          || recoveryOutcome?.kind !== "null"
           || !failure
           || browserEvidence.sessionId !== savedSessionId
           || browserEvidence.transitioning !== true
@@ -5292,7 +6518,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         ) {
           throw new Error("F2 recovery-transition null result did not fail sticky with zero POST/readback evidence: " + JSON.stringify({
             flushError, repeatedDrain, entry: entry && { status: entry.status, reason: entry.terminalReason },
-            failure, browserEvidence, postObserved, durableReadbackObserved, summary: recoveryTracker.summary(),
+            recoveryOutcome, failure, browserEvidence, postObserved, durableReadbackObserved, summary: recoveryTracker.summary(),
           }) + ".");
         }
         await recoveryPage.evaluate(() => window.__sqagF2ReleasePurge?.());
@@ -5316,6 +6542,8 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           flushResult: "FAIL",
           stickyFailure: "YES",
           requiredWorkNotSilentlySatisfied: "YES",
+          executableRecoveryContinuationStarted: "YES",
+          actualApplicationSaveReturnedNull: "YES",
           postObserved: "NO",
           durableReadbackObserved: "NO",
           preservedSessionId: browserEvidence.sessionId,
@@ -5441,10 +6669,14 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         clearOnlyCapture = await clearOnlyTracker.capturePendingQueuedSave(clearOnlyPage);
         await clearOnlyPage.evaluate(() => clearQuoteSessionDraftSaveTimer());
         clearOnlyDrained = await clearOnlyTracker.drain(1000, clearOnlyPage);
-        clearOnlyIssue = clearOnlyTracker.issues.find((issue) => issue.reason.includes("cancelled without an accounted successor"));
-        const stillFailed = await clearOnlyTracker.drain(1000, clearOnlyPage);
-        if (clearOnlyDrained || stillFailed || !clearOnlyIssue) {
-          throw new Error(`C6 clear-only control unexpectedly satisfied or forgot pending work: ${JSON.stringify({ clearOnlyCapture, clearOnlyDrained, stillFailed, clearOnlyIssue, summary: clearOnlyTracker.summary() })}.`);
+        clearOnlyIssue = clearOnlyTracker.issues.find((issue) => issue.reason.includes("ORPHAN_NO_REAL_PRODUCER"));
+        const secondDrainPassed = await clearOnlyTracker.drain(1000, clearOnlyPage);
+        const stickyFailure = clearOnlyCapture.entry?.status === "failed"
+          && String(clearOnlyCapture.entry.terminalReason || "").includes("ORPHAN_NO_REAL_PRODUCER");
+        if (clearOnlyDrained || secondDrainPassed || !stickyFailure || !clearOnlyIssue) {
+          throw new Error(`C6 clear-only control unexpectedly satisfied or forgot pending work: ${JSON.stringify({
+            clearOnlyDrained, secondDrainPassed, stickyFailure, clearOnlyIssue, summary: clearOnlyTracker.summary(),
+          })}.`);
         }
       } finally {
         await clearOnlyContext.close();
@@ -5966,6 +7198,38 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     ), null, { timeout: 15000 });
     sessionId = await currentQuoteSessionId(browserPage);
     if (!sessionId) throw new Error("SQAG #212 quote was not saved after basis confirmation.");
+    if (deferTrackerUntilSessionStable) {
+      await tracker.install(isolatedContext);
+      await browserPage.reload({ waitUntil: "domcontentloaded" });
+      await browserPage.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+      await browserPage.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+      await browserPage.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+      if (!await tracker.drain(30000, browserPage)) {
+        throw new Error("G3 focused tracker installation did not reach a clean persisted-session baseline: " + JSON.stringify(tracker.summary()) + ".");
+      }
+      if (g3LifecycleOnly) {
+        drainControls = {
+          ...(await runSqag212TrackerFailureControls()),
+          threeFindingHarness: await runSqag212ThreeFindingControls(sessionId),
+          recoveryTransitionNull: await runSqag212RecoveryNullControl(sessionId),
+        };
+        drainSummary = await tracker.assert();
+        return {
+          quoteSessionPostStatuses: quoteSessionResponses
+            .filter((response) => response.method === "POST")
+            .map((response) => response.status),
+          quoteSessionResponseCount: quoteSessionResponses.length,
+          quoteSessionDrain: drainSummary,
+          drainControls,
+          timerFlushControls: null,
+          browserNegativeControl: null,
+          unexpectedRequestFailures,
+          listenerFailures,
+          focusedG3LifecycleControlsPassed: true,
+          equivalentPathReview: drainControls.threeFindingHarness.equivalentPathReview,
+        };
+      }
+    }
     stage = "awaiting the initiating application save and positive drain control";
     const positiveOperationId = "sqag212/positive-control-save/" + Date.now();
     const initiatingTimer = await tracker.capturePendingQueuedSave(browserPage);
@@ -6035,45 +7299,59 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     if (dashboardSession.session_id !== sessionId) {
       throw new Error(`Dashboard refresh returned a different quote session: ${JSON.stringify(dashboardSession)}.`);
     }
-    drainControls = {
-      ...(await runSqag212TrackerFailureControls()),
-      threeFindingHarness: await runSqag212ThreeFindingControls(sessionId),
-      asyncProgress: await runSqag212DrainControls(sessionId),
-      ...(await runSqag212DrainRaceControls(sessionId)),
-      recoveryTransitionNull: await runSqag212RecoveryNullControl(sessionId),
-    };
-    timerFlushControls = await runSqag212TimerFlushControls(sessionId);
-    await flushRequiredQuoteSessionSaves(browserPage, tracker);
-    await drainListenerTasks();
-    drainSummary = await tracker.assert();
-    const negativePayload = await browserPage.evaluate(() => currentQuoteSessionPayload({
-      sessionId: state.quoteSessionId,
-      quoteGenerated: false,
-      includeDraftState: true,
-      draftState: currentQuoteSessionDraftState(),
-      draftFiles: sessionFileRecordsFromDraft(),
-    }));
-    const negativeSessionId = `quote-sqag212-negative-${Date.now()}`;
-    stage = "proving exact held save and detail requests abort only on navigation";
-    browserNegativeControl = await runQuoteSessionNavigationAbortNegativeControl(negativePayload, negativeSessionId);
-    if (
-      browserNegativeControl.skipped
-      || browserNegativeControl.outcomes?.length !== 3
-      || browserNegativeControl.outcomes.slice(0, 2).some((outcome) => (
-        outcome.requestFailedObserved !== true
-        || outcome.relayClientCloseObserved !== true
-        || outcome.navigationInitiated !== true
-        || outcome.navigationCommitted !== true
-        || outcome.sameCorrelatedRequest !== true
-      ))
-      || browserNegativeControl.outcomes[2]?.requestFailedObserved !== false
-      || browserNegativeControl.outcomes[2]?.relayClientCloseObserved !== false
-      || browserNegativeControl.missingObservationRejected !== true
-    ) {
-      throw new Error(`SQAG #212 real navigation-failure control was incomplete: ${JSON.stringify({ browserNegativeControl, observedDiagnosticNavigations })}.`);
+    if (verificationOptions.skipFocusedControls !== true) {
+      drainControls = {
+        ...(await runSqag212TrackerFailureControls()),
+        threeFindingHarness: await runSqag212ThreeFindingControls(sessionId),
+        asyncProgress: await runSqag212DrainControls(sessionId),
+        ...(await runSqag212DrainRaceControls(sessionId)),
+        recoveryTransitionNull: await runSqag212RecoveryNullControl(sessionId),
+      };
+      timerFlushControls = await runSqag212TimerFlushControls(sessionId);
+      await flushRequiredQuoteSessionSaves(browserPage, tracker);
+      await drainListenerTasks();
+      drainSummary = await tracker.assert();
+      const negativePayload = await browserPage.evaluate(() => currentQuoteSessionPayload({
+        sessionId: state.quoteSessionId,
+        quoteGenerated: false,
+        includeDraftState: true,
+        draftState: currentQuoteSessionDraftState(),
+        draftFiles: sessionFileRecordsFromDraft(),
+      }));
+      const negativeSessionId = `quote-sqag212-negative-${Date.now()}`;
+      stage = "proving exact held save and detail requests abort only on navigation";
+      browserNegativeControl = await runQuoteSessionNavigationAbortNegativeControl(negativePayload, negativeSessionId);
+      if (
+        browserNegativeControl.skipped
+        || browserNegativeControl.outcomes?.length !== 3
+        || browserNegativeControl.outcomes.slice(0, 2).some((outcome) => (
+          outcome.upstreamStatus !== 200
+          || outcome.requestFailedObserved !== true
+          || outcome.relayClientCloseObserved !== true
+          || outcome.navigationInitiated !== true
+          || outcome.navigationCommitted !== true
+          || outcome.sameCorrelatedRequest !== true
+          || outcome.requestFailureText !== "net::ERR_ABORTED"
+        ))
+        || browserNegativeControl.outcomes[0]?.method !== "POST"
+        || browserNegativeControl.outcomes[1]?.method !== "GET"
+        || browserNegativeControl.outcomes[2]?.upstreamStatus !== 200
+        || browserNegativeControl.outcomes[2]?.requestFailedObserved !== false
+        || browserNegativeControl.outcomes[2]?.relayClientCloseObserved !== false
+        || browserNegativeControl.outcomes[2]?.navigationInitiated !== false
+        || browserNegativeControl.outcomes[2]?.navigationCommitted !== false
+        || browserNegativeControl.missingObservationRejected !== true
+        || browserNegativeControl.noNavigationPositive !== "PASS"
+      ) {
+        throw new Error(`SQAG #212 real navigation-failure control was incomplete: ${JSON.stringify({ browserNegativeControl, observedDiagnosticNavigations })}.`);
+      }
+      await drainListenerTasks();
+      await tracker.assert();
+    } else {
+      await flushRequiredQuoteSessionSaves(browserPage, tracker);
+      await drainListenerTasks();
+      drainSummary = await tracker.assert();
     }
-    await drainListenerTasks();
-    await tracker.assert();
 
     const savedState = await browserPage.evaluate(() => ({
       snapshot: state.quoteCommercialSnapshot,
@@ -6152,7 +7430,30 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       throw new Error("SQAG #212 XLSX download was not a valid ZIP-based workbook.");
     }
 
-    timerFlushControls.generatedTimerReplacement = await runSqag212GeneratedTimerReplacementControl(sessionId);
+    if (verificationOptions.skipFocusedControls !== true) {
+      timerFlushControls.generatedTimerReplacement = await runSqag212GeneratedTimerReplacementControl(sessionId);
+    }
+
+    if (g3ControlsOnly) {
+      stage = "finishing the focused SQAG #212 G3 controls before the known Windows PDF boundary";
+      await flushRequiredQuoteSessionSaves(browserPage, tracker);
+      await drainListenerTasks();
+      drainSummary = await tracker.assert();
+      return {
+        quoteSessionPostStatuses: quoteSessionResponses
+          .filter((response) => response.method === "POST")
+          .map((response) => response.status),
+        quoteSessionResponseCount: quoteSessionResponses.length,
+        quoteSessionDrain: drainSummary,
+        drainControls,
+        timerFlushControls,
+        browserNegativeControl,
+        unexpectedRequestFailures,
+        listenerFailures,
+        focusedG3ControlsPassed: true,
+        pdfParitySkipped: "focused Windows run stops before the known LibreOffice/Excel PDF boundary",
+      };
+    }
 
     stage = "generating and checking the explicit PDF";
     const pdfReadiness = await browserPage.evaluate(() => ({
@@ -6210,6 +7511,17 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       drainControls,
       timerFlushControls,
       browserNegativeControl,
+      workbookExport: {
+        filename: xlsxResult.filename,
+        downloadStatus: xlsxResponse.status(),
+        magic: xlsxBytes.subarray(0, 4).toString("hex"),
+      },
+      pdfExport: {
+        filename: pdfResult.filename,
+        downloadStatus: pdfResponse.status(),
+        magic: pdfBytes.subarray(0, 4).toString("ascii"),
+      },
+      focusedControlsDelegated: verificationOptions.skipFocusedControls === true,
       unexpectedRequestFailures,
       listenerFailures,
     };
@@ -6274,7 +7586,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
   }
 }
 
-async function runSqag212RegressionInIsolatedServer(page, downstreamServerInfo, downstreamUrl) {
+async function runSqag212RegressionInIsolatedServer(page, downstreamServerInfo, downstreamUrl, verificationOptions = {}) {
   const syntheticRoot = path.join(os.tmpdir(), `playwright-sqag212-${process.pid}`);
   const isolatedDataRoot = syntheticRoot;
   const isolatedLogRoot = path.join(root, "_logs", "server", `playwright-smoke-sqag212-${process.pid}`);
@@ -6312,7 +7624,7 @@ async function runSqag212RegressionInIsolatedServer(page, downstreamServerInfo, 
       const serverOutput = serverInfo.output.join("").trim();
       throw new Error(`Could not start the isolated SQAG #212 server.${serverOutput ? `\n\n${serverOutput}` : ""}`);
     }
-    traffic = await verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, tracker);
+    traffic = await verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, tracker, verificationOptions);
     if (!traffic.quoteSessionPostStatuses.some((status) => status >= 200 && status < 300)) {
       throw new Error(`SQAG #212 isolated flow did not record a successful quote-session POST: ${JSON.stringify(traffic)}.`);
     }
@@ -6342,8 +7654,18 @@ async function runSqag212RegressionInIsolatedServer(page, downstreamServerInfo, 
     downstreamPort: new URL(downstreamUrl).port,
     isolatedProcessAndDataRoot: true,
     quoteSessionPostStatuses: traffic.quoteSessionPostStatuses,
+    quoteSessionResponseCount: traffic.quoteSessionResponseCount,
     quoteSessionDrain: traffic.quoteSessionDrain,
+    ...(args.includes("--sqag212-g3-lifecycle-only")
+      || args.includes("--sqag212-g3-controls-only")
+      || verificationOptions.g3LifecycleOnly === true
+      || verificationOptions.g3ControlsOnly === true
+      ? { focusedG3Controls: traffic.drainControls || null }
+      : {}),
     browserNegativeControl: traffic.browserNegativeControl,
+    workbookExport: traffic.workbookExport || null,
+    pdfExport: traffic.pdfExport || null,
+    focusedControlsDelegated: traffic.focusedControlsDelegated === true,
     isolatedServerStopped: true,
     isolatedStorageCleaned: true,
   };
@@ -8308,7 +9630,9 @@ async function main() {
     await run573LoadedAppTwice();
     return;
   }
-  const sqag212Only = args.includes("--sqag212-only");
+  const sqag212Only = args.includes("--sqag212-only")
+    || args.includes("--sqag212-g3-controls-only")
+    || args.includes("--sqag212-g3-lifecycle-only");
   let serverInfo = null;
   const hasExistingServer = sqag212Only ? false : await healthOk();
   if (!sqag212Only && !hasExistingServer) {
@@ -8347,7 +9671,11 @@ async function main() {
       sqag212Isolation = await runSqag212RegressionInIsolatedServer(page, serverInfo, baseUrl);
       console.log(JSON.stringify({
         status: "ok",
-        regression: "sqag212-analysis-confirmation-save-reload-xlsx-pdf",
+        regression: args.includes("--sqag212-g3-lifecycle-only")
+          ? "sqag212-g3-lifecycle-producer-deadline-controls"
+          : args.includes("--sqag212-g3-controls-only")
+            ? "sqag212-g3-controls-before-pdf"
+            : "sqag212-analysis-confirmation-save-reload-xlsx-pdf",
         isolation: sqag212Isolation,
       }, null, 2));
       return;
@@ -8357,7 +9685,65 @@ async function main() {
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
     const downstreamResponseBaseline = mainQuoteSessionResponses.length;
     const downstreamUrl = baseUrl;
-    sqag212Isolation = await runSqag212RegressionInIsolatedServer(page, serverInfo, downstreamUrl);
+    const focusedG3Isolation = await runSqag212RegressionInIsolatedServer(
+      page,
+      serverInfo,
+      downstreamUrl,
+      { g3ControlsOnly: true },
+    );
+    const focusedCases = focusedG3Isolation.focusedG3Controls?.threeFindingHarness || {};
+    const requiredLifecycleCases = [
+      "L1_NEGATIVE_DELIVERY_FAILURE_THEN_PAGE_CLOSE",
+      "L1_NEGATIVE_DELIVERY_FAILURE_THEN_DOCUMENT_NAVIGATION",
+      "L1_POSITIVE_DELIVERY_FAILURE_PAGE_REMAINS_OPEN",
+      "L1_POSITIVE_CLEAN_PAGE_CLOSE_WITH_PROVEN_ZERO_WORK",
+      "L1_POSITIVE_NAVIGATION_AFTER_REQUIRED_WORK_COMPLETES",
+      "L2_NEGATIVE_OWNED_FLUSH_LEASE_WITHOUT_EXECUTABLE_WORK",
+      "L2_POSITIVE_FLUSH_OWNERSHIP_TRANSFERS_TO_STARTED_REAL_SAVE",
+      "L2_POSITIVE_NATIVE_TIMER_REMAINS_REAL_PRODUCER",
+      "L2_POSITIVE_STARTED_FLUSH_HELD_THEN_COMPLETES",
+      "L3_NEGATIVE_HELD_EVENT_ACK_BOUNDED_BY_ABSOLUTE_DEADLINE",
+      "L3_POSITIVE_NORMAL_EVENT_ACK_WITHIN_BUDGET",
+      "L3_POSITIVE_REQUIRED_TIMER_NATIVE_COMPLETION_WITHIN_BUDGET",
+      "L3_POSITIVE_FINAL_ZERO_ARRIVAL_STILL_BOUNDED",
+    ];
+    const lifecycleCasePassed = (evidence) => evidence === "PASS" || evidence?.result === "PASS";
+    if (
+      focusedCases.L1_RESULT !== "PASS"
+      || focusedCases.L2_RESULT !== "PASS"
+      || focusedCases.L3_RESULT !== "PASS"
+      || requiredLifecycleCases.some((caseName) => !lifecycleCasePassed(focusedCases[caseName]))
+    ) {
+      throw new Error(`SQAG #212 focused lifecycle controls did not report every required L1-L3 case: ${JSON.stringify(focusedCases)}.`);
+    }
+    const functionalIsolation = await runSqag212RegressionInIsolatedServer(
+      page,
+      serverInfo,
+      downstreamUrl,
+      { skipFocusedControls: true },
+    );
+    if (
+      functionalIsolation.pdfExport?.filename !== "quotation.pdf"
+      || functionalIsolation.pdfExport?.magic !== "%PDF"
+      || functionalIsolation.pdfExport?.downloadStatus !== 200
+      || functionalIsolation.workbookExport?.filename !== "quotation.xlsx"
+      || functionalIsolation.workbookExport?.downloadStatus !== 200
+      || functionalIsolation.workbookExport?.magic !== "504b0304"
+    ) {
+      throw new Error(`SQAG #212 separated functional smoke did not prove real workbook and PDF downloads: ${JSON.stringify(functionalIsolation)}.`);
+    }
+    sqag212Isolation = {
+      ...functionalIsolation,
+      browserNegativeControl: focusedG3Isolation.browserNegativeControl,
+      focusedG3Controls: focusedG3Isolation.focusedG3Controls,
+      focusedG3Isolation: {
+        isolatedServerPid: focusedG3Isolation.isolatedServerPid,
+        isolatedPort: focusedG3Isolation.isolatedPort,
+        isolatedServerStopped: focusedG3Isolation.isolatedServerStopped,
+        isolatedStorageCleaned: focusedG3Isolation.isolatedStorageCleaned,
+      },
+      functionalSmokePdfAndWorkbookParity: true,
+    };
     if (mainQuoteSessionResponses.length !== downstreamResponseBaseline) {
       throw new Error("SQAG #212 quote-session traffic reached the downstream smoke process during its isolated prelude.");
     }
