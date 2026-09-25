@@ -474,6 +474,7 @@ function createQuoteSessionDrainTracker(group) {
   const queuedSaveHistory = new Map();
   const attachedPages = new Set();
   const pageIdentities = new WeakMap();
+  const observedTimerEventFailures = new Set();
   const issues = [];
   const progressWaiters = new Set();
   const drainWaitingWaiters = new Set();
@@ -501,6 +502,41 @@ function createQuoteSessionDrainTracker(group) {
     notifyProgress();
   };
 
+  const createProducerLease = (kind) => {
+    let resolve;
+    const lease = {
+      kind,
+      settled: false,
+      promise: new Promise((resolvePromise) => { resolve = resolvePromise; }),
+      resolve: (outcome) => {
+        if (lease.settled) return;
+        lease.settled = true;
+        resolve(outcome);
+      },
+    };
+    return lease;
+  };
+
+  const setQueuedSaveProducer = (entry, producer, kind) => {
+    if (!entry) return;
+    const previous = entry.producerLease;
+    const lease = producer && typeof producer === "object" && producer.promise
+      ? producer : null;
+    if (previous && previous !== lease) previous.resolve({ status: "transferred", to: kind });
+    entry.producerLease = lease;
+    entry.producer = lease ? lease.promise : (producer || null);
+    entry.producerKind = String(kind || lease?.kind || "");
+    if (entry.producerKind) entry.lastProducerKind = entry.producerKind;
+    entry.transitions?.push({ type: "producer-registered", at: Date.now(), producer: entry.producerKind });
+  };
+
+  const releaseQueuedSaveProducer = (entry, outcome) => {
+    entry.producerLease?.resolve(outcome);
+    entry.producerLease = null;
+    entry.producer = null;
+    entry.producerKind = "";
+  };
+
   const trackRequiredJob = (promise, identity) => {
     const job = {
       identity: String(identity || `${group}/required-job-${Date.now()}-${operationSequence + 1}`),
@@ -526,17 +562,19 @@ function createQuoteSessionDrainTracker(group) {
     entry.status = status;
     entry.terminalReason = reason;
     entry.completedAt = Date.now();
+    entry.transitions.push({ type: status, at: entry.completedAt, reason });
     pendingQueuedSaveWork.delete(String(entry.snapshot.timerIdentity));
     if (status === "failed") {
       addIssue({ operationId: entry.identity, fixture: group, operation: "queued-save" }, reason || "queued quote-session save failed without persistence proof");
     }
+    releaseQueuedSaveProducer(entry, { status, reason });
     entry.terminalResolve?.({ status, reason });
     notifyProgress();
   };
 
   const registerQueuedSaveWork = (snapshot, supersedes = "") => {
     const timerIdentity = String(snapshot?.timerIdentity || "");
-    if (!timerIdentity || !snapshot?.options || typeof snapshot.options !== "object") {
+    if (!timerIdentity) {
       addIssue({ operationId: "<queued-save>", fixture: group, operation: "queued-save" }, "pending quote-session save timer has no captured options or identity");
       return null;
     }
@@ -548,7 +586,9 @@ function createQuoteSessionDrainTracker(group) {
         identity: `${group}/queued-save/${timerIdentity}`,
         snapshot: structuredClone(snapshot),
         status: "pending",
-        producer: terminalPromise,
+        producer: null,
+        producerKind: "",
+        producerLease: null,
         terminalPromise,
         terminalResolve,
         transitions: [{ type: supersedes ? "replace" : "create", at: Date.now(), supersedes: String(supersedes || "") }],
@@ -561,16 +601,31 @@ function createQuoteSessionDrainTracker(group) {
         if (previous?.status === "pending") {
           previous.successorIdentity = timerIdentity;
           previous.transitions.push({ type: "superseded", at: Date.now(), successor: timerIdentity });
-          previous.status = "superseded";
-          previous.terminalReason = "replaced by a newer queued draft save";
-          previous.completedAt = Date.now();
-          pendingQueuedSaveWork.delete(String(supersedes));
-          previous.terminalResolve?.({ status: "superseded", successor: timerIdentity });
+          settleQueuedSave(previous, "superseded", "replaced by a newer queued draft save");
+        } else if (previous) {
+          previous.successorIdentity = timerIdentity;
+          previous.transitions.push({ type: "successor-created", at: Date.now(), successor: timerIdentity });
         }
       }
       notifyProgress();
     } else if (entry.status === "pending") {
       entry.snapshot = structuredClone(snapshot);
+    }
+    if (
+      !snapshot?.options
+      || typeof snapshot.options !== "object"
+      || typeof snapshot.options.quoteGenerated !== "boolean"
+    ) {
+      if (entry.status === "pending") {
+        settleQueuedSave(entry, "failed", "pending quote-session save timer was captured without required options");
+      }
+      return entry;
+    }
+    if (snapshot.active === true && entry.status === "pending" && !entry.producer) {
+      const nativeTimerLease = createProducerLease("native-timer");
+      entry.nativeTimerLease = nativeTimerLease;
+      setQueuedSaveProducer(entry, nativeTimerLease, "native-timer");
+      notifyProgress();
     }
     return entry;
   };
@@ -580,9 +635,12 @@ function createQuoteSessionDrainTracker(group) {
     if (record) {
       entry.persistenceRecord = record;
       entry.evidence.postObserved = true;
-      entry.producer = record.terminalPromise;
+      entry.applicationSaveLease?.resolve({ status: "transferred", to: "request-response-body-durable-readback" });
+      entry.applicationSaveLease = null;
+      setQueuedSaveProducer(entry, record.terminalPromise, "request-response-body-durable-readback");
     } else if (producer) {
       entry.applicationSaveProducer = producer;
+      setQueuedSaveProducer(entry, producer, "application-save");
     }
     notifyProgress();
   };
@@ -840,14 +898,28 @@ function createQuoteSessionDrainTracker(group) {
       pendingSavePromises.add(record);
       const entry = record.queuedSaveIdentity ? queuedSaveHistory.get(record.queuedSaveIdentity) : null;
       if (record.queuedSaveIdentity && (!entry || !queuedSaveMatchesRecord(entry, record))) {
-        addIssue(record, "queued save request identity did not match its captured session, state, files, and required status");
+        addIssue(record, "queued save request identity did not match its captured session, state, files, and required status"
+          + (entry ? ": " + JSON.stringify(queuedSaveMismatchSummary(entry, record)) : ""));
         if (entry?.status === "pending") settleQueuedSave(entry, "failed", "correlated POST did not match the captured queued save");
       } else if (entry?.status === "pending") {
         attachQueuedSaveProducer(entry, record.terminalPromise, record);
       }
       for (const candidate of pendingQueuedSaveWork.values()) {
-        if (candidate.status === "pending" && !candidate.persistenceRecord && queuedSaveMatchesRecord(candidate, record)) {
+        const matchesCapturedWork = candidate.status === "pending"
+          && !candidate.persistenceRecord
+          && queuedSaveMatchesRecord(candidate, record);
+        const ownsEquivalentHandoff = candidate.status === "pending"
+          && !candidate.persistenceRecord
+          && candidate.ownedFlushLease
+          && !candidate.ownedFlushLease.settled
+          && candidate.snapshot?.sessionId === record.expectedSessionId;
+        if (matchesCapturedWork || ownsEquivalentHandoff) {
           candidate.equivalentRequestRecord = record;
+          candidate.equivalentRequestMatches = matchesCapturedWork;
+          if (matchesCapturedWork) candidate.evidence.postObserved = true;
+          if (ownsEquivalentHandoff) {
+            setQueuedSaveProducer(candidate, record.terminalPromise, "equivalent-request-response-body-durable-readback");
+          }
         }
       }
       notifyProgress();
@@ -1044,6 +1116,18 @@ function createQuoteSessionDrainTracker(group) {
 
   const failQueuedSave = (entry, reason) => settleQueuedSave(entry, "failed", reason);
 
+  const registerOwnedQueuedSaveFlush = (captured, reason = "tracker-owned queued-save flush") => {
+    const entry = captured?.entry
+      || queuedSaveHistory.get(String(captured?.snapshot?.timerIdentity || ""));
+    if (!entry || entry.status !== "pending") return null;
+    if (entry.ownedFlushLease && !entry.ownedFlushLease.settled) return entry.ownedFlushLease;
+    const lease = createProducerLease("owned-flush");
+    entry.ownedFlushLease = lease;
+    entry.transitions.push({ type: "owned-flush-registered", at: Date.now(), reason: String(reason) });
+    notifyProgress();
+    return lease;
+  };
+
   const proveQueuedSaveByReadback = async (page, entry) => {
     if (!page || page.isClosed()) {
       failQueuedSave(entry, "queued save settled without a POST and its page closed before durable readback");
@@ -1060,7 +1144,7 @@ function createQuoteSessionDrainTracker(group) {
       return;
     }
     try {
-      const readback = await page.evaluate(async (sessionId) => {
+      const readbackPromise = page.evaluate(async (sessionId) => {
         const response = await fetch(`/api/quote-sessions/${encodeURIComponent(sessionId)}?__sqag_smoke_equivalent=${Date.now()}`, {
           cache: "no-store", headers: { "cache-control": "no-cache", pragma: "no-cache" },
         });
@@ -1075,6 +1159,10 @@ function createQuoteSessionDrainTracker(group) {
           draftFiles: Array.isArray(session?.draft_files) ? session.draft_files : null,
         };
       }, snapshot.sessionId);
+      entry.applicationSaveLease?.resolve({ status: "transferred", to: "durable-readback" });
+      entry.applicationSaveLease = null;
+      setQueuedSaveProducer(entry, readbackPromise, "durable-readback");
+      const readback = await readbackPromise;
       entry.evidence.durableReadbackObserved = true;
       entry.evidence.readback = readback;
       const failures = [];
@@ -1119,23 +1207,49 @@ function createQuoteSessionDrainTracker(group) {
         return;
       }
       entry.snapshot = snapshot;
+      const applicationSaveLease = createProducerLease("application-save");
+      entry.applicationSaveLease = applicationSaveLease;
+      setQueuedSaveProducer(entry, applicationSaveLease, "application-save");
       notifyProgress();
       return;
     }
     if (type === "cancel") {
+      entry.snapshot.active = false;
       if (event.reason === "recovery-transition") {
         entry.cancelledForRecovery = true;
-        entry.producer = entry.terminalPromise;
+        if (entry.ownedFlushLease && !entry.ownedFlushLease.settled) {
+          setQueuedSaveProducer(entry, entry.ownedFlushLease, "owned-flush");
+          notifyProgress();
+        } else {
+          failQueuedSave(entry, "recovery cancellation orphaned queued save: native timer was removed without a registered real successor or owned flush");
+        }
+      } else if (entry.ownedFlushLease && !entry.ownedFlushLease.settled) {
+        entry.cancelledForApplication = true;
+        setQueuedSaveProducer(entry, entry.ownedFlushLease, "owned-flush");
         notifyProgress();
       } else {
         failQueuedSave(entry, "queued save timer was cancelled without an accounted successor or persistence");
       }
       return;
     }
-    if (type === "fire" || type === "flush") {
-      entry.dispatchedBy = type;
+    if (type === "fire") {
+      entry.dispatchedBy = "fire";
       entry.snapshot.active = false;
-      entry.producer = entry.terminalPromise;
+      entry.nativeTimerLease?.resolve({ status: "fired" });
+      const callbackLease = createProducerLease("native-timer-callback");
+      entry.timerCallbackLease = callbackLease;
+      setQueuedSaveProducer(entry, callbackLease, "native-timer-callback");
+      notifyProgress();
+      return;
+    }
+    if (type === "flush") {
+      entry.dispatchedBy = "flush";
+      entry.snapshot.active = false;
+      if (!entry.ownedFlushLease || entry.ownedFlushLease.settled) {
+        failQueuedSave(entry, "queued save timer was flushed without a registered owned flush producer");
+        return;
+      }
+      setQueuedSaveProducer(entry, entry.ownedFlushLease, "owned-flush");
       notifyProgress();
       return;
     }
@@ -1205,6 +1319,16 @@ function createQuoteSessionDrainTracker(group) {
           return null;
         }
       };
+      const captureEffectiveSaveOptions = (value) => {
+        const requestedOptions = cloneOptions(value);
+        const options = cloneOptions(requestedOptions);
+        if (options && typeof options.quoteGenerated === "boolean") {
+          const hasFreshExports = typeof window.quoteSessionHasFreshOutputExports === "function"
+            && Boolean(window.quoteSessionHasFreshOutputExports());
+          options.quoteGenerated = Boolean(options.quoteGenerated && hasFreshExports);
+        }
+        return { options, requestedOptions };
+      };
       const stableValue = (value) => {
         if (Array.isArray(value)) return value.map(stableValue);
         if (value && typeof value === "object") {
@@ -1232,11 +1356,10 @@ function createQuoteSessionDrainTracker(group) {
         saveCurrentCalls: [],
         queuedSaveOperations: [],
         apiTrace: [],
-        trackQueuedSaves: false,
         timerSequence: 0,
         replaceCandidate: null,
       };
-      for (const key of ["saveCalls", "saveCurrentCalls", "queuedSaveOperations", "apiTrace"]) {
+      for (const key of ["saveCalls", "saveCurrentCalls", "queuedSaveOperations", "apiTrace", "eventDeliveryFailures"]) {
         if (!Array.isArray(timerState[key])) timerState[key] = [];
       }
       timerState.pending ??= null;
@@ -1246,14 +1369,35 @@ function createQuoteSessionDrainTracker(group) {
       timerState.timerSequence = Number(timerState.timerSequence || 0);
       window.__sqagSmokeQuoteSessionTimerState = timerState;
       const emitTimerEvent = (event) => {
-        try {
-          const pending = window[settings.timerEventBinding]?.({ ...event, documentId: timerState.documentId });
-          timerState.lastEventPromise = pending && typeof pending.then === "function"
-            ? Promise.resolve(pending).catch(() => {})
-            : Promise.resolve();
+        const eventIdentity = String(event?.snapshot?.timerIdentity || event?.timerIdentity || "");
+        const detail = {
+          type: String(event?.type || ""),
+          timerIdentity: eventIdentity,
+          at: Date.now(),
+        };
+        const binding = window[settings.timerEventBinding];
+        if (typeof binding !== "function") {
+          timerState.eventDeliveryFailures.push({ ...detail, reason: "tracker event binding is unavailable" });
+          timerState.lastEventPromise = Promise.resolve(false);
           return timerState.lastEventPromise;
-        } catch {
-          return Promise.resolve();
+        }
+        try {
+          timerState.lastEventPromise = Promise.resolve(binding({ ...event, documentId: timerState.documentId }))
+            .then(() => true, (error) => {
+              timerState.eventDeliveryFailures.push({
+                ...detail,
+                reason: String(error?.message || error || "tracker event binding rejected"),
+              });
+              return false;
+            });
+          return timerState.lastEventPromise;
+        } catch (error) {
+          timerState.eventDeliveryFailures.push({
+            ...detail,
+            reason: String(error?.message || error || "tracker event binding threw"),
+          });
+          timerState.lastEventPromise = Promise.resolve(false);
+          return timerState.lastEventPromise;
         }
       };
       window.__sqagSmokeEmitQueuedSaveEvent = emitTimerEvent;
@@ -1281,18 +1425,20 @@ function createQuoteSessionDrainTracker(group) {
           };
           timerId = nativeSetTimeout(wrappedHandler, delay, ...args);
           const current = window.__sqagSmokeQuoteSessionTimerState;
-          if (current?.queueCaptureDepth > 0 && current.trackQueuedSaves === true) {
+          if (current?.queueCaptureDepth > 0) {
             let persistedSessionId = "";
             try {
               persistedSessionId = String(JSON.parse(localStorage.getItem("swooshz_quote_session_v1") || "{}").quoteSessionId || "");
             } catch {
               persistedSessionId = "";
             }
+            const capturedOptions = captureEffectiveSaveOptions(current.queueOptions);
             const snapshot = {
               timerIdentity: `${settings.group}/doc-${current.documentId}/timer-${++current.timerSequence}`,
               nativeTimerId: String(timerId),
               documentId: current.documentId,
-              options: cloneOptions(current.queueOptions),
+              options: capturedOptions.options,
+              requestedOptions: capturedOptions.requestedOptions,
               sessionId: String(window.state?.quoteSessionId || persistedSessionId),
               draftState: typeof window.currentQuoteSessionDraftState === "function"
                 ? cloneOptions(window.currentQuoteSessionDraftState()) : null,
@@ -1449,7 +1595,9 @@ function createQuoteSessionDrainTracker(group) {
         if (typeof draftSave === "function" && draftSave.__sqagSmokeCaptured !== true) {
           const wrappedDraftSave = async function (...args) {
             const timerState = window.__sqagSmokeQuoteSessionTimerState;
-            const options = args[0] && typeof args[0] === "object" ? cloneOptions(args[0]) : {};
+            const capturedOptions = captureEffectiveSaveOptions(args[0] && typeof args[0] === "object" ? args[0] : {});
+            const options = capturedOptions.options;
+            const requestedOptions = capturedOptions.requestedOptions;
             const timerIdentity = String(timerState.activeTimerIdentity || timerState.flushIntentIdentity || "");
             const priorSnapshot = timerIdentity
               ? (timerState.pending?.timerIdentity === timerIdentity
@@ -1460,6 +1608,7 @@ function createQuoteSessionDrainTracker(group) {
               ...cloneOptions(priorSnapshot),
               timerIdentity,
               options,
+              requestedOptions,
               sessionId: String(options.sessionId || window.state?.quoteSessionId || priorSnapshot.sessionId || ""),
               draftState: cloneOptions(options.draftState || window.currentQuoteSessionDraftState?.()),
               draftFiles: cloneOptions(Array.isArray(options.draftFiles)
@@ -1467,10 +1616,10 @@ function createQuoteSessionDrainTracker(group) {
                 : (typeof window.sessionFileRecordsFromDraft === "function" ? window.sessionFileRecordsFromDraft() : [])),
             } : null;
             const queuedSaveOperation = timerIdentity
-              ? { identity: timerIdentity, requestStarted: false, options, snapshot: saveSnapshot }
+              ? { identity: timerIdentity, requestStarted: false, options, requestedOptions, snapshot: saveSnapshot }
               : null;
             if (queuedSaveOperation) timerState.queuedSaveOperations.push(queuedSaveOperation);
-            timerState.saveCalls.push({ options, timerIdentity, startedAt: Date.now() });
+            timerState.saveCalls.push({ options, requestedOptions, timerIdentity, startedAt: Date.now() });
             if (timerIdentity) {
               await emitTimerEvent({ type: "save-start", timerIdentity, snapshot: saveSnapshot });
             }
@@ -1623,24 +1772,50 @@ function createQuoteSessionDrainTracker(group) {
 
   const readQueuedSaveTimer = async (page) => {
     if (!page || page.isClosed()) return null;
+    await page.evaluate(async () => {
+      await window.__sqagSmokeQuoteSessionTimerState?.lastEventPromise;
+    });
     return page.evaluate(() => {
       if (typeof window.__sqagSmokeGetPendingQuoteSessionDraftSave !== "function") {
         throw new Error("Quote-session timer instrumentation was not installed.");
       }
-      return window.__sqagSmokeGetPendingQuoteSessionDraftSave();
+      return {
+        ...window.__sqagSmokeGetPendingQuoteSessionDraftSave(),
+        eventDeliveryFailures: (window.__sqagSmokeQuoteSessionTimerState?.eventDeliveryFailures || []).map((failure) => ({ ...failure })),
+      };
     });
   };
 
   const syncQueuedSaveTimer = async (page) => {
     if (!page || page.isClosed()) return null;
     const state = await readQueuedSaveTimer(page);
+    const pageIdentity = ensurePageIdentity(page);
+    for (const failure of state?.eventDeliveryFailures || []) {
+      const failureIdentity = `${pageIdentity}/${failure.at}/${failure.type}/${failure.timerIdentity}`;
+      if (observedTimerEventFailures.has(failureIdentity)) continue;
+      observedTimerEventFailures.add(failureIdentity);
+      addIssue({
+        operationId: failure.timerIdentity || "<timer-event>",
+        fixture: group,
+        operation: "queued-save-timer-event",
+      }, `browser timer event delivery failed (${failure.type || "unknown"}): ${failure.reason || "unknown binding failure"}`);
+    }
     const snapshot = state?.pending?.active ? normalizeTimerSnapshot(page, state.pending) : null;
     let entry = snapshot ? registerQueuedSaveWork(snapshot, snapshot.supersedesTimerIdentity) : null;
     const last = state?.last;
     if (last?.timerIdentity) {
       const lastIdentity = normalizeTimerIdentity(page, last.timerIdentity);
       const prior = queuedSaveHistory.get(lastIdentity);
-      if (prior?.status === "pending" && !last.active && last.clearedAt && !last.firedAt && !last.flushedAt && !last.cancelledForRecovery) {
+      if (
+        prior?.status === "pending"
+        && !last.active
+        && last.clearedAt
+        && !last.firedAt
+        && !last.flushedAt
+        && !last.cancelledForRecovery
+        && !prior.cancelledForApplication
+        && !prior.ownedFlushLease
+      ) {
         failQueuedSave(prior, "queued save timer disappeared without a flush, firing, successor, or persistence proof");
       }
     }
@@ -1654,6 +1829,15 @@ function createQuoteSessionDrainTracker(group) {
     const state = await readQueuedSaveTimer(page);
     if (!state?.pending) return null;
     const rawSnapshot = state.pending;
+    const snapshot = normalizeTimerSnapshot(page, rawSnapshot);
+    const entry = snapshot ? registerQueuedSaveWork(snapshot, snapshot.supersedesTimerIdentity) : null;
+    const failCapture = (reason) => {
+      if (entry?.status === "pending") failQueuedSave(entry, reason);
+      else if (!entry) {
+        addIssue({ operationId: rawSnapshot.timerIdentity || "<queued-save>", fixture: group, operation: "queued-save" }, reason);
+      }
+      throw new Error(`Pending quote-session save timer was not capturable: ${JSON.stringify(state)}.`);
+    };
     if (
       rawSnapshot.active !== true
       || !rawSnapshot.options
@@ -1664,22 +1848,41 @@ function createQuoteSessionDrainTracker(group) {
       || !rawSnapshot.draftState
       || !Array.isArray(rawSnapshot.draftFiles)
     ) {
-      throw new Error(`Pending quote-session save timer was not capturable: ${JSON.stringify(state)}.`);
+      return failCapture("pending quote-session save timer was captured without exact identity, session, state, files, and required options");
     }
-    const snapshot = normalizeTimerSnapshot(page, rawSnapshot);
-    const entry = registerQueuedSaveWork(snapshot, snapshot.supersedesTimerIdentity);
-    if (!entry) throw new Error("Pending quote-session save timer could not be registered.");
+    if (!snapshot || !entry || entry.status !== "pending") {
+      throw new Error("Pending quote-session save timer could not be registered as live required work.");
+    }
     return { snapshot, entry };
   };
 
-  const unproducedQueuedSaveWork = () => [...pendingQueuedSaveWork.values()].find((entry) => !entry.producer) || null;
+  const unproducedQueuedSaveWork = () => [...pendingQueuedSaveWork.values()].find((entry) => (
+    !entry.producer || entry.producer === entry.terminalPromise
+  )) || null;
 
   const startCapturedQueuedSave = async (page, captured) => {
     if (!captured?.snapshot?.browserTimerIdentity || !captured?.snapshot?.options) {
       throw new Error("Captured queued save has no browser timer identity or options.");
     }
     await syncQueuedSaveTimer(page);
-    return page.evaluate(({ browserTimerIdentity, options }) => {
+    const timerStateBeforeFlush = await readQueuedSaveTimer(page);
+    const pendingBeforeFlush = timerStateBeforeFlush?.pending?.active ? timerStateBeforeFlush.pending : null;
+    if (pendingBeforeFlush && pendingBeforeFlush.timerIdentity !== captured.snapshot.browserTimerIdentity) {
+      return { status: "replaced", currentTimerIdentity: String(pendingBeforeFlush.timerIdentity || "") };
+    }
+    const lastBeforeFlush = timerStateBeforeFlush?.last;
+    const cancelledForRecovery = !pendingBeforeFlush
+      && lastBeforeFlush?.timerIdentity === captured.snapshot.browserTimerIdentity
+      && lastBeforeFlush.cancelledForRecovery === true;
+    if (!pendingBeforeFlush && !cancelledForRecovery) {
+      return { status: "unavailable", reason: "captured timer is no longer live and has no recovery-transition flush authority" };
+    }
+    const entry = captured.entry || queuedSaveHistory.get(String(captured.snapshot.timerIdentity || ""));
+    if (!entry || entry.status !== "pending") {
+      return { status: "unavailable", reason: "captured queued-save obligation is already terminal" };
+    }
+    registerOwnedQueuedSaveFlush(captured);
+    const started = await page.evaluate(({ browserTimerIdentity, options }) => {
       const timerState = window.__sqagSmokeQuoteSessionTimerState;
       if (!timerState) return { status: "unavailable", reason: "timer instrumentation is missing" };
       const pending = timerState.pending?.active ? timerState.pending : null;
@@ -1716,6 +1919,18 @@ function createQuoteSessionDrainTracker(group) {
       );
       return { status: "started", timerIdentity: browserTimerIdentity };
     }, { browserTimerIdentity: captured.snapshot.browserTimerIdentity, options: captured.snapshot.options });
+    await syncQueuedSaveTimer(page);
+    if (started.status !== "started" && entry.status === "pending") {
+      if (entry.producerLease === entry.ownedFlushLease) {
+        if (entry.nativeTimerLease && !entry.nativeTimerLease.settled) {
+          setQueuedSaveProducer(entry, entry.nativeTimerLease, "native-timer");
+        } else {
+          failQueuedSave(entry, "registered queued-save flush did not start the real application save");
+        }
+      }
+      entry.ownedFlushLease = null;
+    }
+    return started;
   };
 
   const outstandingOperations = () => {
@@ -1726,7 +1941,10 @@ function createQuoteSessionDrainTracker(group) {
     for (const record of pendingReadbacks) operations.push({ identity: `${record.operationId}/durable-readback`, producer: record.readbackProducer || null });
     for (const record of pendingSavePromises) operations.push({ identity: `${record.operationId}/application-save`, producer: record.terminalProducer ? record.terminalPromise : null });
     for (const job of pendingRequiredJobs) operations.push({ identity: job.identity, producer: job.producer });
-    for (const entry of pendingQueuedSaveWork.values()) operations.push({ identity: entry.identity, producer: entry.producer });
+    for (const entry of pendingQueuedSaveWork.values()) operations.push({
+      identity: entry.identity,
+      producer: entry.producer === entry.terminalPromise ? null : entry.producer,
+    });
     return operations;
   };
 
@@ -1851,6 +2069,8 @@ function createQuoteSessionDrainTracker(group) {
       identity: entry.identity,
       timerIdentity: entry.snapshot.timerIdentity,
       status: entry.status,
+      producerKind: entry.producerKind || entry.lastProducerKind || "",
+      hasProducer: Boolean(entry.producer),
       successorIdentity: entry.successorIdentity || "",
       terminalReason: entry.terminalReason || "",
       postObserved: entry.evidence.postObserved === true,
@@ -1881,6 +2101,7 @@ function createQuoteSessionDrainTracker(group) {
     capturePendingQueuedSave,
     unproducedQueuedSaveWork,
     attachQueuedSaveProducer,
+    registerOwnedQueuedSaveFlush: registerOwnedQueuedSaveFlush,
     queuedSaveStatus,
     startCapturedQueuedSave,
     armFinalReconciliationBarrier,
@@ -4305,7 +4526,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       const firstWait = await tracker.waitForDrainWaiting(5000, waitCountBefore);
       await applySort(sortA);
       await browserPage.evaluate(() => {
-        window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
         const draftState = currentQuoteSessionDraftState();
         const draftFiles = sessionFileRecordsFromDraft();
         queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000, draftState, draftFiles });
@@ -4387,7 +4607,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           + "; relatedRequests=" + JSON.stringify(relatedRecords.filter((record) => record.operationId === firstOperationId))
           + "; browserSaveCapture=" + JSON.stringify(browserSaveCapture));
       }
-      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
       const drainPassed = await drainPromise;
       const firstRecords = tracker.records.filter((record) => record.operationId === firstOperationId && record.method === "POST");
       const firstStatus = tracker.queuedSaveStatus(captured.snapshot.timerIdentity);
@@ -4426,7 +4645,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       });
       await applySort(sortB);
       await browserPage.evaluate(() => {
-        window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
         const draftState = currentQuoteSessionDraftState();
         const draftFiles = sessionFileRecordsFromDraft();
         queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000, draftState, draftFiles });
@@ -4452,7 +4670,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         throw new Error("F4 final reconciliation returned success without waiting for the timer created inside its zero-work barrier.");
       }
       const finalFlush = await flushRequiredQuoteSessionSaves(browserPage, tracker, finalCaptured);
-      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
       const finalDrainPassed = await finalDrainPromise;
       const secondRecords = tracker.records.filter((record) => record.operationId === secondOperationId && record.method === "POST");
       const finalStatus = tracker.queuedSaveStatus(finalCaptured.snapshot.timerIdentity);
@@ -4504,6 +4721,458 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       };
     };
 
+    const runSqag212ThreeFindingControls = async (seedSessionId) => {
+      let returnT1 = null;
+      let returnT2 = null;
+      const openFixture = async (name, targetSessionId) => {
+        const fixtureTracker = createQuoteSessionDrainTracker(name);
+        const fixtureContext = await isolatedContext.browser().newContext({ viewport: { width: 1365, height: 900 } });
+        try {
+          await fixtureTracker.install(fixtureContext);
+          const fixturePage = await fixtureContext.newPage();
+          await fixturePage.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+          await fixturePage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+          if (!await fixtureTracker.drain(15000, fixturePage)) {
+            throw new Error(name + " ordinary installation did not reach a zero-work baseline: " + JSON.stringify(fixtureTracker.summary()) + ".");
+          }
+          const restoredSeed = await fixturePage.evaluate(async ({ sourceSessionId, targetId }) => {
+            const detailedSession = await loadQuoteSessionDetail(sourceSessionId);
+            let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object"
+              ? detailedSession.draft_state : {};
+            if (!Object.keys(draftState).length) return { restored: false, reason: "seed session has no saved draft state" };
+            const draftFiles = Array.isArray(detailedSession?.draft_files) ? detailedSession.draft_files : [];
+            if (draftFiles.length) {
+              await persistSessionFiles(draftFiles);
+              draftState = mergeDashboardDraftImagesWithAvailablePayloads(draftState, draftFiles);
+            }
+            draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
+            draftState = hydrateDashboardDraftImagePayloads(draftState, sourceSessionId);
+            const restored = await applyQuoteSessionSnapshot({
+              ...draftState,
+              quoteSessionId: targetId,
+              quoteSessionDraftSaveStarted: true,
+            }, {
+              sessionId: targetId,
+              forceQuoteView: true,
+              restoreFurthestPanel: true,
+            });
+            return {
+              restored,
+              sessionId: String(state.quoteSessionId || ""),
+              draftFiles: draftFiles.length,
+            };
+          }, { sourceSessionId: seedSessionId, targetId: targetSessionId });
+          if (!restoredSeed.restored || restoredSeed.sessionId !== targetSessionId) {
+            throw new Error(name + " could not restore the persisted synthetic seed into its isolated session: " + JSON.stringify(restoredSeed) + ".");
+          }
+          if (!await fixtureTracker.drain(15000, fixturePage)) {
+            throw new Error(name + " restored seed produced unaccounted quote-session work: " + JSON.stringify(fixtureTracker.summary()) + ".");
+          }
+          return { tracker: fixtureTracker, context: fixtureContext, page: fixturePage };
+        } catch (error) {
+          await fixtureContext.close();
+          throw error;
+        }
+      };
+      const prepareSession = async (fixture, sessionId, operationId, operation) => {
+        await fixture.tracker.setPageOperation(fixture.page, {
+          fixture: "sqag212",
+          operation,
+          operationId,
+          expectedSessionId: sessionId,
+          persistenceClass: "REQUIRED_SUCCESS",
+        });
+        await fixture.page.evaluate((id) => {
+          state.quoteSessionId = id;
+          state.quoteSessionDraftSaveStarted = true;
+          state.outputSortMode = state.outputSortMode === "name" ? "category" : "name";
+          saveSessionState();
+        }, sessionId);
+      };
+      const cleanupSession = async (page, sessionId) => {
+        if (!page || page.isClosed() || !sessionId) return;
+        const cleanup = await page.evaluate(async (id) => {
+          const headers = {};
+          if (state.csrfToken) headers[state.csrfHeaderName] = state.csrfToken;
+          const response = await fetch("/api/quote-sessions/" + encodeURIComponent(id), { method: "DELETE", headers });
+          return { status: response.status, body: await response.text() };
+        }, sessionId);
+        if (![200, 404].includes(cleanup.status)) {
+          throw new Error("Three-finding synthetic session cleanup failed: " + JSON.stringify(cleanup) + ".");
+        }
+      };
+      const queuedRecordIsDurable = (record, captured) => Boolean(
+        record
+        && record.httpStatus >= 200
+        && record.httpStatus < 300
+        && record.bodyStatus === "saved"
+        && record.expectedSessionId === captured.snapshot.sessionId
+        && record.responseSessionId === captured.snapshot.sessionId
+        && record.clientResult?.nonNull === true
+        && record.clientResult?.sessionId === captured.snapshot.sessionId
+        && record.readback?.httpStatus === 200
+        && record.readback?.sessionId === captured.snapshot.sessionId
+        && record.readback?.quoteGenerated === captured.snapshot.options.quoteGenerated
+        && JSON.stringify(queuedDraftStateComparable(record.readback?.draftState))
+          === JSON.stringify(queuedDraftStateComparable(captured.snapshot.draftState))
+        && JSON.stringify(queuedDraftFilesComparable(record.readback?.draftFiles))
+          === JSON.stringify(queuedDraftFilesComparable(captured.snapshot.draftFiles))
+      );
+
+      const t1SessionId = "quote-sqag212-t1-" + Date.now();
+      const t1 = await openFixture("sqag212-t1-default-timer", t1SessionId);
+      let t1Barrier = null;
+      let t1FinalDrain = null;
+      try {
+        const defaultTimerState = await t1.tracker.readQueuedSaveTimer(t1.page);
+        const trueZero = defaultTimerState?.pending === null
+          && !t1.tracker.summary().outstanding.queuedRequiredSaves.length
+          && t1.tracker.summary().outstanding.requiredRequests === 0
+          && t1.tracker.summary().outstanding.requiredSavePromises === 0;
+        if (!trueZero) throw new Error("T1 default installation did not prove a true zero-work state: " + JSON.stringify(t1.tracker.summary()) + ".");
+
+        const nativeOperationId = "sqag212/t1-default-native-timer/" + Date.now();
+        await prepareSession(t1, t1SessionId, nativeOperationId, "t1-default-native-timer");
+        await t1.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 900 }));
+        await t1.tracker.syncQueuedSaveTimer(t1.page);
+        const nativeCaptured = await t1.tracker.capturePendingQueuedSave(t1.page);
+        if (!nativeCaptured || nativeCaptured.entry.producerKind !== "native-timer") {
+          throw new Error("T1 ordinary installation did not register its real native timer producer: " + JSON.stringify(nativeCaptured?.entry && {
+            status: nativeCaptured.entry.status,
+            producerKind: nativeCaptured.entry.producerKind,
+          }) + ".");
+        }
+        const nativeProducerRegistered = nativeCaptured.entry.producerKind === "native-timer"
+          && nativeCaptured.entry.producer !== nativeCaptured.entry.terminalPromise;
+        const defaultState = await t1.page.evaluate(() => ({
+          visibilityToggle: typeof window.__sqagSmokeQuoteSessionTimerState?.trackQueuedSaves,
+          pending: Boolean(window.__sqagSmokeGetPendingQuoteSessionDraftSave?.().pending?.active),
+        }));
+        const nativeWaitCount = t1.tracker.summary().drainWaitCount;
+        let nativeDrainFinishedEarly = false;
+        const nativeDrain = t1.tracker.drain(20000, t1.page);
+        nativeDrain.then(() => { nativeDrainFinishedEarly = true; });
+        const nativeWaiting = await t1.tracker.waitForDrainWaiting(5000, nativeWaitCount);
+        const pendingNativeTimer = await t1.tracker.readQueuedSaveTimer(t1.page);
+        await Promise.resolve();
+        if (
+          defaultState.visibilityToggle !== "undefined"
+          || !defaultState.pending
+          || !pendingNativeTimer?.pending?.active
+          || nativeDrainFinishedEarly
+          || nativeWaiting.count <= nativeWaitCount
+          || nativeCaptured.entry.producer === nativeCaptured.entry.terminalPromise
+        ) {
+          throw new Error("T1 negative default-visibility control allowed a pending native timer to coexist with drain completion: " + JSON.stringify({
+            defaultState, pending: pendingNativeTimer?.pending, nativeDrainFinishedEarly, nativeWaiting,
+          }) + ".");
+        }
+        const nativeDrainPassed = await nativeDrain;
+        const nativeRecord = t1.tracker.records.find((record) => record.operationId === nativeOperationId && record.method === "POST");
+        const nativeEntry = t1.tracker.queuedSaveStatus(nativeCaptured.snapshot.timerIdentity);
+        const nativeChecks = {
+          drainPassed: nativeDrainPassed,
+          nativeTimerProducer: nativeProducerRegistered,
+          terminalStatus: nativeEntry?.status === "succeeded",
+          exactlyOnePost: t1.tracker.records.filter((record) => record.operationId === nativeOperationId && record.method === "POST").length === 1,
+          completeResponse: nativeRecord?.httpStatus >= 200 && nativeRecord?.httpStatus < 300 && nativeRecord?.bodyStatus === "saved",
+          independentDurableReadback: queuedRecordIsDurable(nativeRecord, nativeCaptured),
+        };
+        if (Object.values(nativeChecks).some((passed) => !passed)) {
+          throw new Error("T1 default native timer did not complete through response and durable readback: " + JSON.stringify({ nativeChecks, summary: t1.tracker.summary() }) + ".");
+        }
+
+        if (!await t1.tracker.drain(15000, t1.page)) {
+          throw new Error("T1 native timer did not leave the tracker at a clean zero-work state before final-zero control.");
+        }
+        const finalOperationId = "sqag212/t1-default-final-zero-flush/" + Date.now();
+        const finalWaitCount = t1.tracker.summary().drainWaitCount;
+        t1Barrier = t1.tracker.armFinalReconciliationBarrier();
+        t1FinalDrain = t1.tracker.drain(20000, t1.page);
+        await t1Barrier.reached;
+        await prepareSession(t1, t1SessionId, finalOperationId, "t1-default-final-zero-flush");
+        await t1.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        await t1.tracker.syncQueuedSaveTimer(t1.page);
+        const finalCaptured = await t1.tracker.capturePendingQueuedSave(t1.page);
+        if (!finalCaptured || finalCaptured.entry.producerKind !== "native-timer") {
+          t1Barrier.release();
+          throw new Error("T1 final-zero registration did not create a default native timer producer.");
+        }
+        t1Barrier.release();
+        const finalWaiting = await t1.tracker.waitForDrainWaiting(5000, finalWaitCount);
+        const finalTimerState = await t1.tracker.readQueuedSaveTimer(t1.page);
+        let finalDrainFinishedEarly = false;
+        t1FinalDrain.then(() => { finalDrainFinishedEarly = true; });
+        await Promise.resolve();
+        if (!finalTimerState?.pending?.active || finalDrainFinishedEarly || finalWaiting.count <= finalWaitCount) {
+          throw new Error("T1 final-zero reconciliation missed newly created required native timer work: " + JSON.stringify({
+            finalTimerState, finalDrainFinishedEarly, finalWaiting,
+          }) + ".");
+        }
+        const finalFlush = await flushRequiredQuoteSessionSaves(t1.page, t1.tracker, finalCaptured);
+        const finalDrainPassed = await t1FinalDrain;
+        const finalRecord = t1.tracker.records.find((record) => record.operationId === finalOperationId && record.method === "POST");
+        const finalEntry = t1.tracker.queuedSaveStatus(finalCaptured.snapshot.timerIdentity);
+        const flushChecks = {
+          flushStarted: finalFlush.status === "succeeded",
+          finalDrainPassed,
+          terminalStatus: finalEntry?.status === "succeeded",
+          exactlyOnePost: t1.tracker.records.filter((record) => record.operationId === finalOperationId && record.method === "POST").length === 1,
+          completeResponse: finalRecord?.httpStatus >= 200 && finalRecord?.httpStatus < 300 && finalRecord?.bodyStatus === "saved",
+          independentDurableReadback: queuedRecordIsDurable(finalRecord, finalCaptured),
+          noNativeTimerRemains: (await t1.tracker.readQueuedSaveTimer(t1.page))?.pending === null,
+        };
+        if (Object.values(flushChecks).some((passed) => !passed)) {
+          throw new Error("T1 default queued-timer flush did not complete through response and durable readback: " + JSON.stringify({ flushChecks, summary: t1.tracker.summary() }) + ".");
+        }
+        returnT1 = {
+          T1_RESULT: "PASS",
+          T1_NEGATIVE_DEFAULT_INSTRUMENTATION_TIMER_VISIBILITY: "PASS",
+          T1_POSITIVE_TRUE_ZERO_DEFAULT_INSTALLATION: "PASS",
+          T1_POSITIVE_DEFAULT_TIMER_NATIVE_COMPLETION: "PASS",
+          T1_POSITIVE_DEFAULT_TIMER_FLUSH_COMPLETION: "PASS",
+          native: nativeChecks,
+          finalZeroFlush: flushChecks,
+        };
+      } finally {
+        t1Barrier?.release();
+        await cleanupSession(t1.page, t1SessionId);
+        await t1.context.close();
+      }
+
+      const t2SessionId = "quote-sqag212-t2-" + Date.now();
+      const t2 = await openFixture("sqag212-t2-sticky-options", t2SessionId);
+      try {
+        const operationA = "sqag212/t2-missing-options-a/" + Date.now();
+        await prepareSession(t2, t2SessionId, operationA, "t2-missing-options-a");
+        await t2.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        await t2.tracker.syncQueuedSaveTimer(t2.page);
+        const capturedA = await t2.tracker.capturePendingQueuedSave(t2.page);
+        if (!capturedA) throw new Error("T2 could not capture required timer A before injecting the missing-options boundary.");
+        await t2.page.evaluate(() => {
+          const timerState = window.__sqagSmokeQuoteSessionTimerState;
+          if (timerState?.pending) timerState.pending.options = null;
+        });
+        let missingOptionsRejected = false;
+        try {
+          await t2.tracker.capturePendingQueuedSave(t2.page);
+        } catch (error) {
+          if (!String(error?.message || error).includes("not capturable")) throw error;
+          missingOptionsRejected = true;
+        }
+        const entryA = t2.tracker.queuedSaveStatus(capturedA.snapshot.timerIdentity);
+        const issueABeforeB = t2.tracker.issues.find((issue) => issue.operationId === entryA?.identity);
+        const aFailedBeforeB = missingOptionsRejected && entryA?.status === "failed" && Boolean(issueABeforeB);
+        if (!aFailedBeforeB) {
+          throw new Error("T2 did not record timer A's sticky failure before replacement B existed: " + JSON.stringify({
+            missingOptionsRejected, entryA: entryA && { status: entryA.status, terminalReason: entryA.terminalReason }, issues: t2.tracker.issues,
+          }) + ".");
+        }
+
+        const operationB = "sqag212/t2-replacement-b/" + Date.now();
+        await t2.tracker.setPageOperation(t2.page, {
+          fixture: "sqag212",
+          operation: "t2-replacement-b",
+          operationId: operationB,
+          expectedSessionId: t2SessionId,
+          persistenceClass: "REQUIRED_SUCCESS",
+        });
+        await t2.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        await t2.tracker.syncQueuedSaveTimer(t2.page);
+        const capturedB = await t2.tracker.capturePendingQueuedSave(t2.page);
+        if (!capturedB || capturedB.snapshot.timerIdentity === capturedA.snapshot.timerIdentity) {
+          throw new Error("T2 did not create a distinct valid replacement timer B.");
+        }
+        const aStillFailedAfterReplacement = entryA.status === "failed"
+          && t2.tracker.issues.some((issue) => issue.operationId === entryA.identity)
+          && entryA.successorIdentity === capturedB.snapshot.timerIdentity;
+        const startB = await t2.tracker.startCapturedQueuedSave(t2.page, capturedB);
+        if (startB.status !== "started") throw new Error("T2 real replacement B did not start: " + JSON.stringify(startB) + ".");
+        await capturedB.entry.terminalPromise;
+        const recordB = t2.tracker.records.find((record) => record.operationId === operationB && record.method === "POST");
+        const bPersisted = capturedB.entry.status === "succeeded" && queuedRecordIsDurable(recordB, capturedB);
+        const finalDrain = await t2.tracker.drain(1000, t2.page);
+        const aRemainsFailed = entryA.status === "failed"
+          && t2.tracker.issues.some((issue) => issue.operationId === entryA.identity)
+          && !finalDrain;
+        if (!aStillFailedAfterReplacement || !bPersisted || !aRemainsFailed) {
+          throw new Error("T2 replacement B erased timer A's failure or failed to persist independently: " + JSON.stringify({
+            aStillFailedAfterReplacement, bPersisted, aRemainsFailed,
+            entryA: { status: entryA.status, successorIdentity: entryA.successorIdentity },
+            entryB: { status: capturedB.entry.status, evidence: capturedB.entry.evidence },
+            recordB: recordB && { httpStatus: recordB.httpStatus, bodyStatus: recordB.bodyStatus, readback: recordB.readback },
+            summary: t2.tracker.summary(),
+          }) + ".");
+        }
+        const healthyAOperation = "sqag212/t2-healthy-a/" + Date.now();
+        await prepareSession(t2, t2SessionId, healthyAOperation, "t2-healthy-a");
+        await t2.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        await t2.tracker.syncQueuedSaveTimer(t2.page);
+        const healthyA = await t2.tracker.capturePendingQueuedSave(t2.page);
+        const healthyBOperation = "sqag212/t2-healthy-b/" + Date.now();
+        await t2.tracker.setPageOperation(t2.page, {
+          fixture: "sqag212",
+          operation: "t2-healthy-b",
+          operationId: healthyBOperation,
+          expectedSessionId: t2SessionId,
+          persistenceClass: "REQUIRED_SUCCESS",
+        });
+        await t2.page.evaluate(() => {
+          state.outputSortMode = "pricing_reference";
+          saveSessionState();
+          queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
+        });
+        await t2.tracker.syncQueuedSaveTimer(t2.page);
+        const healthyB = await t2.tracker.capturePendingQueuedSave(t2.page);
+        const healthySupersession = Boolean(
+          healthyA
+          && healthyB
+          && healthyA.entry.status === "superseded"
+          && healthyA.entry.successorIdentity === healthyB.snapshot.timerIdentity
+        );
+        const healthyBStart = healthyB
+          ? await t2.tracker.startCapturedQueuedSave(t2.page, healthyB)
+          : { status: "unavailable" };
+        if (healthyBStart.status !== "started") {
+          throw new Error("T2 healthy replacement B did not start after accounting for A: " + JSON.stringify(healthyBStart) + ".");
+        }
+        await healthyB.entry.terminalPromise;
+        const healthyBRecord = t2.tracker.records.find((record) => record.operationId === healthyBOperation && record.method === "POST");
+        const healthyReplacementPersisted = healthySupersession
+          && healthyB.entry.status === "succeeded"
+          && queuedRecordIsDurable(healthyBRecord, healthyB);
+        const stickyDrainAfterHealthyReplacement = await t2.tracker.drain(1000, t2.page);
+        if (!healthyReplacementPersisted || stickyDrainAfterHealthyReplacement
+          || entryA.status !== "failed"
+          || !t2.tracker.issues.some((issue) => issue.operationId === entryA.identity)) {
+          throw new Error("T2 healthy A-to-B replacement or original sticky failure was not preserved: " + JSON.stringify({
+            healthySupersession, healthyReplacementPersisted, stickyDrainAfterHealthyReplacement,
+            healthyA: healthyA && { status: healthyA.entry.status, successorIdentity: healthyA.entry.successorIdentity },
+            healthyB: healthyB && { status: healthyB.entry.status, evidence: healthyB.entry.evidence },
+            originalA: { status: entryA.status, successorIdentity: entryA.successorIdentity },
+          }) + ".");
+        }
+        returnT2 = {
+          T2_RESULT: "PASS",
+          T2_NEGATIVE_MISSING_OPTIONS_THEN_SUCCESSFUL_REPLACEMENT: "PASS",
+          T2_POSITIVE_HEALTHY_A_SUPERSEDED_BY_B: healthyReplacementPersisted ? "PASS" : "FAIL",
+          T2_POSITIVE_B_SUCCESS_REMAINS_INDEPENDENT_OF_FAILED_A: "PASS",
+          issueBeforeB: true,
+          replacementBPostAndDurableReadback: true,
+          finalDrainStillFailedOnA: true,
+        };
+      } finally {
+        await cleanupSession(t2.page, t2SessionId);
+        await t2.context.close();
+      }
+
+      const t3NegativeSessionId = "quote-sqag212-t3n-" + Date.now();
+      const t3Negative = await openFixture("sqag212-t3-orphaned-recovery-cancel", t3NegativeSessionId);
+      let t3NegativeResult = false;
+      try {
+        const operationId = "sqag212/t3-orphaned-cancel/" + Date.now();
+        await prepareSession(t3Negative, t3NegativeSessionId, operationId, "t3-orphaned-recovery-cancel");
+        await t3Negative.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        await t3Negative.tracker.syncQueuedSaveTimer(t3Negative.page);
+        const captured = await t3Negative.tracker.capturePendingQueuedSave(t3Negative.page);
+        if (!captured || captured.entry.producerKind !== "native-timer") {
+          throw new Error("T3 negative control did not begin with a real native timer producer.");
+        }
+        const waitCountBeforeCancel = t3Negative.tracker.summary().drainWaitCount;
+        await t3Negative.page.evaluate(() => {
+          state.isRecoveryScopeTransitioning = true;
+          clearQuoteSessionDraftSaveTimer();
+        });
+        await t3Negative.tracker.syncQueuedSaveTimer(t3Negative.page);
+        const orphanEntry = t3Negative.tracker.queuedSaveStatus(captured.snapshot.timerIdentity);
+        const orphanIssue = t3Negative.tracker.issues.find((issue) => issue.operationId === orphanEntry?.identity);
+        const immediateOrphan = orphanEntry?.status === "failed"
+          && !orphanEntry.producer
+          && orphanEntry.producer !== orphanEntry.terminalPromise
+          && Boolean(orphanIssue)
+          && t3Negative.tracker.summary().drainWaitCount === waitCountBeforeCancel;
+        const orphanDrain = await t3Negative.tracker.drain(1000, t3Negative.page);
+        t3NegativeResult = immediateOrphan && !orphanDrain
+          && t3Negative.tracker.summary().drainWaitCount === waitCountBeforeCancel;
+        if (!t3NegativeResult) {
+          throw new Error("T3 recovery cancellation with only bookkeeping did not fail immediately before a drain wait: " + JSON.stringify({
+            immediateOrphan, orphanDrain, waitCountBeforeCancel, entry: orphanEntry && { status: orphanEntry.status, producerKind: orphanEntry.producerKind, terminalReason: orphanEntry.terminalReason }, orphanIssue,
+          }) + ".");
+        }
+      } finally {
+        await t3Negative.context.close();
+      }
+
+      const t3PositiveSessionId = "quote-sqag212-t3p-" + Date.now();
+      const t3Positive = await openFixture("sqag212-t3-owned-recovery-flush", t3PositiveSessionId);
+      try {
+        const operationId = "sqag212/t3-owned-recovery-flush/" + Date.now();
+        await prepareSession(t3Positive, t3PositiveSessionId, operationId, "t3-owned-recovery-flush");
+        await t3Positive.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        await t3Positive.tracker.syncQueuedSaveTimer(t3Positive.page);
+        const captured = await t3Positive.tracker.capturePendingQueuedSave(t3Positive.page);
+        if (!captured || captured.entry.producerKind !== "native-timer") {
+          throw new Error("T3 positive control did not begin with the native timer producer.");
+        }
+        const ownedFlush = t3Positive.tracker.registerOwnedQueuedSaveFlush(captured, "T3 registered real save handoff before recovery cancellation");
+        if (!ownedFlush || ownedFlush.settled) throw new Error("T3 could not register the real owned flush producer.");
+        await t3Positive.page.evaluate(() => {
+          state.isRecoveryScopeTransitioning = true;
+          clearQuoteSessionDraftSaveTimer();
+          state.isRecoveryScopeTransitioning = false;
+        });
+        await t3Positive.tracker.syncQueuedSaveTimer(t3Positive.page);
+        const transferredProducer = captured.entry.producerKind === "owned-flush"
+          && captured.entry.producer === ownedFlush.promise
+          && captured.entry.producer !== captured.entry.terminalPromise
+          && captured.entry.status === "pending";
+        if (!transferredProducer) {
+          throw new Error("T3 registered flush did not own the obligation after native recovery cancellation: " + JSON.stringify({
+            status: captured.entry.status, producerKind: captured.entry.producerKind,
+            sameAsBookkeeping: captured.entry.producer === captured.entry.terminalPromise,
+          }) + ".");
+        }
+        const start = await t3Positive.tracker.startCapturedQueuedSave(t3Positive.page, captured);
+        if (start.status !== "started") throw new Error("T3 registered recovery flush did not invoke the real save: " + JSON.stringify(start) + ".");
+        await captured.entry.terminalPromise;
+        const record = t3Positive.tracker.records.find((candidate) => candidate.operationId === operationId && candidate.method === "POST");
+        const persisted = captured.entry.status === "succeeded" && queuedRecordIsDurable(record, captured);
+        const drainPassed = await t3Positive.tracker.drain(15000, t3Positive.page);
+        if (!persisted || !drainPassed || t3Positive.tracker.issues.length) {
+          throw new Error("T3 registered recovery flush did not transfer to real save and durable work: " + JSON.stringify({
+            persisted, drainPassed, entry: { status: captured.entry.status, evidence: captured.entry.evidence },
+            record: record && { httpStatus: record.httpStatus, bodyStatus: record.bodyStatus, readback: record.readback },
+            summary: t3Positive.tracker.summary(),
+          }) + ".");
+        }
+        return {
+          T1_RESULT: returnT1.T1_RESULT,
+          T1_NEGATIVE_DEFAULT_INSTRUMENTATION_TIMER_VISIBILITY: returnT1.T1_NEGATIVE_DEFAULT_INSTRUMENTATION_TIMER_VISIBILITY,
+          T1_POSITIVE_TRUE_ZERO_DEFAULT_INSTALLATION: returnT1.T1_POSITIVE_TRUE_ZERO_DEFAULT_INSTALLATION,
+          T1_POSITIVE_DEFAULT_TIMER_NATIVE_COMPLETION: returnT1.T1_POSITIVE_DEFAULT_TIMER_NATIVE_COMPLETION,
+          T1_POSITIVE_DEFAULT_TIMER_FLUSH_COMPLETION: returnT1.T1_POSITIVE_DEFAULT_TIMER_FLUSH_COMPLETION,
+          T2_RESULT: returnT2.T2_RESULT,
+          T2_NEGATIVE_MISSING_OPTIONS_THEN_SUCCESSFUL_REPLACEMENT: returnT2.T2_NEGATIVE_MISSING_OPTIONS_THEN_SUCCESSFUL_REPLACEMENT,
+          T2_POSITIVE_HEALTHY_A_SUPERSEDED_BY_B: returnT2.T2_POSITIVE_HEALTHY_A_SUPERSEDED_BY_B,
+          T2_POSITIVE_B_SUCCESS_REMAINS_INDEPENDENT_OF_FAILED_A: returnT2.T2_POSITIVE_B_SUCCESS_REMAINS_INDEPENDENT_OF_FAILED_A,
+          T3_RESULT: "PASS",
+          T3_NEGATIVE_RECOVERY_CANCEL_WITH_BOOKKEEPING_ONLY_PRODUCER: t3NegativeResult ? "PASS" : "FAIL",
+          T3_POSITIVE_CANCEL_TRANSFERS_TO_REGISTERED_REAL_WORK: "PASS",
+          T3_POSITIVE_NATIVE_TIMER_PRODUCER: "PASS",
+          T1: returnT1,
+          T2: returnT2,
+          T3: {
+            negativeImmediateOrphan: t3NegativeResult,
+            cancelTransferredToOwnedFlush: transferredProducer,
+            realSaveAndReadback: persisted,
+          },
+        };
+      } finally {
+        await cleanupSession(t3Positive.page, t3PositiveSessionId);
+        await t3Positive.context.close();
+      }
+    };
+
 
     const runSqag212RecoveryNullControl = async (savedSessionId) => {
       const recoveryTracker = createQuoteSessionDrainTracker("sqag212-f2-recovery-null");
@@ -4542,7 +5211,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           state.quoteSessionId = id;
           state.quoteSessionDraftSaveStarted = true;
           const timerState = window.__sqagSmokeQuoteSessionTimerState;
-          timerState.trackQueuedSaves = true;
           timerState.saveCurrentCalls.length = 0;
           timerState.apiTrace.length = 0;
           queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
@@ -4551,6 +5219,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         if (!captured || captured.snapshot.sessionId !== savedSessionId) {
           throw new Error("F2 did not capture the exact pending timer before recovery transition: " + JSON.stringify(captured?.snapshot || null) + ".");
         }
+        recoveryTracker.registerOwnedQueuedSaveFlush(captured, "F2 recovery transition queued-save handoff");
         await recoveryPage.evaluate(() => {
           const originalPurge = purgeBrowserRecoveryState;
           window.__sqagF2PurgeReached = false;
@@ -4683,7 +5352,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
       });
       await setSyntheticDraftPrice(pendingPrice);
       await browserPage.evaluate(() => {
-        window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
         queueQuoteSessionDraftStateSave({ quoteGenerated: false });
       });
       const captured = await tracker.capturePendingQueuedSave(browserPage);
@@ -4691,7 +5359,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         throw new Error(`C6 did not retain the real pending timer options: ${JSON.stringify(captured?.snapshot || null)}.`);
       }
       await flushRequiredQuoteSessionSaves(browserPage, tracker);
-      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
       const c6Records = tracker.records.filter((record) => record.operationId === operationId && record.persistenceClass !== "DIAGNOSTIC_ONLY");
       if (c6Records.length !== 1) {
         throw new Error(`C6 pending timer flush dispatched ${c6Records.length} real application saves instead of exactly one.`);
@@ -4769,7 +5436,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         await clearOnlyPage.evaluate((id) => {
           state.quoteSessionId = id;
           state.quoteSessionDraftSaveStarted = true;
-          window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
           queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
         }, savedSessionId);
         clearOnlyCapture = await clearOnlyTracker.capturePendingQueuedSave(clearOnlyPage);
@@ -4798,7 +5464,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         await missingOptionsPage.evaluate((id) => {
           state.quoteSessionId = id;
           state.quoteSessionDraftSaveStarted = true;
-          window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = true;
           queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
           const timerState = window.__sqagSmokeQuoteSessionTimerState;
           if (timerState?.pending) timerState.pending.options = null;
@@ -5016,7 +5681,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         const timerState = window.__sqagSmokeQuoteSessionTimerState;
         timerState.apiTrace.length = 0;
         timerState.saveCurrentCalls.length = 0;
-        timerState.trackQueuedSaves = true;
         queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 });
       });
       const capturedA = await tracker.capturePendingQueuedSave(browserPage);
@@ -5071,7 +5735,6 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         }) + ".");
       }
       const flushB = await flushRequiredQuoteSessionSaves(browserPage, tracker, capturedB);
-      await browserPage.evaluate(() => { window.__sqagSmokeQuoteSessionTimerState.trackQueuedSaves = false; });
       const drainPassed = await drainPromise;
       const records = tracker.records.filter((record) => record.operationId === operationId && record.method === "POST");
       const statusB = tracker.queuedSaveStatus(capturedB.snapshot.timerIdentity);
@@ -5305,6 +5968,17 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     if (!sessionId) throw new Error("SQAG #212 quote was not saved after basis confirmation.");
     stage = "awaiting the initiating application save and positive drain control";
     const positiveOperationId = "sqag212/positive-control-save/" + Date.now();
+    const initiatingTimer = await tracker.capturePendingQueuedSave(browserPage);
+    if (initiatingTimer) {
+      await tracker.setPageOperation(browserPage, {
+        fixture: "sqag212",
+        operation: "initiating-pending-draft-timer",
+        operationId: "sqag212/initiating-pending-draft-timer/" + Date.now(),
+        expectedSessionId: sessionId,
+        persistenceClass: "REQUIRED_SUCCESS",
+      });
+      await flushRequiredQuoteSessionSaves(browserPage, tracker, initiatingTimer);
+    }
     await tracker.setPageOperation(browserPage, {
       fixture: "sqag212",
       operation: "positive-control-save",
@@ -5363,6 +6037,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
     }
     drainControls = {
       ...(await runSqag212TrackerFailureControls()),
+      threeFindingHarness: await runSqag212ThreeFindingControls(sessionId),
       asyncProgress: await runSqag212DrainControls(sessionId),
       ...(await runSqag212DrainRaceControls(sessionId)),
       recoveryTransitionNull: await runSqag212RecoveryNullControl(sessionId),
