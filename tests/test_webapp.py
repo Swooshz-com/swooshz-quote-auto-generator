@@ -16714,6 +16714,309 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     b"run472-persistent-pdf",
                 )
 
+    def test_f1_negative_fresh_owner_commit_failure_rolls_back_and_retries(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            xlsx_bytes = b"synthetic-f1-fresh-xlsx"
+            pdf_bytes = b"%PDF-1.4\nsynthetic-f1-fresh-pdf\n%%EOF\n"
+            payload, result, output_dir = self._local_publication_case(
+                root, "quote-F1-FreshOwner", xlsx_bytes, pdf_bytes, variant="fresh-failure"
+            )
+            draft_records = [{
+                "session_file_key": "f1-fresh-reference",
+                "name": "reference.pdf",
+                "type": "application/pdf",
+                "size": 3,
+                "data_url": "data:application/pdf;base64,UERG",
+            }]
+            payload["quote_session"]["draft_files"] = copy.deepcopy(draft_records)
+            payload["draft_files"] = copy.deepcopy(draft_records)
+            payload["quote_session"]["draft_state"]["images"] = [{
+                "session_file_key": "f1-fresh-reference",
+                "name": "reference.pdf",
+                "type": "application/pdf",
+                "size": 3,
+            }]
+            session_id = payload["quote_session"]["session_id"]
+            session_dir = data_root / "quote-sessions" / session_id
+            metadata_path = session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+            marker_path = (data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME)
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                self.assertFalse(session_dir.exists())
+                self.assertFalse(metadata_path.exists())
+                self.assertFalse(marker_path.exists())
+                original_replace = webapp.os.replace
+
+                def fail_first_metadata_commit(source, destination):
+                    if Path(destination).resolve() == metadata_path.resolve():
+                        raise OSError("synthetic first-owner metadata commit failure")
+                    return original_replace(source, destination)
+
+                with self.assertRaisesRegex(OSError, "first-owner metadata commit failure"):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_first_metadata_commit):
+                        webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+
+                self.assertFalse(session_dir.exists(), "F1 rollback left a transaction-created session container")
+                self.assertFalse(metadata_path.exists(), "F1 rollback created phantom owner metadata")
+                self.assertFalse(marker_path.exists(), "F1 rollback created a retirement record")
+                self.assertEqual(webapp.read_quote_session_metadata(session_id), {})
+                self.assertIsNone(webapp.get_quote_session(session_id))
+                self.assertFalse(webapp.quote_session_is_retired(session_id))
+
+                saved = webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                metadata = webapp.read_quote_session_metadata(session_id)
+                publication_id = metadata["publication"]["active_publication_id"]
+                self.assertEqual(saved["session_id"], session_id)
+                self.assertEqual(metadata["session_id"], session_id)
+                self.assertTrue(webapp.quote_session_has_current_v2_publication(metadata))
+                self.assertEqual(metadata["publication"]["draft_files_publication_id"], publication_id)
+                self.assertEqual(webapp.read_quote_session_draft_files(session_id, metadata), draft_records)
+                for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
+                    export = metadata["exports"][kind]
+                    self.assertEqual(export["publication_id"], publication_id)
+                    self.assertEqual(export["size_bytes"], len(expected))
+                    self.assertEqual(export["sha256"], hashlib.sha256(expected).hexdigest())
+                    self.assertEqual(webapp.quote_session_export_path(session_id, kind).read_bytes(), expected)
+                detail = webapp.get_quote_session(session_id, include_draft_state=True)
+                self.assertEqual(detail["session_id"], session_id)
+                self.assertTrue(detail["status"]["quote_generated"])
+                self._assert_local_pair_downloads(runner, session_id, xlsx_bytes, pdf_bytes)
+
+                alternate_owner_id = "quote-F1-AlternateRetry"
+                alternate_payload, alternate_result, alternate_output = self._local_publication_case(
+                    root, alternate_owner_id, xlsx_bytes, pdf_bytes, variant="alternate-failure"
+                )
+                alternate_payload["quote_session"]["draft_files"] = copy.deepcopy(draft_records)
+                alternate_payload["draft_files"] = copy.deepcopy(draft_records)
+                alternate_payload["quote_session"]["draft_state"]["images"] = copy.deepcopy(payload["quote_session"]["draft_state"]["images"])
+                alternate_session_dir = data_root / "quote-sessions" / alternate_owner_id
+                alternate_metadata_path = alternate_session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+                capability = webapp._quote_session_filesystem_capability()
+                original_replace = webapp.os.replace
+
+                def fail_alternate_metadata_commit(source, destination):
+                    if Path(destination).resolve() == alternate_metadata_path.resolve():
+                        raise OSError("synthetic alternate first-owner metadata commit failure")
+                    return original_replace(source, destination)
+
+                with self.assertRaisesRegex(OSError, "alternate first-owner metadata commit failure"):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_alternate_metadata_commit):
+                        webapp.create_or_update_quote_session(
+                            alternate_payload,
+                            result=alternate_result,
+                            output_dir=alternate_output,
+                        )
+                self.assertFalse(alternate_session_dir.exists())
+                self.assertFalse((data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME).exists())
+                retry_id = (
+                    "quote-" + alternate_owner_id[len("quote-"):].swapcase()
+                    if capability["case_insensitive"] else alternate_owner_id
+                )
+                retry_payload, retry_result, retry_output = self._local_publication_case(
+                    root, retry_id, xlsx_bytes, pdf_bytes, variant="alternate-retry"
+                )
+                retry_payload["quote_session"]["draft_files"] = copy.deepcopy(draft_records)
+                retry_payload["draft_files"] = copy.deepcopy(draft_records)
+                retry_payload["quote_session"]["draft_state"]["images"] = copy.deepcopy(payload["quote_session"]["draft_state"]["images"])
+                retry_saved = webapp.create_or_update_quote_session(
+                    retry_payload,
+                    result=retry_result,
+                    output_dir=retry_output,
+                )
+                self.assertEqual(retry_saved["session_id"], retry_id)
+                self.assertEqual(webapp.read_quote_session_metadata(retry_id)["session_id"], retry_id)
+                if capability["case_insensitive"]:
+                    self.assertIsNone(webapp.get_quote_session(alternate_owner_id))
+                else:
+                    original_payload, original_result, original_output = self._local_publication_case(
+                        root, alternate_owner_id, xlsx_bytes, pdf_bytes, variant="case-distinct-owner"
+                    )
+                    original_saved = webapp.create_or_update_quote_session(
+                        original_payload, result=original_result, output_dir=original_output
+                    )
+                    self.assertEqual(original_saved["session_id"], alternate_owner_id)
+                    self.assertTrue((data_root / "quote-sessions" / retry_id).is_dir())
+                    self.assertTrue((data_root / "quote-sessions" / alternate_owner_id).is_dir())
+
+    def test_f1_positive_fresh_draft_only_failure_removes_owned_draft_and_container(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            data_root = Path(tmp) / "data"
+            session_id = "quote-F1-DraftOnly"
+            payload = valid_payload()
+            payload["quote_session"] = {
+                "session_id": session_id,
+                "draft_state": {"images": [{"session_file_key": "f1-draft", "name": "reference.pdf"}]},
+                "draft_files": [{
+                    "session_file_key": "f1-draft",
+                    "name": "reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }],
+            }
+            session_dir = data_root / "quote-sessions" / session_id
+            draft_path = session_dir / webapp.QUOTE_SESSION_DRAFT_FILES_FILENAME
+            metadata_path = session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+            original_replace = webapp.os.replace
+
+            def fail_metadata_commit(source, destination):
+                if Path(destination).resolve() == metadata_path.resolve():
+                    raise OSError("synthetic draft-only metadata commit failure")
+                return original_replace(source, destination)
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                with self.assertRaisesRegex(OSError, "draft-only metadata commit failure"):
+                    with mock.patch.object(webapp.os, "replace", side_effect=fail_metadata_commit):
+                        webapp.create_or_update_quote_session(payload)
+                self.assertFalse(draft_path.exists(), "F1 draft-only rollback left transaction-owned draft records")
+                self.assertFalse(session_dir.exists(), "F1 draft-only rollback left an empty owner container")
+                self.assertFalse(metadata_path.exists())
+                self.assertFalse(webapp.quote_session_is_retired(session_id))
+
+    def test_f1_positive_established_owner_rollback(self):
+        self.test_local_publication_f4_metadata_pointer_failure_keeps_parseable_old_state()
+
+    def test_f1_f5_positive_unowned_inconsistent_storage_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            data_root = Path(tmp) / "data"
+            session_id = "quote-F1-UnownedInconsistent"
+            session_dir = data_root / "quote-sessions" / session_id
+            session_dir.mkdir(parents=True)
+            unrelated = session_dir / "unowned-marker.bin"
+            unrelated.write_bytes(b"pre-existing-unowned")
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": session_id}
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                before = unrelated.read_bytes()
+                response = self._post_local_quote_session(runner, payload)
+                self.assertEqual(response["status"], 503)
+                body = response["body"]
+                self.assertEqual(body["status"], "failed")
+                self.assertRegex(body["error_reference"], r"^ERR-[A-F0-9]{8}$")
+                with self.assertRaises(webapp.SqagStorageAccessError) as storage_error:
+                    webapp.create_or_update_quote_session(payload)
+                self.assertEqual(storage_error.exception.status, 503)
+                self.assertEqual(storage_error.exception.reason, "quote_session_storage_inconsistent")
+                self.assertEqual(unrelated.read_bytes(), before)
+                self.assertEqual(sorted(path.name for path in session_dir.iterdir()), [unrelated.name])
+                self.assertFalse(webapp.quote_session_is_retired(session_id))
+                self.assertFalse(webapp.quote_session_metadata_path(session_id).exists())
+
+    def test_f5_negative_interrupted_delete_with_durable_retirement(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-F5-InterruptedOwner"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                b"synthetic-f5-xlsx",
+                b"%PDF-1.4\nsynthetic-f5-pdf\n%%EOF\n",
+                variant="interrupted-delete",
+            )
+            alias_id = "quote-" + session_id[len("quote-"):].swapcase()
+            alias_payload = valid_payload()
+            alias_payload["quote_session"] = {"session_id": alias_id}
+            alias_publication_payload, alias_result, alias_output = self._local_publication_case(
+                root,
+                alias_id,
+                b"synthetic-f5-alias-xlsx",
+                b"%PDF-1.4\nsynthetic-f5-alias-pdf\n%%EOF\n",
+                variant="alias",
+            )
+            session_dir = data_root / "quote-sessions" / session_id
+            metadata_path = session_dir / webapp.QUOTE_SESSION_METADATA_FILENAME
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), LocalRunnerServer() as runner:
+                capability = webapp._quote_session_filesystem_capability()
+                webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                self.assertTrue(webapp.quote_session_has_current_v2_publication(webapp.read_quote_session_metadata(session_id)))
+                original_cleanup = webapp._remove_quote_session_tree_without_following_redirects
+
+                def remove_metadata_then_interrupt(directory):
+                    self.assertEqual(Path(directory), session_dir)
+                    metadata_path.unlink()
+                    raise OSError("synthetic interruption after metadata removal")
+
+                with self.assertRaisesRegex(OSError, "interruption after metadata removal"):
+                    with mock.patch.object(
+                        webapp,
+                        "_remove_quote_session_tree_without_following_redirects",
+                        side_effect=remove_metadata_then_interrupt,
+                    ):
+                        webapp.delete_quote_session(session_id)
+                self.assertTrue(webapp.quote_session_is_retired(session_id))
+                self.assertFalse(metadata_path.exists())
+                self.assertTrue(session_dir.is_dir())
+                residual_before = {
+                    str(path.relative_to(session_dir)): path.read_bytes()
+                    for path in session_dir.rglob("*") if path.is_file()
+                }
+                if capability["case_insensitive"]:
+                    with self.assertRaises(webapp.SqagStorageAccessError) as save_error:
+                        webapp.create_or_update_quote_session(alias_payload)
+                    self.assertEqual((save_error.exception.status, save_error.exception.reason), (409, "quote_session_retired"))
+                    with self.assertRaises(webapp.SqagStorageAccessError) as publish_error:
+                        webapp.create_or_update_quote_session(
+                            alias_publication_payload,
+                            result=alias_result,
+                            output_dir=alias_output,
+                        )
+                    self.assertEqual((publish_error.exception.status, publish_error.exception.reason), (409, "quote_session_retired"))
+                    self.assertTrue(session_dir.is_dir(), "case-equivalent spelling resolves the same residual owner directory")
+                    self.assertIsNone(webapp.get_quote_session(alias_id))
+                    self.assertIsNone(webapp.get_quote_session(session_id))
+                    self.assertIsNone(webapp.quote_session_export_path(alias_id, "xlsx"))
+                    self.assertIsNone(webapp.LocalSqagStorage().quote_session_export_file_path(session_id, "xlsx"))
+                    self.assertNotIn(session_id, [item["session_id"] for item in webapp.list_quote_sessions()])
+                    for requested_id in (session_id, alias_id):
+                        self.assertEqual(local_http_get_json(runner, f"/api/quote-sessions/{requested_id}")[0], 404)
+                        self.assertEqual(local_http_get_bytes(runner, f"/api/quote-sessions/{requested_id}/download/xlsx")[0], 404)
+                    self.assertEqual(
+                        {
+                            str(path.relative_to(session_dir)): path.read_bytes()
+                            for path in session_dir.rglob("*") if path.is_file()
+                        },
+                        residual_before,
+                        "F5 equivalent alias attempts mutated the residual owner tree",
+                    )
+                    with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                        webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                    with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                        webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                    with webapp.QUOTE_SESSION_FILESYSTEM_CAPABILITY_LOCK:
+                        webapp.QUOTE_SESSION_FILESYSTEM_CAPABILITIES.clear()
+                    with self.assertRaises(webapp.SqagStorageAccessError) as reset_error:
+                        webapp.create_or_update_quote_session(alias_payload)
+                    self.assertEqual((reset_error.exception.status, reset_error.exception.reason), (409, "quote_session_retired"))
+                    self.assertEqual(
+                        {
+                            str(path.relative_to(session_dir)): path.read_bytes()
+                            for path in session_dir.rglob("*") if path.is_file()
+                        },
+                        residual_before,
+                    )
+                else:
+                    independent = webapp.create_or_update_quote_session(alias_payload)
+                    self.assertEqual(independent["session_id"], alias_id)
+                    self.assertTrue((data_root / "quote-sessions" / alias_id).is_dir())
+                    self.assertIsNone(webapp.get_quote_session(session_id))
+                    self.assertFalse(webapp.quote_session_is_retired(alias_id))
+                    self.assertTrue(webapp.delete_quote_session(alias_id))
+
+                with mock.patch.object(webapp, "_remove_quote_session_tree_without_following_redirects", wraps=original_cleanup):
+                    self.assertTrue(webapp.delete_quote_session(session_id))
+                self.assertFalse(session_dir.exists())
+                self.assertTrue(webapp.delete_quote_session(session_id))
+                self.assertTrue(webapp.quote_session_is_retired(session_id))
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as final_reuse:
+                    webapp.create_or_update_quote_session(payload)
+                self.assertEqual((final_reuse.exception.status, final_reuse.exception.reason), (409, "quote_session_retired"))
+
     def test_local_publication_f1_xlsx_staging_failure_keeps_old_pair(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
@@ -16998,6 +17301,44 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     migrated["exports"]["pdf"]["publication_id"],
                 )
                 self._assert_local_pair_downloads(runner, session_id, new_xlsx, new_pdf)
+
+    def test_quote_session_state_only_update_preserves_existing_draft_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            session_id = "quote-state-only-preserves-files"
+            initial = valid_payload()
+            initial["quote_session"] = {
+                "session_id": session_id,
+                "draft_state": {"version": 1, "images": [{"session_file_key": "reference-file-key"}]},
+                "draft_files": [{
+                    "session_file_key": "reference-file-key",
+                    "name": "reference.pdf",
+                    "type": "application/pdf",
+                    "size": 3,
+                    "data_url": "data:application/pdf;base64,UERG",
+                }],
+            }
+            state_only = valid_payload()
+            state_only["quote_session"] = {
+                "session_id": session_id,
+                "draft_state": {
+                    "version": 1,
+                    "images": [{"session_file_key": "reference-file-key"}],
+                    "outputSortMode": "name",
+                },
+            }
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                created = webapp.create_or_update_quote_session(initial)
+                self.assertEqual(created["session_id"], session_id)
+                updated = webapp.create_or_update_quote_session(state_only)
+                self.assertEqual(updated["session_id"], session_id)
+                detailed = webapp.get_quote_session(session_id, include_draft_state=True)
+
+            self.assertEqual(detailed["draft_state"]["outputSortMode"], "name")
+            self.assertEqual(len(detailed["draft_files"]), 1)
+            self.assertEqual(detailed["draft_files"][0]["session_file_key"], "reference-file-key")
+            self.assertEqual(detailed["draft_files"][0]["data_url"], "data:application/pdf;base64,UERG")
 
     def test_quote_session_draft_update_marks_existing_exports_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -17354,6 +17695,485 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 self.assertEqual(outside_marker.read_text(encoding="utf-8"), "keep")
                 self.assertNotIn(str(data_root), response_text)
                 self.assertNotIn(str(Path(tmp)), response_text)
+
+    def test_local_quote_session_publication_owns_transaction_before_delete(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-g3-publication-first"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-publication\n%%EOF\n",
+                variant="publication",
+            )
+            initial_payload = copy.deepcopy(payload)
+            initial_payload["quote_session"]["status"] = {"quote_generated": False}
+            publication_entered = threading.Event()
+            publication_release = threading.Event()
+            delete_started = threading.Event()
+            delete_done = threading.Event()
+            results = {}
+            original_stage = webapp.stage_local_quote_publication
+
+            def paused_stage(*args, **kwargs):
+                publication_entered.set()
+                if not publication_release.wait(5):
+                    raise AssertionError("Timed out waiting to release publication staging.")
+                return original_stage(*args, **kwargs)
+
+            def publish():
+                try:
+                    results["publication"] = webapp.create_or_update_quote_session(
+                        payload,
+                        result=result,
+                        output_dir=output_dir,
+                    )
+                except Exception as exc:  # pragma: no cover - assertion below reports the failure
+                    results["publication"] = exc
+
+            def delete():
+                delete_started.set()
+                try:
+                    results["delete"] = webapp.delete_quote_session(session_id)
+                except Exception as exc:  # pragma: no cover - assertion below reports the failure
+                    results["delete"] = exc
+                finally:
+                    delete_done.set()
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                webapp.create_or_update_quote_session(initial_payload)
+                with mock.patch.object(webapp, "stage_local_quote_publication", side_effect=paused_stage):
+                    publication_thread = threading.Thread(target=publish)
+                    publication_thread.start()
+                    self.assertTrue(publication_entered.wait(5), "Publication did not reach the staging boundary.")
+
+                    delete_thread = threading.Thread(target=delete)
+                    delete_thread.start()
+                    self.assertTrue(delete_started.wait(5), "Delete thread did not start.")
+                    self.assertFalse(delete_done.is_set(), "Delete completed while publication owned the session transaction.")
+
+                    publication_release.set()
+                    publication_thread.join(timeout=5)
+                    delete_thread.join(timeout=5)
+
+                self.assertFalse(publication_thread.is_alive(), "Publication thread remained blocked.")
+                self.assertFalse(delete_thread.is_alive(), "Delete thread remained blocked.")
+                self.assertEqual(results["publication"]["status"]["quote_generated"], True)
+                self.assertIs(results["delete"], True)
+                self.assertTrue(webapp.quote_session_retired_marker_path().is_file())
+                marker = json.loads(webapp.quote_session_retired_marker_path().read_text(encoding="utf-8"))
+                self.assertEqual(marker["schema_version"], webapp.QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION)
+                self.assertEqual(marker["session_ids"], [session_id])
+                self.assertFalse((data_root / "quote-sessions" / session_id).exists())
+                self.assertIsNone(webapp.get_quote_session(session_id))
+                self.assertIsNone(webapp.LocalSqagStorage().quote_session_export_file_path(session_id, "xlsx"))
+
+    def test_local_quote_session_delete_first_blocks_late_save_after_coordinator_restart(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-g3-delete-first"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-delete-first\n%%EOF\n",
+                variant="late",
+            )
+            publication_ready = threading.Event()
+            publication_release = threading.Event()
+            results = {}
+
+            def delayed_publication():
+                publication_ready.set()
+                publication_release.wait(5)
+                try:
+                    results["publication"] = webapp.create_or_update_quote_session(
+                        payload,
+                        result=result,
+                        output_dir=output_dir,
+                    )
+                except Exception as exc:
+                    results["publication"] = exc
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                draft = copy.deepcopy(payload)
+                draft["quote_session"]["status"] = {"quote_generated": False}
+                webapp.create_or_update_quote_session(draft)
+                self.assertTrue(webapp.delete_quote_session(session_id))
+
+                publication_thread = threading.Thread(target=delayed_publication)
+                publication_thread.start()
+                self.assertTrue(publication_ready.wait(5))
+                publication_release.set()
+                publication_thread.join(timeout=5)
+                self.assertFalse(publication_thread.is_alive(), "Late publication thread remained blocked.")
+                self.assertIsInstance(results["publication"], webapp.SqagStorageAccessError)
+                self.assertEqual(results["publication"].status, 409)
+                self.assertEqual(results["publication"].reason, "quote_session_retired")
+                self.assertFalse((data_root / "quote-sessions" / session_id).exists())
+
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as retry:
+                    webapp.create_or_update_quote_session(draft)
+                self.assertEqual(retry.exception.status, 409)
+                self.assertEqual(retry.exception.reason, "quote_session_retired")
+
+                fresh = copy.deepcopy(draft)
+                fresh["quote_session"]["session_id"] = "quote-g3-fresh-after-delete"
+                saved = webapp.create_or_update_quote_session(fresh)
+                self.assertEqual(saved["session_id"], "quote-g3-fresh-after-delete")
+
+                with LocalRunnerServer() as runner:
+                    rejected = self._post_local_quote_session(runner, draft)
+                self.assertEqual(rejected["status"], 409)
+                self.assertEqual(rejected["body"]["status"], "blocked")
+                self.assertRegex(rejected["body"]["error_reference"], r"^ERR-[A-F0-9]{8}$")
+                self.assertEqual(len(rejected["body"]["errors"]), 1)
+                self.assertNotIn(session_id, json.dumps(rejected["body"]))
+
+    def test_local_quote_session_retirement_failure_is_non_success_and_retryable(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-g3-delete-retry"
+            payload = valid_payload()
+            payload["quote_session"] = {"session_id": session_id}
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                webapp.create_or_update_quote_session(payload)
+                session_dir = data_root / "quote-sessions" / session_id
+                marker_path = data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME
+
+                with mock.patch.object(webapp, "atomic_write_text", side_effect=OSError("synthetic retirement write failure")):
+                    with self.assertRaises(webapp.SqagStorageAccessError):
+                        webapp.delete_quote_session(session_id)
+                self.assertTrue(session_dir.is_dir())
+                self.assertFalse(marker_path.exists())
+
+                with mock.patch.object(
+                    webapp,
+                    "_remove_quote_session_tree_without_following_redirects",
+                    side_effect=OSError("synthetic tree removal failure"),
+                ):
+                    with self.assertRaises(OSError):
+                        webapp.delete_quote_session(session_id)
+                self.assertTrue(session_dir.is_dir())
+                self.assertTrue(webapp.quote_session_is_retired(session_id))
+
+                self.assertTrue(webapp.delete_quote_session(session_id))
+                self.assertFalse(session_dir.exists())
+                self.assertTrue(marker_path.is_file())
+                self.assertFalse(webapp.quote_session_is_retired("quote-g3-never-created"))
+
+    def test_local_quote_session_mutation_locks_are_independent_per_session(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            held_id = "quote-g3-held-session"
+            independent_id = "quote-g3-independent"
+            held_payload, held_result, held_output = self._local_publication_case(
+                root,
+                held_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-held\n%%EOF\n",
+                variant="held",
+            )
+            independent_payload, independent_result, independent_output = self._local_publication_case(
+                root,
+                independent_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-independent\n%%EOF\n",
+                variant="independent",
+            )
+            held_entered = threading.Event()
+            held_release = threading.Event()
+            independent_done = threading.Event()
+            results = {}
+            original_stage = webapp.stage_local_quote_publication
+
+            def pause_only_held(session_id, *args, **kwargs):
+                if session_id == held_id:
+                    held_entered.set()
+                    if not held_release.wait(5):
+                        raise AssertionError("Timed out waiting to release held session.")
+                return original_stage(session_id, *args, **kwargs)
+
+            def run_independent():
+                try:
+                    results["independent"] = webapp.create_or_update_quote_session(
+                        independent_payload,
+                        result=independent_result,
+                        output_dir=independent_output,
+                    )
+                except Exception as exc:
+                    results["independent"] = exc
+                finally:
+                    independent_done.set()
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root), mock.patch.object(
+                webapp,
+                "stage_local_quote_publication",
+                side_effect=pause_only_held,
+            ):
+                held_thread = threading.Thread(
+                    target=lambda: results.setdefault(
+                        "held",
+                        webapp.create_or_update_quote_session(
+                            held_payload,
+                            result=held_result,
+                            output_dir=held_output,
+                        ),
+                    )
+                )
+                held_thread.start()
+                self.assertTrue(held_entered.wait(5), "Held session did not reach its staging boundary.")
+
+                independent_thread = threading.Thread(target=run_independent)
+                independent_thread.start()
+                self.assertTrue(independent_done.wait(5), "Independent session was blocked by another session's mutation.")
+                self.assertIsInstance(results["independent"], dict)
+
+                held_release.set()
+                held_thread.join(timeout=5)
+                independent_thread.join(timeout=5)
+            self.assertFalse(held_thread.is_alive(), "Held session thread remained blocked.")
+            self.assertFalse(independent_thread.is_alive(), "Independent session thread remained blocked.")
+            self.assertIsInstance(results["held"], dict)
+
+    def test_g3_c1_case_equivalent_deleted_alias_remains_retired_after_restart(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            owner_id = "quote-G3-MixedOwner"
+            alias_id = "quote-" + owner_id[len("quote-"):].swapcase()
+            self.assertNotEqual(owner_id, alias_id)
+            owner_payload = valid_payload()
+            owner_payload["quote_session"] = {"session_id": owner_id}
+            alias_payload = valid_payload()
+            alias_payload["quote_session"] = {"session_id": alias_id}
+            alias_publication_payload, alias_result, alias_output = self._local_publication_case(
+                root,
+                alias_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-c1-alias\n%%EOF\n",
+                variant="alias",
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                capability = webapp._quote_session_filesystem_capability()
+                if not capability["case_insensitive"]:
+                    self.skipTest("C1 requires an actual case-insensitive session-storage filesystem.")
+                webapp.create_or_update_quote_session(owner_payload)
+                self.assertTrue(webapp.delete_quote_session(owner_id))
+                self.assertFalse((data_root / "quote-sessions" / owner_id).exists())
+
+                with self.assertRaises(webapp.SqagStorageAccessError) as save_error:
+                    webapp.create_or_update_quote_session(alias_payload)
+                self.assertEqual(save_error.exception.status, 409)
+                self.assertEqual(save_error.exception.reason, "quote_session_retired")
+                with self.assertRaises(webapp.SqagStorageAccessError) as publish_error:
+                    webapp.create_or_update_quote_session(
+                        alias_publication_payload,
+                        result=alias_result,
+                        output_dir=alias_output,
+                    )
+                self.assertEqual(publish_error.exception.status, 409)
+                self.assertEqual(publish_error.exception.reason, "quote_session_retired")
+                self.assertIsNone(webapp.get_quote_session(alias_id))
+                self.assertFalse((data_root / "quote-sessions" / alias_id).exists())
+
+                marker_path = data_root / webapp.QUOTE_SESSION_RETIRED_MARKER_FILENAME
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                marker["session_ids"].append("quote-G3-HistoricalMixed")
+                marker_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as historical_error:
+                    historical = "quote-" + "quote-G3-HistoricalMixed"[len("quote-"):].swapcase()
+                    historical_payload = valid_payload()
+                    historical_payload["quote_session"] = {"session_id": historical}
+                    webapp.create_or_update_quote_session(historical_payload)
+                self.assertEqual(historical_error.exception.status, 409)
+                self.assertEqual(historical_error.exception.reason, "quote_session_retired")
+
+                with LocalRunnerServer() as runner:
+                    detail = local_http_get_json(runner, f"/api/quote-sessions/{alias_id}")
+                    self.assertEqual(detail[0], 404)
+                    download_status, _download_body = local_http_get_bytes(
+                        runner,
+                        f"/api/quote-sessions/{alias_id}/download/xlsx",
+                    )
+                    self.assertEqual(download_status, 404)
+
+                with webapp.QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_MUTATION_LOCKS.clear()
+                with webapp.QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+                    webapp.QUOTE_SESSION_RETIREMENT_LOCKS.clear()
+                with self.assertRaises(webapp.SqagStorageAccessError) as restarted_error:
+                    webapp.create_or_update_quote_session(alias_payload)
+                self.assertEqual(restarted_error.exception.status, 409)
+                self.assertEqual(restarted_error.exception.reason, "quote_session_retired")
+
+    def test_g3_c2_case_equivalent_active_aliases_serialize_and_reject(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            owner_id = "quote-G3-ActiveOwner"
+            alias_id = "quote-" + owner_id[len("quote-"):].swapcase()
+            owner_payload, owner_result, owner_output = self._local_publication_case(
+                root,
+                owner_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-c2-owner\n%%EOF\n",
+                variant="owner",
+            )
+            alias_payload, alias_result, alias_output = self._local_publication_case(
+                root,
+                alias_id,
+                KONCEPT_LAYOUT.read_bytes(),
+                b"%PDF-1.4\nsynthetic-g3-c2-alias\n%%EOF\n",
+                variant="alias",
+            )
+            owner_entered = threading.Event()
+            owner_release = threading.Event()
+            alias_done = threading.Event()
+            results = {}
+            original_stage = webapp.stage_local_quote_publication
+
+            def hold_owner(session_id, *args, **kwargs):
+                if session_id == owner_id:
+                    owner_entered.set()
+                    if not owner_release.wait(5):
+                        raise AssertionError("Timed out waiting to release the exact owner.")
+                return original_stage(session_id, *args, **kwargs)
+
+            def run_alias():
+                try:
+                    results["alias"] = webapp.create_or_update_quote_session(
+                        alias_payload,
+                        result=alias_result,
+                        output_dir=alias_output,
+                    )
+                except Exception as exc:
+                    results["alias"] = exc
+                finally:
+                    alias_done.set()
+
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                capability = webapp._quote_session_filesystem_capability()
+                if not capability["case_insensitive"]:
+                    self.skipTest("C2 requires an actual case-insensitive session-storage filesystem.")
+                with mock.patch.object(webapp, "stage_local_quote_publication", side_effect=hold_owner):
+                    owner_thread = threading.Thread(
+                        target=lambda: results.setdefault(
+                            "owner",
+                            webapp.create_or_update_quote_session(
+                                owner_payload,
+                                result=owner_result,
+                                output_dir=owner_output,
+                            ),
+                        )
+                    )
+                    owner_thread.start()
+                    self.assertTrue(owner_entered.wait(5), "Exact owner did not reach the staging barrier.")
+                    alias_thread = threading.Thread(target=run_alias)
+                    alias_thread.start()
+                    self.assertFalse(alias_done.wait(0.25), "Equivalent alias entered mutation before owner release.")
+                    owner_release.set()
+                    owner_thread.join(timeout=5)
+                    alias_thread.join(timeout=5)
+                self.assertFalse(owner_thread.is_alive())
+                self.assertFalse(alias_thread.is_alive())
+                self.assertIsInstance(results["owner"], dict)
+                self.assertIsInstance(results["alias"], webapp.SqagStorageAccessError)
+                self.assertEqual(results["alias"].status, 409)
+                self.assertEqual(results["alias"].reason, "quote_session_alias")
+                self.assertEqual(webapp.read_quote_session_metadata(owner_id)["session_id"], owner_id)
+                self.assertIsNone(webapp.get_quote_session(alias_id))
+
+                first_id = "quote-G3-RaceOwner"
+                second_id = "quote-" + first_id[len("quote-"):].swapcase()
+                first_payload, first_result, first_output = self._local_publication_case(
+                    root,
+                    first_id,
+                    KONCEPT_LAYOUT.read_bytes(),
+                    b"%PDF-1.4\nsynthetic-g3-c2-race-first\n%%EOF\n",
+                    variant="race-first",
+                )
+                second_payload, second_result, second_output = self._local_publication_case(
+                    root,
+                    second_id,
+                    KONCEPT_LAYOUT.read_bytes(),
+                    b"%PDF-1.4\nsynthetic-g3-c2-race-second\n%%EOF\n",
+                    variant="race-second",
+                )
+                race_results = {}
+
+                def run_race(key, payload, result, output):
+                    try:
+                        race_results[key] = webapp.create_or_update_quote_session(
+                            payload,
+                            result=result,
+                            output_dir=output,
+                        )
+                    except Exception as exc:
+                        race_results[key] = exc
+
+                first_thread = threading.Thread(target=run_race, args=("first", first_payload, first_result, first_output))
+                second_thread = threading.Thread(target=run_race, args=("second", second_payload, second_result, second_output))
+                first_thread.start()
+                second_thread.start()
+                first_thread.join(timeout=5)
+                second_thread.join(timeout=5)
+                self.assertFalse(first_thread.is_alive())
+                self.assertFalse(second_thread.is_alive())
+                self.assertEqual(
+                    sum(isinstance(value, dict) for value in race_results.values()),
+                    1,
+                )
+                self.assertEqual(
+                    sum(isinstance(value, webapp.SqagStorageAccessError) and value.reason == "quote_session_alias" for value in race_results.values()),
+                    1,
+                )
+
+    def test_g3_c3_public_spelling_and_case_sensitive_compatibility(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            data_root = Path(tmp) / "data"
+            exact_id = "quote-G3-PublicSpelling"
+            case_variant = "quote-" + exact_id[len("quote-"):].swapcase()
+            fresh_id = "quote-g3-independent-fresh"
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                capability = webapp._quote_session_filesystem_capability()
+                first = valid_payload()
+                first["quote_session"] = {"session_id": exact_id}
+                fresh = valid_payload()
+                fresh["quote_session"] = {"session_id": fresh_id}
+                webapp.create_or_update_quote_session(first)
+                webapp.create_or_update_quote_session(fresh)
+                self.assertEqual(webapp.get_quote_session(exact_id)["session_id"], exact_id)
+                self.assertEqual(webapp.get_quote_session(fresh_id)["session_id"], fresh_id)
+                listed_ids = {item["session_id"] for item in webapp.list_quote_sessions()}
+                self.assertIn(exact_id, listed_ids)
+                self.assertIn(fresh_id, listed_ids)
+                if capability["case_insensitive"]:
+                    variant_payload = valid_payload()
+                    variant_payload["quote_session"] = {"session_id": case_variant}
+                    with self.assertRaises(webapp.SqagStorageAccessError) as alias_error:
+                        webapp.create_or_update_quote_session(variant_payload)
+                    self.assertEqual(alias_error.exception.reason, "quote_session_alias")
+                else:
+                    variant_payload = valid_payload()
+                    variant_payload["quote_session"] = {"session_id": case_variant}
+                    webapp.create_or_update_quote_session(variant_payload)
+                    self.assertEqual(webapp.get_quote_session(case_variant)["session_id"], case_variant)
+                    self.assertEqual(webapp.read_quote_session_metadata(exact_id)["session_id"], exact_id)
+                    self.assertEqual(webapp.read_quote_session_metadata(case_variant)["session_id"], case_variant)
 
     def test_protected_deploy_quote_session_routes_block_local_runtime_storage(self):
         root = test_temp_root() / f"quote-session-protected-deploy-{time.time_ns()}"
@@ -30905,6 +31725,221 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                     )
                     self.assertEqual(webapp.normalize_line_items(mismatched, auth_session=workspace_a_session), [])
 
+    def test_sqag212_database_commercial_validation_keeps_requesting_auth_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag212-commercial.sqlite3').as_posix()}"
+            reference_id = "sqag212-company-pricing"
+            profile_id = "sqag212-company-profile"
+            workspace_a_session = self.platform_auth_session("workspace-sqag212-a", membership_role="admin")
+            workspace_b_session = self.platform_auth_session("workspace-sqag212-b", membership_role="admin")
+            env = {
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                workspace_a = webapp.app_storage_for_auth_session(workspace_a_session)
+                workspace_a.save_profile(workspace_profile_with_layout(profile_id))
+                workspace_a.save_pricing_reference(workspace_pricing_reference(reference_id))
+                reference = workspace_a.pricing_reference_detail(reference_id, source="company")
+                self.assertIsNotNone(reference)
+
+                def owned_payload(raw_rows):
+                    payload = payload_with_workspace_pricing(reference_id)
+                    payload["profile_id"] = profile_id
+                    payload["profile_source"] = "company"
+                    payload["quote_company_profile"] = {"id": profile_id, "source": "company"}
+                    payload["pricing_reference"] = {
+                        "id": reference_id,
+                        "source": "company",
+                        "currency": reference["currency"],
+                        "tax": copy.deepcopy(reference["tax"]),
+                    }
+                    payload["line_items"] = copy.deepcopy(raw_rows)
+                    normalized = webapp.normalize_line_items(payload, auth_session=workspace_a_session)
+                    payload["line_items"] = normalized
+                    authority = webapp.exact_pricing_reference_authority(payload, auth_session=workspace_a_session)
+                    self.assertTrue(authority["ok"], authority.get("reason"))
+                    details = {
+                        "quote_date": payload["quote_date"],
+                        "project_number": payload["project_number"],
+                        "client": copy.deepcopy(payload["client"]),
+                        "project": copy.deepcopy(payload["project"]),
+                        "company": copy.deepcopy(payload["company"]),
+                        "currency": reference["currency"],
+                        "exchange_rate": 1,
+                        "tax": copy.deepcopy(reference["tax"]),
+                        "quote_text": copy.deepcopy(payload["quote_text"]),
+                        "signature": copy.deepcopy(payload["signature"]),
+                        "rich_text": copy.deepcopy(payload["rich_text"]),
+                    }
+                    details["commercial_snapshot"] = {
+                        "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA,
+                        "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+                        "owner": "quote",
+                        "lifecycle": "EXISTING",
+                        "origin": "captured",
+                        "presence": {
+                            key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                            for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
+                        },
+                        "pricing_basis": {
+                            "currency": reference["currency"],
+                            "source": "company",
+                            "id": reference_id,
+                            "digest": authority["detail"]["digest_sha256"],
+                        },
+                    }
+                    payload["quote_session"] = {
+                        "session_id": "quote-sqag212-commercial",
+                        "draft_state": {
+                            "quoteCommercialLifecycle": "EXISTING",
+                            "quoteCommercialReview": None,
+                            "quoteDetails": details,
+                        },
+                    }
+                    return payload
+
+                catalog_row = {
+                    "section": "Graphics",
+                    "quantity": 2,
+                    "unit": "sqm",
+                    "description": "Workspace printed graphics",
+                    "pricing_keyword": "workspace-row",
+                }
+                payload = owned_payload([catalog_row])
+                state = webapp.quote_commercial_state(payload)
+                self.assertFalse(state["review_required"])
+                self.assertIsNone(payload["quote_session"]["draft_state"]["quoteCommercialReview"])
+                canonical = webapp.quote_commercial_payload(payload)
+                authenticated_rows = webapp.normalize_line_items(canonical, auth_session=workspace_a_session)
+                sessionless_rows = webapp.normalize_line_items(canonical)
+                self.assertEqual(len(authenticated_rows), 1)
+                self.assertEqual(authenticated_rows[0]["pricing_authority"]["variant"], "catalog")
+                self.assertEqual(sessionless_rows, [])
+                self.assertEqual(webapp.quote_commercial_state_errors(payload, state, auth_session=workspace_a_session), [])
+                self.assertEqual(webapp.validate_generation_payload(payload, auth_session=workspace_a_session), [])
+                brief = webapp.payload_to_brief(payload, auth_session=workspace_a_session)
+                self.assertEqual(brief["line_items"][0]["pricing_authority"]["variant"], "catalog")
+
+                valid_rows = (
+                    ("catalog", catalog_row, "catalog"),
+                    ("manual", {
+                        "section": "Custom",
+                        "quantity": 2,
+                        "unit": "nos",
+                        "description": "Operator-approved custom row",
+                        "pricing_keyword": "custom-not-in-catalog",
+                        "unit_price_override": 37,
+                    }, "manual"),
+                    ("manual zero", {
+                        "section": "Custom",
+                        "quantity": 2,
+                        "unit": "nos",
+                        "description": "Operator-approved zero-price row",
+                        "pricing_keyword": "custom-zero-not-in-catalog",
+                        "unit_price_override": 0,
+                    }, "manual"),
+                    ("included", {
+                        "section": "Custom",
+                        "quantity": 1,
+                        "unit": "lot",
+                        "description": "Included coordination",
+                        "price_mode": "Included",
+                        "unit_price_override": 999,
+                        "catalog_unit_price": 999,
+                    }, "included"),
+                )
+                for label, raw_row, expected_variant in valid_rows:
+                    with self.subTest(label=label):
+                        candidate = owned_payload([raw_row])
+                        [normalized] = webapp.normalize_line_items(
+                            webapp.quote_commercial_payload(candidate),
+                            auth_session=workspace_a_session,
+                        )
+                        self.assertEqual(normalized["pricing_authority"]["variant"], expected_variant)
+                        self.assertEqual(webapp.quote_commercial_state_errors(candidate, auth_session=workspace_a_session), [])
+                        self.assertEqual(webapp.validate_generation_payload(candidate, auth_session=workspace_a_session), [])
+                        webapp.payload_to_brief(candidate, auth_session=workspace_a_session)
+                zero_price = owned_payload([valid_rows[2][1]])
+                self.assertEqual(zero_price["line_items"][0]["pricing_authority"]["price"], 0)
+
+                def assert_blocked(label, candidate, auth_session=workspace_a_session, *, authority_error=False):
+                    with self.subTest(blocked=label):
+                        self.assertIn(
+                            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                            webapp.quote_commercial_state_errors(candidate, auth_session=auth_session),
+                        )
+                        if authority_error:
+                            self.assertEqual(
+                                webapp.pricing_reference_authority_error(candidate, auth_session=auth_session),
+                                webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                            )
+                        self.assertIn(
+                            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                            webapp.validate_generation_payload(candidate, auth_session=auth_session),
+                        )
+                        with self.assertRaises(webapp.QuoteCommercialStateError) as raised:
+                            webapp.payload_to_brief(candidate, auth_session=auth_session)
+                        self.assertEqual(str(raised.exception), webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+
+                unresolved = copy.deepcopy(payload)
+                unresolved["line_items"] = [{"section": "Unresolved", "quantity": 1, "unit": "nos", "description": "Unresolved row"}]
+                assert_blocked("unresolved row", unresolved)
+
+                for variant in ("historical", "none"):
+                    candidate = copy.deepcopy(payload)
+                    row = candidate["line_items"][0]
+                    row["pricing_authority"] = webapp.build_pricing_authority(variant, row)
+                    assert_blocked(f"{variant} authority", candidate)
+
+                malformed_authority = copy.deepcopy(payload)
+                malformed_authority["line_items"][0]["pricing_authority"] = {"schema": "invalid", "version": 1, "variant": "catalog"}
+                assert_blocked("malformed authority", malformed_authority)
+
+                invalid_override = owned_payload([valid_rows[1][1]])
+                invalid_override["line_items"][0]["unit_price_override"] = "0x10"
+                assert_blocked("invalid numeric override", invalid_override)
+
+                missing_snapshot = copy.deepcopy(payload)
+                missing_snapshot["quote_session"]["draft_state"]["quoteDetails"].pop("commercial_snapshot")
+                assert_blocked("missing snapshot", missing_snapshot, authority_error=True)
+                invalid_snapshot = copy.deepcopy(payload)
+                invalid_snapshot["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"] = {"schema": "invalid"}
+                assert_blocked("invalid snapshot", invalid_snapshot, authority_error=True)
+                lifecycle_mismatch = copy.deepcopy(payload)
+                lifecycle_mismatch["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["lifecycle"] = "NEW_UNINITIALISED"
+                assert_blocked("lifecycle mismatch", lifecycle_mismatch, authority_error=True)
+                active_review = copy.deepcopy(payload)
+                basis = active_review["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]
+                active_review["quote_session"]["draft_state"]["quoteCommercialReview"] = webapp.build_quote_commercial_review(
+                    "pricing_reference_digest_mismatch",
+                    pricing_basis=basis,
+                )
+                assert_blocked("active durable review", active_review, authority_error=True)
+
+                wrong_identity = copy.deepcopy(payload)
+                wrong_identity["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["id"] = "other-company-pricing"
+                assert_blocked("wrong pricing identity", wrong_identity, authority_error=True)
+                wrong_source = copy.deepcopy(payload)
+                wrong_source["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["source"] = "local"
+                assert_blocked("wrong pricing source", wrong_source, authority_error=True)
+                wrong_digest = copy.deepcopy(payload)
+                wrong_digest["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["digest"] = "sha256:" + ("0" * 64)
+                assert_blocked("wrong pricing digest", wrong_digest, authority_error=True)
+                wrong_currency = copy.deepcopy(payload)
+                wrong_currency["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]["currency"] = "USD"
+                assert_blocked("wrong pricing currency", wrong_currency, authority_error=True)
+
+                self.assertFalse(webapp.exact_pricing_reference_authority(payload, auth_session=None)["ok"])
+                self.assertEqual(webapp.normalize_line_items(canonical, auth_session=None), [])
+                assert_blocked("missing auth session", payload, auth_session=None, authority_error=True)
+                self.assertFalse(webapp.exact_pricing_reference_authority(payload, auth_session=workspace_b_session)["ok"])
+                self.assertEqual(webapp.normalize_line_items(canonical, auth_session=workspace_b_session), [])
+                assert_blocked("different workspace", payload, auth_session=workspace_b_session, authority_error=True)
+
     def test_server_pricing_reference_mismatch_returns_durable_review_only_for_established_basis(self):
         reference_id = "repair-review-pricing"
         payload = valid_payload()
@@ -37242,7 +38277,7 @@ main().catch((error) => {
         self.assertNotIn("logo_data_url", resolved_payload["company"])
 
     def test_run_quote_job_uses_explicit_profile_and_local_pricing_reference_roots(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
             profiles_root = root / "profiles"
             pricing_root = root / "pricing-references"
@@ -37266,6 +38301,8 @@ main().catch((error) => {
                 stdout="Wrote quotation.xlsx\nPDF export status: skipped\n",
                 stderr="",
             )
+            expected_catalog_path = str((reference_dir / "pricing-catalog.json").resolve())
+            expected_layout_path = str((profile_dir / "quotation-layout.xlsx").resolve())
             with (
                 mock.patch.object(webapp, "profiles_root", return_value=profiles_root),
                 mock.patch.object(webapp, "pricing_references_root", return_value=pricing_root),
@@ -37275,8 +38312,8 @@ main().catch((error) => {
 
         command = run.call_args.args[0]
         self.assertEqual(result["status"], "completed")
-        self.assertIn(str((reference_dir / "pricing-catalog.json").resolve()), command)
-        self.assertIn(str((profile_dir / "quotation-layout.xlsx").resolve()), command)
+        self.assertEqual(command[command.index("--template") + 1], expected_catalog_path)
+        self.assertEqual(command[command.index("--layout-template") + 1], expected_layout_path)
         self.assertNotIn(str(KONCEPT_CATALOG), command)
         self.assertNotIn(str(KONCEPT_LAYOUT), command)
     def test_exported_quote_company_profile_imports_to_default_company_store(self):
