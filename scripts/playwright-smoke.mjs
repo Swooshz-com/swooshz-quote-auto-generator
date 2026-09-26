@@ -141,6 +141,11 @@ const quoteSessionSessionHeader = "x-sqag-smoke-session-id";
 const quoteSessionPersistenceClassHeader = "x-sqag-smoke-persistence-class";
 const quoteSessionCorrelationHeader = "x-sqag-smoke-correlation-token";
 const quoteSessionQueuedSaveHeader = "x-sqag-smoke-queued-save-id";
+// One application postJson invocation may issue at most two transport attempts (the real
+// 403 -> session refresh -> same-payload retry). Each attempt carries its ordinal and a
+// unique transport identity so Node can hold every attempt inside one invocation.
+const quoteSessionTransportAttemptHeader = "x-sqag-smoke-transport-attempt";
+const quoteSessionTransportIdHeader = "x-sqag-smoke-transport-id";
 const quoteSessionOperationStorageKey = "__sqag_smoke_quote_session_operation_v1";
 const quoteSessionSaveResultsKey = "__sqagSmokeQuoteSessionSaveResults";
 
@@ -490,6 +495,16 @@ function createQuoteSessionDrainTracker(group) {
   const timerEventAckHolds = new WeakMap();
   const timerEventHandlingHolds = new WeakMap();
   const readbackHolds = new Map();
+  // R2B: every successful save must prove its own durable state/files through the authenticated
+  // detail boundary before any later save may explain one of its later readbacks.
+  const pendingOwnProofs = new Set();
+  const ownProofHolds = new Map();
+  // R1B: every application invocation owns its transport attempts; a queued timer identity is
+  // owned by exactly one invocation. Session refreshes are observed to validate a 403 retry.
+  const transportInvocations = new Map();
+  const sessionRefreshes = [];
+  const sessionRefreshByRequest = new WeakMap();
+  let eventSequence = 0;
   const sessionCommitClocks = new Map();
   const observedTimerEventFailures = new Set();
   const issues = [];
@@ -594,6 +609,13 @@ function createQuoteSessionDrainTracker(group) {
 
   const settleQueuedSave = (entry, status, reason = "") => {
     if (!entry || entry.status !== "pending") return;
+    // A duplicate/replay/wrong-generation claim is sticky: no later correlation, successor,
+    // proof, or cleanup may turn this queued save into a success.
+    const sticky = entry.ownership?.sticky || [];
+    if (sticky.length && status !== "superseded") {
+      reason = `sticky request-ownership violation retained (${sticky.map((violation) => violation.verdict).join(", ")}); ${reason}`;
+      if (status === "succeeded") status = "failed";
+    }
     entry.status = status;
     entry.terminalReason = reason;
     entry.completedAt = Date.now();
@@ -634,12 +656,30 @@ function createQuoteSessionDrainTracker(group) {
         terminalResolve,
         transitions: [{ type: supersedes ? "replace" : "create", at: Date.now(), supersedes: String(supersedes || "") }],
         evidence: { postObserved: false, durableReadbackObserved: false },
+        // Exclusive request ownership: queued -> awaiting request -> invocation-owned request
+        // -> independently proven persistence -> succeeded. History is retained after terminal
+        // settlement so replays of this identity stay rejectable.
+        ownership: {
+          state: "awaiting-request",
+          invocationKey: "",
+          ownerRecord: null,
+          currentAttempt: null,
+          claims: [],
+          sticky: [],
+        },
       };
       queuedSaveHistory.set(timerIdentity, entry);
       pendingQueuedSaveWork.set(timerIdentity, entry);
       if (supersedes) {
         const previous = queuedSaveHistory.get(String(supersedes));
-        if (previous?.status === "pending") {
+        const previousInvoked = Boolean(previous && (
+          previous.dispatchedBy || previous.saveInvocationSnapshot || previous.ownership?.ownerRecord || previous.persistenceRecord
+        ));
+        if (previous?.status === "pending" && previousInvoked) {
+          // Queue replacement cannot retire a save that was already invoked and awaits proof.
+          previous.successorIdentity = timerIdentity;
+          previous.transitions.push({ type: "successor-created-while-invoked", at: Date.now(), successor: timerIdentity });
+        } else if (previous?.status === "pending") {
           previous.successorIdentity = timerIdentity;
           previous.transitions.push({ type: "superseded", at: Date.now(), successor: timerIdentity });
           settleQueuedSave(previous, "superseded", "replaced by a newer queued draft save");
@@ -789,59 +829,269 @@ function createQuoteSessionDrainTracker(group) {
     return failures;
   };
 
-  // R2: an older save's readback may legitimately observe a newer same-session save. That is
-  // accepted only when the older save's own commit is proven by its fresh successful server
-  // response, and a later-issued save observed before the readback returned is itself fully
-  // validated, committed after the older save, and is exactly the commit the readback observed.
-  // A failed or unproven older save is never laundered by a successful successor.
+  const requestOwnershipRejected = (record) => String(record?.claim?.verdict || "").startsWith("rejected")
+    || String(record?.correlationState || "").startsWith("rejected");
+
+  // R2B: reasons a save cannot serve as independently proven persistence. HTTP 200, saved=true,
+  // updated_at/commit-clock advancement, a null prior clock, the session id, and any other
+  // save's state/files/success are never proof; only this save's own accepted detail proof is.
+  const persistenceProofIneligibility = (record) => {
+    const reasons = [];
+    if (record?.ownProof?.state !== "accepted") {
+      reasons.push(`own authenticated state/file persistence proof was not accepted (${record?.ownProof?.state || "absent"}: ${record?.ownProof?.reason || ""})`);
+    } else if (record.ownProof.consequential !== true) {
+      reasons.push("own proof did not establish complete consequential draft-state/file equality");
+    }
+    if (requestOwnershipRejected(record)) reasons.push("request-ownership claim was rejected");
+    if (record?.transportVerdict && record.transportVerdict.accepted !== true) reasons.push("transport attempt was not a validated invocation attempt");
+    const entry = record?.queuedEntry;
+    if (entry) {
+      if (entry.ownership.currentAttempt !== record) reasons.push("not the queued save's current owned attempt");
+      if (entry.ownership.sticky.length) reasons.push("queued save carries a sticky request-ownership violation");
+      if (record.correlationState !== "correlated-by-save-invocation-snapshot") reasons.push("invocation correlation was not accepted");
+    }
+    if (issues.some((issue) => issue.operationId === record?.operationId)) reasons.push("save carries a sticky tracker issue");
+    return reasons;
+  };
+
+  // R2: an older save A's later readback may legitimately observe a newer same-session save B.
+  // R2B: that is accepted only when A has already proven itself (accepted own detail proof of its
+  // exact state and files, no sticky failure), B was admitted only after that proof, B passes its
+  // own correlation and own proof independently, and A's readback is exactly B's proven
+  // representation. Commit clocks are ordering evidence only. Nothing about B launders A.
   const findValidatedReadbackSuccessor = async (record, readback, laterRecords) => {
-    const ownClock = quoteSessionCommitClock(record.responseUpdatedAt);
-    const ownCommitProven = !record.transportFailure
-      && record.httpStatus >= 200 && record.httpStatus < 300
-      && record.bodyStatus === "saved"
-      && record.responseSessionId === record.expectedSessionId
-      && record.responseQuoteGenerated === record.expectedQuoteGenerated
-      && ownClock !== null
-      && (record.priorCommitClock === null || ownClock > record.priorCommitClock);
-    if (!ownCommitProven) {
+    const ownIneligibility = persistenceProofIneligibility(record);
+    const ownProofClock = quoteSessionCommitClock(record.ownProof?.readback?.updatedAt);
+    const readbackClock = quoteSessionCommitClock(readback.updatedAt);
+    if (ownIneligibility.length) {
       return {
         successor: null,
-        reason: "older save's own commit was not proven by a fresh successful server response",
-        ownClock,
+        reason: "older save's own persistence proof was not accepted: " + ownIneligibility.join("; "),
+        ownProofState: record.ownProof?.state || "absent",
         priorCommitClock: record.priorCommitClock,
+        readbackClock,
       };
     }
-    const readbackClock = quoteSessionCommitClock(readback.updatedAt);
     const rejected = [];
     for (const candidate of [...laterRecords].reverse()) {
       if (candidate.kind || candidate.method !== "POST" || candidate.persistenceClass === "DIAGNOSTIC_ONLY") continue;
-      if (candidate.expectedSessionId !== record.expectedSessionId || !candidate.payloadDraftState) continue;
+      if (candidate === record || candidate.expectedSessionId !== record.expectedSessionId || !candidate.payloadDraftState) continue;
       if (readback.quoteGenerated !== candidate.expectedQuoteGenerated
         || !quoteSessionValueContains(readback.fields, candidate.expectedFields)
         || JSON.stringify(queuedDraftStateComparable(readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(candidate.payloadDraftState))) continue;
+      if (!(candidate.requestSeq > record.ownProof.acceptedSeq)) {
+        rejected.push({ operationId: candidate.operationId, reason: "admitted before the older save's own proof was accepted" });
+        continue;
+      }
       await candidate.terminalPromise;
-      const candidateClock = quoteSessionCommitClock(candidate.responseUpdatedAt);
+      const candidateIneligibility = persistenceProofIneligibility(candidate);
+      const proven = candidate.ownProof?.readback || null;
+      const candidateProofClock = quoteSessionCommitClock(proven?.updatedAt);
       const checks = {
-        noTransportFailure: !candidate.transportFailure,
-        savedResponse: candidate.httpStatus >= 200 && candidate.httpStatus < 300 && candidate.bodyStatus === "saved",
-        exactSession: candidate.responseSessionId === record.expectedSessionId,
-        committedAfterOlderSave: candidateClock !== null && candidateClock > ownClock,
-        readbackObservedThisCommit: readbackClock !== null && readbackClock === candidateClock,
-        successorReadbackValidated: ["exact", "superseded"].includes(candidate.readbackVerdict),
-        successorHasNoIssues: !issues.some((issue) => issue.operationId === candidate.operationId),
+        successorIndependentlyProven: candidateIneligibility.length === 0,
+        successorQueuedSaveSucceeded: !candidate.queuedEntry || candidate.queuedEntry.status === "succeeded",
+        successorReadbackNotFailed: candidate.readbackVerdict !== "failed",
+        readbackIsSuccessorProvenState: Boolean(proven)
+          && JSON.stringify(queuedDraftStateComparable(readback.draftState)) === JSON.stringify(queuedDraftStateComparable(proven.draftState)),
+        readbackIsSuccessorProvenFiles: Boolean(proven) && Array.isArray(readback.draftFiles) && Array.isArray(proven.draftFiles)
+          && JSON.stringify(queuedDraftFilesComparable(readback.draftFiles)) === JSON.stringify(queuedDraftFilesComparable(proven.draftFiles)),
+        readbackIsSuccessorProvenStatus: Boolean(proven) && readback.quoteGenerated === proven.quoteGenerated,
+        readbackIsSuccessorProvenCommit: Boolean(proven) && readback.updatedAt === proven.updatedAt,
+        // Ordering evidence only: contradictory clocks reject, absent clocks neither waive nor reject.
+        successorOrderingNotContradicted: ownProofClock === null || candidateProofClock === null || candidateProofClock > ownProofClock,
       };
       if (Object.values(checks).every(Boolean)) {
-        return { successor: candidate, ownClock, successorClock: candidateClock, readbackClock };
+        return { successor: candidate, ownClock: ownProofClock, successorClock: candidateProofClock, readbackClock };
       }
-      rejected.push({ operationId: candidate.operationId, checks });
+      rejected.push({ operationId: candidate.operationId, checks, candidateIneligibility });
     }
     return {
       successor: null,
-      reason: "no validated later same-session save explains the observed readback",
-      ownClock,
+      reason: "no independently proven later same-session save explains the observed readback",
+      ownClock: ownProofClock,
       readbackClock,
       rejected,
     };
+  };
+
+  const holdOwnProof = (operationId) => {
+    let reachedResolve;
+    let releaseResolve;
+    const hold = {
+      operationId: String(operationId || ""),
+      reached: new Promise((resolve) => { reachedResolve = resolve; }),
+      gate: new Promise((resolve) => { releaseResolve = resolve; }),
+      reachedResolve: (value) => reachedResolve(value),
+      release: () => releaseResolve(),
+    };
+    ownProofHolds.set(hold.operationId, hold);
+    return hold;
+  };
+
+  const createOwnProofState = (record) => {
+    let resolveSettled;
+    record.ownProof = { state: "pending", reason: "", consequential: false, readback: null, acceptedSeq: 0, settledSeq: 0 };
+    record.ownProofSettled = new Promise((resolve) => { resolveSettled = resolve; });
+    record.resolveOwnProof = (state, reason = "", detail = {}) => {
+      if (record.ownProof.state !== "pending") return record.ownProof;
+      Object.assign(record.ownProof, detail, { state, reason: String(reason || "") });
+      record.ownProof.settledSeq = ++eventSequence;
+      if (state === "accepted") record.ownProof.acceptedSeq = record.ownProof.settledSeq;
+      resolveSettled(record.ownProof);
+      notifyProgress();
+      return record.ownProof;
+    };
+  };
+
+  const detailReadbackFromBody = (httpStatus, body) => {
+    const session = body?.quote_session && typeof body.quote_session === "object" ? body.quote_session : null;
+    return {
+      httpStatus,
+      sessionId: String(session?.session_id || ""),
+      quoteGenerated: typeof session?.status?.quote_generated === "boolean" ? session.status.quote_generated : null,
+      draftState: session?.draft_state && typeof session.draft_state === "object" ? session.draft_state : null,
+      draftFiles: Array.isArray(session?.draft_files) ? session.draft_files : null,
+      fields: quoteSessionActualFields(session),
+      updatedAt: String(session?.updated_at || ""),
+    };
+  };
+
+  // Authenticated (the request's own browser-context session cookies), cache-bypassed read of the
+  // existing detail boundary. The result reflects durable server state, never the echoed payload.
+  const authenticatedDetailRead = async (record, signal) => {
+    const origin = new URL(record.request.url()).origin;
+    const context = record.page?.context?.() || null;
+    const cookies = context ? await context.cookies(origin) : [];
+    const headers = { "cache-control": "no-cache", pragma: "no-cache" };
+    if (cookies.length) headers.cookie = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+    const url = `${origin}/api/quote-sessions/${encodeURIComponent(record.expectedSessionId)}?__sqag_smoke_own_proof=${Date.now()}-${records.length}`;
+    const response = await fetch(url, { cache: "no-store", headers, signal });
+    const text = await response.text();
+    let body = null;
+    try { body = JSON.parse(text); } catch { body = null; }
+    return detailReadbackFromBody(response.status, body);
+  };
+
+  const ownProofEvaluation = (record, readback) => {
+    const exactFailures = [];
+    if (readback.httpStatus !== 200 || readback.sessionId !== record.expectedSessionId) exactFailures.push("authenticated detail did not return the exact saved session");
+    if (!quoteSessionValueContains(readback.fields, record.expectedFields)) exactFailures.push("authenticated detail lost expected saved fields");
+    if (typeof record.expectedQuoteGenerated === "boolean" && readback.quoteGenerated !== record.expectedQuoteGenerated) {
+      exactFailures.push("authenticated detail had the wrong quote_generated state");
+    }
+    const consequentialFailures = [];
+    if (record.payloadDraftState && JSON.stringify(queuedDraftStateComparable(readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(record.payloadDraftState))) {
+      consequentialFailures.push("authenticated detail draft state did not equal this save's consequential draft state; fields="
+        + queuedDraftStateDiffKeys(readback.draftState, record.payloadDraftState).join(","));
+    }
+    if (Array.isArray(record.payloadDraftFiles) && (!Array.isArray(readback.draftFiles)
+      || JSON.stringify(queuedDraftFilesComparable(readback.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles)))) {
+      consequentialFailures.push("authenticated detail files did not match this save's file identity/metadata/content; expected="
+        + JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles)) + "; actual=" + JSON.stringify(queuedDraftFilesComparable(readback.draftFiles)));
+    }
+    return { exactFailures, consequentialFailures };
+  };
+
+  // A validated 403 retry must be backed by the real session refresh it observed: the refresh
+  // returned a token, the retry carried exactly that token, and the first attempt did not.
+  // Only digests are compared; no credential value is retained or reported.
+  const verifyRetryRefreshEvidence = async (record) => {
+    const previous = record.retryOf;
+    const refresh = record.retryRefresh;
+    if (!previous || !refresh) return { passed: false, reason: "retry has no observed first attempt or refresh" };
+    const [refreshBody] = await Promise.all([refresh.bodyEvidence, previous.bodyObservedPromise]);
+    const header = String(refreshBody?.csrfHeader || "").toLowerCase();
+    const checks = {
+      refreshReturnedSessionToken: refreshBody?.ok === true && Boolean(header) && Boolean(refreshBody.tokenDigest) && refreshBody.recoveryScopePresent === true,
+      retryCarriedRefreshedToken: Boolean(header) && record.credentialDigests[header] === refreshBody?.tokenDigest,
+      firstAttemptCarriedStaleToken: Boolean(header) && previous.credentialDigests[header] !== refreshBody?.tokenDigest,
+      firstAttemptRealServerRejection: previous.httpStatus === 403 && previous.bodyStatus === "blocked",
+    };
+    return { passed: Object.values(checks).every(Boolean), checks };
+  };
+
+  const rejectTransportAttempt = (record, reason) => {
+    record.transportVerdict = { ...(record.transportVerdict || {}), accepted: false, reason: String(reason) };
+    const entry = record.queuedEntry;
+    if (entry) {
+      const violation = { operationId: record.operationId, transportId: record.transportId, verdict: "rejected-invalid-retry", reason: String(reason), requestSeq: record.requestSeq };
+      entry.ownership.sticky.push(violation);
+      entry.transitions.push({ type: "request-ownership-violation", at: Date.now(), ...violation });
+    }
+    addIssue(record, `queued save transport attempt rejected: ${reason}`);
+  };
+
+  const proveOwnPersistence = async (record) => {
+    if (record.ownProof.state !== "pending") return record.ownProof;
+    if (requestOwnershipRejected(record)) return record.resolveOwnProof("ineligible", "rejected request-ownership claim cannot mint persistence proof");
+    if (record.transportVerdict && record.transportVerdict.accepted !== true) {
+      return record.resolveOwnProof("ineligible", "unvalidated transport attempt cannot mint persistence proof");
+    }
+    if (record.transportFailure || record.httpStatus < 200 || record.httpStatus >= 300 || record.bodyStatus !== "saved"
+      || record.responseSessionId !== record.expectedSessionId) {
+      return record.resolveOwnProof("ineligible", `HTTP ${record.httpStatus} response was not a successful exact saved result and provides no persistence proof`);
+    }
+    const abort = new AbortController();
+    record.ownProofAbort = abort;
+    const aborted = new Promise((resolve) => abort.signal.addEventListener("abort", resolve, { once: true }));
+    pendingOwnProofs.add(record);
+    const proof = (async () => {
+      const hold = ownProofHolds.get(record.operationId);
+      if (hold) {
+        ownProofHolds.delete(record.operationId);
+        hold.reachedResolve({ operationId: record.operationId });
+        await Promise.race([hold.gate, aborted]);
+      }
+      if (abort.signal.aborted) throw new Error("own-proof aborted");
+      if (record.transportVerdict?.role === "retry") {
+        const evidence = await Promise.race([verifyRetryRefreshEvidence(record), aborted.then(() => null)]);
+        if (abort.signal.aborted) throw new Error("own-proof aborted");
+        record.retryEvidence = { ...(record.retryEvidence || {}), body: evidence };
+        if (!evidence.passed) {
+          rejectTransportAttempt(record, "403 retry was not backed by the real refreshed session: " + JSON.stringify(evidence.checks || evidence.reason));
+          return record.resolveOwnProof("ineligible", "unvalidated retry cannot mint persistence proof");
+        }
+      }
+      const readback = await authenticatedDetailRead(record, AbortSignal.any([abort.signal, AbortSignal.timeout(15000)]));
+      const { exactFailures, consequentialFailures } = ownProofEvaluation(record, readback);
+      // Saves bound to a queued identity must prove complete consequential state/files; other
+      // required saves keep their existing proof floor but record whether they could be a successor.
+      const failures = record.queuedSaveIdentity ? [...exactFailures, ...consequentialFailures] : exactFailures;
+      const detail = { readback, consequential: exactFailures.length === 0 && consequentialFailures.length === 0, consequentialFailures };
+      if (failures.length) {
+        record.resolveOwnProof("failed", failures.join("; "), detail);
+        addIssue(record, `own persistence proof failed: ${failures.join("; ")}`);
+      } else {
+        record.resolveOwnProof("accepted", "exact authenticated durable state/file proof", detail);
+      }
+      return record.ownProof;
+    })();
+    record.ownProofProducer = proof;
+    try {
+      return await proof;
+    } catch (error) {
+      if (abort.signal.aborted) {
+        record.resolveOwnProof("aborted", record.ownProofAbortReason || "own-proof wait aborted");
+        addIssue(record, `own persistence proof aborted: ${record.ownProofAbortReason || "page lifecycle"}`);
+      } else {
+        record.resolveOwnProof("failed", `authenticated detail proof failed: ${error?.message || error}`);
+        addIssue(record, `own persistence proof failed: ${error?.message || error}`);
+      }
+      return record.ownProof;
+    } finally {
+      pendingOwnProofs.delete(record);
+      notifyProgress();
+    }
+  };
+
+  // A proof wait bound to a queued save must not outlive its page/document: abort it so the
+  // save fails with the lifecycle loss instead of leaving an orphaned proof gate.
+  const abortOwnProofsForPage = (page, reason) => {
+    for (const record of [...pendingOwnProofs]) {
+      if (record.page !== page || !record.queuedSaveIdentity) continue;
+      record.ownProofAbortReason = String(reason || "page lifecycle ended");
+      record.ownProofAbort?.abort();
+    }
   };
 
   const holdDurableReadback = (operationId) => {
@@ -947,6 +1197,7 @@ function createQuoteSessionDrainTracker(group) {
     record.responseQuoteGenerated = typeof responseSession?.status?.quote_generated === "boolean"
       ? responseSession.status.quote_generated : null;
     record.responseUpdatedAt = String(responseSession?.updated_at || "");
+    record.resolveBodyObserved?.();
     if (record.kind === "list") {
       pendingRequiredRequests.delete(record);
       notifyProgress();
@@ -979,11 +1230,35 @@ function createQuoteSessionDrainTracker(group) {
       return;
     }
     if (record.persistenceClass === "DIAGNOSTIC_ONLY") return;
+    if (requestOwnershipRejected(record)) {
+      // A rejected request-ownership claim (duplicate, replay, wrong generation, invalid retry)
+      // can never mint persistence proof or successor evidence; its violation is already sticky.
+      record.resolveOwnProof("ineligible", "rejected request-ownership claim cannot mint persistence proof");
+      pendingRequiredRequests.delete(record);
+      pendingSavePromises.delete(record);
+      record.readbackVerdict = "ineligible-rejected-claim";
+      notifyProgress();
+      return;
+    }
+    // R2B: prove this save's own durable state/files immediately after its response, before any
+    // later save can be admitted as the explanation of one of its later readbacks.
+    await proveOwnPersistence(record);
     const clientResult = await readClientResult(record.request, record.operationId);
     record.clientResult = clientResult;
     pendingRequiredRequests.delete(record);
     pendingSavePromises.delete(record);
     notifyProgress();
+    if (record.httpStatus === 403 && record.transportVerdict?.role === "initial" && record.transportVerdict.accepted === true) {
+      // R1B: the real 403 -> refresh -> same-payload retry is one invocation with two transport
+      // attempts. The first attempt proves nothing; only a validated final retry may prove.
+      const retry = record.invocation?.attempts.find((attempt) => attempt !== record && attempt.transportVerdict?.role === "retry");
+      if (retry) await Promise.race([retry.ownProofSettled, retry.terminalPromise]);
+      if (retry?.transportVerdict?.accepted === true) {
+        record.transportOutcome = "superseded-by-validated-retry";
+        record.readbackVerdict = "not-applicable-retried-transport-attempt";
+        return;
+      }
+    }
     if (record.httpStatus < 200 || record.httpStatus >= 300) addIssue(record, `required save returned HTTP ${record.httpStatus}`);
     if (record.bodyStatus !== "saved") addIssue(record, "required save response body status was not saved");
     if (!responseSession || record.responseSessionId !== record.expectedSessionId) {
@@ -1017,6 +1292,159 @@ function createQuoteSessionDrainTracker(group) {
     if (record.payloadDraftFiles === null) return true;
     if (!Array.isArray(record.payloadDraftFiles)) return false;
     return JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles)) === JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles));
+  };
+
+  // Request headers (whatever the configured session-token header is named) are retained only as
+  // SHA-256 digests so retry evidence can be compared without holding or reporting any value.
+  const credentialHeaderDigests = (headers) => Object.fromEntries(Object.entries(headers || {})
+    .filter(([name]) => !name.toLowerCase().startsWith("x-sqag-smoke-"))
+    .map(([name, value]) => [name.toLowerCase(), createHash("sha256").update(String(value || "")).digest("hex")]));
+
+  const refreshBetween = (previous, record) => sessionRefreshes.find((refresh) => (
+    refresh.pageIdentity === record.pageIdentity
+    && refresh.requestSeq > previous.responseSeq
+    && refresh.responseSeq > 0
+    && refresh.responseSeq < record.requestSeq
+    && refresh.responseStatus === 200
+  )) || null;
+
+  // R1B: one application invocation (page + operation id) owns at most two transport attempts:
+  // an initial attempt and one retry after a real pre-persistence 403 and a real session refresh.
+  const registerTransportAttempt = (record) => {
+    const key = `${record.pageIdentity}/${record.operationId}`;
+    const invocation = transportInvocations.get(key) || null;
+    record.invocation = invocation;
+    if (record.transportAttempt === 1) {
+      if (invocation) {
+        record.transportVerdict = { accepted: false, role: "duplicate-initial", reason: "invocation already issued its initial transport attempt" };
+        return;
+      }
+      const created = { key, operationId: record.operationId, pageIdentity: record.pageIdentity, attempts: [record] };
+      transportInvocations.set(key, created);
+      record.invocation = created;
+      record.transportVerdict = { accepted: true, role: "initial" };
+      return;
+    }
+    if (!invocation) {
+      record.transportVerdict = { accepted: false, role: "retry", reason: "retry attempt has no initial attempt in the same invocation" };
+      return;
+    }
+    const previous = invocation.attempts[invocation.attempts.length - 1];
+    const refresh = previous.responseSeq ? refreshBetween(previous, record) : null;
+    const checks = {
+      singleRetryAfterInitial: invocation.attempts.length === 1 && record.transportAttempt === 2,
+      previousAcceptedInitial: previous.transportVerdict?.accepted === true && previous.transportVerdict.role === "initial",
+      previousResponseObserved: Number(previous.responseSeq) > 0,
+      previousServerRejected403: previous.responseStatus === 403,
+      previousProvidedNoProof: previous.ownProof?.state !== "accepted",
+      noOverlappingAttempt: Number(previous.responseSeq) > 0 && previous.responseSeq < record.requestSeq,
+      samePage: previous.pageIdentity === record.pageIdentity,
+      sameSession: previous.expectedSessionId === record.expectedSessionId,
+      samePayload: previous.postData === record.postData,
+      sameQueuedIdentity: previous.queuedSaveIdentity === record.queuedSaveIdentity,
+      realSessionRefreshBetweenAttempts: Boolean(refresh),
+    };
+    record.retryEvidence = { checks };
+    if (!Object.values(checks).every(Boolean)) {
+      record.transportVerdict = {
+        accepted: false,
+        role: "retry",
+        reason: "retry was not a single same-payload attempt after a real 403 and refresh: "
+          + Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name).join(","),
+      };
+      return;
+    }
+    record.retryOf = previous;
+    record.retryRefresh = refresh;
+    invocation.attempts.push(record);
+    record.transportVerdict = { accepted: true, role: "retry" };
+  };
+
+  // R1B: exclusive request ownership for one queued timer identity. The first real exact-identity
+  // POST becomes the owned request (provisionally, until save-start supplies the save-invocation
+  // snapshot). Every later claim is either that invocation's one validated retry or a sticky
+  // violation; no later claim is ever compared with queue-time state, replaces the owner or its
+  // producer, or completes the queued save. Terminal entries keep rejecting replays.
+  const admitQueuedSaveClaim = (entry, record) => {
+    const claim = { operationId: record.operationId, transportId: record.transportId, transportAttempt: record.transportAttempt, requestSeq: record.requestSeq, comparedSnapshot: "none" };
+    const reject = (verdict, reason) => {
+      record.correlationState = verdict;
+      record.claim = { ...claim, verdict, reason };
+      if (entry) {
+        entry.ownership.claims.push(record.claim);
+        entry.ownership.sticky.push({ operationId: record.operationId, transportId: record.transportId, verdict, reason, requestSeq: record.requestSeq });
+        entry.transitions.push({ type: "request-ownership-violation", at: Date.now(), verdict, operationId: record.operationId });
+      }
+      addIssue(record, `queued save request ownership violation (${verdict}): ${reason}`);
+      record.resolveOwnProof("ineligible", "rejected request-ownership claim cannot mint persistence proof");
+      notifyProgress();
+      return false;
+    };
+    if (!entry) return reject("rejected-unknown-identity", "claimed queued save identity is unknown");
+    if (entry.status !== "pending") return reject("rejected-terminal-replay", `claimed queued save is already terminal (${entry.status})`);
+    const ownership = entry.ownership;
+    if (!ownership.ownerRecord) {
+      if (record.transportVerdict?.accepted !== true || record.transportVerdict.role !== "initial") {
+        return reject("rejected-wrong-generation", "first claim was not the initial transport attempt of a fresh invocation: " + String(record.transportVerdict?.reason || ""));
+      }
+      ownership.ownerRecord = record;
+      ownership.currentAttempt = record;
+      ownership.invocationKey = record.invocation.key;
+      record.queuedEntry = entry;
+      if (!entry.saveInvocationSnapshot) {
+        // R1: Node can observe the POST before the save-start event carrying the authoritative
+        // save-invocation snapshot. Keep this request provisionally owned and judge it against that
+        // snapshot when it arrives; never against the stale queue-time snapshot.
+        record.correlationState = "awaiting-save-invocation-snapshot";
+        ownership.state = "provisional-owned";
+        entry.correlationPendingRecord = record;
+        entry.correlationEvidence = { order: "post-before-save-start", operationId: record.operationId };
+        entry.transitions.push({ type: "post-observed-before-save-start", at: Date.now(), operationId: record.operationId });
+      } else if (!queuedSaveMatchesRecord(entry, record)) {
+        record.correlationState = "rejected";
+        record.claim = { ...claim, comparedSnapshot: "save-invocation", verdict: "rejected-save-invocation-mismatch" };
+        ownership.claims.push(record.claim);
+        ownership.state = "rejected";
+        addIssue(record, "queued save request identity did not match its captured session, state, files, and required status: "
+          + JSON.stringify(queuedSaveMismatchSummary(entry, record)));
+        record.resolveOwnProof("ineligible", "request did not match its save-invocation snapshot");
+        settleQueuedSave(entry, "failed", "correlated POST did not match the captured queued save");
+        return false;
+      } else {
+        record.correlationState = "correlated-by-save-invocation-snapshot";
+        ownership.state = "owned";
+        entry.correlationEvidence = { order: "save-start-before-post", operationId: record.operationId, correlatedAgainst: "save-invocation-snapshot" };
+      }
+      record.claim = { ...claim, verdict: "owner", comparedSnapshot: entry.saveInvocationSnapshot ? "save-invocation" : "deferred-save-invocation" };
+      ownership.claims.push(record.claim);
+      attachQueuedSaveProducer(entry, record.terminalPromise, record);
+      return true;
+    }
+    if (record.invocation?.key !== ownership.invocationKey) {
+      return reject(
+        record.transportAttempt > 1 ? "rejected-wrong-generation" : "rejected-duplicate-claim",
+        `identity is already owned by invocation ${ownership.ownerRecord.operationId}; claimant belongs to a different invocation`,
+      );
+    }
+    if (record.transportVerdict?.accepted !== true || record.transportVerdict.role !== "retry") {
+      return reject(
+        record.transportAttempt === 1 ? "rejected-duplicate-claim" : "rejected-invalid-retry",
+        String(record.transportVerdict?.reason || "claim was not a validated retry of the owning invocation"),
+      );
+    }
+    if (ownership.currentAttempt !== ownership.ownerRecord || record.retryOf !== ownership.ownerRecord) {
+      return reject("rejected-invalid-retry", "owning invocation already used its single retry");
+    }
+    // The owning invocation's validated retry: same invocation, same session, same payload.
+    ownership.currentAttempt = record;
+    ownership.state = ownership.state === "provisional-owned" ? "provisional-owned-retry" : "owned-retry";
+    record.queuedEntry = entry;
+    record.correlationState = ownership.ownerRecord.correlationState;
+    record.claim = { ...claim, verdict: "retry", comparedSnapshot: "owner-invocation-payload" };
+    ownership.claims.push(record.claim);
+    entry.transitions.push({ type: "owned-invocation-retry", at: Date.now(), operationId: record.operationId, transportId: record.transportId });
+    attachQueuedSaveProducer(entry, record.terminalPromise, record);
+    return true;
   };
 
   const observeRequest = (request) => {
@@ -1062,34 +1490,33 @@ function createQuoteSessionDrainTracker(group) {
       transportFailure: false,
       done: false,
     };
+    const rawTransportAttempt = Number(headers[quoteSessionTransportAttemptHeader] || 1);
+    record.transportAttempt = Number.isInteger(rawTransportAttempt) && rawTransportAttempt > 0 ? rawTransportAttempt : 0;
+    record.transportId = String(headers[quoteSessionTransportIdHeader] || `${group}/transport-${operationSequence}-${records.length}`);
+    record.page = requestPage;
+    record.pageIdentity = requestPage ? ensurePageIdentity(requestPage) : `${group}/page-unregistered`;
+    record.requestSeq = ++eventSequence;
+    record.postData = String(request.postData() || "");
+    record.credentialDigests = credentialHeaderDigests(headers);
+    record.bodyObservedPromise = new Promise((resolve) => { record.resolveBodyObserved = resolve; });
+    createOwnProofState(record);
     record.terminalPromise = new Promise((resolve) => { record.terminalResolve = resolve; });
     requestRecords.set(request, record);
     records.push(record);
-    if (record.persistenceClass !== "DIAGNOSTIC_ONLY") {
+    if (record.persistenceClass === "DIAGNOSTIC_ONLY") {
+      record.resolveOwnProof("ineligible", "diagnostic request");
+    } else {
       pendingRequiredRequests.add(record);
       pendingSavePromises.add(record);
+      registerTransportAttempt(record);
       const entry = record.queuedSaveIdentity ? queuedSaveHistory.get(record.queuedSaveIdentity) : null;
-      if (entry?.status === "pending" && !entry.saveInvocationSnapshot && !entry.correlationPendingRecord) {
-        // R1: the application builds its POST from state current at save invocation, and Node can
-        // observe that POST before the save-start event carrying the authoritative save-invocation
-        // snapshot. Bind the exact identity now and judge the request against that snapshot when it
-        // arrives; never against the stale queue-time snapshot.
-        record.correlationState = "awaiting-save-invocation-snapshot";
-        entry.correlationPendingRecord = record;
-        entry.correlationEvidence = { order: "post-before-save-start", operationId: record.operationId };
-        entry.transitions.push({ type: "post-observed-before-save-start", at: Date.now(), operationId: record.operationId });
-        attachQueuedSaveProducer(entry, record.terminalPromise, record);
-      } else if (record.queuedSaveIdentity && (!entry || !queuedSaveMatchesRecord(entry, record))) {
-        addIssue(record, "queued save request identity did not match its captured session, state, files, and required status"
-          + (entry ? ": " + JSON.stringify(queuedSaveMismatchSummary(entry, record)) : ""));
-        record.correlationState = "rejected";
-        if (entry?.status === "pending") settleQueuedSave(entry, "failed", "correlated POST did not match the captured queued save");
-      } else if (entry?.status === "pending") {
-        record.correlationState = "correlated-by-save-invocation-snapshot";
-        entry.correlationEvidence = { order: "save-start-before-post", operationId: record.operationId, correlatedAgainst: "save-invocation-snapshot" };
-        attachQueuedSaveProducer(entry, record.terminalPromise, record);
+      const claimAccepted = record.queuedSaveIdentity ? admitQueuedSaveClaim(entry, record) : true;
+      if (!record.queuedSaveIdentity && record.transportVerdict?.accepted !== true) {
+        addIssue(record, `required save transport attempt rejected: ${record.transportVerdict?.reason || "unvalidated transport attempt"}`);
       }
-      for (const candidate of pendingQueuedSaveWork.values()) {
+      // A rejected claim never participates in equivalent-work matching, so it cannot settle or
+      // dequeue any other invocation.
+      for (const candidate of claimAccepted ? pendingQueuedSaveWork.values() : []) {
         const matchesCapturedWork = candidate.status === "pending"
           && !candidate.persistenceRecord
           && queuedSaveMatchesRecord(candidate, record);
@@ -1191,6 +1618,42 @@ function createQuoteSessionDrainTracker(group) {
     notifyProgress();
   };
 
+  // Real session refreshes are the only admissible bridge between a 403 attempt and its retry.
+  const observeSessionRefreshRequest = (request) => {
+    if (request.method() !== "GET" || quoteSessionPathForRequest(request) !== "/api/session") return;
+    let requestPage = null;
+    try { requestPage = request.frame()?.page() || null; } catch {}
+    const refresh = {
+      pageIdentity: requestPage ? ensurePageIdentity(requestPage) : `${group}/page-unregistered`,
+      requestSeq: ++eventSequence,
+      responseSeq: 0,
+      responseStatus: null,
+      bodyEvidence: null,
+    };
+    let resolveBody;
+    refresh.bodyEvidence = new Promise((resolve) => { resolveBody = resolve; });
+    refresh.resolveBody = resolveBody;
+    sessionRefreshByRequest.set(request, refresh);
+    sessionRefreshes.push(refresh);
+  };
+
+  const observeSessionRefreshResponse = (response) => {
+    const refresh = sessionRefreshByRequest.get(response.request());
+    if (!refresh || refresh.responseSeq) return;
+    refresh.responseSeq = ++eventSequence;
+    refresh.responseStatus = response.status();
+    response.text().then((text) => {
+      let body = null;
+      try { body = JSON.parse(text); } catch { body = null; }
+      refresh.resolveBody({
+        ok: refresh.responseStatus === 200,
+        csrfHeader: String(body?.csrf_header || "").toLowerCase(),
+        tokenDigest: body?.csrf_token ? createHash("sha256").update(String(body.csrf_token)).digest("hex") : "",
+        recoveryScopePresent: Boolean(body?.browser_recovery_scope),
+      });
+    }, () => refresh.resolveBody({ ok: false, csrfHeader: "", tokenDigest: "", recoveryScopePresent: false }));
+  };
+
   const queuedSaveMismatchSummary = (entry, record) => {
     const snapshot = entry?.snapshot || {};
     const expectedState = queuedDraftStateComparable(snapshot.draftState);
@@ -1222,16 +1685,32 @@ function createQuoteSessionDrainTracker(group) {
     if (record.httpStatus < 200 || record.httpStatus >= 300 || record.bodyStatus !== "saved") failures.push("application response was not a successful saved result");
     if (record.responseSessionId !== snapshot.sessionId || record.responseQuoteGenerated !== snapshot.options?.quoteGenerated) failures.push("application response session/status did not match the captured save");
     if (record.clientResult?.nonNull !== true || record.clientResult?.sessionId !== snapshot.sessionId || record.clientResult?.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("application save result did not match the captured session/status");
+    // R2B: this save's own authenticated detail proof is mandatory and content-bound; nothing
+    // about a response, a clock, or another save substitutes for it.
+    const proof = record.ownProof?.state === "accepted" ? record.ownProof.readback : null;
+    if (!proof) {
+      failures.push(`own authenticated persistence proof was not accepted (${record.ownProof?.state || "absent"}: ${record.ownProof?.reason || ""})`);
+    } else {
+      if (proof.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("own proof did not show the required quote_generated status");
+      if (!proof.draftState || JSON.stringify(queuedDraftStateComparable(proof.draftState)) !== JSON.stringify(queuedDraftStateComparable(snapshot.draftState))) {
+        failures.push("own proof draft state did not equal the save-invocation draft state");
+      }
+      // Covers valid confirmed file omission: omitted files must still be durably the save's files.
+      if (!Array.isArray(proof.draftFiles) || JSON.stringify(queuedDraftFilesComparable(proof.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles))) {
+        failures.push("own proof files did not match the save-invocation file identity/metadata/content");
+      }
+    }
     if (record.readback?.httpStatus !== 200 || record.readback?.sessionId !== snapshot.sessionId) failures.push("durable readback did not return the exact saved session");
     const successor = record.readbackVerdict === "superseded" ? record.readbackSuccessor : null;
     if (!successor) {
       if (record.readback?.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("durable readback did not preserve required quote_generated status");
       if (!record.readback?.draftState || JSON.stringify(queuedDraftStateComparable(record.readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(snapshot.draftState))) failures.push("durable readback did not match captured draft state");
     }
-    // Files stay durably preserved: a validated successor that omitted draft_files must leave
-    // this save's files in place; one that sent files must be exactly what was read back.
-    const expectedFiles = successor && Array.isArray(successor.payloadDraftFiles) ? successor.payloadDraftFiles : snapshot.draftFiles;
-    if (!Array.isArray(record.readback?.draftFiles) || JSON.stringify(queuedDraftFilesComparable(record.readback.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(expectedFiles))) failures.push("durable readback did not match captured draft files");
+    // A later readback explained by an independently proven successor must be exactly that
+    // successor's proven files; otherwise it must still be this save's files.
+    const expectedFiles = successor ? successor.ownProof?.readback?.draftFiles : snapshot.draftFiles;
+    if (!Array.isArray(expectedFiles) || !Array.isArray(record.readback?.draftFiles)
+      || JSON.stringify(queuedDraftFilesComparable(record.readback.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(expectedFiles))) failures.push("durable readback did not match captured draft files");
     return failures;
   };
 
@@ -1247,7 +1726,9 @@ function createQuoteSessionDrainTracker(group) {
     for (const entry of candidates) {
       if (entry.status !== "pending") continue;
       // Deferred R1 correlation completes when the save-invocation snapshot arrives.
-      if (entry.correlationPendingRecord === record) continue;
+      if (entry.correlationPendingRecord) continue;
+      // R1B: only the owning invocation's current transport attempt can complete its queued save.
+      if (entry.ownership?.ownerRecord && entry.ownership.currentAttempt !== record) continue;
       const failures = validateQueuedPersistence(entry, record);
       if (failures.length) {
         settleQueuedSave(entry, "failed", `queued save persistence proof failed: ${failures.join("; ")}`);
@@ -1255,6 +1736,8 @@ function createQuoteSessionDrainTracker(group) {
         entry.evidence.postObserved = true;
         entry.evidence.durableReadbackObserved = true;
         entry.evidence.persistenceRecordId = record.operationId;
+        entry.evidence.persistenceTransportId = record.transportId;
+        entry.evidence.ownProofAcceptedSeq = record.ownProof?.acceptedSeq || 0;
         if (record.readbackVerdict === "superseded") {
           entry.evidence.readbackSupersession = { ...record.readbackSupersession };
           settleQueuedSave(entry, "succeeded", "validated POST response and fresh commit, durably superseded by a validated later same-session save");
@@ -1268,9 +1751,14 @@ function createQuoteSessionDrainTracker(group) {
   const observeResponse = (response) => {
     const record = requestRecords.get(response.request());
     if (!record || record.done) return;
+    // Synchronous ordering evidence: the response is observed before any later request it causes.
+    record.responseSeq = ++eventSequence;
+    record.responseStatus = response.status();
     const task = finishResponse(record, response)
       .catch((error) => addIssue(record, `required response/body/save/readback drain failed: ${error?.message || error}`))
       .finally(() => {
+        record.resolveBodyObserved?.();
+        record.resolveOwnProof?.("ineligible", "response processing ended without persistence proof");
         record.done = true;
         record.terminalResolve?.();
         if (record.persistenceClass !== "DIAGNOSTIC_ONLY") completeQueuedPersistenceRecord(record);
@@ -1285,14 +1773,19 @@ function createQuoteSessionDrainTracker(group) {
     const record = requestRecords.get(request);
     if (!record || record.done) return;
     record.done = true;
-    record.terminalResolve?.();
     record.transportFailure = true;
+    record.resolveBodyObserved?.();
+    record.resolveOwnProof?.("ineligible", "transport failure provides no persistence proof");
+    record.terminalResolve?.();
     pendingRequiredRequests.delete(record);
     pendingSavePromises.delete(record);
     if (record.persistenceClass !== "DIAGNOSTIC_ONLY") {
       addIssue(record, `required quote-session save request failed: ${request.failure()?.errorText || "transport failure"}`);
       const entry = record.queuedSaveIdentity ? queuedSaveHistory.get(record.queuedSaveIdentity) : null;
-      if (entry?.status === "pending") settleQueuedSave(entry, "failed", "correlated queued save request failed before persistence");
+      // Only the queued save's own current attempt can fail it; a rejected claimant cannot.
+      if (entry?.status === "pending" && entry.ownership?.currentAttempt === record) {
+        settleQueuedSave(entry, "failed", "correlated queued save request failed before persistence");
+      }
     }
     notifyProgress();
   };
@@ -1426,14 +1919,19 @@ function createQuoteSessionDrainTracker(group) {
       executableSuccessor.startedAt = Date.now();
       entry.applicationSaveLease = executableSuccessor;
       if (deferredRecord) {
-        if (!queuedSaveMatchesRecord(entry, deferredRecord)) {
-          deferredRecord.correlationState = "rejected";
-          addIssue(deferredRecord, "queued save request did not match the save-invocation snapshot of its exact queued save: "
-            + JSON.stringify(queuedSaveMismatchSummary(entry, deferredRecord)));
+        // Correlate the owning invocation only (its initial attempt and any validated retry). A
+        // late save-start never erases a sticky violation already recorded against this identity.
+        const invocationAttempts = [...new Set([deferredRecord, entry.ownership?.currentAttempt].filter(Boolean))];
+        const mismatched = invocationAttempts.find((attempt) => !queuedSaveMatchesRecord(entry, attempt));
+        if (mismatched) {
+          for (const attempt of invocationAttempts) attempt.correlationState = "rejected";
+          addIssue(mismatched, "queued save request did not match the save-invocation snapshot of its exact queued save: "
+            + JSON.stringify(queuedSaveMismatchSummary(entry, mismatched)));
           failQueuedSave(entry, "correlated POST did not match the save-invocation snapshot of its queued save");
           return;
         }
-        deferredRecord.correlationState = "correlated-by-save-invocation-snapshot";
+        for (const attempt of invocationAttempts) attempt.correlationState = "correlated-by-save-invocation-snapshot";
+        entry.ownership.state = "owned";
         entry.correlationEvidence = { ...(entry.correlationEvidence || {}), correlatedAgainst: "save-invocation-snapshot" };
         // The already-observed request remains the producer; this lease only records the start.
         executableSuccessor.resolve({ status: "transferred", to: "request-response-body-durable-readback" });
@@ -1448,7 +1946,8 @@ function createQuoteSessionDrainTracker(group) {
           };
         }
         updateDocumentWork(entry, "pending", { producerState: "request-observed-before-save-start" });
-        if (deferredRecord.done) completeQueuedPersistenceRecord(deferredRecord);
+        const currentAttempt = entry.ownership?.currentAttempt || deferredRecord;
+        if (currentAttempt.done) completeQueuedPersistenceRecord(currentAttempt);
         notifyProgress();
         return;
       }
@@ -1785,6 +2284,8 @@ function createQuoteSessionDrainTracker(group) {
     });
     await context.addInitScript((settings) => {
       const pendingOperations = [];
+      const transportTags = [];
+      let transportSequence = 0;
       let sequence = 0;
       const readScope = () => {
         try { return JSON.parse(sessionStorage.getItem(settings.operationStorageKey) || "{}"); } catch { return {}; }
@@ -2000,20 +2501,32 @@ function createQuoteSessionDrainTracker(group) {
         const sessionId = typeof payload?.session_id === "string"
           ? payload.session_id
           : (url.pathname.match(/^\/api\/quote-sessions\/([^/]+)/)?.[1] || String(scope.expectedSessionId || ""));
-        const pendingIndex = method === "POST" && url.pathname === "/api/quote-sessions"
+        const isQuoteSessionPost = method === "POST" && url.pathname === "/api/quote-sessions";
+        // An application postJson invocation registered its transport attempt by exact body.
+        const transportTagIndex = isQuoteSessionPost && typeof init.body === "string"
+          ? transportTags.findIndex((tag) => tag.body === init.body)
+          : -1;
+        const transportTag = transportTagIndex >= 0 ? transportTags.splice(transportTagIndex, 1)[0] : null;
+        const pendingIndex = isQuoteSessionPost && !transportTag
           ? pendingOperations.findIndex((item) => item.sessionId === sessionId || !item.sessionId)
           : -1;
         const pending = pendingIndex >= 0 ? pendingOperations.splice(pendingIndex, 1)[0] : null;
-        const scopedOperation = !pending && scope.operationId && Number(scope.calls || 0) === 0
+        const scopedOperation = !transportTag && !pending && scope.operationId && Number(scope.calls || 0) === 0
           ? String(scope.operationId) : "";
-        const operationId = pending?.operationId || scopedOperation || nextOperationId(`${method.toLowerCase()}-api`);
+        const operationId = transportTag?.operationId || pending?.operationId || scopedOperation || nextOperationId(`${method.toLowerCase()}-api`);
         if (scopedOperation) {
           scope.calls = 1;
           sessionStorage.setItem(settings.operationStorageKey, JSON.stringify(scope));
         }
         const headers = new Headers(init.headers || (typeof Request !== "undefined" && input instanceof Request ? input.headers : undefined));
         headers.set(settings.operationHeader, operationId);
-        if (pending?.queuedSaveIdentity) headers.set(settings.queuedSaveHeader, String(pending.queuedSaveIdentity));
+        const queuedSaveIdentity = transportTag ? transportTag.queuedSaveIdentity : pending?.queuedSaveIdentity;
+        if (queuedSaveIdentity) headers.set(settings.queuedSaveHeader, String(queuedSaveIdentity));
+        if (isQuoteSessionPost) {
+          if (transportTag) headers.set(settings.transportAttemptHeader, String(transportTag.attempt));
+          else if (!headers.has(settings.transportAttemptHeader)) headers.set(settings.transportAttemptHeader, "1");
+          headers.set(settings.transportIdHeader, `${timerState.documentId}/transport-${++transportSequence}`);
+        }
         headers.set(settings.fixtureHeader, String(scope.fixture || settings.group));
         headers.set(settings.operationNameHeader, String(scope.operation || operationId));
         headers.set(settings.sessionHeader, sessionId);
@@ -2182,6 +2695,60 @@ function createQuoteSessionDrainTracker(group) {
           Object.defineProperty(wrappedClearSaveTimer, "__sqagSmokeCaptured", { value: true });
           window.clearQuoteSessionDraftSaveTimer = wrappedClearSaveTimer;
         }
+        // postJson reuses one payload object for its initial POST and its single post-403 retry,
+        // so the payload object identifies the invocation; each call is one transport attempt.
+        const postTransport = window.fetchPostJsonResponse;
+        if (typeof postTransport === "function" && postTransport.__sqagSmokeCaptured !== true) {
+          const transportInvocations = new WeakMap();
+          const wrappedPostTransport = function (url, payload, ...rest) {
+            let target = "";
+            try { target = new URL(String(url), window.location.href).pathname; } catch { target = ""; }
+            if (target !== "/api/quote-sessions" || !payload || typeof payload !== "object") {
+              return postTransport.call(this, url, payload, ...rest);
+            }
+            let invocation = transportInvocations.get(payload);
+            if (!invocation) {
+              const sessionId = typeof payload.session_id === "string" ? payload.session_id : "";
+              const pendingIndex = pendingOperations.findIndex((item) => item.sessionId === sessionId || !item.sessionId);
+              const pending = pendingIndex >= 0 ? pendingOperations.splice(pendingIndex, 1)[0] : null;
+              const scope = readScope();
+              const scopedOperation = !pending && scope.operationId && Number(scope.calls || 0) === 0
+                ? String(scope.operationId) : "";
+              if (scopedOperation) {
+                scope.calls = 1;
+                sessionStorage.setItem(settings.operationStorageKey, JSON.stringify(scope));
+              }
+              invocation = {
+                operationId: pending?.operationId || scopedOperation || nextOperationId("post-api"),
+                queuedSaveIdentity: String(pending?.queuedSaveIdentity || ""),
+                attempts: 0,
+              };
+              transportInvocations.set(payload, invocation);
+            }
+            invocation.attempts += 1;
+            const tag = {
+              body: JSON.stringify(payload),
+              operationId: invocation.operationId,
+              queuedSaveIdentity: invocation.queuedSaveIdentity,
+              attempt: invocation.attempts,
+            };
+            transportTags.push(tag);
+            const releaseTag = () => {
+              const index = transportTags.indexOf(tag);
+              if (index >= 0) transportTags.splice(index, 1);
+            };
+            try {
+              const result = postTransport.call(this, url, payload, ...rest);
+              Promise.resolve(result).then(releaseTag, releaseTag);
+              return result;
+            } catch (error) {
+              releaseTag();
+              throw error;
+            }
+          };
+          Object.defineProperty(wrappedPostTransport, "__sqagSmokeCaptured", { value: true });
+          window.fetchPostJsonResponse = wrappedPostTransport;
+        }
       };
       window.__sqagSmokeInstallQuoteSessionCapture = installSaveCapture;
       document.addEventListener("DOMContentLoaded", installSaveCapture, { once: true });
@@ -2198,6 +2765,8 @@ function createQuoteSessionDrainTracker(group) {
       correlationHeader: quoteSessionCorrelationHeader,
       persistenceClassHeader: quoteSessionPersistenceClassHeader,
       queuedSaveHeader: quoteSessionQueuedSaveHeader,
+      transportAttemptHeader: quoteSessionTransportAttemptHeader,
+      transportIdHeader: quoteSessionTransportIdHeader,
       timerEventBinding,
     });
     const attachPage = (page) => {
@@ -2205,11 +2774,18 @@ function createQuoteSessionDrainTracker(group) {
       page.on("request", observeRequest);
       page.on("request", observeDetailRequest);
       page.on("request", observeListRequest);
+      page.on("request", observeSessionRefreshRequest);
       page.on("response", observeResponse);
+      page.on("response", observeSessionRefreshResponse);
       page.on("requestfailed", observeFailure);
-      page.on("close", () => markPageWorkUnresolved(page, "page closed with unresolved queued quote-session save work"));
+      page.on("requestfailed", (request) => sessionRefreshByRequest.get(request)?.resolveBody({ ok: false, csrfHeader: "", tokenDigest: "", recoveryScopePresent: false }));
+      page.on("close", () => {
+        abortOwnProofsForPage(page, "page closed while a queued save's own-proof wait was outstanding");
+        markPageWorkUnresolved(page, "page closed with unresolved queued quote-session save work");
+      });
       page.on("framenavigated", (frame) => {
         if (frame === page.mainFrame()) {
+          abortOwnProofsForPage(page, "document navigated while a queued save's own-proof wait was outstanding");
           const currentKey = currentDocumentByPage.get(page);
           if (currentKey) retireDocumentEpisode(documentEpisodes.get(currentKey), "document navigated with unresolved queued quote-session save work");
           markPageWorkUnresolved(page, "document navigated with unresolved queued quote-session save work");
@@ -2535,6 +3111,7 @@ function createQuoteSessionDrainTracker(group) {
     for (const record of pendingRequiredRequests) operations.push({ identity: record.operationId, state: "request-pending", producer: record.terminalProducer ? record.terminalPromise : null });
     for (const record of pendingResponseBodies) operations.push({ identity: `${record.operationId}/response-body`, state: "response-body-pending", producer: record.responseBodyProducer || null });
     for (const record of pendingReadbacks) operations.push({ identity: `${record.operationId}/durable-readback`, state: "readback-pending", producer: record.readbackProducer || null });
+    for (const record of pendingOwnProofs) operations.push({ identity: `${record.operationId}/own-proof`, state: "own-proof-pending", producer: record.ownProofProducer || null });
     for (const record of pendingSavePromises) operations.push({ identity: `${record.operationId}/application-save`, state: "application-save-pending", producer: record.terminalProducer ? record.terminalPromise : null });
     for (const job of pendingRequiredJobs) operations.push({ identity: job.identity, state: "required-job-pending", producer: job.producer });
     for (const entry of pendingQueuedSaveWork.values()) operations.push({
@@ -2782,6 +3359,13 @@ function createQuoteSessionDrainTracker(group) {
       saveInvocationObserved: Boolean(entry.saveInvocationSnapshot),
       correlation: entry.correlationEvidence ? { ...entry.correlationEvidence } : null,
       readbackSupersession: entry.evidence.readbackSupersession ? { ...entry.evidence.readbackSupersession } : null,
+      requestOwnership: entry.ownership ? {
+        state: entry.ownership.state,
+        ownerOperationId: entry.ownership.ownerRecord?.operationId || "",
+        currentTransportId: entry.ownership.currentAttempt?.transportId || "",
+        claims: entry.ownership.claims.map((claim) => ({ ...claim })),
+        sticky: entry.ownership.sticky.map((violation) => ({ ...violation })),
+      } : null,
     })),
     drainWaitCount,
     drainRuns: drainReports.map((report) => ({ ...report, outstanding: report.outstanding.map((item) => ({ ...item })) })),
@@ -2802,6 +3386,7 @@ function createQuoteSessionDrainTracker(group) {
       requiredRequests: [...pendingRequiredRequests].length,
       requiredResponseBodies: [...pendingResponseBodies].length,
       requiredDurableReadbacks: [...pendingReadbacks].length,
+      requiredOwnProofs: [...pendingOwnProofs].length,
       requiredSavePromises: [...pendingSavePromises].length,
       nonterminalRequiredJobs: [...pendingRequiredJobs].length,
       queuedRequiredSaves: [...pendingQueuedSaveWork.values()].map((entry) => entry.identity),
@@ -2828,6 +3413,7 @@ function createQuoteSessionDrainTracker(group) {
     holdTimerEventAcknowledgement,
     holdTimerEventHandling,
     holdDurableReadback,
+    holdOwnProof,
     documentEpisodes,
     drainReports,
     activeDrainRuns,
@@ -6750,6 +7336,15 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
             saveStateEqualsPost: draftStatesEqual(saveSnapshot?.draftState, record.payloadDraftState),
             durableReadback: saveInvocationDurable(record, entry),
             exactlyOnePost: postsFor(fixture.tracker, operationId).length === 1,
+            // R1B: the single real POST is the exclusive owner of its queued identity.
+            exclusiveRequestOwnership: entry.ownership?.ownerRecord === record
+              && entry.ownership.currentAttempt === record
+              && entry.ownership.claims.length === 1
+              && entry.ownership.sticky.length === 0
+              && record.transportAttempt === 1,
+            // R2B: persistence was proven by this save's own authenticated state/file detail read.
+            independentOwnProof: record.ownProof?.state === "accepted" && record.ownProof.consequential === true
+              && entry.evidence.persistenceTransportId === record.transportId,
           };
           if (Object.values(checks).some((passed) => !passed)) {
             throw new Error(`${name} did not correlate the real save by its save-invocation snapshot: ${JSON.stringify({
@@ -6875,6 +7470,9 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           bSucceeded: firstB.entry.status === "succeeded",
           aExact: firstRecordA?.readbackVerdict === "exact" && draftStatesEqual(firstRecordA.readback?.draftState, firstRecordA.payloadDraftState),
           bExact: firstRecordB?.readbackVerdict === "exact",
+          aIndependentOwnProof: firstRecordA?.ownProof?.state === "accepted" && firstRecordA.ownProof.consequential === true,
+          bIndependentOwnProof: firstRecordB?.ownProof?.state === "accepted" && firstRecordB.ownProof.consequential === true,
+          aProvenBeforeBAdmitted: firstRecordB?.requestSeq > firstRecordA?.ownProof?.acceptedSeq,
         };
         if (Object.values(readbackFirstChecks).some((passed) => !passed)) {
           throw new Error("R2 A-readback-before-B positive failed: " + JSON.stringify({ readbackFirstChecks, summary: r2Positive.tracker.summary() }) + ".");
@@ -6911,6 +7509,15 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
             causalCommitOrder: recordA?.readbackSupersession?.successorCommitClock > recordA?.readbackSupersession?.ownCommitClock
               && recordA?.readbackSupersession?.readbackCommitClock === recordA?.readbackSupersession?.successorCommitClock,
             filesPreserved: draftFilesEqual(recordA?.readback?.draftFiles, capturedA.snapshot.draftFiles),
+            // R2B: A proved its own state/files before B was admitted, B proved itself, and A's
+            // later readback is exactly B's proven representation.
+            aIndependentlyProvenFirst: recordA?.ownProof?.state === "accepted" && recordA.ownProof.consequential === true
+              && recordB?.requestSeq > recordA.ownProof.acceptedSeq
+              && draftStatesEqual(recordA.ownProof.readback?.draftState, recordA.payloadDraftState),
+            bIndependentlyProven: recordB?.ownProof?.state === "accepted" && recordB.ownProof.consequential === true,
+            aReadbackIsBProvenRepresentation: draftStatesEqual(recordA?.readback?.draftState, recordB?.ownProof?.readback?.draftState)
+              && draftFilesEqual(recordA?.readback?.draftFiles, recordB?.ownProof?.readback?.draftFiles)
+              && recordA?.readback?.updatedAt === recordB?.ownProof?.readback?.updatedAt,
           };
           if (Object.values(checks).some((passed) => !passed)) {
             throw new Error("R2 valid A-to-B supersession was not recognised: " + JSON.stringify({ checks, summary: r2Positive.tracker.summary() }) + ".");
@@ -6961,6 +7568,7 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
           const drained = await fixture.tracker.drain(3000, fixture.page);
           const checks = {
             aClaimedSaved: recordA?.httpStatus === 200 && recordA.bodyStatus === "saved",
+            aOwnProofFailed: recordA?.ownProof?.state === "failed",
             aFailed: capturedA.entry.status === "failed",
             aReadbackFailed: recordA?.readbackVerdict === "failed",
             aIssueRetained: fixture.tracker.issues.some((issue) => issue.operationId === operationA),
@@ -6970,10 +7578,10 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
             checks.bSucceeded = capturedB?.entry.status === "succeeded" && recordB?.readbackVerdict === "exact";
             checks.aReadbackObservedB = draftStatesEqual(recordA?.readback?.draftState, recordB?.payloadDraftState);
             checks.launderingRejectedForUnprovenCommit = String(recordA?.readbackSupersessionRejection?.reason || "")
-              .includes("own commit was not proven");
+              .includes("own persistence proof was not accepted");
           } else {
-            // Either the unpersisted save's own stale commit or the absence of any successor rejects it.
-            checks.supersessionRejected = /own commit was not proven|no validated later/.test(String(recordA?.readbackSupersessionRejection?.reason || ""));
+            // Either the unpersisted save's missing own proof or the absence of any successor rejects it.
+            checks.supersessionRejected = /own persistence proof was not accepted|no independently proven later/.test(String(recordA?.readbackSupersessionRejection?.reason || ""));
           }
           if (Object.values(checks).some((passed) => !passed)) {
             throw new Error(`${name} did not keep the unpersisted older save failed: ${JSON.stringify({ checks, summary: fixture.tracker.summary() })}.`);
@@ -7004,7 +7612,786 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         throw new Error("R1/R2 rate-window separation did not exceed the limiter window: " + JSON.stringify(r1r2RateWindowSeparation) + ".");
       }
 
+      // R1B/R2B: exclusive request ownership and independent own-proof controls. Every request is
+      // a real browser request to the real server. Negatives use real adversarial browser requests
+      // or real storage-loss transports; no tracker record or success is fabricated.
+      const separateQuoteSessionRateWindow = async (label) => {
+        // Same accepted pacing as the R1/R2 separation: let the unchanged 60-second quote-session
+        // limiter window fully elapse so each control group runs within its normal budget.
+        const evidence = { label, windowMs: 60000, marginMs: 3000, lastRequestAt: Date.now() };
+        await new Promise((resolve) => setTimeout(resolve, evidence.windowMs + evidence.marginMs));
+        evidence.releasedAt = Date.now();
+        evidence.elapsedMs = evidence.releasedAt - evidence.lastRequestAt;
+        if (evidence.elapsedMs <= evidence.windowMs) {
+          throw new Error(`${label} rate-window separation did not exceed the limiter window: ${JSON.stringify(evidence)}.`);
+        }
+        return evidence;
+      };
+      // The app accepts quote-<3..64 safe characters>; keep synthetic ids inside that bound.
+      const boundedSessionId = (name, role) => `quote-s212-${String(name).slice(0, 40)}-${role}${Date.now().toString(36)}`;
+      const ownershipTrackers = [];
+      const openOwnershipFixture = async (name, sessionId) => {
+        const fixture = await openFixture(name, sessionId);
+        ownershipTrackers.push(fixture.tracker);
+        return fixture;
+      };
+      const failedChecks = (checks) => Object.entries(checks).filter(([, passed]) => !passed).map(([name]) => name);
+      const requireChecks = (name, checks, fixture) => {
+        if (failedChecks(checks).length) {
+          throw new Error(`${name} failed ${JSON.stringify(failedChecks(checks))}: ${JSON.stringify({ checks, summary: fixture.tracker.summary() })}.`);
+        }
+      };
+      const newPostsFor = (fixtureTracker, operationId, afterCount) => postsFor(fixtureTracker, operationId).slice(afterCount);
+      const stickyReason = (entry) => String(entry?.terminalReason || "").includes("sticky request-ownership violation");
+      // A real browser POST claiming a queued identity, optionally as an invocation's transport attempt.
+      const sendClaimingPost = async (fixture, { operationId, operation, sessionId, browserTimerIdentity, body, transportAttempt = 0 }) => {
+        const before = postsFor(fixture.tracker, operationId).length;
+        await fixture.tracker.setPageOperation(fixture.page, {
+          fixture: "sqag212",
+          operation,
+          operationId,
+          expectedSessionId: sessionId,
+          persistenceClass: "REQUIRED_SUCCESS",
+        });
+        const response = await fixture.page.evaluate(async ({ queuedHeader, identity, attemptHeader, attempt, payload }) => {
+          const headers = { "content-type": "application/json", [queuedHeader]: identity };
+          if (attempt) headers[attemptHeader] = String(attempt);
+          if (state.csrfToken) headers[state.csrfHeaderName] = state.csrfToken;
+          const reply = await fetch("/api/quote-sessions", { method: "POST", headers, body: payload });
+          const text = await reply.text();
+          return { status: reply.status, bodyBytes: text.length };
+        }, {
+          queuedHeader: quoteSessionQueuedSaveHeader,
+          identity: browserTimerIdentity,
+          attemptHeader: quoteSessionTransportAttemptHeader,
+          attempt: transportAttempt,
+          payload: body,
+        });
+        await waitForCondition(() => newPostsFor(fixture.tracker, operationId, before).length > 0, 10000, `${operation} claiming POST was not observed.`);
+        const record = newPostsFor(fixture.tracker, operationId, before)[0];
+        await withTimeout(record.terminalPromise, 30000, `${operation} claiming POST did not complete.`);
+        return { response, record };
+      };
+      // A real queued save whose first POST meets a stale cached session token, so the real server
+      // answers 403 before persistence and the application refreshes the session and retries.
+      const runStaleTokenSave = async (fixture, sessionId, operationId, operation, { mutateRetryPayload = false } = {}) => {
+        await prepareSession(fixture, sessionId, operationId, operation);
+        if (mutateRetryPayload) {
+          await fixture.page.evaluate(() => {
+            const inner = window.fetchPostJsonResponse;
+            let quoteSessionCalls = 0;
+            const adversarial = function (url, payload, ...rest) {
+              let target = "";
+              try { target = new URL(String(url), window.location.href).pathname; } catch { target = ""; }
+              if (target === "/api/quote-sessions" && payload && typeof payload === "object") {
+                quoteSessionCalls += 1;
+                if (quoteSessionCalls === 2 && payload.draft_state && typeof payload.draft_state === "object") {
+                  // Adversarial control: the same invocation's retry transport carries a changed payload.
+                  payload.draft_state = {
+                    ...payload.draft_state,
+                    outputSortMode: payload.draft_state.outputSortMode === "pricing_reference" ? "name" : "pricing_reference",
+                  };
+                  window.fetchPostJsonResponse = inner;
+                }
+              }
+              return inner.call(this, url, payload, ...rest);
+            };
+            Object.defineProperty(adversarial, "__sqagSmokeCaptured", { value: true });
+            window.fetchPostJsonResponse = adversarial;
+          });
+        }
+        await fixture.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 400 }));
+        const captured = await fixture.tracker.capturePendingQueuedSave(fixture.page);
+        if (!captured || captured.entry.producerKind !== "native-timer") {
+          throw new Error(`${operation} did not register its real native timer producer.`);
+        }
+        await fixture.page.evaluate(() => { state.csrfToken = `sqag212-r1b-stale-${Date.now()}`; });
+        await withTimeout(captured.entry.terminalPromise, 30000, `${operation} did not settle.`);
+        return { captured, entry: captured.entry, attempts: postsFor(fixture.tracker, operationId) };
+      };
+
+      const runR1BSecondPostNegative = async () => {
+        const name = "r1b-second-post-pending-correlation";
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, sessionId);
+        let handlingHold = null;
+        try {
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          await prepareSession(fixture, sessionId, operationA, `${name}-a`);
+          handlingHold = fixture.tracker.holdTimerEventHandling(fixture.page, "save-start");
+          await fixture.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 400 }));
+          const captured = await fixture.tracker.capturePendingQueuedSave(fixture.page);
+          if (!captured || captured.entry.producerKind !== "native-timer") throw new Error(`${name} did not register its real native timer producer.`);
+          const entry = captured.entry;
+          const queueSnapshot = structuredClone(captured.snapshot);
+          // Legitimate state evolution Q -> E after queueing and before the real native timer fires.
+          await fixture.page.evaluate(() => { state.outputSortMode = "pricing_reference"; });
+          await withTimeout(handlingHold.observed, 10000, `${name} native timer save-start was not delivered.`);
+          const owner = await waitForTrackedPost(fixture.tracker, operationA);
+          await withTimeout(owner.terminalPromise, 20000, `${name} owner POST did not complete.`);
+          const beforeDuplicate = {
+            nativeTimerFired: entry.dispatchedBy === "fire",
+            ownerCarriesEvolvedState: !draftStatesEqual(queueSnapshot.draftState, owner.payloadDraftState),
+            invocationCorrelationPending: !entry.saveInvocationSnapshot
+              && owner.correlationState === "awaiting-save-invocation-snapshot"
+              && entry.correlationPendingRecord === owner,
+            ownerProvisionallyOwned: entry.ownership.ownerRecord === owner && entry.ownership.state === "provisional-owned",
+          };
+          const stalePayload = JSON.parse(owner.postData || "{}");
+          stalePayload.draft_state = queueSnapshot.draftState;
+          const operationDuplicate = `sqag212/${name}-duplicate/${Date.now()}`;
+          const { response, record: duplicate } = await sendClaimingPost(fixture, {
+            operationId: operationDuplicate,
+            operation: `${name}-duplicate`,
+            sessionId,
+            browserTimerIdentity: captured.snapshot.browserTimerIdentity,
+            body: JSON.stringify(stalePayload),
+          });
+          const duplicateMatchesQueueTimeState = duplicate.expectedSessionId === queueSnapshot.sessionId
+            && duplicate.expectedQuoteGenerated === queueSnapshot.options?.quoteGenerated
+            && draftStatesEqual(duplicate.payloadDraftState, queueSnapshot.draftState)
+            && (duplicate.payloadDraftFiles === null || draftFilesEqual(duplicate.payloadDraftFiles, queueSnapshot.draftFiles));
+          const whilePending = {
+            duplicateWasRealBrowserPost: response.status === 200 && duplicate.httpStatus === 200,
+            noTerminalSuccess: entry.status === "pending",
+            originalRemainsOwned: entry.ownership.ownerRecord === owner
+              && entry.ownership.currentAttempt === owner
+              && entry.persistenceRecord === owner,
+            producerNotOverwritten: entry.producer !== duplicate.terminalPromise,
+            duplicateRejected: duplicate.correlationState === "rejected-duplicate-claim",
+            noQueueTimeFallback: duplicateMatchesQueueTimeState && duplicate.claim?.comparedSnapshot === "none",
+            duplicateMintedNoProof: duplicate.ownProof?.state === "ineligible" && !duplicate.readback,
+            stickyDuplicateRetained: entry.ownership.sticky.some((violation) => violation.operationId === operationDuplicate),
+          };
+          handlingHold.release();
+          await withTimeout(entry.terminalPromise, 20000, `${name} queued save did not settle after save-start.`);
+          const drained = await fixture.tracker.drain(3000, fixture.page);
+          const checks = {
+            ...beforeDuplicate,
+            ...whilePending,
+            lateSaveStartCorrelatedOriginalOnly: Boolean(entry.saveInvocationSnapshot)
+              && owner.correlationState === "correlated-by-save-invocation-snapshot"
+              && duplicate.correlationState === "rejected-duplicate-claim",
+            aNotSuccessful: entry.status === "failed" && stickyReason(entry),
+            stickyStillRetained: entry.ownership.sticky.some((violation) => violation.operationId === operationDuplicate),
+            drainFailed: drained === false,
+          };
+          requireChecks(name, checks, fixture);
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks, timerIdentity: entry.snapshot.timerIdentity };
+        } finally {
+          handlingHold?.release();
+          await fixture.context.close();
+        }
+      };
+
+      const runR1BConcurrentDuplicate = async () => {
+        const name = "r1b-concurrent-same-payload-duplicate";
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, sessionId);
+        let releaseOwner = null;
+        let ownerHeldResolve;
+        const ownerHeld = new Promise((resolve) => { ownerHeldResolve = resolve; });
+        let holdArmed = true;
+        try {
+          await fixture.page.route("**/api/quote-sessions", async (route) => {
+            if (route.request().method() === "POST" && holdArmed) {
+              holdArmed = false;
+              ownerHeldResolve();
+              await new Promise((resolve) => { releaseOwner = resolve; });
+            }
+            await route.fallback();
+          });
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          await prepareSession(fixture, sessionId, operationA, `${name}-a`);
+          await fixture.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 300 }));
+          const captured = await fixture.tracker.capturePendingQueuedSave(fixture.page);
+          if (!captured) throw new Error(`${name} did not capture its real queued save.`);
+          const entry = captured.entry;
+          await withTimeout(ownerHeld, 15000, `${name} owner POST was not held in flight.`);
+          const owner = await waitForTrackedPost(fixture.tracker, operationA);
+          // Same invocation id, same identity, byte-identical payload, while the owner is in flight.
+          const { response, record: duplicate } = await sendClaimingPost(fixture, {
+            operationId: operationA,
+            operation: `${name}-duplicate`,
+            sessionId,
+            browserTimerIdentity: captured.snapshot.browserTimerIdentity,
+            body: owner.postData,
+          });
+          const whileInFlight = {
+            duplicateReachedServer: response.status === 200,
+            duplicateOverlappedOwnerInFlight: duplicate.requestSeq > owner.requestSeq && !owner.responseSeq,
+            samePayloadBytes: duplicate.postData === owner.postData,
+            sameInvocationClaimed: duplicate.operationId === owner.operationId && duplicate.transportAttempt === 1,
+            duplicateTransportRejected: duplicate.transportVerdict?.accepted === false,
+            duplicateRejected: duplicate.correlationState === "rejected-duplicate-claim",
+            duplicateMintedNoProof: duplicate.ownProof?.state === "ineligible",
+            originalRemainsOwned: entry.ownership.ownerRecord === owner
+              && entry.ownership.currentAttempt === owner
+              && entry.persistenceRecord === owner,
+            noTerminalSuccess: entry.status === "pending",
+            stickyDuplicateRetained: entry.ownership.sticky.some((violation) => violation.transportId === duplicate.transportId),
+          };
+          releaseOwner?.();
+          await withTimeout(entry.terminalPromise, 20000, `${name} queued save did not settle.`);
+          const drained = await fixture.tracker.drain(3000, fixture.page);
+          const checks = {
+            ...whileInFlight,
+            aNotSuccessful: entry.status === "failed" && stickyReason(entry),
+            drainFailed: drained === false,
+          };
+          requireChecks(name, checks, fixture);
+          await fixture.page.unroute("**/api/quote-sessions");
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks };
+        } finally {
+          releaseOwner?.();
+          await fixture.page.unroute("**/api/quote-sessions").catch(() => {});
+          await fixture.context.close();
+        }
+      };
+
+      const runR1BRealForbiddenRetry = async () => {
+        const name = "r1b-real-403-refresh-same-payload-retry";
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, sessionId);
+        try {
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          const { entry, attempts } = await runStaleTokenSave(fixture, sessionId, operationA, `${name}-a`);
+          const [first, retry] = attempts;
+          const drained = await fixture.tracker.drain(15000, fixture.page);
+          const checks = {
+            drained,
+            noIssues: fixture.tracker.issues.length === 0,
+            succeeded: entry.status === "succeeded",
+            nativeTimerFired: entry.dispatchedBy === "fire",
+            twoTransportAttemptsOneInvocation: attempts.length === 2 && Boolean(retry)
+              && first.invocation === retry.invocation && first.invocation.attempts.length === 2,
+            attemptOrdinals: first?.transportAttempt === 1 && retry?.transportAttempt === 2,
+            firstRealServer403BeforePersistence: first?.httpStatus === 403 && first.bodyStatus === "blocked",
+            firstProvidesNoPersistenceProof: first?.ownProof?.state === "ineligible" && !first.readback
+              && first.transportOutcome === "superseded-by-validated-retry",
+            sameSession: first?.expectedSessionId === sessionId && retry?.expectedSessionId === sessionId,
+            samePayload: Boolean(first?.postData) && first.postData === retry?.postData,
+            sameQueuedIdentity: first?.queuedSaveIdentity === entry.snapshot.timerIdentity && retry?.queuedSaveIdentity === entry.snapshot.timerIdentity,
+            realSessionRefreshBetweenAttempts: retry?.retryEvidence?.checks?.realSessionRefreshBetweenAttempts === true,
+            retryUsedRefreshedSession: retry?.retryEvidence?.body?.passed === true,
+            singleValidatedRetry: retry?.transportVerdict?.accepted === true && retry.transportVerdict.role === "retry",
+            noOverlappingAcceptedRequest: first?.responseSeq > 0 && first.responseSeq < retry?.requestSeq,
+            oneInvocationOwnsIdentity: entry.ownership.ownerRecord === first
+              && entry.ownership.currentAttempt === retry
+              && entry.ownership.claims.length === 2
+              && entry.ownership.sticky.length === 0,
+            onlyFinalAttemptProvedPersistence: retry?.ownProof?.state === "accepted" && retry.ownProof.consequential === true
+              && retry.readbackVerdict === "exact"
+              && entry.evidence.persistenceTransportId === retry.transportId,
+          };
+          requireChecks(name, checks, fixture);
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks, retryEvidence: { structural: retry.retryEvidence.checks, refresh: retry.retryEvidence.body?.checks } };
+        } finally {
+          await fixture.context.close();
+        }
+      };
+
+      const runR1BWrongPayloadRetry = async () => {
+        const name = "r1b-wrong-payload-retry";
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, sessionId);
+        try {
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          const { entry, attempts } = await runStaleTokenSave(fixture, sessionId, operationA, `${name}-a`, { mutateRetryPayload: true });
+          const [first, retry] = attempts;
+          const drained = await fixture.tracker.drain(3000, fixture.page);
+          const checks = {
+            firstRealServer403: first?.httpStatus === 403 && first.bodyStatus === "blocked",
+            retryClaimedSameInvocation: retry?.operationId === first?.operationId && retry?.transportAttempt === 2,
+            retryChangedPayload: Boolean(retry) && retry.postData !== first.postData,
+            retryReachedServer: retry?.httpStatus === 200,
+            retryTransportRejected: retry?.transportVerdict?.accepted === false
+              && String(retry.transportVerdict.reason || "").includes("samePayload"),
+            retryClaimRejected: retry?.correlationState === "rejected-invalid-retry",
+            retryMintedNoProof: retry?.ownProof?.state === "ineligible" && !retry.readback,
+            firstNotTreatedAsRetried: first?.transportOutcome !== "superseded-by-validated-retry",
+            ownerAttemptRetained: entry.ownership.currentAttempt === first,
+            aFailed: entry.status === "failed" && stickyReason(entry),
+            drainFailed: drained === false,
+          };
+          requireChecks(name, checks, fixture);
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks };
+        } finally {
+          await fixture.context.close();
+        }
+      };
+
+      const runR1BWrongGeneration = async () => {
+        const name = "r1b-wrong-generation";
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, sessionId);
+        let readbackHold = null;
+        try {
+          const operationP = `sqag212/${name}-older-generation/${Date.now()}`;
+          const capturedP = await startQueuedFlush(fixture, sessionId, operationP, `${name}-older-generation`);
+          await withTimeout(capturedP.entry.terminalPromise, 15000, `${name} older generation did not settle.`);
+          const recordP = postsFor(fixture.tracker, operationP)[0];
+          if (capturedP.entry.status !== "succeeded" || !recordP) throw new Error(`${name} older generation did not persist.`);
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          readbackHold = fixture.tracker.holdDurableReadback(operationA);
+          const olderA = await runNativeTimerSave(fixture, sessionId, operationA, `${name}-a`, { awaitTerminal: false });
+          const entryA = olderA.entry;
+          const recordA = olderA.record;
+          await withTimeout(readbackHold.reached, 15000, `${name} A readback did not reach its hold.`);
+          const aProvedItselfFirst = recordA.ownProof?.state === "accepted";
+          // Older invocation P, presented as a retry, carrying P's generation, claiming A's identity.
+          const { response, record: wrong } = await sendClaimingPost(fixture, {
+            operationId: operationP,
+            operation: `${name}-claim`,
+            sessionId,
+            browserTimerIdentity: entryA.snapshot.browserTimerIdentity,
+            body: recordP.postData,
+            transportAttempt: 2,
+          });
+          readbackHold.release();
+          await withTimeout(entryA.terminalPromise, 20000, `${name} A did not settle.`);
+          const drained = await fixture.tracker.drain(3000, fixture.page);
+          const rejection = recordA.readbackSupersessionRejection || {};
+          const checks = {
+            wrongGenerationWasRealBrowserPost: response.status === 200,
+            wrongGenerationCarriedOlderGeneration: draftStatesEqual(wrong.payloadDraftState, recordP.payloadDraftState)
+              && !draftStatesEqual(wrong.payloadDraftState, recordA.payloadDraftState),
+            wrongGenerationRejected: wrong.correlationState === "rejected-wrong-generation",
+            wrongGenerationMintedNoProof: wrong.ownProof?.state === "ineligible",
+            aProvedItselfFirst,
+            aReadbackObservedWrongGeneration: draftStatesEqual(recordA.readback?.draftState, recordP.payloadDraftState),
+            // The claim made A sticky, so no successor may explain A's readback at all; the claim is
+            // also independently ineligible (rejected, no proof) if it were ever weighed.
+            wrongGenerationNotSuccessorEvidence: recordA.readbackVerdict === "failed" && !recordA.readbackSuccessor
+              && String(rejection.reason || "").includes("sticky request-ownership violation")
+              && (rejection.rejected || []).every((item) => item.operationId !== operationP || item.checks?.successorIndependentlyProven === false),
+            olderGenerationOutcomeUnchanged: capturedP.entry.status === "succeeded",
+            aFailed: entryA.status === "failed" && stickyReason(entryA),
+            drainFailed: drained === false,
+          };
+          requireChecks(name, checks, fixture);
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks };
+        } finally {
+          readbackHold?.release();
+          await fixture.context.close();
+        }
+      };
+
+      const runR1BTerminalReplay = async () => {
+        const name = "r1b-terminal-replay";
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, sessionId);
+        try {
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          const capturedA = await startQueuedFlush(fixture, sessionId, operationA, `${name}-a`);
+          await withTimeout(capturedA.entry.terminalPromise, 15000, `${name} A did not settle.`);
+          const recordA = postsFor(fixture.tracker, operationA)[0];
+          const drainedBeforeReplay = await fixture.tracker.drain(15000, fixture.page);
+          const statusBeforeReplay = capturedA.entry.status;
+          if (!drainedBeforeReplay || statusBeforeReplay !== "succeeded" || !recordA) {
+            throw new Error(`${name} A did not complete before replay: ${JSON.stringify(fixture.tracker.summary())}.`);
+          }
+          const replay = await sendClaimingPost(fixture, {
+            operationId: operationA,
+            operation: `${name}-exact-replay`,
+            sessionId,
+            browserTimerIdentity: capturedA.snapshot.browserTimerIdentity,
+            body: recordA.postData,
+          });
+          const extraRetry = await sendClaimingPost(fixture, {
+            operationId: operationA,
+            operation: `${name}-extra-retry`,
+            sessionId,
+            browserTimerIdentity: capturedA.snapshot.browserTimerIdentity,
+            body: recordA.postData,
+            transportAttempt: 3,
+          });
+          const drainedAfterReplay = await fixture.tracker.drain(3000, fixture.page);
+          const checks = {
+            completedBeforeReplay: drainedBeforeReplay && statusBeforeReplay === "succeeded",
+            replaysWereRealBrowserPosts: replay.response.status === 200 && extraRetry.response.status === 200,
+            exactReplayRejected: replay.record.correlationState === "rejected-terminal-replay" && replay.record.postData === recordA.postData,
+            extraRetryRejected: extraRetry.record.correlationState === "rejected-terminal-replay"
+              && extraRetry.record.transportVerdict?.accepted === false,
+            identityHistoryRetained: fixture.tracker.queuedSaveStatus(capturedA.snapshot.timerIdentity) === capturedA.entry
+              && capturedA.entry.ownership.claims.length === 3,
+            replaysMintedNoProof: replay.record.ownProof?.state === "ineligible" && extraRetry.record.ownProof?.state === "ineligible",
+            replayViolationsSticky: capturedA.entry.ownership.sticky.length === 2,
+            terminalOutcomeNotRewritten: capturedA.entry.status === "succeeded",
+            drainFailedAfterReplay: drainedAfterReplay === false,
+          };
+          requireChecks(name, checks, fixture);
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks };
+        } finally {
+          await fixture.context.close();
+        }
+      };
+
+      const r1bSecondPost = await runR1BSecondPostNegative();
+      const r1bConcurrentDuplicate = await runR1BConcurrentDuplicate();
+      const r1bRealForbiddenRetry = await runR1BRealForbiddenRetry();
+      const r1bWrongPayload = await runR1BWrongPayloadRetry();
+      const r1bWrongGeneration = await runR1BWrongGeneration();
+      const r1bTerminalReplay = await runR1BTerminalReplay();
+      const singlePostOwnershipCase = (...cases) => ({
+        result: cases.every((item) => item?.result === "PASS"
+          && item.checks?.exclusiveRequestOwnership === true
+          && item.checks?.independentOwnProof === true) ? "PASS" : "FAIL",
+        cases: cases.map((item) => ({ result: item?.result, order: item?.order, evolvedState: item?.evolvedState, checks: item?.checks })),
+      });
+      const r1bPostBeforeSaveStart = singlePostOwnershipCase(r1PostBeforeEvolved, r1PostBeforeSame);
+      const r1bSaveStartBeforePost = singlePostOwnershipCase(r1SaveStartBefore);
+      const r1bCases = {
+        R1B_NEGATIVE_SECOND_POST_STALE_QUEUE_STATE_CANNOT_BYPASS_PENDING_INVOCATION_CORRELATION: r1bSecondPost,
+        R1B_POSITIVE_SINGLE_POST_POST_BEFORE_SAVE_START: r1bPostBeforeSaveStart,
+        R1B_POSITIVE_SINGLE_POST_SAVE_START_BEFORE_POST: r1bSaveStartBeforePost,
+        R1B_POSITIVE_REAL_403_REFRESH_SAME_PAYLOAD_RETRY: r1bRealForbiddenRetry,
+        R1B_NEGATIVE_CONCURRENT_SAME_PAYLOAD_DUPLICATE: r1bConcurrentDuplicate,
+        R1B_NEGATIVE_WRONG_PAYLOAD: r1bWrongPayload,
+        R1B_NEGATIVE_WRONG_GENERATION: r1bWrongGeneration,
+        R1B_NEGATIVE_TERMINAL_REPLAY: r1bTerminalReplay,
+      };
+      const r1bRateWindowSeparation = await separateQuoteSessionRateWindow("R1B");
+
+      const runR2BUnprovenANegative = async (name, { baseline, storageLoss }) => {
+        // baseline "diagnostic": the session exists durably but this tracker holds no prior commit
+        // clock for it; "tracked": a tracked prior save gives A a known prior clock.
+        const fixtureSessionId = boundedSessionId(name, "f");
+        const sessionId = baseline === "diagnostic" ? boundedSessionId(name, "s") : fixtureSessionId;
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, fixtureSessionId);
+        let readbackHold = null;
+        try {
+          if (baseline === "diagnostic") {
+            await fixture.tracker.setPageDiagnostic(fixture.page, { operation: `${name}-baseline`, operationId: `sqag212/${name}-baseline/${Date.now()}` }, sessionId);
+            const saved = await fixture.page.evaluate(async (id) => {
+              clearQuoteSessionDraftSaveTimer();
+              state.quoteSessionId = id;
+              state.quoteSessionDraftSaveStarted = true;
+              saveSessionState();
+              const session = await saveCurrentQuoteSession({
+                sessionId: id,
+                quoteGenerated: false,
+                includeDraftState: true,
+                includeDraftFiles: true,
+                draftState: currentQuoteSessionDraftState(),
+                draftFiles: sessionFileRecordsFromDraft(),
+              });
+              return String(session?.session_id || "");
+            }, sessionId);
+            if (saved !== sessionId) throw new Error(`${name} diagnostic baseline did not persist.`);
+          } else {
+            const baselineOperation = `sqag212/${name}-baseline/${Date.now()}`;
+            const tracked = await startQueuedFlush(fixture, sessionId, baselineOperation, `${name}-baseline`);
+            await withTimeout(tracked.entry.terminalPromise, 15000, `${name} baseline did not settle.`);
+            if (tracked.entry.status !== "succeeded") throw new Error(`${name} tracked baseline did not persist.`);
+          }
+          let armed = true;
+          await fixture.page.route("**/api/quote-sessions", async (route) => {
+            if (route.request().method() !== "POST" || !armed) {
+              await route.continue();
+              return;
+            }
+            armed = false;
+            if (storageLoss === "unpersisted") {
+              await fulfilUnpersistedSave(route);
+              return;
+            }
+            // Real server write whose durable draft state is not A's consequential state.
+            const payload = JSON.parse(route.request().postData() || "{}");
+            if (payload.draft_state && typeof payload.draft_state === "object") {
+              payload.draft_state = {
+                ...payload.draft_state,
+                outputSortMode: payload.draft_state.outputSortMode === "pricing_reference" ? "name" : "pricing_reference",
+              };
+            }
+            await route.continue({ postData: JSON.stringify(payload) });
+          });
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          readbackHold = fixture.tracker.holdDurableReadback(operationA);
+          const olderA = await runNativeTimerSave(fixture, sessionId, operationA, `${name}-a`, { awaitTerminal: false });
+          const recordA = olderA.record;
+          const entryA = olderA.entry;
+          await withTimeout(readbackHold.reached, 15000, `${name} A readback did not reach its hold.`);
+          const operationB = `sqag212/${name}-b/${Date.now()}`;
+          const successorB = await runNativeTimerSave(fixture, sessionId, operationB, `${name}-b`);
+          readbackHold.release();
+          await withTimeout(entryA.terminalPromise, 15000, `${name} A did not settle.`);
+          const recordB = successorB.record;
+          const drained = await fixture.tracker.drain(3000, fixture.page);
+          const responseClock = quoteSessionCommitClock(recordA.responseUpdatedAt);
+          const checks = {
+            aResponseLookedSaved: recordA.httpStatus === 200 && recordA.bodyStatus === "saved"
+              && recordA.responseSessionId === sessionId
+              && recordA.responseQuoteGenerated === recordA.expectedQuoteGenerated
+              && responseClock !== null,
+            aOwnProofFailedOnState: recordA.ownProof?.state === "failed" && String(recordA.ownProof.reason).includes("draft state"),
+            bIndependentlyProven: successorB.entry.status === "succeeded"
+              && recordB.ownProof?.state === "accepted" && recordB.ownProof.consequential === true,
+            aReadbackObservedB: draftStatesEqual(recordA.readback?.draftState, recordB.payloadDraftState),
+            bCannotLaunderA: !recordA.readbackSuccessor
+              && String(recordA.readbackSupersessionRejection?.reason || "").includes("own persistence proof was not accepted"),
+            aFailed: entryA.status === "failed",
+            drainFailed: drained === false,
+          };
+          if (baseline === "diagnostic") checks.aPriorCommitClockNull = recordA.priorCommitClock === null;
+          else {
+            checks.aPriorCommitClockKnown = recordA.priorCommitClock !== null;
+            checks.aResponseTimestampAdvanced = responseClock !== null && responseClock > recordA.priorCommitClock;
+          }
+          requireChecks(name, checks, fixture);
+          await fixture.page.unroute("**/api/quote-sessions");
+          await cleanupSession(fixture.page, sessionId);
+          if (sessionId !== fixtureSessionId) await cleanupSession(fixture.page, fixtureSessionId);
+          return { result: "PASS", checks, rejection: recordA.readbackSupersessionRejection?.reason || "" };
+        } finally {
+          readbackHold?.release();
+          await fixture.page.unroute("**/api/quote-sessions").catch(() => {});
+          await fixture.context.close();
+        }
+      };
+
+      const corruptDataUrl = (dataUrl) => {
+        const separator = String(dataUrl || "").indexOf(",");
+        const header = separator >= 0 ? dataUrl.slice(0, separator) : "";
+        if (!/;base64$/i.test(header)) return "";
+        const bytes = Buffer.concat([Buffer.from(dataUrl.slice(separator + 1), "base64"), Buffer.from("\n%sqag212-r2b-corrupted-bytes\n")]);
+        return `${header},${bytes.toString("base64")}`;
+      };
+      const runR2BFileNegative = async (name, { storageLoss, successorFiles }) => {
+        const fixtureSessionId = boundedSessionId(name, "f");
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, fixtureSessionId);
+        let readbackHold = null;
+        try {
+          let armed = true;
+          await fixture.page.route("**/api/quote-sessions", async (route) => {
+            if (route.request().method() !== "POST" || !armed) {
+              await route.continue();
+              return;
+            }
+            armed = false;
+            // Adversarial storage loss: the real server receives A's state with missing or corrupt files.
+            const payload = JSON.parse(route.request().postData() || "{}");
+            const files = Array.isArray(payload.draft_files) ? payload.draft_files : [];
+            payload.draft_files = storageLoss === "missing"
+              ? []
+              : files.map((file, index) => (index === 0 ? { ...file, data_url: corruptDataUrl(file.data_url) || file.data_url } : file));
+            await route.continue({ postData: JSON.stringify(payload) });
+          });
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          readbackHold = fixture.tracker.holdDurableReadback(operationA);
+          // A is the first save of a fresh session, so it must carry and persist its own files.
+          const olderA = await runNativeTimerSave(fixture, sessionId, operationA, `${name}-a`, { awaitTerminal: false });
+          const recordA = olderA.record;
+          const entryA = olderA.entry;
+          await withTimeout(readbackHold.reached, 15000, `${name} A readback did not reach its hold.`);
+          const aFiles = Array.isArray(recordA.payloadDraftFiles) ? recordA.payloadDraftFiles : [];
+          const successorPayloadFiles = successorFiles === "empty"
+            ? []
+            : aFiles.map((file) => ({ ...file, name: `r2b-successor-${file.name || "reference"}` }));
+          const operationB = `sqag212/${name}-b/${Date.now()}`;
+          await prepareSession(fixture, sessionId, operationB, `${name}-b`);
+          await fixture.page.evaluate((draftFiles) => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 300, draftFiles }), successorPayloadFiles);
+          const recordB = await waitForTrackedPost(fixture.tracker, operationB, 15000);
+          const entryB = fixture.tracker.queuedSaveStatus(recordB.queuedSaveIdentity);
+          if (!entryB) throw new Error(`${name} B POST was not correlated to a real queued save.`);
+          await withTimeout(entryB.terminalPromise, 20000, `${name} B did not settle.`);
+          readbackHold.release();
+          await withTimeout(entryA.terminalPromise, 15000, `${name} A did not settle.`);
+          const drained = await fixture.tracker.drain(3000, fixture.page);
+          const bProvenFiles = recordB.ownProof?.readback?.draftFiles;
+          const checks = {
+            aRequiredNonemptyIdentifiableFiles: aFiles.length > 0
+              && queuedDraftFilesComparable(aFiles).every((file) => file.session_file_key && file.content_fingerprint),
+            aStatePersisted: !String(recordA.ownProof?.reason || "").includes("draft state"),
+            aFileDurabilityFailed: recordA.ownProof?.state === "failed" && String(recordA.ownProof.reason).includes("files"),
+            bSucceededIndependently: entryB.status === "succeeded"
+              && recordB.ownProof?.state === "accepted" && recordB.ownProof.consequential === true,
+            bFilesDifferFromA: Array.isArray(bProvenFiles) && !draftFilesEqual(bProvenFiles, aFiles)
+              && (successorFiles === "empty"
+                ? bProvenFiles.length === 0 && Array.isArray(recordB.payloadDraftFiles) && recordB.payloadDraftFiles.length === 0
+                : bProvenFiles.length === aFiles.length && bProvenFiles.length > 0),
+            aReadbackObservedBFiles: draftFilesEqual(recordA.readback?.draftFiles, bProvenFiles),
+            bCannotSubstituteForA: !recordA.readbackSuccessor
+              && String(recordA.readbackSupersessionRejection?.reason || "").includes("own persistence proof was not accepted"),
+            aFailed: entryA.status === "failed",
+            drainFailed: drained === false,
+          };
+          requireChecks(name, checks, fixture);
+          await fixture.page.unroute("**/api/quote-sessions");
+          await cleanupSession(fixture.page, sessionId);
+          await cleanupSession(fixture.page, fixtureSessionId);
+          return { result: "PASS", storageLoss, successorFiles, checks };
+        } finally {
+          readbackHold?.release();
+          await fixture.page.unroute("**/api/quote-sessions").catch(() => {});
+          await fixture.context.close();
+        }
+      };
+
+      const runR2BNullClockPositive = async () => {
+        const name = "r2b-null-prior-clock-proven-a";
+        const fixtureSessionId = boundedSessionId(name, "f");
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, fixtureSessionId);
+        try {
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          const saved = await runNativeTimerSave(fixture, sessionId, operationA, `${name}-a`);
+          const recordA = saved.record;
+          const drained = await fixture.tracker.drain(15000, fixture.page);
+          const proof = recordA.ownProof?.readback;
+          const checks = {
+            drained,
+            noIssues: fixture.tracker.issues.length === 0,
+            priorCommitClockNull: recordA.priorCommitClock === null,
+            aCarriedNonemptyFiles: Array.isArray(recordA.payloadDraftFiles) && recordA.payloadDraftFiles.length > 0,
+            ownStateProof: recordA.ownProof?.state === "accepted" && recordA.ownProof.consequential === true
+              && draftStatesEqual(proof?.draftState, recordA.payloadDraftState),
+            ownFileProof: draftFilesEqual(proof?.draftFiles, recordA.payloadDraftFiles),
+            succeeded: saved.entry.status === "succeeded" && saved.entry.evidence.persistenceTransportId === recordA.transportId,
+            exactLaterReadback: recordA.readbackVerdict === "exact",
+          };
+          requireChecks(name, checks, fixture);
+          await cleanupSession(fixture.page, sessionId);
+          await cleanupSession(fixture.page, fixtureSessionId);
+          return { result: "PASS", checks };
+        } finally {
+          await fixture.context.close();
+        }
+      };
+
+      const runR2BProofWaitLifecycle = async (lifecycle) => {
+        const name = `r2b-proof-wait-${lifecycle}`;
+        const sessionId = boundedSessionId(name, "s");
+        const fixture = await openOwnershipFixture(`sqag212-${name}`, sessionId);
+        let hold = null;
+        try {
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          hold = fixture.tracker.holdOwnProof(operationA);
+          const olderA = await runNativeTimerSave(fixture, sessionId, operationA, `${name}-a`, { awaitTerminal: false });
+          const recordA = olderA.record;
+          const entryA = olderA.entry;
+          await withTimeout(hold.reached, 15000, `${name} own-proof wait was not reached.`);
+          const proofWaitOutstanding = fixture.tracker.summary().outstanding.requiredOwnProofs === 1;
+          let checks;
+          if (lifecycle === "deadline") {
+            const drained = await fixture.tracker.drain(1500, fixture.page);
+            const report = [...fixture.tracker.drainReports].reverse().find((item) => item.outcome === "deadline-failure");
+            const atDeadline = {
+              drainFailedAtAbsoluteDeadline: drained === false && Boolean(report),
+              deadlineBudgetUnchanged: report?.budgetMs === 1500 && report.deadlineUnchanged === true,
+              proofWaitLifecycleAccounted: (report?.outstanding || []).some((item) => (
+                item.identity === `${operationA}/own-proof` && item.state === "own-proof-pending" && item.producerState !== "none"
+              )),
+              aNotCompletedByDeadline: entryA.status === "pending",
+            };
+            hold.release();
+            await withTimeout(entryA.terminalPromise, 20000, `${name} A did not settle after the proof wait was released.`);
+            const drainedAfter = await fixture.tracker.drain(3000, fixture.page);
+            checks = {
+              ...atDeadline,
+              lateProofNeverExtendedDeadline: recordA.ownProof?.state === "accepted",
+              deadlineFailureRetained: fixture.tracker.issues.some((issue) => issue.operationId === report?.identity),
+              laterDrainStillFailed: drainedAfter === false,
+            };
+          } else {
+            if (lifecycle === "close") await fixture.page.close();
+            else await fixture.page.goto(diagnosticRelay.baseUrl, { waitUntil: "domcontentloaded" });
+            await withTimeout(recordA.ownProofSettled, 10000, `${name} own-proof wait survived the ${lifecycle}.`);
+            await withTimeout(entryA.terminalPromise, 10000, `${name} A did not settle after the ${lifecycle}.`);
+            // The navigated-away save's client-result wait may run to its own 10-second bound.
+            const drained = await fixture.tracker.drain(30000, lifecycle === "close" ? null : fixture.page);
+            const report = fixture.tracker.drainReports.at(-1);
+            checks = {
+              proofWaitAborted: recordA.ownProof?.state === "aborted",
+              aFailed: entryA.status === "failed",
+              noOrphanedProofGate: fixture.tracker.summary().outstanding.requiredOwnProofs === 0,
+              drainTerminatedWithoutDeadline: drained === false && report?.outcome === "failure",
+            };
+          }
+          checks.proofWaitWasOutstanding = proofWaitOutstanding;
+          requireChecks(name, checks, fixture);
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks };
+        } finally {
+          hold?.release();
+          await fixture.context.close();
+        }
+      };
+
+      const r2bNullClockNegative = await runR2BUnprovenANegative("r2b-null-prior-clock-unpersisted-a", { baseline: "diagnostic", storageLoss: "unpersisted" });
+      const r2bAdvancedClockNegative = await runR2BUnprovenANegative("r2b-advanced-timestamp-unpersisted-state", { baseline: "tracked", storageLoss: "state" });
+      const r2bMissingFilesNegative = await runR2BFileNegative("r2b-missing-a-files-different-b-files", { storageLoss: "missing", successorFiles: "different" });
+      const r2bCorruptFilesNegative = await runR2BFileNegative("r2b-corrupt-a-files-empty-b-files", { storageLoss: "corrupt", successorFiles: "empty" });
+      const r2bNullClockPositive = await runR2BNullClockPositive();
+      const r2bProofWaitClose = await runR2BProofWaitLifecycle("close");
+      const r2bProofWaitNavigation = await runR2BProofWaitLifecycle("navigation");
+      const r2bProofWaitDeadline = await runR2BProofWaitLifecycle("deadline");
+      const r2bFileNegative = {
+        result: [r2bMissingFilesNegative, r2bCorruptFilesNegative].every((item) => item?.result === "PASS") ? "PASS" : "FAIL",
+        missingAFilesThenDifferentBFiles: r2bMissingFilesNegative,
+        corruptAFilesThenEmptyBFiles: r2bCorruptFilesNegative,
+      };
+      const r2bNoLaundering = {
+        result: [r2NoLaundering, r2bNullClockNegative, r2bAdvancedClockNegative, r2bMissingFilesNegative, r2bCorruptFilesNegative]
+          .every((item) => item?.result === "PASS") ? "PASS" : "FAIL",
+        unpersistedStateWithKnownClock: r2NoLaundering,
+        unpersistedStateWithNullClock: r2bNullClockNegative?.result,
+        advancedTimestampWithoutState: r2bAdvancedClockNegative?.result,
+        missingFiles: r2bMissingFilesNegative?.result,
+        corruptFiles: r2bCorruptFilesNegative?.result,
+      };
+      const r2bSupersedes = {
+        result: r2Supersedes?.result === "PASS"
+          && r2Supersedes.checks?.aIndependentlyProvenFirst === true
+          && r2Supersedes.checks?.bIndependentlyProven === true
+          && r2Supersedes.checks?.aReadbackIsBProvenRepresentation === true ? "PASS" : "FAIL",
+        checks: r2Supersedes?.checks,
+        supersession: r2Supersedes?.supersession,
+      };
+      const r2bReadbackBeforeB = {
+        result: r2ReadbackBeforeB?.result === "PASS"
+          && r2ReadbackBeforeB.checks?.aIndependentOwnProof === true
+          && r2ReadbackBeforeB.checks?.bIndependentOwnProof === true ? "PASS" : "FAIL",
+        checks: r2ReadbackBeforeB?.checks,
+      };
+      const r2bCases = {
+        R2B_NEGATIVE_NULL_PRIOR_CLOCK_UNPERSISTED_A_THEN_VALID_B: r2bNullClockNegative,
+        R2B_NEGATIVE_ADVANCED_TIMESTAMP_WITHOUT_A_STATE_PERSISTENCE: r2bAdvancedClockNegative,
+        R2B_NEGATIVE_B_FILES_CANNOT_SUBSTITUTE_FOR_A_FILE_DURABILITY: r2bFileNegative,
+        R2B_NEGATIVE_B_SUCCESS_CANNOT_SUPPLY_A_MISSING_STATE_OR_FILE_PROOF: r2bNoLaundering,
+        R2B_POSITIVE_A_INDEPENDENTLY_PROVEN_THEN_B_SUPERSEDES_BEFORE_A_READBACK: r2bSupersedes,
+        R2B_POSITIVE_A_READBACK_BEFORE_B: r2bReadbackBeforeB,
+        R2B_POSITIVE_A_PROVEN_WITH_NULL_PRIOR_CLOCK_USING_CONSEQUENTIAL_STATE_FILE_EVIDENCE: r2bNullClockPositive,
+        R2B_ADVERSARIAL_PROOF_WAIT_PAGE_CLOSE: r2bProofWaitClose,
+        R2B_ADVERSARIAL_PROOF_WAIT_NAVIGATION: r2bProofWaitNavigation,
+        R2B_ADVERSARIAL_PROOF_WAIT_ABSOLUTE_DEADLINE: r2bProofWaitDeadline,
+      };
+      const r2bRateWindowSeparation = await separateQuoteSessionRateWindow("R2B");
+      const ownershipStatuses = ownershipTrackers.flatMap((fixtureTracker) => fixtureTracker.records
+        .filter((record) => record.method === "POST").map((record) => record.httpStatus));
+      const r1bR2bLimiterEvidence = {
+        result: ownershipStatuses.includes(429) ? "FAIL" : "PASS",
+        quoteSessionPostCount: ownershipStatuses.length,
+        rateLimitedCount: ownershipStatuses.filter((status) => status === 429).length,
+      };
+      const r1bPassed = Object.values(r1bCases).every((item) => item?.result === "PASS");
+      const r2bPassed = Object.values(r2bCases).every((item) => item?.result === "PASS");
+
       return {
+        R1B_RESULT: r1bPassed ? "PASS" : "FAIL",
+        ...r1bCases,
+        R1B_RATE_WINDOW_SEPARATION: r1bRateWindowSeparation,
+        R2B_RESULT: r2bPassed ? "PASS" : "FAIL",
+        ...r2bCases,
+        R2B_RATE_WINDOW_SEPARATION: r2bRateWindowSeparation,
+        R1B_R2B_NO_LIMITER_SELF_INTERFERENCE: r1bR2bLimiterEvidence,
         ...(t3PositiveEvidence || {}),
         R1_RESULT: r1Passed ? "PASS" : "FAIL",
         R1_NEGATIVE_POST_BEFORE_SAVE_START_WITH_QUEUE_STATE_EVOLUTION: r1PostBeforeEvolved,
@@ -10387,6 +11774,25 @@ async function main() {
       "R2_POSITIVE_A_PERSISTS_THEN_B_VALIDLY_SUPERSEDES_BEFORE_A_READBACK",
       "R2_POSITIVE_A_READBACK_BEFORE_B",
       "R2_NEGATIVE_B_SUCCESS_CANNOT_LAUNDER_A_FAILURE",
+      "R1B_NEGATIVE_SECOND_POST_STALE_QUEUE_STATE_CANNOT_BYPASS_PENDING_INVOCATION_CORRELATION",
+      "R1B_POSITIVE_SINGLE_POST_POST_BEFORE_SAVE_START",
+      "R1B_POSITIVE_SINGLE_POST_SAVE_START_BEFORE_POST",
+      "R1B_POSITIVE_REAL_403_REFRESH_SAME_PAYLOAD_RETRY",
+      "R1B_NEGATIVE_CONCURRENT_SAME_PAYLOAD_DUPLICATE",
+      "R1B_NEGATIVE_WRONG_PAYLOAD",
+      "R1B_NEGATIVE_WRONG_GENERATION",
+      "R1B_NEGATIVE_TERMINAL_REPLAY",
+      "R2B_NEGATIVE_NULL_PRIOR_CLOCK_UNPERSISTED_A_THEN_VALID_B",
+      "R2B_NEGATIVE_ADVANCED_TIMESTAMP_WITHOUT_A_STATE_PERSISTENCE",
+      "R2B_NEGATIVE_B_FILES_CANNOT_SUBSTITUTE_FOR_A_FILE_DURABILITY",
+      "R2B_NEGATIVE_B_SUCCESS_CANNOT_SUPPLY_A_MISSING_STATE_OR_FILE_PROOF",
+      "R2B_POSITIVE_A_INDEPENDENTLY_PROVEN_THEN_B_SUPERSEDES_BEFORE_A_READBACK",
+      "R2B_POSITIVE_A_READBACK_BEFORE_B",
+      "R2B_POSITIVE_A_PROVEN_WITH_NULL_PRIOR_CLOCK_USING_CONSEQUENTIAL_STATE_FILE_EVIDENCE",
+      "R2B_ADVERSARIAL_PROOF_WAIT_PAGE_CLOSE",
+      "R2B_ADVERSARIAL_PROOF_WAIT_NAVIGATION",
+      "R2B_ADVERSARIAL_PROOF_WAIT_ABSOLUTE_DEADLINE",
+      "R1B_R2B_NO_LIMITER_SELF_INTERFERENCE",
     ];
     const lifecycleCasePassed = (evidence) => evidence === "PASS" || evidence?.result === "PASS";
     if (
@@ -10395,9 +11801,11 @@ async function main() {
       || focusedCases.L3_RESULT !== "PASS"
       || focusedCases.R1_RESULT !== "PASS"
       || focusedCases.R2_RESULT !== "PASS"
+      || focusedCases.R1B_RESULT !== "PASS"
+      || focusedCases.R2B_RESULT !== "PASS"
       || requiredLifecycleCases.some((caseName) => !lifecycleCasePassed(focusedCases[caseName]))
     ) {
-      throw new Error(`SQAG #212 focused lifecycle controls did not report every required L1-L3 and R1-R2 case: ${JSON.stringify(focusedCases)}.`);
+      throw new Error(`SQAG #212 focused lifecycle controls did not report every required L1-L3, R1-R2, and R1B-R2B case: ${JSON.stringify(focusedCases)}.`);
     }
     const functionalIsolation = await runSqag212RegressionInIsolatedServer(
       page,
