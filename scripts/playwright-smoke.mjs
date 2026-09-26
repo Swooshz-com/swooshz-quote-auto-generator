@@ -460,6 +460,16 @@ function quoteSessionActualFields(session) {
   };
 }
 
+// Server quote-session updated_at values are ISO timestamps with optional microseconds
+// (the fraction is omitted when it is zero), so compare them numerically, not lexically.
+function quoteSessionCommitClock(value) {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/.exec(String(value || ""));
+  if (!match) return null;
+  const seconds = Date.parse(`${match[1]}${match[3]}`);
+  if (!Number.isFinite(seconds)) return null;
+  return seconds * 1000 + Number(String(match[2] || "").padEnd(6, "0"));
+}
+
 function createQuoteSessionDrainTracker(group) {
   const records = [];
   const requestRecords = new WeakMap();
@@ -478,6 +488,9 @@ function createQuoteSessionDrainTracker(group) {
   const documentEpisodes = new Map();
   const timerEventFaults = new WeakMap();
   const timerEventAckHolds = new WeakMap();
+  const timerEventHandlingHolds = new WeakMap();
+  const readbackHolds = new Map();
+  const sessionCommitClocks = new Map();
   const observedTimerEventFailures = new Set();
   const issues = [];
   const progressWaiters = new Set();
@@ -751,12 +764,112 @@ function createQuoteSessionDrainTracker(group) {
     }
   };
 
+  const advanceSessionCommitClock = (sessionId, updatedAt) => {
+    const clock = quoteSessionCommitClock(updatedAt);
+    if (!sessionId || clock === null) return;
+    const current = sessionCommitClocks.get(sessionId);
+    if (current === undefined || clock > current) sessionCommitClocks.set(sessionId, clock);
+  };
+
+  const readbackMismatches = (readback, record) => {
+    const failures = [];
+    if (readback.httpStatus !== 200 || readback.sessionId !== record.expectedSessionId) {
+      failures.push("independent durable quote-session readback did not return the exact saved session");
+    }
+    if (!quoteSessionValueContains(readback.fields, record.expectedFields)) {
+      failures.push("independent durable readback lost expected saved fields");
+    }
+    if (record.kind !== "detail" && readback.quoteGenerated !== record.expectedQuoteGenerated) {
+      failures.push("independent durable readback had the wrong quote_generated state");
+    }
+    if (record.kind !== "detail" && record.queuedSaveIdentity && record.payloadDraftState
+      && JSON.stringify(queuedDraftStateComparable(readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(record.payloadDraftState))) {
+      failures.push("independent durable readback did not match the queued save request draft state");
+    }
+    return failures;
+  };
+
+  // R2: an older save's readback may legitimately observe a newer same-session save. That is
+  // accepted only when the older save's own commit is proven by its fresh successful server
+  // response, and a later-issued save observed before the readback returned is itself fully
+  // validated, committed after the older save, and is exactly the commit the readback observed.
+  // A failed or unproven older save is never laundered by a successful successor.
+  const findValidatedReadbackSuccessor = async (record, readback, laterRecords) => {
+    const ownClock = quoteSessionCommitClock(record.responseUpdatedAt);
+    const ownCommitProven = !record.transportFailure
+      && record.httpStatus >= 200 && record.httpStatus < 300
+      && record.bodyStatus === "saved"
+      && record.responseSessionId === record.expectedSessionId
+      && record.responseQuoteGenerated === record.expectedQuoteGenerated
+      && ownClock !== null
+      && (record.priorCommitClock === null || ownClock > record.priorCommitClock);
+    if (!ownCommitProven) {
+      return {
+        successor: null,
+        reason: "older save's own commit was not proven by a fresh successful server response",
+        ownClock,
+        priorCommitClock: record.priorCommitClock,
+      };
+    }
+    const readbackClock = quoteSessionCommitClock(readback.updatedAt);
+    const rejected = [];
+    for (const candidate of [...laterRecords].reverse()) {
+      if (candidate.kind || candidate.method !== "POST" || candidate.persistenceClass === "DIAGNOSTIC_ONLY") continue;
+      if (candidate.expectedSessionId !== record.expectedSessionId || !candidate.payloadDraftState) continue;
+      if (readback.quoteGenerated !== candidate.expectedQuoteGenerated
+        || !quoteSessionValueContains(readback.fields, candidate.expectedFields)
+        || JSON.stringify(queuedDraftStateComparable(readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(candidate.payloadDraftState))) continue;
+      await candidate.terminalPromise;
+      const candidateClock = quoteSessionCommitClock(candidate.responseUpdatedAt);
+      const checks = {
+        noTransportFailure: !candidate.transportFailure,
+        savedResponse: candidate.httpStatus >= 200 && candidate.httpStatus < 300 && candidate.bodyStatus === "saved",
+        exactSession: candidate.responseSessionId === record.expectedSessionId,
+        committedAfterOlderSave: candidateClock !== null && candidateClock > ownClock,
+        readbackObservedThisCommit: readbackClock !== null && readbackClock === candidateClock,
+        successorReadbackValidated: ["exact", "superseded"].includes(candidate.readbackVerdict),
+        successorHasNoIssues: !issues.some((issue) => issue.operationId === candidate.operationId),
+      };
+      if (Object.values(checks).every(Boolean)) {
+        return { successor: candidate, ownClock, successorClock: candidateClock, readbackClock };
+      }
+      rejected.push({ operationId: candidate.operationId, checks });
+    }
+    return {
+      successor: null,
+      reason: "no validated later same-session save explains the observed readback",
+      ownClock,
+      readbackClock,
+      rejected,
+    };
+  };
+
+  const holdDurableReadback = (operationId) => {
+    let reachedResolve;
+    let releaseResolve;
+    const hold = {
+      operationId: String(operationId || ""),
+      reached: new Promise((resolve) => { reachedResolve = resolve; }),
+      gate: new Promise((resolve) => { releaseResolve = resolve; }),
+      reachedResolve: (value) => reachedResolve(value),
+      release: () => releaseResolve(),
+    };
+    readbackHolds.set(hold.operationId, hold);
+    return hold;
+  };
+
   const durableReadback = async (request, record) => {
     const origin = new URL(request.url()).origin;
     const sessionId = encodeURIComponent(record.expectedSessionId);
-    const url = `${origin}/api/quote-sessions/${sessionId}?__sqag_smoke_readback=${Date.now()}-${records.length}`;
     pendingReadbacks.add(record);
     try {
+      const hold = readbackHolds.get(record.operationId);
+      if (hold) {
+        readbackHolds.delete(record.operationId);
+        hold.reachedResolve({ operationId: record.operationId });
+        await hold.gate;
+      }
+      const url = `${origin}/api/quote-sessions/${sessionId}?__sqag_smoke_readback=${Date.now()}-${records.length}`;
       const response = await fetch(url, {
         cache: "no-store",
         headers: { "cache-control": "no-cache", pragma: "no-cache" },
@@ -773,18 +886,41 @@ function createQuoteSessionDrainTracker(group) {
         draftState: session?.draft_state && typeof session.draft_state === "object" ? session.draft_state : null,
         draftFiles: Array.isArray(session?.draft_files) ? session.draft_files : null,
         fields: quoteSessionActualFields(session),
+        updatedAt: String(session?.updated_at || ""),
       };
-      if (response.status !== 200 || record.readback.sessionId !== record.expectedSessionId) {
-        addIssue(record, "independent durable quote-session readback did not return the exact saved session");
+      // Only saves observed before this readback returned can explain what it read.
+      const laterRecords = records.slice(records.indexOf(record) + 1);
+      if (response.status === 200 && record.readback.sessionId === record.expectedSessionId) {
+        advanceSessionCommitClock(record.expectedSessionId, record.readback.updatedAt);
       }
-      if (!quoteSessionValueContains(record.readback.fields, record.expectedFields)) {
-        addIssue(record, "independent durable readback lost expected saved fields");
+      const failures = readbackMismatches(record.readback, record);
+      if (!failures.length) {
+        record.readbackVerdict = "exact";
+        return record.readback;
       }
-      if (record.kind !== "detail" && record.readback.quoteGenerated !== record.expectedQuoteGenerated) {
-        addIssue(record, "independent durable readback had the wrong quote_generated state");
+      const supersession = response.status === 200 && record.readback.sessionId === record.expectedSessionId
+        ? await findValidatedReadbackSuccessor(record, record.readback, laterRecords)
+        : { successor: null, reason: "readback did not return the exact saved session" };
+      if (supersession.successor) {
+        record.readbackVerdict = "superseded";
+        record.readbackSuccessor = supersession.successor;
+        record.readbackSupersession = {
+          successorOperationId: supersession.successor.operationId,
+          ownCommitClock: supersession.ownClock,
+          successorCommitClock: supersession.successorClock,
+          readbackCommitClock: supersession.readbackClock,
+          supersededMismatches: failures,
+        };
+        return record.readback;
+      }
+      record.readbackVerdict = "failed";
+      record.readbackSupersessionRejection = { ...supersession, successor: undefined };
+      for (const failure of failures) {
+        addIssue(record, `${failure}; supersession rejected: ${JSON.stringify(record.readbackSupersessionRejection)}`);
       }
       return record.readback;
     } catch (error) {
+      record.readbackVerdict = "failed";
       addIssue(record, `independent durable quote-session readback failed: ${error?.message || error}`);
       return null;
     } finally {
@@ -810,6 +946,7 @@ function createQuoteSessionDrainTracker(group) {
     record.responseSessionId = String(responseSession?.session_id || "");
     record.responseQuoteGenerated = typeof responseSession?.status?.quote_generated === "boolean"
       ? responseSession.status.quote_generated : null;
+    record.responseUpdatedAt = String(responseSession?.updated_at || "");
     if (record.kind === "list") {
       pendingRequiredRequests.delete(record);
       notifyProgress();
@@ -861,6 +998,10 @@ function createQuoteSessionDrainTracker(group) {
     if (clientResult?.quoteGenerated !== record.expectedQuoteGenerated) {
       addIssue(record, "initiating application save promise returned the wrong quote_generated state");
     }
+    if (record.httpStatus >= 200 && record.httpStatus < 300 && record.bodyStatus === "saved"
+      && record.responseSessionId === record.expectedSessionId) {
+      advanceSessionCommitClock(record.expectedSessionId, record.responseUpdatedAt);
+    }
     const readbackPromise = durableReadback(record.request, record);
     record.readbackProducer = readbackPromise;
     await readbackPromise;
@@ -911,8 +1052,13 @@ function createQuoteSessionDrainTracker(group) {
       bodyStatus: "",
       responseSessionId: "",
       responseQuoteGenerated: null,
+      responseUpdatedAt: "",
       clientResult: null,
       readback: null,
+      readbackVerdict: "",
+      observedAt: Date.now(),
+      priorCommitClock: sessionCommitClocks.get(quoteSessionRequestId(request, payload)) ?? null,
+      correlationState: "",
       transportFailure: false,
       done: false,
     };
@@ -923,11 +1069,24 @@ function createQuoteSessionDrainTracker(group) {
       pendingRequiredRequests.add(record);
       pendingSavePromises.add(record);
       const entry = record.queuedSaveIdentity ? queuedSaveHistory.get(record.queuedSaveIdentity) : null;
-      if (record.queuedSaveIdentity && (!entry || !queuedSaveMatchesRecord(entry, record))) {
+      if (entry?.status === "pending" && !entry.saveInvocationSnapshot && !entry.correlationPendingRecord) {
+        // R1: the application builds its POST from state current at save invocation, and Node can
+        // observe that POST before the save-start event carrying the authoritative save-invocation
+        // snapshot. Bind the exact identity now and judge the request against that snapshot when it
+        // arrives; never against the stale queue-time snapshot.
+        record.correlationState = "awaiting-save-invocation-snapshot";
+        entry.correlationPendingRecord = record;
+        entry.correlationEvidence = { order: "post-before-save-start", operationId: record.operationId };
+        entry.transitions.push({ type: "post-observed-before-save-start", at: Date.now(), operationId: record.operationId });
+        attachQueuedSaveProducer(entry, record.terminalPromise, record);
+      } else if (record.queuedSaveIdentity && (!entry || !queuedSaveMatchesRecord(entry, record))) {
         addIssue(record, "queued save request identity did not match its captured session, state, files, and required status"
           + (entry ? ": " + JSON.stringify(queuedSaveMismatchSummary(entry, record)) : ""));
+        record.correlationState = "rejected";
         if (entry?.status === "pending") settleQueuedSave(entry, "failed", "correlated POST did not match the captured queued save");
       } else if (entry?.status === "pending") {
+        record.correlationState = "correlated-by-save-invocation-snapshot";
+        entry.correlationEvidence = { order: "save-start-before-post", operationId: record.operationId, correlatedAgainst: "save-invocation-snapshot" };
         attachQueuedSaveProducer(entry, record.terminalPromise, record);
       }
       for (const candidate of pendingQueuedSaveWork.values()) {
@@ -1046,9 +1205,13 @@ function createQuoteSessionDrainTracker(group) {
       stateDiffKeys,
       expectedFileCount: Array.isArray(snapshot.draftFiles) ? snapshot.draftFiles.length : null,
       actualFileCount: Array.isArray(record.payloadDraftFiles) ? record.payloadDraftFiles.length : null,
-      filesMatch: Array.isArray(snapshot.draftFiles)
-        && Array.isArray(record.payloadDraftFiles)
-        && JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles)) === JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles)),
+      // A POST may legitimately omit already-confirmed files; durable readback still proves them.
+      filesRepresentation: record.payloadDraftFiles === null ? "omitted-confirmed-files" : "present",
+      filesMatch: record.payloadDraftFiles === null
+        ? "not-applicable"
+        : Array.isArray(snapshot.draftFiles)
+          && JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles)) === JSON.stringify(queuedDraftFilesComparable(record.payloadDraftFiles)),
+      comparedSnapshot: entry?.saveInvocationSnapshot ? "save-invocation" : "queue-time",
     };
   };
 
@@ -1060,9 +1223,15 @@ function createQuoteSessionDrainTracker(group) {
     if (record.responseSessionId !== snapshot.sessionId || record.responseQuoteGenerated !== snapshot.options?.quoteGenerated) failures.push("application response session/status did not match the captured save");
     if (record.clientResult?.nonNull !== true || record.clientResult?.sessionId !== snapshot.sessionId || record.clientResult?.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("application save result did not match the captured session/status");
     if (record.readback?.httpStatus !== 200 || record.readback?.sessionId !== snapshot.sessionId) failures.push("durable readback did not return the exact saved session");
-    if (record.readback?.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("durable readback did not preserve required quote_generated status");
-    if (!record.readback?.draftState || JSON.stringify(queuedDraftStateComparable(record.readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(snapshot.draftState))) failures.push("durable readback did not match captured draft state");
-    if (!Array.isArray(record.readback?.draftFiles) || JSON.stringify(queuedDraftFilesComparable(record.readback.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(snapshot.draftFiles))) failures.push("durable readback did not match captured draft files");
+    const successor = record.readbackVerdict === "superseded" ? record.readbackSuccessor : null;
+    if (!successor) {
+      if (record.readback?.quoteGenerated !== snapshot.options?.quoteGenerated) failures.push("durable readback did not preserve required quote_generated status");
+      if (!record.readback?.draftState || JSON.stringify(queuedDraftStateComparable(record.readback.draftState)) !== JSON.stringify(queuedDraftStateComparable(snapshot.draftState))) failures.push("durable readback did not match captured draft state");
+    }
+    // Files stay durably preserved: a validated successor that omitted draft_files must leave
+    // this save's files in place; one that sent files must be exactly what was read back.
+    const expectedFiles = successor && Array.isArray(successor.payloadDraftFiles) ? successor.payloadDraftFiles : snapshot.draftFiles;
+    if (!Array.isArray(record.readback?.draftFiles) || JSON.stringify(queuedDraftFilesComparable(record.readback.draftFiles)) !== JSON.stringify(queuedDraftFilesComparable(expectedFiles))) failures.push("durable readback did not match captured draft files");
     return failures;
   };
 
@@ -1077,6 +1246,8 @@ function createQuoteSessionDrainTracker(group) {
     }
     for (const entry of candidates) {
       if (entry.status !== "pending") continue;
+      // Deferred R1 correlation completes when the save-invocation snapshot arrives.
+      if (entry.correlationPendingRecord === record) continue;
       const failures = validateQueuedPersistence(entry, record);
       if (failures.length) {
         settleQueuedSave(entry, "failed", `queued save persistence proof failed: ${failures.join("; ")}`);
@@ -1084,7 +1255,12 @@ function createQuoteSessionDrainTracker(group) {
         entry.evidence.postObserved = true;
         entry.evidence.durableReadbackObserved = true;
         entry.evidence.persistenceRecordId = record.operationId;
-        settleQueuedSave(entry, "succeeded", "validated POST response and exact durable readback");
+        if (record.readbackVerdict === "superseded") {
+          entry.evidence.readbackSupersession = { ...record.readbackSupersession };
+          settleQueuedSave(entry, "succeeded", "validated POST response and fresh commit, durably superseded by a validated later same-session save");
+        } else {
+          settleQueuedSave(entry, "succeeded", "validated POST response and exact durable readback");
+        }
       }
     }
   };
@@ -1240,11 +1416,42 @@ function createQuoteSessionDrainTracker(group) {
         return;
       }
       entry.snapshot = snapshot;
+      entry.saveInvocationSnapshot = snapshot;
+      entry.saveInvocationObservedAt = Date.now();
+      const deferredRecord = entry.correlationPendingRecord || null;
+      entry.correlationPendingRecord = null;
       const executableSuccessor = entry.ownedFlushLease || createProducerLease("application-save", "started");
       executableSuccessor.state = "started";
       executableSuccessor.executable = true;
       executableSuccessor.startedAt = Date.now();
       entry.applicationSaveLease = executableSuccessor;
+      if (deferredRecord) {
+        if (!queuedSaveMatchesRecord(entry, deferredRecord)) {
+          deferredRecord.correlationState = "rejected";
+          addIssue(deferredRecord, "queued save request did not match the save-invocation snapshot of its exact queued save: "
+            + JSON.stringify(queuedSaveMismatchSummary(entry, deferredRecord)));
+          failQueuedSave(entry, "correlated POST did not match the save-invocation snapshot of its queued save");
+          return;
+        }
+        deferredRecord.correlationState = "correlated-by-save-invocation-snapshot";
+        entry.correlationEvidence = { ...(entry.correlationEvidence || {}), correlatedAgainst: "save-invocation-snapshot" };
+        // The already-observed request remains the producer; this lease only records the start.
+        executableSuccessor.resolve({ status: "transferred", to: "request-response-body-durable-readback" });
+        entry.applicationSaveLease = null;
+        if (entry.ownedFlushLease) {
+          entry.flushOperation = {
+            ...(entry.flushOperation || {}),
+            state: "FLUSH_OPERATION_STARTED",
+            identity: entry.identity,
+            startedAt: executableSuccessor.startedAt,
+            documentId: String(snapshot.documentId || ""),
+          };
+        }
+        updateDocumentWork(entry, "pending", { producerState: "request-observed-before-save-start" });
+        if (deferredRecord.done) completeQueuedPersistenceRecord(deferredRecord);
+        notifyProgress();
+        return;
+      }
       if (entry.ownedFlushLease) {
         entry.flushOperation = {
           ...(entry.flushOperation || {}),
@@ -1509,6 +1716,28 @@ function createQuoteSessionDrainTracker(group) {
     return hold;
   };
 
+  // Deterministically delays Node's handling of one real timer event (without touching the page
+  // or application timing) so controls can order it against the application's real POST.
+  const holdTimerEventHandling = (page, type) => {
+    let observedResolve;
+    let releaseResolve;
+    const hold = {
+      type: String(type || "save-start"),
+      held: false,
+      eventIdentity: "",
+      observed: new Promise((resolve) => { observedResolve = resolve; }),
+      released: new Promise((resolve) => { releaseResolve = resolve; }),
+      observe: (eventIdentity) => {
+        hold.held = true;
+        hold.eventIdentity = String(eventIdentity || "");
+        observedResolve({ identity: hold.eventIdentity, type: hold.type });
+      },
+      release: () => releaseResolve(),
+    };
+    timerEventHandlingHolds.set(page, hold);
+    return hold;
+  };
+
   const markPageWorkUnresolved = (page, reason) => {
     const pageIdentity = pageIdentities.get(page);
     if (!pageIdentity) return;
@@ -1531,6 +1760,13 @@ function createQuoteSessionDrainTracker(group) {
         fault.armed = false;
         recordTimerEventDeliveryFailure(page, event, "deterministic smoke fault rejected the actual exposed timer-event binding");
         throw new Error("deterministic smoke fault at timer-event binding");
+      }
+      const handlingHold = timerEventHandlingHolds.get(page);
+      if (handlingHold && handlingHold.type === String(event?.type || "") && !handlingHold.held) {
+        const rawIdentity = String(event?.snapshot?.timerIdentity || event?.timerIdentity || "");
+        handlingHold.observe(rawIdentity ? normalizeTimerIdentity(page, rawIdentity) : "");
+        await handlingHold.released;
+        timerEventHandlingHolds.delete(page);
       }
       try {
         await handleTimerEvent(source, event);
@@ -2543,6 +2779,9 @@ function createQuoteSessionDrainTracker(group) {
       terminalReason: entry.terminalReason || "",
       postObserved: entry.evidence.postObserved === true,
       durableReadbackObserved: entry.evidence.durableReadbackObserved === true,
+      saveInvocationObserved: Boolean(entry.saveInvocationSnapshot),
+      correlation: entry.correlationEvidence ? { ...entry.correlationEvidence } : null,
+      readbackSupersession: entry.evidence.readbackSupersession ? { ...entry.evidence.readbackSupersession } : null,
     })),
     drainWaitCount,
     drainRuns: drainReports.map((report) => ({ ...report, outstanding: report.outstanding.map((item) => ({ ...item })) })),
@@ -2587,6 +2826,8 @@ function createQuoteSessionDrainTracker(group) {
     startRecoveryFlushOnActualCancellation,
     faultNextTimerEventDelivery,
     holdTimerEventAcknowledgement,
+    holdTimerEventHandling,
+    holdDurableReadback,
     documentEpisodes,
     drainReports,
     activeDrainRuns,
@@ -6342,8 +6583,440 @@ async function verifySqag212AnalysisConfirmationPriceSaveReloadAndExports(page, 
         await l3FinalLate.context.close();
       }
 
+      // R1/R2: save correlation ordering and readback supersession controls. Every positive uses
+      // the real queue, real save invocation, real fetch/POST, real response, and durable readback.
+      const withTimeout = (promise, ms, label) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(typeof label === "function" ? label() : label)), ms)),
+      ]);
+      const waitForTrackedPost = async (fixtureTracker, operationId, timeoutMs = 10000) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const record = fixtureTracker.records.find((candidate) => candidate.operationId === operationId && candidate.method === "POST");
+          if (record) return record;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error(`Required POST ${operationId} was not observed within ${timeoutMs} ms.`);
+      };
+      const waitForCondition = async (predicate, timeoutMs, label) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (predicate()) return;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error(label);
+      };
+      const draftStatesEqual = (left, right) => Boolean(left && right)
+        && JSON.stringify(queuedDraftStateComparable(left)) === JSON.stringify(queuedDraftStateComparable(right));
+      const draftFilesEqual = (left, right) => Array.isArray(left) && Array.isArray(right)
+        && JSON.stringify(queuedDraftFilesComparable(left)) === JSON.stringify(queuedDraftFilesComparable(right));
+      const postsFor = (fixtureTracker, operationId) => fixtureTracker.records.filter((candidate) => (
+        candidate.operationId === operationId && candidate.method === "POST"
+      ));
+      const saveInvocationDurable = (record, entry) => {
+        const saveSnapshot = entry?.saveInvocationSnapshot;
+        return Boolean(
+          record && saveSnapshot
+          && record.httpStatus >= 200 && record.httpStatus < 300
+          && record.bodyStatus === "saved"
+          && record.responseSessionId === saveSnapshot.sessionId
+          && record.clientResult?.nonNull === true
+          && record.clientResult?.sessionId === saveSnapshot.sessionId
+          && record.readback?.httpStatus === 200
+          && record.readback?.sessionId === saveSnapshot.sessionId
+          && record.readback?.quoteGenerated === saveSnapshot.options?.quoteGenerated
+          && record.readbackVerdict === "exact"
+          && draftStatesEqual(record.payloadDraftState, saveSnapshot.draftState)
+          && draftStatesEqual(record.readback?.draftState, saveSnapshot.draftState)
+          && draftFilesEqual(record.readback?.draftFiles, saveSnapshot.draftFiles)
+        );
+      };
+      const startQueuedFlush = async (fixture, sessionId, operationId, operation) => {
+        await prepareSession(fixture, sessionId, operationId, operation);
+        await fixture.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        const captured = await fixture.tracker.capturePendingQueuedSave(fixture.page);
+        if (!captured) throw new Error(`${operation} did not capture its real queued save.`);
+        const start = await fixture.tracker.startCapturedQueuedSave(fixture.page, captured);
+        if (start.status !== "started") throw new Error(`${operation} did not start its real queued save: ${JSON.stringify(start)}.`);
+        return captured;
+      };
+      // A successor save driven only by the real native timer. It deliberately avoids harness timer
+      // capture, which waits on every pending timer event (including a held older save's outcome).
+      const runNativeTimerSave = async (fixture, sessionId, operationId, operation, { awaitTerminal = true } = {}) => {
+        await prepareSession(fixture, sessionId, operationId, operation);
+        await fixture.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 300 }));
+        const record = await waitForTrackedPost(fixture.tracker, operationId, 15000);
+        const entry = fixture.tracker.queuedSaveStatus(record.queuedSaveIdentity);
+        if (!entry) throw new Error(`${operation} POST was not correlated to a real queued timer save.`);
+        if (awaitTerminal) await withTimeout(entry.terminalPromise, 20000, `${operation} native timer save did not settle.`);
+        return { record, entry };
+      };
+      const fulfilUnpersistedSave = async (route) => {
+        // Negative control only: answer "saved" with the unchanged stored session, without writing.
+        const request = route.request();
+        let payload = {};
+        try { payload = request.postDataJSON() || {}; } catch {}
+        const origin = new URL(request.url()).origin;
+        const stored = await fetch(`${origin}/api/quote-sessions/${encodeURIComponent(String(payload.session_id || ""))}?__sqag_smoke_r2_unpersisted=${Date.now()}`, {
+          cache: "no-store",
+          signal: AbortSignal.timeout(15000),
+        });
+        const storedBody = await stored.json();
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "saved", quote_session: storedBody?.quote_session || null }),
+        });
+      };
+
+      const runR1OrderingCase = async (fixture, sessionId, name, { order, evolveState }) => {
+        const operationId = `sqag212/${name}/${Date.now()}`;
+        let handlingHold = null;
+        try {
+          await prepareSession(fixture, sessionId, operationId, name);
+          if (order === "post-before-save-start") {
+            handlingHold = fixture.tracker.holdTimerEventHandling(fixture.page, "save-start");
+          } else {
+            await fixture.page.evaluate(() => {
+              const innerFetch = window.fetch;
+              let release;
+              window.__sqagR1PostGate = new Promise((resolve) => { release = resolve; });
+              window.__sqagR1ReleasePost = () => release();
+              window.__sqagR1PostGateReached = false;
+              window.fetch = (input, init = {}) => {
+                let url = null;
+                try { url = new URL(typeof input === "string" ? input : input.url, window.location.href); } catch {}
+                const method = String(init.method || input?.method || "GET").toUpperCase();
+                if (url && method === "POST" && url.pathname === "/api/quote-sessions" && window.__sqagR1PostGate) {
+                  const gate = window.__sqagR1PostGate;
+                  window.__sqagR1PostGate = null;
+                  window.__sqagR1PostGateReached = true;
+                  window.fetch = innerFetch;
+                  return gate.then(() => innerFetch(input, init));
+                }
+                return innerFetch(input, init);
+              };
+            });
+          }
+          await fixture.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 400 }));
+          const captured = await fixture.tracker.capturePendingQueuedSave(fixture.page);
+          if (!captured || captured.entry.producerKind !== "native-timer") {
+            throw new Error(`${name} did not register its real native timer producer.`);
+          }
+          const queueSnapshot = structuredClone(captured.snapshot);
+          const entry = captured.entry;
+          if (evolveState) {
+            // Legitimate post-queue, pre-fire state evolution; the save must be judged on save-time state.
+            await fixture.page.evaluate(() => { state.outputSortMode = "pricing_reference"; });
+          }
+          const ordering = {};
+          let record;
+          if (order === "post-before-save-start") {
+            await withTimeout(handlingHold.observed, 10000, `${name} native timer save-start was not delivered.`);
+            record = await waitForTrackedPost(fixture.tracker, operationId);
+            ordering.postObservedWhileSaveStartUndelivered = !entry.saveInvocationSnapshot
+              && record.correlationState === "awaiting-save-invocation-snapshot"
+              && entry.status === "pending";
+            // With evolution the stale queue-time snapshot must differ from the real POST (the old
+            // false rejection); without evolution the queue-time snapshot equals the POST.
+            ordering.queueSnapshotVersusPost = evolveState
+              ? !draftStatesEqual(queueSnapshot.draftState, record.payloadDraftState)
+              : draftStatesEqual(queueSnapshot.draftState, record.payloadDraftState);
+            await withTimeout(record.terminalPromise, 15000, `${name} real POST response/readback did not complete.`);
+            ordering.responseCompletedBeforeSaveStart = !entry.saveInvocationSnapshot && entry.status === "pending";
+            handlingHold.release();
+          } else {
+            await fixture.page.waitForFunction(() => window.__sqagR1PostGateReached === true, null, { timeout: 10000 });
+            await waitForCondition(() => Boolean(entry.saveInvocationSnapshot), 10000, `${name} save-start was not handled before the POST.`);
+            ordering.saveStartHandledBeforePost = postsFor(fixture.tracker, operationId).length === 0;
+            await fixture.page.evaluate(() => window.__sqagR1ReleasePost());
+            record = await waitForTrackedPost(fixture.tracker, operationId);
+          }
+          const drained = await fixture.tracker.drain(15000, fixture.page);
+          const saveSnapshot = entry.saveInvocationSnapshot;
+          const checks = {
+            ...ordering,
+            drained,
+            noIssues: fixture.tracker.issues.length === 0,
+            succeeded: entry.status === "succeeded",
+            nativeTimerFired: entry.dispatchedBy === "fire",
+            observedOrder: entry.correlationEvidence?.order === order,
+            correlatedAgainstSaveInvocation: record.correlationState === "correlated-by-save-invocation-snapshot"
+              && entry.correlationEvidence?.correlatedAgainst === "save-invocation-snapshot",
+            exactIdentity: record.queuedSaveIdentity === entry.snapshot.timerIdentity,
+            queueToSaveState: evolveState
+              ? !draftStatesEqual(queueSnapshot.draftState, saveSnapshot?.draftState)
+              : draftStatesEqual(queueSnapshot.draftState, saveSnapshot?.draftState),
+            saveStateEqualsPost: draftStatesEqual(saveSnapshot?.draftState, record.payloadDraftState),
+            durableReadback: saveInvocationDurable(record, entry),
+            exactlyOnePost: postsFor(fixture.tracker, operationId).length === 1,
+          };
+          if (Object.values(checks).some((passed) => !passed)) {
+            throw new Error(`${name} did not correlate the real save by its save-invocation snapshot: ${JSON.stringify({
+              checks,
+              filesRepresentation: record.payloadDraftFiles === null ? "omitted-confirmed-files" : "present",
+              summary: fixture.tracker.summary(),
+            })}.`);
+          }
+          return {
+            result: "PASS",
+            order,
+            evolvedState: evolveState,
+            timerIdentity: entry.snapshot.timerIdentity,
+            operationId,
+            postFilesRepresentation: record.payloadDraftFiles === null ? "omitted-confirmed-files" : "present",
+            checks,
+          };
+        } finally {
+          handlingHold?.release();
+        }
+      };
+
+      const r1PositiveSessionId = `quote-sqag212-r1-positive-${Date.now()}`;
+      const r1Positive = await openFixture("sqag212-r1-save-correlation-ordering", r1PositiveSessionId);
+      let r1PostBeforeEvolved;
+      let r1PostBeforeSame;
+      let r1SaveStartBefore;
+      try {
+        r1PostBeforeEvolved = await runR1OrderingCase(r1Positive, r1PositiveSessionId, "r1-post-before-save-start-evolved", { order: "post-before-save-start", evolveState: true });
+        r1PostBeforeSame = await runR1OrderingCase(r1Positive, r1PositiveSessionId, "r1-post-before-save-start-same-state", { order: "post-before-save-start", evolveState: false });
+        r1SaveStartBefore = await runR1OrderingCase(r1Positive, r1PositiveSessionId, "r1-save-start-before-post-evolved", { order: "save-start-before-post", evolveState: true });
+        await cleanupSession(r1Positive.page, r1PositiveSessionId);
+      } finally {
+        await r1Positive.context.close();
+      }
+
+      const r1WrongSessionId = `quote-sqag212-r1-wrong-timer-${Date.now()}`;
+      const r1Wrong = await openFixture("sqag212-r1-wrong-timer-post", r1WrongSessionId);
+      let r1WrongTimer;
+      try {
+        const operationA = `sqag212/r1-wrong-timer-source-a/${Date.now()}`;
+        const capturedA = await startQueuedFlush(r1Wrong, r1WrongSessionId, operationA, "r1-wrong-timer-source-a");
+        await withTimeout(capturedA.entry.terminalPromise, 15000, "R1 wrong-timer source save did not settle.");
+        const recordA = postsFor(r1Wrong.tracker, operationA)[0];
+        if (capturedA.entry.status !== "succeeded" || !recordA) {
+          throw new Error("R1 wrong-timer control source save did not persist: " + JSON.stringify(r1Wrong.tracker.summary()) + ".");
+        }
+        const operationX = `sqag212/r1-wrong-timer-target-x/${Date.now()}`;
+        await prepareSession(r1Wrong, r1WrongSessionId, operationX, "r1-wrong-timer-target-x");
+        await r1Wrong.page.evaluate(() => queueQuoteSessionDraftStateSave({ quoteGenerated: false, delay: 60000 }));
+        const capturedX = await r1Wrong.tracker.capturePendingQueuedSave(r1Wrong.page);
+        if (!capturedX || capturedX.snapshot.timerIdentity === capturedA.snapshot.timerIdentity) {
+          throw new Error("R1 wrong-timer control did not create a distinct target timer.");
+        }
+        const replayOperation = `sqag212/r1-wrong-timer-replay/${Date.now()}`;
+        await r1Wrong.tracker.setPageOperation(r1Wrong.page, {
+          fixture: "sqag212",
+          operation: "r1-wrong-timer-replay",
+          operationId: replayOperation,
+          expectedSessionId: r1WrongSessionId,
+          persistenceClass: "REQUIRED_SUCCESS",
+        });
+        // A real POST carrying timer A's generation, presented under timer X's identity.
+        const replay = await r1Wrong.page.evaluate(async ({ header, identity, body }) => {
+          const headers = { "content-type": "application/json", [header]: identity };
+          if (state.csrfToken) headers[state.csrfHeaderName] = state.csrfToken;
+          const response = await fetch("/api/quote-sessions", { method: "POST", headers, body });
+          // Consume the body so the real response completes for every observer.
+          const text = await response.text();
+          return { status: response.status, bodyBytes: text.length };
+        }, { header: quoteSessionQueuedSaveHeader, identity: capturedX.snapshot.browserTimerIdentity, body: recordA.request.postData() });
+        const replayRecord = await waitForTrackedPost(r1Wrong.tracker, replayOperation);
+        // The replay is not an application save, so its client-result wait runs to its own timeout.
+        await withTimeout(replayRecord.terminalPromise, 30000, () => "R1 wrong-timer replay did not complete: " + JSON.stringify({
+          replay,
+          httpStatus: replayRecord.httpStatus,
+          bodyStatus: replayRecord.bodyStatus,
+          correlationState: replayRecord.correlationState,
+          readbackVerdict: replayRecord.readbackVerdict,
+          done: replayRecord.done,
+        }));
+        const deferredBeforeSaveStart = replayRecord.correlationState === "awaiting-save-invocation-snapshot";
+        const startX = await r1Wrong.tracker.startCapturedQueuedSave(r1Wrong.page, capturedX);
+        await withTimeout(capturedX.entry.terminalPromise, 15000, "R1 wrong-timer target did not settle.");
+        const drained = await r1Wrong.tracker.drain(3000, r1Wrong.page);
+        const checks = {
+          replayWasRealSuccessfulPost: replay.status === 200 && replayRecord.httpStatus === 200,
+          replayCarriedTargetIdentity: replayRecord.queuedSaveIdentity === capturedX.snapshot.timerIdentity,
+          deferredBeforeSaveStart,
+          targetSaveStarted: startX.status === "started",
+          targetFailed: capturedX.entry.status === "failed"
+            && String(capturedX.entry.terminalReason || "").includes("save-invocation snapshot"),
+          replayRejected: replayRecord.correlationState === "rejected"
+            && r1Wrong.tracker.issues.some((issue) => issue.operationId === replayOperation),
+          drainFailed: drained === false,
+        };
+        if (Object.values(checks).some((passed) => !passed)) {
+          throw new Error("R1 wrong-timer POST was not rejected: " + JSON.stringify({ checks, summary: r1Wrong.tracker.summary() }) + ".");
+        }
+        r1WrongTimer = { result: "PASS", checks, targetTimerIdentity: capturedX.snapshot.timerIdentity, sourceTimerIdentity: capturedA.snapshot.timerIdentity };
+        await cleanupSession(r1Wrong.page, r1WrongSessionId);
+      } finally {
+        await r1Wrong.context.close();
+      }
+
+      const r2PositiveSessionId = `quote-sqag212-r2-positive-${Date.now()}`;
+      const r2Positive = await openFixture("sqag212-r2-readback-supersession", r2PositiveSessionId);
+      let r2ReadbackBeforeB;
+      let r2Supersedes;
+      try {
+        const readbackFirstA = `sqag212/r2-readback-first-a/${Date.now()}`;
+        const firstA = await startQueuedFlush(r2Positive, r2PositiveSessionId, readbackFirstA, "r2-readback-first-a");
+        await withTimeout(firstA.entry.terminalPromise, 15000, "R2 readback-first A did not settle.");
+        const readbackFirstB = `sqag212/r2-readback-first-b/${Date.now()}`;
+        const firstB = await startQueuedFlush(r2Positive, r2PositiveSessionId, readbackFirstB, "r2-readback-first-b");
+        await withTimeout(firstB.entry.terminalPromise, 15000, "R2 readback-first B did not settle.");
+        const firstRecordA = postsFor(r2Positive.tracker, readbackFirstA)[0];
+        const firstRecordB = postsFor(r2Positive.tracker, readbackFirstB)[0];
+        const readbackFirstChecks = {
+          drained: await r2Positive.tracker.drain(15000, r2Positive.page),
+          noIssues: r2Positive.tracker.issues.length === 0,
+          aSucceeded: firstA.entry.status === "succeeded",
+          bSucceeded: firstB.entry.status === "succeeded",
+          aExact: firstRecordA?.readbackVerdict === "exact" && draftStatesEqual(firstRecordA.readback?.draftState, firstRecordA.payloadDraftState),
+          bExact: firstRecordB?.readbackVerdict === "exact",
+        };
+        if (Object.values(readbackFirstChecks).some((passed) => !passed)) {
+          throw new Error("R2 A-readback-before-B positive failed: " + JSON.stringify({ readbackFirstChecks, summary: r2Positive.tracker.summary() }) + ".");
+        }
+        r2ReadbackBeforeB = { result: "PASS", checks: readbackFirstChecks };
+
+        const supersededA = `sqag212/r2-superseded-a/${Date.now()}`;
+        const readbackHold = r2Positive.tracker.holdDurableReadback(supersededA);
+        let capturedA;
+        try {
+          const olderA = await runNativeTimerSave(r2Positive, r2PositiveSessionId, supersededA, "r2-superseded-a", { awaitTerminal: false });
+          capturedA = { entry: olderA.entry, snapshot: olderA.entry.snapshot };
+          await withTimeout(readbackHold.reached, 15000, "R2 A readback did not reach its hold after A's response.");
+          const supersedingB = `sqag212/r2-superseding-b/${Date.now()}`;
+          const successorB = await runNativeTimerSave(r2Positive, r2PositiveSessionId, supersedingB, "r2-superseding-b");
+          const capturedB = { entry: successorB.entry, snapshot: successorB.entry.snapshot };
+          readbackHold.release();
+          await withTimeout(capturedA.entry.terminalPromise, 15000, "R2 superseded A did not settle.");
+          const recordA = postsFor(r2Positive.tracker, supersededA)[0];
+          const recordB = postsFor(r2Positive.tracker, supersedingB)[0];
+          const checks = {
+            drained: await r2Positive.tracker.drain(15000, r2Positive.page),
+            noIssues: r2Positive.tracker.issues.length === 0,
+            distinctIdentities: capturedA.snapshot.timerIdentity !== capturedB.snapshot.timerIdentity,
+            aSucceeded: capturedA.entry.status === "succeeded",
+            bSucceeded: capturedB.entry.status === "succeeded",
+            aOwnCommitSaved: recordA?.httpStatus === 200 && recordA.bodyStatus === "saved",
+            aSuperseded: recordA?.readbackVerdict === "superseded"
+              && recordA.readbackSupersession?.successorOperationId === recordB?.operationId,
+            bLaterIssued: r2Positive.tracker.records.indexOf(recordB) > r2Positive.tracker.records.indexOf(recordA),
+            bExact: recordB?.readbackVerdict === "exact",
+            aReadbackIsB: draftStatesEqual(recordA?.readback?.draftState, recordB?.payloadDraftState)
+              && !draftStatesEqual(recordA?.readback?.draftState, recordA?.payloadDraftState),
+            causalCommitOrder: recordA?.readbackSupersession?.successorCommitClock > recordA?.readbackSupersession?.ownCommitClock
+              && recordA?.readbackSupersession?.readbackCommitClock === recordA?.readbackSupersession?.successorCommitClock,
+            filesPreserved: draftFilesEqual(recordA?.readback?.draftFiles, capturedA.snapshot.draftFiles),
+          };
+          if (Object.values(checks).some((passed) => !passed)) {
+            throw new Error("R2 valid A-to-B supersession was not recognised: " + JSON.stringify({ checks, summary: r2Positive.tracker.summary() }) + ".");
+          }
+          r2Supersedes = { result: "PASS", checks, supersession: recordA.readbackSupersession };
+        } finally {
+          readbackHold.release();
+        }
+        await cleanupSession(r2Positive.page, r2PositiveSessionId);
+      } finally {
+        await r2Positive.context.close();
+      }
+
+      const runR2NegativeCase = async (name, { withSuccessor }) => {
+        const sessionId = `quote-sqag212-${name}-${Date.now()}`;
+        const fixture = await openFixture(`sqag212-${name}`, sessionId);
+        let readbackHold = null;
+        try {
+          const baselineOperation = `sqag212/${name}-baseline/${Date.now()}`;
+          const baseline = await startQueuedFlush(fixture, sessionId, baselineOperation, `${name}-baseline`);
+          await withTimeout(baseline.entry.terminalPromise, 15000, `${name} baseline save did not settle.`);
+          if (baseline.entry.status !== "succeeded") throw new Error(`${name} baseline save did not persist.`);
+          let unpersistedArmed = true;
+          await fixture.page.route("**/api/quote-sessions", async (route) => {
+            if (route.request().method() === "POST" && unpersistedArmed) {
+              unpersistedArmed = false;
+              await fulfilUnpersistedSave(route);
+              return;
+            }
+            await route.continue();
+          });
+          const operationA = `sqag212/${name}-a/${Date.now()}`;
+          if (withSuccessor) readbackHold = fixture.tracker.holdDurableReadback(operationA);
+          const olderA = await runNativeTimerSave(fixture, sessionId, operationA, `${name}-a`, { awaitTerminal: false });
+          const capturedA = { entry: olderA.entry, snapshot: olderA.entry.snapshot };
+          let recordB = null;
+          let capturedB = null;
+          if (withSuccessor) {
+            await withTimeout(readbackHold.reached, 15000, `${name} A readback did not reach its hold.`);
+            const operationB = `sqag212/${name}-b/${Date.now()}`;
+            const successorB = await runNativeTimerSave(fixture, sessionId, operationB, `${name}-b`);
+            capturedB = { entry: successorB.entry };
+            recordB = successorB.record;
+            readbackHold.release();
+          }
+          await withTimeout(capturedA.entry.terminalPromise, 15000, `${name} A did not settle.`);
+          const recordA = postsFor(fixture.tracker, operationA)[0];
+          const drained = await fixture.tracker.drain(3000, fixture.page);
+          const checks = {
+            aClaimedSaved: recordA?.httpStatus === 200 && recordA.bodyStatus === "saved",
+            aFailed: capturedA.entry.status === "failed",
+            aReadbackFailed: recordA?.readbackVerdict === "failed",
+            aIssueRetained: fixture.tracker.issues.some((issue) => issue.operationId === operationA),
+            drainFailed: drained === false,
+          };
+          if (withSuccessor) {
+            checks.bSucceeded = capturedB?.entry.status === "succeeded" && recordB?.readbackVerdict === "exact";
+            checks.aReadbackObservedB = draftStatesEqual(recordA?.readback?.draftState, recordB?.payloadDraftState);
+            checks.launderingRejectedForUnprovenCommit = String(recordA?.readbackSupersessionRejection?.reason || "")
+              .includes("own commit was not proven");
+          } else {
+            // Either the unpersisted save's own stale commit or the absence of any successor rejects it.
+            checks.supersessionRejected = /own commit was not proven|no validated later/.test(String(recordA?.readbackSupersessionRejection?.reason || ""));
+          }
+          if (Object.values(checks).some((passed) => !passed)) {
+            throw new Error(`${name} did not keep the unpersisted older save failed: ${JSON.stringify({ checks, summary: fixture.tracker.summary() })}.`);
+          }
+          await fixture.page.unroute("**/api/quote-sessions");
+          await cleanupSession(fixture.page, sessionId);
+          return { result: "PASS", checks, rejection: recordA.readbackSupersessionRejection };
+        } finally {
+          readbackHold?.release();
+          await fixture.page.unroute("**/api/quote-sessions").catch(() => {});
+          await fixture.context.close();
+        }
+      };
+      const r2NotPersisted = await runR2NegativeCase("r2-older-save-not-persisted", { withSuccessor: false });
+      const r2NoLaundering = await runR2NegativeCase("r2-successor-cannot-launder", { withSuccessor: true });
+      const r1Passed = [r1PostBeforeEvolved, r1WrongTimer, r1SaveStartBefore, r1PostBeforeSame].every((item) => item?.result === "PASS");
+      const r2Passed = [r2NotPersisted, r2Supersedes, r2ReadbackBeforeB, r2NoLaundering].every((item) => item?.result === "PASS");
+
+      // Window separation: the R1/R2 controls issue many real quote-session saves from the same
+      // loopback client. Let the server's existing 60-second quote-session rate-limit window fully
+      // elapse (plus a fixed margin) so later controls such as F4 run with their normal budget.
+      // The limiter, client identity, and server process are unchanged.
+      const r1r2RateWindowSeparation = { windowMs: 60000, marginMs: 3000, lastRequestAt: Date.now() };
+      await new Promise((resolve) => setTimeout(resolve, r1r2RateWindowSeparation.windowMs + r1r2RateWindowSeparation.marginMs));
+      r1r2RateWindowSeparation.releasedAt = Date.now();
+      r1r2RateWindowSeparation.elapsedMs = r1r2RateWindowSeparation.releasedAt - r1r2RateWindowSeparation.lastRequestAt;
+      if (r1r2RateWindowSeparation.elapsedMs <= r1r2RateWindowSeparation.windowMs) {
+        throw new Error("R1/R2 rate-window separation did not exceed the limiter window: " + JSON.stringify(r1r2RateWindowSeparation) + ".");
+      }
+
       return {
         ...(t3PositiveEvidence || {}),
+        R1_RESULT: r1Passed ? "PASS" : "FAIL",
+        R1_NEGATIVE_POST_BEFORE_SAVE_START_WITH_QUEUE_STATE_EVOLUTION: r1PostBeforeEvolved,
+        R1_NEGATIVE_WRONG_TIMER_POST_STILL_REJECTED: r1WrongTimer,
+        R1_POSITIVE_SAVE_START_BEFORE_POST: r1SaveStartBefore,
+        R1_POSITIVE_POST_BEFORE_SAVE_START_SAME_SAVE_STATE: r1PostBeforeSame,
+        R2_RESULT: r2Passed ? "PASS" : "FAIL",
+        R2_NEGATIVE_OLDER_SAVE_ACTUALLY_NOT_PERSISTED: r2NotPersisted,
+        R2_POSITIVE_A_PERSISTS_THEN_B_VALIDLY_SUPERSEDES_BEFORE_A_READBACK: r2Supersedes,
+        R2_POSITIVE_A_READBACK_BEFORE_B: r2ReadbackBeforeB,
+        R2_NEGATIVE_B_SUCCESS_CANNOT_LAUNDER_A_FAILURE: r2NoLaundering,
+        R1_R2_RATE_WINDOW_SEPARATION: r1r2RateWindowSeparation,
         L1_RESULT: "PASS",
         L1_NEGATIVE_DELIVERY_FAILURE_THEN_PAGE_CLOSE: l1PageClose,
         L1_NEGATIVE_DELIVERY_FAILURE_THEN_DOCUMENT_NAVIGATION: l1Navigation,
@@ -9706,15 +10379,25 @@ async function main() {
       "L3_POSITIVE_NORMAL_EVENT_ACK_WITHIN_BUDGET",
       "L3_POSITIVE_REQUIRED_TIMER_NATIVE_COMPLETION_WITHIN_BUDGET",
       "L3_POSITIVE_FINAL_ZERO_ARRIVAL_STILL_BOUNDED",
+      "R1_NEGATIVE_POST_BEFORE_SAVE_START_WITH_QUEUE_STATE_EVOLUTION",
+      "R1_NEGATIVE_WRONG_TIMER_POST_STILL_REJECTED",
+      "R1_POSITIVE_SAVE_START_BEFORE_POST",
+      "R1_POSITIVE_POST_BEFORE_SAVE_START_SAME_SAVE_STATE",
+      "R2_NEGATIVE_OLDER_SAVE_ACTUALLY_NOT_PERSISTED",
+      "R2_POSITIVE_A_PERSISTS_THEN_B_VALIDLY_SUPERSEDES_BEFORE_A_READBACK",
+      "R2_POSITIVE_A_READBACK_BEFORE_B",
+      "R2_NEGATIVE_B_SUCCESS_CANNOT_LAUNDER_A_FAILURE",
     ];
     const lifecycleCasePassed = (evidence) => evidence === "PASS" || evidence?.result === "PASS";
     if (
       focusedCases.L1_RESULT !== "PASS"
       || focusedCases.L2_RESULT !== "PASS"
       || focusedCases.L3_RESULT !== "PASS"
+      || focusedCases.R1_RESULT !== "PASS"
+      || focusedCases.R2_RESULT !== "PASS"
       || requiredLifecycleCases.some((caseName) => !lifecycleCasePassed(focusedCases[caseName]))
     ) {
-      throw new Error(`SQAG #212 focused lifecycle controls did not report every required L1-L3 case: ${JSON.stringify(focusedCases)}.`);
+      throw new Error(`SQAG #212 focused lifecycle controls did not report every required L1-L3 and R1-R2 case: ${JSON.stringify(focusedCases)}.`);
     }
     const functionalIsolation = await runSqag212RegressionInIsolatedServer(
       page,
