@@ -5199,9 +5199,9 @@ def bracketed_reference_matches_catalog_item(value: Any, item: dict[str, Any]) -
     if not bracketed:
         return False
     reference, _detail = bracketed
-    reference_key = comparable_catalog_description_key(reference)
+    reference_key = comparable_catalog_description_key_without_leading_unit(reference)
     return bool(reference_key) and any(
-        comparable_catalog_description_key(candidate) == reference_key
+        comparable_catalog_description_key_without_leading_unit(candidate) == reference_key
         for candidate in catalog_reference_values(item)
     )
 
@@ -6389,6 +6389,8 @@ def normalize_pricing_authority(
     *,
     reference_authority: dict[str, Any] | None = None,
     catalog_item: dict[str, Any] | None = None,
+    catalog_items: list[dict[str, Any]] | None = None,
+    catalog_evidence_descriptions: tuple[Any, ...] | list[Any] | None = None,
 ) -> dict[str, Any] | None:
     """Validate a persisted/client authority against the current row and catalog."""
     if not isinstance(raw, dict):
@@ -6439,6 +6441,17 @@ def normalize_pricing_authority(
         "currency": supplied_currency,
     }
     if variant == "catalog":
+        evidence_descriptions = (
+            list(catalog_evidence_descriptions)
+            if isinstance(catalog_evidence_descriptions, (list, tuple))
+            else [row.get("description")]
+        )
+        if catalog_item is not None and any(
+            catalog_line_contradicts_item(value, catalog_item, catalog_items=catalog_items)
+            for value in evidence_descriptions
+            if clean_text(value)
+        ):
+            return None
         item_id = raw["catalog_item_id"]
         supplied_source = raw["catalog_source"]
         supplied_digest = raw["catalog_digest"]
@@ -6452,11 +6465,29 @@ def normalize_pricing_authority(
         actual_description = canonical_pricing_authority_text((catalog_item or {}).get("description"))
         actual_unit = canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item))
         actual_section = canonical_pricing_authority_text((catalog_item or {}).get("section")) or "General"
+        selected_catalog_id = clean_text(row.get("pricing_keyword"))
+        selected_catalog_id_matches = not selected_catalog_id or selected_catalog_id == actual_id
+        if selected_catalog_id and not selected_catalog_id_matches:
+            active_catalog_items = {
+                clean_text(candidate.get("id")): candidate
+                for candidate in catalog_items or []
+                if isinstance(candidate, dict) and clean_text(candidate.get("id"))
+            }
+            if selected_catalog_id in active_catalog_items:
+                selected_catalog_id_matches = False
+            else:
+                selected_alias_item_ids = {
+                    candidate_id
+                    for candidate_id, candidate in active_catalog_items.items()
+                    if selected_catalog_id in legacy_pricing_catalog_id_aliases(candidate_id, candidate)
+                }
+                selected_catalog_id_matches = selected_alias_item_ids == {actual_id}
         if (
             catalog_item is None
             or
             supplied_source != source
             or item_id != actual_id
+            or not selected_catalog_id_matches
             or supplied_digest != digest
             or not PRICING_REFERENCE_DIGEST_RE.fullmatch(supplied_digest)
             or actual_price is None
@@ -6488,6 +6519,7 @@ def rebind_pricing_authority_context(
     *,
     reference_authority: dict[str, Any] | None = None,
     catalog_lookup: dict[str, dict[str, Any]] | None = None,
+    catalog_evidence_descriptions: tuple[Any, ...] | list[Any] | None = None,
 ) -> dict[str, Any]:
     """Revalidate authority after a current-operation row display is normalised."""
     raw = row.get("pricing_authority") if isinstance(row.get("pricing_authority"), dict) else None
@@ -6514,6 +6546,8 @@ def rebind_pricing_authority_context(
         row,
         reference_authority=authority,
         catalog_item=catalog_item,
+        catalog_items=list(lookup.values()),
+        catalog_evidence_descriptions=catalog_evidence_descriptions,
     )
     row["pricing_authority"] = normalized or build_pricing_authority("historical", row)
     return row
@@ -19028,51 +19062,208 @@ def catalog_attribute_conflicts(line_tokens: set[str], item_tokens: set[str]) ->
     return False
 
 
+def catalog_item_identity_key(item: dict[str, Any] | None) -> str:
+    return clean_text(item.get("id")) if isinstance(item, dict) else ""
+
+
+def catalog_items_grouped_by_identity_key(
+    catalog_items: list[dict[str, Any]] | None,
+    selected_item: dict[str, Any] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    values = [*(catalog_items or []), selected_item]
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        item_id = catalog_item_identity_key(item)
+        if item_id:
+            grouped.setdefault(item_id, []).append(item)
+    return {item_id: grouped[item_id] for item_id in sorted(grouped)}
+
+
+def catalog_family_tokens(value: Any) -> set[str]:
+    tokens = catalog_inference_tokens(value)
+    normalized_unit = normalize_pricing_unit(infer_unit_prefix(value))
+    if normalized_unit:
+        tokens.difference_update(catalog_inference_tokens(normalized_unit))
+    return tokens
+
+
+def catalog_family_token_sequence(value: Any) -> tuple[str, ...]:
+    normalized = comparable_catalog_description_key_without_leading_unit(value)
+    sequence: list[str] = []
+    for raw_token in normalized.split():
+        token = catalog_inference_token(raw_token)
+        if len(token) <= 2 and not token.isdigit() and token != "tv":
+            continue
+        sequence.append(token)
+    while sequence and normalize_pricing_unit(sequence[-1]) in {"sqm", "nos", "lot", "sets"}:
+        sequence.pop()
+    return tuple(sequence)
+
+
+def catalog_family_alternative_sequences(items: list[dict[str, Any]]) -> list[tuple[str, ...]]:
+    alternatives = {
+        sequence
+        for item in items
+        for family in catalog_item_object_families(item)
+        for sequence in [catalog_family_token_sequence(family)]
+        if sequence
+    }
+    return sorted(alternatives)
+
+
+def catalog_family_sequence_occurs(detail_sequence: tuple[str, ...], family_sequence: tuple[str, ...]) -> bool:
+    width = len(family_sequence)
+    return bool(width and any(
+        detail_sequence[index:index + width] == family_sequence
+        for index in range(len(detail_sequence) - width + 1)
+    ))
+
+
+def catalog_family_sequence_is_subsequence(
+    family_sequence: tuple[str, ...],
+    selected_sequence: tuple[str, ...],
+) -> bool:
+    width = len(family_sequence)
+    return bool(width and any(
+        selected_sequence[index:index + width] == family_sequence
+        for index in range(len(selected_sequence) - width + 1)
+    ))
+
+
+def catalog_family_evidence_tokens(
+    line_text: Any,
+    item: dict[str, Any],
+    catalog_items: list[dict[str, Any]] | None,
+) -> tuple[set[str], bool, bool, str]:
+    """Return independent row-detail tokens, selected-reference evidence, and mismatch state."""
+    selected_id = catalog_item_identity_key(item)
+    grouped = catalog_items_grouped_by_identity_key(catalog_items, item)
+    bracketed = bracketed_catalog_reference_parts(line_text)
+    if bracketed:
+        reference, detail = bracketed
+        reference_key = comparable_catalog_description_key_without_leading_unit(reference)
+        matching_ids = {
+            item_id
+            for item_id, entries in grouped.items()
+            if any(
+                comparable_catalog_description_key_without_leading_unit(candidate)
+                == reference_key
+                for entry in entries
+                for candidate in catalog_reference_values(entry)
+            )
+        } if reference_key else set()
+        if matching_ids == {selected_id} and selected_id:
+            return catalog_family_tokens(detail), True, False, clean_text(detail)
+        return set(), False, True, ""
+
+    description_words = comparable_catalog_description_key_without_leading_unit(line_text).split()
+    prefixes: list[tuple[int, str]] = []
+    for item_id, entries in grouped.items():
+        for entry in entries:
+            for reference in catalog_reference_values(entry):
+                reference_words = comparable_catalog_description_key_without_leading_unit(reference).split()
+                if (
+                    reference_words
+                    and len(reference_words) <= len(description_words)
+                    and description_words[:len(reference_words)] == reference_words
+                ):
+                    prefixes.append((len(reference_words), item_id))
+    if prefixes:
+        longest = max(length for length, _item_id in prefixes)
+        matching_ids = {item_id for length, item_id in prefixes if length == longest}
+        if matching_ids == {selected_id} and selected_id:
+            detail_text = " ".join(description_words[longest:])
+            return catalog_family_tokens(detail_text), True, False, detail_text
+        return set(), False, True, ""
+
+    occurrences: list[tuple[int, int, str]] = []
+    for item_id, entries in grouped.items():
+        for entry in entries:
+            for reference in catalog_reference_values(entry):
+                reference_words = comparable_catalog_description_key_without_leading_unit(reference).split()
+                width = len(reference_words)
+                if not width or width > len(description_words):
+                    continue
+                for start in range(len(description_words) - width + 1):
+                    if description_words[start:start + width] == reference_words:
+                        occurrences.append((width, start, item_id))
+    if occurrences:
+        longest = max(width for width, _start, _item_id in occurrences)
+        matching = [
+            (start, item_id)
+            for width, start, item_id in occurrences
+            if width == longest
+        ]
+        matching_ids = {item_id for _start, item_id in matching}
+        matching_positions = {start for start, _item_id in matching}
+        if matching_ids == {selected_id} and len(matching_positions) == 1 and selected_id:
+            start = next(iter(matching_positions))
+            detail_words = description_words[:start] + description_words[start + longest:]
+            detail_text = " ".join(detail_words)
+            return catalog_family_tokens(detail_text), True, False, detail_text
+        return set(), False, True, ""
+
+    detail_text = comparable_catalog_description_key_without_leading_unit(line_text)
+    return catalog_family_tokens(detail_text), False, False, detail_text
+
+
 def catalog_detail_matches_other_catalog_object_family(
     detail_tokens: set[str],
     item: dict[str, Any],
     catalog_items: list[dict[str, Any]] | None,
+    *,
+    selected_reference_established: bool = False,
+    detail_text: Any = None,
 ) -> bool:
     if not detail_tokens or not catalog_items:
         return False
 
-    selected_id = clean_text(item.get("id"))
-    selected_families = [
-        catalog_inference_tokens(family)
-        for family in catalog_item_object_families(item)
-        if len(catalog_inference_tokens(family)) >= 2
-    ]
-    selected_overlap = max(
-        (len(detail_tokens & family_tokens) for family_tokens in selected_families),
-        default=0,
-    )
-    if not selected_families:
-        selected_tokens: set[str] = set()
-        for value in catalog_inference_values(item):
-            selected_tokens.update(catalog_inference_tokens(value))
-        selected_overlap = len(detail_tokens & selected_tokens)
+    grouped = catalog_items_grouped_by_identity_key(catalog_items, item)
+    selected_id = catalog_item_identity_key(item)
+    selected_sequences = catalog_family_alternative_sequences(grouped.get(selected_id, [item]))
+    selected_family_tokens = set().union(*(set(sequence) for sequence in selected_sequences)) if selected_sequences else set()
+    selected_heads = {sequence[-1] for sequence in selected_sequences if sequence}
+    detail_sequence = catalog_family_token_sequence(detail_text) if clean_text(detail_text) else ()
 
-    for candidate in catalog_items:
-        if not isinstance(candidate, dict):
+    for candidate_id, entries in grouped.items():
+        if candidate_id == selected_id:
             continue
-        candidate_id = clean_text(candidate.get("id"))
-        if candidate is item or (selected_id and candidate_id == selected_id):
-            continue
-        for family in catalog_item_object_families(candidate):
-            family_tokens = catalog_inference_tokens(family)
-            if len(family_tokens) < 2:
+        for family_sequence in catalog_family_alternative_sequences(entries):
+            family_tokens = frozenset(family_sequence)
+            if any(
+                catalog_family_sequence_is_subsequence(family_sequence, selected_sequence)
+                for selected_sequence in selected_sequences
+            ):
                 continue
-            overlap_count = len(detail_tokens & family_tokens)
-            if overlap_count < 2 or overlap_count / len(family_tokens) < 0.6:
-                continue
-            if overlap_count < selected_overlap + 2:
-                continue
-            candidate_tokens: set[str] = set()
-            for value in catalog_inference_values(candidate):
-                candidate_tokens.update(catalog_inference_tokens(value))
-            if catalog_attribute_conflicts(detail_tokens, candidate_tokens):
-                continue
-            return True
+            if (
+                detail_sequence
+                and catalog_family_sequence_occurs(detail_sequence, family_sequence)
+            ) or (not detail_sequence and family_tokens <= detail_tokens):
+                return True
+            family_head = family_sequence[-1] if family_sequence else ""
+            shared_object_head = bool(family_head and family_head in selected_heads)
+            shared_selected_object_head = bool(selected_heads & family_tokens)
+            distinguishing_tokens = family_tokens - selected_family_tokens
+            selected_reference_conflict = bool(
+                selected_reference_established
+                and distinguishing_tokens
+                and (
+                    (shared_selected_object_head and distinguishing_tokens & detail_tokens)
+                    or (
+                        len(distinguishing_tokens) >= 2
+                        and distinguishing_tokens <= detail_tokens
+                    )
+                )
+            )
+            shared_head_conflict = bool(
+                shared_object_head
+                and family_head in detail_tokens
+                and detail_tokens & distinguishing_tokens
+            )
+            if selected_reference_conflict or shared_head_conflict:
+                return True
     return False
 
 
@@ -19082,31 +19273,28 @@ def catalog_line_contradicts_item(
     *,
     catalog_items: list[dict[str, Any]] | None = None,
 ) -> bool:
-    bracketed = bracketed_catalog_reference_parts(line_text)
+    line_tokens, selected_reference, reference_mismatch, detail_text = catalog_family_evidence_tokens(
+        line_text,
+        item,
+        catalog_items,
+    )
+    if reference_mismatch:
+        return True
     item_tokens: set[str] = set()
     for value in catalog_inference_values(item):
         item_tokens.update(catalog_inference_tokens(value))
-    if bracketed:
-        reference, detail = bracketed
-        if bracketed_reference_matches_catalog_item(line_text, item):
-            # An exact catalog reference establishes identity, but a conflicting
-            # suffix still makes the selected item unsafe for this row.
-            detail_tokens = catalog_inference_tokens(detail)
-            if not detail_tokens or not item_tokens:
-                return False
-            if catalog_attribute_conflicts(detail_tokens, item_tokens):
-                return True
-            return catalog_detail_matches_other_catalog_object_family(
-                detail_tokens,
-                item,
-                catalog_items,
-            )
-        line_text = detail or reference
-    line_tokens = catalog_inference_tokens(line_text)
-    if not line_tokens or not item_tokens:
-        return False
-    if catalog_attribute_conflicts(line_tokens, item_tokens):
+    if line_tokens and item_tokens and catalog_attribute_conflicts(line_tokens, item_tokens):
         return True
+    if catalog_detail_matches_other_catalog_object_family(
+        line_tokens,
+        item,
+        catalog_items,
+        selected_reference_established=selected_reference,
+        detail_text=detail_text,
+    ):
+        return True
+    if selected_reference or not line_tokens or not item_tokens:
+        return False
     overlap = line_tokens & item_tokens
     if len(overlap) >= 2:
         return False
@@ -19115,31 +19303,64 @@ def catalog_line_contradicts_item(
     return line_ratio < 0.2 and item_ratio < 0.2
 
 
+def reject_catalog_line_item_authority(
+    row: dict[str, Any],
+    *,
+    evidence_description: Any = None,
+) -> dict[str, Any]:
+    """Demote a rejected catalog price while preserving independent manual/Included authority."""
+    rejected = dict(row)
+    authority = rejected.get("pricing_authority") if isinstance(rejected.get("pricing_authority"), dict) else {}
+    variant = clean_text(authority.get("variant")).lower()
+    if variant in {"manual", "included"} or clean_text(rejected.get("price_mode")).lower() == "included":
+        return rejected
+    if not clean_text(rejected.get("description")) and clean_text(evidence_description):
+        rejected["description"] = clean_customer_quote_line_text(evidence_description)
+    rejected["pricing_keyword"] = ""
+    for key in (
+        "effective_unit_price",
+        "unit_price_override",
+        "catalog_unit_price",
+        "pricing_basis_amount",
+        "approved_quote_amount",
+        "pricing_basis_currency",
+        "pricing_reference_source",
+        "pricing_reference_id",
+        "pricing_basis_digest",
+        "catalog_description",
+        "pricing_reference_description",
+    ):
+        rejected.pop(key, None)
+    if clean_text(rejected.get("display_price")).lower() != "included":
+        rejected.pop("display_price", None)
+    rejected["status"] = "unmatched"
+    rejected["pricing_authority"] = build_pricing_authority("historical", rejected)
+    return rejected
+
+
 def explicit_catalog_keyword_has_usable_overlap(
     line_text: Any,
     item: dict[str, Any],
     *,
     catalog_items: list[dict[str, Any]] | None = None,
 ) -> bool:
-    bracketed = bracketed_catalog_reference_parts(line_text)
-    if bracketed:
-        reference, detail = bracketed
-        if bracketed_reference_matches_catalog_item(line_text, item):
-            line_text = detail
-        else:
-            line_text = detail or reference
-    line_tokens = catalog_inference_tokens(line_text)
+    line_tokens, _selected_reference, reference_mismatch, _detail_text = catalog_family_evidence_tokens(
+        line_text,
+        item,
+        catalog_items,
+    )
+    if reference_mismatch or catalog_line_contradicts_item(
+        line_text,
+        item,
+        catalog_items=catalog_items,
+    ):
+        return False
     item_tokens: set[str] = set()
     for value in catalog_inference_values(item):
         item_tokens.update(catalog_inference_tokens(value))
     if not line_tokens or not item_tokens or not (line_tokens & item_tokens):
         return False
-    # Shared wording cannot make a distinguishing attribute conflict safe.
-    return not catalog_attribute_conflicts(line_tokens, item_tokens) and not catalog_detail_matches_other_catalog_object_family(
-        line_tokens,
-        item,
-        catalog_items,
-    )
+    return True
 
 
 def catalog_inference_values(item: dict[str, Any]) -> list[str]:
@@ -19413,6 +19634,7 @@ def normalize_owned_line_item(
     catalog_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     raw = canonicalize_primary_order_fields(raw)
+    original_description = raw.get("description")
     display_price = clean_text(raw.get("display_price"))
     price_mode = clean_text(raw.get("price_mode")).title()
     if clean_text(raw.get("unit_price_override")).lower() == "included" or display_price.lower() == "included":
@@ -19461,11 +19683,22 @@ def normalize_owned_line_item(
         candidate = (catalog_lookup or {}).get(catalog_item_id)
         if isinstance(candidate, dict) and clean_text(candidate.get("id")) == catalog_item_id:
             catalog_item = candidate
+    catalog_items = list((catalog_lookup or {}).values())
+    catalog_family_rejected = bool(
+        catalog_item
+        and catalog_line_contradicts_item(
+            original_description,
+            catalog_item,
+            catalog_items=catalog_items,
+        )
+    )
     authority = normalize_pricing_authority(
         raw_authority,
         item,
         reference_authority=reference_authority,
         catalog_item=catalog_item,
+        catalog_items=catalog_items,
+        catalog_evidence_descriptions=(original_description,),
     ) if raw_authority_present else None
     if authority is None:
         legacy_evidence = any(
@@ -19482,6 +19715,8 @@ def normalize_owned_line_item(
         ) or price_mode == "Included"
         authority = build_pricing_authority("historical" if (raw_authority_present or legacy_evidence) else "none", item)
     item["pricing_authority"] = authority
+    if catalog_family_rejected:
+        item["status"] = "unmatched"
     trusted_price = pricing_authority_price(authority)
     authority_variant = clean_text(authority.get("variant")).lower()
     authority_is_untrusted = raw_authority_present and authority_variant not in PRICING_AUTHORITY_TRUSTED_VARIANTS
@@ -19638,11 +19873,18 @@ def normalize_line_items(
         if not isinstance(raw, dict):
             continue
         raw = canonicalize_primary_order_fields(raw)
+        original_description = raw.get("description")
         display_price = clean_text(raw.get("display_price"))
         pricing_keyword = clean_text(raw.get("pricing_keyword"))
         authority_supplied = "pricing_authority" in raw
         authority_hint = raw.get("pricing_authority") if isinstance(raw.get("pricing_authority"), dict) else {}
         authority_variant_hint = authority_hint.get("variant") if isinstance(authority_hint.get("variant"), str) else ""
+        raw_price_mode_hint = clean_text(raw.get("price_mode")).title()
+        raw_is_included = (
+            raw_price_mode_hint == "Included"
+            or clean_text(raw.get("unit_price_override")).lower() == "included"
+            or display_price.lower() == "included"
+        ) and not (authority_supplied and authority_variant_hint == "catalog")
         raw_unit = normalize_pricing_unit(raw.get("unit"))
         output_unit_locked = raw.get("output_unit_locked") is True
         quantity_parts = normalized_line_text_quantity_parts(raw.get("description"), raw.get("quantity"), raw_unit)
@@ -19669,6 +19911,7 @@ def normalize_line_items(
                 # An explicit no-authority marker on a new draft must not block first catalog resolution.
                 authority_supplied = False
         incoming_authority = None
+        catalog_item_for_family_admission = None
         if authority_supplied:
             catalog_item = None
             if authority_variant_hint == "catalog":
@@ -19676,6 +19919,7 @@ def normalize_line_items(
                 candidate = catalog_lookup.get(catalog_item_id)
                 if isinstance(candidate, dict) and clean_text(candidate.get("id")) == catalog_item_id:
                     catalog_item = candidate
+            catalog_item_for_family_admission = catalog_item
             incoming_authority = normalize_pricing_authority(
                 authority_hint,
                 {
@@ -19687,6 +19931,8 @@ def normalize_line_items(
                 },
                 reference_authority=authority,
                 catalog_item=catalog_item,
+                catalog_items=catalog_items,
+                catalog_evidence_descriptions=(original_description,),
             )
             if incoming_authority is None:
                 catalog_item = None
@@ -19712,6 +19958,7 @@ def normalize_line_items(
                         pricing_keyword_was_explicit = True
                 else:
                     pricing_keyword = ""
+            catalog_item_for_family_admission = catalog_item
         unit = (
             quantity_parts["unit"]
             if quantity_parts.get("from_text_prefix")
@@ -19723,19 +19970,12 @@ def normalize_line_items(
         )
         raw_description = incoming_description
         catalog_item_rejected_for_contradiction = bool(
-            catalog_item
+            (catalog_item or catalog_item_for_family_admission)
+            and not raw_is_included
             and catalog_line_contradicts_item(
-                raw_description,
-                catalog_item,
+                original_description,
+                catalog_item or catalog_item_for_family_admission,
                 catalog_items=catalog_items,
-            )
-            and not (
-                pricing_keyword_was_explicit
-                and explicit_catalog_keyword_has_usable_overlap(
-                    raw_description,
-                    catalog_item,
-                    catalog_items=catalog_items,
-                )
             )
         )
         if catalog_item_rejected_for_contradiction:
@@ -19842,6 +20082,7 @@ def normalize_line_items(
         elif (
             price_mode == "Priced"
             and catalog_item is None
+            and not catalog_item_rejected_for_contradiction
             and unit_price_override is not None
             and unit_price_override >= 0
             and quantity is not None
@@ -19865,6 +20106,8 @@ def normalize_line_items(
                 item,
                 reference_authority=authority,
                 catalog_item=catalog_item,
+                catalog_items=catalog_items,
+                catalog_evidence_descriptions=(original_description,),
             )
             if (
                 normalized_authority is None
@@ -19876,6 +20119,7 @@ def normalize_line_items(
                     {**item, "pricing_authority": incoming_authority},
                     reference_authority=authority,
                     catalog_lookup=catalog_lookup,
+                    catalog_evidence_descriptions=(original_description,),
                 )
                 normalized_authority = rebound.get("pricing_authority")
         elif price_mode == "Included":
@@ -19884,7 +20128,12 @@ def normalize_line_items(
                 item,
                 reference_authority=authority,
             )
-        elif manual_authority_price is not None and bool(description) and bool(unit):
+        elif (
+            manual_authority_price is not None
+            and bool(description)
+            and bool(unit)
+            and not catalog_item_rejected_for_contradiction
+        ):
             normalized_authority = build_pricing_authority(
                 "manual",
                 item,
@@ -19908,13 +20157,27 @@ def normalize_line_items(
             normalized_authority = None
         if normalized_authority is None:
             normalized_authority = build_pricing_authority(
-                "historical" if authority_supplied or any(
+                "historical" if authority_supplied or catalog_item_rejected_for_contradiction or any(
                     raw.get(key) not in (None, "")
                     for key in ("unit_price_override", "effective_unit_price", "pricing_basis_amount", "catalog_unit_price")
                 ) else "none",
                 item,
             )
         item["pricing_authority"] = normalized_authority
+        if catalog_item_rejected_for_contradiction:
+            item["status"] = "unmatched"
+            for stale_key in (
+                "effective_unit_price",
+                "unit_price_override",
+                "catalog_unit_price",
+                "pricing_basis_amount",
+                "approved_quote_amount",
+                "pricing_basis_currency",
+                "pricing_reference_source",
+                "pricing_reference_id",
+                "pricing_basis_digest",
+            ):
+                item.pop(stale_key, None)
         trusted_price = pricing_authority_price(normalized_authority)
         trusted_variant = clean_text(normalized_authority.get("variant")).lower()
         if trusted_variant == "included":
@@ -21645,6 +21908,51 @@ def quote_basis_sections_with_catalog_exact_lines(
                 values.append(title)
         return values
 
+    def basis_line_has_catalog_conflict(line: dict[str, Any], catalog_item: dict[str, Any]) -> bool:
+        evidence_descriptions = [line.get("text")]
+        line_source_ids = {
+            safe_resource_id(value, "")
+            for value in (line.get("id"), line.get("source_line_item_id"))
+            if safe_resource_id(value, "")
+        }
+        selected_id = catalog_item_identity_key(catalog_item)
+        matched_source_items = []
+        catalog_fallback_items = []
+        for source_item in line_items:
+            if not isinstance(source_item, dict):
+                continue
+            source_item_ids = {
+                safe_resource_id(value, "")
+                for value in (
+                    source_item.get("source_basis_line_id"),
+                    source_item.get("id"),
+                    source_item.get("source_line_item_id"),
+                )
+                if safe_resource_id(value, "")
+            }
+            source_catalog = catalog_item_for_pricing_keyword(source_item.get("pricing_keyword"))
+            same_catalog = bool(
+                source_catalog
+                and catalog_item_identity_key(source_catalog) == selected_id
+            )
+            if line_source_ids & source_item_ids:
+                matched_source_items.append(source_item)
+            elif same_catalog and (not line_source_ids or not source_item_ids):
+                catalog_fallback_items.append(source_item)
+        associated_source_items = matched_source_items or (
+            catalog_fallback_items if len(catalog_fallback_items) == 1 else []
+        )
+        evidence_descriptions.extend(item.get("description") for item in associated_source_items)
+        return any(
+            catalog_line_contradicts_item(
+                evidence,
+                catalog_item,
+                catalog_items=exact_catalog_items,
+            )
+            for evidence in evidence_descriptions
+            if clean_text(evidence)
+        )
+
     catalog_items_by_section: dict[str, list[dict[str, Any]]] = {}
     for item in line_items:
         if not clean_text(item.get("pricing_keyword")) or not clean_text(item.get("description")) or not item_has_catalog_reference(item):
@@ -22174,11 +22482,7 @@ def quote_basis_sections_with_catalog_exact_lines(
             catalog_item = catalog_item_for_pricing_keyword(line.get("pricing_keyword"))
             if not catalog_item:
                 continue
-            if catalog_line_contradicts_item(
-                line.get("text"),
-                catalog_item,
-                catalog_items=exact_catalog_items,
-            ):
+            if basis_line_has_catalog_conflict(line, catalog_item):
                 mark_line_custom_for_manual_pricing(line)
                 continue
             apply_catalog_item_metadata(line, catalog_item, replace_text=True)
@@ -22248,6 +22552,26 @@ def line_items_with_resolved_basis_catalog(
         source_id = safe_resource_id(item.get("source_basis_line_id"), "")
         basis_line = basis_catalog_lines_by_id.get(source_id)
         pricing_keyword = clean_text(item.get("pricing_keyword"))
+        current_catalog_item = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
+        current_evidence = [item.get("description")]
+        if basis_line:
+            current_evidence.append(basis_line.get("text"))
+        if current_catalog_item and any(
+            catalog_line_contradicts_item(
+                evidence,
+                current_catalog_item,
+                catalog_items=list(catalog_lookup.values()),
+            )
+            for evidence in current_evidence
+            if clean_text(evidence)
+        ):
+            resolved_items.append(
+                reject_catalog_line_item_authority(
+                    item,
+                    evidence_description=basis_line.get("text") if basis_line else item.get("description"),
+                )
+            )
+            continue
         if pricing_keyword and pricing_keyword in catalog_lookup:
             resolved_items.append(item)
             continue
@@ -22257,6 +22581,22 @@ def line_items_with_resolved_basis_catalog(
         catalog_item = catalog_lookup.get(clean_text(basis_line.get("pricing_keyword")))
         if not catalog_item:
             resolved_items.append(item)
+            continue
+        if any(
+            catalog_line_contradicts_item(
+                evidence,
+                catalog_item,
+                catalog_items=list(catalog_lookup.values()),
+            )
+            for evidence in (item.get("description"), basis_line.get("text"))
+            if clean_text(evidence)
+        ):
+            resolved_items.append(
+                reject_catalog_line_item_authority(
+                    item,
+                    evidence_description=basis_line.get("text"),
+                )
+            )
             continue
         catalog_reference_description = clean_text(
             catalog_item.get("pricing_reference_description")
@@ -22298,6 +22638,7 @@ def line_items_with_resolved_basis_catalog(
             rebind_pricing_authority_context(
                 next_item,
                 catalog_lookup=catalog_lookup,
+                catalog_evidence_descriptions=(item.get("description"), basis_line.get("text")),
             )
         )
     return resolved_items
@@ -22446,10 +22787,33 @@ def line_items_aligned_to_quote_basis(
             is_custom = normalize_basis_tag(line.get("tag")) == "Custom" or bool(line.get("custom_pricing"))
             if not pricing_keyword and not is_custom:
                 continue
+            existing = existing_item_for_basis_line(line) or {}
+            if catalog_item and any(
+                catalog_line_contradicts_item(
+                    evidence,
+                    catalog_item,
+                    catalog_items=list(catalog_lookup.values()),
+                )
+                for evidence in (line.get("text"), existing.get("description"))
+                if clean_text(evidence)
+            ):
+                rejected_row = existing or {
+                    "section": section_title,
+                    "description": clean_customer_quote_line_text(line.get("text")),
+                    "quantity": parse_float_or_none(line.get("quantity")),
+                    "unit": normalize_pricing_unit(line.get("unit") or catalog_item_unit_hint(catalog_item)),
+                    "price_mode": "Priced",
+                }
+                aligned.append(
+                    reject_catalog_line_item_authority(
+                        rejected_row,
+                        evidence_description=line.get("text"),
+                    )
+                )
+                continue
             description = output_description_for_basis_line(line, catalog_item)
             if not description:
                 continue
-            existing = existing_item_for_basis_line(line) or {}
             next_item = dict(existing)
             catalog_section = (
                 normalize_catalog_section(catalog_item.get("section"))
@@ -22516,6 +22880,7 @@ def line_items_aligned_to_quote_basis(
                 rebind_pricing_authority_context(
                     next_item,
                     catalog_lookup=catalog_lookup,
+                    catalog_evidence_descriptions=(line.get("text"), existing.get("description")),
                 )
             )
     return aligned if approved_only else (aligned or line_items)
