@@ -10,7 +10,8 @@
     "playwright:smoke": "node scripts/playwright-smoke.mjs",
     "playwright:ai-stress": "node scripts/playwright-ai-basis-chat-stress.mjs",
     "playwright:internal-auth": "node scripts/playwright-internal-google-auth.mjs",
-    "playwright:screenshot": "node scripts/playwright-smoke.mjs --screenshots"
+    "playwright:screenshot": "node scripts/playwright-smoke.mjs --screenshots",
+    "playwright:alpha-smoke": "node scripts/playwright-alpha-smoke.mjs"
   },
   "devDependencies": {
     "playwright": "^1.60.0"

@@ -6941,6 +6941,38 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertTrue(webapp.deploy_requires_auth_guard())
             self.assertFalse(webapp.is_allowed_host_header("quote.example"))
 
+    def test_local_internal_google_session_revocation_invalidates_existing_cookie(self):
+        env = {
+            "APP_MODE": "local",
+            "AUTH_REQUIRED": "true",
+            "SQAG_AUTH_MODE": "internal_google",
+            "SQAG_DISABLE_DOTENV": "1",
+            "SESSION_SECRET": "synthetic-local-internal-session-secret",
+            "SQAG_INTERNAL_WORKSPACE_ID": "workspace-internal-alpha",
+            "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
+                [{"sub": "synthetic-browser-subject", "email": "alpha-admin@example.test", "role": "admin"}],
+                separators=(",", ":"),
+            ),
+        }
+        webapp.INTERNAL_AUTH_STATE.reset()
+        try:
+            with mock.patch.dict(os.environ, env, clear=True):
+                policy = webapp.internal_auth_policy()
+                session = webapp.INTERNAL_AUTH_STATE.create_session(
+                    google_sub="synthetic-browser-subject",
+                    email="alpha-admin@example.test",
+                    policy=policy,
+                )
+                cookie = webapp.signed_cookie_value(session)
+                cookie_header = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
+
+                accepted = webapp.session_from_cookie_header(cookie_header)
+                self.assertEqual(accepted["session_id"], session["session_id"])
+                self.assertTrue(webapp.INTERNAL_AUTH_STATE.revoke_session(session["session_id"]))
+                self.assertIsNone(webapp.session_from_cookie_header(cookie_header))
+        finally:
+            webapp.INTERNAL_AUTH_STATE.reset()
+
     def test_local_oidc_component_scaffold_signs_sessions_and_maps_claims(self):
         env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
         with mock.patch.dict(os.environ, env, clear=True):
@@ -20513,8 +20545,9 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertNotIn("openPendingPdfWindow", js)
         self.assertNotIn("navigatePendingPdfWindow", js)
         self.assertNotIn("closePendingPdfWindow", js)
-        self.assertNotIn("about:blank", js)
+        self.assertIn('const pdfWindow = window.open("about:blank", "_blank");', js)
         self.assertIn('window.open(file.url, "_blank")', js)
+        self.assertIn("opened.opener = null;", js)
         self.assertNotIn("window.location.assign(file.url)", js)
         self.assertIn('link.target = "_blank";', js)
         self.assertIn('link.rel = "noopener";', js)
@@ -20538,8 +20571,9 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("downloadCurrentExcelFile();", download_handler)
         self.assertIn("hideExcelGeneratingModal();", download_handler)
         self.assertIn("await handleGenerate({ viewPdf: true });", pdf_handler)
-        self.assertIn("viewCurrentPdfFile();", pdf_handler)
-        self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile();"))
+        self.assertIn("viewCurrentPdfFile(state.pdfFile, pdfWindow);", pdf_handler)
+        self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile(state.pdfFile, pdfWindow);"))
+        self.assertIn("if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();", pdf_handler)
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(true));", pdf_handler)
         self.assertIn('title: "Generating PDF"', loading_options_body)
         self.assertIn('title: viewPdf ? "Finalizing PDF" : "Finalizing Excel"', finalizing_options_body)
@@ -25992,6 +26026,7 @@ eval([
   "renderOutputEditCell",
   "commitOutputEditor",
   "applyOutputIncludedAction",
+  "handleOutputEditorCommit",
 ].map(extractFunction).join("\n"));
 
 const unitPriceCell = renderOutputEditCell(
@@ -26007,15 +26042,21 @@ assert.ok(outputEditorHtml({ price_mode: "Priced", unit_price_override: "" }, 0,
 const state = {
   outputRows: [
     { section: "A", description: "First", quantity: "1", unit: "lot", price_mode: "Priced", unit_price_override: "", catalog_unit_price: "", amount: "" },
-    { section: "B", description: "Second", quantity: "1", unit: "lot", price_mode: "Priced", unit_price_override: "", catalog_unit_price: "", amount: "" },
+    { section: "B", description: "Second", quantity: "1", unit: "lot", price_mode: "Priced", unit_price_override: "45.50", catalog_unit_price: "45.50", amount: "45.50" },
   ],
   lineItems: [],
   downloadFile: null,
 };
+let pendingFocusout = null;
 function outputRowsToLineItems() { return []; }
 function outputRowsValid() { return { valid: true, errors: [] }; }
 function renderOutputValidationMessages() {}
-function renderPricingMatches() {}
+function renderPricingMatches() {
+  if (!pendingFocusout) return;
+  const editor = pendingFocusout;
+  pendingFocusout = null;
+  handleOutputEditorCommit({ target: { closest: () => editor }, type: "focusout" });
+}
 function renderMatchSummary() {}
 function syncControlStates() {}
 function markOutputRowsDirty() { state.downloadFile = null; }
@@ -26040,9 +26081,30 @@ commitOutputEditor({
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_override"), "Included");
 
-applyOutputIncludedAction({ dataset: { outputRow: "1" } });
+const replacedEditor = {
+  dataset: { outputEditorField: "unit_price_override", outputRow: "1" },
+  value: "45.50",
+  isConnected: true,
+};
+pendingFocusout = replacedEditor;
+applyOutputIncludedAction({
+  dataset: { outputRow: "1" },
+  closest: (selector) => selector === ".output-edit-cell"
+    ? { querySelector: () => replacedEditor }
+    : null,
+});
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 assert.strictEqual(state.outputRows[1].price_mode, "Included");
+assert.strictEqual(replacedEditor.dataset.outputCommitSuperseded, "true");
+
+const normalEditor = {
+  dataset: { outputEditorField: "quantity", outputRow: "0" },
+  value: "3",
+  isConnected: true,
+};
+handleOutputEditorCommit({ target: { closest: () => normalEditor }, type: "focusout" });
+assert.strictEqual(state.outputRows[0].quantity, "3");
+assert.strictEqual(state.outputRows[0].price_mode, "Included");
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -26210,10 +26272,24 @@ function quoteCommercialReviewRequired() { return false; }
 setDownloadFiles([
   { url: "/api/jobs/old/files/quotation.xlsx", name: "quotation.xlsx" },
   { url: "/api/jobs/old/files/quotation.pdf", name: "quotation.pdf" },
-]);
+], {
+  xlsx: { url: "/api/quote-sessions/old/download/xlsx" },
+});
+assert.strictEqual(downloadFileIsFresh(), true);
+assert.strictEqual(pdfFileIsFresh(), false);
+assert.strictEqual(state.pdfFile, null);
+
+setDownloadFiles([
+  { url: "/api/jobs/old/files/quotation.xlsx", name: "quotation.xlsx" },
+  { url: "/api/jobs/old/files/quotation.pdf", name: "quotation.pdf" },
+], {
+  xlsx: { url: "/api/quote-sessions/old/download/xlsx" },
+  pdf: { url: "/api/quote-sessions/old/download/pdf", view_url: "/api/quote-sessions/old/view/pdf" },
+});
 assert.strictEqual(downloadFileIsFresh(), true);
 assert.strictEqual(pdfFileIsFresh(), true);
-assert.strictEqual(elements.sideDownloadButton.href, "/api/jobs/old/files/quotation.xlsx");
+assert.strictEqual(elements.sideDownloadButton.href, "/api/quote-sessions/old/download/xlsx");
+assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/old/view/pdf");
 
 commitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
@@ -26221,8 +26297,8 @@ commitOutputEditor({
   isConnected: true,
 });
 assert.strictEqual(state.outputRevision, 1);
-assert.strictEqual(state.downloadFile.url, "/api/jobs/old/files/quotation.xlsx");
-assert.strictEqual(state.pdfFile.url, "/api/jobs/old/files/quotation.pdf");
+assert.strictEqual(state.downloadFile.url, "/api/quote-sessions/old/download/xlsx");
+assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/old/view/pdf");
 assert.strictEqual(state.outputRows[0].unit_price_override, "not-a-price");
 assert.strictEqual(outputRowsValid().valid, false);
 assert.strictEqual(downloadFileIsFresh(), false);
@@ -26233,14 +26309,17 @@ assert.strictEqual(elements.sideDownloadButton.download, "");
 setDownloadFiles([
   { url: "/api/jobs/new/files/quotation.xlsx", name: "quotation.xlsx" },
   { url: "/api/jobs/new/files/quotation.pdf", name: "quotation.pdf" },
-]);
+], {
+  xlsx: { url: "/api/quote-sessions/new/download/xlsx" },
+  pdf: { url: "/api/quote-sessions/new/download/pdf", view_url: "/api/quote-sessions/new/view/pdf" },
+});
 assert.strictEqual(downloadFileIsFresh(), true);
 assert.strictEqual(pdfFileIsFresh(), true);
 confirmOutputRowDelete();
 assert.strictEqual(state.outputRevision, 2);
 assert.strictEqual(state.outputRows.length, 1);
-assert.strictEqual(state.downloadFile.url, "/api/jobs/new/files/quotation.xlsx");
-assert.strictEqual(state.pdfFile.url, "/api/jobs/new/files/quotation.pdf");
+assert.strictEqual(state.downloadFile.url, "/api/quote-sessions/new/download/xlsx");
+assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/new/view/pdf");
 assert.strictEqual(downloadFileIsFresh(), false);
 assert.strictEqual(pdfFileIsFresh(), false);
 assert.strictEqual(elements.sideDownloadButton.href, "#");
@@ -40383,6 +40462,49 @@ main().catch((error) => {
             with self.subTest(label=label):
                 self.assertIsNone(validate(candidate_authority=candidate_authority))
 
+    def test_run635_persisted_pdf_view_route_is_inline_and_download_route_stays_attachment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data"
+            session_id = "quote-run635-pdf-view"
+            xlsx_bytes = b"PK\x03\x04run635-xlsx"
+            pdf_bytes = b"%PDF-1.4\nsynthetic current PDF\n%%EOF\n"
+            payload, result, output_dir = self._local_publication_case(
+                root,
+                session_id,
+                xlsx_bytes,
+                pdf_bytes,
+            )
+            with mock.patch.object(webapp, "configured_data_root", return_value=data_root):
+                webapp.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                session = webapp.get_quote_session(session_id)
+                with LocalRunnerServer() as runner:
+                    def get_response(path):
+                        connection = http.client.HTTPConnection(
+                            runner.server.server_address[0],
+                            runner.server.server_address[1],
+                            timeout=3,
+                        )
+                        try:
+                            connection.request("GET", path)
+                            response = connection.getresponse()
+                            headers = {key.lower(): value for key, value in response.getheaders()}
+                            return response.status, headers, response.read()
+                        finally:
+                            connection.close()
+
+                    viewed = get_response(f"/api/quote-sessions/{session_id}/view/pdf")
+                    downloaded = get_response(f"/api/quote-sessions/{session_id}/download/pdf")
+
+        self.assertEqual(session["exports"]["pdf"]["view_url"], f"/api/quote-sessions/{session_id}/view/pdf")
+        self.assertEqual(viewed[0], 200)
+        self.assertIn("application/pdf", viewed[1].get("content-type", ""))
+        self.assertEqual(viewed[1].get("content-disposition"), 'inline; filename="quotation.pdf"')
+        self.assertEqual(viewed[2], pdf_bytes)
+        self.assertEqual(downloaded[0], 200)
+        self.assertEqual(downloaded[1].get("content-disposition"), 'attachment; filename="quotation.pdf"')
+        self.assertEqual(downloaded[2], pdf_bytes)
+
     def test_run582_local_download_rejects_malformed_raw_authority_before_artifact_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -41367,6 +41489,56 @@ process.stdout.write("ok");
         self.assertEqual(authority["catalog_item_id"], catalog_item["pricing_keyword"])
         self.assertEqual(authority["catalog_digest"], catalog_item["pricing_basis_digest"])
 
+        submitted_row = copy.deepcopy(payload["line_items"][0])
+        submitted_row["source_basis_line_id"] = "alpha-basis-line-1"
+        reference_authority = webapp.exact_pricing_reference_authority(payload)
+        catalog_lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload)
+        submitted_catalog_authority = webapp.build_pricing_authority(
+            "catalog",
+            submitted_row,
+            price=catalog_item["effective_unit_price"],
+            reference_authority=reference_authority,
+            catalog_item=catalog_lookup[catalog_item["pricing_keyword"]],
+        )
+        round_trip = copy.deepcopy(payload)
+        round_trip["line_items"] = [{
+            **copy.deepcopy(catalog_item),
+            **submitted_row,
+            "source_basis_line_id": submitted_row["source_basis_line_id"],
+            "status": "matched-from-ambiguous",
+            "unit_price_override": catalog_item["effective_unit_price"],
+            "catalog_unit_price": catalog_item["effective_unit_price"],
+            "pricing_authority": submitted_catalog_authority,
+        }]
+        [normalized_round_trip] = webapp.normalize_line_items(round_trip)
+        self.assertEqual(normalized_round_trip["status"], "matched-from-ambiguous")
+        self.assertEqual(normalized_round_trip["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(normalized_round_trip["pricing_authority"]["context"]["description"], "[ sqm synthetic carpet tile ]")
+        self.assertEqual(normalized_round_trip["effective_unit_price"], catalog_item["effective_unit_price"])
+
+        stale_round_trip = copy.deepcopy(round_trip)
+        stale_round_trip["line_items"][0]["description"] = "A different admitted row"
+        [stale_round_trip_row] = webapp.normalize_line_items(stale_round_trip)
+        self.assertEqual(stale_round_trip_row["status"], "unmatched")
+        self.assertEqual(stale_round_trip_row["pricing_authority"]["variant"], "historical")
+        self.assertNotIn("effective_unit_price", stale_round_trip_row)
+
+        restored_new_draft = copy.deepcopy(payload)
+        unpriced_row = copy.deepcopy(restored_new_draft["line_items"][0])
+        unpriced_row["pricing_authority"] = webapp.build_pricing_authority("none", unpriced_row)
+        restored_new_draft["line_items"] = [unpriced_row]
+        [restored_catalog_item] = webapp.normalize_line_items(restored_new_draft)
+        self.assertEqual(restored_catalog_item["status"], "matched")
+        self.assertEqual(restored_catalog_item["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(restored_catalog_item["pricing_authority"]["catalog_item_id"], catalog_item["pricing_keyword"])
+        self.assertEqual(restored_catalog_item["effective_unit_price"], catalog_item["effective_unit_price"])
+
+        invalid_none_authority = copy.deepcopy(restored_new_draft)
+        invalid_none_authority["line_items"][0]["pricing_authority"]["context"]["description"] = "Stale row identity"
+        [blocked_row] = webapp.normalize_line_items(invalid_none_authority)
+        self.assertEqual(blocked_row["status"], "unmatched")
+        self.assertEqual(blocked_row["pricing_authority"]["variant"], "historical")
+
         changed_quantity = copy.deepcopy(payload)
         changed_quantity["line_items"] = [copy.deepcopy(catalog_item)]
         changed_quantity["line_items"][0]["quantity"] = 99
@@ -41407,6 +41579,250 @@ process.stdout.write("ok");
         self.assertEqual(included_item["pricing_authority"]["variant"], "included")
         self.assertEqual(included_item["pricing_authority"]["price"], 0)
         self.assertNotIn("effective_unit_price", included_item)
+
+    def test_run640_catalog_authority_cannot_override_contradictory_row(self):
+        payload = valid_payload()
+        payload["pricing_reference"]["items"] = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))["items"]
+        payload["line_items"] = [{
+            "section": "Synthetic Floors",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "sqm synthetic carpet tile",
+            "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+        }]
+        [catalog_row] = webapp.normalize_line_items(payload)
+        catalog_item_id = catalog_row["pricing_keyword"]
+        reference_authority = webapp.exact_pricing_reference_authority(payload)
+        catalog_lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload)
+        price = catalog_row["effective_unit_price"]
+        self.assertEqual(catalog_row["pricing_authority"]["variant"], "catalog")
+        contradictory_row = {
+            "source_basis_line_id": "alpha-basis-line-1",
+            "section": "Synthetic Floors",
+            "quantity": 2,
+            "unit": "sqm",
+            "description": "stainless steel wall rail",
+            "pricing_keyword": catalog_item_id,
+            "price_mode": "Priced",
+            "unit_price_override": price,
+            "catalog_unit_price": price,
+            "status": "matched-from-ambiguous",
+        }
+        contradictory_authority = webapp.build_pricing_authority(
+            "catalog",
+            contradictory_row,
+            price=price,
+            reference_authority=reference_authority,
+            catalog_item=catalog_lookup[catalog_item_id],
+        )
+        payload["line_items"] = [{
+            **contradictory_row,
+            "pricing_authority": contradictory_authority,
+        }]
+
+        self.assertTrue(webapp.catalog_line_contradicts_item(
+            contradictory_row["description"],
+            catalog_lookup[catalog_item_id],
+        ))
+        [normalized] = webapp.normalize_line_items(payload)
+        self.assertEqual(normalized["pricing_authority"]["variant"], "historical")
+        self.assertEqual(normalized["status"], "unmatched")
+        for field in (
+            "effective_unit_price",
+            "unit_price_override",
+            "catalog_unit_price",
+            "pricing_basis_amount",
+            "approved_quote_amount",
+        ):
+            self.assertNotIn(field, normalized)
+
+
+    def test_explicit_keyword_overlap_cannot_override_material_conflict(self):
+        payload = valid_payload()
+        payload['pricing_reference']['items'] = json.loads(KONCEPT_CATALOG.read_text(encoding='utf-8'))['items']
+        catalog_item_id = 'synthetic-floors-synthetic-vinyl-floor-finish'
+        catalog_lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload)
+        catalog_item = catalog_lookup[catalog_item_id]
+
+        vinyl_row = {
+            'section': 'Synthetic Floors',
+            'quantity': 2,
+            'unit': 'sqm',
+            'description': 'sqm synthetic vinyl floor finish',
+            'pricing_keyword': catalog_item_id,
+        }
+        payload['line_items'] = [vinyl_row]
+        [positive] = webapp.normalize_line_items(payload)
+        price = positive['effective_unit_price']
+        self.assertEqual(positive['pricing_authority']['variant'], 'catalog')
+        self.assertEqual(positive['status'], 'matched')
+        self.assertAlmostEqual(price, 10.4)
+
+        wood_row = {
+            **vinyl_row,
+            'description': 'sqm synthetic wood floor finish',
+        }
+        self.assertTrue(webapp.catalog_line_contradicts_item(wood_row['description'], catalog_item))
+        self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(wood_row['description'], catalog_item))
+
+        payload['line_items'] = [wood_row]
+        [untrusted] = webapp.normalize_line_items(payload)
+        self.assertEqual(untrusted['pricing_authority']['variant'], 'none')
+        for field in (
+            'effective_unit_price',
+            'unit_price_override',
+            'catalog_unit_price',
+            'pricing_basis_amount',
+            'approved_quote_amount',
+        ):
+            self.assertNotIn(field, untrusted)
+
+        reference_authority = webapp.exact_pricing_reference_authority(payload)
+        wood_row_with_price = {
+            **wood_row,
+            'price_mode': 'Priced',
+            'unit_price_override': price,
+            'catalog_unit_price': price,
+            'status': 'matched-from-ambiguous',
+        }
+        incoming_authority = webapp.build_pricing_authority(
+            'catalog',
+            wood_row_with_price,
+            price=price,
+            reference_authority=reference_authority,
+            catalog_item=catalog_item,
+        )
+        payload['line_items'] = [{**wood_row_with_price, 'pricing_authority': incoming_authority}]
+        [recovered] = webapp.normalize_line_items(payload)
+        self.assertEqual(recovered['pricing_authority']['variant'], 'historical')
+        self.assertEqual(recovered['status'], 'unmatched')
+        for field in (
+            'effective_unit_price',
+            'unit_price_override',
+            'catalog_unit_price',
+            'pricing_basis_amount',
+            'approved_quote_amount',
+        ):
+            self.assertNotIn(field, recovered)
+
+        bracketed_positive_row = {
+            **vinyl_row,
+            'description': '[ sqm synthetic vinyl floor finish ] - Cut to fit booth footprint',
+        }
+        self.assertFalse(webapp.catalog_line_contradicts_item(bracketed_positive_row['description'], catalog_item))
+        payload['line_items'] = [bracketed_positive_row]
+        [bracketed_positive] = webapp.normalize_line_items(payload)
+        self.assertEqual(bracketed_positive['pricing_authority']['variant'], 'catalog')
+        self.assertEqual(bracketed_positive['status'], 'matched')
+        self.assertAlmostEqual(bracketed_positive['effective_unit_price'], 10.4)
+
+        bracketed_wood_row = {
+            **vinyl_row,
+            'description': '[ sqm synthetic vinyl floor finish ] - Replace with solid wood floor finish',
+        }
+        self.assertTrue(webapp.catalog_line_contradicts_item(bracketed_wood_row['description'], catalog_item))
+        self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(bracketed_wood_row['description'], catalog_item))
+        payload['line_items'] = [bracketed_wood_row]
+        [bracketed_untrusted] = webapp.normalize_line_items(payload)
+        self.assertEqual(bracketed_untrusted['pricing_authority']['variant'], 'none')
+        for field in (
+            'effective_unit_price',
+            'unit_price_override',
+            'catalog_unit_price',
+            'pricing_basis_amount',
+            'approved_quote_amount',
+        ):
+            self.assertNotIn(field, bracketed_untrusted)
+
+        mismatched_reference_row = {
+            **vinyl_row,
+            'description': '[ sqm synthetic wood floor finish ]',
+        }
+        self.assertTrue(webapp.catalog_line_contradicts_item(mismatched_reference_row['description'], catalog_item))
+        payload['line_items'] = [mismatched_reference_row]
+        [mismatched_untrusted] = webapp.normalize_line_items(payload)
+        self.assertEqual(mismatched_untrusted['pricing_authority']['variant'], 'none')
+        for field in (
+            'effective_unit_price',
+            'unit_price_override',
+            'catalog_unit_price',
+            'pricing_basis_amount',
+            'approved_quote_amount',
+        ):
+            self.assertNotIn(field, mismatched_untrusted)
+
+    def test_exact_bracket_reference_rejects_other_catalog_object_suffix(self):
+        payload = valid_payload()
+        payload['pricing_reference']['items'] = json.loads(KONCEPT_CATALOG.read_text(encoding='utf-8'))['items']
+        catalog_lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload)
+        catalog_items = list(catalog_lookup.values())
+        carpet_item = catalog_lookup['synthetic-floors-synthetic-carpet-tile']
+        price = carpet_item['sale_unit_price']
+
+        fitting_row = {
+            'section': 'Synthetic Floors',
+            'quantity': 2,
+            'unit': 'sqm',
+            'description': '[ sqm synthetic carpet tile ] - Cut to fit booth footprint',
+            'pricing_keyword': carpet_item['id'],
+        }
+        payload['line_items'] = [fitting_row]
+        [fitting_match] = webapp.normalize_line_items(payload)
+        self.assertEqual(fitting_match['pricing_authority']['variant'], 'catalog')
+        self.assertEqual(fitting_match['status'], 'matched')
+        self.assertAlmostEqual(fitting_match['effective_unit_price'], price)
+
+        wall_rail_row = {
+            **fitting_row,
+            'description': '[ sqm synthetic carpet tile ] - stainless steel wall rail',
+        }
+        self.assertTrue(webapp.catalog_line_contradicts_item(
+            wall_rail_row['description'], carpet_item, catalog_items=catalog_items,
+        ))
+        payload['line_items'] = [{**wall_rail_row, 'pricing_keyword': ''}]
+        [wall_rail_untrusted] = webapp.normalize_line_items(payload)
+        self.assertEqual(wall_rail_untrusted['pricing_authority']['variant'], 'none')
+        for field in (
+            'effective_unit_price',
+            'unit_price_override',
+            'catalog_unit_price',
+            'pricing_basis_amount',
+            'approved_quote_amount',
+        ):
+            self.assertNotIn(field, wall_rail_untrusted)
+
+        reference_authority = webapp.exact_pricing_reference_authority(payload)
+        wall_rail_row_with_price = {
+            **wall_rail_row,
+            'price_mode': 'Priced',
+            'unit_price_override': price,
+            'catalog_unit_price': price,
+            'status': 'matched-from-ambiguous',
+        }
+        incoming_authority = webapp.build_pricing_authority(
+            'catalog',
+            wall_rail_row_with_price,
+            price=price,
+            reference_authority=reference_authority,
+            catalog_item=carpet_item,
+        )
+        payload['line_items'] = [{
+            **wall_rail_row_with_price,
+            'pricing_authority': incoming_authority,
+        }]
+        [wall_rail_recovered] = webapp.normalize_line_items(payload)
+        self.assertEqual(wall_rail_recovered['pricing_authority']['variant'], 'historical')
+        self.assertEqual(wall_rail_recovered['status'], 'unmatched')
+        for field in (
+            'effective_unit_price',
+            'unit_price_override',
+            'catalog_unit_price',
+            'pricing_basis_amount',
+            'approved_quote_amount',
+        ):
+            self.assertNotIn(field, wall_rail_recovered)
+
+
 
     def test_run635_legacy_recovered_rows_are_historical_and_block_generation(self):
         payload = recovered_convergence_payload()

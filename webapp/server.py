@@ -2495,33 +2495,30 @@ def session_from_cookie_header(cookie_header: str) -> dict[str, Any] | None:
     )
     if not payload or not isinstance(payload.get("user"), dict):
         return None
-    if configured_app_mode() == "deploy":
-        if mode == "platform":
-            if payload.get("auth_mode") != "platform" or not platform_auth_session_complete(payload):
-                return None
-        elif mode == INTERNAL_AUTH_MODE:
-            try:
-                payload = INTERNAL_AUTH_STATE.validate_session(
-                    payload,
-                    policy=internal_auth_policy(),
-                    current_mode=mode,
-                )
-            except (InternalAuthConfigError, InternalAuthStateError) as exc:
-                reason = getattr(exc, "reason", "internal_session_policy_invalid")
-                write_local_log(
-                    "security_event",
-                    {
-                        "reason": reason,
-                        "path": "protected_request",
-                        "status": 401,
-                        "user_id": privacy_safe_audit_tracking_id_or_unavailable(
-                            payload.get("google_sub"),
-                            "unknown",
-                        ),
-                    },
-                )
-                return None
-        else:
+    if mode == INTERNAL_AUTH_MODE:
+        try:
+            payload = INTERNAL_AUTH_STATE.validate_session(
+                payload,
+                policy=internal_auth_policy(),
+                current_mode=mode,
+            )
+        except (InternalAuthConfigError, InternalAuthStateError) as exc:
+            reason = getattr(exc, "reason", "internal_session_policy_invalid")
+            write_local_log(
+                "security_event",
+                {
+                    "reason": reason,
+                    "path": "protected_request",
+                    "status": 401,
+                    "user_id": privacy_safe_audit_tracking_id_or_unavailable(
+                        payload.get("google_sub"),
+                        "unknown",
+                    ),
+                },
+            )
+            return None
+    elif configured_app_mode() == "deploy":
+        if mode != "platform" or payload.get("auth_mode") != "platform" or not platform_auth_session_complete(payload):
             return None
     return payload
 
@@ -15151,6 +15148,11 @@ class DatabaseSqagStorage:
             export["missing"] = bool(safe_recorded and not artifact_exists)
             export["stale"] = stale
             export["url"] = f"/api/quote-sessions/{public['session_id']}/download/{kind}" if exists else None
+            export["view_url"] = (
+                f"/api/quote-sessions/{public['session_id']}/view/pdf"
+                if kind == "pdf" and exists and not stale
+                else None
+            )
             if artifact:
                 export["sha256"] = artifact["sha256"]
                 export["size_bytes"] = artifact["size_bytes"]
@@ -19026,18 +19028,81 @@ def catalog_attribute_conflicts(line_tokens: set[str], item_tokens: set[str]) ->
     return False
 
 
-def catalog_line_contradicts_item(line_text: Any, item: dict[str, Any]) -> bool:
+def catalog_detail_matches_other_catalog_object_family(
+    detail_tokens: set[str],
+    item: dict[str, Any],
+    catalog_items: list[dict[str, Any]] | None,
+) -> bool:
+    if not detail_tokens or not catalog_items:
+        return False
+
+    selected_id = clean_text(item.get("id"))
+    selected_families = [
+        catalog_inference_tokens(family)
+        for family in catalog_item_object_families(item)
+        if len(catalog_inference_tokens(family)) >= 2
+    ]
+    selected_overlap = max(
+        (len(detail_tokens & family_tokens) for family_tokens in selected_families),
+        default=0,
+    )
+    if not selected_families:
+        selected_tokens: set[str] = set()
+        for value in catalog_inference_values(item):
+            selected_tokens.update(catalog_inference_tokens(value))
+        selected_overlap = len(detail_tokens & selected_tokens)
+
+    for candidate in catalog_items:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = clean_text(candidate.get("id"))
+        if candidate is item or (selected_id and candidate_id == selected_id):
+            continue
+        for family in catalog_item_object_families(candidate):
+            family_tokens = catalog_inference_tokens(family)
+            if len(family_tokens) < 2:
+                continue
+            overlap_count = len(detail_tokens & family_tokens)
+            if overlap_count < 2 or overlap_count / len(family_tokens) < 0.6:
+                continue
+            if overlap_count < selected_overlap + 2:
+                continue
+            candidate_tokens: set[str] = set()
+            for value in catalog_inference_values(candidate):
+                candidate_tokens.update(catalog_inference_tokens(value))
+            if catalog_attribute_conflicts(detail_tokens, candidate_tokens):
+                continue
+            return True
+    return False
+
+
+def catalog_line_contradicts_item(
+    line_text: Any,
+    item: dict[str, Any],
+    *,
+    catalog_items: list[dict[str, Any]] | None = None,
+) -> bool:
     bracketed = bracketed_catalog_reference_parts(line_text)
-    if bracketed:
-        reference, detail = bracketed
-        catalog_reference = clean_customer_quote_line_text(item.get("pricing_reference_description") or item.get("description"))
-        if comparable_catalog_description_key(reference) == comparable_catalog_description_key(catalog_reference):
-            return False
-        line_text = detail
-    line_tokens = catalog_inference_tokens(line_text)
     item_tokens: set[str] = set()
     for value in catalog_inference_values(item):
         item_tokens.update(catalog_inference_tokens(value))
+    if bracketed:
+        reference, detail = bracketed
+        if bracketed_reference_matches_catalog_item(line_text, item):
+            # An exact catalog reference establishes identity, but a conflicting
+            # suffix still makes the selected item unsafe for this row.
+            detail_tokens = catalog_inference_tokens(detail)
+            if not detail_tokens or not item_tokens:
+                return False
+            if catalog_attribute_conflicts(detail_tokens, item_tokens):
+                return True
+            return catalog_detail_matches_other_catalog_object_family(
+                detail_tokens,
+                item,
+                catalog_items,
+            )
+        line_text = detail or reference
+    line_tokens = catalog_inference_tokens(line_text)
     if not line_tokens or not item_tokens:
         return False
     if catalog_attribute_conflicts(line_tokens, item_tokens):
@@ -19050,12 +19115,31 @@ def catalog_line_contradicts_item(line_text: Any, item: dict[str, Any]) -> bool:
     return line_ratio < 0.2 and item_ratio < 0.2
 
 
-def explicit_catalog_keyword_has_usable_overlap(line_text: Any, item: dict[str, Any]) -> bool:
+def explicit_catalog_keyword_has_usable_overlap(
+    line_text: Any,
+    item: dict[str, Any],
+    *,
+    catalog_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    bracketed = bracketed_catalog_reference_parts(line_text)
+    if bracketed:
+        reference, detail = bracketed
+        if bracketed_reference_matches_catalog_item(line_text, item):
+            line_text = detail
+        else:
+            line_text = detail or reference
     line_tokens = catalog_inference_tokens(line_text)
     item_tokens: set[str] = set()
     for value in catalog_inference_values(item):
         item_tokens.update(catalog_inference_tokens(value))
-    return bool(line_tokens and item_tokens and (line_tokens & item_tokens))
+    if not line_tokens or not item_tokens or not (line_tokens & item_tokens):
+        return False
+    # Shared wording cannot make a distinguishing attribute conflict safe.
+    return not catalog_attribute_conflicts(line_tokens, item_tokens) and not catalog_detail_matches_other_catalog_object_family(
+        line_tokens,
+        item,
+        catalog_items,
+    )
 
 
 def catalog_inference_values(item: dict[str, Any]) -> list[str]:
@@ -19548,6 +19632,7 @@ def normalize_line_items(
         if use_catalog
         else {}
     )
+    catalog_items = list(catalog_lookup.values())
     items: list[dict[str, Any]] = []
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -19568,6 +19653,21 @@ def normalize_line_items(
             else raw_unit
         )
         incoming_description = clean_customer_quote_line_text(quantity_parts["text"])
+        if authority_supplied and authority_variant_hint == "none":
+            none_authority = normalize_pricing_authority(
+                authority_hint,
+                {
+                    "source_basis_line_id": canonical_pricing_authority_text(raw.get("source_basis_line_id")),
+                    "section": canonical_pricing_authority_text(raw.get("section")) or "General",
+                    "description": incoming_description,
+                    "unit": incoming_unit,
+                    "pricing_keyword": pricing_keyword,
+                },
+                reference_authority=authority,
+            )
+            if none_authority and none_authority.get("variant") == "none":
+                # An explicit no-authority marker on a new draft must not block first catalog resolution.
+                authority_supplied = False
         incoming_authority = None
         if authority_supplied:
             catalog_item = None
@@ -19622,14 +19722,23 @@ def normalize_line_items(
             )
         )
         raw_description = incoming_description
-        if (
+        catalog_item_rejected_for_contradiction = bool(
             catalog_item
-            and catalog_line_contradicts_item(raw_description, catalog_item)
+            and catalog_line_contradicts_item(
+                raw_description,
+                catalog_item,
+                catalog_items=catalog_items,
+            )
             and not (
                 pricing_keyword_was_explicit
-                and explicit_catalog_keyword_has_usable_overlap(raw_description, catalog_item)
+                and explicit_catalog_keyword_has_usable_overlap(
+                    raw_description,
+                    catalog_item,
+                    catalog_items=catalog_items,
+                )
             )
-        ):
+        )
+        if catalog_item_rejected_for_contradiction:
             catalog_item = None
             pricing_keyword = ""
             unit = quantity_parts["unit"] if quantity_parts.get("from_text_prefix") else raw_unit
@@ -19757,6 +19866,18 @@ def normalize_line_items(
                 reference_authority=authority,
                 catalog_item=catalog_item,
             )
+            if (
+                normalized_authority is None
+                and incoming_authority is not None
+                and not catalog_item_rejected_for_contradiction
+            ):
+                # Rebind row authority only when its catalog item remains admitted.
+                rebound = rebind_pricing_authority_context(
+                    {**item, "pricing_authority": incoming_authority},
+                    reference_authority=authority,
+                    catalog_lookup=catalog_lookup,
+                )
+                normalized_authority = rebound.get("pricing_authority")
         elif price_mode == "Included":
             normalized_authority = build_pricing_authority(
                 "included",
@@ -22053,7 +22174,11 @@ def quote_basis_sections_with_catalog_exact_lines(
             catalog_item = catalog_item_for_pricing_keyword(line.get("pricing_keyword"))
             if not catalog_item:
                 continue
-            if catalog_line_contradicts_item(line.get("text"), catalog_item):
+            if catalog_line_contradicts_item(
+                line.get("text"),
+                catalog_item,
+                catalog_items=exact_catalog_items,
+            ):
                 mark_line_custom_for_manual_pricing(line)
                 continue
             apply_catalog_item_metadata(line, catalog_item, replace_text=True)
@@ -26663,6 +26788,11 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         raw_export["missing"] = bool(safe_recorded and not file_exists)
         raw_export["stale"] = stale
         raw_export["url"] = f"/api/quote-sessions/{session_id}/download/{kind}" if exists else None
+        raw_export["view_url"] = (
+            f"/api/quote-sessions/{session_id}/view/pdf"
+            if kind == "pdf" and exists and not stale
+            else None
+        )
         if file_exists and export_path is not None:
             raw_export["sha256"] = hashlib.sha256(export_path.read_bytes()).hexdigest()
             raw_export["size_bytes"] = export_path.stat().st_size
@@ -29544,6 +29674,13 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 return
             self.send_quote_session_download(quote_session_download_match.group(1), quote_session_download_match.group(2), storage)
             return
+        quote_session_pdf_view_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)/view/pdf", path)
+        if quote_session_pdf_view_match:
+            storage = self.current_quote_session_storage()
+            if storage is None:
+                return
+            self.send_quote_session_download(quote_session_pdf_view_match.group(1), "pdf", storage, inline=True)
+            return
         quote_session_detail_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", path)
         if quote_session_detail_match:
             storage = self.current_quote_session_storage()
@@ -31341,7 +31478,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_quote_session_download(self, session_id: str, kind: str, storage: LocalSqagStorage | DatabaseSqagStorage) -> None:
+    def send_quote_session_download(
+        self,
+        session_id: str,
+        kind: str,
+        storage: LocalSqagStorage | DatabaseSqagStorage,
+        *,
+        inline: bool = False,
+    ) -> None:
         safe_id = safe_quote_session_id(session_id, "")
         normalized_kind = clean_text(kind).lower()
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(normalized_kind)
@@ -31414,7 +31558,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "completed",
                 action_reference=safe_id,
                 session_reference=safe_id,
-                operation_route="/api/quote-sessions/download",
+                operation_route="/api/quote-sessions/view/pdf" if inline else "/api/quote-sessions/download",
                 purpose=normalized_kind,
             )
         except SqagStorageAccessError as exc:
@@ -31422,7 +31566,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        disposition = "inline" if inline else "attachment"
+        self.send_header("Content-Disposition", f'{disposition}; filename="{safe_filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_security_headers()
         self.end_headers()

@@ -202,6 +202,7 @@ jobs:
           node --check scripts/playwright-smoke.mjs
           node --check scripts/playwright-ai-basis-chat-stress.mjs
           node --check scripts/playwright-internal-google-auth.mjs
+          node --check scripts/playwright-alpha-smoke.mjs
 
       - name: Check Python syntax
         run: |
@@ -230,3 +231,6 @@ jobs:
 
       - name: Run app smoke test
         run: npm run playwright:smoke
+
+      - name: Run minimum internal alpha browser smoke
+        run: npm run playwright:alpha-smoke

@@ -9132,16 +9132,19 @@ function postCommitProjectionWarningMessage(warning = {}) {
   return String(warning.message || "Generation completed, but the session view could not be refreshed. Refresh to retry.").trim();
 }
 
-function setDownloadFiles(files = []) {
-  const excelFile = files.find((file) => /\.xlsx$/i.test(file.name || "")) || null;
-  const pdfFile = files.find((file) => /\.pdf$/i.test(file.name || "")) || null;
+function setDownloadFiles(files = [], quoteSessionExports = null) {
+  const excelSource = files.find((file) => /\.xlsx$/i.test(file.name || "")) || null;
+  const pdfSource = files.find((file) => /\.pdf$/i.test(file.name || "")) || null;
+  const excelFile = excelSource ? { ...excelSource, url: quoteSessionExports?.xlsx?.url || excelSource.url } : null;
+  const pdfFile = pdfSource && quoteSessionExports?.pdf?.view_url
+    ? { ...pdfSource, url: quoteSessionExports.pdf.view_url }
+    : null;
   state.downloadFileRevision = excelFile ? revisionNumber(state.outputRevision, 0) : -1;
   state.pdfFileRevision = pdfFile ? revisionNumber(state.outputRevision, 0) : -1;
   state.downloadFile = excelFile ? { ...excelFile, output_revision: state.downloadFileRevision } : null;
   state.pdfFile = pdfFile ? { ...pdfFile, output_revision: state.pdfFileRevision } : null;
   updateDownloadButton();
 }
-
 function revisionNumber(value, fallback = 0) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -9363,11 +9366,17 @@ function downloadCurrentExcelFile(file = state.downloadFile) {
   return true;
 }
 
-function viewCurrentPdfFile(file = state.pdfFile) {
-  if (!file?.url) return false;
-  const opened = window.open(file.url, "_blank");
+function viewCurrentPdfFile(file = state.pdfFile, preparedWindow = null) {
+  if (!file?.url) {
+    if (preparedWindow && !preparedWindow.closed) preparedWindow.close();
+    return false;
+  }
+  const opened = preparedWindow || window.open(file.url, "_blank");
   if (opened) {
-    opened.opener = null;
+    if (preparedWindow) opened.location.href = new URL(file.url, window.location.href).href;
+    window.setTimeout(() => {
+      if (!opened.closed) opened.opener = null;
+    }, 0);
     return true;
   }
   const link = document.createElement("a");
@@ -10542,6 +10551,9 @@ function commitOutputEditor(editor) {
 function applyOutputIncludedAction(button) {
   const index = Number(button?.dataset.outputRow);
   if (!Number.isInteger(index) || index < 0 || !state.outputRows[index]) return;
+  const unitPriceEditor = button?.closest?.(".output-edit-cell")
+    ?.querySelector?.('[data-output-editor-field="unit_price_override"]');
+  if (unitPriceEditor?.dataset) unitPriceEditor.dataset.outputCommitSuperseded = "true";
   const nextRow = {
     ...state.outputRows[index],
     price_mode: "Included",
@@ -10631,6 +10643,7 @@ function handleOutputCellKeydown(event) {
 function handleOutputEditorCommit(event) {
   const editor = event.target.closest("[data-output-editor-field]");
   if (!editor) return;
+  if (editor.dataset.outputCommitSuperseded === "true") return;
   commitOutputEditor(editor);
 }
 
@@ -15621,6 +15634,7 @@ async function handleGenerate(options = {}) {
       postCommitProjectionWarning
         ? (data.committed_files || [])
         : (data.files || []),
+      data.quote_session?.exports,
     );
     renderPricingMatches(state.outputRows);
     renderMatchSummary({ pricing_matches: state.outputRows });
@@ -15872,6 +15886,7 @@ async function resumeSavedJob() {
         postCommitProjectionWarning
           ? (data.committed_files || [])
           : (data.files || []),
+        data.quote_session?.exports,
       );
     }
     if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
@@ -16379,12 +16394,15 @@ function wireEvents() {
       return;
     }
     commitActiveOutputEditor();
+    const pdfWindow = window.open("about:blank", "_blank");
+    let openedPdf = false;
     showExcelGeneratingModal(generationLoadingModalOptions(true));
     await waitForUiPaint();
     try {
       const generated = await handleGenerate({ viewPdf: true });
-      if (generated) viewCurrentPdfFile();
+      if (generated) openedPdf = viewCurrentPdfFile(state.pdfFile, pdfWindow);
     } finally {
+      if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();
       hideExcelGeneratingModal();
     }
   });
