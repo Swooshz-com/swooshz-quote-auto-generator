@@ -32751,6 +32751,145 @@ main().catch((error) => {
                 self.assertIsNone(workspace_b.profile_detail("team-layout-profile", source="company"))
                 self.assertIsNone(workspace_b.profile_layout_artifact("team-layout-profile"))
 
+    def test_database_profile_save_serializes_with_delete_before_layout_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag-storage.sqlite3').as_posix()}"
+            workspace_id = "workspace-database-profile-save-delete-race"
+            profile_id = "database-profile-race"
+            env = {
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+            }
+            validation_reached = threading.Event()
+            allow_validation = threading.Event()
+            delete_begin_attempted = threading.Event()
+            delete_begin_returned = threading.Event()
+            delete_done = threading.Event()
+            save_done = threading.Event()
+            results = {}
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                seed_storage = webapp.app_storage_for_auth_session(
+                    self.platform_auth_session(workspace_id)
+                )
+                seed_storage.save_profile(workspace_profile_with_layout(profile_id))
+                save_storage = webapp.app_storage_for_auth_session(
+                    self.platform_auth_session(workspace_id)
+                )
+                delete_storage = webapp.app_storage_for_auth_session(
+                    self.platform_auth_session(workspace_id)
+                )
+                original_validate_layout = save_storage._validated_profile_layout_record
+                original_delete_connection = delete_storage.connection
+
+                def pause_after_valid_layout(candidate_id, *args, **kwargs):
+                    validated = original_validate_layout(candidate_id, *args, **kwargs)
+                    if validated is not None:
+                        validation_reached.set()
+                        if not allow_validation.wait(5):
+                            raise AssertionError("Timed out waiting to release profile validation.")
+                    return validated
+
+                @contextlib.contextmanager
+                def observed_delete_connection():
+                    with original_delete_connection() as connection:
+                        class ObservedConnection:
+                            def execute(self, sql, params=()):
+                                if clean_sql(sql).startswith("begin immediate"):
+                                    delete_begin_attempted.set()
+                                    result = connection.execute(sql, params)
+                                    delete_begin_returned.set()
+                                    return result
+                                return connection.execute(sql, params)
+
+                            def commit(self):
+                                return connection.commit()
+
+                            def rollback(self):
+                                return connection.rollback()
+
+                            def __getattr__(self, name):
+                                return getattr(connection, name)
+
+                        yield ObservedConnection()
+
+                def save_operation():
+                    return save_storage.save_profile(
+                        {"id": profile_id, "label": "Metadata-only update"}
+                    )
+
+                def delete_operation():
+                    return delete_storage.delete_profile(profile_id)
+
+                save_thread = threading.Thread(
+                    target=run_thread_operation,
+                    args=(results, "save", save_done, save_operation),
+                    daemon=True,
+                )
+                delete_thread = threading.Thread(
+                    target=run_thread_operation,
+                    args=(results, "delete", delete_done, delete_operation),
+                    daemon=True,
+                )
+                try:
+                    with (
+                        mock.patch.object(
+                            save_storage,
+                            "_validated_profile_layout_record",
+                            side_effect=pause_after_valid_layout,
+                        ),
+                        mock.patch.object(
+                            delete_storage,
+                            "connection",
+                            new=observed_delete_connection,
+                        ),
+                    ):
+                        save_thread.start()
+                        self.assertTrue(
+                            validation_reached.wait(5),
+                            "Metadata-only save did not validate its existing layout.",
+                        )
+                        delete_thread.start()
+                        self.assertTrue(
+                            delete_begin_attempted.wait(5),
+                            "Concurrent delete did not reach its SQLite write lock.",
+                        )
+                        self.assertFalse(
+                            delete_begin_returned.wait(0.1),
+                            "Delete passed its write lock while profile validation was in flight.",
+                        )
+                        allow_validation.set()
+                        self.assertTrue(save_done.wait(5), "Profile save did not finish.")
+                        self.assertTrue(delete_done.wait(5), "Profile delete did not finish.")
+                finally:
+                    allow_validation.set()
+                    save_thread.join(timeout=5)
+                    delete_thread.join(timeout=5)
+
+                with seed_storage.connection() as connection:
+                    row = connection.execute(
+                        "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                        (workspace_id, profile_id),
+                    ).fetchone()
+                    layout_row = connection.execute(
+                        "select 1 from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                        (workspace_id, "profile", profile_id, "quotation_layout"),
+                    ).fetchone()
+
+            self.assertFalse(save_thread.is_alive(), "Profile save thread remained blocked.")
+            self.assertFalse(delete_thread.is_alive(), "Profile delete thread remained blocked.")
+            self.assertIsInstance(results.get("save"), dict)
+            self.assertTrue(results.get("delete"))
+            self.assertTrue(row)
+            self.assertTrue(
+                json.loads(row["payload_json"]).get(webapp.DELETED_PROFILE_MARKER_KEY)
+            )
+            self.assertIsNone(layout_row)
+            self.assertIsNone(seed_storage.profile_detail(profile_id, source="company"))
+
     def test_database_storage_profiles_are_workspace_db_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

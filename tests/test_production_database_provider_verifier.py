@@ -220,11 +220,27 @@ class FakeLivePostgresConnection:
             if key in self.profiles:
                 raise RuntimeError("synthetic profile collision")
             self.profiles[key] = {
+                "workspace_id": workspace_id,
+                "profile_id": profile_id,
                 "payload_json": payload_json,
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
             return FakeLivePostgresCursor(rowcount=1)
+        if normalized.startswith("select workspace_id, profile_id, payload_json from sqag_profiles"):
+            workspace_id, profile_a, profile_b = params[:3]
+            requested_ids = {profile_a, profile_b}
+            rows = [
+                {
+                    "workspace_id": stored_workspace,
+                    "profile_id": profile_id,
+                    "payload_json": row["payload_json"],
+                }
+                for (stored_workspace, profile_id), row in sorted(self.profiles.items())
+                if profile_id in requested_ids
+                and (self.leak_workspace_reads or stored_workspace == workspace_id)
+            ]
+            return FakeLivePostgresCursor(rows)
         if normalized.startswith("select payload_json from sqag_profiles"):
             workspace_id = params[0]
             if "profile_id = ?" in normalized:
@@ -922,7 +938,9 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         with mock.patch.dict(verifier.os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": "object"}, clear=False), \
             mock.patch.object(verifier.webapp, "configured_object_storage_backend", side_effect=AssertionError("object backend factory must not be called")) as configured_backend, \
             mock.patch.object(verifier.webapp.DatabaseSqagStorage, "tombstone_object_quote_artifacts", side_effect=AssertionError("object tombstone must not be called")) as tombstone, \
-            mock.patch.object(verifier.webapp.DatabaseSqagStorage, "delete_quote_session", side_effect=AssertionError("runtime quote-session delete must not be called")) as delete_session:
+            mock.patch.object(verifier.webapp.DatabaseSqagStorage, "delete_quote_session", side_effect=AssertionError("runtime quote-session delete must not be called")) as delete_session, \
+            mock.patch.object(verifier.webapp.DatabaseSqagStorage, "list_company_profiles", side_effect=AssertionError("profile readiness must not be called")) as list_profiles, \
+            mock.patch.object(verifier.webapp.DatabaseSqagStorage, "profile_detail", side_effect=AssertionError("profile readiness must not be called")) as profile_detail:
             report = run_live_database_report(connection)
 
         self.assertEqual(report["status"], "passed")
@@ -930,7 +948,16 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         configured_backend.assert_not_called()
         tombstone.assert_not_called()
         delete_session.assert_not_called()
+        list_profiles.assert_not_called()
+        profile_detail.assert_not_called()
         backend.delete_artifact.assert_not_called()
+        profile_queries = [
+            (query, params)
+            for query, params in connection.queries
+            if query.lower().startswith("select workspace_id, profile_id, payload_json from sqag_profiles")
+        ]
+        self.assertEqual(len(profile_queries), 2)
+        self.assertTrue(all(len(params) == 3 for _query, params in profile_queries))
 
     def test_live_opt_in_workspace_isolation_failure_fails_closed(self):
         report = run_live_database_report(FakeLivePostgresConnection(leak_workspace_reads=True))

@@ -18,10 +18,12 @@ import argparse
 import datetime as dt
 import hashlib
 import importlib
+import io
 import json
 import os
 import sys
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple
 
@@ -454,8 +456,11 @@ def _default_checks(
         "read_attempted": False,
         "restore_attempted": False,
         "active_db_write_read_verified": False,
+        "active_profile_layout_artifacts_verified": False,
         "active_object_write_read_verified": False,
         "restore_db_write_read_verified": False,
+        "restore_profile_layout_artifacts_verified": False,
+        "profile_layout_object_storage_mode_required": False,
         "restore_object_write_read_verified": False,
         "restore_database_cannot_read_active_synthetic_rows": False,
         "restore_object_cannot_read_active_synthetic_object": False,
@@ -583,7 +588,7 @@ def _report(
             for value in (cleanup_contexts or {}).values()
         ],
         "notes": [
-            "This verifier uses synthetic namespaced rows and one tiny synthetic generated artifact payload only.",
+            "This verifier uses synthetic namespaced rows, deterministic profile quotation-layout workbooks, and one tiny generated artifact payload only.",
             "It fails closed unless explicit live evidence, isolated restore targets, and operator decision markers are present.",
             "It never restores over active runtime targets and never reports private target values or object keys.",
             "A test-injected backend exercises verifier logic only and is not live production evidence.",
@@ -666,6 +671,69 @@ def _synthetic_ids() -> dict[str, str]:
 def _synthetic_payload(ids: Mapping[str, str]) -> bytes:
     seed = f"sqag-db-object-restore:{ids['workspace_a']}:{ids['session_a']}".encode("ascii")
     return hashlib.sha256(seed).digest()[:24]
+
+
+def _synthetic_profile_layout_payload() -> bytes:
+    parts = (
+        (
+            "[Content_Types].xml",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+            b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n"
+            b"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n"
+            b"<Default Extension=\"xml\" ContentType=\"application/xml\"/>\n"
+            b"<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>\n"
+            b"<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\n"
+            b"<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\n"
+            b"</Types>\n",
+        ),
+        (
+            "_rels/.rels",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+            b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n"
+            b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\n"
+            b"</Relationships>\n",
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+            b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n"
+            b"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\n"
+            b"<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>\n"
+            b"</Relationships>\n",
+        ),
+        (
+            "xl/styles.xml",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+            b"<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n"
+            b"<fonts count=\"1\"><font/></fonts><fills count=\"1\"><fill><patternFill patternType=\"none\"/></fill></fills>\n"
+            b"<borders count=\"1\"><border/></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\n"
+            b"<cellXfs count=\"1\"><xf xfId=\"0\"/></cellXfs></styleSheet>\n",
+        ),
+        (
+            "xl/workbook.xml",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+            b"<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n"
+            b"<sheets><sheet name=\"Synthetic\" sheetId=\"1\" r:id=\"rId2\"/></sheets></workbook>\n",
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+            b"<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData/></worksheet>\n",
+        ),
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, content in parts:
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 0
+            info.external_attr = 0
+            info.internal_attr = 0
+            info.extra = b""
+            archive.writestr(info, content)
+    raw = buffer.getvalue()
+    webapp.validate_profile_layout_xlsx(raw)
+    return raw
 
 
 def _synthetic_probe_payload(ids: Mapping[str, str], purpose: str) -> bytes:
@@ -769,7 +837,44 @@ def _expected_artifact_descriptors(
     ids: Mapping[str, str],
     active_payload: bytes,
 ) -> dict[str, dict[str, object]]:
-    return {
+    profile_layout = _synthetic_profile_layout_payload()
+    descriptors = {
+        "active/workspace_a/profile": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_a"],
+            owner_type="profile",
+            owner_id=ids["profile_a"],
+            artifact_kind="quotation_layout",
+            filename="quotation-layout.xlsx",
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=profile_layout,
+        ),
+        "active/workspace_b/profile": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_b"],
+            owner_type="profile",
+            owner_id=ids["profile_b"],
+            artifact_kind="quotation_layout",
+            filename="quotation-layout.xlsx",
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=profile_layout,
+        ),
+        "restore/workspace_a/profile": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_a"],
+            owner_type="profile",
+            owner_id=ids["profile_a"],
+            artifact_kind="quotation_layout",
+            filename="quotation-layout.xlsx",
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=profile_layout,
+        ),
+        "restore/workspace_b/profile": _expected_artifact_descriptor(
+            workspace_id=ids["workspace_b"],
+            owner_type="profile",
+            owner_id=ids["profile_b"],
+            artifact_kind="quotation_layout",
+            filename="quotation-layout.xlsx",
+            content_type=SYNTHETIC_CONTENT_TYPE,
+            content=profile_layout,
+        ),
         "active/workspace_a/generated_xlsx": _expected_artifact_descriptor(
             workspace_id=ids["workspace_a"],
             owner_type="generated_quote",
@@ -807,6 +912,7 @@ def _expected_artifact_descriptors(
             content=_synthetic_probe_payload(ids, "restore"),
         ),
     }
+    return descriptors
 
 
 def _artifact_receipt_matches(
@@ -1280,7 +1386,18 @@ def _owner_write_payload(
     if resource_kind == "profile":
         return (
             "save_profile",
-            {"id": identifier, "label": f"SQAG synthetic restore drill profile {workspace_label[-1].upper()}"},
+            {
+                "id": identifier,
+                "label": f"SQAG synthetic restore drill profile {workspace_label[-1].upper()}",
+                "description": "Synthetic profile for bounded backup and restore evidence.",
+                "defaults": {},
+                "_pack_assets": {
+                    "quotation_layout": {
+                        "filename": "quotation-layout.xlsx",
+                        "bytes": _synthetic_profile_layout_payload(),
+                    },
+                },
+            },
             {"id": identifier},
         )
     if resource_kind == "pricing_reference":
@@ -1359,15 +1476,36 @@ def _write_owner_resource(
     return receipt
 
 
-def _verify_db_rows(storage_a: object, storage_b: object, ids: Mapping[str, str]) -> bool:
-    profiles_a = storage_a.list_company_profiles()
-    profiles_b = storage_b.list_company_profiles()
+def _verify_db_rows(
+    storage_a: object,
+    storage_b: object,
+    ids: Mapping[str, str],
+    backend: ObjectStorageBackend,
+) -> bool:
+    profiles_a = _with_configured_backend(backend, storage_a.list_company_profiles)
+    profiles_b = _with_configured_backend(backend, storage_b.list_company_profiles)
+    profile_a_metadata = _profile_metadata_row_present(storage_a, ids["profile_a"])
+    profile_b_in_a_metadata = _profile_metadata_row_present(storage_a, ids["profile_b"])
+    profile_b_metadata = _profile_metadata_row_present(storage_b, ids["profile_b"])
+    profile_a_in_b_metadata = _profile_metadata_row_present(storage_b, ids["profile_a"])
+    profile_a_layout = _profile_layout_artifact_row_present(storage_a, ids["profile_a"])
+    profile_b_layout_in_a = _profile_layout_artifact_row_present(storage_a, ids["profile_b"])
+    profile_b_layout = _profile_layout_artifact_row_present(storage_b, ids["profile_b"])
+    profile_a_layout_in_b = _profile_layout_artifact_row_present(storage_b, ids["profile_a"])
     pricing_a = storage_a.list_pricing_references()
     pricing_b = storage_b.list_pricing_references()
     sessions_a = storage_a.list_quote_sessions()
     sessions_b = storage_b.list_quote_sessions()
     return all(
         (
+            profile_a_metadata is True,
+            profile_b_in_a_metadata is False,
+            profile_a_layout is True,
+            profile_b_layout_in_a is False,
+            profile_b_metadata is True,
+            profile_a_in_b_metadata is False,
+            profile_b_layout is True,
+            profile_a_layout_in_b is False,
             _contains_id(profiles_a, ids["profile_a"]),
             not _contains_id(profiles_a, ids["profile_b"]),
             _contains_id(profiles_b, ids["profile_b"]),
@@ -1405,6 +1543,110 @@ def _metadata_object_pairing_ok(storage: object, session_id: str, metadata: Obje
     )
 
 
+def _profile_layout_object_state(
+    backend: ObjectStorageBackend,
+    descriptor: Mapping[str, object],
+) -> str:
+    metadata = descriptor.get("metadata")
+    expected_content = descriptor.get("content")
+    if not isinstance(metadata, ObjectArtifactMetadata) or not isinstance(expected_content, bytes):
+        return "failed"
+    try:
+        content = backend.retrieve_artifact(metadata, workspace_id=metadata.workspace_id)
+    except (ObjectStorageNotFoundError, KeyError):
+        return "absent"
+    except Exception:
+        return "failed"
+    try:
+        webapp.validate_profile_layout_xlsx(content)
+    except Exception:
+        return "mismatch"
+    if (
+        content != expected_content
+        or len(content) != metadata.size_bytes
+        or artifact_checksum(content) != metadata.checksum_sha256
+    ):
+        return "mismatch"
+    return "present"
+
+
+def _verify_profile_layout_artifact(
+    storage: object,
+    backend: ObjectStorageBackend,
+    profile_id: str,
+    descriptor: Mapping[str, object],
+) -> ObjectArtifactMetadata | None:
+    expected = descriptor.get("metadata")
+    content = descriptor.get("content")
+    if not isinstance(expected, ObjectArtifactMetadata) or not isinstance(content, bytes):
+        return None
+    try:
+        selected_profile = _with_configured_backend(
+            backend,
+            lambda: storage.profile_detail(profile_id),
+        )
+    except Exception:
+        return None
+    if not isinstance(selected_profile, Mapping) or _clean(selected_profile.get("id")) != profile_id:
+        return None
+    metadata_rows = _active_artifact_metadata(
+        storage,
+        "profile",
+        profile_id,
+        artifact_kind="quotation_layout",
+    )
+    if metadata_rows is None or len(metadata_rows) != 1:
+        return None
+    actual = metadata_rows[0]
+    if not _artifact_receipt_matches(actual, expected):
+        return None
+    try:
+        actual_content = backend.retrieve_artifact(
+            actual,
+            workspace_id=expected.workspace_id,
+        )
+        webapp.validate_profile_layout_xlsx(actual_content)
+    except Exception:
+        return None
+    if (
+        actual_content != content
+        or len(actual_content) != expected.size_bytes
+        or artifact_checksum(actual_content) != expected.checksum_sha256
+    ):
+        return None
+    rows = _database_rows(
+        storage,
+        "select * from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+        (expected.workspace_id, "profile", profile_id, "quotation_layout"),
+    )
+    if rows is None or rows is False or len(rows) != 1:
+        return None
+    row = rows[0]
+    valid = all(
+        (
+            _clean(_row_value(row, "artifact_id")),
+            _clean(_row_value(row, "workspace_id")) == expected.workspace_id,
+            _clean(_row_value(row, "owner_type")) == "profile",
+            _clean(_row_value(row, "owner_id")) == profile_id,
+            _clean(_row_value(row, "artifact_kind")) == "quotation_layout",
+            _clean(_row_value(row, "filename")) == "quotation-layout.xlsx",
+            _clean(_row_value(row, "content_type")) == expected.content_type,
+            _row_int(row, "size_bytes") == expected.size_bytes,
+            _clean(_row_value(row, "checksum_sha256")) == expected.checksum_sha256,
+            _clean(_row_value(row, "object_key_ref")) == actual.storage_key,
+            _clean(_row_value(row, "object_provider_type")) == "s3_compatible",
+            not _clean(_row_value(row, "session_id")),
+            not _clean(_row_value(row, "job_id")),
+            _clean(_row_value(row, "status")) == "active",
+            _clean(_row_value(row, "retention_status")) == "active",
+            _row_value(row, "deleted_at") is None,
+            _clean(_row_value(row, "created_at")) == actual.created_at,
+            _clean(_row_value(row, "updated_at")) == actual.updated_at,
+        )
+    )
+    return actual if valid else None
+
+
 def _restore_database_cannot_read_active_synthetic_rows(
     *,
     restore_storage_a: object,
@@ -1416,6 +1658,14 @@ def _restore_database_cannot_read_active_synthetic_rows(
         (
             restore_storage_a.profile_detail(ids["profile_a"]) is not None,
             restore_storage_b.profile_detail(ids["profile_b"]) is not None,
+            _profile_metadata_row_present(restore_storage_a, ids["profile_a"]) is not False,
+            _profile_metadata_row_present(restore_storage_a, ids["profile_b"]) is not False,
+            _profile_metadata_row_present(restore_storage_b, ids["profile_a"]) is not False,
+            _profile_metadata_row_present(restore_storage_b, ids["profile_b"]) is not False,
+            _profile_layout_artifact_row_present(restore_storage_a, ids["profile_a"]) is not False,
+            _profile_layout_artifact_row_present(restore_storage_a, ids["profile_b"]) is not False,
+            _profile_layout_artifact_row_present(restore_storage_b, ids["profile_a"]) is not False,
+            _profile_layout_artifact_row_present(restore_storage_b, ids["profile_b"]) is not False,
             restore_storage_a.pricing_reference_detail(ids["pricing_a"]) is not None,
             restore_storage_b.pricing_reference_detail(ids["pricing_b"]) is not None,
             restore_storage_a.get_quote_session(ids["session_a"]) is not None,
@@ -1462,6 +1712,36 @@ def _database_rows(
             return list(connection.execute(query, params).fetchall())
     except Exception:
         return False
+
+
+def _profile_metadata_row_present(storage: object, profile_id: str) -> bool | None:
+    workspace_id = _clean(getattr(storage, "workspace_id", ""))
+    safe_profile_id = _clean(profile_id)
+    if not workspace_id or not safe_profile_id:
+        return None
+    rows = _database_rows(
+        storage,
+        "select workspace_id, profile_id from sqag_profiles where workspace_id = ? and profile_id = ?",
+        (workspace_id, safe_profile_id),
+    )
+    if rows is None or rows is False:
+        return None
+    return bool(rows)
+
+
+def _profile_layout_artifact_row_present(storage: object, profile_id: str) -> bool | None:
+    workspace_id = _clean(getattr(storage, "workspace_id", ""))
+    safe_profile_id = _clean(profile_id)
+    if not workspace_id or not safe_profile_id:
+        return None
+    rows = _database_rows(
+        storage,
+        "select artifact_id from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+        (workspace_id, "profile", safe_profile_id, "quotation_layout"),
+    )
+    if rows is None or rows is False:
+        return None
+    return bool(rows)
 
 
 def _object_artifact_row_snapshot(
@@ -1859,7 +2139,7 @@ def _build_cleanup_contexts(
         object_artifact_snapshots: dict[str, Mapping[str, object]] = {}
         if storage is not None:
             for key in resource_keys:
-                if not key.endswith("/generated_xlsx"):
+                if not key.endswith("/generated_xlsx") and not key.endswith("/profile"):
                     continue
                 metadata = artifact_metadata.get(key)
                 if metadata is None:
@@ -1975,6 +2255,31 @@ def _resolve_unknown_resource(
             identifier=spec.identifier,
             artifact_storage_mode=artifact_storage_mode,
         )
+        if (
+            spec.resource_kind == "profile"
+            and evidence == "absent"
+            and artifact_storage_mode == "object"
+        ):
+            descriptor = expected_artifacts.get(key)
+            backend = backend_by_operation.get(spec.operation)
+            if descriptor is None or backend is None:
+                journal.mark_cleanup_failed(key, "unknown-resolution:profile-layout-backend-missing")
+                return
+            object_state = _profile_layout_object_state(backend, descriptor)
+            if object_state == "present":
+                expected = descriptor.get("metadata")
+                if not isinstance(expected, ObjectArtifactMetadata):
+                    journal.mark_cleanup_failed(key, "unknown-resolution:profile-layout-descriptor-invalid")
+                    return
+                artifact_metadata[key] = expected
+                journal.record_receipt(key, "unknown-resolution:profile-layout-object-present")
+                journal.mark_touched(key, "unknown-resolution:profile-layout-object-present")
+            elif object_state == "absent":
+                journal.record_receipt(key, "unknown-resolution:database-and-profile-layout-absent")
+                journal.mark_absence_verified(key, "unknown-resolution:database-and-profile-layout-absent")
+            else:
+                journal.mark_cleanup_failed(key, "unknown-resolution:profile-layout-object-unverified")
+            return
         if evidence == "present":
             journal.record_receipt(key, "unknown-resolution:database-present")
             journal.mark_touched(key, "unknown-resolution:database-present")
@@ -2140,6 +2445,76 @@ def _owner_postconditions(
         )
         if object_rows is None or object_rows is False or not _object_rows_are_deleted(object_rows):
             return False
+        if resource_kind == "profile":
+            resource_key = f"{context.operation}/{context.workspace_label}/profile"
+            snapshot = (
+                context.object_artifact_snapshots.get(resource_key)
+                if context.object_artifact_snapshots is not None
+                else None
+            )
+            profile_layouts = [
+                metadata
+                for metadata in _captured_for_resource(
+                    context,
+                    resource_kind="profile",
+                    identifier=identifier,
+                )
+                if metadata.artifact_kind == "quotation_layout"
+            ]
+            if len(profile_layouts) > 1:
+                return False
+            for metadata in profile_layouts:
+                key_rows = _database_rows(
+                    storage,
+                    "select * from sqag_object_artifacts where workspace_id = ? and object_key_ref = ?",
+                    (workspace_id, metadata.storage_key),
+                )
+                if key_rows is None or key_rows is False or len(key_rows) > 1:
+                    return False
+                if key_rows:
+                    row = key_rows[0]
+                    if not all(
+                        (
+                            _clean(_row_value(row, "workspace_id")) == metadata.workspace_id,
+                            _clean(_row_value(row, "owner_type")) == "profile",
+                            _clean(_row_value(row, "owner_id")) == identifier,
+                            _clean(_row_value(row, "artifact_kind")) == "quotation_layout",
+                            _clean(_row_value(row, "filename")) == metadata.filename,
+                            _clean(_row_value(row, "content_type")) == metadata.content_type,
+                            _row_int(row, "size_bytes") == metadata.size_bytes,
+                            _clean(_row_value(row, "checksum_sha256")) == metadata.checksum_sha256,
+                            _clean(_row_value(row, "object_key_ref")) == metadata.storage_key,
+                            _clean(_row_value(row, "object_provider_type")) == "s3_compatible",
+                            not _clean(_row_value(row, "session_id")),
+                            not _clean(_row_value(row, "job_id")),
+                            _clean(_row_value(row, "status")) == "deleted",
+                            _clean(_row_value(row, "retention_status")) == "deleted",
+                            _canonical_tombstone_timestamp(_row_value(row, "deleted_at")),
+                        )
+                    ):
+                        return False
+                    if snapshot is not None:
+                        for field in (
+                            "artifact_id",
+                            "workspace_id",
+                            "owner_type",
+                            "owner_id",
+                            "platform_user_id",
+                            "session_id",
+                            "job_id",
+                            "artifact_kind",
+                            "filename",
+                            "content_type",
+                            "size_bytes",
+                            "checksum_sha256",
+                            "object_provider_type",
+                            "object_key_ref",
+                            "created_at",
+                        ):
+                            if _row_value(row, field) != snapshot.get(field):
+                                return False
+                elif profile_rows:
+                    return False
         for metadata in _captured_for_resource(
             context,
             resource_kind=resource_kind,
@@ -2243,6 +2618,7 @@ def _cleanup_owner_resource(
     key: str,
     resource_kind: str,
     identifier: str,
+    expected_artifacts: Mapping[str, Mapping[str, object]],
 ) -> bool:
     if journal.state(key) != JOURNAL_TOUCHED:
         return True
@@ -2251,6 +2627,39 @@ def _cleanup_owner_resource(
         return False
     journal.mark_cleanup_pending(key, "destructive-cleanup:owner-pending")
     journal.mark_destructive_cleanup_attempt(key, f"delete-{resource_kind}")
+    if resource_kind == "profile" and context.artifact_storage_mode == "object":
+        workspace_id = _clean(getattr(context.storage, "workspace_id", ""))
+        profile_rows = _database_rows(
+            context.storage,
+            "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+            (workspace_id, identifier),
+        )
+        object_rows = _database_rows(
+            context.storage,
+            "select * from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
+            (workspace_id, "profile", identifier),
+        )
+        if profile_rows is None or profile_rows is False or object_rows is None or object_rows is False:
+            journal.mark_cleanup_failed(key, "destructive-cleanup:profile-layout-orphan-evidence-failed")
+            return False
+        if not profile_rows and not object_rows:
+            descriptor = expected_artifacts.get(key)
+            if descriptor is None or context.backend is None:
+                journal.mark_cleanup_failed(key, "destructive-cleanup:profile-layout-descriptor-missing")
+                return False
+            object_state = _profile_layout_object_state(context.backend, descriptor)
+            if object_state in {"failed", "mismatch"}:
+                journal.mark_cleanup_failed(key, "destructive-cleanup:profile-layout-orphan-unverified")
+                return False
+            if object_state == "present":
+                metadata = descriptor.get("metadata")
+                if not isinstance(metadata, ObjectArtifactMetadata) or not _delete_backend_artifact_and_verify(
+                    context.backend,
+                    metadata,
+                    workspace_id=workspace_id,
+                ):
+                    journal.mark_cleanup_failed(key, "destructive-cleanup:profile-layout-orphan-residue")
+                    return False
     method_name = {
         "profile": "delete_profile",
         "pricing_reference": "delete_pricing_reference",
@@ -2508,6 +2917,7 @@ def _cleanup(
                     key=key,
                     resource_kind=resource_kind,
                     identifier=spec.identifier,
+                    expected_artifacts=expected_artifacts,
                 ):
                     ok = False
 
@@ -2540,9 +2950,13 @@ def _cleanup(
             if any(
                 (
                     left.profile_detail(ids[right_ids[0]]) is not None,
+                    _profile_metadata_row_present(left, ids[right_ids[0]]) is not False,
+                    _profile_layout_artifact_row_present(left, ids[right_ids[0]]) is not False,
                     left.pricing_reference_detail(ids[right_ids[1]]) is not None,
                     left.get_quote_session(ids[right_ids[2]]) is not None,
                     right.profile_detail(ids[left_ids[0]]) is not None,
+                    _profile_metadata_row_present(right, ids[left_ids[0]]) is not False,
+                    _profile_layout_artifact_row_present(right, ids[left_ids[0]]) is not False,
                     right.pricing_reference_detail(ids[left_ids[1]]) is not None,
                     right.get_quote_session(ids[left_ids[2]]) is not None,
                 )
@@ -2620,6 +3034,12 @@ def _run_drill(
             barrier,
         )
 
+    if artifact_storage_mode != "object":
+        barrier.fail("profile_layout_object_storage_mode_required")
+        blockers.append("profile_layout_object_storage_mode_required")
+        return result()
+    checks["profile_layout_object_storage_mode_required"] = True
+
     try:
         checks["connection_attempted"] = True
         try:
@@ -2686,7 +3106,31 @@ def _run_drill(
                     artifact_storage_mode=artifact_storage_mode,
                 )
                 active_db_rows += 1
-            checks["active_db_write_read_verified"] = _verify_db_rows(active_storage_a, active_storage_b, ids)
+                if resource_kind == "profile":
+                    layout_metadata = _verify_profile_layout_artifact(
+                        storage,
+                        active_backend,
+                        identifier,
+                        expected_artifacts[resource_key],
+                    )
+                    if layout_metadata is None:
+                        checks["active_profile_layout_artifacts_verified"] = False
+                        blockers.append("active_profile_layout_artifact_unverified")
+                        return result()
+                    artifact_metadata[resource_key] = layout_metadata
+                    active_db_rows += 1
+                    active_object_count += 1
+            checks["active_profile_layout_artifacts_verified"] = sum(
+                1
+                for key in ("active/workspace_a/profile", "active/workspace_b/profile")
+                if key in artifact_metadata
+            ) == 2
+            checks["active_db_write_read_verified"] = _verify_db_rows(
+                active_storage_a,
+                active_storage_b,
+                ids,
+                active_backend,
+            )
             checks["workspace_isolation_preserved"] = checks["active_db_write_read_verified"]
         except Exception:
             barrier.fail("active_database_destination_failed")
@@ -2701,7 +3145,7 @@ def _run_drill(
                 descriptor=expected_artifacts["active/workspace_a/generated_xlsx"],
             )
             artifact_metadata["active/workspace_a/generated_xlsx"] = active_metadata
-            active_object_count = 1
+            active_object_count += 1
             _with_configured_backend(
                 active_backend,
                 lambda: active_storage_a._upsert_object_quote_artifact(
@@ -2816,7 +3260,31 @@ def _run_drill(
                     destination_guard=barrier.require_restore_destination_ready,
                 )
                 restore_db_rows += 1
-            checks["restore_db_write_read_verified"] = _verify_db_rows(restore_storage_a, restore_storage_b, ids)
+                if resource_kind == "profile":
+                    layout_metadata = _verify_profile_layout_artifact(
+                        storage,
+                        restore_backend,
+                        identifier,
+                        expected_artifacts[resource_key],
+                    )
+                    if layout_metadata is None:
+                        checks["restore_profile_layout_artifacts_verified"] = False
+                        blockers.append("restore_profile_layout_artifact_unverified")
+                        return result()
+                    artifact_metadata[resource_key] = layout_metadata
+                    restore_db_rows += 1
+                    restore_object_count += 1
+            checks["restore_profile_layout_artifacts_verified"] = sum(
+                1
+                for key in ("restore/workspace_a/profile", "restore/workspace_b/profile")
+                if key in artifact_metadata
+            ) == 2
+            checks["restore_db_write_read_verified"] = _verify_db_rows(
+                restore_storage_a,
+                restore_storage_b,
+                ids,
+                restore_backend,
+            )
             checks["workspace_isolation_preserved"] = (
                 checks["workspace_isolation_preserved"] and checks["restore_db_write_read_verified"]
             )
@@ -2835,7 +3303,7 @@ def _run_drill(
                 descriptor=expected_artifacts["restore/workspace_a/generated_xlsx"],
             )
             artifact_metadata["restore/workspace_a/generated_xlsx"] = restore_metadata
-            restore_object_count = 1
+            restore_object_count += 1
             barrier.require_restore_destination_ready(
                 "restore/workspace_a/generated_xlsx"
             )

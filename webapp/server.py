@@ -13077,6 +13077,8 @@ class DatabaseSqagStorage:
             return stored
 
         def persist_profile(connection: Any) -> None:
+            if artifact_mode == "database" and self.database_family == "sqlite":
+                connection.execute("begin immediate")
             self._assert_profile_can_be_saved(profile_id, connection=connection)
             item = self._prepare_profile_layout_artifact(profile)
             if item is None:
@@ -13174,6 +13176,8 @@ class DatabaseSqagStorage:
                 raise self._storage_unavailable_error(exc) from exc
 
         def delete_profile_owner(connection: Any) -> bool:
+            if artifact_mode == "database" and self.database_family == "sqlite":
+                connection.execute("begin immediate")
             existing_row = connection.execute(
                 "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
                 (self.workspace_id, safe_id),

@@ -78,9 +78,50 @@ class FakeDatabaseConnection:
         for table, rows in self.storage.database_rows.items():
             if table in query:
                 return FakeDatabaseResult(rows)
-        if "sqag_object_artifacts" in query:
-            return FakeDatabaseResult(list(self.storage.object_artifacts.values()))
+        normalized = " ".join(query.lower().split())
+        if "sqag_profiles" in normalized:
+            rows_by_id = {
+                profile_id: dict(row)
+                for profile_id, row in self.storage.profile_rows.items()
+                if row.get("workspace_id") == self.storage.workspace_id
+            }
+            for profile_id, profile in self.storage.profiles.items():
+                rows_by_id.setdefault(
+                    profile_id,
+                    {
+                        "workspace_id": self.storage.workspace_id,
+                        "profile_id": profile_id,
+                        "payload_json": json.dumps(profile, sort_keys=True),
+                    },
+                )
+            rows = list(rows_by_id.values())
+            if "profile_id = ?" in normalized:
+                rows = [row for row in rows if row.get("profile_id") == params[1]]
+            if "profile_id in (" in normalized:
+                allowed = set(params[1:])
+                rows = [row for row in rows if row.get("profile_id") in allowed]
+            if normalized.startswith("select 1"):
+                rows = [{"present": 1} for _row in rows]
+            elif normalized.startswith("select payload_json"):
+                rows = [{"payload_json": row.get("payload_json")} for row in rows]
+            return FakeDatabaseResult(rows)
+        if "sqag_object_artifacts" in normalized:
+            rows = list(self.storage.object_artifacts.values())
+            if "workspace_id = ?" in normalized:
+                rows = [row for row in rows if row.get("workspace_id") == params[0]]
+            if "owner_type = ?" in normalized and "owner_id = ?" in normalized:
+                rows = [
+                    row for row in rows
+                    if row.get("owner_type") == params[1] and row.get("owner_id") == params[2]
+                ]
+            if "artifact_kind = ?" in normalized:
+                kind_index = 3 if "owner_type = ?" in normalized else 1
+                rows = [row for row in rows if row.get("artifact_kind") == params[kind_index]]
+            if "object_key_ref = ?" in normalized:
+                rows = [row for row in rows if row.get("object_key_ref") == params[1]]
+            return FakeDatabaseResult(rows)
         return FakeDatabaseResult([])
+
 
 
 class FakeStorage:
@@ -95,6 +136,8 @@ class FakeStorage:
         pairing_mismatch: bool = False,
         state: dict[str, dict[object, dict[str, object]]] | None = None,
         runtime_filename_gate: bool = False,
+        profile_layout_mismatch: bool = False,
+        cross_workspace_profile_metadata_leak: bool = False,
         events: list[tuple[object, ...]] | None = None,
     ):
         self.label = label
@@ -105,6 +148,8 @@ class FakeStorage:
         self.fail_on = fail_on
         self.pairing_mismatch = pairing_mismatch
         self.runtime_filename_gate = runtime_filename_gate
+        self.profile_layout_mismatch = profile_layout_mismatch
+        self.cross_workspace_profile_metadata_leak = cross_workspace_profile_metadata_leak
         self.events = events if events is not None else []
         self.delete_calls: list[tuple[str, str]] = []
         self._state = state or {
@@ -114,6 +159,8 @@ class FakeStorage:
             "object_artifacts": {},
         }
         self.profiles = self._state["profiles"]
+        self.profile_readiness_observations = self._state.setdefault("profile_readiness_observations", [])
+        self.profile_rows = self._state.setdefault("profile_rows", {})
         self.pricing = self._state["pricing"]
         self.sessions = self._state["sessions"]
         self.object_artifacts = self._state["object_artifacts"]
@@ -133,10 +180,63 @@ class FakeStorage:
         self._maybe_fail("ensure_object_artifact_ready")
 
     def save_profile(self, profile: dict[str, object]) -> dict[str, object]:
-        self.events.append(("storage-write", self.label, "profile", str(profile["id"])))
+        profile_id = str(profile["id"])
+        self.events.append(("storage-write", self.label, "profile", profile_id))
         self._maybe_fail("write")
-        self.profiles[str(profile["id"])] = dict(profile)
-        return dict(profile)
+        assets = profile.get("_pack_assets")
+        layout = assets.get("quotation_layout") if isinstance(assets, dict) else None
+        layout_bytes = layout.get("bytes") if isinstance(layout, dict) else None
+        if not isinstance(layout_bytes, bytes):
+            raise ValueError("Synthetic profile layout is missing.")
+        verifier = load_verifier()
+        verifier.webapp.validate_profile_layout_xlsx(layout_bytes)
+        backend = verifier.webapp.configured_object_storage_backend()
+        metadata = backend.store_artifact(
+            workspace_id=self.workspace_id,
+            owner_type="profile",
+            owner_id=profile_id,
+            artifact_kind="quotation_layout",
+            filename="quotation-layout.xlsx",
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            content=layout_bytes,
+        )
+        self.events.append(("storage-write", self.label, "profile_object_metadata", profile_id))
+        self._maybe_fail("profile_metadata")
+        row = {
+            "artifact_id": f"fake-{profile_id}-quotation-layout",
+            "workspace_id": self.workspace_id,
+            "owner_type": "profile",
+            "owner_id": (
+                f"{profile_id}-mismatch"
+                if self.profile_layout_mismatch
+                else profile_id
+            ),
+            "platform_user_id": f"synthetic-user-{self.label}",
+            "session_id": "",
+            "job_id": "",
+            "artifact_kind": "quotation_layout",
+            "filename": "quotation-layout.xlsx",
+            "content_type": verifier.SYNTHETIC_CONTENT_TYPE,
+            "size_bytes": metadata.size_bytes,
+            "checksum_sha256": metadata.checksum_sha256,
+            "object_provider_type": "s3_compatible",
+            "object_key_ref": metadata.storage_key,
+            "status": "active",
+            "retention_status": "active",
+            "created_at": metadata.created_at,
+            "updated_at": metadata.updated_at,
+            "deleted_at": None,
+            "_metadata": metadata,
+        }
+        self.object_artifacts[(profile_id, "quotation_layout")] = row
+        stored = {key: value for key, value in profile.items() if key not in {"_pack_assets", "pack", "profile_pack"}}
+        self.profiles[profile_id] = stored
+        self.profile_rows[profile_id] = {
+            "workspace_id": self.workspace_id,
+            "profile_id": profile_id,
+            "payload_json": json.dumps(stored, sort_keys=True),
+        }
+        return dict(stored)
 
     def save_pricing_reference(self, reference: dict[str, object]) -> dict[str, object]:
         self.events.append(("storage-write", self.label, "pricing_reference", str(reference["id"])))
@@ -187,8 +287,58 @@ class FakeStorage:
             "_metadata": metadata,
         }
 
+    def _profile_layout_is_ready(self, profile_id: str) -> bool:
+        row = self.object_artifacts.get((profile_id, "quotation_layout"))
+        if not row or row.get("status") != "active" or row.get("retention_status") != "active":
+            return False
+        verifier = load_verifier()
+        if (
+            row.get("workspace_id") != self.workspace_id
+            or row.get("owner_type") != "profile"
+            or row.get("owner_id") != profile_id
+            or row.get("artifact_kind") != "quotation_layout"
+            or row.get("filename") != "quotation-layout.xlsx"
+            or row.get("content_type") != verifier.SYNTHETIC_CONTENT_TYPE
+            or row.get("object_provider_type") != "s3_compatible"
+            or row.get("session_id") not in {"", None}
+            or row.get("job_id") not in {"", None}
+            or row.get("deleted_at") is not None
+        ):
+            return False
+        metadata = row.get("_metadata")
+        if not isinstance(metadata, verifier.ObjectArtifactMetadata) or not all(
+            (
+                metadata.workspace_id == self.workspace_id,
+                metadata.owner_type == "profile",
+                metadata.owner_id == profile_id,
+                metadata.artifact_kind == "quotation_layout",
+                metadata.filename == "quotation-layout.xlsx",
+                metadata.content_type == verifier.SYNTHETIC_CONTENT_TYPE,
+                row.get("size_bytes") == metadata.size_bytes,
+                row.get("checksum_sha256") == metadata.checksum_sha256,
+                row.get("object_key_ref") == metadata.storage_key,
+            )
+        ):
+            return False
+        try:
+            content = load_verifier().webapp.configured_object_storage_backend().retrieve_artifact(
+                metadata,
+                workspace_id=self.workspace_id,
+            )
+            load_verifier().webapp.validate_profile_layout_xlsx(content)
+        except Exception:
+            return False
+        return (
+            len(content) == metadata.size_bytes
+            and __import__("hashlib").sha256(content).hexdigest() == metadata.checksum_sha256
+        )
+
     def list_company_profiles(self) -> list[dict[str, object]]:
-        return list(self.profiles.values())
+        return [
+            profile
+            for profile_id, profile in self.profiles.items()
+            if self._profile_layout_is_ready(profile_id)
+        ]
 
     def list_pricing_references(self) -> list[dict[str, object]]:
         return list(self.pricing.values())
@@ -197,6 +347,23 @@ class FakeStorage:
         return list(self.sessions.values())
 
     def profile_detail(self, profile_id: str, **_kwargs):
+        ready = self._profile_layout_is_ready(profile_id)
+        if (
+            self.cross_workspace_profile_metadata_leak
+            and profile_id.endswith("-profile-b")
+        ):
+            self.profile_rows[profile_id] = {
+                "workspace_id": self.workspace_id,
+                "profile_id": profile_id,
+                "payload_json": json.dumps(
+                    {"id": profile_id, "label": "synthetic metadata-only leak"},
+                    sort_keys=True,
+                ),
+            }
+        if profile_id in self.profiles:
+            self.profile_readiness_observations.append((profile_id, ready))
+        if not ready:
+            return None
         return self.profiles.get(profile_id)
 
     def pricing_reference_detail(self, reference_id: str, **_kwargs):
@@ -204,6 +371,22 @@ class FakeStorage:
 
     def get_quote_session(self, session_id: str, **_kwargs):
         return self.sessions.get(session_id)
+
+    def _active_object_artifact_rows(self, owner_type: str, owner_id: str, *, artifact_kind: str = ""):
+        return [
+            row
+            for row in self.object_artifacts.values()
+            if row.get("workspace_id") == self.workspace_id
+            and row.get("owner_type") == owner_type
+            and row.get("owner_id") == owner_id
+            and (not artifact_kind or row.get("artifact_kind") == artifact_kind)
+            and row.get("status") == "active"
+            and row.get("retention_status") == "active"
+            and row.get("deleted_at") is None
+        ]
+
+    def _object_metadata_from_row(self, row):
+        return row["_metadata"]
 
     def object_artifact_row(self, session_id: str, kind: str):
         row = self.object_artifacts.get((session_id, kind))
@@ -236,7 +419,32 @@ class FakeStorage:
         self.events.append(("storage-delete", self.label, "profile", profile_id))
         self.delete_calls.append(("profile", profile_id))
         self._maybe_fail("cleanup")
-        return self.profiles.pop(profile_id, None) is not None
+        existed = self.profiles.pop(profile_id, None) is not None
+        layout_rows = [
+            row
+            for row in self.object_artifacts.values()
+            if row.get("workspace_id") == self.workspace_id
+            and row.get("owner_type") == "profile"
+            and row.get("owner_id") == profile_id
+            and row.get("status") == "active"
+        ]
+        if layout_rows:
+            backend = load_verifier().webapp.configured_object_storage_backend()
+            for row in layout_rows:
+                if not backend.delete_artifact(row["_metadata"], workspace_id=self.workspace_id):
+                    raise RuntimeError("synthetic profile layout deletion failed")
+                row["status"] = "deleted"
+                row["retention_status"] = "deleted"
+                row["updated_at"] = "2026-01-01T00:00:00Z"
+                row["deleted_at"] = "2026-01-01T00:00:00Z"
+        if existed:
+            marker = load_verifier().webapp.DELETED_PROFILE_MARKER_KEY
+            self.profile_rows[profile_id] = {
+                "workspace_id": self.workspace_id,
+                "profile_id": profile_id,
+                "payload_json": json.dumps({"id": profile_id, marker: True}, sort_keys=True),
+            }
+        return existed
 
     def delete_pricing_reference(self, reference_id: str, **_kwargs) -> bool:
         self.events.append(("storage-delete", self.label, "pricing_reference", reference_id))
@@ -556,6 +764,8 @@ def run_injected_drill(
     cross_denial_mode: str = "",
     tamper_store_metadata: str = "",
     tamper_probe_retrieve: str = "",
+    profile_layout_mismatch: str = "",
+    cross_workspace_profile_metadata_leak: bool = False,
     backend_factory_error: str = "",
     generic_key_error: bool = False,
     missing_backend: bool | str = False,
@@ -587,6 +797,12 @@ def run_injected_drill(
                 pairing_mismatch=pairing_mismatch and label == "restore",
                 state=state,
                 runtime_filename_gate=runtime_filename_gate,
+                profile_layout_mismatch=profile_layout_mismatch == label,
+                cross_workspace_profile_metadata_leak=(
+                    cross_workspace_profile_metadata_leak
+                    and label == "active"
+                    and workspace_id.endswith("-workspace-a")
+                ),
                 events=events,
             )
             storages[(label, workspace_id)] = storage
@@ -1052,8 +1268,11 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertFalse(report["live_db_object_backup_restore_evidence_supported"])
         self.assertTrue(report["test_injected_backend"])
         self.assertTrue(report["checks"]["active_db_write_read_verified"])
+        self.assertTrue(report["checks"]["active_profile_layout_artifacts_verified"])
         self.assertTrue(report["checks"]["active_object_write_read_verified"])
         self.assertTrue(report["checks"]["restore_db_write_read_verified"])
+        self.assertTrue(report["checks"]["restore_profile_layout_artifacts_verified"])
+        self.assertTrue(report["checks"]["profile_layout_object_storage_mode_required"])
         self.assertTrue(report["checks"]["restore_object_write_read_verified"])
         self.assertTrue(report["checks"]["checksum_match"])
         self.assertTrue(report["checks"]["metadata_object_pairing_verified"])
@@ -1061,10 +1280,10 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertTrue(report["checks"]["restore_database_cannot_read_active_synthetic_rows"])
         self.assertTrue(report["checks"]["restore_object_cannot_read_active_synthetic_object"])
         self.assertTrue(report["checks"]["cleanup_completed"])
-        self.assertEqual(report["active_db_synthetic_rows_written"], 7)
-        self.assertEqual(report["active_object_synthetic_objects_written"], 1)
-        self.assertEqual(report["restore_db_synthetic_rows_written"], 7)
-        self.assertEqual(report["restore_object_synthetic_objects_written"], 1)
+        self.assertEqual(report["active_db_synthetic_rows_written"], 9)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 3)
+        self.assertEqual(report["restore_db_synthetic_rows_written"], 9)
+        self.assertEqual(report["restore_object_synthetic_objects_written"], 3)
         self.assertEqual(report["db_blob_artifact_rows_written"], 0)
         self.assertFalse(report["production_ready"])
         self.assertEqual(report["blockers"], [])
@@ -1113,6 +1332,81 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
                 for context in report["cleanup_contexts"]
             )
         )
+
+    def test_synthetic_profile_layout_is_deterministic_valid_and_bound_to_each_profile(self):
+        verifier = load_verifier()
+        first = verifier._synthetic_profile_layout_payload()
+        second = verifier._synthetic_profile_layout_payload()
+        verifier.webapp.validate_profile_layout_xlsx(first)
+
+        ids = verifier._synthetic_ids()
+        descriptors = verifier._expected_artifact_descriptors(ids, verifier._synthetic_payload(ids))
+        profile_keys = (
+            "active/workspace_a/profile",
+            "active/workspace_b/profile",
+            "restore/workspace_a/profile",
+            "restore/workspace_b/profile",
+        )
+        self.assertEqual(first, second)
+        for key in profile_keys:
+            metadata = descriptors[key]["metadata"]
+            self.assertEqual(descriptors[key]["content"], first)
+            self.assertEqual(metadata.owner_type, "profile")
+            self.assertEqual(metadata.artifact_kind, "quotation_layout")
+            self.assertEqual(metadata.filename, "quotation-layout.xlsx")
+            self.assertEqual(metadata.content_type, verifier.SYNTHETIC_CONTENT_TYPE)
+
+    def test_database_artifact_mode_fails_before_live_targets_are_opened(self):
+        verifier = load_verifier()
+        with mock.patch.object(verifier, "_verifier_artifact_storage_mode", return_value="database"):
+            report, storages, backends = run_injected_drill(verifier)
+
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("profile_layout_object_storage_mode_required", report["blockers"])
+        self.assertFalse(report["checks"]["connection_attempted"])
+        self.assertEqual(storages, {})
+        self.assertEqual(backends, {})
+
+    def test_restored_profile_is_not_selectable_without_exact_layout_binding(self):
+        verifier = load_verifier()
+        report, storages, backends = run_injected_drill(
+            verifier,
+            profile_layout_mismatch="restore",
+        )
+        restore_storage = next(
+            storage
+            for (label, _workspace), storage in storages.items()
+            if label == "restore"
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertFalse(report["checks"]["restore_profile_layout_artifacts_verified"])
+        self.assertTrue(
+            any(not ready for _profile_id, ready in restore_storage.profile_readiness_observations)
+        )
+        self.assertFalse(report["checks"]["cleanup_completed"])
+        self.assertTrue(backends["restore"].objects)
+
+    def test_uncertain_profile_save_removes_verified_orphan_layout_bytes(self):
+        verifier = load_verifier()
+        report, _storages, backends = run_injected_drill(
+            verifier,
+            raise_after_store_kind="quotation_layout",
+        )
+        profile_entry = next(
+            entry
+            for entry in report["resource_journal"]["entries"]
+            if entry["resource_key"] == "active/workspace_a/profile"
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["checks"]["cleanup_completed"])
+        self.assertEqual(profile_entry["state"], verifier.JOURNAL_CLEANED)
+        self.assertIn(
+            "unknown-resolution:profile-layout-object-present",
+            profile_entry["touch_receipts"],
+        )
+        self.assertFalse(backends["active"].objects)
 
     def test_successful_drill_has_exact_backend_counts_and_denial_order(self):
         verifier = load_verifier()
@@ -1176,10 +1470,19 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
             and event[1] == "restore"
             and event[2] == "xlsx"
         )
+        first_restore_profile_layout_write = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "backend-store"
+            and event[1] == "restore"
+            and event[2] == "quotation_layout"
+        )
         self.assertLess(active_denial, first_restore_db_write)
         self.assertLess(restore_denial, first_restore_db_write)
         self.assertLess(active_denial, first_restore_generated_write)
         self.assertLess(restore_denial, first_restore_generated_write)
+        self.assertLess(active_denial, first_restore_profile_layout_write)
+        self.assertLess(restore_denial, first_restore_profile_layout_write)
 
     def test_dual_existing_probe_barrier_reports_actual_metadata_and_exact_timeline(self):
         global GLOBAL_AMBIENT_ROUTE_CALLS
@@ -1923,6 +2226,164 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
 
         self.assertTrue(verifier._metadata_object_pairing_ok(Storage(), "quote-session-a", metadata))
 
+    def test_restore_preflight_detects_incomplete_profile_metadata_rows(self):
+        verifier = load_verifier()
+        restore_storage_a = FakeStorage(label="restore", workspace_id="workspace-a")
+        restore_storage_b = FakeStorage(label="restore", workspace_id="workspace-b")
+        restore_storage_a.profile_rows["profile-a"] = {
+            "workspace_id": "workspace-a",
+            "profile_id": "profile-a",
+            "payload_json": json.dumps({"id": "profile-a", "label": "metadata-only"}),
+        }
+        active_backend = FakeBackend(
+            verifier.ObjectArtifactMetadata,
+            label="active",
+            object_key_fn=verifier.webapp.object_artifact_key,
+        )
+        active_metadata = active_backend.store_artifact(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-a",
+            artifact_kind="xlsx",
+            filename=verifier.SYNTHETIC_FILENAME,
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            content=b"synthetic active quote",
+        )
+        ids = {
+            "profile_a": "profile-a",
+            "profile_b": "profile-b",
+            "pricing_a": "pricing-a",
+            "pricing_b": "pricing-b",
+            "session_a": "quote-a",
+            "session_b": "quote-b",
+        }
+
+        self.assertIsNone(restore_storage_a.profile_detail("profile-a"))
+        self.assertFalse(
+            verifier._restore_database_cannot_read_active_synthetic_rows(
+                restore_storage_a=restore_storage_a,
+                restore_storage_b=restore_storage_b,
+                ids=ids,
+                active_metadata=active_metadata,
+            )
+        )
+
+    def test_restore_preflight_detects_orphan_profile_layout_metadata(self):
+        verifier = load_verifier()
+        restore_storage_a = FakeStorage(label="restore", workspace_id="workspace-a")
+        restore_storage_b = FakeStorage(label="restore", workspace_id="workspace-b")
+        restore_storage_a.object_artifacts[("profile-a", "quotation_layout")] = {
+            "artifact_id": "synthetic-profile-layout-row",
+            "workspace_id": "workspace-a",
+            "owner_type": "profile",
+            "owner_id": "profile-a",
+            "artifact_kind": "quotation_layout",
+        }
+        active_backend = FakeBackend(
+            verifier.ObjectArtifactMetadata,
+            label="active",
+            object_key_fn=verifier.webapp.object_artifact_key,
+        )
+        active_metadata = active_backend.store_artifact(
+            workspace_id="workspace-a",
+            owner_type="generated_quote",
+            owner_id="quote-a",
+            artifact_kind="xlsx",
+            filename=verifier.SYNTHETIC_FILENAME,
+            content_type=verifier.SYNTHETIC_CONTENT_TYPE,
+            content=b"synthetic active quote",
+        )
+        ids = {
+            "profile_a": "profile-a",
+            "profile_b": "profile-b",
+            "pricing_a": "pricing-a",
+            "pricing_b": "pricing-b",
+            "session_a": "quote-a",
+            "session_b": "quote-b",
+        }
+
+        self.assertIsNone(restore_storage_a.profile_detail("profile-a"))
+        self.assertFalse(
+            verifier._restore_database_cannot_read_active_synthetic_rows(
+                restore_storage_a=restore_storage_a,
+                restore_storage_b=restore_storage_b,
+                ids=ids,
+                active_metadata=active_metadata,
+            )
+        )
+
+    def test_db_row_verification_detects_hidden_cross_workspace_profile_metadata(self):
+        verifier = load_verifier()
+        ids = {
+            "workspace_a": "workspace-a",
+            "workspace_b": "workspace-b",
+            "profile_a": "profile-a",
+            "profile_b": "profile-b",
+            "pricing_a": "pricing-a",
+            "pricing_b": "pricing-b",
+            "session_a": "quote-a",
+            "session_b": "quote-b",
+        }
+        storage_a = FakeStorage(label="active", workspace_id="workspace-a")
+        storage_b = FakeStorage(label="active", workspace_id="workspace-b")
+        storage_a.profile_rows["profile-a"] = {
+            "workspace_id": "workspace-a",
+            "profile_id": "profile-a",
+            "payload_json": json.dumps({"id": "profile-a", "label": "complete"}),
+        }
+        storage_a.profile_rows["profile-b"] = {
+            "workspace_id": "workspace-a",
+            "profile_id": "profile-b",
+            "payload_json": json.dumps({"id": "profile-b", "label": "metadata-only"}),
+        }
+        storage_b.profile_rows["profile-b"] = {
+            "workspace_id": "workspace-b",
+            "profile_id": "profile-b",
+            "payload_json": json.dumps({"id": "profile-b", "label": "complete"}),
+        }
+
+        def profile_layout_row(workspace_id, profile_id):
+            return {
+                "artifact_id": f"synthetic-{workspace_id}-{profile_id}",
+                "workspace_id": workspace_id,
+                "owner_type": "profile",
+                "owner_id": profile_id,
+                "artifact_kind": "quotation_layout",
+            }
+
+        storage_a.object_artifacts[("profile-a", "quotation_layout")] = profile_layout_row(
+            "workspace-a", "profile-a"
+        )
+        storage_b.object_artifacts[("profile-b", "quotation_layout")] = profile_layout_row(
+            "workspace-b", "profile-b"
+        )
+        backend = FakeBackend(
+            verifier.ObjectArtifactMetadata,
+            label="active",
+            object_key_fn=verifier.webapp.object_artifact_key,
+        )
+
+        with (
+            mock.patch.object(storage_a, "list_company_profiles", return_value=[{"id": "profile-a"}]),
+            mock.patch.object(storage_b, "list_company_profiles", return_value=[{"id": "profile-b"}]),
+            mock.patch.object(storage_a, "list_pricing_references", return_value=[{"id": "pricing-a"}]),
+            mock.patch.object(storage_b, "list_pricing_references", return_value=[{"id": "pricing-b"}]),
+            mock.patch.object(storage_a, "list_quote_sessions", return_value=[{"session_id": "quote-a"}]),
+            mock.patch.object(storage_b, "list_quote_sessions", return_value=[{"session_id": "quote-b"}]),
+        ):
+            self.assertFalse(verifier._verify_db_rows(storage_a, storage_b, ids, backend))
+
+    def test_final_cleanup_detects_readiness_hidden_cross_workspace_profile_metadata(self):
+        verifier = load_verifier()
+
+        report, _storages, _backends = run_injected_drill(
+            verifier,
+            cross_workspace_profile_metadata_leak=True,
+        )
+
+        self.assertFalse(report["checks"]["cleanup_completed"])
+        self.assertFalse(report["live_db_object_backup_restore_evidence_supported"])
+
     def test_same_underlying_restore_database_fails_before_restore_write(self):
         verifier = load_verifier()
 
@@ -2032,7 +2493,8 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
                 backend=None,
             )
         )
-        self.assertIsNotNone(storage.profile_detail("profile-a"))
+        self.assertIn("profile-a", storage.profiles)
+        self.assertIsNone(storage.profile_detail("profile-a"))
 
     def test_backend_delete_false_with_bytes_remaining_fails_cleanup(self):
         verifier = load_verifier()
