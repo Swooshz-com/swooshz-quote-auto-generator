@@ -11,10 +11,12 @@ import argparse
 import base64
 import binascii
 import contextlib
+import contextvars
 import copy
 import csv
 import datetime as dt
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import functools
 import html
 import hashlib
 import hmac
@@ -32,6 +34,7 @@ import posixpath
 import re
 import secrets
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -375,6 +378,8 @@ QUOTE_SESSION_METADATA_FILENAME = "quote-session.json"
 QUOTE_SESSION_DRAFT_FILES_FILENAME = "draft-files.json"
 QUOTE_SESSION_EXPORT_DIR_NAME = "exports"
 QUOTE_SESSION_PUBLICATIONS_DIR_NAME = "publications"
+QUOTE_SESSION_RETIRED_MARKER_FILENAME = ".retired-session-ids.json"
+QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION = 1
 QUOTE_SESSION_PUBLICATION_ID_RE = re.compile(r"^pub-[0-9a-f]{32}$")
 QUOTE_SESSION_EXPORT_KINDS = {
     "xlsx": "quotation.xlsx",
@@ -659,6 +664,7 @@ SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
+QUOTE_SESSION_RETIRED_MESSAGE = "This quote session is no longer available. Please start a new quote. Contact support if this keeps happening."
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
 DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
@@ -725,6 +731,16 @@ MAX_PROMPT_CATALOG_MATCH_TERMS = 6
 # and pricing-reference storage partitioned by authenticated user/account.
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+QUOTE_SESSION_MUTATION_LOCKS_LOCK = threading.Lock()
+QUOTE_SESSION_MUTATION_LOCKS: dict[tuple[tuple[int, int], str], threading.RLock] = {}
+QUOTE_SESSION_RETIREMENT_LOCKS_LOCK = threading.Lock()
+QUOTE_SESSION_RETIREMENT_LOCKS: dict[str, threading.RLock] = {}
+QUOTE_SESSION_FILESYSTEM_CAPABILITY_LOCK = threading.Lock()
+QUOTE_SESSION_FILESYSTEM_CAPABILITIES: dict[tuple[int, int], dict[str, Any]] = {}
+QUOTE_SESSION_TRANSACTION_CONTEXT: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "quote_session_transaction_context", default=None
+)
+QUOTE_SESSION_FILESYSTEM_PROBE_PREFIX = ".sqag-case-equivalence-probe-"
 
 
 class RequestBodyError(ValueError):
@@ -2479,33 +2495,30 @@ def session_from_cookie_header(cookie_header: str) -> dict[str, Any] | None:
     )
     if not payload or not isinstance(payload.get("user"), dict):
         return None
-    if configured_app_mode() == "deploy":
-        if mode == "platform":
-            if payload.get("auth_mode") != "platform" or not platform_auth_session_complete(payload):
-                return None
-        elif mode == INTERNAL_AUTH_MODE:
-            try:
-                payload = INTERNAL_AUTH_STATE.validate_session(
-                    payload,
-                    policy=internal_auth_policy(),
-                    current_mode=mode,
-                )
-            except (InternalAuthConfigError, InternalAuthStateError) as exc:
-                reason = getattr(exc, "reason", "internal_session_policy_invalid")
-                write_local_log(
-                    "security_event",
-                    {
-                        "reason": reason,
-                        "path": "protected_request",
-                        "status": 401,
-                        "user_id": privacy_safe_audit_tracking_id_or_unavailable(
-                            payload.get("google_sub"),
-                            "unknown",
-                        ),
-                    },
-                )
-                return None
-        else:
+    if mode == INTERNAL_AUTH_MODE:
+        try:
+            payload = INTERNAL_AUTH_STATE.validate_session(
+                payload,
+                policy=internal_auth_policy(),
+                current_mode=mode,
+            )
+        except (InternalAuthConfigError, InternalAuthStateError) as exc:
+            reason = getattr(exc, "reason", "internal_session_policy_invalid")
+            write_local_log(
+                "security_event",
+                {
+                    "reason": reason,
+                    "path": "protected_request",
+                    "status": 401,
+                    "user_id": privacy_safe_audit_tracking_id_or_unavailable(
+                        payload.get("google_sub"),
+                        "unknown",
+                    ),
+                },
+            )
+            return None
+    elif configured_app_mode() == "deploy":
+        if mode != "platform" or payload.get("auth_mode") != "platform" or not platform_auth_session_complete(payload):
             return None
     return payload
 
@@ -4858,6 +4871,7 @@ def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def quote_commercial_state_errors(
     payload: dict[str, Any],
     state: dict[str, Any] | None = None,
+    auth_session: dict[str, Any] | None = None,
 ) -> list[str]:
     commercial_state = state or quote_commercial_state(payload)
     if commercial_state.get("review_required"):
@@ -4936,7 +4950,12 @@ def quote_commercial_state_errors(
 
     canonical = quote_commercial_payload(payload)
     rows = canonical.get("line_items") if isinstance(canonical.get("line_items"), list) else []
-    validated_rows = normalize_line_items(canonical)
+    if any(
+        isinstance(row, dict) and row.get("_commercial_invalid_unit_price_override") is True
+        for row in rows
+    ):
+        errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+    validated_rows = normalize_line_items(canonical, auth_session=auth_session)
     if rows and len(validated_rows) != len(rows):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     rows = validated_rows
@@ -5180,9 +5199,9 @@ def bracketed_reference_matches_catalog_item(value: Any, item: dict[str, Any]) -
     if not bracketed:
         return False
     reference, _detail = bracketed
-    reference_key = comparable_catalog_description_key(reference)
+    reference_key = comparable_catalog_description_key_without_leading_unit(reference)
     return bool(reference_key) and any(
-        comparable_catalog_description_key(candidate) == reference_key
+        comparable_catalog_description_key_without_leading_unit(candidate) == reference_key
         for candidate in catalog_reference_values(item)
     )
 
@@ -6370,6 +6389,8 @@ def normalize_pricing_authority(
     *,
     reference_authority: dict[str, Any] | None = None,
     catalog_item: dict[str, Any] | None = None,
+    catalog_items: list[dict[str, Any]] | None = None,
+    catalog_evidence_descriptions: tuple[Any, ...] | list[Any] | None = None,
 ) -> dict[str, Any] | None:
     """Validate a persisted/client authority against the current row and catalog."""
     if not isinstance(raw, dict):
@@ -6420,6 +6441,17 @@ def normalize_pricing_authority(
         "currency": supplied_currency,
     }
     if variant == "catalog":
+        evidence_descriptions = (
+            list(catalog_evidence_descriptions)
+            if isinstance(catalog_evidence_descriptions, (list, tuple))
+            else [row.get("description")]
+        )
+        if catalog_item is not None and any(
+            catalog_line_contradicts_item(value, catalog_item, catalog_items=catalog_items)
+            for value in evidence_descriptions
+            if clean_text(value)
+        ):
+            return None
         item_id = raw["catalog_item_id"]
         supplied_source = raw["catalog_source"]
         supplied_digest = raw["catalog_digest"]
@@ -6433,11 +6465,29 @@ def normalize_pricing_authority(
         actual_description = canonical_pricing_authority_text((catalog_item or {}).get("description"))
         actual_unit = canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item))
         actual_section = canonical_pricing_authority_text((catalog_item or {}).get("section")) or "General"
+        selected_catalog_id = clean_text(row.get("pricing_keyword"))
+        selected_catalog_id_matches = not selected_catalog_id or selected_catalog_id == actual_id
+        if selected_catalog_id and not selected_catalog_id_matches:
+            active_catalog_items = {
+                clean_text(candidate.get("id")): candidate
+                for candidate in catalog_items or []
+                if isinstance(candidate, dict) and clean_text(candidate.get("id"))
+            }
+            if selected_catalog_id in active_catalog_items:
+                selected_catalog_id_matches = False
+            else:
+                selected_alias_item_ids = {
+                    candidate_id
+                    for candidate_id, candidate in active_catalog_items.items()
+                    if selected_catalog_id in legacy_pricing_catalog_id_aliases(candidate_id, candidate)
+                }
+                selected_catalog_id_matches = selected_alias_item_ids == {actual_id}
         if (
             catalog_item is None
             or
             supplied_source != source
             or item_id != actual_id
+            or not selected_catalog_id_matches
             or supplied_digest != digest
             or not PRICING_REFERENCE_DIGEST_RE.fullmatch(supplied_digest)
             or actual_price is None
@@ -6469,6 +6519,7 @@ def rebind_pricing_authority_context(
     *,
     reference_authority: dict[str, Any] | None = None,
     catalog_lookup: dict[str, dict[str, Any]] | None = None,
+    catalog_evidence_descriptions: tuple[Any, ...] | list[Any] | None = None,
 ) -> dict[str, Any]:
     """Revalidate authority after a current-operation row display is normalised."""
     raw = row.get("pricing_authority") if isinstance(row.get("pricing_authority"), dict) else None
@@ -6495,6 +6546,8 @@ def rebind_pricing_authority_context(
         row,
         reference_authority=authority,
         catalog_item=catalog_item,
+        catalog_items=list(lookup.values()),
+        catalog_evidence_descriptions=catalog_evidence_descriptions,
     )
     row["pricing_authority"] = normalized or build_pricing_authority("historical", row)
     return row
@@ -11937,12 +11990,16 @@ def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
     message = (
-        QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE
-        if exc.reason in {"protected_local_artifact_storage_unavailable", "object_artifact_storage_unavailable", "object_draft_recovery_required", "storage_object_artifact_database_not_migrated"}
+        QUOTE_SESSION_RETIRED_MESSAGE
+        if exc.reason == "quote_session_retired"
         else (
-            QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
-            if exc.reason == "protected_local_quote_session_storage_unavailable"
-            else "SQAG storage is not available for this workspace."
+            QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE
+            if exc.reason in {"protected_local_artifact_storage_unavailable", "object_artifact_storage_unavailable", "object_draft_recovery_required", "storage_object_artifact_database_not_migrated"}
+            else (
+                QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE
+                if exc.reason == "protected_local_quote_session_storage_unavailable"
+                else "SQAG storage is not available for this workspace."
+            )
         )
     )
     payload = {"status": "blocked" if exc.status < 500 else "failed", "errors": [message], "error_reference": error_reference}
@@ -12048,7 +12105,13 @@ class LocalSqagStorage:
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(clean_text(kind).lower())
         if not safe_id or not expected_filename:
             return None
-        metadata = read_quote_session_metadata(safe_id)
+        capability = _quote_session_filesystem_capability()
+        if _quote_session_retirement_state(safe_id, capability)[0]:
+            return None
+        state = _read_local_quote_session_state(safe_id, capability)
+        if state["owner"] != safe_id:
+            return None
+        metadata = state["metadata"] if isinstance(state["metadata"], dict) else {}
         if not quote_session_has_current_v2_publication(metadata):
             return None
         export = metadata.get("exports", {}).get(clean_text(kind).lower()) if metadata else None
@@ -15119,6 +15182,11 @@ class DatabaseSqagStorage:
             export["missing"] = bool(safe_recorded and not artifact_exists)
             export["stale"] = stale
             export["url"] = f"/api/quote-sessions/{public['session_id']}/download/{kind}" if exists else None
+            export["view_url"] = (
+                f"/api/quote-sessions/{public['session_id']}/view/pdf"
+                if kind == "pdf" and exists and not stale
+                else None
+            )
             if artifact:
                 export["sha256"] = artifact["sha256"]
                 export["size_bytes"] = artifact["size_bytes"]
@@ -18994,22 +19062,236 @@ def catalog_attribute_conflicts(line_tokens: set[str], item_tokens: set[str]) ->
     return False
 
 
-def catalog_line_contradicts_item(line_text: Any, item: dict[str, Any]) -> bool:
+def catalog_item_identity_key(item: dict[str, Any] | None) -> str:
+    return clean_text(item.get("id")) if isinstance(item, dict) else ""
+
+
+def catalog_items_grouped_by_identity_key(
+    catalog_items: list[dict[str, Any]] | None,
+    selected_item: dict[str, Any] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    values = [*(catalog_items or []), selected_item]
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        item_id = catalog_item_identity_key(item)
+        if item_id:
+            grouped.setdefault(item_id, []).append(item)
+    return {item_id: grouped[item_id] for item_id in sorted(grouped)}
+
+
+def catalog_family_tokens(value: Any) -> set[str]:
+    tokens = catalog_inference_tokens(value)
+    normalized_unit = normalize_pricing_unit(infer_unit_prefix(value))
+    if normalized_unit:
+        tokens.difference_update(catalog_inference_tokens(normalized_unit))
+    return tokens
+
+
+def catalog_family_token_sequence(value: Any) -> tuple[str, ...]:
+    normalized = comparable_catalog_description_key_without_leading_unit(value)
+    sequence: list[str] = []
+    for raw_token in normalized.split():
+        token = catalog_inference_token(raw_token)
+        if len(token) <= 2 and not token.isdigit() and token != "tv":
+            continue
+        sequence.append(token)
+    while sequence and normalize_pricing_unit(sequence[-1]) in {"sqm", "nos", "lot", "sets"}:
+        sequence.pop()
+    return tuple(sequence)
+
+
+def catalog_family_alternative_sequences(items: list[dict[str, Any]]) -> list[tuple[str, ...]]:
+    alternatives = {
+        sequence
+        for item in items
+        for family in catalog_item_object_families(item)
+        for sequence in [catalog_family_token_sequence(family)]
+        if sequence
+    }
+    return sorted(alternatives)
+
+
+def catalog_family_sequence_occurs(detail_sequence: tuple[str, ...], family_sequence: tuple[str, ...]) -> bool:
+    width = len(family_sequence)
+    return bool(width and any(
+        detail_sequence[index:index + width] == family_sequence
+        for index in range(len(detail_sequence) - width + 1)
+    ))
+
+
+def catalog_family_sequence_is_subsequence(
+    family_sequence: tuple[str, ...],
+    selected_sequence: tuple[str, ...],
+) -> bool:
+    width = len(family_sequence)
+    return bool(width and any(
+        selected_sequence[index:index + width] == family_sequence
+        for index in range(len(selected_sequence) - width + 1)
+    ))
+
+
+def catalog_family_evidence_tokens(
+    line_text: Any,
+    item: dict[str, Any],
+    catalog_items: list[dict[str, Any]] | None,
+) -> tuple[set[str], bool, bool, str]:
+    """Return independent row-detail tokens, selected-reference evidence, and mismatch state."""
+    selected_id = catalog_item_identity_key(item)
+    grouped = catalog_items_grouped_by_identity_key(catalog_items, item)
     bracketed = bracketed_catalog_reference_parts(line_text)
     if bracketed:
         reference, detail = bracketed
-        catalog_reference = clean_customer_quote_line_text(item.get("pricing_reference_description") or item.get("description"))
-        if comparable_catalog_description_key(reference) == comparable_catalog_description_key(catalog_reference):
-            return False
-        line_text = detail
-    line_tokens = catalog_inference_tokens(line_text)
+        reference_key = comparable_catalog_description_key_without_leading_unit(reference)
+        matching_ids = {
+            item_id
+            for item_id, entries in grouped.items()
+            if any(
+                comparable_catalog_description_key_without_leading_unit(candidate)
+                == reference_key
+                for entry in entries
+                for candidate in catalog_reference_values(entry)
+            )
+        } if reference_key else set()
+        if matching_ids == {selected_id} and selected_id:
+            return catalog_family_tokens(detail), True, False, clean_text(detail)
+        return set(), False, True, ""
+
+    description_words = comparable_catalog_description_key_without_leading_unit(line_text).split()
+    prefixes: list[tuple[int, str]] = []
+    for item_id, entries in grouped.items():
+        for entry in entries:
+            for reference in catalog_reference_values(entry):
+                reference_words = comparable_catalog_description_key_without_leading_unit(reference).split()
+                if (
+                    reference_words
+                    and len(reference_words) <= len(description_words)
+                    and description_words[:len(reference_words)] == reference_words
+                ):
+                    prefixes.append((len(reference_words), item_id))
+    if prefixes:
+        longest = max(length for length, _item_id in prefixes)
+        matching_ids = {item_id for length, item_id in prefixes if length == longest}
+        if matching_ids == {selected_id} and selected_id:
+            detail_text = " ".join(description_words[longest:])
+            return catalog_family_tokens(detail_text), True, False, detail_text
+        return set(), False, True, ""
+
+    occurrences: list[tuple[int, int, str]] = []
+    for item_id, entries in grouped.items():
+        for entry in entries:
+            for reference in catalog_reference_values(entry):
+                reference_words = comparable_catalog_description_key_without_leading_unit(reference).split()
+                width = len(reference_words)
+                if not width or width > len(description_words):
+                    continue
+                for start in range(len(description_words) - width + 1):
+                    if description_words[start:start + width] == reference_words:
+                        occurrences.append((width, start, item_id))
+    if occurrences:
+        longest = max(width for width, _start, _item_id in occurrences)
+        matching = [
+            (start, item_id)
+            for width, start, item_id in occurrences
+            if width == longest
+        ]
+        matching_ids = {item_id for _start, item_id in matching}
+        matching_positions = {start for start, _item_id in matching}
+        if matching_ids == {selected_id} and len(matching_positions) == 1 and selected_id:
+            start = next(iter(matching_positions))
+            detail_words = description_words[:start] + description_words[start + longest:]
+            detail_text = " ".join(detail_words)
+            return catalog_family_tokens(detail_text), True, False, detail_text
+        return set(), False, True, ""
+
+    detail_text = comparable_catalog_description_key_without_leading_unit(line_text)
+    return catalog_family_tokens(detail_text), False, False, detail_text
+
+
+def catalog_detail_matches_other_catalog_object_family(
+    detail_tokens: set[str],
+    item: dict[str, Any],
+    catalog_items: list[dict[str, Any]] | None,
+    *,
+    selected_reference_established: bool = False,
+    detail_text: Any = None,
+) -> bool:
+    full_detail_tokens = (
+        set(catalog_family_token_sequence(detail_text))
+        if detail_text is not None
+        else set(detail_tokens)
+    )
+    if not (detail_tokens or full_detail_tokens) or not catalog_items:
+        return False
+
+    grouped = catalog_items_grouped_by_identity_key(catalog_items, item)
+    selected_id = catalog_item_identity_key(item)
+    selected_alternatives = {
+        frozenset(sequence)
+        for sequence in catalog_family_alternative_sequences(grouped.get(selected_id, [item]))
+    }
+
+    for candidate_id, entries in grouped.items():
+        if candidate_id == selected_id:
+            continue
+        for family_sequence in catalog_family_alternative_sequences(entries):
+            family_tokens = frozenset(family_sequence)
+            if family_tokens in selected_alternatives:
+                continue
+            if family_tokens <= full_detail_tokens:
+                return True
+
+            competing_evidence = family_tokens & detail_tokens
+            if any(
+                alternative <= detail_tokens
+                and competing_evidence <= alternative
+                for alternative in selected_alternatives
+            ):
+                continue
+
+            for alternative in selected_alternatives:
+                shared_tokens = family_tokens & alternative
+                discriminating_detail = (family_tokens - alternative) & detail_tokens
+                if (
+                    discriminating_detail
+                    and shared_tokens
+                    and (
+                        selected_reference_established
+                        or shared_tokens & detail_tokens
+                    )
+                ):
+                    return True
+    return False
+
+def catalog_line_contradicts_item(
+    line_text: Any,
+    item: dict[str, Any],
+    *,
+    catalog_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    line_tokens, selected_reference, reference_mismatch, detail_text = catalog_family_evidence_tokens(
+        line_text,
+        item,
+        catalog_items,
+    )
+    if reference_mismatch:
+        return True
     item_tokens: set[str] = set()
     for value in catalog_inference_values(item):
         item_tokens.update(catalog_inference_tokens(value))
-    if not line_tokens or not item_tokens:
-        return False
-    if catalog_attribute_conflicts(line_tokens, item_tokens):
+    if line_tokens and item_tokens and catalog_attribute_conflicts(line_tokens, item_tokens):
         return True
+    if catalog_detail_matches_other_catalog_object_family(
+        line_tokens,
+        item,
+        catalog_items,
+        selected_reference_established=selected_reference,
+        detail_text=detail_text,
+    ):
+        return True
+    if selected_reference or not line_tokens or not item_tokens:
+        return False
     overlap = line_tokens & item_tokens
     if len(overlap) >= 2:
         return False
@@ -19018,12 +19300,64 @@ def catalog_line_contradicts_item(line_text: Any, item: dict[str, Any]) -> bool:
     return line_ratio < 0.2 and item_ratio < 0.2
 
 
-def explicit_catalog_keyword_has_usable_overlap(line_text: Any, item: dict[str, Any]) -> bool:
-    line_tokens = catalog_inference_tokens(line_text)
+def reject_catalog_line_item_authority(
+    row: dict[str, Any],
+    *,
+    evidence_description: Any = None,
+) -> dict[str, Any]:
+    """Demote a rejected catalog price while preserving independent manual/Included authority."""
+    rejected = dict(row)
+    authority = rejected.get("pricing_authority") if isinstance(rejected.get("pricing_authority"), dict) else {}
+    variant = clean_text(authority.get("variant")).lower()
+    if variant in {"manual", "included"} or clean_text(rejected.get("price_mode")).lower() == "included":
+        return rejected
+    if not clean_text(rejected.get("description")) and clean_text(evidence_description):
+        rejected["description"] = clean_customer_quote_line_text(evidence_description)
+    rejected["pricing_keyword"] = ""
+    for key in (
+        "effective_unit_price",
+        "unit_price_override",
+        "catalog_unit_price",
+        "pricing_basis_amount",
+        "approved_quote_amount",
+        "pricing_basis_currency",
+        "pricing_reference_source",
+        "pricing_reference_id",
+        "pricing_basis_digest",
+        "catalog_description",
+        "pricing_reference_description",
+    ):
+        rejected.pop(key, None)
+    if clean_text(rejected.get("display_price")).lower() != "included":
+        rejected.pop("display_price", None)
+    rejected["status"] = "unmatched"
+    rejected["pricing_authority"] = build_pricing_authority("historical", rejected)
+    return rejected
+
+
+def explicit_catalog_keyword_has_usable_overlap(
+    line_text: Any,
+    item: dict[str, Any],
+    *,
+    catalog_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    line_tokens, _selected_reference, reference_mismatch, _detail_text = catalog_family_evidence_tokens(
+        line_text,
+        item,
+        catalog_items,
+    )
+    if reference_mismatch or catalog_line_contradicts_item(
+        line_text,
+        item,
+        catalog_items=catalog_items,
+    ):
+        return False
     item_tokens: set[str] = set()
     for value in catalog_inference_values(item):
         item_tokens.update(catalog_inference_tokens(value))
-    return bool(line_tokens and item_tokens and (line_tokens & item_tokens))
+    if not line_tokens or not item_tokens or not (line_tokens & item_tokens):
+        return False
+    return True
 
 
 def catalog_inference_values(item: dict[str, Any]) -> list[str]:
@@ -19297,6 +19631,7 @@ def normalize_owned_line_item(
     catalog_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     raw = canonicalize_primary_order_fields(raw)
+    original_description = raw.get("description")
     display_price = clean_text(raw.get("display_price"))
     price_mode = clean_text(raw.get("price_mode")).title()
     if clean_text(raw.get("unit_price_override")).lower() == "included" or display_price.lower() == "included":
@@ -19345,11 +19680,22 @@ def normalize_owned_line_item(
         candidate = (catalog_lookup or {}).get(catalog_item_id)
         if isinstance(candidate, dict) and clean_text(candidate.get("id")) == catalog_item_id:
             catalog_item = candidate
+    catalog_items = list((catalog_lookup or {}).values())
+    catalog_family_rejected = bool(
+        catalog_item
+        and catalog_line_contradicts_item(
+            original_description,
+            catalog_item,
+            catalog_items=catalog_items,
+        )
+    )
     authority = normalize_pricing_authority(
         raw_authority,
         item,
         reference_authority=reference_authority,
         catalog_item=catalog_item,
+        catalog_items=catalog_items,
+        catalog_evidence_descriptions=(original_description,),
     ) if raw_authority_present else None
     if authority is None:
         legacy_evidence = any(
@@ -19366,6 +19712,8 @@ def normalize_owned_line_item(
         ) or price_mode == "Included"
         authority = build_pricing_authority("historical" if (raw_authority_present or legacy_evidence) else "none", item)
     item["pricing_authority"] = authority
+    if catalog_family_rejected:
+        item["status"] = "unmatched"
     trusted_price = pricing_authority_price(authority)
     authority_variant = clean_text(authority.get("variant")).lower()
     authority_is_untrusted = raw_authority_present and authority_variant not in PRICING_AUTHORITY_TRUSTED_VARIANTS
@@ -19516,16 +19864,24 @@ def normalize_line_items(
         if use_catalog
         else {}
     )
+    catalog_items = list(catalog_lookup.values())
     items: list[dict[str, Any]] = []
     for raw in raw_items:
         if not isinstance(raw, dict):
             continue
         raw = canonicalize_primary_order_fields(raw)
+        original_description = raw.get("description")
         display_price = clean_text(raw.get("display_price"))
         pricing_keyword = clean_text(raw.get("pricing_keyword"))
         authority_supplied = "pricing_authority" in raw
         authority_hint = raw.get("pricing_authority") if isinstance(raw.get("pricing_authority"), dict) else {}
         authority_variant_hint = authority_hint.get("variant") if isinstance(authority_hint.get("variant"), str) else ""
+        raw_price_mode_hint = clean_text(raw.get("price_mode")).title()
+        raw_is_included = (
+            raw_price_mode_hint == "Included"
+            or clean_text(raw.get("unit_price_override")).lower() == "included"
+            or display_price.lower() == "included"
+        ) and not (authority_supplied and authority_variant_hint == "catalog")
         raw_unit = normalize_pricing_unit(raw.get("unit"))
         output_unit_locked = raw.get("output_unit_locked") is True
         quantity_parts = normalized_line_text_quantity_parts(raw.get("description"), raw.get("quantity"), raw_unit)
@@ -19536,7 +19892,23 @@ def normalize_line_items(
             else raw_unit
         )
         incoming_description = clean_customer_quote_line_text(quantity_parts["text"])
+        if authority_supplied and authority_variant_hint == "none":
+            none_authority = normalize_pricing_authority(
+                authority_hint,
+                {
+                    "source_basis_line_id": canonical_pricing_authority_text(raw.get("source_basis_line_id")),
+                    "section": canonical_pricing_authority_text(raw.get("section")) or "General",
+                    "description": incoming_description,
+                    "unit": incoming_unit,
+                    "pricing_keyword": pricing_keyword,
+                },
+                reference_authority=authority,
+            )
+            if none_authority and none_authority.get("variant") == "none":
+                # An explicit no-authority marker on a new draft must not block first catalog resolution.
+                authority_supplied = False
         incoming_authority = None
+        catalog_item_for_family_admission = None
         if authority_supplied:
             catalog_item = None
             if authority_variant_hint == "catalog":
@@ -19544,6 +19916,7 @@ def normalize_line_items(
                 candidate = catalog_lookup.get(catalog_item_id)
                 if isinstance(candidate, dict) and clean_text(candidate.get("id")) == catalog_item_id:
                     catalog_item = candidate
+            catalog_item_for_family_admission = catalog_item
             incoming_authority = normalize_pricing_authority(
                 authority_hint,
                 {
@@ -19555,6 +19928,8 @@ def normalize_line_items(
                 },
                 reference_authority=authority,
                 catalog_item=catalog_item,
+                catalog_items=catalog_items,
+                catalog_evidence_descriptions=(original_description,),
             )
             if incoming_authority is None:
                 catalog_item = None
@@ -19580,6 +19955,7 @@ def normalize_line_items(
                         pricing_keyword_was_explicit = True
                 else:
                     pricing_keyword = ""
+            catalog_item_for_family_admission = catalog_item
         unit = (
             quantity_parts["unit"]
             if quantity_parts.get("from_text_prefix")
@@ -19590,14 +19966,16 @@ def normalize_line_items(
             )
         )
         raw_description = incoming_description
-        if (
-            catalog_item
-            and catalog_line_contradicts_item(raw_description, catalog_item)
-            and not (
-                pricing_keyword_was_explicit
-                and explicit_catalog_keyword_has_usable_overlap(raw_description, catalog_item)
+        catalog_item_rejected_for_contradiction = bool(
+            (catalog_item or catalog_item_for_family_admission)
+            and not raw_is_included
+            and catalog_line_contradicts_item(
+                original_description,
+                catalog_item or catalog_item_for_family_admission,
+                catalog_items=catalog_items,
             )
-        ):
+        )
+        if catalog_item_rejected_for_contradiction:
             catalog_item = None
             pricing_keyword = ""
             unit = quantity_parts["unit"] if quantity_parts.get("from_text_prefix") else raw_unit
@@ -19701,6 +20079,7 @@ def normalize_line_items(
         elif (
             price_mode == "Priced"
             and catalog_item is None
+            and not catalog_item_rejected_for_contradiction
             and unit_price_override is not None
             and unit_price_override >= 0
             and quantity is not None
@@ -19724,14 +20103,34 @@ def normalize_line_items(
                 item,
                 reference_authority=authority,
                 catalog_item=catalog_item,
+                catalog_items=catalog_items,
+                catalog_evidence_descriptions=(original_description,),
             )
+            if (
+                normalized_authority is None
+                and incoming_authority is not None
+                and not catalog_item_rejected_for_contradiction
+            ):
+                # Rebind row authority only when its catalog item remains admitted.
+                rebound = rebind_pricing_authority_context(
+                    {**item, "pricing_authority": incoming_authority},
+                    reference_authority=authority,
+                    catalog_lookup=catalog_lookup,
+                    catalog_evidence_descriptions=(original_description,),
+                )
+                normalized_authority = rebound.get("pricing_authority")
         elif price_mode == "Included":
             normalized_authority = build_pricing_authority(
                 "included",
                 item,
                 reference_authority=authority,
             )
-        elif manual_authority_price is not None and bool(description) and bool(unit):
+        elif (
+            manual_authority_price is not None
+            and bool(description)
+            and bool(unit)
+            and not catalog_item_rejected_for_contradiction
+        ):
             normalized_authority = build_pricing_authority(
                 "manual",
                 item,
@@ -19755,13 +20154,27 @@ def normalize_line_items(
             normalized_authority = None
         if normalized_authority is None:
             normalized_authority = build_pricing_authority(
-                "historical" if authority_supplied or any(
+                "historical" if authority_supplied or catalog_item_rejected_for_contradiction or any(
                     raw.get(key) not in (None, "")
                     for key in ("unit_price_override", "effective_unit_price", "pricing_basis_amount", "catalog_unit_price")
                 ) else "none",
                 item,
             )
         item["pricing_authority"] = normalized_authority
+        if catalog_item_rejected_for_contradiction:
+            item["status"] = "unmatched"
+            for stale_key in (
+                "effective_unit_price",
+                "unit_price_override",
+                "catalog_unit_price",
+                "pricing_basis_amount",
+                "approved_quote_amount",
+                "pricing_basis_currency",
+                "pricing_reference_source",
+                "pricing_reference_id",
+                "pricing_basis_digest",
+            ):
+                item.pop(stale_key, None)
         trusted_price = pricing_authority_price(normalized_authority)
         trusted_variant = clean_text(normalized_authority.get("variant")).lower()
         if trusted_variant == "included":
@@ -19840,7 +20253,7 @@ def quote_detail_missing_fields(payload: dict[str, Any]) -> list[str]:
 def validate_generation_payload(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> list[str]:
     errors: list[str] = []
     commercial_state = quote_commercial_state(payload)
-    errors.extend(quote_commercial_state_errors(payload, commercial_state))
+    errors.extend(quote_commercial_state_errors(payload, commercial_state, auth_session=auth_session))
     pricing_reference_authority_error_value = pricing_reference_authority_error(
         payload,
         auth_session=auth_session,
@@ -19932,7 +20345,7 @@ def payload_to_brief(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     commercial_state = quote_commercial_state(payload)
-    commercial_errors = quote_commercial_state_errors(payload, commercial_state)
+    commercial_errors = quote_commercial_state_errors(payload, commercial_state, auth_session=auth_session)
     authority_error = pricing_reference_authority_error(payload, auth_session=auth_session)
     if authority_error and authority_error not in commercial_errors:
         commercial_errors.append(authority_error)
@@ -21492,6 +21905,51 @@ def quote_basis_sections_with_catalog_exact_lines(
                 values.append(title)
         return values
 
+    def basis_line_has_catalog_conflict(line: dict[str, Any], catalog_item: dict[str, Any]) -> bool:
+        evidence_descriptions = [line.get("text")]
+        line_source_ids = {
+            safe_resource_id(value, "")
+            for value in (line.get("id"), line.get("source_line_item_id"))
+            if safe_resource_id(value, "")
+        }
+        selected_id = catalog_item_identity_key(catalog_item)
+        matched_source_items = []
+        catalog_fallback_items = []
+        for source_item in line_items:
+            if not isinstance(source_item, dict):
+                continue
+            source_item_ids = {
+                safe_resource_id(value, "")
+                for value in (
+                    source_item.get("source_basis_line_id"),
+                    source_item.get("id"),
+                    source_item.get("source_line_item_id"),
+                )
+                if safe_resource_id(value, "")
+            }
+            source_catalog = catalog_item_for_pricing_keyword(source_item.get("pricing_keyword"))
+            same_catalog = bool(
+                source_catalog
+                and catalog_item_identity_key(source_catalog) == selected_id
+            )
+            if line_source_ids & source_item_ids:
+                matched_source_items.append(source_item)
+            elif same_catalog and (not line_source_ids or not source_item_ids):
+                catalog_fallback_items.append(source_item)
+        associated_source_items = matched_source_items or (
+            catalog_fallback_items if len(catalog_fallback_items) == 1 else []
+        )
+        evidence_descriptions.extend(item.get("description") for item in associated_source_items)
+        return any(
+            catalog_line_contradicts_item(
+                evidence,
+                catalog_item,
+                catalog_items=exact_catalog_items,
+            )
+            for evidence in evidence_descriptions
+            if clean_text(evidence)
+        )
+
     catalog_items_by_section: dict[str, list[dict[str, Any]]] = {}
     for item in line_items:
         if not clean_text(item.get("pricing_keyword")) or not clean_text(item.get("description")) or not item_has_catalog_reference(item):
@@ -22021,7 +22479,7 @@ def quote_basis_sections_with_catalog_exact_lines(
             catalog_item = catalog_item_for_pricing_keyword(line.get("pricing_keyword"))
             if not catalog_item:
                 continue
-            if catalog_line_contradicts_item(line.get("text"), catalog_item):
+            if basis_line_has_catalog_conflict(line, catalog_item):
                 mark_line_custom_for_manual_pricing(line)
                 continue
             apply_catalog_item_metadata(line, catalog_item, replace_text=True)
@@ -22091,6 +22549,26 @@ def line_items_with_resolved_basis_catalog(
         source_id = safe_resource_id(item.get("source_basis_line_id"), "")
         basis_line = basis_catalog_lines_by_id.get(source_id)
         pricing_keyword = clean_text(item.get("pricing_keyword"))
+        current_catalog_item = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
+        current_evidence = [item.get("description")]
+        if basis_line:
+            current_evidence.append(basis_line.get("text"))
+        if current_catalog_item and any(
+            catalog_line_contradicts_item(
+                evidence,
+                current_catalog_item,
+                catalog_items=list(catalog_lookup.values()),
+            )
+            for evidence in current_evidence
+            if clean_text(evidence)
+        ):
+            resolved_items.append(
+                reject_catalog_line_item_authority(
+                    item,
+                    evidence_description=basis_line.get("text") if basis_line else item.get("description"),
+                )
+            )
+            continue
         if pricing_keyword and pricing_keyword in catalog_lookup:
             resolved_items.append(item)
             continue
@@ -22100,6 +22578,22 @@ def line_items_with_resolved_basis_catalog(
         catalog_item = catalog_lookup.get(clean_text(basis_line.get("pricing_keyword")))
         if not catalog_item:
             resolved_items.append(item)
+            continue
+        if any(
+            catalog_line_contradicts_item(
+                evidence,
+                catalog_item,
+                catalog_items=list(catalog_lookup.values()),
+            )
+            for evidence in (item.get("description"), basis_line.get("text"))
+            if clean_text(evidence)
+        ):
+            resolved_items.append(
+                reject_catalog_line_item_authority(
+                    item,
+                    evidence_description=basis_line.get("text"),
+                )
+            )
             continue
         catalog_reference_description = clean_text(
             catalog_item.get("pricing_reference_description")
@@ -22141,6 +22635,7 @@ def line_items_with_resolved_basis_catalog(
             rebind_pricing_authority_context(
                 next_item,
                 catalog_lookup=catalog_lookup,
+                catalog_evidence_descriptions=(item.get("description"), basis_line.get("text")),
             )
         )
     return resolved_items
@@ -22289,10 +22784,33 @@ def line_items_aligned_to_quote_basis(
             is_custom = normalize_basis_tag(line.get("tag")) == "Custom" or bool(line.get("custom_pricing"))
             if not pricing_keyword and not is_custom:
                 continue
+            existing = existing_item_for_basis_line(line) or {}
+            if catalog_item and any(
+                catalog_line_contradicts_item(
+                    evidence,
+                    catalog_item,
+                    catalog_items=list(catalog_lookup.values()),
+                )
+                for evidence in (line.get("text"), existing.get("description"))
+                if clean_text(evidence)
+            ):
+                rejected_row = existing or {
+                    "section": section_title,
+                    "description": clean_customer_quote_line_text(line.get("text")),
+                    "quantity": parse_float_or_none(line.get("quantity")),
+                    "unit": normalize_pricing_unit(line.get("unit") or catalog_item_unit_hint(catalog_item)),
+                    "price_mode": "Priced",
+                }
+                aligned.append(
+                    reject_catalog_line_item_authority(
+                        rejected_row,
+                        evidence_description=line.get("text"),
+                    )
+                )
+                continue
             description = output_description_for_basis_line(line, catalog_item)
             if not description:
                 continue
-            existing = existing_item_for_basis_line(line) or {}
             next_item = dict(existing)
             catalog_section = (
                 normalize_catalog_section(catalog_item.get("section"))
@@ -22359,6 +22877,7 @@ def line_items_aligned_to_quote_basis(
                 rebind_pricing_authority_context(
                     next_item,
                     catalog_lookup=catalog_lookup,
+                    catalog_evidence_descriptions=(line.get("text"), existing.get("description")),
                 )
             )
     return aligned if approved_only else (aligned or line_items)
@@ -23874,11 +24393,330 @@ def quote_sessions_root() -> Path:
     return configured_data_root() / QUOTE_SESSION_DIR_NAME
 
 
+def quote_session_retired_marker_path() -> Path:
+    """Return the minimal retirement ledger outside every session directory."""
+    return _quote_session_storage_root().parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
+
+
+def _quote_session_storage_root() -> Path:
+    return quote_sessions_root().resolve()
+
+
+def _quote_session_storage_error(reason: str, message: str = "Quote session storage is unavailable.") -> SqagStorageAccessError:
+    return SqagStorageAccessError(message, status=503, reason=reason)
+
+
+def _quote_session_path_is_redirect(path: Path) -> bool:
+    try:
+        file_stat = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if stat.S_ISLNK(file_stat.st_mode):
+        return True
+    return bool(int(getattr(file_stat, "st_file_attributes", 0)) & 0x0400)
+
+
+def _quote_session_root_object_identity(root: Path) -> tuple[int, int]:
+    try:
+        root_stat = root.stat()
+        device = int(root_stat.st_dev)
+        inode = int(root_stat.st_ino)
+    except (OSError, TypeError, ValueError) as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_identity_unavailable") from exc
+    if device <= 0 or inode <= 0:
+        raise _quote_session_storage_error("quote_session_filesystem_identity_unavailable")
+    return device, inode
+
+
+def _ascii_case_swapped(value: str) -> str:
+    swapped = []
+    for character in value:
+        if "a" <= character <= "z":
+            swapped.append(character.upper())
+        elif "A" <= character <= "Z":
+            swapped.append(character.lower())
+        else:
+            swapped.append(character)
+    return "".join(swapped)
+
+
+def _quote_session_filesystem_capability() -> dict[str, Any]:
+    """Probe the actual session-storage filesystem's ASCII case semantics once."""
+    root = _quote_session_storage_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_probe_failed") from exc
+    if _quote_session_path_is_redirect(root) or not root.is_dir():
+        raise _quote_session_storage_error("quote_session_filesystem_probe_failed")
+    root_identity = _quote_session_root_object_identity(root)
+    with QUOTE_SESSION_FILESYSTEM_CAPABILITY_LOCK:
+        cached = QUOTE_SESSION_FILESYSTEM_CAPABILITIES.get(root_identity)
+        cached_root = cached.get("root") if isinstance(cached, dict) else None
+        same_root_path = bool(
+            cached_root is not None
+            and os.path.normcase(os.path.abspath(str(cached_root)))
+            == os.path.normcase(os.path.abspath(str(root)))
+        )
+        if cached is not None and same_root_path:
+            return cached
+
+        probe_path: Path | None = None
+        probe_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        case_insensitive = False
+        for _attempt in range(8):
+            candidate = root / f"{QUOTE_SESSION_FILESYSTEM_PROBE_PREFIX}{secrets.token_hex(12)}Aa"
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                probe_error = exc
+                break
+            probe_path = candidate
+            break
+        if probe_path is None and probe_error is None:
+            probe_error = OSError("Could not allocate a unique filesystem capability probe.")
+        try:
+            if probe_error is None and probe_path is not None:
+                if _quote_session_path_is_redirect(probe_path) or not probe_path.is_dir():
+                    raise OSError("Filesystem capability probe was redirected.")
+                swapped_path = root / _ascii_case_swapped(probe_path.name)
+                if swapped_path.name == probe_path.name:
+                    raise OSError("Filesystem capability probe was not mixed case.")
+                if swapped_path.exists():
+                    if _quote_session_path_is_redirect(swapped_path) or not os.path.samefile(probe_path, swapped_path):
+                        raise OSError("Filesystem capability probe returned contradictory identity.")
+                    case_insensitive = True
+        except (OSError, RuntimeError) as exc:
+            probe_error = probe_error or exc
+        finally:
+            if probe_path is not None:
+                try:
+                    if _quote_session_path_is_redirect(probe_path):
+                        raise OSError("Filesystem capability probe was redirected before cleanup.")
+                    probe_path.rmdir()
+                    if probe_path.exists():
+                        raise OSError("Filesystem capability probe was not removed.")
+                except OSError as exc:
+                    cleanup_error = exc
+        if probe_error is not None or cleanup_error is not None:
+            raise _quote_session_storage_error("quote_session_filesystem_probe_failed") from (cleanup_error or probe_error)
+        capability = {
+            "root": root,
+            "root_identity": root_identity,
+            "case_insensitive": case_insensitive,
+        }
+        QUOTE_SESSION_FILESYSTEM_CAPABILITIES[root_identity] = capability
+        return capability
+
+
+def _quote_session_lifecycle_component(session_id: str, capability: dict[str, Any]) -> str:
+    return session_id.casefold() if capability["case_insensitive"] else session_id
+
+
+def _quote_session_lifecycle_identity(session_id: str, capability: dict[str, Any] | None = None) -> tuple[tuple[int, int], str]:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        raise ValueError("Quote session id is required and may only contain safe generated characters.")
+    capability = capability or _quote_session_filesystem_capability()
+    return capability["root_identity"], _quote_session_lifecycle_component(safe_id, capability)
+
+
+def _quote_session_mutation_lock(session_id: str) -> threading.RLock:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        raise ValueError("Quote session id is required and may only contain safe generated characters.")
+    capability = _quote_session_filesystem_capability()
+    identity = _quote_session_lifecycle_identity(safe_id, capability)
+    with QUOTE_SESSION_MUTATION_LOCKS_LOCK:
+        lock = QUOTE_SESSION_MUTATION_LOCKS.get(identity)
+        if lock is None:
+            lock = threading.RLock()
+            QUOTE_SESSION_MUTATION_LOCKS[identity] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def quote_session_mutation(session_id: str):
+    """Serialize one local session's complete persistence transaction."""
+    lock = _quote_session_mutation_lock(session_id)
+    with lock:
+        yield
+
+
+def _quote_session_retirement_lock(root: Path, capability: dict[str, Any] | None = None) -> threading.RLock:
+    capability = capability or _quote_session_filesystem_capability()
+    root_key = capability["root_identity"]
+    with QUOTE_SESSION_RETIREMENT_LOCKS_LOCK:
+        lock = QUOTE_SESSION_RETIREMENT_LOCKS.get(root_key)
+        if lock is None:
+            lock = threading.RLock()
+            QUOTE_SESSION_RETIREMENT_LOCKS[root_key] = lock
+        return lock
+
+
+def _read_retired_quote_session_ids(root: Path) -> set[str]:
+    marker_path = root.parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
+    try:
+        raw = marker_path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_read_failed",
+        ) from exc
+    try:
+        marker = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_invalid",
+        ) from exc
+    if not isinstance(marker, dict) or marker.get("schema_version") != QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION:
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_invalid",
+        )
+    raw_ids = marker.get("session_ids")
+    if not isinstance(raw_ids, list):
+        raise SqagStorageAccessError(
+            "Quote session retirement state is unavailable.",
+            status=503,
+            reason="quote_session_retirement_invalid",
+        )
+    retired: set[str] = set()
+    for value in raw_ids:
+        safe_id = safe_quote_session_id(value, "")
+        if not isinstance(value, str) or not safe_id or safe_id != value:
+            raise SqagStorageAccessError(
+                "Quote session retirement state is unavailable.",
+                status=503,
+                reason="quote_session_retirement_invalid",
+            )
+        retired.add(safe_id)
+    return retired
+
+
+def _quote_session_retirement_state(
+    session_id: str,
+    capability: dict[str, Any] | None = None,
+) -> tuple[bool, set[str]]:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        return False, set()
+    capability = capability or _quote_session_filesystem_capability()
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(safe_id, capability)
+    with _quote_session_retirement_lock(root, capability):
+        retired_ids = _read_retired_quote_session_ids(root)
+    return (
+        any(_quote_session_lifecycle_component(value, capability) == component for value in retired_ids),
+        retired_ids,
+    )
+
+
+def quote_session_is_retired(session_id: str) -> bool:
+    return _quote_session_retirement_state(session_id)[0]
+
+
+def retire_quote_session_id(session_id: str) -> bool:
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        raise ValueError("Quote session id is required and may only contain safe generated characters.")
+    capability = _quote_session_filesystem_capability()
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(safe_id, capability)
+    marker_path = root.parent / QUOTE_SESSION_RETIRED_MARKER_FILENAME
+    with _quote_session_retirement_lock(root, capability):
+        retired = _read_retired_quote_session_ids(root)
+        if any(
+            _quote_session_lifecycle_component(retired_id, capability) == component
+            for retired_id in retired
+        ):
+            return False
+        retired.add(safe_id)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            atomic_write_text(
+                marker_path,
+                json.dumps(
+                    {
+                        "schema_version": QUOTE_SESSION_RETIRED_MARKER_SCHEMA_VERSION,
+                        "session_ids": sorted(retired),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+        except OSError as exc:
+            raise SqagStorageAccessError(
+                "Quote session retirement state could not be saved.",
+                status=503,
+                reason="quote_session_retirement_write_failed",
+            ) from exc
+        return True
+
+
+def _read_local_quote_session_state(
+    session_id: str,
+    capability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve one local lifecycle identity without changing its public spelling."""
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        return {"owner": "", "directory": None, "metadata": None}
+    capability = capability or _quote_session_filesystem_capability()
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(safe_id, capability)
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_read_failed") from exc
+    matches: list[Path] = []
+    for entry in entries:
+        if _quote_session_lifecycle_component(entry.name, capability) != component:
+            continue
+        if _quote_session_path_is_redirect(entry) or not entry.is_dir():
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        matches.append(entry)
+    if len(matches) > 1:
+        raise _quote_session_storage_error("quote_session_storage_ambiguous")
+    if not matches:
+        return {"owner": "", "directory": None, "metadata": None}
+    directory = matches[0]
+    try:
+        resolved_directory = directory.resolve(strict=True)
+        resolved_directory.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent") from exc
+    metadata_path = directory / QUOTE_SESSION_METADATA_FILENAME
+    if _quote_session_path_is_redirect(metadata_path) or not metadata_path.is_file():
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent") from exc
+    if not isinstance(metadata, dict):
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    owner = safe_quote_session_id(metadata.get("session_id"), "")
+    if not owner or owner != directory.name:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    return {"owner": owner, "directory": directory, "metadata": metadata}
+
+
 def quote_session_dir(session_id: str) -> Path:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         raise ValueError("Quote session id is required and may only contain safe generated characters.")
-    root = quote_sessions_root()
+    root = _quote_session_filesystem_capability()["root"]
     path = root / safe_id
     resolved_root = root.resolve()
     resolved_path = path.resolve()
@@ -23960,23 +24798,29 @@ def quote_session_recorded_export_path(
     return quote_session_legacy_export_path(session_id, normalized_kind)
 
 
-def quote_session_export_path(session_id: str, kind: str) -> Path:
+def quote_session_export_path(session_id: str, kind: str) -> Path | None:
     safe_id = safe_quote_session_id(session_id, "")
     if safe_id:
+        capability = _quote_session_filesystem_capability()
+        if _quote_session_retirement_state(safe_id, capability)[0]:
+            return None
         metadata = read_quote_session_metadata(safe_id)
         if metadata:
             return quote_session_recorded_export_path(safe_id, kind, metadata)
-    return quote_session_legacy_export_path(session_id, kind)
+    return quote_session_legacy_export_path(session_id)
 
 
 def read_quote_session_metadata(session_id: str) -> dict[str, Any]:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return {}
-    data = load_json_file(quote_session_metadata_path(safe_id))
-    if safe_quote_session_id(data.get("session_id"), "") != safe_id:
+    capability = _quote_session_filesystem_capability()
+    if _quote_session_retirement_state(safe_id, capability)[0]:
         return {}
-    return data
+    state = _read_local_quote_session_state(safe_id, capability)
+    if state["owner"] != safe_id:
+        return {}
+    return state["metadata"] if isinstance(state["metadata"], dict) else {}
 
 
 def dashboard_safe_text(value: Any, limit: int = 160) -> str:
@@ -25314,11 +26158,20 @@ def write_quote_session_draft_files(
     destination: Path | None = None,
 ) -> None:
     path = destination or quote_session_draft_files_path(session_id)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
     if destination is None and not records:
         if path.exists():
+            if transaction is not None:
+                transaction.ensure_directory(path.parent)
+                transaction.capture_file(path)
             path.unlink()
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
+    if transaction is not None:
+        transaction.ensure_directory(path.parent)
+        transaction.capture_file(path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         path,
         json.dumps(records, indent=2, sort_keys=True),
@@ -25527,11 +26380,18 @@ def write_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     if not normalized:
         raise ValueError("Quote session metadata is not valid.")
     path = quote_session_metadata_path(normalized["session_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
+    if transaction is not None:
+        transaction.ensure_directory(path.parent)
+        transaction.capture_file(path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         path,
         json.dumps(normalized, indent=2, sort_keys=True),
     )
+    if transaction is not None:
+        transaction.metadata_committed = True
     return normalized
 
 
@@ -25543,6 +26403,9 @@ def atomic_write_text(path: Path, content: str) -> None:
         dir=str(path.parent),
     )
     temporary_path = Path(temporary_name)
+    transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
+    if transaction is not None:
+        transaction.track_temporary_file(temporary_path)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
@@ -25745,6 +26608,115 @@ def mark_quote_session_exports_stale(metadata: dict[str, Any], preserve_kinds: s
         metadata["status"]["draft_modified"] = True
 
 
+@dataclass
+class LocalQuoteSessionTransaction:
+    session_id: str
+    session_directory: Path
+    initial_owner: bool
+    created_directories: set[Path] = field(default_factory=set)
+    owned_files: set[Path] = field(default_factory=set)
+    file_snapshots: dict[Path, bytes] = field(default_factory=dict)
+    metadata_committed: bool = False
+
+    def _path_key(self, path: Path) -> Path:
+        return Path(os.path.abspath(str(path)))
+
+    def _inside_session(self, path: Path) -> Path:
+        target = self._path_key(path)
+        root = self._path_key(self.session_directory)
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("Quote-session transaction path escaped its session directory.") from exc
+        return target
+
+    def ensure_directory(self, path: Path) -> None:
+        target = self._inside_session(path)
+        missing: list[Path] = []
+        cursor = target
+        root = self._path_key(self.session_directory)
+        while True:
+            if _quote_session_path_is_redirect(cursor):
+                raise _quote_session_storage_error("quote_session_storage_inconsistent")
+            try:
+                info = cursor.lstat()
+            except FileNotFoundError:
+                missing.append(cursor)
+            else:
+                if not stat.S_ISDIR(info.st_mode):
+                    raise _quote_session_storage_error("quote_session_storage_inconsistent")
+                break
+            if cursor == root:
+                cursor = cursor.parent
+                continue
+            cursor = cursor.parent
+        for directory in reversed(missing):
+            directory.mkdir()
+            self.created_directories.add(directory)
+
+    def capture_file(self, path: Path) -> Path:
+        target = self._inside_session(path)
+        if target in self.owned_files or target in self.file_snapshots:
+            return target
+        if _quote_session_path_is_redirect(target):
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            self.owned_files.add(target)
+            return target
+        if not stat.S_ISREG(info.st_mode):
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        self.file_snapshots[target] = target.read_bytes()
+        return target
+
+    def track_temporary_file(self, path: Path) -> None:
+        target = self._path_key(path)
+        try:
+            target.relative_to(self._path_key(self.session_directory))
+        except ValueError:
+            return
+        self.owned_files.add(target)
+
+    def remap_owned_prefix(self, source: Path, destination: Path) -> None:
+        source_key = self._path_key(source)
+        destination_key = self._path_key(destination)
+        def remap(path: Path) -> Path:
+            try:
+                return destination_key / path.relative_to(source_key)
+            except ValueError:
+                return path
+        self.created_directories = {remap(path) for path in self.created_directories}
+        self.owned_files = {remap(path) for path in self.owned_files}
+        self.file_snapshots = {remap(path): value for path, value in self.file_snapshots.items()}
+
+
+def _remove_uncommitted_quote_session_transaction(transaction: LocalQuoteSessionTransaction) -> None:
+    if transaction.metadata_committed and not transaction.initial_owner:
+        return
+    for path in sorted(transaction.owned_files, key=lambda item: len(item.parts), reverse=True):
+        if _quote_session_path_is_redirect(path):
+            raise OSError("Transaction-owned quote-session file was redirected before rollback.")
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("Transaction-owned quote-session file changed type before rollback.")
+        path.unlink()
+    for path, content in transaction.file_snapshots.items():
+        if _quote_session_path_is_redirect(path):
+            raise OSError("Pre-existing quote-session file was redirected before rollback.")
+        atomic_write_text(path, content.decode("utf-8"))
+    for directory in sorted(transaction.created_directories, key=lambda item: len(item.parts), reverse=True):
+        if _quote_session_path_is_redirect(directory):
+            raise OSError("Transaction-created quote-session directory was redirected before rollback.")
+        try:
+            directory.rmdir()
+        except FileNotFoundError:
+            continue
+
+
 def local_quote_publication_sources(
     result: dict[str, Any] | None,
     output_dir: Path | None,
@@ -25776,16 +26748,18 @@ def stage_local_quote_publication(
     output_dir: Path | None,
     *,
     draft_file_records: list[dict[str, Any]] | None = None,
+    transaction: LocalQuoteSessionTransaction,
 ) -> dict[str, Any] | None:
     sources = local_quote_publication_sources(result, output_dir)
     if not any(kind == "xlsx" for kind, _filename, _source in sources):
         return None
     publication_id = new_quote_publication_id()
     publications_dir = quote_session_publications_dir(session_id)
-    publications_dir.mkdir(parents=True, exist_ok=True)
+    transaction.ensure_directory(publications_dir)
     staging_dir = publications_dir / f".{publication_id}.staging"
     final_dir = quote_session_publication_dir(session_id, publication_id)
-    staging_dir.mkdir(parents=True, exist_ok=False)
+    staging_dir.mkdir(parents=False, exist_ok=False)
+    transaction.created_directories.add(transaction._path_key(staging_dir))
     staged_at = utc_timestamp()
     staged_exports: dict[str, dict[str, Any]] = {}
     try:
@@ -25795,6 +26769,7 @@ def stage_local_quote_publication(
                 raise ValueError(f"Generated quote publication source is empty: {filename}.")
             source_digest = hashlib.sha256(source_bytes).hexdigest()
             target = staging_dir / filename
+            transaction.capture_file(target)
             shutil.copy2(source, target)
             if not target.is_file():
                 raise ValueError(f"Staged quote publication file is missing: {filename}.")
@@ -25832,11 +26807,11 @@ def stage_local_quote_publication(
                 raise ValueError("Staged quote session draft files are invalid.") from exc
             if staged_draft_files != draft_file_records:
                 raise ValueError("Staged quote session draft files validation failed.")
+        if final_dir.exists() or _quote_session_path_is_redirect(final_dir):
+            raise FileExistsError("Quote publication generation already exists.")
         os.replace(staging_dir, final_dir)
+        transaction.remap_owned_prefix(staging_dir, final_dir)
     except Exception:
-        for uncommitted_dir in (staging_dir, final_dir):
-            if uncommitted_dir.exists() and uncommitted_dir.is_dir():
-                shutil.rmtree(uncommitted_dir)
         raise
     return {
         "publication_id": publication_id,
@@ -25908,58 +26883,70 @@ def cleanup_uncommitted_local_quote_publication(
     session_id: str,
     staged_publication: dict[str, Any] | None,
     *,
-    previous_metadata: dict[str, Any] | None = None,
-    previous_metadata_snapshot: str | None = None,
+    transaction: LocalQuoteSessionTransaction,
 ) -> None:
-    if not isinstance(staged_publication, dict):
-        return
-    publication_id = safe_quote_publication_id(
-        staged_publication.get("publication_id"),
-        "",
-    )
-    if not publication_id:
-        return
-    current = read_quote_session_metadata(session_id)
-    current_publication = current.get("publication") if isinstance(current.get("publication"), dict) else {}
-    if safe_quote_publication_id(current_publication.get("active_publication_id"), "") == publication_id:
-        if previous_metadata is None:
-            return
-        metadata_path = quote_session_metadata_path(session_id)
-        if previous_metadata_snapshot is not None:
-            atomic_write_text(metadata_path, previous_metadata_snapshot)
-        elif previous_metadata:
-            restored = normalized_quote_session_metadata(previous_metadata)
-            if not restored:
-                raise ValueError("Previous quote session metadata is not restorable.")
-            atomic_write_text(
-                metadata_path,
-                json.dumps(restored, indent=2, sort_keys=True),
-            )
-        elif metadata_path.exists():
-            metadata_path.unlink()
-        restored_metadata = read_quote_session_metadata(session_id)
-        restored_publication = (
-            restored_metadata.get("publication")
-            if isinstance(restored_metadata.get("publication"), dict)
-            else {}
+    _ = session_id, staged_publication
+    _remove_uncommitted_quote_session_transaction(transaction)
+
+
+def coordinated_local_quote_session_mutation(function):
+    """Admit local saves before any session read or rollback snapshot."""
+    @functools.wraps(function)
+    def coordinated(
+        payload: dict[str, Any],
+        result: dict[str, Any] | None = None,
+        output_dir: Path | None = None,
+        session_id: str | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        persistence_review = quote_commercial_persistence_preflight(payload)
+        if persistence_review:
+            error = QuoteCommercialStateError(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+            error.quote_commercial_review = persistence_review
+            raise error
+        patch = quote_session_patch_payload(payload)
+        raw_session_id = (
+            session_id
+            or patch.get("session_id")
+            or (payload.get("session_id") if isinstance(payload, dict) else "")
         )
-        if safe_quote_publication_id(
-            restored_publication.get("active_publication_id"),
-            "",
-        ) == publication_id:
-            raise RuntimeError("Failed to restore the prior quote publication authority.")
-    final_dir = staged_publication.get("final_dir")
-    if not isinstance(final_dir, Path):
-        return
-    publications_dir = quote_session_publications_dir(session_id).resolve()
-    try:
-        final_dir.resolve().relative_to(publications_dir)
-    except ValueError:
-        return
-    if final_dir.exists() and final_dir.is_dir():
-        shutil.rmtree(final_dir)
+        requested_session_id = safe_quote_session_id(raw_session_id, "")
+        explicit_session_id = bool(requested_session_id)
+        while True:
+            candidate_session_id = requested_session_id or new_quote_session_id()
+            with quote_session_mutation(candidate_session_id):
+                capability = _quote_session_filesystem_capability()
+                if _quote_session_retirement_state(candidate_session_id, capability)[0]:
+                    if explicit_session_id:
+                        raise SqagStorageAccessError(
+                            QUOTE_SESSION_RETIRED_MESSAGE,
+                            status=409,
+                            reason="quote_session_retired",
+                        )
+                    continue
+                state = _read_local_quote_session_state(candidate_session_id, capability)
+                if state["owner"] and state["owner"] != candidate_session_id:
+                    if explicit_session_id:
+                        raise SqagStorageAccessError(
+                            "Quote session alias is not available.",
+                            status=409,
+                            reason="quote_session_alias",
+                        )
+                    continue
+                return function(
+                    payload,
+                    result,
+                    output_dir,
+                    candidate_session_id,
+                    *args,
+                    **kwargs,
+                )
+
+    return coordinated
 
 
+@coordinated_local_quote_session_mutation
 def create_or_update_quote_session(
     payload: dict[str, Any],
     result: dict[str, Any] | None = None,
@@ -25981,13 +26968,11 @@ def create_or_update_quote_session(
         "",
     ) or new_quote_session_id()
     existing = read_quote_session_metadata(resolved_session_id)
-    previous_metadata_snapshot: str | None = None
-    try:
-        metadata_path = quote_session_metadata_path(resolved_session_id)
-        if metadata_path.is_file():
-            previous_metadata_snapshot = metadata_path.read_text(encoding="utf-8")
-    except OSError:
-        previous_metadata_snapshot = None
+    transaction = LocalQuoteSessionTransaction(
+        session_id=resolved_session_id,
+        session_directory=quote_session_dir(resolved_session_id),
+        initial_owner=bool(existing),
+    )
     storage = storage or LocalSqagStorage()
     now = utc_timestamp()
     metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
@@ -26003,7 +26988,11 @@ def create_or_update_quote_session(
     draft_file_records: list[dict[str, Any]] | None = None
     if draft_state_supplied:
         metadata["draft_state"] = quote_session_draft_state(patch)
-        draft_file_records = quote_session_draft_files(patch)
+        draft_file_records = (
+            quote_session_draft_files(patch)
+            if "draft_files" in patch
+            else read_quote_session_draft_files(resolved_session_id, existing)
+        )
     elif result_has_generated_quote(result):
         draft_file_records = read_quote_session_draft_files(
             resolved_session_id,
@@ -26011,50 +27000,57 @@ def create_or_update_quote_session(
         )
     staged_publication: dict[str, Any] | None = None
     committed_publication: dict[str, Any] | None = None
+    transaction_token = QUOTE_SESSION_TRANSACTION_CONTEXT.set(transaction)
     try:
-        staged_publication = stage_local_quote_publication(
-            resolved_session_id,
-            result,
-            output_dir,
-            draft_file_records=draft_file_records,
-        )
-        if staged_publication is not None:
-            metadata["generation_snapshot"] = quote_session_generation_snapshot(
-                payload,
-                patch,
-                created_at=now,
+        try:
+            staged_publication = stage_local_quote_publication(
+                resolved_session_id,
+                result,
+                output_dir,
+                draft_file_records=draft_file_records,
+                transaction=transaction,
             )
-            committed_publication = commit_local_quote_publication(
-                metadata,
-                staged_publication,
-                freshness_proof=quote_session_publication_freshness_proof(patch),
-                patch=patch,
-                authority=(result or {}).get("_publication_authority") or local_publication_authority_for_payload(payload),
-            )
-        else:
-            if draft_state_supplied and draft_file_records is not None:
-                write_quote_session_draft_files(resolved_session_id, draft_file_records)
-                metadata["publication"].pop("draft_files_publication_id", None)
-            mark_quote_session_exports_stale(
-                metadata,
-                quote_session_authoritative_current_export_kinds(
-                    existing,
+            if staged_publication is not None:
+                metadata["generation_snapshot"] = quote_session_generation_snapshot(
+                    payload,
                     patch,
-                    storage=storage,
-                    authority=local_current_publication_authority(payload),
-                ),
-            )
-            committed = write_quote_session_metadata(metadata)
-            metadata.clear()
-            metadata.update(committed)
-    except Exception:
-        cleanup_uncommitted_local_quote_publication(
-            resolved_session_id,
-            staged_publication,
-            previous_metadata=existing,
-            previous_metadata_snapshot=previous_metadata_snapshot,
-        )
-        raise
+                    created_at=now,
+                )
+                committed_publication = commit_local_quote_publication(
+                    metadata,
+                    staged_publication,
+                    freshness_proof=quote_session_publication_freshness_proof(patch),
+                    patch=patch,
+                    authority=(result or {}).get("_publication_authority") or local_publication_authority_for_payload(payload),
+                )
+            else:
+                if draft_state_supplied and draft_file_records is not None:
+                    write_quote_session_draft_files(resolved_session_id, draft_file_records)
+                    metadata["publication"].pop("draft_files_publication_id", None)
+                mark_quote_session_exports_stale(
+                    metadata,
+                    quote_session_authoritative_current_export_kinds(
+                        existing,
+                        patch,
+                        storage=storage,
+                        authority=local_current_publication_authority(payload),
+                    ),
+                )
+                committed = write_quote_session_metadata(metadata)
+                metadata.clear()
+                metadata.update(committed)
+        except Exception as error:
+            try:
+                cleanup_uncommitted_local_quote_publication(
+                    resolved_session_id,
+                    staged_publication,
+                    transaction=transaction,
+                )
+            except Exception as cleanup_error:
+                raise cleanup_error from error
+            raise
+    finally:
+        QUOTE_SESSION_TRANSACTION_CONTEXT.reset(transaction_token)
     try:
         return public_quote_session(metadata)
     except Exception as exc:
@@ -26154,6 +27150,11 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
         raw_export["missing"] = bool(safe_recorded and not file_exists)
         raw_export["stale"] = stale
         raw_export["url"] = f"/api/quote-sessions/{session_id}/download/{kind}" if exists else None
+        raw_export["view_url"] = (
+            f"/api/quote-sessions/{session_id}/view/pdf"
+            if kind == "pdf" and exists and not stale
+            else None
+        )
         if file_exists and export_path is not None:
             raw_export["sha256"] = hashlib.sha256(export_path.read_bytes()).hexdigest()
             raw_export["size_bytes"] = export_path.stat().st_size
@@ -26280,7 +27281,16 @@ def committed_quote_session_downloads(
 
 
 def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> dict[str, Any] | None:
-    metadata = read_quote_session_metadata(session_id)
+    safe_id = safe_quote_session_id(session_id, "")
+    if not safe_id:
+        return None
+    capability = _quote_session_filesystem_capability()
+    if _quote_session_retirement_state(safe_id, capability)[0]:
+        return None
+    state = _read_local_quote_session_state(safe_id, capability)
+    if state["owner"] != safe_id:
+        return None
+    metadata = state["metadata"] if isinstance(state["metadata"], dict) else {}
     if not metadata:
         return None
     return public_quote_session(metadata, include_draft_state=include_draft_state)
@@ -26291,7 +27301,7 @@ def iso_timestamp_sort_value(value: Any) -> float:
 
 
 def list_quote_sessions() -> list[dict[str, Any]]:
-    root = quote_sessions_root()
+    root = _quote_session_filesystem_capability()["root"]
     if not root.exists():
         return []
     sessions: list[dict[str, Any]] = []
@@ -26314,20 +27324,88 @@ def list_quote_sessions() -> list[dict[str, Any]]:
     )
 
 
+def _remove_quote_session_tree_without_following_redirects(session_dir: Path) -> None:
+    if _quote_session_path_is_redirect(session_dir):
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    try:
+        entries = list(session_dir.iterdir())
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if _quote_session_path_is_redirect(entry):
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            _remove_quote_session_tree_without_following_redirects(entry)
+        elif stat.S_ISREG(info.st_mode):
+            entry.unlink()
+        else:
+            raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    session_dir.rmdir()
+
+
+def _retired_quote_session_residual_directory(
+    session_id: str,
+    capability: dict[str, Any],
+) -> Path | None:
+    root = capability["root"]
+    component = _quote_session_lifecycle_component(session_id, capability)
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise _quote_session_storage_error("quote_session_filesystem_read_failed") from exc
+    matches = [
+        entry for entry in entries
+        if _quote_session_lifecycle_component(entry.name, capability) == component
+    ]
+    if len(matches) > 1:
+        raise _quote_session_storage_error("quote_session_storage_ambiguous")
+    if not matches:
+        return None
+    residual = matches[0]
+    if _quote_session_path_is_redirect(residual) or not residual.is_dir():
+        raise _quote_session_storage_error("quote_session_storage_inconsistent")
+    try:
+        residual.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise _quote_session_storage_error("quote_session_storage_inconsistent") from exc
+    return residual
+
+
 def delete_quote_session(session_id: str) -> bool:
     safe_id = safe_quote_session_id(session_id, "")
     if not safe_id:
         return False
-    root = quote_sessions_root().resolve()
-    session_dir = quote_session_dir(safe_id)
-    try:
-        session_dir.relative_to(root)
-    except ValueError:
-        return False
-    if session_dir.name != safe_id or not session_dir.exists() or not session_dir.is_dir():
-        return False
-    shutil.rmtree(session_dir)
-    return True
+    with quote_session_mutation(safe_id):
+        capability = _quote_session_filesystem_capability()
+        retired, retired_ids = _quote_session_retirement_state(safe_id, capability)
+        if retired:
+            if safe_id not in retired_ids:
+                return True
+            residual = _retired_quote_session_residual_directory(safe_id, capability)
+            if residual is None or residual.name != safe_id:
+                return True
+            _remove_quote_session_tree_without_following_redirects(residual)
+            return True
+
+        state = _read_local_quote_session_state(safe_id, capability)
+        if state["owner"] and state["owner"] != safe_id:
+            raise SqagStorageAccessError(
+                "Quote session alias is not available.",
+                status=409,
+                reason="quote_session_alias",
+            )
+        session_dir = state["directory"]
+        if session_dir is None:
+            return False
+        retire_quote_session_id(safe_id)
+        _remove_quote_session_tree_without_following_redirects(session_dir)
+        if session_dir.exists():
+            raise OSError("Quote session directory removal did not complete.")
+        return True
 
 
 def file_data_url(path: Path) -> str:
@@ -28958,6 +30036,13 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 return
             self.send_quote_session_download(quote_session_download_match.group(1), quote_session_download_match.group(2), storage)
             return
+        quote_session_pdf_view_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)/view/pdf", path)
+        if quote_session_pdf_view_match:
+            storage = self.current_quote_session_storage()
+            if storage is None:
+                return
+            self.send_quote_session_download(quote_session_pdf_view_match.group(1), "pdf", storage, inline=True)
+            return
         quote_session_detail_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", path)
         if quote_session_detail_match:
             storage = self.current_quote_session_storage()
@@ -30755,7 +31840,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_quote_session_download(self, session_id: str, kind: str, storage: LocalSqagStorage | DatabaseSqagStorage) -> None:
+    def send_quote_session_download(
+        self,
+        session_id: str,
+        kind: str,
+        storage: LocalSqagStorage | DatabaseSqagStorage,
+        *,
+        inline: bool = False,
+    ) -> None:
         safe_id = safe_quote_session_id(session_id, "")
         normalized_kind = clean_text(kind).lower()
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(normalized_kind)
@@ -30828,7 +31920,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "completed",
                 action_reference=safe_id,
                 session_reference=safe_id,
-                operation_route="/api/quote-sessions/download",
+                operation_route="/api/quote-sessions/view/pdf" if inline else "/api/quote-sessions/download",
                 purpose=normalized_kind,
             )
         except SqagStorageAccessError as exc:
@@ -30836,7 +31928,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        disposition = "inline" if inline else "attachment"
+        self.send_header("Content-Disposition", f'{disposition}; filename="{safe_filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_security_headers()
         self.end_headers()

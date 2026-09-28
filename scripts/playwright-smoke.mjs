@@ -709,7 +709,14 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
                 status: "completed",
                 files,
                 pricing_matches: [],
-                quote_session: { session_id: quoteSessionId },
+                quote_session: {
+                  session_id: quoteSessionId,
+                  ...(testCase.viewPdf ? {
+                    exports: {
+                      pdf: { view_url: `/api/quote-sessions/${quoteSessionId}/view/pdf` },
+                    },
+                  } : {}),
+                },
               },
             }
           : {
@@ -820,6 +827,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
   }
 }
 async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
+  const quoteSessionId = await currentQuoteSessionId(page);
   const cases = [
     { id: "job-refresh-excel-completed", type: "generate", viewPdf: false, title: "Regenerating Excel", terminalStatus: "completed" },
     { id: "job-refresh-pdf-completed", type: "generate_pdf", viewPdf: true, title: "Generating PDF", terminalStatus: "completed" },
@@ -859,6 +867,14 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
                     { name: "quotation.xlsx", url: `/api/jobs/${testCase.id}/files/quotation.xlsx` },
                     ...(testCase.viewPdf ? [{ name: "quotation.pdf", url: `/api/jobs/${testCase.id}/files/quotation.pdf` }] : []),
                   ],
+                  ...(testCase.viewPdf ? {
+                    quote_session: {
+                      session_id: quoteSessionId,
+                      exports: {
+                        pdf: { view_url: `/api/quote-sessions/${quoteSessionId}/view/pdf` },
+                      },
+                    },
+                  } : {}),
                 } : {}),
               },
             }
