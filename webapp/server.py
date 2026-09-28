@@ -19217,55 +19217,52 @@ def catalog_detail_matches_other_catalog_object_family(
     selected_reference_established: bool = False,
     detail_text: Any = None,
 ) -> bool:
-    if not detail_tokens or not catalog_items:
+    full_detail_tokens = (
+        set(catalog_family_token_sequence(detail_text))
+        if detail_text is not None
+        else set(detail_tokens)
+    )
+    if not (detail_tokens or full_detail_tokens) or not catalog_items:
         return False
 
     grouped = catalog_items_grouped_by_identity_key(catalog_items, item)
     selected_id = catalog_item_identity_key(item)
-    selected_sequences = catalog_family_alternative_sequences(grouped.get(selected_id, [item]))
-    selected_family_tokens = set().union(*(set(sequence) for sequence in selected_sequences)) if selected_sequences else set()
-    selected_heads = {sequence[-1] for sequence in selected_sequences if sequence}
-    detail_sequence = catalog_family_token_sequence(detail_text) if clean_text(detail_text) else ()
+    selected_alternatives = {
+        frozenset(sequence)
+        for sequence in catalog_family_alternative_sequences(grouped.get(selected_id, [item]))
+    }
 
     for candidate_id, entries in grouped.items():
         if candidate_id == selected_id:
             continue
         for family_sequence in catalog_family_alternative_sequences(entries):
             family_tokens = frozenset(family_sequence)
+            if family_tokens in selected_alternatives:
+                continue
+            if family_tokens <= full_detail_tokens:
+                return True
+
+            competing_evidence = family_tokens & detail_tokens
             if any(
-                catalog_family_sequence_is_subsequence(family_sequence, selected_sequence)
-                for selected_sequence in selected_sequences
+                alternative <= detail_tokens
+                and competing_evidence <= alternative
+                for alternative in selected_alternatives
             ):
                 continue
-            if (
-                detail_sequence
-                and catalog_family_sequence_occurs(detail_sequence, family_sequence)
-            ) or (not detail_sequence and family_tokens <= detail_tokens):
-                return True
-            family_head = family_sequence[-1] if family_sequence else ""
-            shared_object_head = bool(family_head and family_head in selected_heads)
-            shared_selected_object_head = bool(selected_heads & family_tokens)
-            distinguishing_tokens = family_tokens - selected_family_tokens
-            selected_reference_conflict = bool(
-                selected_reference_established
-                and distinguishing_tokens
-                and (
-                    (shared_selected_object_head and distinguishing_tokens & detail_tokens)
-                    or (
-                        len(distinguishing_tokens) >= 2
-                        and distinguishing_tokens <= detail_tokens
-                    )
-                )
-            )
-            shared_head_conflict = bool(
-                shared_object_head
-                and family_head in detail_tokens
-                and detail_tokens & distinguishing_tokens
-            )
-            if selected_reference_conflict or shared_head_conflict:
-                return True
-    return False
 
+            for alternative in selected_alternatives:
+                shared_tokens = family_tokens & alternative
+                discriminating_detail = (family_tokens - alternative) & detail_tokens
+                if (
+                    discriminating_detail
+                    and shared_tokens
+                    and (
+                        selected_reference_established
+                        or shared_tokens & detail_tokens
+                    )
+                ):
+                    return True
+    return False
 
 def catalog_line_contradicts_item(
     line_text: Any,

@@ -8,6 +8,7 @@ import hashlib
 import html
 import http.client
 import inspect
+import itertools
 import io
 import json
 import os
@@ -3911,10 +3912,29 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         self.assertEqual(items[0]["unit"], "sqm")
-        self.assertEqual(
-            items[0]["description"],
-            "[ sqm synthetic carpet tile ] - sqm synthetic carpet and sqm printed floor panel",
-        )
+        self.assertEqual(items[0]["description"], "sqm synthetic carpet and sqm printed floor panel")
+        self.assertEqual(items[0]["pricing_keyword"], "")
+        self.assertEqual(items[0]["status"], "unmatched")
+        self.assertNotIn("catalog_unit_price", items[0])
+
+    def test_normalize_line_items_prices_safe_carpet_tile_with_customer_facing_sqm_text(self):
+        items = webapp.normalize_line_items({
+            "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
+            "pricing_reference_source": "local",
+            "pricing_reference": {"id": "synthetic-exhibition-fixture-pricing", "source": "local"},
+            "line_items": [{
+                "section": "Synthetic Floors",
+                "quantity": "36",
+                "unit": "m2",
+                "description": "m2 synthetic carpet tile for final layout",
+                "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+            }],
+        })
+
+        self.assertEqual(items[0]["unit"], "sqm")
+        self.assertEqual(items[0]["description"], "[ sqm synthetic carpet tile ] - For final layout")
+        self.assertEqual(items[0]["pricing_keyword"], "synthetic-floors-synthetic-carpet-tile")
+        self.assertEqual(items[0]["catalog_unit_price"], 14.4)
 
     def test_catalog_reference_suffix_starts_with_uppercase_letter(self):
         self.assertEqual(
@@ -4260,7 +4280,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         )
         self.assertEqual(items[2]["catalog_unit_price"], 14.3)
 
-    def test_normalize_line_items_preserves_explicit_one_metre_structural_catalog_price(self):
+    def test_normalize_line_items_reviews_one_metre_structural_competing_family(self):
         items = webapp.normalize_line_items({
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
             "pricing_reference_source": "local",
@@ -4274,6 +4294,25 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "pricing_keyword": "synthetic-structures-synthetic-wall-rail",
                 }
             ],
+        })
+
+        self.assertEqual(items[0]["unit"], "m")
+        self.assertEqual(items[0]["pricing_keyword"], "")
+        self.assertEqual(items[0]["status"], "unmatched")
+        self.assertNotIn("catalog_unit_price", items[0])
+
+    def test_normalize_line_items_prices_explicit_one_metre_structural_match_without_competing_detail(self):
+        items = webapp.normalize_line_items({
+            "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
+            "pricing_reference_source": "local",
+            "pricing_reference": {"id": "synthetic-exhibition-fixture-pricing", "source": "local"},
+            "line_items": [{
+                "section": "Synthetic Structures",
+                "quantity": 1,
+                "unit": "m",
+                "description": "synthetic wall rail",
+                "pricing_keyword": "synthetic-structures-synthetic-wall-rail",
+            }],
         })
 
         self.assertEqual(items[0]["unit"], "m length")
@@ -6036,7 +6075,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("pricing_keyword", lines[1])
         self.assertNotIn("pricing_reference_description", lines[1])
 
-    def test_normalize_ai_draft_maps_positive_coffee_package_to_catalog_row(self):
+    def test_normalize_ai_draft_keeps_coffee_package_context_for_pricing_review(self):
         parsed = {
             "quote_basis_sections": [
                 {
@@ -6062,11 +6101,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["tag"], "Confirm")
-        self.assertEqual(line["pricing_keyword"], "synthetic-lighting-and-av-day-synthetic-refreshment-service")
-        self.assertEqual(line["pricing_reference_description"], "day synthetic refreshment service")
-        self.assertTrue(line["text"].startswith("[ day synthetic refreshment service ] - "))
-        self.assertNotIn("custom_pricing", line)
+        self.assertEqual(line["tag"], "Custom")
+        self.assertEqual(line["text"], "synthetic refreshment service package for fixture counter area")
+        self.assertTrue(line["custom_pricing"])
+        self.assertNotIn("pricing_keyword", line)
+        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
 
     def test_normalize_ai_draft_maps_positive_water_connection_to_catalog_row(self):
         reference_id = "water-metadata-test"
@@ -6445,12 +6484,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             for section in result["quote_basis_sections"]
             for line in section["lines"]
         ]
-        pe_line = next(line for line in lines if line.get("pricing_keyword") == "synthetic-rentals-synthetic-storage-cabinet")
-        water_line = next(line for line in lines if line.get("pricing_keyword") == "synthetic-lighting-and-av-synthetic-socket-point")
-        self.assertEqual(pe_line["text"], "[ nos. synthetic storage cabinet ] - Custom synthetic counter")
-        self.assertEqual(water_line["tag"], "Confirm")
-        self.assertEqual(water_line["pricing_keyword"], "synthetic-lighting-and-av-synthetic-socket-point")
-        self.assertEqual(water_line["pricing_reference_description"], "nos. synthetic socket point")
+        storage_line = next(line for line in lines if line["text"] == "Custom synthetic counter")
+        socket_line = next(
+            line for line in lines
+            if line["text"] == "synthetic socket point provision for fixture counter"
+        )
+        for line in (storage_line, socket_line):
+            self.assertEqual(line["tag"], "Custom")
+            self.assertNotIn("pricing_keyword", line)
 
     def test_remote_draft_keeps_catalog_matches_confirm_and_custom_rows_ai_confirm(self):
         reference_id = "catalog-confirm-custom-review-test"
@@ -6680,7 +6721,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(draft["quote_basis_sections"][0]["lines"][0]["tag"], "Confirm")
         self.assertEqual(draft["quote_basis_sections"][0]["lines"][0]["confidence"], 91)
 
-    def test_normalize_ai_draft_moves_catalog_matched_basis_line_to_catalog_section(self):
+    def test_normalize_ai_draft_keeps_meeting_area_catalog_conflict_for_review(self):
         parsed = {
             "quote_basis_sections": [
                 {
@@ -6708,9 +6749,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(draft["quote_basis_sections"][0]["title"], "Synthetic Rentals")
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["text"], "[ nos. synthetic cafe chair ] - For meeting area seating")
-        self.assertEqual(line["pricing_keyword"], "synthetic-rentals-synthetic-cafe-chair")
-        self.assertEqual(line["catalog_description"], "nos. synthetic cafe chair")
+        self.assertEqual(line["tag"], "Custom")
+        self.assertEqual(line["text"], "synthetic cafe chair for meeting area seating")
+        self.assertTrue(line["custom_pricing"])
+        self.assertNotIn("pricing_keyword", line)
+        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
 
     def test_normalize_ai_draft_splits_embedded_basis_decisions_for_review(self):
         parsed = {
@@ -11029,10 +11072,26 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         })
 
-        self.assertEqual(items[0]["unit"], "nos")
-        self.assertEqual(items[0]["quantity"], 0.5)
-        self.assertEqual(items[0]["price_mode"], "Priced")
-        self.assertIn("catalog_unit_price", items[0])
+        self.assertEqual(items[0]["unit"], "m length")
+        self.assertEqual(items[0]["pricing_keyword"], "")
+        self.assertEqual(items[0]["status"], "unmatched")
+        self.assertNotIn("catalog_unit_price", items[0])
+
+        safe_items = webapp.normalize_line_items({
+            "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
+            "pricing_reference_source": "local",
+            "line_items": [{
+                "section": "Synthetic Rentals",
+                "quantity": 0.5,
+                "unit": "m length",
+                "description": "0.5 synthetic cafe chair",
+                "pricing_keyword": affected[0]["id"],
+            }],
+        })
+        self.assertEqual(safe_items[0]["unit"], "nos")
+        self.assertEqual(safe_items[0]["quantity"], 0.5)
+        self.assertEqual(safe_items[0]["price_mode"], "Priced")
+        self.assertIn("catalog_unit_price", safe_items[0])
 
     def test_koncept_pricing_reference_descriptions_match_clean_v11_workbook_build(self):
         current = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))
@@ -12269,8 +12328,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("fixture-beta", result["quote_basis"])
         self.assertNotIn("counters", result["quote_basis"])
         self.assertEqual(result["line_items"][0]["unit"], "sqm")
-        self.assertEqual(result["line_items"][0]["description"], "sqm synthetic carpet tile")
-        self.assertEqual(result["line_items"][0]["catalog_description"], "sqm synthetic carpet tile")
+        self.assertTrue(result["line_items"])
+        self.assertTrue(all(not line.get("pricing_keyword") for line in result["line_items"]))
+        self.assertTrue(all("catalog_unit_price" not in line for line in result["line_items"]))
+        self.assertTrue(any(line.get("status") == "unmatched" for line in result["line_items"]))
+        floor_section = next(
+            section for section in result["quote_basis_sections"]
+            if section["title"] == "Synthetic Floors"
+        )
+        self.assertTrue(all(line["tag"] == "Custom" for line in floor_section["lines"]))
 
     def test_draft_quote_basis_falls_back_when_env_file_has_no_key(self):
         payload = valid_payload()
@@ -42836,6 +42902,202 @@ process.stdout.write("ok");
             catalog_items=list(alternate_lookup.values()),
         ))
 
+    def test_sqag_212_catalog_family_residual_set_semantics(self):
+        def catalog_item(item_id, description, families, price):
+            return {
+                "id": item_id,
+                "section": "Lighting",
+                "description": f"nos {description}",
+                "pricing_reference_description": f"nos {description}",
+                "unit_hint": "nos",
+                "sale_unit_price": price,
+                "match_terms": [description],
+                "object_families": list(families),
+            }
+
+        # R1/R2: family identity is a set, including deterministic two- and
+        # three-token permutations of each family and its independent detail.
+        for selected_words, competing_words in (
+            (("wall", "light"), ("ceiling", "light")),
+            (("wall", "lamp", "light"), ("ceiling", "lamp", "light")),
+        ):
+            outcomes = set()
+            for selected_order in itertools.permutations(selected_words):
+                for competing_order in itertools.permutations(competing_words):
+                    for detail_order in itertools.permutations(competing_words):
+                        selected = catalog_item(
+                            "selected-light",
+                            "wall light",
+                            [" ".join(selected_order)],
+                            40,
+                        )
+                        competing = catalog_item(
+                            "competing-light",
+                            "ceiling light",
+                            [" ".join(competing_order)],
+                            120,
+                        )
+                        detail = " ".join(detail_order)
+                        description = f"[ nos wall light ] - {detail}"
+                        outcome = webapp.catalog_line_contradicts_item(
+                            description,
+                            selected,
+                            catalog_items=[selected, competing],
+                        )
+                        outcomes.add(outcome)
+                        self.assertTrue(outcome, description)
+            self.assertEqual(outcomes, {True})
+
+        # R2 stop-word boundary: saved family and detail sets retain the same
+        # tokens even when their word orders differ.
+        for family_order in itertools.permutations(("ceiling", "area", "panel")):
+            for detail_order in itertools.permutations(("ceiling", "area", "panel")):
+                selected_lamp = catalog_item(
+                    "selected-wall-lamp",
+                    "wall lamp",
+                    ["wall lamp"],
+                    40,
+                )
+                competing_panel = catalog_item(
+                    "competing-ceiling-panel",
+                    "ceiling area panel",
+                    [" ".join(family_order)],
+                    120,
+                )
+                description = f"[ nos wall lamp ] - {' '.join(detail_order)}"
+                self.assertTrue(webapp.catalog_line_contradicts_item(
+                    description,
+                    selected_lamp,
+                    catalog_items=[selected_lamp, competing_panel],
+                ), description)
+                self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(
+                    description,
+                    selected_lamp,
+                    catalog_items=[selected_lamp, competing_panel],
+                ), description)
+
+        # R3 strict-superset boundary: a selected ceiling-light-adapter family
+        # does not make a complete ceiling-light competitor compatible. Token
+        # order in either saved family or the row detail must not change review.
+        for selected_order in itertools.permutations(("ceiling", "light", "adapter")):
+            selected_adapter = catalog_item(
+                "selected-ceiling-adapter",
+                "ceiling light adapter",
+                [" ".join(selected_order)],
+                40,
+            )
+            for competing_order in itertools.permutations(("ceiling", "light")):
+                competing_light = catalog_item(
+                    "competing-ceiling-light",
+                    "ceiling light",
+                    [" ".join(competing_order)],
+                    120,
+                )
+                for detail_order in itertools.permutations(("ceiling", "light")):
+                    description = f"[ nos ceiling light adapter ] - {' '.join(detail_order)}"
+                    self.assertTrue(webapp.catalog_line_contradicts_item(
+                        description, selected_adapter,
+                        catalog_items=[selected_adapter, competing_light],
+                    ), description)
+                    self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(
+                        description, selected_adapter,
+                        catalog_items=[selected_adapter, competing_light],
+                    ), description)
+
+        selected = catalog_item(
+            "selected-wall-light",
+            "wall light",
+            ["wall light", "ceiling adapter"],
+            40,
+        )
+        competing = catalog_item(
+            "competing-ceiling-light",
+            "ceiling light",
+            ["ceiling light"],
+            120,
+        )
+        partial_description = "[ nos wall light ] - ceiling mounted"
+        # R3/R4: ceiling tokens from the second selected alternative cannot be
+        # combined with the shared light token from the first alternative.
+        for selected_families in (
+            ["wall light", "ceiling adapter"],
+            ["ceiling adapter", "wall light"],
+        ):
+            for catalog_order in (
+                [selected, competing],
+                [competing, selected],
+            ):
+                selected_variant = {
+                    **copy.deepcopy(selected),
+                    "object_families": list(selected_families),
+                }
+                catalog = [
+                    selected_variant if row["id"] == selected["id"] else row
+                    for row in catalog_order
+                ]
+                self.assertTrue(webapp.catalog_line_contradicts_item(
+                    partial_description,
+                    selected_variant,
+                    catalog_items=catalog,
+                ))
+                self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(
+                    partial_description,
+                    selected_variant,
+                    catalog_items=catalog,
+                ))
+
+        # C3: a selected saved-family phrase may be declared in the other token order.
+        reordered_selected = catalog_item(
+            "reordered-wall-light",
+            "wall light",
+            ["light wall"],
+            40,
+        )
+        reordered_competitor = catalog_item(
+            "reordered-ceiling-light",
+            "ceiling light",
+            ["light ceiling"],
+            120,
+        )
+        selected_detail = "[ nos wall light ] - wall light"
+        self.assertFalse(webapp.catalog_line_contradicts_item(
+            selected_detail,
+            reordered_selected,
+            catalog_items=[reordered_selected, reordered_competitor],
+        ))
+        self.assertTrue(webapp.explicit_catalog_keyword_has_usable_overlap(
+            selected_detail,
+            reordered_selected,
+            catalog_items=[reordered_selected, reordered_competitor],
+        ))
+
+        # C4: one genuinely supporting selected alternative is sufficient.
+        compatible_selected = {
+            **copy.deepcopy(reordered_selected),
+            "object_families": ["wall light", "ceiling light"],
+        }
+        compatible_detail = "[ nos wall light ] - ceiling light"
+        self.assertFalse(webapp.catalog_line_contradicts_item(
+            compatible_detail,
+            compatible_selected,
+            catalog_items=[compatible_selected, reordered_competitor],
+        ))
+
+        # G2 boundary: complete selected evidence resolves the shared ceiling
+        # token, while complete competing evidence still rejects the selection.
+        adapter = catalog_item("selected-adapter", "ceiling adapter", ["ceiling adapter"], 70)
+        ceiling_light = catalog_item("competing-ceiling-light", "ceiling light", ["ceiling light"], 120)
+        self.assertFalse(webapp.catalog_line_contradicts_item(
+            "[ nos ceiling adapter ] - ceiling adapter",
+            adapter,
+            catalog_items=[adapter, ceiling_light],
+        ))
+        self.assertTrue(webapp.catalog_line_contradicts_item(
+            "[ nos ceiling adapter ] - ceiling light",
+            adapter,
+            catalog_items=[adapter, ceiling_light],
+        ))
+
     def test_sqag_212_rejection_and_safe_authority_reach_real_generator(self):
         import generate_quote as quote_generator
 
@@ -42872,8 +43134,9 @@ process.stdout.write("ok");
         negative_brief = webapp.payload_to_brief(negative_payload)
         self.assertIs(negative_brief["_pricing_authority_enforced"], True)
 
-        def generator_rows(brief):
+        def generator_rows(brief, catalog_items=None):
             digest = brief["_pricing_reference_authority"]["digest"]
+            rows = catalog_items if catalog_items is not None else items
             return [
                 quote_generator.PriceRow(
                     row_number=index,
@@ -42889,7 +43152,7 @@ process.stdout.write("ok");
                     catalog_digest=digest,
                     catalog_currency="SGD",
                 )
-                for index, item in enumerate(items, start=1)
+                for index, item in enumerate(rows, start=1)
             ]
 
         negative_lines = quote_generator.prepare_lines(
@@ -42905,6 +43168,211 @@ process.stdout.write("ok");
         self.assertIsNone(negative_lines[0].amount)
         negative_issues = quote_generator.confirmation_issues([], negative_lines)
         self.assertTrue(any("Unmatched pricing" in issue for issue in negative_issues))
+
+        def assert_residual_unpriced(lines):
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0].match_status, "unmatched")
+            self.assertIsNone(lines[0].matched_price)
+            self.assertIsNone(lines[0].amount)
+            self.assertTrue(any(
+                "Unmatched pricing" in issue
+                for issue in quote_generator.confirmation_issues([], lines)
+            ))
+
+        # R1, R3, R6, R7, R8, and R10: order-invariant complete evidence and
+        # independent partial evidence survive copied prices and a valid-looking
+        # selected catalog authority through restore, owned normalization, brief
+        # conversion, and the real generator with ambiguity explicitly enabled.
+        residual_negative_cases = (
+            (
+                "R1_ordered_family",
+                self.sqag_212_catalog_items(wall_families=["light wall"]),
+                "[ nos wall light ] - light ceiling",
+            ),
+            (
+                "R3_distributed_alternatives",
+                self.sqag_212_catalog_items(wall_families=["wall light", "ceiling adapter"]),
+                "[ nos wall light ] - ceiling mounted",
+            ),
+            (
+                "R2_stop_word_family_permutation",
+                [
+                    {
+                        "id": "arbitrary-wall-luminaire-01",
+                        "section": "Lighting",
+                        "description": "nos wall lamp",
+                        "pricing_reference_description": "nos wall lamp",
+                        "unit_hint": "nos",
+                        "sale_unit_price": 40,
+                        "match_terms": ["wall lamp"],
+                        "object_families": ["wall lamp"],
+                    },
+                    {
+                        "id": "arbitrary-ceiling-luminaire-02",
+                        "section": "Lighting",
+                        "description": "nos ceiling area panel",
+                        "pricing_reference_description": "nos ceiling area panel",
+                        "unit_hint": "nos",
+                        "sale_unit_price": 120,
+                        "match_terms": ["ceiling area panel"],
+                        "object_families": ["panel area ceiling"],
+                    },
+                ],
+                "[ nos wall lamp ] - panel ceiling area",
+            ),
+            (
+                "R5_strict_superset_competitor",
+                [
+                    {
+                        "id": "arbitrary-wall-luminaire-01",
+                        "section": "Lighting",
+                        "description": "nos ceiling adapter light",
+                        "pricing_reference_description": "nos ceiling adapter light",
+                        "unit_hint": "nos",
+                        "sale_unit_price": 40,
+                        "match_terms": ["ceiling adapter light"],
+                        "object_families": ["ceiling adapter light"],
+                    },
+                    {
+                        "id": "arbitrary-ceiling-luminaire-02",
+                        "section": "Lighting",
+                        "description": "nos ceiling light",
+                        "pricing_reference_description": "nos ceiling light",
+                        "unit_hint": "nos",
+                        "sale_unit_price": 120,
+                        "match_terms": ["ceiling light"],
+                        "object_families": ["light ceiling"],
+                    },
+                ],
+                "[ nos ceiling adapter light ] - light ceiling",
+            ),
+        )
+        for label, residual_items, description in residual_negative_cases:
+            with self.subTest(case=label):
+                payload = self.sqag_212_payload(residual_items)
+                lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload)
+                selected_item = lookup["arbitrary-wall-luminaire-01"]
+                reference_authority = webapp.exact_pricing_reference_authority(payload)
+                copied_row = {
+                    "section": "Lighting",
+                    "quantity": 2,
+                    "unit": "nos",
+                    "description": description,
+                    "pricing_keyword": selected_item["id"],
+                    "price_mode": "Priced",
+                    "status": "matched",
+                    "unit_price_override": 40,
+                    "effective_unit_price": 40,
+                    "catalog_unit_price": 40,
+                    "pricing_basis_amount": 80,
+                    "approved_quote_amount": 109.6,
+                }
+                copied_row["pricing_authority"] = webapp.build_pricing_authority(
+                    "catalog",
+                    copied_row,
+                    price=40,
+                    reference_authority=reference_authority,
+                    catalog_item=selected_item,
+                )
+                payload["line_items"] = [copied_row]
+
+                # JSON serialization/restore and repeated normalization must not
+                # turn the rejected catalog authority into manual-price authority.
+                restored = json.loads(json.dumps(payload))
+                for _ in range(2):
+                    [rejected] = webapp.normalize_line_items(restored)
+                    self.assertEqual(rejected["pricing_authority"]["variant"], "historical")
+                    self.assertEqual(rejected["status"], "unmatched")
+                    self.assertIsNone(webapp.pricing_authority_price(rejected["pricing_authority"]))
+                    for field in (
+                        "effective_unit_price", "unit_price_override", "catalog_unit_price",
+                        "pricing_basis_amount", "approved_quote_amount",
+                    ):
+                        self.assertNotIn(field, rejected)
+                    owned = webapp.normalize_owned_line_item(
+                        rejected,
+                        reference_authority=reference_authority,
+                        catalog_lookup=lookup,
+                    )
+                    self.assertEqual(owned["pricing_authority"]["variant"], "historical")
+                    self.assertEqual(owned["status"], "unmatched")
+                    rebound = webapp.rebind_pricing_authority_context(
+                        owned,
+                        reference_authority=reference_authority,
+                        catalog_lookup=lookup,
+                        catalog_evidence_descriptions=(description,),
+                    )
+                    self.assertEqual(rebound["pricing_authority"]["variant"], "historical")
+                    self.assertEqual(rebound["status"], "unmatched")
+                    restored["line_items"] = [rebound]
+
+                # The original payload and the persisted/rebound row both reach
+                # the generator and remain review-only with allow_ambiguous=True.
+                raw_brief = webapp.payload_to_brief(copy.deepcopy(payload))
+                assert_residual_unpriced(quote_generator.prepare_lines(
+                    raw_brief,
+                    generator_rows(raw_brief, residual_items),
+                    allow_ambiguous=True,
+                    authority_required=True,
+                    trusted_pricing_reference=raw_brief["_pricing_reference_authority"],
+                ))
+                payload["line_items"] = [rebound]
+                owned_brief = webapp.payload_to_brief(payload)
+                assert_residual_unpriced(quote_generator.prepare_lines(
+                    owned_brief,
+                    generator_rows(owned_brief, residual_items),
+                    allow_ambiguous=True,
+                    authority_required=True,
+                    trusted_pricing_reference=owned_brief["_pricing_reference_authority"],
+                ))
+
+        # C3/C4: changed phrase order and a single genuinely supporting selected
+        # alternative remain priceable through the same consequential boundary.
+        positive_family_cases = (
+            ("C3_reordered_family", ["light wall"], "[ nos wall light ] - wall light"),
+            (
+                "C4_individual_alternative",
+                ["wall light", "ceiling light"],
+                "[ nos wall light ] - ceiling light",
+            ),
+            (
+                "C5_harmless_suffix",
+                ["wall light"],
+                "[ nos wall light ] - mounted on a white panel",
+            ),
+        )
+        for label, selected_families, description in positive_family_cases:
+            with self.subTest(case=label):
+                positive_items = self.sqag_212_catalog_items(wall_families=selected_families)
+                payload = self.sqag_212_payload(positive_items)
+                payload["line_items"] = [{
+                    "section": "Lighting",
+                    "quantity": 2,
+                    "unit": "nos",
+                    "description": description,
+                    "pricing_keyword": "arbitrary-wall-luminaire-01",
+                    "price_mode": "Priced",
+                }]
+                [normalized] = webapp.normalize_line_items(payload)
+                self.assertEqual(normalized["pricing_authority"]["variant"], "catalog")
+                lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload)
+                owned = webapp.normalize_owned_line_item(
+                    normalized,
+                    reference_authority=webapp.exact_pricing_reference_authority(payload),
+                    catalog_lookup=lookup,
+                )
+                payload["line_items"] = [owned]
+                brief = webapp.payload_to_brief(payload)
+                [generated] = quote_generator.prepare_lines(
+                    brief,
+                    generator_rows(brief, positive_items),
+                    allow_ambiguous=True,
+                    authority_required=True,
+                    trusted_pricing_reference=brief["_pricing_reference_authority"],
+                )
+                self.assertEqual(generated.match_status, "matched")
+                self.assertEqual(generated.amount, 80)
+                self.assertEqual(quote_generator.confirmation_issues([], [generated]), [])
 
         # P1/P2: correct wall and ceiling identities price through the same boundary.
         for label, item_id, description, expected in (
@@ -43482,6 +43950,245 @@ process.stdout.write("ok");
             self.assertTrue(existing_artifact.exists(), response)
             self.assertEqual(existing_artifact.read_bytes(), existing_bytes)
             self.assertEqual(sorted(path.name for path in output_root.iterdir()), ["job-sqag212family"])
+
+    def test_sqag_212_authenticated_generation_preserves_valid_publication_on_residual_review(self):
+        root = test_temp_root() / f"sqag-212-published-residual-{time.time_ns()}"
+        db_path = root / "sqag.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        output_root = root / "output"
+        session_id = "quote-sqag212-published"
+        profile_id = "profile-sqag212-published"
+        pricing_id = "pricing-sqag212-published"
+        workspace_id = "workspace-sqag212-published"
+        auth_session = self.platform_auth_session(
+            workspace_id, membership_role="owner", user_id="sqag212-publisher"
+        )
+        env = self.platform_launch_env(
+            SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="database",
+            SQAG_DATABASE_URL=database_url,
+            QUOTE_DATA_ROOT=str(root / "data"),
+            QUOTE_OUTPUT_ROOT=str(output_root),
+            QUOTE_TMP_ROOT=str(root / "tmp"),
+            QUOTE_LOG_ROOT=str(root / "_logs" / "app"),
+        )
+
+        items = self.sqag_212_catalog_items()
+        items[0]["object_families"] = ["light wall", "synthetic wall light"]
+        items[1]["object_families"] = [
+            "light ceiling",
+            "synthetic ceiling light",
+            "ceiling area panel",
+        ]
+        items[0]["object_families"].append("synthetic ceiling light adapter")
+        items.append({
+            "id": "arbitrary-synthetic-meeting-panel-03",
+            "section": "Other",
+            "description": "nos synthetic meeting room panel",
+            "pricing_reference_description": "nos synthetic meeting room panel",
+            "unit_hint": "nos",
+            "sale_unit_price": 75,
+            "match_terms": ["synthetic meeting room panel"],
+            "object_families": ["synthetic meeting room panel"],
+        })
+        for item in items:
+            item["internal_cost"] = item["sale_unit_price"]
+            item["markup_multiplier"] = 1
+        quote_session = copy.deepcopy(
+            recovered_convergence_payload(include_included_row=False)["quote_session"]
+        )
+        payload = self.sqag_212_payload(items)
+        payload.update({
+            "profile_id": profile_id,
+            "profile_source": "company",
+            "pricing_reference_id": pricing_id,
+            "pricing_reference_source": "company",
+            "pricing_reference": {"id": pricing_id, "source": "company"},
+            "line_items": [{
+                "section": "Lighting",
+                "quantity": 2,
+                "unit": "nos",
+                "description": "[ nos wall light ] - for final layout",
+                "pricing_keyword": "arbitrary-wall-luminaire-01",
+                "price_mode": "Priced",
+            }],
+        })
+        quote_session["session_id"] = session_id
+        quote_session["draft_state"]["selectedPresetValue"] = f"company:{profile_id}"
+
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp, "validated_platform_auth_session", side_effect=lambda session: session
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(auth_session)
+            self.assertIsNotNone(storage)
+            storage.save_profile(workspace_profile_with_layout(profile_id))
+            pricing_reference = webapp.normalize_pricing_reference_payload({
+                "id": pricing_id,
+                "label": "Synthetic SQAG 212 residual publication catalog",
+                "currency": "SGD",
+                "tax": {"label": "GST", "rate": 0.09},
+                "items": copy.deepcopy(items),
+            })
+            storage.save_pricing_reference(pricing_reference)
+
+            # Establish the valid catalog authority before attaching recovered,
+            # workspace-owned state. This exercises the initial owned transition.
+            reference_authority = webapp.exact_pricing_reference_authority(
+                payload, auth_session=auth_session
+            )
+            self.assertIsNotNone(reference_authority)
+            [baseline_row] = webapp.normalize_line_items(payload, auth_session=auth_session)
+            self.assertEqual(baseline_row["pricing_authority"]["variant"], "catalog")
+            self.assertEqual(baseline_row["effective_unit_price"], 40)
+            baseline_row.update({
+                "pricing_basis_amount": 80,
+                "approved_quote_amount": 109.6,
+                "pricing_basis_currency": "SGD",
+                "pricing_reference_id": pricing_id,
+                "pricing_reference_source": "company",
+                "pricing_basis_digest": reference_authority["detail"]["digest_sha256"],
+            })
+            payload["line_items"] = [copy.deepcopy(baseline_row)]
+            payload["quote_session"] = quote_session
+            draft = payload["quote_session"]["draft_state"]
+            draft["outputRows"] = [copy.deepcopy(baseline_row)]
+            snapshot = draft["quoteDetails"]["commercial_snapshot"]
+            snapshot["pricing_basis"] = {
+                "currency": "SGD",
+                "source": "company",
+                "id": pricing_id,
+                "digest": reference_authority["detail"]["digest_sha256"],
+            }
+
+            cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(auth_session)}"
+            with LocalRunnerServer() as runner:
+                session_response = self.http_json(runner, "GET", "/api/session", cookie=cookie)
+                self.assertEqual(session_response["status"], 200, session_response)
+                csrf_header = session_response["body"]["csrf_header"]
+                csrf_token = session_response["body"]["csrf_token"]
+                baseline_response = self.http_json(
+                    runner,
+                    "POST",
+                    "/api/generate",
+                    cookie=cookie,
+                    body=copy.deepcopy(payload),
+                    headers={
+                        csrf_header: csrf_token,
+                        "Idempotency-Key": "job-sqag212-baseline",
+                    },
+                )
+                self.assertEqual(baseline_response["status"], 200, baseline_response)
+                self.assertEqual(baseline_response["body"].get("status"), "completed", baseline_response)
+                published = baseline_response["body"]["quote_session"]
+                self.assertEqual(published["session_id"], session_id)
+                export = published["exports"]["xlsx"]
+                self.assertTrue(export.get("sha256"), export)
+                artifact_path = f"/api/quote-sessions/{session_id}/download/xlsx"
+                download_headers = {"Cookie": cookie}
+                download_status, baseline_bytes = local_http_get_bytes(
+                    runner, artifact_path, headers=download_headers
+                )
+                self.assertEqual(download_status, 200)
+                baseline_hash = hashlib.sha256(baseline_bytes).hexdigest()
+                self.assertEqual(export.get("sha256"), baseline_hash)
+
+                with storage.connection() as connection:
+                    baseline_session_json = connection.execute(
+                        "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                        (workspace_id, session_id),
+                    ).fetchone()[0]
+                    baseline_artifacts = connection.execute(
+                        "select artifact_kind, filename, size_bytes, content_blob from sqag_quote_publication_artifacts where workspace_id = ? and session_id = ? order by artifact_kind",
+                        (workspace_id, session_id),
+                    ).fetchall()
+                baseline_metadata = json.loads(baseline_session_json)
+                baseline_publication_id = baseline_metadata["publication"]["proof"]["publication"]["id"]
+                self.assertTrue(baseline_publication_id, baseline_metadata)
+                baseline_exports = copy.deepcopy(baseline_metadata["exports"])
+                baseline_jobs = copy.deepcopy(webapp.JOBS)
+                baseline_output_dirs = sorted(path.name for path in output_root.iterdir())
+
+                selected_item = storage.pricing_reference_detail(pricing_id, source="company")["items"][0]
+                for suffix, description in (
+                    ("r1", "[ nos wall light ] - light ceiling"),
+                    ("r3", "[ nos wall light ] - ceiling mounted"),
+                    ("r2_stop_word_family", "[ nos wall light ] - panel ceiling area"),
+                    ("r5_strict_superset_family", "[ nos wall light ] - light synthetic ceiling"),
+                    ("r4_meeting_area_seating", "[ nos wall light ] - meeting area seating"),
+                ):
+                    with self.subTest(residual=suffix):
+                        conflicting = copy.deepcopy(payload)
+                        [conflict_row] = conflicting["line_items"]
+                        conflict_row["description"] = description
+                        conflict_row["pricing_authority"] = webapp.build_pricing_authority(
+                            "catalog",
+                            conflict_row,
+                            price=40,
+                            reference_authority=reference_authority,
+                            catalog_item=selected_item,
+                        )
+                        conflict_row.update({
+                            "unit_price_override": 40,
+                            "effective_unit_price": 40,
+                            "catalog_unit_price": 40,
+                            "pricing_basis_amount": 80,
+                            "approved_quote_amount": 109.6,
+                            "pricing_basis_currency": "SGD",
+                            "pricing_reference_id": pricing_id,
+                            "pricing_reference_source": "company",
+                            "pricing_basis_digest": reference_authority["detail"]["digest_sha256"],
+                        })
+                        conflicting["quote_session"]["draft_state"]["outputRows"] = [
+                            copy.deepcopy(conflict_row)
+                        ]
+                        response = self.http_json(
+                            runner,
+                            "POST",
+                            "/api/generate",
+                            cookie=cookie,
+                            body=conflicting,
+                            headers={
+                                csrf_header: csrf_token,
+                                "Idempotency-Key": f"job-sqag212-{suffix}-conflict",
+                            },
+                        )
+                        self.assertEqual(response["status"], 400, response)
+                        self.assertEqual(response["body"].get("status"), "blocked", response)
+                        self.assertIn(
+                            webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE,
+                            response["body"].get("errors", []),
+                        )
+                        self.assertNotEqual(response["status"], 200)
+                        self.assertNotEqual(response["body"].get("status"), "completed")
+                        self.assertEqual(webapp.JOBS, baseline_jobs)
+
+                        with storage.connection() as connection:
+                            current_session_json = connection.execute(
+                                "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                                (workspace_id, session_id),
+                            ).fetchone()[0]
+                            current_artifacts = connection.execute(
+                                "select artifact_kind, filename, size_bytes, content_blob from sqag_quote_publication_artifacts where workspace_id = ? and session_id = ? order by artifact_kind",
+                                (workspace_id, session_id),
+                            ).fetchall()
+                        current_metadata = json.loads(current_session_json)
+                        self.assertEqual(
+                            current_metadata["publication"]["proof"]["publication"]["id"],
+                            baseline_publication_id,
+                        )
+                        self.assertEqual(current_session_json, baseline_session_json)
+                        self.assertEqual(current_artifacts, baseline_artifacts)
+                        self.assertEqual(current_metadata["exports"], baseline_exports)
+                        self.assertEqual(
+                            local_http_get_bytes(runner, artifact_path, headers=download_headers),
+                            (200, baseline_bytes),
+                        )
+                        self.assertEqual(hashlib.sha256(baseline_bytes).hexdigest(), baseline_hash)
+                        self.assertEqual(
+                            sorted(path.name for path in output_root.iterdir()),
+                            baseline_output_dirs,
+                        )
 
 
 if __name__ == "__main__":
