@@ -264,6 +264,25 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         client.head_bucket = mock.Mock(side_effect=RuntimeError("private-provider-response"))
         self.assertFalse(backend.readiness_probe())
 
+    def test_s3_remote_content_type_must_match_artifact_metadata(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(bucket="synthetic", client=client)
+        metadata = backend.store_artifact(
+            workspace_id="workspace-content-type",
+            owner_type="profile",
+            owner_id="synthetic-profile",
+            artifact_kind="quotation_layout",
+            filename="synthetic-layout.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            content=b"synthetic-layout-object",
+        )
+        stored = client.objects[("synthetic", metadata.storage_key)]
+        stored["content_type"] = "application/octet-stream"
+
+        with self.assertRaises(object_storage.ObjectStorageContractError):
+            backend.retrieve_artifact(metadata, workspace_id="workspace-content-type")
+        self.assertFalse(backend.verify_metadata(metadata, workspace_id="workspace-content-type"))
+
     def test_s3_adapter_distinguishes_authoritative_missing_from_provider_outage(self):
         client = FakeS3Client()
         backend = object_storage.S3CompatibleObjectStorageBackend(bucket="synthetic", client=client)

@@ -355,12 +355,32 @@ Database rows are keyed by the platform workspace ID from the SQAG platform
 session. Profiles, pricing references, and quote sessions saved by workspace A
 must not list, read, export, or delete from workspace B.
 
+A hosted company profile is generation-ready only when its exact workspace and
+profile metadata resolve with an active quotation-layout artifact bound to that
+profile. The artifact provider, canonical key, XLSX content type, size, checksum,
+provider metadata, retrieved bytes, and workbook safety validation must agree.
+Metadata-only profiles stay out of selectable lists and do not produce complete
+detail or export responses. A metadata-only update is accepted only after the
+existing exact layout binding is freshly verified. New and incomplete profiles
+need an explicitly supplied valid layout; no default, local, bundled, generated,
+or other-profile workbook is substituted.
+
+Hosted profile JSON export includes the validated layout bytes so the exported
+pack can be imported again as authoritative profile data. Identical imports reuse
+the same artifact binding. Layout-rule normalization writes ZIP entries in a
+deterministic order with fixed metadata so timestamps alone do not change the
+normalized workbook bytes.
+
 ## Included App Data
 
 The boundary covers:
 
 - quote-company profile list, save, delete, and export payload resolution
 - profile pack layout asset persistence when artifact database mode is enabled
+- profile pack layout object persistence when artifact object mode is enabled with a usable object
+  backend
+- hosted profile selection, detail, and complete export are available only when the exact workspace
+  profile has a validated authoritative quotation-layout artifact
 - pricing-reference list, detail, save, delete, and export payload resolution
 - pricing-reference visual asset persistence when artifact database mode is enabled
 - quote-session list, read, save, delete, and download metadata resolution

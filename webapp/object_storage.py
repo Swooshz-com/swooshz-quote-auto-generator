@@ -343,6 +343,16 @@ class S3CompatibleObjectStorageBackend:
         for key, value in expected.items():
             if normalized_remote.get(key) != value:
                 raise ObjectStorageContractError("Artifact metadata verification failed.")
+        remote_content_type = str(response.get("ContentType") or "").strip()
+        require_remote_content_type = (
+            metadata.owner_type == "profile"
+            and metadata.artifact_kind == "quotation_layout"
+        )
+        if (
+            (require_remote_content_type and remote_content_type != metadata.content_type)
+            or (remote_content_type and remote_content_type != metadata.content_type)
+        ):
+            raise ObjectStorageContractError("Artifact content type verification failed.")
 
     def store_artifact(
         self,

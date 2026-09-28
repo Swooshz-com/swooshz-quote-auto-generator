@@ -1,3 +1,4 @@
+import base64
 import io
 import zipfile
 import unittest
@@ -35,6 +36,22 @@ def rewritten_layout(mutator) -> bytes:
 
 def layout_with_extra_member(name: str, value: bytes = b"synthetic") -> bytes:
     return rewritten_layout(lambda parts: parts.__setitem__(name, value))
+
+
+def layout_with_zip_timestamp(raw: bytes, timestamp: tuple[int, int, int, int, int, int]) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(raw)) as source:
+        entries = [
+            (info.filename, source.read(info))
+            for info in source.infolist()
+            if not info.is_dir()
+        ]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as target:
+        for name, content in entries:
+            info = zipfile.ZipInfo(name, date_time=timestamp)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            target.writestr(info, content)
+    return buffer.getvalue()
 
 
 def layout_with_duplicate_member(name: str) -> bytes:
@@ -318,6 +335,30 @@ class ProfileLayoutSafetyTest(unittest.TestCase):
                     {"output": {"master_format": "xlsx"}},
                 )
                 webapp.validate_profile_layout_xlsx(embedded)
+
+    def test_profile_pack_normalization_is_stable_across_zip_timestamps(self):
+        raw = FIXTURE_LAYOUT.read_bytes()
+        first = layout_with_zip_timestamp(raw, (2001, 2, 3, 4, 5, 6))
+        second = layout_with_zip_timestamp(raw, (2024, 7, 8, 9, 10, 12))
+
+        def normalized(layout_bytes):
+            data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout_bytes).decode("ascii")
+            assets = webapp.normalize_profile_pack_assets(
+                {"pack": {"quotation_layout": {"filename": "synthetic-layout.xlsx", "data_url": data_url}}},
+                {},
+            )
+            return assets["quotation_layout"]["bytes"]
+
+        with mock.patch.object(
+            webapp,
+            "default_layout_rules_payload",
+            side_effect=AssertionError("profile normalization must not read fallback layout rules"),
+        ):
+            normalized_first = normalized(first)
+            normalized_second = normalized(second)
+
+        self.assertEqual(normalized_first, normalized_second)
+        webapp.validate_profile_layout_xlsx(normalized_first)
 
     def test_rejects_unbounded_expansion_and_member_count(self):
         expanded = layout_with_extra_member("xl/media/padding.png", b"A" * 4096)

@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -446,11 +447,16 @@ class PostgresMetadataStorageTest(unittest.TestCase):
             return_value=backend,
         ):
             storage = webapp.app_storage_for_auth_session(platform_session("workspace-alpha"))
-            saved = storage.save_profile({"id": "profile-a", "label": "Profile A"})
-            listed = storage.list_company_profiles()
+            layout = ROOT / "tests" / "fixtures" / "quote-generator" / "profiles" / "synthetic-exhibition-fixture-template" / "quotation-layout.xlsx"
+            data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout.read_bytes()).decode("ascii")
+            saved = storage.save_profile(webapp.normalize_profile_payload({
+                "id": "profile-a",
+                "label": "Synthetic Profile A",
+                "pack": {"quotation_layout": {"filename": "synthetic-layout.xlsx", "data_url": data_url}},
+            }))
 
         self.assertEqual(saved["id"], "profile-a")
-        self.assertEqual([item["id"] for item in listed], ["profile-a"])
+        self.assertIn(("workspace-alpha", "profile", "profile-a", "quotation_layout"), connection.object_artifacts)
         self.assertTrue(connection.closed)
         self.assertTrue(
             any("workspace_id = %s" in query and params[0] == "workspace-alpha" for query, params in connection.queries),

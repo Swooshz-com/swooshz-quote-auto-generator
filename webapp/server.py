@@ -8841,17 +8841,39 @@ def ensure_layout_rules_relationship(parts: dict[str, bytes]) -> None:
 def xlsx_bytes_with_embedded_layout_rules(raw: bytes, rules: dict[str, Any]) -> bytes:
     validate_profile_layout_xlsx(raw)
     normalized_rules = normalize_profile_layout_rules_payload(rules)
-    if not normalized_rules:
-        return raw
-    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        parts = {name: zf.read(name) for name in zf.namelist()}
-    parts[LAYOUT_RULES_CUSTOM_XML_PATH] = layout_rules_custom_xml_bytes(normalized_rules)
-    ensure_layout_rules_relationship(parts)
+    with zipfile.ZipFile(io.BytesIO(raw)) as source:
+        parts = {
+            info.filename: source.read(info)
+            for info in source.infolist()
+            if not info.is_dir()
+        }
+    if normalized_rules:
+        parts[LAYOUT_RULES_CUSTOM_XML_PATH] = layout_rules_custom_xml_bytes(normalized_rules)
+        ensure_layout_rules_relationship(parts)
     buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, content in parts.items():
-            zf.writestr(name, content)
-    return buffer.getvalue()
+    with zipfile.ZipFile(
+        buffer,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as target:
+        for name in sorted(parts):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 0
+            info.external_attr = 0o100644 << 16
+            info.flag_bits = 0
+            info.extra = b""
+            info.comment = b""
+            target.writestr(
+                info,
+                parts[name],
+                compress_type=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            )
+    normalized = buffer.getvalue()
+    validate_profile_layout_xlsx(normalized)
+    return normalized
 
 
 def default_layout_rules_payload() -> dict[str, Any]:
@@ -8884,12 +8906,8 @@ def normalize_profile_pack_assets(profile_payload: dict[str, Any], source_payloa
     if layout:
         raw = decode_data_url_bytes(layout.get("data_url"), MAX_PROFILE_LAYOUT_BYTES)
         validate_profile_layout_xlsx(raw)
-        if rules_payload:
-            raw = xlsx_bytes_with_embedded_layout_rules(raw, rules_payload)
-        elif not embedded_layout_rules_from_xlsx_bytes(raw):
-            default_rules = default_layout_rules_payload()
-            if default_rules:
-                raw = xlsx_bytes_with_embedded_layout_rules(raw, default_rules)
+        effective_rules = rules_payload or embedded_layout_rules_from_xlsx_bytes(raw)
+        raw = xlsx_bytes_with_embedded_layout_rules(raw, effective_rules)
         assets["quotation_layout"] = {
             "filename": safe_profile_pack_filename(layout.get("filename") or layout.get("name"), "quotation-layout.xlsx", {".xlsx"}),
             "bytes": raw,
@@ -12471,9 +12489,25 @@ class DatabaseSqagStorage:
     def _is_deleted_profile_payload(payload: Any) -> bool:
         return isinstance(payload, Mapping) and payload.get(DELETED_PROFILE_MARKER_KEY) is True
 
-    def _read_payload(self, table: str, id_column: str, item_id: str) -> dict[str, Any] | None:
-        with self.connection() as connection:
-            row = connection.execute(f"select payload_json from {table} where workspace_id = ? and {id_column} = ?", (self.workspace_id, item_id)).fetchone()
+    def _read_payload(
+        self,
+        table: str,
+        id_column: str,
+        item_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any] | None:
+        if connection is None:
+            with self.connection() as active_connection:
+                row = active_connection.execute(
+                    f"select payload_json from {table} where workspace_id = ? and {id_column} = ?",
+                    (self.workspace_id, item_id),
+                ).fetchone()
+        else:
+            row = connection.execute(
+                f"select payload_json from {table} where workspace_id = ? and {id_column} = ?",
+                (self.workspace_id, item_id),
+            ).fetchone()
         if not row:
             return None
         try:
@@ -12725,12 +12759,155 @@ class DatabaseSqagStorage:
         ]
         return sorted(profiles, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("id")).casefold()))
 
+    def _validated_profile_layout_record(
+        self,
+        profile_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any] | None:
+        safe_id = safe_resource_id(profile_id, "")
+        if not safe_id:
+            return None
+        if connection is None:
+            with self.connection() as active_connection:
+                return self._validated_profile_layout_record(
+                    safe_id,
+                    connection=active_connection,
+                )
+        profile = self._read_payload(
+            "sqag_profiles",
+            "profile_id",
+            safe_id,
+            connection=connection,
+        )
+        if (
+            profile is None
+            or safe_resource_id(profile.get("id"), "") != safe_id
+            or self._is_deleted_profile_payload(profile)
+        ):
+            return None
+
+        artifact_mode = configured_artifact_storage_mode()
+        expected_content_type = QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"]
+        if artifact_mode == "database":
+            artifact = self._read_file_artifact(
+                "profile",
+                safe_id,
+                "quotation_layout",
+                connection=connection,
+            )
+            if not artifact:
+                return None
+            content = artifact.get("content")
+            filename = clean_text(artifact.get("filename"))
+            try:
+                size_bytes = int(artifact.get("size_bytes") or 0)
+            except (TypeError, ValueError):
+                return None
+            if (
+                not isinstance(content, bytes)
+                or not content
+                or not filename
+                or safe_profile_pack_filename(filename, "quotation-layout.xlsx", {".xlsx"}) != filename
+                or clean_text(artifact.get("content_type")) != expected_content_type
+                or size_bytes <= 0
+                or size_bytes > MAX_PROFILE_LAYOUT_BYTES
+                or len(content) != size_bytes
+            ):
+                return None
+            checksum = hashlib.sha256(content).hexdigest()
+        elif artifact_mode == "object":
+            rows = self._active_object_artifact_rows(
+                "profile",
+                safe_id,
+                connection=connection,
+                artifact_kind="quotation_layout",
+            )
+            if len(rows) != 1:
+                return None
+            row = rows[0]
+            try:
+                filename = clean_text(row["filename"])
+                checksum = clean_text(row["checksum_sha256"])
+                size_bytes = int(row["size_bytes"] or 0)
+                expected_key = object_artifact_key(
+                    workspace_id=self.workspace_id,
+                    owner_type="profile",
+                    owner_id=safe_id,
+                    artifact_kind="quotation_layout",
+                    filename=filename,
+                    checksum_sha256=checksum,
+                )
+            except (KeyError, TypeError, ValueError, ObjectStorageContractError):
+                return None
+            if (
+                not clean_text(row["artifact_id"])
+                or clean_text(row["workspace_id"]) != self.workspace_id
+                or clean_text(row["owner_type"]) != "profile"
+                or clean_text(row["owner_id"]) != safe_id
+                or clean_text(row["artifact_kind"]) != "quotation_layout"
+                or clean_text(row["session_id"])
+                or clean_text(row["job_id"])
+                or clean_text(row["object_provider_type"]) != "s3_compatible"
+                or clean_text(row["content_type"]) != expected_content_type
+                or not filename
+                or safe_profile_pack_filename(filename, "quotation-layout.xlsx", {".xlsx"}) != filename
+                or not re.fullmatch(r"[a-f0-9]{64}", checksum)
+                or size_bytes <= 0
+                or size_bytes > MAX_PROFILE_LAYOUT_BYTES
+                or clean_text(row["status"]) != "active"
+                or clean_text(row["retention_status"]) != "active"
+                or clean_text(row["deleted_at"])
+                or clean_text(row["object_key_ref"]) != expected_key
+            ):
+                return None
+            artifact = self._read_object_file_artifact(
+                "profile",
+                safe_id,
+                "quotation_layout",
+                connection=connection,
+            )
+            if not artifact:
+                return None
+            content = artifact.get("content")
+            if (
+                not isinstance(content, bytes)
+                or not content
+                or len(content) != size_bytes
+                or hashlib.sha256(content).hexdigest() != checksum
+                or clean_text(artifact.get("filename")) != filename
+                or clean_text(artifact.get("content_type")) != expected_content_type
+                or int(artifact.get("size_bytes") or 0) != size_bytes
+            ):
+                return None
+        else:
+            return None
+
+        try:
+            validate_profile_layout_xlsx(content)
+        except ValueError:
+            return None
+        return {
+            "profile": profile,
+            "layout": {
+                "filename": filename,
+                "content_type": expected_content_type,
+                "size_bytes": size_bytes,
+                "sha256": checksum,
+                "content": content,
+            },
+        }
+
     def list_company_profiles(self) -> list[dict[str, Any]]:
-        return [
-            profile
-            for profile in self._read_payloads("sqag_profiles", "profile_id")
-            if not self._is_deleted_profile_payload(profile)
-        ]
+        profiles: list[dict[str, Any]] = []
+        for candidate in self._read_payloads("sqag_profiles", "profile_id"):
+            profile_id = safe_resource_id(candidate.get("id"), "")
+            if not profile_id:
+                continue
+            validated = self._validated_profile_layout_record(profile_id)
+            if validated is not None:
+                profiles.append(validated["profile"])
+        return profiles
 
     def profile_detail(self, profile_id: str, source: str = "") -> dict[str, Any] | None:
         safe_id = safe_resource_id(profile_id, "")
@@ -12739,10 +12916,10 @@ class DatabaseSqagStorage:
         requested_source = clean_text(source).lower()
         if requested_source not in {"", "company"}:
             return None
-        profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None or self._is_deleted_profile_payload(profile):
+        validated = self._validated_profile_layout_record(safe_id)
+        if validated is None:
             return None
-        detail = copy.deepcopy(profile)
+        detail = copy.deepcopy(validated["profile"])
         detail["id"] = safe_id
         detail["source"] = "company"
         return detail
@@ -12781,52 +12958,89 @@ class DatabaseSqagStorage:
         profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
         if not profile_id:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
-        stored = {key: copy.deepcopy(value) for key, value in profile.items() if key not in {"_pack_assets", "pack", "profile_pack"}}
+        stored = {
+            key: copy.deepcopy(value)
+            for key, value in profile.items()
+            if key not in {"_pack_assets", "pack", "profile_pack"}
+        }
         stored["id"] = profile_id
         artifact_mode = configured_artifact_storage_mode()
-        materialize_default_layout = configured_storage_mode() == "database"
         if artifact_mode not in {"database", "object"}:
-            def persist_plain_profile(connection: Any) -> None:
-                self._assert_profile_can_be_saved(profile_id, connection=connection)
-                self._execute_upsert_payload(
-                    connection,
-                    "sqag_profiles",
-                    "profile_id",
-                    profile_id,
-                    stored,
-                )
+            raise ValueError("A valid quotation layout is required for a hosted company profile.")
 
-            self._run_storage_transaction(persist_plain_profile)
-            return stored
-
-        if artifact_mode == 'object':
+        if artifact_mode == "object":
             def prepare_object_profile(connection: Any):
                 self._assert_profile_can_be_saved(profile_id, connection=connection)
                 item = self._prepare_profile_layout_artifact(profile)
-                profile_layout_item = item
-                if (
-                    profile_layout_item is None
-                    and materialize_default_layout
-                    and not self._profile_layout_artifact_exists(
+                if item is None:
+                    if self._validated_profile_layout_record(
                         profile_id,
-                        artifact_mode=artifact_mode,
                         connection=connection,
-                    )
-                ):
-                    profile_layout_item = self._prepare_default_profile_layout_artifact()
-                plan = (
-                    self._prepare_object_artifact_batch(
-                        'profile',
-                        profile_id,
-                        [profile_layout_item],
-                        {'quotation_layout'},
-                        {'quotation_layout'},
-                        connection=connection,
-                        quote_session=False,
-                    )
-                    if profile_layout_item is not None
-                    else None
+                    ) is None:
+                        raise ValueError(
+                            "A valid quotation layout is required for a hosted company profile."
+                        )
+                    return None, None
+
+                plan = self._prepare_object_artifact_batch(
+                    "profile",
+                    profile_id,
+                    [item],
+                    {"quotation_layout"},
+                    {"quotation_layout"},
+                    connection=connection,
+                    quote_session=False,
                 )
+                try:
+                    metadata = plan.desired_metadata.get("quotation_layout")
+                    expected_checksum = hashlib.sha256(item.content).hexdigest()
+                    expected_key = object_artifact_key(
+                        workspace_id=self.workspace_id,
+                        owner_type="profile",
+                        owner_id=profile_id,
+                        artifact_kind="quotation_layout",
+                        filename=item.filename,
+                        checksum_sha256=expected_checksum,
+                    )
+                    if (
+                        metadata is None
+                        or metadata.workspace_id != self.workspace_id
+                        or metadata.owner_type != "profile"
+                        or metadata.owner_id != profile_id
+                        or metadata.artifact_kind != "quotation_layout"
+                        or metadata.filename != item.filename
+                        or metadata.content_type != QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"]
+                        or metadata.size_bytes != len(item.content)
+                        or metadata.checksum_sha256 != expected_checksum
+                        or metadata.storage_key != expected_key
+                    ):
+                        raise ObjectStorageContractError(
+                            "Artifact storage metadata is inconsistent."
+                        )
+                    readback = plan.backend.retrieve_artifact(
+                        metadata,
+                        workspace_id=self.workspace_id,
+                    )
+                    if (
+                        readback != item.content
+                        or len(readback) != metadata.size_bytes
+                        or hashlib.sha256(readback).hexdigest() != metadata.checksum_sha256
+                    ):
+                        raise ObjectStorageContractError(
+                            "Artifact readback verification failed."
+                        )
+                    validate_profile_layout_xlsx(readback)
+                except Exception:
+                    try:
+                        self._compensate_object_artifact_batch(
+                            plan,
+                            connection=connection,
+                        )
+                    except Exception as compensation_exc:
+                        raise ObjectStorageContractError(
+                            "Artifact lifecycle recovery failed."
+                        ) from compensation_exc
+                    raise
                 return plan, plan
 
             def persist_object_profile(
@@ -12841,15 +13055,15 @@ class DatabaseSqagStorage:
                     )
                 self._execute_upsert_payload(
                     connection,
-                    'sqag_profiles',
-                    'profile_id',
+                    "sqag_profiles",
+                    "profile_id",
                     profile_id,
                     stored,
                 )
 
             try:
                 _result, object_plan = self._run_object_lifecycle_save(
-                    'profile',
+                    "profile",
                     profile_id,
                     prepare_object_profile,
                     persist_object_profile,
@@ -12865,26 +13079,23 @@ class DatabaseSqagStorage:
         def persist_profile(connection: Any) -> None:
             self._assert_profile_can_be_saved(profile_id, connection=connection)
             item = self._prepare_profile_layout_artifact(profile)
-            profile_layout_item = item
-            if (
-                profile_layout_item is None
-                and materialize_default_layout
-                and not self._profile_layout_artifact_exists(
+            if item is None:
+                if self._validated_profile_layout_record(
                     profile_id,
-                    artifact_mode=artifact_mode,
                     connection=connection,
-                )
-            ):
-                profile_layout_item = self._prepare_default_profile_layout_artifact()
-            if profile_layout_item is not None:
+                ) is None:
+                    raise ValueError(
+                        "A valid quotation layout is required for a hosted company profile."
+                    )
+            else:
                 self._execute_upsert_file_artifact(
                     connection,
                     "profile",
                     profile_id,
-                    profile_layout_item.artifact_kind,
-                    profile_layout_item.filename,
-                    profile_layout_item.content_type,
-                    profile_layout_item.content,
+                    item.artifact_kind,
+                    item.filename,
+                    item.content_type,
+                    item.content,
                 )
             self._execute_upsert_payload(
                 connection,
@@ -13007,10 +13218,40 @@ class DatabaseSqagStorage:
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             return None
-        profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None or self._is_deleted_profile_payload(profile):
+        validated = self._validated_profile_layout_record(safe_id)
+        if validated is None:
             return None
-        return {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
+        profile = validated["profile"]
+        layout = validated["layout"]
+        layout_bytes = layout["content"]
+        pack: dict[str, Any] = {
+            "quotation_layout": {
+                "filename": layout["filename"],
+                "data_url": (
+                    f"data:{layout['content_type']};base64,"
+                    f"{base64.b64encode(layout_bytes).decode('ascii')}"
+                ),
+            }
+        }
+        layout_rules = embedded_layout_rules_from_xlsx_bytes(layout_bytes)
+        if layout_rules:
+            pack["layout_rules"] = {
+                "filename": "layout-rules.json",
+                "json": layout_rules,
+            }
+        return {
+            "schema": COMPANY_PROFILE_EXPORT_SCHEMA,
+            "exported_at": utc_timestamp(),
+            "profile": {
+                "id": safe_id,
+                "label": clean_text(profile.get("label")) or safe_id,
+                "description": clean_text(profile.get("description")),
+                "defaults": copy.deepcopy(profile.get("defaults"))
+                if isinstance(profile.get("defaults"), dict)
+                else {},
+            },
+            "pack": pack,
+        }
 
     def list_pricing_references(self) -> list[dict[str, Any]]:
         company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("sqag_pricing_references", "reference_id")]
@@ -13248,21 +13489,37 @@ class DatabaseSqagStorage:
             )
             connection.commit()
 
-    def _read_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str) -> dict[str, Any] | None:
+    def _read_file_artifact(
+        self,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any] | None:
         safe_owner_type = safe_resource_id(owner_type, "")
         safe_owner_id = safe_resource_id(owner_id, "")
         safe_kind = safe_resource_id(artifact_kind, "")
         if not safe_owner_type or not safe_owner_id or not safe_kind:
             return None
-        with self.connection() as connection:
-            row = connection.execute(
-                "select filename, content_type, size_bytes, content_blob from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
-            ).fetchone()
+        query = (
+            "select filename, content_type, size_bytes, content_blob "
+            "from sqag_file_artifacts where workspace_id = ? and owner_type = ? "
+            "and owner_id = ? and artifact_kind = ?"
+        )
+        params = (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind)
+        if connection is None:
+            with self.connection() as active_connection:
+                row = active_connection.execute(query, params).fetchone()
+        else:
+            row = connection.execute(query, params).fetchone()
         if not row:
             return None
-        content = bytes(row["content_blob"] or b"")
-        size = int(row["size_bytes"] or 0)
+        try:
+            content = bytes(row["content_blob"] or b"")
+            size = int(row["size_bytes"] or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if not content or len(content) != size:
             return None
         return {
@@ -13341,10 +13598,18 @@ class DatabaseSqagStorage:
         with self.connection() as read_connection:
             return read_connection.execute(query, tuple(params)).fetchall()
 
-    def _object_artifact_row(self, owner_type: str, owner_id: str, artifact_kind: str) -> sqlite3.Row | None:
+    def _object_artifact_row(
+        self,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        *,
+        connection: Any | None = None,
+    ) -> sqlite3.Row | None:
         rows = self._active_object_artifact_rows(
             owner_type,
             owner_id,
+            connection=connection,
             artifact_kind=artifact_kind,
         )
         row = rows[0] if rows else None
@@ -14335,19 +14600,51 @@ class DatabaseSqagStorage:
         )
         return cursor.rowcount
 
-    def _read_object_file_artifact(self, owner_type: str, owner_id: str, artifact_kind: str) -> dict[str, Any] | None:
-        row = self._object_artifact_row(owner_type, owner_id, artifact_kind)
+    def _read_object_file_artifact(
+        self,
+        owner_type: str,
+        owner_id: str,
+        artifact_kind: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any] | None:
+        if connection is None:
+            with self.connection() as active_connection:
+                return self._read_object_file_artifact(
+                    owner_type,
+                    owner_id,
+                    artifact_kind,
+                    connection=active_connection,
+                )
+        row = self._object_artifact_row(
+            owner_type,
+            owner_id,
+            artifact_kind,
+            connection=connection,
+        )
         if not row:
             return None
+        snapshot = dict(row)
         object_metadata = self._object_metadata_from_row(row)
         try:
-            content = configured_object_storage_backend().retrieve_artifact(object_metadata, workspace_id=self.workspace_id)
+            content = configured_object_storage_backend().retrieve_artifact(
+                object_metadata,
+                workspace_id=self.workspace_id,
+            )
         except ObjectStorageContractError:
             return None
         if not content or len(content) != object_metadata.size_bytes:
             return None
-        current = self._object_artifact_row(owner_type, owner_id, artifact_kind)
-        if not current or clean_text(current["artifact_id"]) != clean_text(row["artifact_id"]):
+        current = self._object_artifact_row(
+            owner_type,
+            owner_id,
+            artifact_kind,
+            connection=connection,
+        )
+        if not current or not self._object_artifact_row_matches_snapshot(
+            current,
+            snapshot,
+        ):
             return None
         return {
             "filename": row["filename"],
@@ -14357,33 +14654,13 @@ class DatabaseSqagStorage:
         }
 
     def profile_layout_artifact(self, profile_id: str) -> dict[str, Any] | None:
-        artifact_mode = configured_artifact_storage_mode()
-        if artifact_mode not in {"database", "object"}:
-            return None
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             return None
-        profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None or self._is_deleted_profile_payload(profile):
+        validated = self._validated_profile_layout_record(safe_id)
+        if validated is None:
             return None
-        artifact = (
-            self._read_object_file_artifact("profile", safe_id, "quotation_layout")
-            if artifact_mode == "object"
-            else self._read_file_artifact("profile", safe_id, "quotation_layout")
-        )
-        if not artifact:
-            return None
-        content = artifact.get("content") if isinstance(artifact.get("content"), bytes) else b""
-        try:
-            validate_profile_layout_xlsx(content)
-        except ValueError:
-            return None
-        return {
-            "filename": safe_profile_pack_filename(artifact.get("filename"), "quotation-layout.xlsx", {".xlsx"}),
-            "content_type": clean_text(artifact.get("content_type")) or QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
-            "size_bytes": len(content),
-            "content": content,
-        }
+        return copy.deepcopy(validated["layout"])
 
     def _prepare_profile_layout_artifact(
         self,
