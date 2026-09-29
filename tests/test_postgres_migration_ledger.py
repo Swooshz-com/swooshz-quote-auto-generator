@@ -681,6 +681,8 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             {
                 ("sqag_reject_immutable_change", ""),
                 ("sqag_require_retention_delete_authorization", ""),
+                ("sqag_object_artifact_operations_guard", ""),
+                ("sqag_object_artifact_cleanup_policy_lock", ""),
             },
         )
 

@@ -33012,6 +33012,70 @@ main().catch((error) => {
         self.assertEqual(brief["company"]["name"], valid_payload()["company"]["name"])
         self.assertEqual(brief["_webapp"]["profile"]["id"], "workspace-profile")
 
+    def test_object_mode_generation_rejects_profile_change_during_layout_read(self):
+        class MutatingBackend(webapp.InMemoryObjectStorageBackend):
+            database_path = None
+            workspace_id = ""
+            profile_id = ""
+            mutation_count = 0
+            mutate_profile = False
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                content = super().retrieve_artifact(metadata, workspace_id=workspace_id)
+                if (
+                    self.mutate_profile
+                    and self.mutation_count == 0
+                    and getattr(metadata, "owner_type", None) == "profile"
+                    and getattr(metadata, "owner_id", None) == self.profile_id
+                    and getattr(metadata, "artifact_kind", None) == "quotation_layout"
+                    and getattr(metadata, "workspace_id", None) == self.workspace_id
+                ):
+                    with contextlib.closing(sqlite3.connect(self.database_path)) as connection:
+                        cursor = connection.execute(
+                            "update sqag_profiles set updated_at = ? "
+                            "where workspace_id = ? and profile_id = ?",
+                            ("2000-01-01T00:00:00Z", self.workspace_id, self.profile_id),
+                        )
+                        connection.commit()
+                        if cursor.rowcount != 1:
+                            raise AssertionError("Expected exactly one profile row to mutate during retrieval.")
+                    self.mutation_count += 1
+                return content
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_path = root / "sqag-storage.sqlite3"
+            database_url = f"sqlite:///{database_path.as_posix()}"
+            profile_id = "object-profile-generate-race"
+            platform_session = self.platform_auth_session("workspace-profile-generate-race")
+            payload = payload_with_workspace_pricing("workspace-pricing")
+            payload["profile_id"] = profile_id
+            env = self.hosted_storage_env(
+                SQAG_DATABASE_URL=database_url,
+                QUOTE_DATA_ROOT=str(root / "data"),
+                QUOTE_OUTPUT_ROOT=str(root / "output"),
+                QUOTE_TMP_ROOT=str(root / "tmp"),
+                QUOTE_LOG_ROOT=str(root / "logs"),
+            )
+            backend = MutatingBackend()
+            backend.database_path = database_path
+            backend.profile_id = profile_id
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                backend.workspace_id = storage.workspace_id
+                storage.save_pricing_reference(workspace_pricing_reference("workspace-pricing"))
+                storage.save_profile(workspace_profile_with_layout(profile_id))
+                backend.mutate_profile = True
+
+                errors = webapp.validate_generation_payload(payload, auth_session=platform_session)
+
+        self.assertEqual(backend.mutation_count, 1)
+        self.assertIn(webapp.PROFILE_SELECTION_ERROR_MESSAGE, errors)
+
     def test_database_storage_pricing_references_are_workspace_db_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

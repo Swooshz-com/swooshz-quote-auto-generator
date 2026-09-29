@@ -12554,9 +12554,16 @@ class DatabaseSqagStorage:
             ):
                 canonical_routines = False
             routine_oids[routine_name] = row["function_oid"]
+        forensic_trigger_names = {
+            trigger_name
+            for routine_name, links in EXPECTED_TRIGGER_ROUTINE_LINKS.items()
+            if routine_name in SQAG_FORENSIC_POSTGRES_REQUIRED_ROUTINES
+            for trigger_name, _table_name in links
+        }
         expected_links = {
             (trigger_name, table_name, routine_oids[routine_name])
             for routine_name, links in EXPECTED_TRIGGER_ROUTINE_LINKS.items()
+            if routine_name in SQAG_FORENSIC_POSTGRES_REQUIRED_ROUTINES
             for trigger_name, table_name in links
             if routine_name in routine_oids
         }
@@ -12567,11 +12574,7 @@ class DatabaseSqagStorage:
                 row["function_oid"],
             )
             for row in trigger_rows
-            if clean_text(row["name"]) in {
-                trigger_name
-                for links in EXPECTED_TRIGGER_ROUTINE_LINKS.values()
-                for trigger_name, _table_name in links
-            }
+            if clean_text(row["name"]) in forensic_trigger_names
             or row["function_oid"] in set(routine_oids.values())
         }
         if actual_links != expected_links:

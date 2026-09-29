@@ -2207,7 +2207,11 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(self._verify()["status"], "verified")
 
     def test_real_pg17_callable_session_hold_authority_v2_metadata_acl_and_relations_are_exact(self):
-        spec = migration_contract.ROUTINE_SPECS[3]
+        spec = next(
+            item
+            for item in migration_contract.ROUTINE_SPECS
+            if item.name == "sqag_quote_session_deletion_hold_blocked_v2"
+        )
         row = self._admin_row(
             "select n.nspname as schema_name, p.proname as name, "
             "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
@@ -3982,7 +3986,18 @@ order by object_kind, object_schema, object_name, object_type
             active_backend,
             restore_backend,
         )
-        self.assertEqual(report["status"], "passed")
+        self.assertEqual(
+            report["status"],
+            "passed",
+            {
+                "blockers": report.get("blockers"),
+                "failed_checks": sorted(
+                    name
+                    for name, value in report.get("checks", {}).items()
+                    if value is False
+                ),
+            },
+        )
         self.assertEqual(report["blockers"], [])
         self.assertTrue(binding_restored)
         self.assertEqual(factory_calls, {"active": 1, "restore": 1})
@@ -4749,7 +4764,7 @@ order by object_kind, object_schema, object_name, object_type
         self.assertFalse(maintenance_ledger["allowed"])
         self.assertTrue(migrator_ledger["allowed"])
 
-    def test_real_pg17_causal_001_008_cli_009_and_runtime_hold_denial(self):
+    def test_real_pg17_causal_001_008_cli_009_010_and_runtime_hold_denial(self):
         partial_database = self._create_isolated_database_fixture(
             self.migrations[:7],
             configure_acl=False,
@@ -4907,6 +4922,7 @@ order by object_kind, object_schema, object_name, object_type
             "Applied migration IDs: " + self.migrations[7].migration_id,
             completed.stdout,
         )
+        self.assertIn(self.migrations[8].migration_id, completed.stdout)
         self.assertNotIn(
             "Applied migration IDs: " + self.migrations[6].migration_id,
             completed.stdout,
@@ -4921,32 +4937,39 @@ order by object_kind, object_schema, object_name, object_type
                 migration_contract.ROUTINE_SPECS[2],
             ),
         )
-        post_009 = self._inspect(partial_database)
-        self.assertEqual(post_009["status"], "ready")
-        self.assertIs(post_009["safeToApply"], True)
-        self.assertEqual(post_009["pendingMigrationIds"], [])
+        post_apply_state = self._inspect(partial_database)
+        self.assertEqual(post_apply_state["status"], "ready")
+        self.assertIs(post_apply_state["safeToApply"], True)
+        self.assertEqual(post_apply_state["pendingMigrationIds"], [])
         self.assertEqual(
-            post_009["appliedMigrationIds"],
+            post_apply_state["appliedMigrationIds"],
             [migration.migration_id for migration in self.migrations],
         )
+        pre_apply_ids = clean_pre_apply["appliedMigrationIds"]
         self.assertEqual(
-            post_009["appliedMigrationIds"][:-1],
-            clean_pre_apply["appliedMigrationIds"],
+            post_apply_state["appliedMigrationIds"][:len(pre_apply_ids)],
+            pre_apply_ids,
+        )
+        newly_applied_ids = [migration.migration_id for migration in self.migrations[7:]]
+        self.assertEqual(
+            post_apply_state["appliedMigrationIds"][len(pre_apply_ids):],
+            newly_applied_ids,
         )
         self.assertEqual(
-            set(post_009["appliedMigrationIds"])
-            - set(clean_pre_apply["appliedMigrationIds"]),
-            {self.migrations[7].migration_id},
+            set(post_apply_state["appliedMigrationIds"]) - set(pre_apply_ids),
+            set(newly_applied_ids),
         )
-        ledger_row = self._admin_row(
-            "select sequence_no, migration_id, checksum_sha256, applied_at "
-            "from public.sqag_schema_migrations where sequence_no = %s",
-            (self.migrations[7].sequence_no,),
-            database_name=partial_database,
-        )
-        self.assertEqual(ledger_row["migration_id"], self.migrations[7].migration_id)
-        self.assertEqual(ledger_row["checksum_sha256"], self.migrations[7].checksum_sha256)
-        self.assertIsNotNone(ledger_row["applied_at"])
+        for migration in self.migrations[7:]:
+            with self.subTest(migration=migration.migration_id):
+                ledger_row = self._admin_row(
+                    "select sequence_no, migration_id, checksum_sha256, applied_at "
+                    "from public.sqag_schema_migrations where sequence_no = %s",
+                    (migration.sequence_no,),
+                    database_name=partial_database,
+                )
+                self.assertEqual(ledger_row["migration_id"], migration.migration_id)
+                self.assertEqual(ledger_row["checksum_sha256"], migration.checksum_sha256)
+                self.assertIsNotNone(ledger_row["applied_at"])
         self.assertEqual(
             self._default_table_acl_snapshot(partial_database),
             default_acl_before_009,
