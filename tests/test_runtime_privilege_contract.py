@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import contextlib
 import datetime as dt
@@ -4004,8 +4005,8 @@ order by object_kind, object_schema, object_name, object_type
         self.assertTrue(report["checks"]["active_object_cannot_read_restore_synthetic_object"])
         self.assertTrue(report["checks"]["bidirectional_backend_isolation_verified"])
         self.assertTrue(report["checks"]["cleanup_completed"])
-        self.assertEqual(report["active_db_synthetic_rows_written"], 7)
-        self.assertEqual(report["restore_db_synthetic_rows_written"], 7)
+        self.assertEqual(report["active_db_synthetic_rows_written"], 9)
+        self.assertEqual(report["restore_db_synthetic_rows_written"], 9)
         self.assertEqual(report["active_object_synthetic_objects_written"], 1)
         self.assertEqual(report["restore_object_synthetic_objects_written"], 1)
 
@@ -4201,30 +4202,104 @@ order by object_kind, object_schema, object_name, object_type
             runtime_url, "workspace-beta", role="admin", user_id="user-beta",
             expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
         )
+        synthetic_profile_fixture = (
+            ROOT
+            / "tests"
+            / "fixtures"
+            / "quote-generator"
+            / "profiles"
+            / "synthetic-exhibition-fixture-template"
+        )
+        synthetic_layout_bytes = (synthetic_profile_fixture / "quotation-layout.xlsx").read_bytes()
+        webapp.validate_profile_layout_xlsx(synthetic_layout_bytes)
+        synthetic_layout_data_url = (
+            "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+            + base64.b64encode(synthetic_layout_bytes).decode("ascii")
+        )
+        synthetic_layout_rules = json.loads(
+            (synthetic_profile_fixture / "layout-rules.json").read_text(encoding="utf-8")
+        )
+
+        def complete_synthetic_profile(workspace_id, profile_id, label):
+            profile_rules = copy.deepcopy(synthetic_layout_rules)
+            profile_rules["profile_id"] = profile_id
+            profile_rules["test_fixture_binding"] = {
+                "workspace_id": workspace_id,
+                "profile_id": profile_id,
+            }
+            normalized = webapp.normalize_profile_payload(
+                {
+                    "id": profile_id,
+                    "label": label,
+                    "description": "Synthetic runtime privilege integration fixture.",
+                    "pack": {
+                        "quotation_layout": {
+                            "filename": "quotation-layout.xlsx",
+                            "data_url": synthetic_layout_data_url,
+                        },
+                        "layout_rules": {
+                            "filename": "layout-rules.json",
+                            "json": profile_rules,
+                        },
+                    },
+                }
+            )
+            layout = normalized["_pack_assets"]["quotation_layout"]["bytes"]
+            embedded_rules = webapp.embedded_layout_rules_from_xlsx_bytes(layout)
+            self.assertEqual(embedded_rules["profile_id"], profile_id)
+            self.assertEqual(
+                embedded_rules["test_fixture_binding"],
+                {"workspace_id": workspace_id, "profile_id": profile_id},
+            )
+            return normalized
+
         with mock.patch.dict(
             os.environ,
             {
                 webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
-                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "database",
             },
             clear=False,
         ):
-            stored_a = storage_a.save_profile(
-                {"id": "shared-profile", "label": "alpha-only", "notes": "synthetic"}
+            profile_a = complete_synthetic_profile(
+                "workspace-alpha", "shared-profile", "alpha-only"
             )
-            stored_b = storage_b.save_profile(
-                {"id": "shared-profile", "label": "beta-only", "notes": "synthetic"}
+            profile_b = complete_synthetic_profile(
+                "workspace-beta", "shared-profile", "beta-only"
             )
-            storage_b.save_profile(
-                {"id": "beta-only-profile", "label": "beta-only-record", "notes": "synthetic"}
+            profile_b_only = complete_synthetic_profile(
+                "workspace-beta", "beta-only-profile", "beta-only-record"
             )
+            stored_a = storage_a.save_profile(profile_a)
+            stored_b = storage_b.save_profile(profile_b)
+            storage_b.save_profile(profile_b_only)
+            for storage, workspace_id, profile in (
+                (storage_a, "workspace-alpha", profile_a),
+                (storage_b, "workspace-beta", profile_b),
+                (storage_b, "workspace-beta", profile_b_only),
+            ):
+                artifact = storage.profile_layout_artifact(profile["id"])
+                self.assertIsNotNone(artifact)
+                self.assertEqual(artifact["filename"], "quotation-layout.xlsx")
+                self.assertEqual(
+                    artifact["content"],
+                    profile["_pack_assets"]["quotation_layout"]["bytes"],
+                )
+                self.assertEqual(
+                    webapp.embedded_layout_rules_from_xlsx_bytes(artifact["content"])[
+                        "test_fixture_binding"
+                    ],
+                    {"workspace_id": workspace_id, "profile_id": profile["id"]},
+                )
             storage_unknown = webapp.DatabaseSqagStorage(
                 runtime_url, "workspace-missing", role="admin", user_id="user-missing",
                 expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
             )
             self.assertIsNone(storage_unknown.profile_detail("shared-profile"))
+            self.assertIsNone(storage_unknown.profile_layout_artifact("shared-profile"))
             self.assertEqual(storage_unknown.list_company_profiles(), [])
             self.assertIsNone(storage_a.profile_detail("beta-only-profile"))
+            self.assertIsNone(storage_a.profile_layout_artifact("beta-only-profile"))
             self.assertEqual(stored_a["label"], "alpha-only")
             self.assertEqual(stored_b["label"], "beta-only")
             self.assertEqual(storage_a.profile_detail("shared-profile")["label"], "alpha-only")
