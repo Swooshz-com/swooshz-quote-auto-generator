@@ -712,8 +712,8 @@ TRIGGER_SPECS = (
     _trigger("sqag_telemetry_events_guard_delete", "sqag_telemetry_events", ("delete",), routine_name="sqag_require_retention_delete_authorization"),
     _trigger("sqag_object_artifact_operations_guard_update", "sqag_object_artifact_operations", ("update",), routine_name="sqag_object_artifact_operations_guard"),
     _trigger("sqag_object_artifact_operations_guard_delete", "sqag_object_artifact_operations", ("delete",), routine_name="sqag_object_artifact_operations_guard"),
-    _trigger("sqag_object_artifact_cleanup_version_lock", "sqag_quote_publication_versions", ("insert", "update", "delete"), routine_name="sqag_object_artifact_cleanup_policy_lock"),
-    _trigger("sqag_object_artifact_cleanup_hold_lock", "sqag_legal_holds", ("insert", "update", "delete"), routine_name="sqag_object_artifact_cleanup_policy_lock"),
+    _trigger("sqag_object_artifact_cleanup_version_lock", "sqag_quote_publication_versions", ("insert", "delete", "update"), routine_name="sqag_object_artifact_cleanup_policy_lock"),
+    _trigger("sqag_object_artifact_cleanup_hold_lock", "sqag_legal_holds", ("insert", "delete", "update"), routine_name="sqag_object_artifact_cleanup_policy_lock"),
 )
 TRIGGER_SPECS_BY_KEY = MappingProxyType(
     {("public", item.table_name, item.name): item for item in TRIGGER_SPECS}
