@@ -4007,8 +4007,8 @@ order by object_kind, object_schema, object_name, object_type
         self.assertTrue(report["checks"]["cleanup_completed"])
         self.assertEqual(report["active_db_synthetic_rows_written"], 9)
         self.assertEqual(report["restore_db_synthetic_rows_written"], 9)
-        self.assertEqual(report["active_object_synthetic_objects_written"], 1)
-        self.assertEqual(report["restore_object_synthetic_objects_written"], 1)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 3)
+        self.assertEqual(report["restore_object_synthetic_objects_written"], 3)
 
         active_layout_calls = assert_layout_calls(active_backend)
         restore_layout_calls = assert_layout_calls(restore_backend)
@@ -4257,9 +4257,13 @@ order by object_kind, object_schema, object_name, object_type
             os.environ,
             {
                 webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
-                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "database",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "object",
             },
             clear=False,
+        ), mock.patch.object(
+            webapp,
+            "configured_object_storage_backend",
+            return_value=webapp.InMemoryObjectStorageBackend(),
         ):
             profile_a = complete_synthetic_profile(
                 "workspace-alpha", "shared-profile", "alpha-only"
