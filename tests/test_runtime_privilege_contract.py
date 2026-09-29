@@ -3574,14 +3574,7 @@ order by object_kind, object_schema, object_name, object_type
             "verify_live_db_object_backup_restore.py",
             "run146_verify_live_db_object_backup_restore",
         )
-        expected_layout = webapp.DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.read_bytes()
-        if not webapp.embedded_layout_rules_from_xlsx_bytes(expected_layout):
-            default_rules = webapp.default_layout_rules_payload()
-            if default_rules:
-                expected_layout = webapp.xlsx_bytes_with_embedded_layout_rules(
-                    expected_layout,
-                    default_rules,
-                )
+        expected_layout = verifier._synthetic_profile_layout_payload()
         webapp.validate_profile_layout_xlsx(expected_layout)
 
         def verifier_env(restore_database_name):
