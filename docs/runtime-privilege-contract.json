@@ -5,7 +5,10 @@
   "repository": "Swooshz-com/swooshz-quote-auto-generator",
   "namespace": {
     "schema": "public",
-    "search_path": ["public", "pg_catalog"],
+    "search_path": [
+      "public",
+      "pg_catalog"
+    ],
     "tables": [
       "sqag_audit_events",
       "sqag_deletion_receipts",
@@ -14,6 +17,7 @@
       "sqag_generation_evidence",
       "sqag_generation_runs",
       "sqag_legal_holds",
+      "sqag_object_artifact_operations",
       "sqag_object_artifacts",
       "sqag_pricing_references",
       "sqag_profiles",
@@ -72,13 +76,32 @@
         "security_mode": "invoker",
         "direct_execute": false,
         "trigger_only": true
+      },
+      {
+        "name": "sqag_object_artifact_operations_guard",
+        "identity_arguments": "",
+        "owner": "sqag_migrator",
+        "security_mode": "invoker",
+        "direct_execute": false,
+        "trigger_only": true
+      },
+      {
+        "name": "sqag_object_artifact_cleanup_policy_lock",
+        "identity_arguments": "",
+        "owner": "sqag_migrator",
+        "security_mode": "invoker",
+        "direct_execute": false,
+        "trigger_only": true
       }
     ],
     "callable_routines": [
       {
         "name": "sqag_quote_session_deletion_hold_blocked",
         "identity_arguments": "text, text",
-        "argument_types": ["text", "text"],
+        "argument_types": [
+          "text",
+          "text"
+        ],
         "result_type": "boolean",
         "language": "sql",
         "owner": "sqag_migrator",
@@ -88,7 +111,10 @@
         "leakproof": false,
         "direct_execute": true,
         "trigger_only": false,
-        "function_search_path": ["pg_catalog", "public"],
+        "function_search_path": [
+          "pg_catalog",
+          "public"
+        ],
         "schema_qualified_relations": true,
         "referenced_relations": [
           "sqag_audit_events",
@@ -100,7 +126,9 @@
           "sqag_quote_publication_versions",
           "sqag_quote_sessions"
         ],
-        "explicit_execute_roles": ["sqag_runtime"],
+        "explicit_execute_roles": [
+          "sqag_runtime"
+        ],
         "owner_execute": true,
         "public_execute": false,
         "maintenance_execute": false,
@@ -111,7 +139,10 @@
       {
         "name": "sqag_quote_session_deletion_hold_blocked_v2",
         "identity_arguments": "text, text",
-        "argument_types": ["text", "text"],
+        "argument_types": [
+          "text",
+          "text"
+        ],
         "result_type": "boolean",
         "language": "sql",
         "owner": "sqag_migrator",
@@ -121,7 +152,10 @@
         "leakproof": false,
         "direct_execute": true,
         "trigger_only": false,
-        "function_search_path": ["pg_catalog", "public"],
+        "function_search_path": [
+          "pg_catalog",
+          "public"
+        ],
         "schema_qualified_relations": true,
         "referenced_relations": [
           "sqag_audit_events",
@@ -134,7 +168,9 @@
           "sqag_quote_sessions",
           "sqag_telemetry_events"
         ],
-        "explicit_execute_roles": ["sqag_runtime"],
+        "explicit_execute_roles": [
+          "sqag_runtime"
+        ],
         "owner_execute": true,
         "public_execute": false,
         "maintenance_execute": false,
@@ -160,28 +196,59 @@
   "roles": {
     "runtime": {
       "name": "sqag_runtime",
-      "attributes": {"login": true, "superuser": false, "createdb": false, "createrole": false, "replication": false, "bypassrls": false, "inherit": false, "connection_limit": -1},
+      "attributes": {
+        "login": true,
+        "superuser": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "bypassrls": false,
+        "inherit": false,
+        "connection_limit": -1
+      },
       "memberships_as_member": [],
       "owned_objects": [],
       "grant_options": []
     },
     "migrator": {
       "name": "sqag_migrator",
-      "attributes": {"login": true, "superuser": false, "createdb": false, "createrole": false, "replication": false, "bypassrls": false, "inherit": false, "connection_limit": -1},
+      "attributes": {
+        "login": true,
+        "superuser": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "bypassrls": false,
+        "inherit": false,
+        "connection_limit": -1
+      },
       "memberships_as_member": [],
       "owned_objects": "all_declared_namespace_objects",
       "grant_options": []
     },
     "maintenance": {
       "name": "sqag_maintenance",
-      "attributes": {"login": true, "superuser": false, "createdb": false, "createrole": false, "replication": false, "bypassrls": false, "inherit": false, "connection_limit": -1},
+      "attributes": {
+        "login": true,
+        "superuser": false,
+        "createdb": false,
+        "createrole": false,
+        "replication": false,
+        "bypassrls": false,
+        "inherit": false,
+        "connection_limit": -1
+      },
       "memberships_as_member": [],
       "owned_objects": [],
       "grant_options": []
     }
   },
   "provider_controlled_memberships": {
-    "protected_roles": ["sqag_runtime", "sqag_migrator", "sqag_maintenance"],
+    "protected_roles": [
+      "sqag_runtime",
+      "sqag_migrator",
+      "sqag_maintenance"
+    ],
     "allowed_edges": [
       {
         "role": "sqag_runtime",
@@ -214,71 +281,391 @@
     "public_schema_owner": "pg_database_owner"
   },
   "production_migrations": [
-    {"path": "migrations/001_platform_scoped_storage.sql", "sequence_no": 1, "sha256": "7ee6e622ba1f99d5d1ae192e0ca979a660ba9a398b67b4ce6e0113bc9c09a8a4", "tables": ["sqag_pricing_references", "sqag_profiles", "sqag_quote_sessions"]},
-    {"path": "migrations/003_object_artifact_metadata.sql", "sequence_no": 2, "sha256": "df3e7bb40865d9b11dbe7dfb9e6a721937680c4401341f0ddf255dab5627ac19", "tables": ["sqag_object_artifacts"]},
-    {"path": "migrations/004_generation_forensics_feedback_retention_postgres.sql", "sequence_no": 3, "sha256": "17e3e779891e76197db477305d0d5d436fb3f25f9ea508993063ce9bd7b39933", "tables": ["sqag_audit_events", "sqag_deletion_receipts", "sqag_feedback", "sqag_feedback_status_history", "sqag_generation_evidence", "sqag_generation_runs", "sqag_legal_holds", "sqag_retention_delete_authorizations", "sqag_retention_scan_cursors"]},
-    {"path": "migrations/005_forensic_postgres_delete_guards.sql", "sequence_no": 4, "sha256": "e4a8d9ce7aceeb59b896dcf621dd04e760a8820891eea258d9edc12f7c0de057", "tables": []},
-    {"path": "migrations/006_quote_publication_versions_postgres.sql", "sequence_no": 5, "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2", "tables": ["sqag_quote_publication_artifacts", "sqag_quote_publication_versions"]},
-    {"path": "migrations/007_feedback_publication_binding_postgres.sql", "sequence_no": 6, "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78", "tables": []},
-    {"path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql", "sequence_no": 7, "sha256": "709a822ff9b66405d97980d189d943b7346bc343ae7fd7ed3cb35ac7aafbb04c", "tables": []},
-    {"path": "migrations/009_telemetry_events_postgres.sql", "sequence_no": 8, "sha256": "7e7f61896a1395ebc8a65ae362e7af6edc34b58bfda40eee6e6b30901dd28d13", "tables": ["sqag_telemetry_events", "sqag_telemetry_source_state"]}
+    {
+      "path": "migrations/001_platform_scoped_storage.sql",
+      "sequence_no": 1,
+      "sha256": "7ee6e622ba1f99d5d1ae192e0ca979a660ba9a398b67b4ce6e0113bc9c09a8a4",
+      "tables": [
+        "sqag_pricing_references",
+        "sqag_profiles",
+        "sqag_quote_sessions"
+      ]
+    },
+    {
+      "path": "migrations/003_object_artifact_metadata.sql",
+      "sequence_no": 2,
+      "sha256": "df3e7bb40865d9b11dbe7dfb9e6a721937680c4401341f0ddf255dab5627ac19",
+      "tables": [
+        "sqag_object_artifacts"
+      ]
+    },
+    {
+      "path": "migrations/004_generation_forensics_feedback_retention_postgres.sql",
+      "sequence_no": 3,
+      "sha256": "17e3e779891e76197db477305d0d5d436fb3f25f9ea508993063ce9bd7b39933",
+      "tables": [
+        "sqag_audit_events",
+        "sqag_deletion_receipts",
+        "sqag_feedback",
+        "sqag_feedback_status_history",
+        "sqag_generation_evidence",
+        "sqag_generation_runs",
+        "sqag_legal_holds",
+        "sqag_retention_delete_authorizations",
+        "sqag_retention_scan_cursors"
+      ]
+    },
+    {
+      "path": "migrations/005_forensic_postgres_delete_guards.sql",
+      "sequence_no": 4,
+      "sha256": "e4a8d9ce7aceeb59b896dcf621dd04e760a8820891eea258d9edc12f7c0de057",
+      "tables": []
+    },
+    {
+      "path": "migrations/006_quote_publication_versions_postgres.sql",
+      "sequence_no": 5,
+      "sha256": "a66f620733c171571dfe44d078ef4bd37d2f8425bdc39d5278703af948d8e2f2",
+      "tables": [
+        "sqag_quote_publication_artifacts",
+        "sqag_quote_publication_versions"
+      ]
+    },
+    {
+      "path": "migrations/007_feedback_publication_binding_postgres.sql",
+      "sequence_no": 6,
+      "sha256": "886faa1a4cc76c942decbe02834662961fa336ca670d88f159ab3c5523cccc78",
+      "tables": []
+    },
+    {
+      "path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql",
+      "sequence_no": 7,
+      "sha256": "709a822ff9b66405d97980d189d943b7346bc343ae7fd7ed3cb35ac7aafbb04c",
+      "tables": []
+    },
+    {
+      "path": "migrations/009_telemetry_events_postgres.sql",
+      "sequence_no": 8,
+      "sha256": "7e7f61896a1395ebc8a65ae362e7af6edc34b58bfda40eee6e6b30901dd28d13",
+      "tables": [
+        "sqag_telemetry_events",
+        "sqag_telemetry_source_state"
+      ]
+    },
+    {
+      "path": "migrations/010_object_artifact_lifecycle.sql",
+      "sequence_no": 9,
+      "sha256": "5138ec488092c5924b15e74387804632a9893df5e7a1277da4d598378afb7df2",
+      "tables": [
+        "sqag_object_artifact_operations"
+      ]
+    }
   ],
   "database_privileges": {
-    "public": {"connect": true, "create": false, "temporary": false},
-    "runtime": {"connect": true, "create": false, "temporary": false},
-    "migrator": {"connect": true, "create": false, "temporary": false},
-    "maintenance": {"connect": true, "create": false, "temporary": false}
+    "public": {
+      "connect": true,
+      "create": false,
+      "temporary": false
+    },
+    "runtime": {
+      "connect": true,
+      "create": false,
+      "temporary": false
+    },
+    "migrator": {
+      "connect": true,
+      "create": false,
+      "temporary": false
+    },
+    "maintenance": {
+      "connect": true,
+      "create": false,
+      "temporary": false
+    }
   },
   "schema_privileges": {
-    "public": {"usage": true, "create": false},
-    "runtime": {"usage": true, "create": false},
-    "migrator": {"usage": true, "create": true},
-    "maintenance": {"usage": true, "create": false}
+    "public": {
+      "usage": true,
+      "create": false
+    },
+    "runtime": {
+      "usage": true,
+      "create": false
+    },
+    "migrator": {
+      "usage": true,
+      "create": true
+    },
+    "maintenance": {
+      "usage": true,
+      "create": false
+    }
   },
   "runtime_tables": {
-    "sqag_profiles": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
-    "sqag_pricing_references": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
-    "sqag_quote_sessions": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
-    "sqag_generation_runs": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
-    "sqag_generation_evidence": {"privileges": ["SELECT", "INSERT"]},
-    "sqag_audit_events": {"privileges": ["SELECT", "INSERT"]},
-    "sqag_feedback": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
-    "sqag_feedback_status_history": {"privileges": ["SELECT", "INSERT"]},
-    "sqag_object_artifacts": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
-    "sqag_quote_publication_versions": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
-    "sqag_quote_publication_artifacts": {"privileges": ["SELECT", "INSERT", "DELETE"]},
-    "sqag_telemetry_events": {"privileges": ["SELECT", "INSERT"]},
-    "sqag_telemetry_source_state": {"privileges": ["SELECT", "INSERT", "UPDATE"]}
+    "sqag_profiles": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_pricing_references": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_quote_sessions": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_generation_runs": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE"
+      ]
+    },
+    "sqag_generation_evidence": {
+      "privileges": [
+        "SELECT",
+        "INSERT"
+      ]
+    },
+    "sqag_audit_events": {
+      "privileges": [
+        "SELECT",
+        "INSERT"
+      ]
+    },
+    "sqag_feedback": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE"
+      ]
+    },
+    "sqag_feedback_status_history": {
+      "privileges": [
+        "SELECT",
+        "INSERT"
+      ]
+    },
+    "sqag_object_artifact_operations": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE"
+      ]
+    },
+    "sqag_object_artifacts": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE"
+      ]
+    },
+    "sqag_quote_publication_versions": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_quote_publication_artifacts": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "DELETE"
+      ]
+    },
+    "sqag_telemetry_events": {
+      "privileges": [
+        "SELECT",
+        "INSERT"
+      ]
+    },
+    "sqag_telemetry_source_state": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE"
+      ]
+    }
   },
   "maintenance_tables": {
-    "sqag_quote_sessions": {"privileges": ["SELECT", "DELETE"]},
-    "sqag_object_artifacts": {"privileges": ["SELECT", "UPDATE"]},
-    "sqag_generation_runs": {"privileges": ["SELECT", "UPDATE", "DELETE"]},
-    "sqag_generation_evidence": {"privileges": ["SELECT", "DELETE"]},
-    "sqag_audit_events": {"privileges": ["SELECT", "INSERT", "DELETE"]},
-    "sqag_feedback": {"privileges": ["SELECT", "UPDATE", "DELETE"]},
-    "sqag_feedback_status_history": {"privileges": ["SELECT", "DELETE"]},
-    "sqag_legal_holds": {"privileges": ["SELECT", "INSERT", "UPDATE"]},
-    "sqag_retention_delete_authorizations": {"privileges": ["SELECT", "INSERT", "DELETE"]},
-    "sqag_deletion_receipts": {"privileges": ["SELECT", "INSERT", "DELETE"]},
-    "sqag_retention_scan_cursors": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
-    "sqag_quote_publication_versions": {"privileges": ["SELECT", "DELETE"]},
-    "sqag_quote_publication_artifacts": {"privileges": ["SELECT", "DELETE"]},
-    "sqag_telemetry_events": {"privileges": ["SELECT", "INSERT", "UPDATE", "DELETE"]},
-    "sqag_telemetry_source_state": {"privileges": ["SELECT", "UPDATE"]}
+    "sqag_quote_sessions": {
+      "privileges": [
+        "SELECT",
+        "DELETE"
+      ]
+    },
+    "sqag_object_artifact_operations": {
+      "privileges": [
+        "SELECT",
+        "UPDATE"
+      ]
+    },
+    "sqag_object_artifacts": {
+      "privileges": [
+        "SELECT",
+        "UPDATE"
+      ]
+    },
+    "sqag_generation_runs": {
+      "privileges": [
+        "SELECT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_generation_evidence": {
+      "privileges": [
+        "SELECT",
+        "DELETE"
+      ]
+    },
+    "sqag_audit_events": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "DELETE"
+      ]
+    },
+    "sqag_feedback": {
+      "privileges": [
+        "SELECT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_feedback_status_history": {
+      "privileges": [
+        "SELECT",
+        "DELETE"
+      ]
+    },
+    "sqag_legal_holds": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE"
+      ]
+    },
+    "sqag_retention_delete_authorizations": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "DELETE"
+      ]
+    },
+    "sqag_deletion_receipts": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "DELETE"
+      ]
+    },
+    "sqag_retention_scan_cursors": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_quote_publication_versions": {
+      "privileges": [
+        "SELECT",
+        "DELETE"
+      ]
+    },
+    "sqag_quote_publication_artifacts": {
+      "privileges": [
+        "SELECT",
+        "DELETE"
+      ]
+    },
+    "sqag_telemetry_events": {
+      "privileges": [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
+    },
+    "sqag_telemetry_source_state": {
+      "privileges": [
+        "SELECT",
+        "UPDATE"
+      ]
+    }
   },
   "runtime_forbidden_tables": {
-    "sqag_legal_holds": {"reason": "maintenance-only legal-hold state"},
-    "sqag_retention_delete_authorizations": {"reason": "maintenance-only delete guard input"},
-    "sqag_deletion_receipts": {"reason": "maintenance-only deletion receipts"},
-    "sqag_retention_scan_cursors": {"reason": "maintenance-only retention cursor"},
-    "sqag_schema_migrations": {"reason": "migrator-only schema ledger"}
+    "sqag_legal_holds": {
+      "reason": "maintenance-only legal-hold state"
+    },
+    "sqag_retention_delete_authorizations": {
+      "reason": "maintenance-only delete guard input"
+    },
+    "sqag_deletion_receipts": {
+      "reason": "maintenance-only deletion receipts"
+    },
+    "sqag_retention_scan_cursors": {
+      "reason": "maintenance-only retention cursor"
+    },
+    "sqag_schema_migrations": {
+      "reason": "migrator-only schema ledger"
+    }
   },
   "source_binding": {
-    "files": ["webapp/server.py", "webapp/forensics.py", "scripts/enforce_forensic_retention.py"],
-    "allowed_sql_relations": ["sqag_audit_events", "sqag_deletion_receipts", "sqag_feedback", "sqag_feedback_status_history", "sqag_generation_evidence", "sqag_generation_runs", "sqag_legal_holds", "sqag_object_artifacts", "sqag_pricing_references", "sqag_profiles", "sqag_quote_publication_artifacts", "sqag_quote_publication_versions", "sqag_quote_sessions", "sqag_retention_delete_authorizations", "sqag_retention_scan_cursors", "sqag_telemetry_events", "sqag_telemetry_source_state"],
-    "unsupported_sql_relations": ["sqag_file_artifacts", "sqag_quote_artifacts"],
-    "dynamic_sql_variables": {"webapp/server.py": ["table"], "webapp/forensics.py": ["table"], "scripts/enforce_forensic_retention.py": []},
+    "files": [
+      "webapp/server.py",
+      "webapp/forensics.py",
+      "scripts/reconcile_object_artifact_lifecycle.py",
+      "scripts/enforce_forensic_retention.py"
+    ],
+    "allowed_sql_relations": [
+      "sqag_audit_events",
+      "sqag_deletion_receipts",
+      "sqag_feedback",
+      "sqag_feedback_status_history",
+      "sqag_generation_evidence",
+      "sqag_generation_runs",
+      "sqag_legal_holds",
+      "sqag_object_artifact_operations",
+      "sqag_object_artifacts",
+      "sqag_pricing_references",
+      "sqag_profiles",
+      "sqag_quote_publication_artifacts",
+      "sqag_quote_publication_versions",
+      "sqag_quote_sessions",
+      "sqag_retention_delete_authorizations",
+      "sqag_retention_scan_cursors",
+      "sqag_telemetry_events",
+      "sqag_telemetry_source_state"
+    ],
+    "unsupported_sql_relations": [
+      "sqag_file_artifacts",
+      "sqag_quote_artifacts"
+    ],
+    "dynamic_sql_variables": {
+      "webapp/server.py": [
+        "table"
+      ],
+      "webapp/forensics.py": [
+        "table"
+      ],
+      "scripts/enforce_forensic_retention.py": [],
+      "scripts/reconcile_object_artifact_lifecycle.py": []
+    },
     "callable_routine_sources": [
       {
         "path": "migrations/008_quote_session_deletion_hold_authority_postgres.sql",
@@ -312,8 +699,27 @@
     ]
   },
   "observation": {
-    "allowed": ["server_major", "database_identity", "search_path", "migration_ledger", "named_namespace_metadata", "normalized_acl_provenance", "role_attributes", "bounded_memberships", "effective_privileges", "sanitized_counts"],
-    "forbidden": ["authentication_material", "business_rows", "private_provider_values", "object_bytes", "query_text", "sensitive_statistics", "raw_catalogue_graphs"]
+    "allowed": [
+      "server_major",
+      "database_identity",
+      "search_path",
+      "migration_ledger",
+      "named_namespace_metadata",
+      "normalized_acl_provenance",
+      "role_attributes",
+      "bounded_memberships",
+      "effective_privileges",
+      "sanitized_counts"
+    ],
+    "forbidden": [
+      "authentication_material",
+      "business_rows",
+      "private_provider_values",
+      "object_bytes",
+      "query_text",
+      "sensitive_statistics",
+      "raw_catalogue_graphs"
+    ]
   },
   "policy": {
     "fail_closed": true,

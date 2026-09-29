@@ -207,6 +207,7 @@ class FakeLivePostgresConnection:
             return FakeLivePostgresCursor([{"lock_acquired": True}])
         if "information_schema.columns" in normalized:
             column_map = runtime_required_metadata_tables()
+            column_map.update(verifier.webapp.SQAG_OBJECT_ARTIFACT_LIFECYCLE_REQUIRED_COLUMNS)
             rows = []
             for table in sorted(set(params)):
                 rows.extend(
@@ -352,8 +353,7 @@ class FakeLivePostgresConnection:
         if normalized.startswith("update sqag_object_artifacts"):
             if self.fail_object_cleanup:
                 raise RuntimeError("synthetic cleanup failed")
-            artifact_id = params[5]
-            workspace_id = params[4]
+            workspace_id, artifact_id = params[4:6]
             row = next(
                 (
                     value
@@ -365,22 +365,20 @@ class FakeLivePostgresConnection:
             )
             if not row:
                 return FakeLivePostgresCursor(rowcount=0)
-            expected_values = {
-                "owner_type": params[8],
-                "owner_id": params[9],
-                "artifact_kind": params[10],
-                "filename": params[11],
-                "content_type": params[12],
-                "object_provider_type": params[13],
-                "platform_user_id": params[14],
-                "session_id": params[15],
-                "job_id": params[16],
-                "object_key_ref": params[17],
-                "checksum_sha256": params[18],
-                "size_bytes": params[19],
-                "created_at": params[20],
-                "updated_at": params[21],
-            }
+            expected_values = {}
+            parameter_index = 6
+            for field in verifier.webapp.ArtifactRowSnapshot.__dataclass_fields__:
+                if field in {"workspace_id", "artifact_id"}:
+                    continue
+                if field == "size_bytes":
+                    expected_values[field] = params[parameter_index]
+                    parameter_index += 1
+                else:
+                    value, null_value = params[parameter_index:parameter_index + 2]
+                    if value != null_value:
+                        return FakeLivePostgresCursor(rowcount=0)
+                    expected_values[field] = value
+                    parameter_index += 2
             if any(row[field] != value for field, value in expected_values.items()):
                 return FakeLivePostgresCursor(rowcount=0)
             if row["status"] != "active" or row["retention_status"] != "active" or row["deleted_at"] is not None:

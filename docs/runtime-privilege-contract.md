@@ -22,10 +22,10 @@ The read-only admission path is
 
 The declared set is deliberately bounded to `public.sqag_*` application objects:
 
-- eight canonical PostgreSQL migrations and their canonical migration-ledger checksums;
-- the 17 application tables plus `sqag_schema_migrations`;
+- nine canonical PostgreSQL migrations and their canonical migration-ledger checksums;
+- the 19 application tables plus `sqag_schema_migrations`;
 - the 28 canonical indexes;
-- the two migrator-owned invoker trigger routines and two migrator-owned,
+- the four migrator-owned invoker trigger routines and two migrator-owned,
   runtime-callable security-definer hold-decision routines: historical v1 from
   migration 008 and telemetry-aware v2 from migration 009;
 - the fixed connection search path `public, pg_catalog`;
@@ -90,6 +90,21 @@ legal-hold mutations, delete authorizations, receipts, cursor updates, and
 publication/object metadata operations required by the canonical retention
 paths. Normal runtime connections are denied every maintenance-only table.
 
+Migration 010 adds the durable sqag_object_artifact_operations journal. The
+runtime role receives only SELECT, INSERT, and UPDATE on it; maintenance
+receives only SELECT and UPDATE. Neither role may delete journal history.
+Database triggers keep operation identity, request digest, immutable plan, and
+creation time fixed, restrict journal state transitions, and reject journal
+history deletion. PostgreSQL policy-lock triggers serialize quote publication
+and legal-hold writes with artifact cleanup without granting runtime direct
+SELECT access to sqag_legal_holds. SQLite installs equivalent journal
+immutability and serializes exact publication-version writes against cleanup
+from the final retention check through provider dispatch, readback, and journal
+update. The cleanup timestamp is diagnostic and does not grant or expire write
+authority; unresolved states such as delete_started and uncertain remain
+guarded until reconciliation. Unrelated legal-hold writes remain available.
+Quote cleanup keeps its serialized transaction through provider deletion. The
+journal is additive and migration application remains an explicit operator action.
 The local SQLite retention path is unchanged when an explicit SQLite URL or the
 local default is selected. `--use-configured-database` is PostgreSQL-only and
 requires the maintenance projection.

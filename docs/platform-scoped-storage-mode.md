@@ -133,6 +133,44 @@ not prove live provider credentials, provider IAM policy, network reachability,
 DB+object backup/restore, retention/delete jobs, alert delivery, or production
 deployment operations.
 
+### Durable replacement and cleanup protocol
+
+Object artifact replacements use a typed immutable snapshot of the artifact row
+and bind profile readiness to the exact profile row plus artifact snapshot.
+Readiness reads provider metadata and bytes from that frozen snapshot, then
+performs a fresh joined profile/artifact readback before accepting the layout.
+The provider helper does not re-resolve a row or change the authority being
+validated.
+
+The additive `migrations/010_object_artifact_lifecycle.sql` migration creates
+`sqag_object_artifact_operations`. A replacement persists a complete `prepared`
+plan before provider writes, reserves a deterministic V2 incarnation under
+owner locks, stores and reads back successors, and publishes artifact rows,
+owner state, and a `published` receipt in one database transaction. The prior
+artifact remains authoritative until that receipt commits. V2 stores are
+create-only; retries may accept a reserved object only after exact metadata and
+byte verification.
+
+Retired objects become cleanup work only after publication. Cleanup records
+`delete_started` before the provider call and records verified absence, pending,
+uncertain, or policy-retained outcomes afterward. Its 120-second timestamp is
+only diagnostic. SQLite keeps matching publication-version references guarded
+while cleanup is `delete_started` or `uncertain`, even after that timestamp, and
+holds a `BEGIN IMMEDIATE` transaction through provider dispatch, readback, and
+journal update. This serializes SQLite writers for the duration of cleanup;
+after restart, an unresolved marker remains guarded until a retry settles it.
+The S3 client uses one request attempt with 5-second connect and 15-second read
+timeouts per request. A failed cleanup does not undo a published replacement.
+`scripts/reconcile_object_artifact_lifecycle.py`
+defaults to bounded inspection; `--apply-cleanup` explicitly resumes eligible published cleanup and rechecks retained-policy targets for one workspace and owner. It prints aggregate
+counts and omits identifiers, keys, credentials, and payloads.
+
+Synthetic coverage lives in `tests/test_object_artifact_authority.py`,
+`tests/test_reconcile_object_artifact_lifecycle.py`, and the focused object
+lifecycle cases in `tests/test_webapp.py`. The lifecycle verifier backs up and
+restores the journal with synthetic SQLite metadata. This is G3 test evidence
+only: it does not prove a live migration, production database, provider
+mutation, backup service, or deployment operation.
 The live-provider verifier is explicit opt-in. In addition to the provider env
 names above, it requires `SQAG_LIVE_OBJECT_STORAGE_EVIDENCE` to be enabled by an
 operator in the execution environment. The repo-controlled Python dependencies

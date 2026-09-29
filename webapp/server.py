@@ -11142,6 +11142,7 @@ SQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "006_quote_publication_versions.sql",
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding.sql",
     PROJECT_ROOT / "migrations" / "009_telemetry_events.sql",
+    PROJECT_ROOT / "migrations" / "010_object_artifact_lifecycle.sql",
 ]
 SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
@@ -11152,6 +11153,7 @@ SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding_postgres.sql",
     PROJECT_ROOT / "migrations" / "008_quote_session_deletion_hold_authority_postgres.sql",
     PROJECT_ROOT / "migrations" / "009_telemetry_events_postgres.sql",
+    PROJECT_ROOT / "migrations" / "010_object_artifact_lifecycle.sql",
 ]
 SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS = {
     "workspace_id", "session_id", "run_id", "job_id", "state",
@@ -11371,6 +11373,13 @@ SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS = {
         "deleted_at",
     },
     "sqag_quote_publication_versions": SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS,
+}
+SQAG_OBJECT_ARTIFACT_LIFECYCLE_REQUIRED_COLUMNS = {
+    "sqag_object_artifact_operations": {
+        "workspace_id", "owner_type", "owner_id", "operation_seq",
+        "operation_id", "request_sha256", "plan_json", "state",
+        "cleanup_json", "created_at", "updated_at",
+    },
 }
 SQAG_STORAGE_SQL = """
 create table if not exists sqag_profiles (
@@ -11860,11 +11869,89 @@ def postgres_storage_connection(
         connection.close()
 
 
+SQAG_OBJECT_ARTIFACT_SQLITE_GUARDS = """
+CREATE TRIGGER IF NOT EXISTS sqag_object_artifact_operations_guard_update
+BEFORE UPDATE ON sqag_object_artifact_operations
+WHEN NEW.workspace_id IS NOT OLD.workspace_id
+  OR NEW.owner_type IS NOT OLD.owner_type
+  OR NEW.owner_id IS NOT OLD.owner_id
+  OR NEW.operation_seq IS NOT OLD.operation_seq
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.request_sha256 IS NOT OLD.request_sha256
+  OR NEW.plan_json IS NOT OLD.plan_json
+  OR NEW.created_at IS NOT OLD.created_at
+  OR NOT (
+    NEW.state = OLD.state
+    OR (OLD.state = 'prepared' AND NEW.state IN ('published', 'aborted'))
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'SQAG object artifact operation is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS sqag_object_artifact_operations_guard_delete
+BEFORE DELETE ON sqag_object_artifact_operations
+BEGIN
+  SELECT RAISE(ABORT, 'SQAG object artifact operation history is retained');
+END;
+DROP TRIGGER IF EXISTS sqag_object_artifact_cleanup_version_guard_insert;
+DROP TRIGGER IF EXISTS sqag_object_artifact_cleanup_version_guard_update;
+DROP TRIGGER IF EXISTS sqag_object_artifact_cleanup_hold_guard_insert;
+DROP TRIGGER IF EXISTS sqag_object_artifact_cleanup_hold_guard_update;
+CREATE TRIGGER IF NOT EXISTS sqag_object_artifact_cleanup_version_guard_insert
+BEFORE INSERT ON sqag_quote_publication_versions
+WHEN EXISTS (
+  SELECT 1
+  FROM sqag_object_artifact_operations AS operation,
+       json_each(operation.cleanup_json) AS cleanup
+  WHERE operation.workspace_id = NEW.workspace_id
+    AND operation.owner_type IN ('profile', 'pricing_reference')
+    AND json_extract(cleanup.value, '$.state') IN ('delete_started', 'uncertain')
+    AND json_extract(NEW.metadata_json, '$.exports.' ||
+        json_extract(cleanup.value, '$.snapshot.artifact_kind') || '.sha256') =
+        json_extract(cleanup.value, '$.snapshot.checksum_sha256')
+    AND json_extract(NEW.metadata_json, '$.exports.' ||
+        json_extract(cleanup.value, '$.snapshot.artifact_kind') || '.filename') =
+        json_extract(cleanup.value, '$.snapshot.filename')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'SQAG object artifact cleanup policy is busy');
+END;
+CREATE TRIGGER IF NOT EXISTS sqag_object_artifact_cleanup_version_guard_update
+BEFORE UPDATE ON sqag_quote_publication_versions
+WHEN EXISTS (
+  SELECT 1
+  FROM sqag_object_artifact_operations AS operation,
+       json_each(operation.cleanup_json) AS cleanup
+  WHERE operation.workspace_id IN (OLD.workspace_id, NEW.workspace_id)
+    AND operation.owner_type IN ('profile', 'pricing_reference')
+    AND json_extract(cleanup.value, '$.state') IN ('delete_started', 'uncertain')
+    AND json_extract(NEW.metadata_json, '$.exports.' ||
+        json_extract(cleanup.value, '$.snapshot.artifact_kind') || '.sha256') =
+        json_extract(cleanup.value, '$.snapshot.checksum_sha256')
+    AND json_extract(NEW.metadata_json, '$.exports.' ||
+        json_extract(cleanup.value, '$.snapshot.artifact_kind') || '.filename') =
+        json_extract(cleanup.value, '$.snapshot.filename')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'SQAG object artifact cleanup policy is busy');
+END;
+"""
+
+
 def sqag_storage_migration_sql() -> str:
     sql_parts: list[str] = []
     for path in SQAG_STORAGE_MIGRATION_PATHS:
         try:
-            sql_parts.append(path.read_text(encoding="utf-8"))
+            source = path.read_text(encoding="utf-8")
+            if path.name == "010_object_artifact_lifecycle.sql":
+                begin = "-- SQAG_POSTGRES_ONLY_BEGIN"
+                end = "-- SQAG_POSTGRES_ONLY_END"
+                if source.count(begin) != source.count(end) or source.count(begin) > 1:
+                    raise RuntimeError("Object artifact migration dialect markers are invalid.")
+                if begin in source:
+                    start = source.index(begin)
+                    finish = source.index(end, start) + len(end)
+                    source = source[:start] + source[finish:]
+            sql_parts.append(source)
         except OSError:
             continue
     if sql_parts:
@@ -11909,6 +11996,7 @@ def apply_sqag_storage_migrations(database_url: str | None = None) -> dict[str, 
             migrate_legacy_sqag_tables_sqlite(connection)
             upgrade_legacy_local_forensic_schema(connection)
             connection.executescript(sqag_storage_migration_sql())
+            connection.executescript(SQAG_OBJECT_ARTIFACT_SQLITE_GUARDS)
             upgrade_legacy_local_forensic_schema(connection)
             connection.commit()
         return
@@ -12150,6 +12238,38 @@ class LocalSqagStorage:
 
 
 @dataclass(frozen=True)
+class ArtifactRowSnapshot:
+    artifact_id: str | None
+    workspace_id: str | None
+    owner_type: str | None
+    owner_id: str | None
+    platform_user_id: str | None
+    session_id: str | None
+    job_id: str | None
+    artifact_kind: str | None
+    filename: str | None
+    content_type: str | None
+    size_bytes: int
+    checksum_sha256: str | None
+    object_provider_type: str | None
+    object_key_ref: str | None
+    status: str | None
+    retention_status: str | None
+    created_at: str | None
+    updated_at: str | None
+    deleted_at: str | None
+
+
+@dataclass(frozen=True)
+class ProfileRowSnapshot:
+    workspace_id: str
+    profile_id: str
+    payload_json: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class ArtifactBatchItem:
     artifact_kind: str
     filename: str
@@ -12165,12 +12285,25 @@ class ObjectArtifactBatchPlan:
     owner_id: str
     items: list[ArtifactBatchItem]
     managed_kinds: set[str] = field(default_factory=set)
-    expected_rows: dict[str, dict[str, Any]] = field(default_factory=dict)
+    expected_rows: dict[str, ArtifactRowSnapshot] = field(default_factory=dict)
     desired_metadata: dict[str, ObjectArtifactMetadata] = field(default_factory=dict)
+    successor_rows: dict[str, ArtifactRowSnapshot] = field(default_factory=dict)
+    published_rows: dict[str, ArtifactRowSnapshot] = field(default_factory=dict)
     omitted_rows: list[dict[str, Any]] = field(default_factory=list)
-    previous_backups: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
-    new_objects: list[ObjectArtifactMetadata] = field(default_factory=list)
-    deleted_previous: list[tuple[ObjectArtifactMetadata, bytes]] = field(default_factory=list)
+    delete_targets: list[ArtifactRowSnapshot] = field(default_factory=list)
+    delete_published_rows: list[ArtifactRowSnapshot] = field(default_factory=list)
+    owner_delete_operation: bool = False
+    operation_seq: int = 0
+    operation_id: str = ""
+    request_sha256: str = ""
+    plan_json: str = ""
+    cleanup: list[dict[str, Any]] = field(default_factory=list)
+    owner_digest: str = ""
+    owner_before_digest: str = ""
+    lock_identities: tuple[tuple[str, str], ...] = ()
+    locked_owner_row_digests: dict[tuple[str, str], str] = field(default_factory=dict)
+    request_context: Any = None
+    journal_persisted: bool = False
     unchanged_kinds: set[str] = field(default_factory=set)
     state: str = "prepared"
 
@@ -12183,24 +12316,6 @@ OBJECT_LIFECYCLE_OWNER_TYPES = frozenset({
     'generated_quote_version',
 })
 OBJECT_LIFECYCLE_WRITE_SAVEPOINT = 'sqag_object_lifecycle_write'
-OBJECT_LIFECYCLE_DELETE_ROOT_SAVEPOINT = 'sqag_object_delete_root'
-OBJECT_LIFECYCLE_DELETE_ITEM_SAVEPOINT = 'sqag_object_delete_item'
-
-
-@dataclass
-class ObjectArtifactDeletionPlan:
-    backend: ObjectStorageBackend
-    owner_type: str
-    owner_id: str
-    deleted: list[
-        tuple[ObjectArtifactMetadata, bytes, dict[str, Any]]
-    ] = field(default_factory=list)
-    in_flight: tuple[
-        ObjectArtifactMetadata,
-        bytes,
-        dict[str, Any],
-    ] | None = None
-    state: str = 'prepared'
 
 
 class DatabaseSqagStorage:
@@ -12271,7 +12386,17 @@ class DatabaseSqagStorage:
         self._ensure_schema(SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS, reason="storage_artifact_database_not_migrated")
 
     def ensure_object_artifact_ready(self) -> None:
-        self._ensure_schema(SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS, reason="storage_object_artifact_database_not_migrated")
+        self._ensure_schema(
+            SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+            reason="storage_object_artifact_database_not_migrated",
+        )
+
+    def ensure_object_artifact_lifecycle_ready(self) -> None:
+        self.ensure_object_artifact_ready()
+        self._ensure_schema(
+            SQAG_OBJECT_ARTIFACT_LIFECYCLE_REQUIRED_COLUMNS,
+            reason="storage_object_artifact_database_not_migrated",
+        )
 
     def _ensure_schema(self, required: dict[str, set[str]], *, reason: str) -> None:
         objects: dict[str, set[str]] = {}
@@ -12687,6 +12812,340 @@ class DatabaseSqagStorage:
         except Exception:
             return False
 
+    def _stage_object_artifact_successors(
+        self, plan: ObjectArtifactBatchPlan
+    ) -> None:
+        item_by_kind = {item.artifact_kind: item for item in plan.items}
+        for kind, successor in plan.successor_rows.items():
+            if kind in plan.unchanged_kinds:
+                continue
+            item = item_by_kind.get(kind)
+            metadata = plan.desired_metadata.get(kind)
+            if item is None or metadata is None:
+                raise ObjectStorageContractError("Reserved artifact plan is incomplete.")
+            if (
+                len(item.content) != successor.size_bytes
+                or artifact_checksum(item.content) != successor.checksum_sha256
+            ):
+                raise ObjectStorageContractError(
+                    "Artifact bytes do not match the reserved successor."
+                )
+            stored = plan.backend.store_artifact(
+                workspace_id=metadata.workspace_id,
+                owner_type=metadata.owner_type,
+                owner_id=metadata.owner_id,
+                artifact_kind=metadata.artifact_kind,
+                filename=metadata.filename,
+                content_type=metadata.content_type,
+                content=item.content,
+                artifact_incarnation=metadata.artifact_incarnation,
+                artifact_id=metadata.artifact_id,
+                platform_user_id=metadata.platform_user_id,
+                session_id=metadata.session_id,
+                job_id=metadata.job_id,
+                binding_sha256=metadata.binding_sha256,
+                created_at=metadata.created_at,
+                updated_at=metadata.updated_at,
+            )
+            if stored != metadata:
+                raise ObjectStorageContractError("Artifact storage metadata is inconsistent.")
+            readback = plan.backend.retrieve_artifact(
+                metadata, workspace_id=metadata.workspace_id
+            )
+            if (
+                readback != item.content
+                or len(readback) != successor.size_bytes
+                or hashlib.sha256(readback).hexdigest() != successor.checksum_sha256
+            ):
+                raise ObjectStorageContractError("Artifact readback verification failed.")
+
+    def _object_artifact_operation_row(
+        self, connection: Any, plan: ObjectArtifactBatchPlan
+    ) -> Mapping[str, Any] | None:
+        return connection.execute(
+            "select workspace_id, owner_type, owner_id, operation_seq, operation_id, "
+            "request_sha256, plan_json, state, cleanup_json, created_at, updated_at "
+            "from sqag_object_artifact_operations where workspace_id = ? "
+            "and owner_type = ? and owner_id = ? and operation_seq = ?",
+            (self.workspace_id, plan.owner_type, plan.owner_id, plan.operation_seq),
+        ).fetchone()
+
+    def _published_object_artifact_plan_is_current(
+        self,
+        connection: Any,
+        plan: ObjectArtifactBatchPlan,
+    ) -> bool:
+        row = self._object_artifact_operation_row(connection, plan)
+        if (
+            plan.state != "published"
+            or row is None
+            or row["state"] != "published"
+            or row["operation_id"] != plan.operation_id
+            or row["request_sha256"] != plan.request_sha256
+            or row["plan_json"] != plan.plan_json
+            or not self._object_artifact_batch_snapshot_is_current(
+                plan, connection, published=True
+            )
+            or self._object_owner_row_digest(
+                connection, plan.owner_type, plan.owner_id
+            ) != plan.owner_digest
+            or (
+                not plan.owner_delete_operation
+                and not self._object_owner_request_matches(connection, plan)
+            )
+        ):
+            return False
+        if plan.delete_targets:
+            if len(plan.delete_targets) != len(plan.delete_published_rows):
+                return False
+            for expected, published in zip(
+                plan.delete_targets, plan.delete_published_rows
+            ):
+                row = connection.execute(
+                    "select artifact_id, workspace_id, owner_type, owner_id, "
+                    "platform_user_id, session_id, job_id, artifact_kind, filename, "
+                    "content_type, size_bytes, checksum_sha256, object_provider_type, "
+                    "object_key_ref, status, retention_status, created_at, updated_at, "
+                    "deleted_at from sqag_object_artifacts where workspace_id = ? "
+                    "and artifact_id = ?",
+                    (self.workspace_id, expected.artifact_id),
+                ).fetchone()
+                if row is None or self._artifact_row_snapshot(row) != published:
+                    return False
+        items = {item.artifact_kind: item for item in plan.items}
+        for kind, snapshot in plan.successor_rows.items():
+            retrieved = self._retrieve_object_artifact_snapshot(snapshot)
+            item = items.get(kind)
+            if (
+                retrieved is None
+                or (item is not None and retrieved["content"] != item.content)
+            ):
+                return False
+        return True
+
+    def _verify_published_object_artifact_batch(
+        self,
+        plan: ObjectArtifactBatchPlan,
+    ) -> bool:
+        if plan.state != "published" or not plan.lock_identities:
+            return False
+        try:
+            with self.connection() as connection:
+                self._begin_object_lifecycle_transactions(
+                    connection, plan.lock_identities
+                )
+                if self._published_object_artifact_plan_is_current(connection, plan):
+                    connection.commit()
+                    return True
+
+                # Supersession preserves a committed receipt only while this
+                # exact operation still has its own durable published journal row.
+                receipt = self._object_artifact_operation_row(connection, plan)
+                if (
+                    receipt is None
+                    or receipt["workspace_id"] != self.workspace_id
+                    or receipt["owner_type"] != plan.owner_type
+                    or receipt["owner_id"] != plan.owner_id
+                    or int(receipt["operation_seq"]) != plan.operation_seq
+                    or receipt["operation_id"] != plan.operation_id
+                    or receipt["request_sha256"] != plan.request_sha256
+                    or receipt["plan_json"] != plan.plan_json
+                    or receipt["state"] != "published"
+                ):
+                    connection.rollback()
+                    return False
+
+                # A later operation may publish after this operation commits but
+                # before its caller completes readback. Preserve the earlier
+                # durable receipt only when a higher-sequence journal plan with
+                # the same lock set is itself the current, provider-verified
+                # publication.
+                later_row = connection.execute(
+                    "select workspace_id, owner_type, owner_id, operation_seq, "
+                    "operation_id, request_sha256, plan_json, state, cleanup_json, "
+                    "created_at, updated_at from sqag_object_artifact_operations "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ? "
+                    "and operation_seq > ? and state = 'published' "
+                    "order by operation_seq desc limit 1",
+                    (
+                        self.workspace_id,
+                        plan.owner_type,
+                        plan.owner_id,
+                        plan.operation_seq,
+                    ),
+                ).fetchone()
+                if later_row is None:
+                    connection.rollback()
+                    return False
+                later_plan = self._load_object_artifact_plan(
+                    later_row,
+                    backend=configured_object_storage_backend(),
+                    items=[],
+                    request_context=None,
+                )
+                if (
+                    later_plan.lock_identities != plan.lock_identities
+                    or later_plan.operation_seq <= plan.operation_seq
+                    or not self._published_object_artifact_plan_is_current(
+                        connection, later_plan
+                    )
+                ):
+                    connection.rollback()
+                    return False
+                connection.commit()
+                return True
+        except Exception:
+            return False
+    def _resume_published_object_artifact_cleanups(
+        self, identities: tuple[tuple[str, str], ...], *,
+        retained_policy_only: bool = False,
+    ) -> None:
+        """Retry exact journal cleanup targets after rechecking current policy."""
+        try:
+            candidates: list[Mapping[str, Any]] = []
+            states = ("retained_policy",) if retained_policy_only else (
+                "pending", "delete_started", "uncertain"
+            )
+            patterns = tuple(f'%' + '"state":"' + state + '"%' for state in states)
+            conditions = " or ".join("cleanup_json like ?" for _ in patterns)
+            with self.connection() as connection:
+                for owner_type, owner_id in sorted(set(identities)):
+                    query = (
+                        "select workspace_id, owner_type, owner_id, operation_seq, "
+                        "operation_id, request_sha256, plan_json, state, cleanup_json, "
+                        "created_at, updated_at from sqag_object_artifact_operations "
+                        "where workspace_id = ? and owner_type = ? and owner_id = ? "
+                        "and state in ('published', 'aborted') "
+                        f"and ({conditions}) "
+                        "order by updated_at asc, operation_seq asc limit ?"
+                    )
+                    rows = connection.execute(
+                        query, (self.workspace_id, owner_type, owner_id, *patterns, 100)
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            cleanup = json.loads(row["cleanup_json"] or "[]")
+                            if isinstance(cleanup, list) and any(
+                                isinstance(item, Mapping)
+                                and clean_text(item.get("state")) in set(states)
+                                for item in cleanup
+                            ):
+                                candidates.append(dict(row))
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+            for row in candidates:
+                try:
+                    backend = configured_object_storage_backend()
+                    plan = self._load_object_artifact_plan(
+                        row, backend=backend, items=[], request_context=None
+                    )
+                    self._cleanup_object_artifact_batch(plan)
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    def reconcile_object_artifact_lifecycle(
+        self,
+        owner_type: str,
+        owner_id: str,
+        *,
+        limit: int = 100,
+        apply_cleanup: bool = False,
+    ) -> dict[str, int]:
+        """Inspect bounded journal state and optionally resume published cleanup."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("Artifact lifecycle reconciliation limit is invalid.")
+        safe_owner_type, safe_owner_id = self._object_lifecycle_identity(
+            owner_type, owner_id
+        )
+        self.ensure_object_artifact_lifecycle_ready()
+        identities = ((safe_owner_type, safe_owner_id),)
+
+        def read_rows(*, cleanup_only: bool) -> list[Mapping[str, Any]]:
+            with self.connection() as connection:
+                self._begin_object_lifecycle_transactions(connection, identities)
+                query = (
+                    "select workspace_id, owner_type, owner_id, operation_seq, "
+                    "operation_id, request_sha256, plan_json, state, cleanup_json, "
+                    "created_at, updated_at from sqag_object_artifact_operations "
+                    "where workspace_id = ? and owner_type = ? and owner_id = "
+                )
+                if cleanup_only:
+                    query += (
+                        "? and state in ('published', 'aborted') and (cleanup_json like ? "
+                        "or cleanup_json like ? or cleanup_json like ? or cleanup_json like ?) "
+                        "order by updated_at asc, operation_seq asc limit ?"
+                    )
+                    params = (
+                        self.workspace_id, safe_owner_type, safe_owner_id,
+                        '%"state":"pending"%',
+                        '%"state":"delete_started"%',
+                        '%"state":"uncertain"%',
+                        '%"state":"retained_policy"%',
+                        limit,
+                    )
+                else:
+                    query += "? order by operation_seq desc limit ?"
+                    params = (self.workspace_id, safe_owner_type, safe_owner_id, limit)
+                rows = connection.execute(query, params).fetchall()
+                selected = []
+                for row in rows:
+                    try:
+                        cleanup = json.loads(row["cleanup_json"] or "[]")
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise ObjectStorageContractError(
+                            "Artifact operation journal is malformed."
+                        ) from exc
+                    if not isinstance(cleanup, list) or any(
+                        not isinstance(item, Mapping) for item in cleanup
+                    ):
+                        raise ObjectStorageContractError(
+                            "Artifact operation journal is malformed."
+                        )
+                    if cleanup_only and not any(
+                        clean_text(item.get("state"))
+                        in {"pending", "delete_started", "uncertain", "retained_policy"}
+                        for item in cleanup
+                    ):
+                        continue
+                    selected.append(dict(row))
+                connection.commit()
+                return selected
+        rows = read_rows(cleanup_only=False)
+        if apply_cleanup:
+            cleanup_rows = read_rows(cleanup_only=True)
+            if cleanup_rows:
+                backend = configured_object_storage_backend()
+                for row in cleanup_rows:
+                    plan = self._load_object_artifact_plan(
+                        row, backend=backend, items=[], request_context=None
+                    )
+                    self._cleanup_object_artifact_batch(plan)
+        rows = read_rows(cleanup_only=False)
+        result = {
+            "operations_inspected": len(rows),
+            "prepared_operations": 0,
+            "published_operations": 0,
+            "aborted_operations": 0,
+            "pending_cleanup_targets": 0,
+            "uncertain_cleanup_targets": 0,
+        }
+        for row in rows:
+            if row["state"] == "prepared":
+                result["prepared_operations"] += 1
+            elif row["state"] == "published":
+                result["published_operations"] += 1
+            elif row["state"] == "aborted":
+                result["aborted_operations"] += 1
+            cleanup = json.loads(row["cleanup_json"] or "[]")
+            for item in cleanup:
+                state = clean_text(item.get("state"))
+                if state in {"pending", "delete_started"}:
+                    result["pending_cleanup_targets"] += 1
+                elif state == "uncertain":
+                    result["uncertain_cleanup_targets"] += 1
+        return result
     def _run_object_lifecycle_save(
         self,
         owner_type: str,
@@ -12696,54 +13155,177 @@ class DatabaseSqagStorage:
         *,
         additional_lock_identities: tuple[tuple[str, str], ...] = (),
     ) -> tuple[Any, ObjectArtifactBatchPlan | None]:
+        safe_owner_type, safe_owner_id = self._object_lifecycle_identity(
+            owner_type, owner_id
+        )
+        lock_identities = tuple(sorted({
+            (safe_owner_type, safe_owner_id),
+            *(
+                self._object_lifecycle_identity(item_type, item_id)
+                for item_type, item_id in additional_lock_identities
+            ),
+        }))
+        plan: ObjectArtifactBatchPlan | None = None
+        state: Any = None
+        result: Any = None
+        self.ensure_object_artifact_lifecycle_ready()
+        self._resume_published_object_artifact_cleanups(lock_identities)
         with self.connection() as connection:
-            state: Any = None
-            plan: ObjectArtifactBatchPlan | None = None
-            savepoint_started = False
             try:
-                self._begin_object_lifecycle_transactions(
-                    connection,
-                    ((owner_type, owner_id),)
-                    + additional_lock_identities,
-                )
-                state, plan = prepare(connection)
-                connection.execute(
-                    f'savepoint {OBJECT_LIFECYCLE_WRITE_SAVEPOINT}'
-                )
-                savepoint_started = True
-                result = persist(connection, state)
-                connection.commit()
-                return result, plan
-            except Exception as exc:
-                recovery_error: Exception | None = None
-                database_rolled_back = not savepoint_started
-                if savepoint_started:
-                    database_rolled_back = self._rollback_to_lifecycle_savepoint(
-                        connection,
-                        OBJECT_LIFECYCLE_WRITE_SAVEPOINT,
-                    )
-                if plan is not None and plan.state == 'prepared':
-                    if database_rolled_back:
-                        try:
-                            self._compensate_object_artifact_batch(
-                                plan,
-                                connection=connection,
-                            )
-                        except Exception as compensation_exc:
-                            recovery_error = compensation_exc
-                    else:
-                        recovery_error = ObjectStorageContractError(
-                            'Artifact lifecycle transaction outcome is uncertain.'
-                        )
+                self._begin_object_lifecycle_transactions(connection, lock_identities)
+                state, plan = prepare(connection, lock_identities)
+            except Exception:
                 try:
                     connection.rollback()
-                except Exception as rollback_exc:
-                    recovery_error = rollback_exc
-                if recovery_error is not None:
+                except Exception:
+                    pass
+                raise
+            if plan is None:
+                try:
+                    result = persist(connection, state)
+                    connection.commit()
+                    return result, None
+                except Exception:
+                    connection.rollback()
+                    raise
+            if plan.state == "published":
+                if plan.lock_identities != lock_identities:
+                    connection.rollback()
+                    raise ObjectStorageContractError("Artifact lock identities changed.")
+                connection.commit()
+                if self._verify_published_object_artifact_batch(plan):
+                    return state, plan
+                raise ObjectStorageContractError(
+                    "Published artifact operation is no longer the current binding."
+                )
+            if plan.lock_identities and plan.lock_identities != lock_identities:
+                connection.rollback()
+                raise ObjectStorageContractError("Artifact lock identities changed.")
+            plan.lock_identities = lock_identities
+            if not plan.journal_persisted:
+                self._persist_object_artifact_prepared(connection, plan)
+            try:
+                connection.commit()
+            except Exception as exc:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                # The durable PREPARED row, not the exception type, decides
+                # whether the first phase committed.
+                found = False
+                try:
+                    with self.connection() as confirm:
+                        self._begin_object_lifecycle_transactions(confirm, lock_identities)
+                        durable = self._object_artifact_operation_row(confirm, plan)
+                        found = bool(
+                            durable is not None
+                            and durable["state"] == "prepared"
+                            and durable["operation_id"] == plan.operation_id
+                            and durable["plan_json"] == plan.plan_json
+                        )
+                        confirm.commit()
+                except Exception:
+                    found = False
+                if not found:
                     raise ObjectStorageContractError(
-                        'Artifact lifecycle recovery failed.'
-                    ) from recovery_error
+                        "Artifact preparation outcome is unavailable."
+                    ) from exc
+
+        if not plan.journal_persisted:
+            raise ObjectStorageContractError("Artifact preparation was not durable.")
+        try:
+            with self.connection() as connection:
+                self._begin_object_lifecycle_transactions(connection, lock_identities)
+                durable = self._object_artifact_operation_row(connection, plan)
+                if (
+                    durable is None
+                    or durable["state"] != "prepared"
+                    or durable["operation_id"] != plan.operation_id
+                    or durable["request_sha256"] != plan.request_sha256
+                    or durable["plan_json"] != plan.plan_json
+                    or tuple(tuple(item) for item in json.loads(plan.plan_json)["lock_identities"])
+                    != lock_identities
+                    or not self._object_artifact_batch_snapshot_is_current(plan, connection)
+                    or self._object_owner_row_digest(
+                        connection, plan.owner_type, plan.owner_id
+                    ) != plan.owner_before_digest
+                    or not self._locked_object_owner_rows_match(connection, plan)
+                ):
+                    raise ObjectStorageContractError(
+                        "Artifact operation predecessors changed."
+                    )
+                self._stage_object_artifact_successors(plan)
+                result = persist(connection, state)
+                if not self._object_owner_request_matches(connection, plan):
+                    raise ObjectStorageContractError(
+                        "Owner publication does not match the prepared digest."
+                    )
+                if not self._object_artifact_batch_snapshot_is_current(
+                    plan, connection, published=True
+                ):
+                    raise ObjectStorageContractError(
+                        "Artifact metadata publication is incomplete."
+                    )
+                for cleanup_item in plan.cleanup:
+                    target = self._artifact_row_snapshot(cleanup_item["snapshot"])
+                    cleanup_item["state"] = (
+                        "retained_policy"
+                        if self._object_artifact_cleanup_blocked(connection, target)
+                        else "pending"
+                    )
+                self._update_object_artifact_operation_state(
+                    connection, plan, "published"
+                )
+                connection.commit()
+        except Exception as exc:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+            # A fresh primary read and reacquired locks decide commit outcome.
+            if self._object_artifact_operation_row_after_uncertain_commit(
+                plan, lock_identities
+            ):
+                plan.state = "published"
+                if self._verify_published_object_artifact_batch(plan):
+                    return result if result is not None else state, plan
+            # Preserve both predecessor and any possible successor. A later
+            # retry/reconciler uses the same journal-reserved key.
+            plan.state = "prepared"
+            if isinstance(exc, ObjectStorageContractError):
                 raise exc
+            raise ObjectStorageContractError(
+                "Artifact publication outcome is unavailable."
+            ) from exc
+
+        plan.state = "published"
+        if not self._verify_published_object_artifact_batch(plan):
+            raise ObjectStorageContractError(
+                "Published artifact binding could not be verified."
+            )
+        return result, plan
+
+    def _object_artifact_operation_row_after_uncertain_commit(
+        self,
+        plan: ObjectArtifactBatchPlan,
+        lock_identities: tuple[tuple[str, str], ...],
+    ) -> bool:
+        try:
+            with self.connection() as connection:
+                self._begin_object_lifecycle_transactions(connection, lock_identities)
+                row = self._object_artifact_operation_row(connection, plan)
+                committed = bool(
+                    row is not None
+                    and row["state"] == "published"
+                    and row["operation_id"] == plan.operation_id
+                    and row["request_sha256"] == plan.request_sha256
+                    and row["plan_json"] == plan.plan_json
+                )
+                connection.commit()
+                return committed
+        except Exception:
+            return False
 
     def _delete_payload(self, table: str, id_column: str, item_id: str) -> bool:
         with self.connection() as connection:
@@ -12759,6 +13341,72 @@ class DatabaseSqagStorage:
         ]
         return sorted(profiles, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("id")).casefold()))
 
+    def _read_profile_artifact_snapshots(
+        self,
+        profile_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> tuple[ProfileRowSnapshot, ArtifactRowSnapshot] | None:
+        safe_id = safe_resource_id(profile_id, "")
+        if not safe_id:
+            return None
+        if connection is None:
+            with self.connection() as active_connection:
+                return self._read_profile_artifact_snapshots(
+                    safe_id, connection=active_connection
+                )
+        artifact_fields = (
+            "a.artifact_id as a_artifact_id, a.workspace_id as a_workspace_id, "
+            "a.owner_type as a_owner_type, a.owner_id as a_owner_id, "
+            "a.platform_user_id as a_platform_user_id, a.session_id as a_session_id, "
+            "a.job_id as a_job_id, a.artifact_kind as a_artifact_kind, "
+            "a.filename as a_filename, a.content_type as a_content_type, "
+            "a.size_bytes as a_size_bytes, a.checksum_sha256 as a_checksum_sha256, "
+            "a.object_provider_type as a_object_provider_type, "
+            "a.object_key_ref as a_object_key_ref, a.status as a_status, "
+            "a.retention_status as a_retention_status, a.created_at as a_created_at, "
+            "a.updated_at as a_updated_at, a.deleted_at as a_deleted_at"
+        )
+        rows = connection.execute(
+            "select p.workspace_id as p_workspace_id, p.profile_id as p_profile_id, "
+            "p.payload_json as p_payload_json, p.created_at as p_created_at, "
+            "p.updated_at as p_updated_at, " + artifact_fields + " "
+            "from sqag_profiles p left join sqag_object_artifacts a "
+            "on a.workspace_id = p.workspace_id and a.owner_type = ? "
+            "and a.owner_id = p.profile_id and a.artifact_kind = ? "
+            "where p.workspace_id = ? and p.profile_id = ?",
+            ("profile", "quotation_layout", self.workspace_id, safe_id),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        try:
+            profile = ProfileRowSnapshot(
+                workspace_id=row["p_workspace_id"],
+                profile_id=row["p_profile_id"],
+                payload_json=row["p_payload_json"],
+                created_at=row["p_created_at"],
+                updated_at=row["p_updated_at"],
+            )
+            if any(not isinstance(value, str) for value in self._profile_snapshot_mapping(profile).values()):
+                raise ObjectStorageContractError("Profile metadata is malformed.")
+        except (KeyError, TypeError, ObjectStorageContractError):
+            return None
+        if profile.workspace_id != self.workspace_id or profile.profile_id != safe_id:
+            return None
+        artifact_row = {
+            name: row[f"a_{name}"] for name in ArtifactRowSnapshot.__dataclass_fields__
+        }
+        if artifact_row["artifact_id"] is None:
+            if any(value is not None for value in artifact_row.values()):
+                return None
+            return profile, None
+        try:
+            artifact = self._artifact_row_snapshot(artifact_row)
+        except ObjectStorageContractError:
+            return None
+        return profile, artifact
+
     def _validated_profile_layout_record(
         self,
         profile_id: str,
@@ -12768,18 +13416,27 @@ class DatabaseSqagStorage:
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             return None
-        if connection is None:
-            with self.connection() as active_connection:
-                return self._validated_profile_layout_record(
-                    safe_id,
-                    connection=active_connection,
-                )
-        profile = self._read_payload(
-            "sqag_profiles",
-            "profile_id",
-            safe_id,
-            connection=connection,
-        )
+        artifact_mode = configured_artifact_storage_mode()
+        expected_content_type = QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"]
+        profile_snapshot: ProfileRowSnapshot | None = None
+        artifact_snapshot: ArtifactRowSnapshot | None = None
+        if artifact_mode == "object":
+            joined = self._read_profile_artifact_snapshots(
+                safe_id, connection=connection
+            )
+            if joined is None:
+                return None
+            profile_snapshot, artifact_snapshot = joined
+            try:
+                profile = json.loads(profile_snapshot.payload_json)
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if not isinstance(profile, dict):
+                return None
+        else:
+            profile = self._read_payload(
+                "sqag_profiles", "profile_id", safe_id, connection=connection
+            )
         if (
             profile is None
             or safe_resource_id(profile.get("id"), "") != safe_id
@@ -12787,14 +13444,9 @@ class DatabaseSqagStorage:
         ):
             return None
 
-        artifact_mode = configured_artifact_storage_mode()
-        expected_content_type = QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"]
         if artifact_mode == "database":
             artifact = self._read_file_artifact(
-                "profile",
-                safe_id,
-                "quotation_layout",
-                connection=connection,
+                "profile", safe_id, "quotation_layout", connection=connection
             )
             if not artifact:
                 return None
@@ -12817,67 +13469,62 @@ class DatabaseSqagStorage:
                 return None
             checksum = hashlib.sha256(content).hexdigest()
         elif artifact_mode == "object":
-            rows = self._active_object_artifact_rows(
-                "profile",
-                safe_id,
-                connection=connection,
-                artifact_kind="quotation_layout",
-            )
-            if len(rows) != 1:
+            if artifact_snapshot is None:
                 return None
-            row = rows[0]
+            snapshot = artifact_snapshot
             try:
-                filename = clean_text(row["filename"])
-                checksum = clean_text(row["checksum_sha256"])
-                size_bytes = int(row["size_bytes"] or 0)
                 expected_key = object_artifact_key(
                     workspace_id=self.workspace_id,
                     owner_type="profile",
                     owner_id=safe_id,
                     artifact_kind="quotation_layout",
-                    filename=filename,
-                    checksum_sha256=checksum,
+                    filename=snapshot.filename,
+                    checksum_sha256=snapshot.checksum_sha256,
+                    artifact_incarnation=self._artifact_incarnation_from_key(
+                        snapshot.object_key_ref or ""
+                    ),
                 )
-            except (KeyError, TypeError, ValueError, ObjectStorageContractError):
+            except (TypeError, ValueError, ObjectStorageContractError):
                 return None
             if (
-                not clean_text(row["artifact_id"])
-                or clean_text(row["workspace_id"]) != self.workspace_id
-                or clean_text(row["owner_type"]) != "profile"
-                or clean_text(row["owner_id"]) != safe_id
-                or clean_text(row["artifact_kind"]) != "quotation_layout"
-                or clean_text(row["session_id"])
-                or clean_text(row["job_id"])
-                or clean_text(row["object_provider_type"]) != "s3_compatible"
-                or clean_text(row["content_type"]) != expected_content_type
-                or not filename
-                or safe_profile_pack_filename(filename, "quotation-layout.xlsx", {".xlsx"}) != filename
-                or not re.fullmatch(r"[a-f0-9]{64}", checksum)
-                or size_bytes <= 0
-                or size_bytes > MAX_PROFILE_LAYOUT_BYTES
-                or clean_text(row["status"]) != "active"
-                or clean_text(row["retention_status"]) != "active"
-                or clean_text(row["deleted_at"])
-                or clean_text(row["object_key_ref"]) != expected_key
+                snapshot.artifact_id is None
+                or snapshot.workspace_id != self.workspace_id
+                or snapshot.owner_type != "profile"
+                or snapshot.owner_id != safe_id
+                or snapshot.artifact_kind != "quotation_layout"
+                or snapshot.object_provider_type != "s3_compatible"
+                or snapshot.content_type != expected_content_type
+                or snapshot.filename is None
+                or safe_profile_pack_filename(snapshot.filename, "quotation-layout.xlsx", {".xlsx"}) != snapshot.filename
+                or snapshot.checksum_sha256 is None
+                or not re.fullmatch(r"[a-f0-9]{64}", snapshot.checksum_sha256)
+                or snapshot.size_bytes <= 0
+                or snapshot.size_bytes > MAX_PROFILE_LAYOUT_BYTES
+                or snapshot.status != "active"
+                or snapshot.retention_status != "active"
+                or snapshot.deleted_at is not None
+                or snapshot.object_key_ref != expected_key
+                or snapshot.session_id not in (None, "")
+                or snapshot.job_id not in (None, "")
             ):
                 return None
-            artifact = self._read_object_file_artifact(
-                "profile",
-                safe_id,
-                "quotation_layout",
-                connection=connection,
+            retrieved = self._read_object_file_artifact(
+                "profile", safe_id, "quotation_layout", snapshot=snapshot
             )
-            if not artifact:
+            if retrieved is None:
                 return None
-            content = artifact.get("content")
+            content = retrieved["content"]
+            filename = snapshot.filename
+            checksum = snapshot.checksum_sha256
+            size_bytes = snapshot.size_bytes
             if (
                 not isinstance(content, bytes)
                 or not content
                 or len(content) != size_bytes
                 or hashlib.sha256(content).hexdigest() != checksum
-                or clean_text(artifact.get("filename")) != filename
-                or clean_text(artifact.get("content_type")) != expected_content_type
-                or int(artifact.get("size_bytes") or 0) != size_bytes
+                or retrieved.get("filename") != filename
+                or retrieved.get("content_type") != expected_content_type
+                or retrieved.get("size_bytes") != size_bytes
             ):
                 return None
         else:
@@ -12887,6 +13534,13 @@ class DatabaseSqagStorage:
             validate_profile_layout_xlsx(content)
         except ValueError:
             return None
+
+        if artifact_mode == "object":
+            final_joined = self._read_profile_artifact_snapshots(safe_id)
+            if final_joined is None or final_joined != (
+                profile_snapshot, artifact_snapshot
+            ):
+                return None
         return {
             "profile": profile,
             "layout": {
@@ -12969,7 +13623,7 @@ class DatabaseSqagStorage:
             raise ValueError("A valid quotation layout is required for a hosted company profile.")
 
         if artifact_mode == "object":
-            def prepare_object_profile(connection: Any):
+            def prepare_object_profile(connection: Any, lifecycle_lock_identities: tuple[tuple[str, str], ...]):
                 self._assert_profile_can_be_saved(profile_id, connection=connection)
                 item = self._prepare_profile_layout_artifact(profile)
                 if item is None:
@@ -12990,57 +13644,11 @@ class DatabaseSqagStorage:
                     {"quotation_layout"},
                     connection=connection,
                     quote_session=False,
+                    request_context=stored,
+                    lifecycle_lock_identities=lifecycle_lock_identities,
                 )
-                try:
-                    metadata = plan.desired_metadata.get("quotation_layout")
-                    expected_checksum = hashlib.sha256(item.content).hexdigest()
-                    expected_key = object_artifact_key(
-                        workspace_id=self.workspace_id,
-                        owner_type="profile",
-                        owner_id=profile_id,
-                        artifact_kind="quotation_layout",
-                        filename=item.filename,
-                        checksum_sha256=expected_checksum,
-                    )
-                    if (
-                        metadata is None
-                        or metadata.workspace_id != self.workspace_id
-                        or metadata.owner_type != "profile"
-                        or metadata.owner_id != profile_id
-                        or metadata.artifact_kind != "quotation_layout"
-                        or metadata.filename != item.filename
-                        or metadata.content_type != QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"]
-                        or metadata.size_bytes != len(item.content)
-                        or metadata.checksum_sha256 != expected_checksum
-                        or metadata.storage_key != expected_key
-                    ):
-                        raise ObjectStorageContractError(
-                            "Artifact storage metadata is inconsistent."
-                        )
-                    readback = plan.backend.retrieve_artifact(
-                        metadata,
-                        workspace_id=self.workspace_id,
-                    )
-                    if (
-                        readback != item.content
-                        or len(readback) != metadata.size_bytes
-                        or hashlib.sha256(readback).hexdigest() != metadata.checksum_sha256
-                    ):
-                        raise ObjectStorageContractError(
-                            "Artifact readback verification failed."
-                        )
-                    validate_profile_layout_xlsx(readback)
-                except Exception:
-                    try:
-                        self._compensate_object_artifact_batch(
-                            plan,
-                            connection=connection,
-                        )
-                    except Exception as compensation_exc:
-                        raise ObjectStorageContractError(
-                            "Artifact lifecycle recovery failed."
-                        ) from compensation_exc
-                    raise
+                plan.request_context = stored
+                plan.owner_digest = self._canonical_json_digest(stored)
                 return plan, plan
 
             def persist_object_profile(
@@ -13169,6 +13777,7 @@ class DatabaseSqagStorage:
                     safe_id,
                     delete_object_profile_owner,
                     authorize=authorize_object_profile,
+                    expected_owner_after_digest=lambda _connection: self._canonical_json_digest({"id": safe_id, DELETED_PROFILE_MARKER_KEY: True}),
                 )
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
@@ -13277,7 +13886,7 @@ class DatabaseSqagStorage:
             stored,
         )
         if artifact_mode == 'object':
-            def prepare_object_pricing(connection: Any):
+            def prepare_object_pricing(connection: Any, lifecycle_lock_identities: tuple[tuple[str, str], ...]):
                 managed_kinds = set(retained_kinds)
                 managed_kinds.update(
                     clean_text(row['artifact_kind'])
@@ -13300,6 +13909,8 @@ class DatabaseSqagStorage:
                         retained_kinds,
                         connection=connection,
                         quote_session=False,
+                        request_context=stored,
+                        lifecycle_lock_identities=lifecycle_lock_identities,
                     )
                     if managed_kinds
                     else None
@@ -13391,6 +14002,7 @@ class DatabaseSqagStorage:
                     "pricing_reference",
                     safe_id,
                     delete_object_pricing_owner,
+                    expected_owner_after_digest=lambda _connection: self._canonical_json_digest(None),
                 )
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
@@ -13637,20 +14249,20 @@ class DatabaseSqagStorage:
         safe_filename = safe_segment(filename, safe_kind or "artifact")
         if not safe_owner_type or not safe_owner_id or not safe_kind or not safe_filename:
             raise ObjectStorageContractError("Artifact metadata is incomplete.")
-        artifact_id = f"obj-{secrets.token_hex(12)}"
-        now = utc_timestamp()
-        safe_content_type = clean_text(content_type) or "application/octet-stream"
+        artifact_id = metadata.artifact_id or f"obj-{secrets.token_hex(12)}"
+        now = metadata.updated_at or utc_timestamp()
+        safe_content_type = metadata.content_type or clean_text(content_type) or "application/octet-stream"
         created_at = metadata.created_at or now
-        platform_user_id = self.user_id
-        session_id = ""
-        job_id = ""
+        platform_user_id = metadata.platform_user_id if metadata.platform_user_id is not None else self.user_id
+        session_id = metadata.session_id if metadata.session_id is not None else ""
+        job_id = metadata.job_id if metadata.job_id is not None else ""
         existing = connection.execute(
             "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
             "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
             (self.workspace_id, safe_owner_type, safe_owner_id, safe_kind),
         ).fetchone()
         reusable_existing = False
-        if existing:
+        if existing and metadata.artifact_incarnation is None:
             try:
                 reusable_existing = (
                     clean_text(existing["workspace_id"]) == self.workspace_id
@@ -13675,7 +14287,7 @@ class DatabaseSqagStorage:
         connection.execute(
             "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
             "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
+            "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, created_at = excluded.created_at, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
             (
                 artifact_id,
                 self.workspace_id,
@@ -13734,141 +14346,598 @@ class DatabaseSqagStorage:
 
     def _object_artifact_row_matches_snapshot(
         self,
-        row: Mapping[str, Any],
-        expected: Mapping[str, Any],
+        row: Mapping[str, Any] | sqlite3.Row,
+        expected: ArtifactRowSnapshot | Mapping[str, Any],
     ) -> bool:
-        text_fields = (
-            "artifact_id",
-            "workspace_id",
-            "owner_type",
-            "owner_id",
-            "platform_user_id",
-            "session_id",
-            "job_id",
-            "artifact_kind",
-            "filename",
-            "content_type",
-            "checksum_sha256",
-            "object_provider_type",
-            "object_key_ref",
-            "status",
-            "retention_status",
-            "created_at",
-            "updated_at",
-            "deleted_at",
-        )
-        return (
-            all(
-                clean_text(row[field]) == clean_text(expected[field])
-                for field in text_fields
-            )
-            and int(row["size_bytes"] or 0)
-            == int(expected["size_bytes"] or 0)
-        )
-
-    def _object_artifact_batch_snapshot_is_current(
-        self,
-        plan: ObjectArtifactBatchPlan,
-        connection: Any,
-    ) -> bool:
-        if connection is None:
-            raise ObjectStorageContractError(
-                'Serialized artifact connection is required.'
-            )
-        def read_rows(active_connection: Any) -> list[Mapping[str, Any]]:
-            return active_connection.execute(
-                "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at "
-                "from sqag_object_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? "
-                "and status = ? and retention_status = ? and deleted_at is null",
-                (
-                    self.workspace_id,
-                    plan.owner_type,
-                    plan.owner_id,
-                    "active",
-                    "active",
-                ),
-            ).fetchall()
-
-        rows = read_rows(connection)
-        current_rows = {
-            clean_text(row["artifact_kind"]): row
-            for row in rows
-            if clean_text(row["artifact_kind"]) in plan.managed_kinds
-        }
-        if set(current_rows) != set(plan.expected_rows):
-            return False
-        return all(
-            self._object_artifact_row_matches_snapshot(
-                current_rows[kind],
-                expected,
-            )
-            for kind, expected in plan.expected_rows.items()
-        )
-
-    def _finalize_object_artifact_batch(
-        self,
-        plan: ObjectArtifactBatchPlan,
-    ) -> None:
-        if plan.state != "prepared":
-            raise ObjectStorageContractError(
-                "Artifact batch state is invalid."
-            )
-        plan.state = "committed"
-
-    def _compensate_object_artifact_batch(
-        self,
-        plan: ObjectArtifactBatchPlan,
-        *,
-        connection: Any,
-    ) -> None:
-        if connection is None:
-            raise ObjectStorageContractError(
-                'Serialized artifact connection is required.'
-            )
-        if plan.state != "prepared":
-            raise ObjectStorageContractError(
-                "Artifact batch state is invalid."
-            )
-        plan.state = "compensating"
-        recovery_errors: list[Exception] = []
         try:
-            if not self._object_artifact_batch_snapshot_is_current(
-                plan,
-                connection,
-            ):
-                raise ObjectStorageContractError(
-                    "Artifact metadata changed during batch recovery."
+            actual = self._artifact_row_snapshot(row)
+            frozen = (
+                expected
+                if isinstance(expected, ArtifactRowSnapshot)
+                else self._artifact_row_snapshot(expected)
+            )
+        except ObjectStorageContractError:
+            return False
+        return actual == frozen
+
+    @staticmethod
+    def _canonical_json_digest(value: Any) -> str:
+        encoded = json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _object_owner_row_digest(
+        self, connection: Any, owner_type: str, owner_id: str
+    ) -> str:
+        table, key = {
+            "profile": ("sqag_profiles", "profile_id"),
+            "pricing_reference": ("sqag_pricing_references", "reference_id"),
+            "generated_quote": ("sqag_quote_sessions", "session_id"),
+            "uploaded_reference": ("sqag_quote_sessions", "session_id"),
+            "generated_quote_version": ("sqag_quote_publication_versions", "run_id"),
+        }[owner_type]
+        row = connection.execute(
+            f"select * from {table} where workspace_id = ? and {key} = ?",
+            (self.workspace_id, owner_id),
+        ).fetchone()
+        if row is None:
+            return self._canonical_json_digest(None)
+        try:
+            if owner_type in {"profile", "pricing_reference"}:
+                context = json.loads(row["payload_json"])
+            elif owner_type == "uploaded_reference":
+                context = {
+                    "metadata": json.loads(row["metadata_json"] or "{}"),
+                    "draft_files": json.loads(row["draft_files_json"] or "[]"),
+                }
+            elif owner_type == "generated_quote":
+                context = {
+                    "metadata": json.loads(row["metadata_json"] or "{}"),
+                    "draft_files": json.loads(row["draft_files_json"] or "[]"),
+                }
+            else:
+                context = {"metadata": json.loads(row["metadata_json"] or "{}")}
+            return self._canonical_json_digest(
+                self._normalized_object_owner_request(owner_type, context)
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ObjectStorageContractError("Artifact owner row is malformed.") from exc
+
+    def _object_owner_full_row_digest(
+        self, connection: Any, owner_type: str, owner_id: str
+    ) -> str:
+        table, key = {
+            "profile": ("sqag_profiles", "profile_id"),
+            "pricing_reference": ("sqag_pricing_references", "reference_id"),
+            "generated_quote": ("sqag_quote_sessions", "session_id"),
+            "uploaded_reference": ("sqag_quote_sessions", "session_id"),
+            "generated_quote_version": ("sqag_quote_publication_versions", "run_id"),
+        }[owner_type]
+        row = connection.execute(
+            f"select * from {table} where workspace_id = ? and {key} = ?",
+            (self.workspace_id, owner_id),
+        ).fetchone()
+        if row is None:
+            return self._canonical_json_digest(None)
+        fields = {
+            "profile": ("workspace_id", "profile_id", "payload_json", "created_at", "updated_at"),
+            "pricing_reference": ("workspace_id", "reference_id", "payload_json", "created_at", "updated_at"),
+            "generated_quote": ("workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"),
+            "uploaded_reference": ("workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"),
+            "generated_quote_version": (
+                "workspace_id", "session_id", "run_id", "job_id", "state",
+                "artifact_storage_mode", "artifact_source", "metadata_json",
+                "error_code", "created_at", "updated_at", "promoted_at", "failed_at",
+                "retention_expires_at", "original_retention_expires_at", "legal_hold",
+                "deletion_state", "deletion_error_code", "deletion_claimed_at",
+            ),
+        }[owner_type]
+        try:
+            projection = {field_name: row[field_name] for field_name in fields}
+            return self._canonical_json_digest(projection)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ObjectStorageContractError("Artifact owner row is malformed.") from exc
+
+    def _locked_object_owner_row_digests(
+        self,
+        connection: Any,
+        identities: tuple[tuple[str, str], ...],
+    ) -> dict[tuple[str, str], str]:
+        normalized = tuple(sorted({
+            self._object_lifecycle_identity(owner_type, owner_id)
+            for owner_type, owner_id in identities
+        }))
+        return {
+            identity: self._object_owner_full_row_digest(connection, *identity)
+            for identity in normalized
+        }
+
+    def _locked_object_owner_rows_match(
+        self,
+        connection: Any,
+        plan: ObjectArtifactBatchPlan,
+    ) -> bool:
+        expected = plan.locked_owner_row_digests
+        return bool(
+            tuple(sorted(expected)) == tuple(sorted(plan.lock_identities))
+            and all(
+                self._object_owner_full_row_digest(connection, *identity) == digest
+                for identity, digest in expected.items()
+            )
+        )
+
+    def _normalized_object_owner_request(self, owner_type: str, context: Any) -> Any:
+        if not isinstance(context, Mapping):
+            return context
+        normalized = copy.deepcopy(dict(context))
+        if owner_type not in {"generated_quote", "generated_quote_version"}:
+            return normalized
+
+        def remove_volatile(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {
+                    key: remove_volatile(item)
+                    for key, item in value.items()
+                    if key not in {"created_at", "updated_at", "staged_at"}
+                }
+            if isinstance(value, list):
+                return [remove_volatile(item) for item in value]
+            return value
+
+        if "metadata" in normalized:
+            normalized["metadata"] = remove_volatile(normalized["metadata"])
+        return normalized
+
+    def _object_owner_request_matches(
+        self,
+        connection: Any,
+        plan: ObjectArtifactBatchPlan,
+    ) -> bool:
+        context = plan.request_context
+        owner_type = plan.owner_type
+        if context is None and owner_type != "generated_quote_version":
+            return True
+        table, key = {
+            "profile": ("sqag_profiles", "profile_id"),
+            "pricing_reference": ("sqag_pricing_references", "reference_id"),
+            "generated_quote": ("sqag_quote_sessions", "session_id"),
+            "uploaded_reference": ("sqag_quote_sessions", "session_id"),
+            "generated_quote_version": ("sqag_quote_publication_versions", "run_id"),
+        }[owner_type]
+        row = connection.execute(
+            f"select * from {table} where workspace_id = ? and {key} = ?",
+            (self.workspace_id, plan.owner_id),
+        ).fetchone()
+        if row is None:
+            return False
+        def digest(value: Any) -> str:
+            return self._canonical_json_digest(
+                self._normalized_object_owner_request(owner_type, value)
+            )
+
+        if owner_type in {"profile", "pricing_reference"}:
+            return row["payload_json"] == json.dumps(
+                context, ensure_ascii=True, sort_keys=True
+            )
+        if owner_type == "uploaded_reference":
+            records = context.get("draft_files") if isinstance(context, Mapping) else context
+            try:
+                actual_metadata = json.loads(row["metadata_json"])
+                metadata_matches = (
+                    "metadata" not in context
+                    or digest(actual_metadata) == digest(context["metadata"])
                 )
-            for metadata in reversed(plan.new_objects):
-                try:
-                    if not plan.backend.delete_artifact(
-                        metadata,
-                        workspace_id=self.workspace_id,
-                    ):
-                        recovery_errors.append(
-                            ObjectStorageContractError(
-                                "Replacement artifact cleanup failed."
-                            )
-                        )
-                except Exception as exc:
-                    recovery_errors.append(exc)
-            for metadata, content in plan.deleted_previous:
-                try:
-                    self._restore_object_artifact(
-                        plan.backend,
-                        metadata,
-                        content,
-                    )
-                except Exception as exc:
-                    recovery_errors.append(exc)
-        except Exception as exc:
-            recovery_errors.append(exc)
-        if recovery_errors:
-            plan.state = "compensation_failed"
+                return metadata_matches and digest(
+                    json.loads(row["draft_files_json"])
+                ) == digest(records)
+            except (TypeError, json.JSONDecodeError):
+                return False
+        if not (
+            owner_type == "generated_quote_version" and context is None
+        ) and (not isinstance(context, Mapping) or "metadata" not in context):
+            return False
+        if owner_type == "generated_quote_version":
+            if context is None:
+                bindings = {
+                    (snapshot.session_id, snapshot.job_id)
+                    for snapshot in plan.published_rows.values()
+                }
+                if len(bindings) != 1:
+                    return False
+                expected_session_id, expected_job_id = next(iter(bindings))
+                expected_run_id = plan.owner_id
+            else:
+                expected_metadata = context.get("metadata")
+                expected_publication = (
+                    expected_metadata.get("publication")
+                    if isinstance(expected_metadata, Mapping)
+                    else None
+                )
+                expected_session_id = (
+                    expected_metadata.get("session_id")
+                    if isinstance(expected_metadata, Mapping)
+                    else None
+                )
+                expected_run_id = (
+                    expected_publication.get("run_id")
+                    if isinstance(expected_publication, Mapping)
+                    else None
+                )
+                expected_job_id = (
+                    expected_publication.get("job_id")
+                    if isinstance(expected_publication, Mapping)
+                    else None
+                )
+            if (
+                row["run_id"] != plan.owner_id
+                or row["session_id"] != expected_session_id
+                or row["job_id"] != expected_job_id
+                or row["state"] not in {"staged", "published"}
+                or row["deletion_state"] != "active"
+                or row["artifact_source"] != "version"
+                or row["artifact_storage_mode"] != configured_artifact_storage_mode()
+                or expected_run_id != plan.owner_id
+            ):
+                return False
+        try:
+            actual_metadata = json.loads(row["metadata_json"])
+            if context is None:
+                if digest({"metadata": actual_metadata}) != plan.owner_digest:
+                    return False
+            elif digest(actual_metadata) != digest(context["metadata"]):
+                return False
+            if owner_type == "generated_quote" and "draft_files" in context:
+                return digest(json.loads(row["draft_files_json"])) == digest(
+                    context["draft_files"]
+                )
+            return True
+        except (TypeError, json.JSONDecodeError):
+            return False
+
+    def _object_artifact_rows_for_kinds(
+        self,
+        connection: Any,
+        owner_type: str,
+        owner_id: str,
+        managed_kinds: set[str],
+    ) -> dict[str, ArtifactRowSnapshot]:
+        if not managed_kinds:
+            return {}
+        placeholders = ", ".join("?" for _ in managed_kinds)
+        rows = connection.execute(
+            "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, "
+            "session_id, job_id, artifact_kind, filename, content_type, size_bytes, "
+            "checksum_sha256, object_provider_type, object_key_ref, status, "
+            "retention_status, created_at, updated_at, deleted_at "
+            "from sqag_object_artifacts where workspace_id = ? and owner_type = ? "
+            f"and owner_id = ? and artifact_kind in ({placeholders}) order by artifact_kind",
+            (self.workspace_id, owner_type, owner_id, *sorted(managed_kinds)),
+        ).fetchall()
+        result: dict[str, ArtifactRowSnapshot] = {}
+        for row in rows:
+            snapshot = self._artifact_row_snapshot(row)
+            kind = snapshot.artifact_kind
+            if not kind or kind in result:
+                raise ObjectStorageContractError("Artifact metadata is duplicated.")
+            result[kind] = snapshot
+        return result
+
+    def _object_artifact_plan_payload(
+        self, plan: ObjectArtifactBatchPlan
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "workspace_id": self.workspace_id,
+            "owner_type": plan.owner_type,
+            "owner_id": plan.owner_id,
+            "operation_seq": plan.operation_seq,
+            "operation_id": plan.operation_id,
+            "request_sha256": plan.request_sha256,
+            "lock_identities": [list(item) for item in plan.lock_identities],
+            "managed_artifact_kinds": sorted(plan.managed_kinds),
+            "predecessors": {
+                kind: self._artifact_snapshot_mapping(snapshot)
+                for kind, snapshot in sorted(plan.expected_rows.items())
+            },
+            "successors": {
+                kind: self._artifact_snapshot_mapping(snapshot)
+                for kind, snapshot in sorted(plan.successor_rows.items())
+            },
+            "published_rows": {
+                kind: self._artifact_snapshot_mapping(snapshot)
+                for kind, snapshot in sorted(plan.published_rows.items())
+            },
+            "unchanged_kinds": sorted(plan.unchanged_kinds),
+            "omitted_kind_dispositions": {
+                row["artifact_kind"]: "tombstone_after_publication"
+                for row in plan.omitted_rows
+            },
+            "delete_targets": [
+                self._artifact_snapshot_mapping(snapshot)
+                for snapshot in plan.delete_targets
+            ],
+            "delete_published_rows": [
+                self._artifact_snapshot_mapping(snapshot)
+                for snapshot in plan.delete_published_rows
+            ],
+            "owner_delete_operation": plan.owner_delete_operation,
+            "owner_row_digests": {
+                "before": plan.owner_before_digest,
+                "after": plan.owner_digest,
+            },
+            "locked_owner_row_digests": [
+                {
+                    "owner_type": owner_type,
+                    "owner_id": owner_id,
+                    "sha256": digest,
+                }
+                for (owner_type, owner_id), digest in sorted(
+                    plan.locked_owner_row_digests.items()
+                )
+            ],
+        }
+
+    def _persist_object_artifact_prepared(
+        self, connection: Any, plan: ObjectArtifactBatchPlan
+    ) -> None:
+        if not plan.locked_owner_row_digests:
+            plan.locked_owner_row_digests = self._locked_object_owner_row_digests(
+                connection, plan.lock_identities
+            )
+        if tuple(sorted(plan.locked_owner_row_digests)) != tuple(
+            sorted(plan.lock_identities)
+        ):
             raise ObjectStorageContractError(
-                "Artifact batch recovery failed."
-            ) from recovery_errors[0]
-        plan.state = "compensated"
+                "Artifact owner guard identities are incomplete."
+            )
+        payload = self._object_artifact_plan_payload(plan)
+        plan.plan_json = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        now = utc_timestamp()
+        connection.execute(
+            "insert into sqag_object_artifact_operations "
+            "(workspace_id, owner_type, owner_id, operation_seq, operation_id, "
+            "request_sha256, plan_json, state, cleanup_json, created_at, updated_at) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.workspace_id, plan.owner_type, plan.owner_id,
+                plan.operation_seq, plan.operation_id, plan.request_sha256,
+                plan.plan_json, "prepared",
+                json.dumps(plan.cleanup, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+                now, now,
+            ),
+        )
+        plan.journal_persisted = True
+        plan.state = "prepared"
+
+    def _update_object_artifact_operation_state(
+        self,
+        connection: Any,
+        plan: ObjectArtifactBatchPlan,
+        state: str,
+    ) -> None:
+        if state not in {"published", "aborted"}:
+            raise ObjectStorageContractError("Artifact operation state is invalid.")
+        now = utc_timestamp()
+        cursor = connection.execute(
+            "update sqag_object_artifact_operations set state = ?, cleanup_json = ?, updated_at = ? "
+            "where workspace_id = ? and owner_type = ? and owner_id = ? "
+            "and operation_seq = ? and operation_id = ? and request_sha256 = ? "
+            "and plan_json = ? and state = 'prepared'",
+            (
+                state,
+                json.dumps(plan.cleanup, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+                now, self.workspace_id, plan.owner_type, plan.owner_id,
+                plan.operation_seq, plan.operation_id, plan.request_sha256,
+                plan.plan_json,
+            ),
+        )
+        if getattr(cursor, "rowcount", 0) != 1:
+            raise ObjectStorageContractError("Artifact operation changed during publication.")
+        plan.state = state
+
+    def _load_object_artifact_plan(
+        self,
+        row: Mapping[str, Any],
+        *,
+        backend: ObjectStorageBackend,
+        items: list[ArtifactBatchItem],
+        request_context: Any,
+    ) -> ObjectArtifactBatchPlan:
+        try:
+            payload = json.loads(row["plan_json"])
+            cleanup = json.loads(row["cleanup_json"])
+            if payload.get("schema_version") != 1 or not isinstance(cleanup, list):
+                raise ValueError
+            expected = {
+                kind: self._artifact_row_snapshot(snapshot)
+                for kind, snapshot in payload["predecessors"].items()
+            }
+            successors = {
+                kind: self._artifact_row_snapshot(snapshot)
+                for kind, snapshot in payload["successors"].items()
+            }
+            published_rows = {
+                kind: self._artifact_row_snapshot(snapshot)
+                for kind, snapshot in payload["published_rows"].items()
+            }
+            delete_targets = [
+                self._artifact_row_snapshot(snapshot)
+                for snapshot in payload.get("delete_targets", [])
+            ]
+            delete_published_rows = [
+                self._artifact_row_snapshot(snapshot)
+                for snapshot in payload.get("delete_published_rows", [])
+            ]
+            lock_identities = tuple(
+                (str(item[0]), str(item[1])) for item in payload["lock_identities"]
+            )
+            locked_owner_row_digests: dict[tuple[str, str], str] = {}
+            for guard in payload["locked_owner_row_digests"]:
+                if not isinstance(guard, Mapping) or set(guard) != {
+                    "owner_type", "owner_id", "sha256"
+                }:
+                    raise ValueError
+                identity = self._object_lifecycle_identity(
+                    str(guard["owner_type"]), str(guard["owner_id"])
+                )
+                digest = guard["sha256"]
+                if (
+                    identity != (guard["owner_type"], guard["owner_id"])
+                    or not isinstance(digest, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                    or identity in locked_owner_row_digests
+                ):
+                    raise ValueError
+                locked_owner_row_digests[identity] = digest
+            if tuple(sorted(locked_owner_row_digests)) != tuple(sorted(lock_identities)):
+                raise ValueError
+            normalized_cleanup: list[dict[str, Any]] = []
+            for item in cleanup:
+                if not isinstance(item, Mapping):
+                    raise ValueError
+                state = item.get("state")
+                item_keys = set(item)
+                if item_keys not in (
+                    {"snapshot", "state"},
+                    {"snapshot", "state", "lease_expires_at"},
+                ) or (
+                    "lease_expires_at" in item_keys
+                    and state not in {"delete_started", "uncertain"}
+                ):
+                    raise ValueError
+                snapshot = self._artifact_row_snapshot(item["snapshot"])
+                if state not in {
+                    "awaiting_publication", "pending", "delete_started",
+                    "deleted", "uncertain", "retained_policy",
+                }:
+                    raise ValueError
+                normalized_entry = {
+                    "snapshot": self._artifact_snapshot_mapping(snapshot),
+                    "state": state,
+                }
+                if "lease_expires_at" in item_keys:
+                    lease_expires_at = item["lease_expires_at"]
+                    if (
+                        not isinstance(lease_expires_at, str)
+                        or not lease_expires_at.endswith("Z")
+                        or self._parse_object_artifact_cleanup_lease(lease_expires_at) is None
+                    ):
+                        raise ValueError
+                    normalized_entry["lease_expires_at"] = lease_expires_at
+                normalized_cleanup.append(normalized_entry)
+            cleanup = normalized_cleanup
+            if (
+                payload["workspace_id"] != self.workspace_id
+                or payload["owner_type"] != row["owner_type"]
+                or payload["owner_id"] != row["owner_id"]
+                or int(payload["operation_seq"]) != int(row["operation_seq"])
+                or payload["operation_id"] != row["operation_id"]
+                or payload["request_sha256"] != row["request_sha256"]
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ObjectStorageContractError("Artifact operation journal is malformed.") from exc
+        plan = ObjectArtifactBatchPlan(
+            backend=backend,
+            owner_type=row["owner_type"],
+            owner_id=row["owner_id"],
+            items=items,
+            managed_kinds=set(payload["managed_artifact_kinds"]),
+            expected_rows=expected,
+            successor_rows=successors,
+            published_rows=published_rows,
+            omitted_rows=[
+                self._artifact_snapshot_mapping(snapshot)
+                for kind, snapshot in expected.items()
+                if kind not in successors and kind in payload["omitted_kind_dispositions"]
+            ],
+            delete_targets=delete_targets,
+            delete_published_rows=delete_published_rows,
+            owner_delete_operation=bool(payload.get("owner_delete_operation", False)),
+            unchanged_kinds=set(payload["unchanged_kinds"]),
+            operation_seq=int(row["operation_seq"]),
+            operation_id=row["operation_id"],
+            request_sha256=row["request_sha256"],
+            plan_json=row["plan_json"],
+            cleanup=cleanup,
+            owner_digest=payload["owner_row_digests"]["after"],
+            owner_before_digest=payload["owner_row_digests"]["before"],
+            lock_identities=lock_identities,
+            locked_owner_row_digests=locked_owner_row_digests,
+            request_context=request_context,
+            journal_persisted=True,
+            state=row["state"],
+        )
+        for kind, snapshot in successors.items():
+            if kind not in plan.unchanged_kinds:
+                plan.desired_metadata[kind] = self._object_metadata_from_snapshot(snapshot)
+            elif kind in expected:
+                plan.desired_metadata[kind] = self._object_metadata_from_snapshot(snapshot)
+        return plan
+
+    def _abort_prepared_object_artifact_operation(
+        self,
+        connection: Any,
+        row: Mapping[str, Any],
+        *,
+        backend: ObjectStorageBackend,
+        held_lock_identities: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Retire one stale prepared incarnation without changing current authority."""
+        plan = self._load_object_artifact_plan(
+            row, backend=backend, items=[], request_context=None
+        )
+        held = {
+            self._object_lifecycle_identity(owner_type, owner_id)
+            for owner_type, owner_id in held_lock_identities
+        }
+        if (
+            plan.state != "prepared"
+            or not plan.journal_persisted
+            or not plan.lock_identities
+            or not set(plan.lock_identities).issubset(held)
+        ):
+            raise ObjectStorageContractError(
+                "Prepared artifact operation cannot be safely aborted."
+            )
+        durable = connection.execute(
+            "select workspace_id, owner_type, owner_id, operation_seq, operation_id, "
+            "request_sha256, plan_json, state, cleanup_json, created_at, updated_at "
+            "from sqag_object_artifact_operations where workspace_id = ? "
+            "and owner_type = ? and owner_id = ? and operation_seq = ?",
+            (self.workspace_id, plan.owner_type, plan.owner_id, plan.operation_seq),
+        ).fetchone()
+        if (
+            durable is None
+            or durable["state"] != "prepared"
+            or durable["operation_id"] != plan.operation_id
+            or durable["request_sha256"] != plan.request_sha256
+            or durable["plan_json"] != plan.plan_json
+        ):
+            raise ObjectStorageContractError(
+                "Prepared artifact operation changed before abort."
+            )
+
+        cleanup: list[dict[str, Any]] = []
+        for kind, snapshot in sorted(plan.successor_rows.items()):
+            if kind in plan.unchanged_kinds:
+                continue
+            metadata = self._object_metadata_from_snapshot(snapshot)
+            self._validate_object_artifact_metadata(metadata)
+            cleanup.append({
+                "snapshot": self._artifact_snapshot_mapping(snapshot),
+                "state": (
+                    "retained_policy"
+                    if self._object_artifact_cleanup_blocked(connection, snapshot)
+                    else "pending"
+                ),
+            })
+        plan.cleanup = cleanup
+        self._update_object_artifact_operation_state(connection, plan, "aborted")
         ForensicStore(
             connection,
             self.workspace_id,
@@ -13876,7 +14945,7 @@ class DatabaseSqagStorage:
             actor_key_version_value="storage-v1",
         ).append_telemetry_event(
             "storage_compensation",
-            "compensated",
+            "started",
             action_reference=plan.owner_id,
             run_reference=(
                 plan.owner_id
@@ -13890,8 +14959,554 @@ class DatabaseSqagStorage:
             ),
             operation_route="object_storage",
             purpose="artifact_compensation",
+
             commit=False,
         )
+
+    def _reconcile_prepared_object_artifact_operations(
+        self, connection: Any, owner_type: str, owner_id: str
+    ) -> list[Mapping[str, Any]]:
+        rows = connection.execute(
+            "select workspace_id, owner_type, owner_id, operation_seq, operation_id, "
+            "request_sha256, plan_json, state, cleanup_json, created_at, updated_at "
+            "from sqag_object_artifact_operations where workspace_id = ? "
+            "and owner_type = ? and owner_id = ? and state = 'prepared' "
+            "order by operation_seq",
+            (self.workspace_id, owner_type, owner_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                plan = json.loads(row["plan_json"])
+                if (
+                    plan.get("schema_version") != 1
+                    or plan.get("workspace_id") != self.workspace_id
+                    or plan.get("owner_type") != owner_type
+                    or plan.get("owner_id") != owner_id
+                    or plan.get("operation_id") != row["operation_id"]
+                    or plan.get("request_sha256") != row["request_sha256"]
+                ):
+                    raise ValueError
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ObjectStorageContractError("Artifact operation journal is malformed.") from exc
+        return rows
+
+    def _object_artifact_batch_snapshot_is_current(
+        self,
+        plan: ObjectArtifactBatchPlan,
+        connection: Any,
+        *,
+        published: bool = False,
+    ) -> bool:
+        if connection is None:
+            raise ObjectStorageContractError(
+                "Serialized artifact connection is required."
+            )
+        expected = plan.published_rows if published else plan.expected_rows
+        try:
+            current = self._object_artifact_rows_for_kinds(
+                connection, plan.owner_type, plan.owner_id, plan.managed_kinds
+            )
+        except ObjectStorageContractError:
+            return False
+        return current == expected
+
+    @staticmethod
+    def _parse_object_artifact_cleanup_lease(value: Any) -> dt.datetime | None:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            return None
+        try:
+            parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError:
+            return None
+        if parsed.utcoffset() != dt.timedelta(0):
+            return None
+        return parsed
+
+    def _object_artifact_cleanup_lease_expiry(self) -> str:
+        """Return a diagnostic deadline; the durable state, not time, gates writes."""
+        return (
+            dt.datetime.now(dt.UTC) + dt.timedelta(seconds=120)
+        ).isoformat().replace("+00:00", "Z")
+
+    def _object_artifact_cleanup_blocked(
+        self, connection: Any, snapshot: ArtifactRowSnapshot,
+        *, plan: ObjectArtifactBatchPlan | None = None,
+    ) -> bool:
+        """Fail closed when a frozen predecessor remains protected or referenced."""
+        try:
+            if (
+                snapshot.status != "active"
+                or snapshot.retention_status != "active"
+                or snapshot.deleted_at is not None
+            ):
+                return True
+            current = connection.execute(
+                "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, "
+                "session_id, job_id, artifact_kind, filename, content_type, size_bytes, "
+                "checksum_sha256, object_provider_type, object_key_ref, status, "
+                "retention_status, created_at, updated_at, deleted_at "
+                "from sqag_object_artifacts where workspace_id = ? and artifact_id = ?",
+                (self.workspace_id, snapshot.artifact_id),
+            ).fetchone()
+            if current is not None and self._artifact_row_snapshot(current) == snapshot:
+                return True
+            key_reference = connection.execute(
+                "select 1 from sqag_object_artifacts where object_key_ref = ? "
+                "and status = ? and retention_status = ? and deleted_at is null limit 1",
+                (snapshot.object_key_ref, "active", "active"),
+            ).fetchone()
+            if key_reference:
+                return True
+            if snapshot.owner_type == "generated_quote_version":
+                version = connection.execute(
+                    "select state, deletion_state, session_id, legal_hold "
+                    "from sqag_quote_publication_versions "
+                    "where workspace_id = ? and run_id = ?",
+                    (self.workspace_id, snapshot.owner_id),
+                ).fetchone()
+                if version and clean_text(version["deletion_state"]) == "active" and clean_text(
+                    version["state"]
+                ) in {"staged", "published"}:
+                    return True
+                if version is None:
+                    retention_delete_published = bool(
+                        plan is not None
+                        and plan.owner_delete_operation
+                        and snapshot in plan.delete_targets
+                        and ("generated_quote_version", snapshot.owner_id)
+                        in plan.lock_identities
+                        and (
+                            (
+                                plan.owner_type == "generated_quote_version"
+                                and plan.owner_id == snapshot.owner_id
+                            )
+                            or (
+                                plan.owner_type == "generated_quote"
+                                and plan.owner_id == clean_text(snapshot.session_id)
+                            )
+                        )
+                        and any(
+                            published.artifact_id == snapshot.artifact_id
+                            for published in plan.delete_published_rows
+                        )
+                    )
+                    if not retention_delete_published:
+                        return True
+                    session_id = clean_text(snapshot.session_id)
+                else:
+                    if bool(version["legal_hold"]):
+                        return True
+                    session_id = clean_text(version["session_id"])
+                if not session_id or self._session_deletion_blocked_by_hold(
+                    connection, session_id
+                ):
+                    return True
+            if snapshot.owner_type in {"generated_quote", "uploaded_reference"}:
+                session = connection.execute(
+                    "select metadata_json, draft_files_json from sqag_quote_sessions "
+                    "where workspace_id = ? and session_id = ?",
+                    (self.workspace_id, snapshot.owner_id),
+                ).fetchone()
+                if self._session_deletion_blocked_by_hold(connection, snapshot.owner_id):
+                    return True
+                if session is not None:
+                    if snapshot.owner_type == "generated_quote":
+                        metadata = json.loads(session["metadata_json"] or "{}")
+                        publication = metadata.get("publication") if isinstance(metadata, dict) else {}
+                        exports = metadata.get("exports") if isinstance(metadata, dict) else {}
+                        export = exports.get(snapshot.artifact_kind) if isinstance(exports, dict) else None
+                        if (
+                            isinstance(publication, Mapping)
+                            and clean_text(publication.get("state")).lower() in {"staged", "published"}
+                            and isinstance(export, Mapping)
+                            and clean_text(export.get("sha256")).lower() == snapshot.checksum_sha256
+                        ):
+                            return True
+                    else:
+                        records = json.loads(session["draft_files_json"] or "[]")
+                        if isinstance(records, list) and any(
+                            isinstance(record, Mapping)
+                            and clean_text(record.get("artifact_kind")) == snapshot.artifact_kind
+                            and clean_text(record.get("sha256")).lower() == snapshot.checksum_sha256
+                            for record in records
+                        ):
+                            return True
+            # Version evidence is immutable while staged/published. Do not remove
+            # a predecessor still named by any retained publication evidence.
+            versions = connection.execute(
+                "select metadata_json from sqag_quote_publication_versions "
+                "where workspace_id = ? and deletion_state = ? and state in (?, ?)",
+                (self.workspace_id, "active", "staged", "published"),
+            ).fetchall()
+            for version in versions:
+                value = json.loads(version["metadata_json"] or "{}")
+                exports = value.get("exports") if isinstance(value, dict) else None
+                export = exports.get(snapshot.artifact_kind) if isinstance(exports, dict) else None
+                if (
+                    isinstance(export, Mapping)
+                    and clean_text(export.get("sha256")).lower() == snapshot.checksum_sha256
+                    and clean_text(export.get("filename")) == snapshot.filename
+                ):
+                    return True
+        except Exception:
+            return True
+        return False
+
+    def _update_object_artifact_cleanup_state_in_transaction(
+        self,
+        connection: Any,
+        plan: ObjectArtifactBatchPlan,
+        expected_cleanup_json: str,
+        new_cleanup: list[dict[str, Any]],
+    ) -> bool:
+        if plan.state not in {"published", "aborted"}:
+            return False
+        encoded = json.dumps(
+            new_cleanup, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        cursor = connection.execute(
+            "update sqag_object_artifact_operations set cleanup_json = ?, updated_at = ? "
+            "where workspace_id = ? and owner_type = ? and owner_id = ? "
+            "and operation_seq = ? and operation_id = ? and plan_json = ? "
+            "and state = ? and cleanup_json = ?",
+            (
+                encoded, utc_timestamp(), self.workspace_id, plan.owner_type,
+                plan.owner_id, plan.operation_seq, plan.operation_id,
+                plan.plan_json, plan.state, expected_cleanup_json,
+            ),
+        )
+        return getattr(cursor, "rowcount", 0) == 1
+
+    def _object_artifact_cleanup_snapshot_is_authorized(
+        self, plan: ObjectArtifactBatchPlan, snapshot: ArtifactRowSnapshot
+    ) -> bool:
+        if plan.owner_delete_operation:
+            authorized = plan.delete_targets if plan.state == "published" else []
+        elif plan.state == "published":
+            authorized = [
+                predecessor
+                for kind, predecessor in plan.expected_rows.items()
+                if kind not in plan.unchanged_kinds
+            ]
+        elif plan.state == "aborted":
+            authorized = [
+                successor
+                for kind, successor in plan.successor_rows.items()
+                if kind not in plan.unchanged_kinds
+            ]
+        else:
+            authorized = []
+        return snapshot in authorized
+
+    def _acquire_object_artifact_publication_reference_lock(
+        self, connection: Any
+    ) -> None:
+        if (
+            self.database_family == "postgres_compatible"
+            and configured_artifact_storage_mode() == "object"
+        ):
+            connection.execute(
+                "select pg_advisory_xact_lock(hashtextextended(? || ? , 0))",
+                (self.workspace_id, ":sqag_object_artifact_cleanup_policy_v1"),
+            )
+
+    def _lock_object_artifact_cleanup_hold_graph(
+        self, connection: Any, snapshot: ArtifactRowSnapshot
+    ) -> None:
+        if snapshot.owner_type not in {
+            "generated_quote", "uploaded_reference", "generated_quote_version"
+        }:
+            return
+        session_id = (
+            clean_text(snapshot.session_id)
+            if snapshot.owner_type == "generated_quote_version"
+            else clean_text(snapshot.owner_id)
+        )
+        safe_session_id = safe_quote_session_id(session_id, "")
+        if not safe_session_id:
+            return
+        rows = connection.execute(
+            "select run_id from sqag_quote_publication_versions "
+            "where workspace_id = ? and session_id = ? order by run_id",
+            (self.workspace_id, safe_session_id),
+        ).fetchall()
+        version_identities = tuple(
+            ("publication_version", run_id)
+            for row in rows
+            if (run_id := safe_reference(row["run_id"], "run-"))
+        )
+        if version_identities:
+            ForensicStore(
+                connection,
+                self.workspace_id,
+                self.user_id or "storage-lifecycle",
+                actor_key_version_value="storage-v1",
+            )._acquire_transaction_locks(*version_identities)
+
+    def _persist_object_artifact_cleanup_state(
+        self,
+        plan: ObjectArtifactBatchPlan,
+        index: int,
+        expected_cleanup_json: str,
+        new_cleanup: list[dict[str, Any]],
+    ) -> bool:
+        if plan.state not in {"published", "aborted"}:
+            return False
+        try:
+            with self.connection() as connection:
+                self._begin_object_lifecycle_transactions(
+                    connection, plan.lock_identities
+                )
+                row = self._object_artifact_operation_row(connection, plan)
+                if (
+                    row is None
+                    or row["state"] != plan.state
+                    or row["operation_id"] != plan.operation_id
+                    or row["plan_json"] != plan.plan_json
+                    or row["cleanup_json"] != expected_cleanup_json
+                ):
+                    connection.rollback()
+                    return False
+                if not self._update_object_artifact_cleanup_state_in_transaction(
+                    connection, plan, expected_cleanup_json, new_cleanup
+                ):
+                    connection.rollback()
+                    return False
+                connection.commit()
+                plan.cleanup = new_cleanup
+                return True
+        except Exception:
+            return False
+
+    def _cleanup_object_artifact_batch(
+        self, plan: ObjectArtifactBatchPlan
+    ) -> None:
+        if (
+            not plan.journal_persisted
+            or plan.state not in {"published", "aborted"}
+            or not plan.lock_identities
+        ):
+            return
+        for index in range(len(plan.cleanup)):
+            try:
+                current = [dict(item) for item in plan.cleanup]
+                entry = current[index]
+                state = clean_text(entry.get("state"))
+                if state == "deleted":
+                    continue
+                had_inflight_cleanup = state in {"delete_started", "uncertain"}
+                snapshot = self._artifact_row_snapshot(entry["snapshot"])
+                if not self._object_artifact_cleanup_snapshot_is_authorized(
+                    plan, snapshot
+                ):
+                    return
+                metadata = self._object_metadata_from_snapshot(snapshot)
+                with self.connection() as connection:
+                    self._begin_object_lifecycle_transactions(
+                        connection, plan.lock_identities
+                    )
+                    journal = self._object_artifact_operation_row(connection, plan)
+                    if (
+                        journal is None
+                        or journal["state"] != plan.state
+                        or journal["operation_id"] != plan.operation_id
+                        or journal["plan_json"] != plan.plan_json
+                    ):
+                        connection.rollback()
+                        return
+                    persisted = json.loads(journal["cleanup_json"] or "[]")
+                    if (
+                        not isinstance(persisted, list)
+                        or len(persisted) != len(current)
+                        or persisted[index] != entry
+                        or not self._object_artifact_cleanup_snapshot_is_authorized(
+                            plan, snapshot
+                        )
+                    ):
+                        connection.rollback()
+                        return
+                    if self._object_artifact_cleanup_blocked(
+                        connection, snapshot, plan=plan
+                    ):
+                        if had_inflight_cleanup:
+                            connection.rollback()
+                            return
+                        next_cleanup = [dict(item) for item in persisted]
+                        next_cleanup[index].pop("lease_expires_at", None)
+                        next_cleanup[index]["state"] = "retained_policy"
+                        if not self._update_object_artifact_cleanup_state_in_transaction(
+                            connection, plan, journal["cleanup_json"], next_cleanup
+                        ):
+                            connection.rollback()
+                            return
+                        connection.commit()
+                        plan.cleanup = next_cleanup
+                        continue
+                    next_cleanup = [dict(item) for item in persisted]
+                    next_cleanup[index]["state"] = "delete_started"
+                    # Keep the old deadline as diagnostic data only. It does not
+                    # release the durable reference guard while provider work runs.
+                    if not had_inflight_cleanup:
+                        next_cleanup[index]["lease_expires_at"] = (
+                            self._object_artifact_cleanup_lease_expiry()
+                        )
+                    if not self._update_object_artifact_cleanup_state_in_transaction(
+                        connection, plan, journal["cleanup_json"], next_cleanup
+                    ):
+                        connection.rollback()
+                        return
+                    connection.commit()
+                    plan.cleanup = next_cleanup
+
+                    # Reacquire the same owners after the durable marker. Recheck
+                    # current policy, then hold policy serialization through dispatch.
+                    self._begin_object_lifecycle_transactions(
+                        connection, plan.lock_identities
+                    )
+                    journal = self._object_artifact_operation_row(connection, plan)
+                    if (
+                        journal is None
+                        or journal["state"] != plan.state
+                        or journal["operation_id"] != plan.operation_id
+                        or journal["plan_json"] != plan.plan_json
+                    ):
+                        connection.rollback()
+                        return
+                    persisted = json.loads(journal["cleanup_json"] or "[]")
+                    if (
+                        not isinstance(persisted, list)
+                        or len(persisted) != len(next_cleanup)
+                        or persisted[index] != next_cleanup[index]
+                        or not self._object_artifact_cleanup_snapshot_is_authorized(
+                            plan, snapshot
+                        )
+                    ):
+                        connection.rollback()
+                        return
+                    # Match the forensic graph locks used by hold writers before
+                    # taking the shared quote-reference gate, then recheck policy.
+                    self._lock_object_artifact_cleanup_hold_graph(
+                        connection, snapshot
+                    )
+                    blocked = self._object_artifact_cleanup_blocked(
+                        connection, snapshot, plan=plan
+                    )
+                    self._acquire_object_artifact_publication_reference_lock(
+                        connection
+                    )
+                    blocked = blocked or self._object_artifact_cleanup_blocked(
+                        connection, snapshot, plan=plan
+                    )
+                    if blocked:
+                        if had_inflight_cleanup:
+                            connection.rollback()
+                            return
+                        retained = [dict(item) for item in persisted]
+                        retained[index].pop("lease_expires_at", None)
+                        retained[index]["state"] = "retained_policy"
+                        if not self._update_object_artifact_cleanup_state_in_transaction(
+                            connection, plan, journal["cleanup_json"], retained
+                        ):
+                            connection.rollback()
+                            return
+                        connection.commit()
+                        plan.cleanup = retained
+                        continue
+
+                    # Keep the transaction lock through provider dispatch. SQLite
+                    # serializes writers globally; its durable cleanup guard also
+                    # survives a process restart while a delete outcome is unknown.
+                    outcome = "uncertain"
+                    try:
+                        content = plan.backend.retrieve_artifact(
+                            metadata, workspace_id=self.workspace_id
+                        )
+                        if (
+                            len(content) == snapshot.size_bytes
+                            and artifact_checksum(content) == snapshot.checksum_sha256
+                        ):
+                            if self._object_artifact_cleanup_blocked(
+                                connection, snapshot, plan=plan
+                            ):
+                                outcome = "retained_policy"
+                            else:
+                                deleted = plan.backend.delete_artifact(
+                                    metadata, workspace_id=self.workspace_id
+                                )
+                                if deleted:
+                                    try:
+                                        plan.backend.retrieve_artifact(
+                                            metadata, workspace_id=self.workspace_id
+                                        )
+                                        # The provider acknowledged dispatch but
+                                        # the object remains visible. A delayed
+                                        # delete may still take effect, so retain
+                                        # the durable reference guard as uncertain.
+                                        outcome = "uncertain"
+                                    except ObjectStorageNotFoundError:
+                                        outcome = "deleted"
+                                    except Exception:
+                                        outcome = "uncertain"
+                                else:
+                                    outcome = "pending"
+                        else:
+                            outcome = "uncertain"
+                    except ObjectStorageNotFoundError:
+                        outcome = "deleted"
+                    except Exception:
+                        # Exception type alone never proves whether the provider
+                        # applied the delete; classify with an exact follow-up read.
+                        try:
+                            after = plan.backend.retrieve_artifact(
+                                metadata, workspace_id=self.workspace_id
+                            )
+                            # Exception identity and an immediate readback cannot
+                            # settle whether an earlier provider delete is still in
+                            # flight. Keep the durable guard until a later retry does.
+                            outcome = "uncertain"
+                        except ObjectStorageNotFoundError:
+                            outcome = (
+                                "pending" if plan.state == "aborted" else "deleted"
+                            )
+                        except Exception:
+                            outcome = "uncertain"
+                    final_cleanup = [dict(item) for item in persisted]
+                    final_cleanup[index].pop("lease_expires_at", None)
+                    final_cleanup[index]["state"] = outcome
+                    if not self._update_object_artifact_cleanup_state_in_transaction(
+                        connection, plan, journal["cleanup_json"], final_cleanup
+                    ):
+                        connection.rollback()
+                        return
+                    connection.commit()
+                    plan.cleanup = final_cleanup
+            except Exception:
+                # Publication is already durable. Preserve the journal residue for
+                # a later retry rather than undoing the published successor.
+                return
+
+    def _finalize_object_artifact_batch(
+        self,
+        plan: ObjectArtifactBatchPlan,
+    ) -> None:
+        if plan.state != "published":
+            raise ObjectStorageContractError("Artifact batch state is invalid.")
+        # Cleanup residue is best-effort after a durable publication receipt.
+        # Unknown provider outcomes stay journaled and never roll back N.
+        self._cleanup_object_artifact_batch(plan)
+
+    def _compensate_object_artifact_batch(
+        self,
+        plan: ObjectArtifactBatchPlan,
+        *,
+        connection: Any,
+    ) -> None:
+        # Replacement safety is journal-based. This compatibility hook never
+        # deletes staged successors or restores predecessor bytes from memory.
+        if plan.state == "published":
+            return
+        if plan.state not in {"new", "prepared"}:
+            raise ObjectStorageContractError("Artifact batch state is invalid.")
 
     def _prepare_object_artifact_batch(
         self,
@@ -13903,15 +15518,15 @@ class DatabaseSqagStorage:
         *,
         connection: Any,
         quote_session: bool,
+        request_context: Any = None,
+        session_id: str = "",
+        job_id: str = "",
+        lifecycle_lock_identities: tuple[tuple[str, str], ...] = (),
     ) -> ObjectArtifactBatchPlan:
         safe_owner_type = safe_resource_id(owner_type, "")
         safe_owner_id = safe_resource_id(owner_id, "")
         item_by_kind = {item.artifact_kind: item for item in items}
-        desired_kinds = (
-            set(retained_kinds)
-            if retained_kinds is not None
-            else set(item_by_kind)
-        )
+        desired_kinds = set(retained_kinds) if retained_kinds is not None else set(item_by_kind)
         if (
             not safe_owner_type
             or not safe_owner_id
@@ -13927,194 +15542,270 @@ class DatabaseSqagStorage:
             )
         try:
             backend = configured_object_storage_backend()
-        except ObjectStorageContractError as exc:
-            raise SqagStorageAccessError(
-                QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-                status=503,
-                reason="object_artifact_storage_unavailable",
-            ) from exc
-
-        previous_rows: dict[str, dict[str, Any]] = {}
-        for row in self._active_object_artifact_rows(
-            safe_owner_type,
-            safe_owner_id,
-            connection=connection,
-        ):
-            artifact_kind = clean_text(row["artifact_kind"])
-            if artifact_kind not in managed_kinds:
-                continue
-            if artifact_kind in previous_rows:
-                raise SqagStorageAccessError(
-                    QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-                    status=503,
-                    reason="object_artifact_storage_unavailable",
+            previous_rows = self._object_artifact_rows_for_kinds(
+                connection, safe_owner_type, safe_owner_id, set(managed_kinds)
+            )
+            owner_before_digest = self._object_owner_row_digest(
+                connection, safe_owner_type, safe_owner_id
+            )
+            normalized_request_context = self._normalized_object_owner_request(
+                safe_owner_type, request_context
+            )
+            owner_digest = self._canonical_json_digest(normalized_request_context)
+            request_payload = {
+                "workspace_id": self.workspace_id,
+                "owner_type": safe_owner_type,
+                "owner_id": safe_owner_id,
+                "managed_kinds": sorted(managed_kinds),
+                "desired_kinds": sorted(desired_kinds),
+                "owner_request_sha256": owner_digest,
+                "items": [
+                    {
+                        "kind": item.artifact_kind,
+                        "filename": safe_segment(item.filename, item.artifact_kind),
+                        "content_type": clean_text(item.content_type) or "application/octet-stream",
+                        "size_bytes": len(item.content),
+                        "checksum_sha256": artifact_checksum(item.content),
+                    }
+                    for item in sorted(items, key=lambda value: value.artifact_kind)
+                ],
+            }
+            request_sha256 = self._canonical_json_digest(request_payload)
+            unresolved = self._reconcile_prepared_object_artifact_operations(
+                connection, safe_owner_type, safe_owner_id
+            )
+            if unresolved:
+                if len(unresolved) != 1:
+                    raise ObjectStorageContractError(
+                        "An unresolved artifact operation requires reconciliation."
+                    )
+                prior = unresolved[0]
+                if prior["request_sha256"] == request_sha256:
+                    plan = self._load_object_artifact_plan(
+                        prior, backend=backend, items=items,
+                        request_context=request_context,
+                    )
+                    if (
+                        plan.expected_rows != previous_rows
+                        or plan.owner_before_digest != owner_before_digest
+                    ):
+                        raise ObjectStorageContractError(
+                            "Artifact operation predecessors changed."
+                        )
+                    return plan
+                self._abort_prepared_object_artifact_operation(
+                    connection,
+                    prior,
+                    backend=backend,
+                    held_lock_identities=lifecycle_lock_identities,
                 )
-            previous_rows[artifact_kind] = dict(row)
 
-        plan = ObjectArtifactBatchPlan(
-            backend=backend,
-            owner_type=safe_owner_type,
-            owner_id=safe_owner_id,
-            items=items,
-            managed_kinds=set(managed_kinds),
-            expected_rows=copy.deepcopy(previous_rows),
-            omitted_rows=[
-                row
-                for kind, row in previous_rows.items()
-                if kind not in desired_kinds
-            ],
-        )
-        try:
-            for artifact_kind, row in previous_rows.items():
-                item = item_by_kind.get(artifact_kind)
-                previous = self._object_metadata_from_row(row)
+            published = connection.execute(
+                "select workspace_id, owner_type, owner_id, operation_seq, operation_id, "
+                "request_sha256, plan_json, state, cleanup_json, created_at, updated_at "
+                "from sqag_object_artifact_operations where workspace_id = ? "
+                "and owner_type = ? and owner_id = ? and request_sha256 = ? "
+                "and state = 'published' order by operation_seq desc",
+                (self.workspace_id, safe_owner_type, safe_owner_id, request_sha256),
+            ).fetchall()
+            if published:
+                previous = self._load_object_artifact_plan(
+                    published[0], backend=backend, items=items,
+                    request_context=request_context,
+                )
                 if (
-                    len(previous.checksum_sha256) != 64
-                    or not previous.storage_key
+                    previous.published_rows == previous_rows
+                    and self._object_owner_request_matches(connection, previous)
+                ):
+                    return previous
+
+            # Validate every active predecessor before reserving successors.
+            # No old object is removed in this preparation phase.
+            for snapshot in previous_rows.values():
+                if (
+                    snapshot.status == "active"
+                    and snapshot.retention_status == "active"
+                    and snapshot.deleted_at is None
+                    and self._retrieve_object_artifact_snapshot(snapshot) is None
                 ):
                     raise ObjectStorageContractError(
-                        "Artifact metadata is incomplete."
-                    )
-                desired_key = (
-                    object_artifact_key(
-                        workspace_id=self.workspace_id,
-                        owner_type=safe_owner_type,
-                        owner_id=safe_owner_id,
-                        artifact_kind=item.artifact_kind,
-                        filename=item.filename,
-                        checksum_sha256=artifact_checksum(item.content),
-                    )
-                    if item is not None
-                    else ""
-                )
-                if artifact_kind not in desired_kinds or (
-                    item is not None
-                    and previous.storage_key != desired_key
-                ):
-                    previous_content = backend.retrieve_artifact(
-                        previous,
-                        workspace_id=self.workspace_id,
-                    )
-                    plan.previous_backups.append(
-                        (previous, previous_content)
+                        "Predecessor artifact is unavailable."
                     )
 
+            operation_row = connection.execute(
+                "select max(operation_seq) as max_seq from sqag_object_artifact_operations "
+                "where workspace_id = ? and owner_type = ? and owner_id = ?",
+                (self.workspace_id, safe_owner_type, safe_owner_id),
+            ).fetchone()
+            operation_seq = int((operation_row["max_seq"] if operation_row else 0) or 0) + 1
+            operation_seed = json.dumps(
+                ["sqag-object-artifact-operation-v2", self.workspace_id,
+                 safe_owner_type, safe_owner_id, operation_seq],
+                ensure_ascii=True, separators=(",", ":"),
+            ).encode("utf-8")
+            operation_id = "op-v2-" + hashlib.sha256(operation_seed).hexdigest()
+            plan = ObjectArtifactBatchPlan(
+                backend=backend,
+                owner_type=safe_owner_type,
+                owner_id=safe_owner_id,
+                items=items,
+                managed_kinds=set(managed_kinds),
+                expected_rows=previous_rows,
+                omitted_rows=[
+                    self._artifact_snapshot_mapping(snapshot)
+                    for kind, snapshot in previous_rows.items()
+                    if kind not in desired_kinds
+                ],
+                operation_seq=operation_seq,
+                operation_id=operation_id,
+                request_sha256=request_sha256,
+                owner_digest=owner_digest,
+                owner_before_digest=owner_before_digest,
+                request_context=request_context,
+                state="new",
+            )
+            expected_session_id = (
+                safe_quote_session_id(session_id or safe_owner_id, "")
+                if quote_session
+                else ""
+            )
+            expected_platform_user_id = self.user_id
+            expected_job_id = safe_reference(job_id, "job-") if job_id else ""
+            now = utc_timestamp()
+
             for item in items:
-                previous_row = previous_rows.get(item.artifact_kind)
-                previous = (
-                    self._object_metadata_from_row(previous_row)
-                    if previous_row is not None
-                    else None
-                )
+                if not isinstance(item.content, bytes) or not item.content:
+                    raise ObjectStorageContractError("Artifact content is required.")
+                filename = safe_segment(item.filename, item.artifact_kind or "artifact")
+                content_type = clean_text(item.content_type) or "application/octet-stream"
                 checksum = artifact_checksum(item.content)
-                desired_key = object_artifact_key(
-                    workspace_id=self.workspace_id,
-                    owner_type=safe_owner_type,
-                    owner_id=safe_owner_id,
-                    artifact_kind=item.artifact_kind,
-                    filename=item.filename,
-                    checksum_sha256=checksum,
-                )
-                if previous is not None and previous.storage_key == desired_key:
-                    current_content = backend.retrieve_artifact(
-                        previous,
-                        workspace_id=self.workspace_id,
+                previous = previous_rows.get(item.artifact_kind)
+                unchanged = False
+                if (
+                    previous is not None
+                    and previous.status == "active"
+                    and previous.retention_status == "active"
+                    and previous.deleted_at is None
+                    and previous.workspace_id == self.workspace_id
+                    and previous.owner_type == safe_owner_type
+                    and previous.owner_id == safe_owner_id
+                    and previous.session_id == expected_session_id
+                    and previous.job_id == expected_job_id
+                    and previous.artifact_kind == item.artifact_kind
+                    and previous.filename == filename
+                    and previous.content_type == content_type
+                    and previous.size_bytes == len(item.content)
+                    and previous.checksum_sha256 == checksum
+                    and previous.object_provider_type == "s3_compatible"
+                    and previous.object_key_ref is not None
+                ):
+                    old_incarnation = self._artifact_incarnation_from_key(
+                        previous.object_key_ref
                     )
-                    if current_content != item.content:
-                        raise ObjectStorageContractError(
-                            "Artifact content does not match metadata."
-                        )
-                    safe_filename = safe_segment(
-                        item.filename,
-                        item.artifact_kind or "artifact",
-                    )
-                    safe_content_type = clean_text(item.content_type) or "application/octet-stream"
-                    same_authoritative_metadata = (
-                        clean_text(previous_row.get("artifact_id"))
-                        and clean_text(previous_row.get("workspace_id")) == self.workspace_id
-                        and clean_text(previous_row.get("owner_type")) == safe_owner_type
-                        and clean_text(previous_row.get("owner_id")) == safe_owner_id
-                        and clean_text(previous_row.get("artifact_kind")) == item.artifact_kind
-                        and clean_text(previous_row.get("filename")) == safe_filename
-                        and clean_text(previous_row.get("content_type")) == safe_content_type
-                        and int(previous_row.get("size_bytes") or 0) == len(item.content)
-                        and clean_text(previous_row.get("checksum_sha256")) == checksum
-                        and clean_text(previous_row.get("object_provider_type")) == "s3_compatible"
-                        and clean_text(previous_row.get("object_key_ref")) == desired_key
-                        and clean_text(previous_row.get("status")) == "active"
-                        and clean_text(previous_row.get("retention_status")) == "active"
-                        and not clean_text(previous_row.get("deleted_at"))
-                        and (
-                            not quote_session
-                            or (
-                                clean_text(previous_row.get("platform_user_id")) == self.user_id
-                                and clean_text(previous_row.get("session_id")) == ""
-                                and clean_text(previous_row.get("job_id")) == ""
-                            )
-                        )
-                    )
-                    plan.desired_metadata[item.artifact_kind] = (
-                        ObjectArtifactMetadata(
+                    try:
+                        canonical_old_key = object_artifact_key(
                             workspace_id=self.workspace_id,
                             owner_type=safe_owner_type,
                             owner_id=safe_owner_id,
                             artifact_kind=item.artifact_kind,
-                            filename=safe_filename,
-                            content_type=safe_content_type,
-                            size_bytes=len(item.content),
+                            filename=filename,
                             checksum_sha256=checksum,
-                            storage_key=desired_key,
-                            created_at=previous.created_at,
-                            updated_at=previous.updated_at,
+                            artifact_incarnation=old_incarnation,
                         )
-                    )
-                    if same_authoritative_metadata:
-                        plan.unchanged_kinds.add(item.artifact_kind)
+                    except ObjectStorageContractError:
+                        canonical_old_key = ""
+                    if (
+                        previous.object_key_ref == canonical_old_key
+                        and self._retrieve_object_artifact_snapshot(previous)
+                        == {
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size_bytes": len(item.content),
+                            "content": item.content,
+                        }
+                    ):
+                        unchanged = True
+                if unchanged:
+                    plan.unchanged_kinds.add(item.artifact_kind)
+                    plan.successor_rows[item.artifact_kind] = previous
+                    plan.desired_metadata[item.artifact_kind] = self._object_metadata_from_snapshot(previous)
                     continue
 
-                stored = backend.store_artifact(
+                artifact_seed = json.dumps(
+                    ["sqag-object-artifact-incarnation-v2", operation_id,
+                     self.workspace_id, safe_owner_type, safe_owner_id,
+                     item.artifact_kind],
+                    ensure_ascii=True, separators=(",", ":"),
+                ).encode("utf-8")
+                incarnation = "inc-v2-" + hashlib.sha256(artifact_seed).hexdigest()
+                artifact_id = "obj-v2-" + hashlib.sha256(
+                    artifact_seed + b"\x00artifact-id"
+                ).hexdigest()
+                storage_key = object_artifact_key(
                     workspace_id=self.workspace_id,
                     owner_type=safe_owner_type,
                     owner_id=safe_owner_id,
                     artifact_kind=item.artifact_kind,
-                    filename=item.filename,
-                    content_type=item.content_type,
-                    content=item.content,
+                    filename=filename,
+                    checksum_sha256=checksum,
+                    artifact_incarnation=incarnation,
                 )
-                plan.new_objects.append(stored)
-                if (
-                    stored.workspace_id != self.workspace_id
-                    or stored.owner_type != safe_owner_type
-                    or stored.owner_id != safe_owner_id
-                    or stored.artifact_kind != item.artifact_kind
-                    or stored.storage_key != desired_key
-                    or stored.checksum_sha256 != checksum
-                    or stored.size_bytes != len(item.content)
-                ):
-                    raise ObjectStorageContractError(
-                        "Artifact storage metadata is inconsistent."
-                    )
-                plan.desired_metadata[item.artifact_kind] = stored
-
-            for backup in plan.previous_backups:
-                previous, _content = backup
-                if not backend.delete_artifact(
-                    previous,
+                successor = ArtifactRowSnapshot(
+                    artifact_id=artifact_id,
                     workspace_id=self.workspace_id,
-                ):
-                    raise ObjectStorageContractError(
-                        "Superseded artifact could not be deleted."
-                    )
-                plan.deleted_previous.append(backup)
-            return plan
-        except Exception as exc:
-            try:
-                self._compensate_object_artifact_batch(
-                    plan,
-                    connection=connection,
+                    owner_type=safe_owner_type,
+                    owner_id=safe_owner_id,
+                    platform_user_id=expected_platform_user_id,
+                    session_id=expected_session_id,
+                    job_id=expected_job_id,
+                    artifact_kind=item.artifact_kind,
+                    filename=filename,
+                    content_type=content_type,
+                    size_bytes=len(item.content),
+                    checksum_sha256=checksum,
+                    object_provider_type="s3_compatible",
+                    object_key_ref=storage_key,
+                    status="active",
+                    retention_status="active",
+                    created_at=now,
+                    updated_at=now,
+                    deleted_at=None,
                 )
-            except ObjectStorageContractError as recovery_exc:
-                exc = recovery_exc
+                plan.successor_rows[item.artifact_kind] = successor
+                plan.desired_metadata[item.artifact_kind] = self._object_metadata_from_snapshot(successor)
+                if (
+                    previous is not None
+                    and previous.status == "active"
+                    and previous.deleted_at is None
+                ):
+                    plan.cleanup.append({
+                        "snapshot": self._artifact_snapshot_mapping(previous),
+                        "state": "awaiting_publication",
+                    })
+
+            plan.published_rows = dict(plan.successor_rows)
+            for row in plan.omitted_rows:
+                snapshot = self._artifact_row_snapshot(row)
+                if snapshot.status == "active" and snapshot.deleted_at is None:
+                    tombstone_at = now
+                    snapshot = ArtifactRowSnapshot(
+                        **{
+                            **self._artifact_snapshot_mapping(snapshot),
+                            "status": "deleted",
+                            "retention_status": "deleted",
+                            "updated_at": tombstone_at,
+                            "deleted_at": tombstone_at,
+                        }
+                    )
+                    plan.cleanup.append({
+                        "snapshot": row,
+                        "state": "awaiting_publication",
+                    })
+                plan.published_rows[snapshot.artifact_kind] = snapshot
+            return plan
+        except SqagStorageAccessError:
+            raise
+        except ObjectStorageContractError as exc:
             raise SqagStorageAccessError(
                 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
                 status=503,
@@ -14129,22 +15820,17 @@ class DatabaseSqagStorage:
         quote_session: bool,
     ) -> None:
         if plan.state != "prepared":
-            raise ObjectStorageContractError(
-                "Artifact batch state is invalid."
-            )
-        if not self._object_artifact_batch_snapshot_is_current(
-            plan,
-            connection,
-        ):
-            raise ObjectStorageContractError(
-                "Artifact metadata changed during replacement."
-            )
+            raise ObjectStorageContractError("Artifact batch state is invalid.")
+        if not self._object_artifact_batch_snapshot_is_current(plan, connection):
+            raise ObjectStorageContractError("Artifact metadata changed during replacement.")
         for row in plan.omitted_rows:
-            self._execute_mark_object_artifact_deleted(
-                connection,
-                clean_text(row["artifact_id"]),
-                row,
-            )
+            kind = row["artifact_kind"]
+            predecessor = plan.expected_rows[kind]
+            target = plan.published_rows[kind]
+            if predecessor != target:
+                self._execute_mark_object_artifact_deleted(
+                    connection, predecessor.artifact_id or "", predecessor, target
+                )
         for item in plan.items:
             if item.artifact_kind in plan.unchanged_kinds:
                 continue
@@ -14152,11 +15838,13 @@ class DatabaseSqagStorage:
             if quote_session:
                 self._execute_upsert_object_quote_artifact(
                     connection,
-                    plan.owner_id,
+                    metadata.session_id or plan.owner_id,
                     item.artifact_kind,
                     item.filename,
                     item.content_type,
                     metadata,
+                    owner_type=plan.owner_type,
+                    owner_id=plan.owner_id,
                 )
             else:
                 self._execute_upsert_object_file_artifact(
@@ -14168,64 +15856,78 @@ class DatabaseSqagStorage:
                     item.content_type,
                     metadata,
                 )
+        if not self._object_artifact_batch_snapshot_is_current(
+            plan, connection, published=True
+        ):
+            raise ObjectStorageContractError("Artifact metadata publication is incomplete.")
 
     def _execute_mark_object_artifact_deleted(
         self,
         connection: Any,
         artifact_id: str,
-        expected_row: Mapping[str, Any] | None = None,
+        expected_row: ArtifactRowSnapshot | Mapping[str, Any] | None = None,
+        tombstone: ArtifactRowSnapshot | None = None,
     ) -> None:
-        safe_artifact_id = clean_text(artifact_id)
+        safe_artifact_id = artifact_id
         if not safe_artifact_id:
             raise ObjectStorageContractError("Artifact metadata is incomplete.")
+        try:
+            expected = (
+                expected_row
+                if isinstance(expected_row, ArtifactRowSnapshot)
+                else self._artifact_row_snapshot(expected_row)
+                if expected_row is not None
+                else None
+            )
+        except ObjectStorageContractError as exc:
+            raise ObjectStorageContractError("Artifact metadata is malformed.") from exc
         now = utc_timestamp()
+        target = tombstone or (
+            ArtifactRowSnapshot(
+                **{
+                    **self._artifact_snapshot_mapping(expected),
+                    "status": "deleted",
+                    "retention_status": "deleted",
+                    "updated_at": now,
+                    "deleted_at": now,
+                }
+            )
+            if expected is not None
+            else None
+        )
         query = (
-            "update sqag_object_artifacts set status = ?, retention_status = ?, updated_at = ?, deleted_at = ? "
-            "where workspace_id = ? and artifact_id = ? and status = ? and retention_status = ? and deleted_at is null"
+            "update sqag_object_artifacts set status = ?, retention_status = ?, "
+            "updated_at = ?, deleted_at = ? where workspace_id = ? and artifact_id = ?"
         )
         params: list[Any] = [
-            "deleted",
-            "deleted",
-            now,
-            now,
+            target.status if target is not None else "deleted",
+            target.retention_status if target is not None else "deleted",
+            target.updated_at if target is not None else now,
+            target.deleted_at if target is not None else now,
             self.workspace_id,
             safe_artifact_id,
-            "active",
-            "active",
         ]
-        if expected_row is not None:
-            query += (
-                " and owner_type = ? and owner_id = ? and artifact_kind = ? "
-                "and filename = ? and content_type = ? and object_provider_type = ? "
-                "and coalesce(platform_user_id, '') = ? and coalesce(session_id, '') = ? "
-                "and coalesce(job_id, '') = ? and object_key_ref = ? "
-                "and checksum_sha256 = ? and size_bytes = ? "
-                "and created_at = ? and updated_at = ?"
-            )
-            params.extend([
-                clean_text(expected_row["owner_type"]),
-                clean_text(expected_row["owner_id"]),
-                clean_text(expected_row["artifact_kind"]),
-                clean_text(expected_row["filename"]),
-                clean_text(expected_row["content_type"]),
-                clean_text(expected_row["object_provider_type"]),
-                clean_text(expected_row["platform_user_id"]),
-                clean_text(expected_row["session_id"]),
-                clean_text(expected_row["job_id"]),
-                clean_text(expected_row["object_key_ref"]),
-                clean_text(expected_row["checksum_sha256"]),
-                int(expected_row["size_bytes"] or 0),
-                clean_text(expected_row["created_at"]),
-                clean_text(expected_row["updated_at"]),
-            ])
+        if expected is not None:
+            for name in ArtifactRowSnapshot.__dataclass_fields__:
+                if name in {"workspace_id", "artifact_id"}:
+                    continue
+                if name == "size_bytes":
+                    query += " and size_bytes = ?"
+                    params.append(expected.size_bytes)
+                else:
+                    query += f" and (({name} = ?) or ({name} is null and ? is null))"
+                    params.extend((getattr(expected, name), getattr(expected, name)))
         cursor = connection.execute(query, tuple(params))
-        if cursor.rowcount != 1:
+        if getattr(cursor, "rowcount", 0) != 1:
             raise ObjectStorageContractError("Artifact metadata changed during deletion.")
 
     def _validate_object_artifact_metadata(
         self,
         metadata: ObjectArtifactMetadata,
     ) -> None:
+        incarnation = metadata.artifact_incarnation
+        if incarnation is None and "/v2/" in metadata.storage_key:
+            incarnation = self._artifact_incarnation_from_key(metadata.storage_key)
         expected_key = object_artifact_key(
             workspace_id=metadata.workspace_id,
             owner_type=metadata.owner_type,
@@ -14233,6 +15935,7 @@ class DatabaseSqagStorage:
             artifact_kind=metadata.artifact_kind,
             filename=metadata.filename,
             checksum_sha256=metadata.checksum_sha256,
+            artifact_incarnation=incarnation,
         )
         if (
             metadata.workspace_id != self.workspace_id
@@ -14242,73 +15945,11 @@ class DatabaseSqagStorage:
             or len(metadata.checksum_sha256) != 64
             or metadata.size_bytes <= 0
             or metadata.storage_key != expected_key
+            or (incarnation is not None and not re.fullmatch(r"obj-v2-[a-f0-9]{64}", metadata.artifact_id))
         ):
             raise ObjectStorageContractError(
                 "Artifact metadata is incomplete."
             )
-
-    def _active_object_artifact_row_for_snapshot_on_connection(
-        self,
-        connection: Any,
-        expected_row: Mapping[str, Any],
-    ) -> Mapping[str, Any] | None:
-        return connection.execute(
-            'select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at '
-            'from sqag_object_artifacts where workspace_id = ? and artifact_id = ? '
-            'and status = ? and retention_status = ? and deleted_at is null',
-            (
-                self.workspace_id,
-                clean_text(expected_row['artifact_id']),
-                'active',
-                'active',
-            ),
-        ).fetchone()
-
-    def _restore_object_deletion_plan(
-        self,
-        connection: Any,
-        plan: ObjectArtifactDeletionPlan,
-    ) -> None:
-        records = list(plan.deleted)
-        if plan.in_flight is not None:
-            records.append(plan.in_flight)
-        recovery_errors: list[Exception] = []
-        for metadata, content, expected_row in reversed(records):
-            current_row = (
-                self._active_object_artifact_row_for_snapshot_on_connection(
-                    connection,
-                    expected_row,
-                )
-            )
-            if (
-                current_row is None
-                or not self._object_artifact_row_matches_snapshot(
-                    current_row,
-                    expected_row,
-                )
-            ):
-                recovery_errors.append(
-                    ObjectStorageContractError(
-                        'Artifact metadata changed during deletion recovery.'
-                    )
-                )
-                continue
-            try:
-                self._restore_object_artifact(
-                    plan.backend,
-                    metadata,
-                    content,
-                )
-            except Exception as exc:
-                recovery_errors.append(exc)
-        if recovery_errors:
-            plan.state = 'recovery_failed'
-            raise ObjectStorageContractError(
-                'Artifact deletion recovery failed.'
-            ) from recovery_errors[0]
-        plan.deleted.clear()
-        plan.in_flight = None
-        plan.state = 'restored'
 
     def _run_object_owner_delete(
         self,
@@ -14320,216 +15961,277 @@ class DatabaseSqagStorage:
         *,
         additional_lock_identities: tuple[tuple[str, str], ...] = (),
         rows_for_delete: Any | None = None,
+        expected_owner_after_digest: Any | None = None,
     ) -> bool | int:
+        safe_owner_type, safe_owner_id = self._object_lifecycle_identity(
+            owner_type, owner_id
+        )
+        lock_identities = tuple(sorted({
+            (safe_owner_type, safe_owner_id),
+            *(self._object_lifecycle_identity(item_type, item_id)
+              for item_type, item_id in additional_lock_identities),
+        }))
+        self.ensure_object_artifact_lifecycle_ready()
+        self._resume_published_object_artifact_cleanups(lock_identities)
+        plan: ObjectArtifactBatchPlan | None = None
+        rows: list[Any] = []
+        result: Any = False
         with self.connection() as connection:
-            plan: ObjectArtifactDeletionPlan | None = None
-            root_savepoint_started = False
-            item_failure = False
-            item_failure_expected = False
-            try:
-                safe_owner_type, safe_owner_id = (
-                    self._object_lifecycle_identity(owner_type, owner_id)
+            self._begin_object_lifecycle_transactions(connection, lock_identities)
+            if authorize is not None and not authorize(connection):
+                connection.rollback()
+                return False
+            backend = configured_object_storage_backend()
+            rows = list(
+                rows_for_delete(connection)
+                if rows_for_delete is not None
+                else self._active_object_artifact_rows(
+                    safe_owner_type, safe_owner_id, connection=connection
                 )
-                self._begin_object_lifecycle_transactions(
-                    connection,
-                    ((safe_owner_type, safe_owner_id),)
-                    + additional_lock_identities,
+            )
+            snapshots = sorted(
+                (self._artifact_row_snapshot(row) for row in rows),
+                key=lambda item: (item.owner_type or "", item.owner_id or "", item.artifact_kind or "", item.artifact_id or ""),
+            )
+            if len({snapshot.artifact_id for snapshot in snapshots}) != len(snapshots):
+                connection.rollback()
+                raise ObjectStorageContractError("Artifact deletion targets are duplicated.")
+            owner_before_digest = self._object_owner_row_digest(
+                connection, safe_owner_type, safe_owner_id
+            )
+            if not callable(expected_owner_after_digest):
+                connection.rollback()
+                raise ObjectStorageContractError(
+                    "Artifact owner deletion digest is unavailable."
                 )
-                connection.execute(
-                    f'savepoint {OBJECT_LIFECYCLE_DELETE_ROOT_SAVEPOINT}'
+            owner_after_digest = expected_owner_after_digest(connection)
+            if not isinstance(owner_after_digest, str) or not re.fullmatch(
+                r"[a-f0-9]{64}", owner_after_digest
+            ):
+                connection.rollback()
+                raise ObjectStorageContractError(
+                    "Artifact owner deletion digest is invalid."
                 )
-                root_savepoint_started = True
-                if authorize is not None and not authorize(connection):
+            request_sha256 = self._canonical_json_digest({
+                "workspace_id": self.workspace_id,
+                "operation": "delete_owner_v2",
+                "owner_type": safe_owner_type,
+                "owner_id": safe_owner_id,
+                "owner_before_sha256": owner_before_digest,
+                "delete_targets": [
+                    self._artifact_snapshot_mapping(snapshot) for snapshot in snapshots
+                ],
+            })
+            unresolved = self._reconcile_prepared_object_artifact_operations(
+                connection, safe_owner_type, safe_owner_id
+            )
+            matching = [
+                item for item in unresolved
+                if item["request_sha256"] == request_sha256
+            ]
+            if unresolved and len(unresolved) != 1:
+                connection.rollback()
+                raise ObjectStorageContractError(
+                    "An unresolved artifact operation requires reconciliation."
+                )
+            if matching:
+                plan = self._load_object_artifact_plan(
+                    matching[0], backend=backend, items=[], request_context={"delete": True}
+                )
+            else:
+                if unresolved:
+                    self._abort_prepared_object_artifact_operation(
+                        connection,
+                        unresolved[0],
+                        backend=backend,
+                        held_lock_identities=lock_identities,
+                    )
+                operation_row = connection.execute(
+                    "select max(operation_seq) as max_seq from sqag_object_artifact_operations "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ?",
+                    (self.workspace_id, safe_owner_type, safe_owner_id),
+                ).fetchone()
+                operation_seq = int((operation_row["max_seq"] if operation_row else 0) or 0) + 1
+                operation_seed = json.dumps(
+                    ["sqag-object-artifact-operation-v2", self.workspace_id,
+                     safe_owner_type, safe_owner_id, operation_seq],
+                    ensure_ascii=True, separators=(",", ":"),
+                ).encode("utf-8")
+                operation_id = "op-v2-" + hashlib.sha256(operation_seed).hexdigest()
+                root_snapshots = [
+                    snapshot for snapshot in snapshots
+                    if snapshot.owner_type == safe_owner_type
+                    and snapshot.owner_id == safe_owner_id
+                ]
+                if len({snapshot.artifact_kind for snapshot in root_snapshots}) != len(root_snapshots):
                     connection.rollback()
-                    return False
-                backend = configured_object_storage_backend()
-                plan = ObjectArtifactDeletionPlan(
-                    backend=backend,
-                    owner_type=safe_owner_type,
-                    owner_id=safe_owner_id,
-                )
-                rows = list(
-                    rows_for_delete(connection)
-                    if rows_for_delete is not None
-                    else self._active_object_artifact_rows(
-                        safe_owner_type,
-                        safe_owner_id,
-                        connection=connection,
+                    raise ObjectStorageContractError("Artifact deletion kinds are duplicated.")
+                now = utc_timestamp()
+                published_targets = [
+                    ArtifactRowSnapshot(
+                        **{
+                            **self._artifact_snapshot_mapping(snapshot),
+                            "status": "deleted",
+                            "retention_status": "deleted",
+                            "updated_at": now,
+                            "deleted_at": now,
+                        }
                     )
+                    for snapshot in snapshots
+                ]
+                published_by_id = {
+                    snapshot.artifact_id: snapshot for snapshot in published_targets
+                }
+                expected_rows = {
+                    snapshot.artifact_kind: snapshot for snapshot in root_snapshots
+                }
+                published_rows = {
+                    snapshot.artifact_kind: published_by_id[snapshot.artifact_id]
+                    for snapshot in root_snapshots
+                }
+                plan = ObjectArtifactBatchPlan(
+                    backend=backend, owner_type=safe_owner_type, owner_id=safe_owner_id,
+                    items=[], managed_kinds=set(expected_rows),
+                    expected_rows=expected_rows, published_rows=published_rows,
+                    delete_targets=snapshots,
+                    delete_published_rows=published_targets,
+                    owner_delete_operation=True,
+                    operation_seq=operation_seq, operation_id=operation_id,
+                    request_sha256=request_sha256,
+                    owner_digest=owner_after_digest,
+                    owner_before_digest=owner_before_digest,
+                    lock_identities=lock_identities,
+                    request_context={"delete": True},
+                    cleanup=[
+                        {"snapshot": self._artifact_snapshot_mapping(snapshot),
+                         "state": "awaiting_publication"}
+                        for snapshot in snapshots
+                    ],
+                    state="new",
                 )
-                for row in rows:
-                    expected_row = dict(row)
-                    connection.execute(
-                        f'savepoint {OBJECT_LIFECYCLE_DELETE_ITEM_SAVEPOINT}'
-                    )
-                    provider_deleted = False
-                    try:
-                        metadata = self._object_metadata_from_row(row)
-                        self._validate_object_artifact_metadata(metadata)
-                        previous_content = backend.retrieve_artifact(
-                            metadata,
-                            workspace_id=self.workspace_id,
-                        )
-                        if (
-                            len(previous_content) != metadata.size_bytes
-                            or artifact_checksum(previous_content)
-                            != metadata.checksum_sha256
-                        ):
-                            raise ObjectStorageContractError(
-                                'Artifact content does not match metadata.'
-                            )
-                        if not backend.delete_artifact(
-                            metadata,
-                            workspace_id=self.workspace_id,
-                        ):
-                            raise ObjectStorageContractError(
-                                'Artifact could not be deleted.'
-                            )
-                        provider_deleted = True
-                        plan.in_flight = (
-                            metadata,
-                            previous_content,
-                            expected_row,
-                        )
-                        self._execute_mark_object_artifact_deleted(
-                            connection,
-                            clean_text(row['artifact_id']),
-                            expected_row,
-                        )
-                        connection.execute(
-                            f'release savepoint {OBJECT_LIFECYCLE_DELETE_ITEM_SAVEPOINT}'
-                        )
-                        plan.deleted.append(plan.in_flight)
-                        plan.in_flight = None
-                    except Exception as item_exc:
-                        item_failure = True
-                        item_failure_expected = self._expected_storage_failure(
-                            item_exc
-                        )
-                        if not self._rollback_to_lifecycle_savepoint(
-                            connection,
-                            OBJECT_LIFECYCLE_DELETE_ITEM_SAVEPOINT,
-                        ):
-                            raise ObjectStorageContractError(
-                                'Artifact deletion transaction recovery failed.'
-                            ) from item_exc
-                        if provider_deleted and plan.in_flight is not None:
-                            current_row = (
-                                self._active_object_artifact_row_for_snapshot_on_connection(
-                                    connection,
-                                    expected_row,
-                                )
-                            )
-                            if (
-                                current_row is None
-                                or not self._object_artifact_row_matches_snapshot(
-                                    current_row,
-                                    expected_row,
-                                )
-                            ):
-                                raise ObjectStorageContractError(
-                                    'Artifact metadata changed during deletion recovery.'
-                                ) from item_exc
-                            self._restore_object_artifact(
-                                backend,
-                                metadata,
-                                previous_content,
-                            )
-                            plan.in_flight = None
-                        raise
-
-                self._assert_no_active_object_owner_artifacts(
-                    connection,
-                    safe_owner_type,
-                    safe_owner_id,
-                )
-                owner_result = bool(delete_owner(connection))
-                result = (
-                    result_from_rows(rows)
-                    if result_from_rows is not None
-                    else owner_result
-                )
+                self._persist_object_artifact_prepared(connection, plan)
                 try:
                     connection.commit()
-                except Exception as commit_exc:
-                    if not self._rollback_to_lifecycle_savepoint(
-                        connection,
-                        OBJECT_LIFECYCLE_DELETE_ROOT_SAVEPOINT,
-                    ):
-                        try:
-                            connection.rollback()
-                        except Exception as rollback_exc:
-                            raise ObjectStorageContractError(
-                                'Artifact deletion rollback failed.'
-                            ) from rollback_exc
-                        raise ObjectStorageContractError(
-                            'Artifact deletion transaction outcome is uncertain.'
-                        ) from commit_exc
-                    root_savepoint_started = False
-                    self._restore_object_deletion_plan(connection, plan)
-                    connection.rollback()
-                    raise
-                plan.state = 'committed'
-                return result
-            except Exception as exc:
-                recovery_error: Exception | None = None
-                if (
-                    plan is not None
-                    and item_failure
-                    and item_failure_expected
-                    and plan.in_flight is None
-                ):
+                except Exception as exc:
                     try:
-                        connection.commit()
-                        plan.state = 'partial_committed'
-                    except Exception as partial_commit_exc:
-                        if root_savepoint_started and self._rollback_to_lifecycle_savepoint(
-                            connection,
-                            OBJECT_LIFECYCLE_DELETE_ROOT_SAVEPOINT,
-                        ):
-                            root_savepoint_started = False
-                            try:
-                                self._restore_object_deletion_plan(
-                                    connection,
-                                    plan,
-                                )
-                            except Exception as restore_exc:
-                                recovery_error = restore_exc
-                        else:
-                            recovery_error = partial_commit_exc
-                        try:
-                            connection.rollback()
-                        except Exception as rollback_exc:
-                            recovery_error = rollback_exc
-                    if recovery_error is not None:
+                        connection.rollback()
+                    except Exception:
+                        pass
+                    durable = False
+                    try:
+                        with self.connection() as confirm:
+                            self._begin_object_lifecycle_transactions(
+                                confirm, lock_identities
+                            )
+                            row = self._object_artifact_operation_row(confirm, plan)
+                            durable = bool(
+                                row is not None and row["state"] == "prepared"
+                                and row["plan_json"] == plan.plan_json
+                            )
+                            confirm.commit()
+                    except Exception:
+                        durable = False
+                    if not durable:
                         raise ObjectStorageContractError(
-                            'Artifact deletion recovery failed.'
-                        ) from recovery_error
-                    raise exc
+                            "Artifact deletion preparation outcome is unavailable."
+                        ) from exc
 
-                if plan is not None and (plan.deleted or plan.in_flight):
-                    if root_savepoint_started and self._rollback_to_lifecycle_savepoint(
-                        connection,
-                        OBJECT_LIFECYCLE_DELETE_ROOT_SAVEPOINT,
-                    ):
-                        root_savepoint_started = False
-                        try:
-                            self._restore_object_deletion_plan(connection, plan)
-                        except Exception as restore_exc:
-                            recovery_error = restore_exc
-                    else:
-                        recovery_error = ObjectStorageContractError(
-                            'Artifact deletion transaction outcome is uncertain.'
+        if plan is None or not plan.journal_persisted:
+            raise ObjectStorageContractError("Artifact deletion intent is not durable.")
+        try:
+            with self.connection() as connection:
+                self._begin_object_lifecycle_transactions(connection, lock_identities)
+                journal = self._object_artifact_operation_row(connection, plan)
+                if (
+                    journal is None
+                    or journal["state"] != "prepared"
+                    or journal["operation_id"] != plan.operation_id
+                    or journal["request_sha256"] != plan.request_sha256
+                    or journal["plan_json"] != plan.plan_json
+                    or tuple(tuple(item) for item in json.loads(plan.plan_json)["lock_identities"])
+                    != lock_identities
+                    or self._object_owner_row_digest(
+                        connection, safe_owner_type, safe_owner_id
+                    ) != plan.owner_before_digest
+                    or not self._locked_object_owner_rows_match(connection, plan)
+                ):
+                    raise ObjectStorageContractError("Artifact deletion predecessors changed.")
+                if authorize is not None and not authorize(connection):
+                    raise ObjectStorageContractError("Artifact deletion is no longer authorized.")
+                for snapshot in plan.delete_targets:
+                    row = connection.execute(
+                        "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, "
+                        "session_id, job_id, artifact_kind, filename, content_type, size_bytes, "
+                        "checksum_sha256, object_provider_type, object_key_ref, status, "
+                        "retention_status, created_at, updated_at, deleted_at "
+                        "from sqag_object_artifacts where workspace_id = ? and artifact_id = ?",
+                        (self.workspace_id, snapshot.artifact_id),
+                    ).fetchone()
+                    if row is None or self._artifact_row_snapshot(row) != snapshot:
+                        raise ObjectStorageContractError("Artifact deletion targets changed.")
+                published_by_id = {
+                    snapshot.artifact_id: snapshot
+                    for snapshot in plan.delete_published_rows
+                }
+                for snapshot in plan.delete_targets:
+                    self._execute_mark_object_artifact_deleted(
+                        connection, snapshot.artifact_id or "", snapshot,
+                        published_by_id[snapshot.artifact_id],
+                    )
+                self._assert_no_active_object_owner_artifacts(
+                    connection, safe_owner_type, safe_owner_id
+                )
+                result = delete_owner(connection)
+                for snapshot in plan.delete_published_rows:
+                    row = connection.execute(
+                        "select artifact_id, workspace_id, owner_type, owner_id, platform_user_id, "
+                        "session_id, job_id, artifact_kind, filename, content_type, size_bytes, "
+                        "checksum_sha256, object_provider_type, object_key_ref, status, "
+                        "retention_status, created_at, updated_at, deleted_at "
+                        "from sqag_object_artifacts where workspace_id = ? and artifact_id = ?",
+                        (self.workspace_id, snapshot.artifact_id),
+                    ).fetchone()
+                    if row is None or self._artifact_row_snapshot(row) != snapshot:
+                        raise ObjectStorageContractError("Artifact deletion publication is incomplete.")
+                for entry in plan.cleanup:
+                    snapshot = self._artifact_row_snapshot(entry["snapshot"])
+                    entry["state"] = (
+                        "retained_policy"
+                        if self._object_artifact_cleanup_blocked(
+                            connection, snapshot, plan=plan
                         )
-                try:
-                    connection.rollback()
-                except Exception as rollback_exc:
-                    recovery_error = rollback_exc
-                if recovery_error is not None:
-                    raise ObjectStorageContractError(
-                        'Artifact deletion recovery failed.'
-                    ) from recovery_error
-                raise exc
+                        else "pending"
+                    )
+                self._update_object_artifact_operation_state(
+                    connection, plan, "published"
+                )
+                connection.commit()
+        except Exception as exc:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+            if self._object_artifact_operation_row_after_uncertain_commit(
+                plan, lock_identities
+            ) and self._verify_published_object_artifact_batch(plan):
+                result = result if result is not None else True
+            else:
+                plan.state = "prepared"
+                if isinstance(exc, ObjectStorageContractError):
+                    raise
+                raise ObjectStorageContractError(
+                    "Artifact deletion publication outcome is unavailable."
+                ) from exc
+        plan.state = "published"
+        if not self._verify_published_object_artifact_batch(plan):
+            raise ObjectStorageContractError("Artifact deletion receipt is unavailable.")
+        # Cleanup starts only after the deletion receipt is durably verified.
+        # Failures remain as durable journal work and do not undo publication.
+        self._cleanup_object_artifact_batch(plan)
+        self._resume_published_object_artifact_cleanups(
+            lock_identities, retained_policy_only=True
+        )
+        return result_from_rows(rows) if result_from_rows is not None else bool(result)
 
     def _assert_no_active_object_owner_artifacts(
         self,
@@ -14604,6 +16306,48 @@ class DatabaseSqagStorage:
         )
         return cursor.rowcount
 
+    def _retrieve_object_artifact_snapshot(
+        self,
+        snapshot: ArtifactRowSnapshot,
+    ) -> dict[str, Any] | None:
+        """Retrieve only the frozen row supplied by the authoritative caller."""
+        try:
+            metadata = self._object_metadata_from_snapshot(snapshot)
+            incarnation = metadata.artifact_incarnation
+            expected_key = object_artifact_key(
+                workspace_id=metadata.workspace_id,
+                owner_type=metadata.owner_type,
+                owner_id=metadata.owner_id,
+                artifact_kind=metadata.artifact_kind,
+                filename=metadata.filename,
+                checksum_sha256=metadata.checksum_sha256,
+                artifact_incarnation=incarnation,
+            )
+            if metadata.storage_key != expected_key:
+                return None
+            if incarnation is not None:
+                if not re.fullmatch(r"obj-v2-[a-f0-9]{64}", metadata.artifact_id):
+                    return None
+            elif "/v2/" in metadata.storage_key:
+                return None
+            content = configured_object_storage_backend().retrieve_artifact(
+                metadata, workspace_id=metadata.workspace_id
+            )
+        except ObjectStorageContractError:
+            return None
+        if (
+            not isinstance(content, bytes)
+            or len(content) != snapshot.size_bytes
+            or hashlib.sha256(content).hexdigest() != snapshot.checksum_sha256
+        ):
+            return None
+        return {
+            "filename": snapshot.filename,
+            "content_type": snapshot.content_type,
+            "size_bytes": snapshot.size_bytes,
+            "content": content,
+        }
+
     def _read_object_file_artifact(
         self,
         owner_type: str,
@@ -14611,7 +16355,17 @@ class DatabaseSqagStorage:
         artifact_kind: str,
         *,
         connection: Any | None = None,
+        snapshot: ArtifactRowSnapshot | None = None,
     ) -> dict[str, Any] | None:
+        if snapshot is not None:
+            if (
+                snapshot.workspace_id != self.workspace_id
+                or snapshot.owner_type != owner_type
+                or snapshot.owner_id != owner_id
+                or snapshot.artifact_kind != artifact_kind
+            ):
+                return None
+            return self._retrieve_object_artifact_snapshot(snapshot)
         if connection is None:
             with self.connection() as active_connection:
                 return self._read_object_file_artifact(
@@ -14620,42 +16374,33 @@ class DatabaseSqagStorage:
                     artifact_kind,
                     connection=active_connection,
                 )
-        row = self._object_artifact_row(
-            owner_type,
-            owner_id,
-            artifact_kind,
-            connection=connection,
+        rows = self._active_object_artifact_rows(
+            owner_type, owner_id, connection=connection, artifact_kind=artifact_kind
         )
-        if not row:
+        if len(rows) != 1:
             return None
-        snapshot = dict(row)
-        object_metadata = self._object_metadata_from_row(row)
         try:
-            content = configured_object_storage_backend().retrieve_artifact(
-                object_metadata,
-                workspace_id=self.workspace_id,
-            )
+            frozen = self._artifact_row_snapshot(rows[0])
         except ObjectStorageContractError:
             return None
-        if not content or len(content) != object_metadata.size_bytes:
+        retrieved = self._retrieve_object_artifact_snapshot(frozen)
+        if retrieved is None:
             return None
-        current = self._object_artifact_row(
-            owner_type,
-            owner_id,
-            artifact_kind,
-            connection=connection,
+        final_connection = (
+            connection
+            if self.database_family != "postgres_compatible"
+            else None
         )
-        if not current or not self._object_artifact_row_matches_snapshot(
-            current,
-            snapshot,
-        ):
+        current_rows = self._active_object_artifact_rows(
+            owner_type, owner_id, connection=final_connection, artifact_kind=artifact_kind
+        )
+        if len(current_rows) != 1:
             return None
-        return {
-            "filename": row["filename"],
-            "content_type": row["content_type"],
-            "size_bytes": object_metadata.size_bytes,
-            "content": content,
-        }
+        try:
+            current = self._artifact_row_snapshot(current_rows[0])
+        except ObjectStorageContractError:
+            return None
+        return retrieved if current == frozen else None
 
     def profile_layout_artifact(self, profile_id: str) -> dict[str, Any] | None:
         safe_id = safe_resource_id(profile_id, "")
@@ -14846,22 +16591,104 @@ class DatabaseSqagStorage:
             if clean_text(row["session_id"]) == safe_id
         ]
 
-    def _object_metadata_from_row(self, row: sqlite3.Row) -> ObjectArtifactMetadata:
-        created_at = clean_text(row["created_at"]) or utc_timestamp()
-        updated_at = clean_text(row["updated_at"]) or created_at
-        return ObjectArtifactMetadata(
-            workspace_id=clean_text(row["workspace_id"]),
-            owner_type=clean_text(row["owner_type"]),
-            owner_id=clean_text(row["owner_id"]),
-            artifact_kind=clean_text(row["artifact_kind"]),
-            filename=clean_text(row["filename"]),
-            content_type=clean_text(row["content_type"]) or "application/octet-stream",
-            size_bytes=int(row["size_bytes"] or 0),
-            checksum_sha256=clean_text(row["checksum_sha256"]),
-            storage_key=clean_text(row["object_key_ref"]),
-            created_at=created_at,
-            updated_at=updated_at,
+    def _artifact_row_snapshot(self, row: Mapping[str, Any] | sqlite3.Row) -> ArtifactRowSnapshot:
+        fields = (
+            "artifact_id", "workspace_id", "owner_type", "owner_id",
+            "platform_user_id", "session_id", "job_id", "artifact_kind",
+            "filename", "content_type", "size_bytes", "checksum_sha256",
+            "object_provider_type", "object_key_ref", "status",
+            "retention_status", "created_at", "updated_at", "deleted_at",
         )
+        try:
+            values = {name: row[name] for name in fields}
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ObjectStorageContractError("Artifact metadata is incomplete.") from exc
+        for name in fields:
+            if name == "size_bytes":
+                value = values[name]
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise ObjectStorageContractError("Artifact metadata is malformed.")
+            elif values[name] is not None and not isinstance(values[name], str):
+                raise ObjectStorageContractError("Artifact metadata is malformed.")
+        return ArtifactRowSnapshot(**values)
+
+    def _profile_row_snapshot(self, row: Mapping[str, Any] | sqlite3.Row) -> ProfileRowSnapshot:
+        fields = ("workspace_id", "profile_id", "payload_json", "created_at", "updated_at")
+        try:
+            values = {name: row[name] for name in fields}
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ObjectStorageContractError("Profile metadata is incomplete.") from exc
+        if any(not isinstance(value, str) for value in values.values()):
+            raise ObjectStorageContractError("Profile metadata is malformed.")
+        return ProfileRowSnapshot(**values)
+
+    def _artifact_snapshot_mapping(self, snapshot: ArtifactRowSnapshot) -> dict[str, Any]:
+        return {name: getattr(snapshot, name) for name in ArtifactRowSnapshot.__dataclass_fields__}
+
+    def _profile_snapshot_mapping(self, snapshot: ProfileRowSnapshot) -> dict[str, str]:
+        return {name: getattr(snapshot, name) for name in ProfileRowSnapshot.__dataclass_fields__}
+
+    def _artifact_snapshot_digest(self, snapshot: ArtifactRowSnapshot) -> str:
+        encoded = json.dumps(
+            self._artifact_snapshot_mapping(snapshot),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _profile_snapshot_digest(self, snapshot: ProfileRowSnapshot) -> str:
+        encoded = json.dumps(
+            self._profile_snapshot_mapping(snapshot),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _object_metadata_from_snapshot(self, snapshot: ArtifactRowSnapshot) -> ObjectArtifactMetadata:
+        required = (
+            snapshot.workspace_id, snapshot.owner_type, snapshot.owner_id,
+            snapshot.artifact_kind, snapshot.filename, snapshot.content_type,
+            snapshot.artifact_id, snapshot.checksum_sha256, snapshot.object_provider_type,
+            snapshot.object_key_ref, snapshot.created_at, snapshot.updated_at,
+        )
+        if any(value is None for value in required):
+            raise ObjectStorageContractError("Artifact metadata is incomplete.")
+        if snapshot.object_provider_type != "s3_compatible":
+            raise ObjectStorageContractError("Artifact provider is invalid.")
+        return ObjectArtifactMetadata(
+            workspace_id=snapshot.workspace_id,
+            owner_type=snapshot.owner_type,
+            owner_id=snapshot.owner_id,
+            artifact_kind=snapshot.artifact_kind,
+            filename=snapshot.filename,
+            content_type=snapshot.content_type,
+            size_bytes=snapshot.size_bytes,
+            checksum_sha256=snapshot.checksum_sha256,
+            storage_key=snapshot.object_key_ref,
+            created_at=snapshot.created_at,
+            updated_at=snapshot.updated_at,
+            artifact_id=snapshot.artifact_id or "",
+            platform_user_id=snapshot.platform_user_id,
+            session_id=snapshot.session_id,
+            job_id=snapshot.job_id,
+            artifact_incarnation=(
+                self._artifact_incarnation_from_key(snapshot.object_key_ref)
+            ),
+            binding_sha256=self._artifact_snapshot_digest(snapshot),
+        )
+
+    def _artifact_incarnation_from_key(self, storage_key: str) -> str | None:
+        parts = storage_key.split("/")
+        if len(parts) >= 8 and parts[-3] == "v2":
+            candidate = parts[-2]
+            if re.fullmatch(r"inc-v2-[a-f0-9]{64}", candidate):
+                return candidate
+        return None
+
+    def _object_metadata_from_row(self, row: sqlite3.Row) -> ObjectArtifactMetadata:
+        return self._object_metadata_from_snapshot(self._artifact_row_snapshot(row))
 
     def _object_quote_artifact_row_is_current(self, session_id: str, kind: str, row: sqlite3.Row) -> bool:
         current = self._object_quote_artifact_row(session_id, kind)
@@ -14899,24 +16726,32 @@ class DatabaseSqagStorage:
         filename: str,
         content_type: str,
         metadata: ObjectArtifactMetadata,
+        *,
+        owner_type: str = "generated_quote",
+        owner_id: str | None = None,
     ) -> None:
-        artifact_id = f"obj-{secrets.token_hex(12)}"
-        now = utc_timestamp()
+        safe_owner_type = safe_resource_id(owner_type, "")
+        safe_owner_id = safe_resource_id(owner_id or session_id, "")
+        if not safe_owner_type or not safe_owner_id:
+            raise ObjectStorageContractError("Artifact metadata is incomplete.")
+        artifact_id = metadata.artifact_id or f"obj-{secrets.token_hex(12)}"
+        now = metadata.updated_at or utc_timestamp()
+        row_session_id = metadata.session_id if metadata.session_id is not None else session_id
         connection.execute(
             "insert into sqag_object_artifacts (artifact_id, workspace_id, owner_type, owner_id, platform_user_id, session_id, job_id, artifact_kind, filename, content_type, size_bytes, checksum_sha256, object_provider_type, object_key_ref, status, retention_status, created_at, updated_at, deleted_at) "
             "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
+            "on conflict(workspace_id, owner_type, owner_id, artifact_kind) do update set artifact_id = excluded.artifact_id, platform_user_id = excluded.platform_user_id, session_id = excluded.session_id, job_id = excluded.job_id, filename = excluded.filename, content_type = excluded.content_type, size_bytes = excluded.size_bytes, checksum_sha256 = excluded.checksum_sha256, object_provider_type = excluded.object_provider_type, object_key_ref = excluded.object_key_ref, status = excluded.status, retention_status = excluded.retention_status, created_at = excluded.created_at, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
             (
                 artifact_id,
                 self.workspace_id,
-                "generated_quote",
-                session_id,
-                self.user_id,
-                session_id,
-                "",
+                safe_owner_type,
+                safe_owner_id,
+                metadata.platform_user_id if metadata.platform_user_id is not None else self.user_id,
+                row_session_id,
+                metadata.job_id if metadata.job_id is not None else "",
                 kind,
                 filename,
-                content_type,
+                metadata.content_type or content_type,
                 metadata.size_bytes,
                 metadata.checksum_sha256,
                 "s3_compatible",
@@ -14924,7 +16759,7 @@ class DatabaseSqagStorage:
                 "active",
                 "active",
                 metadata.created_at or now,
-                now,
+                metadata.updated_at or now,
                 None,
             ),
         )
@@ -15010,6 +16845,9 @@ class DatabaseSqagStorage:
         connection: Any | None = None,
         object_owner_type: str = "generated_quote",
         object_owner_id: str = "",
+        job_id: str = "",
+        defer_object_plan: bool = False,
+        lifecycle_lock_identities: tuple[tuple[str, str], ...] = (),
     ) -> tuple[bool, list[ArtifactBatchItem], ObjectArtifactBatchPlan | None]:
         if not result_has_generated_quote(result) or output_dir is None:
             return False, [], None
@@ -15080,7 +16918,7 @@ class DatabaseSqagStorage:
             metadata["status"][f"{item.artifact_kind}_exported"] = True
 
         object_plan = None
-        if configured_artifact_storage_mode() == "object":
+        if configured_artifact_storage_mode() == "object" and not defer_object_plan:
             object_plan = self._prepare_object_artifact_batch(
                 object_owner_type,
                 object_owner_id or session_id,
@@ -15089,6 +16927,10 @@ class DatabaseSqagStorage:
                 retained_kinds,
                 connection=connection,
                 quote_session=True,
+                session_id=session_id,
+                job_id=job_id,
+                request_context={"metadata": metadata},
+                lifecycle_lock_identities=lifecycle_lock_identities,
             )
         return True, pending_artifacts, object_plan
 
@@ -15431,6 +17273,7 @@ class DatabaseSqagStorage:
                 safe_id,
                 lambda _connection: True,
                 result_from_rows=len,
+                expected_owner_after_digest=lambda connection: self._object_owner_row_digest(connection, "generated_quote", safe_id),
             )
         )
 
@@ -15513,6 +17356,70 @@ class DatabaseSqagStorage:
         owner_id = self._quote_session_owner_id(metadata)
         return bool(owner_id and self.user_id and owner_id == self.user_id)
 
+    def _quote_session_row_snapshot(
+        self, connection: Any, session_id: str
+    ) -> tuple[Any, ...] | None:
+        safe_id = safe_quote_session_id(session_id, "")
+        if not safe_id:
+            return None
+        row = connection.execute(
+            "select workspace_id, session_id, metadata_json, draft_files_json, "
+            "created_at, updated_at from sqag_quote_sessions "
+            "where workspace_id = ? and session_id = ?",
+            (self.workspace_id, safe_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return tuple(
+            row[name]
+            for name in (
+                "workspace_id", "session_id", "metadata_json", "draft_files_json",
+                "created_at", "updated_at",
+            )
+        )
+
+    def _read_quote_session_authority_snapshot_for_workspace(
+        self, session_id: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], tuple[Any, ...] | None]:
+        safe_id = safe_quote_session_id(session_id, "")
+        if not safe_id:
+            return {}, [], None
+        with self.connection() as connection:
+            row = connection.execute(
+                "select workspace_id, session_id, metadata_json, draft_files_json, "
+                "created_at, updated_at from sqag_quote_sessions "
+                "where workspace_id = ? and session_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+        if row is None:
+            return {}, [], None
+        snapshot = tuple(
+            row[name]
+            for name in (
+                "workspace_id", "session_id", "metadata_json", "draft_files_json",
+                "created_at", "updated_at",
+            )
+        )
+        try:
+            metadata = json.loads(row["metadata_json"])
+            draft_files = json.loads(row["draft_files_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return {}, [], snapshot
+        metadata = metadata if isinstance(metadata, dict) else {}
+        draft_files = draft_files if isinstance(draft_files, list) else []
+        if safe_quote_session_id(metadata.get("session_id"), "") != safe_id:
+            return {}, [], snapshot
+        return metadata, [item for item in draft_files if isinstance(item, dict)], snapshot
+
+    def _assert_quote_session_row_matches(
+        self,
+        connection: Any,
+        session_id: str,
+        expected: tuple[Any, ...] | None,
+    ) -> None:
+        if self._quote_session_row_snapshot(connection, session_id) != expected:
+            raise ObjectStorageContractError("Quote session lifecycle state changed.")
+
     def _read_quote_session_metadata_for_workspace_on_connection(
         self,
         connection: Any,
@@ -15577,7 +17484,7 @@ class DatabaseSqagStorage:
         ):
             return records
 
-        def prepare(connection: Any):
+        def prepare(connection: Any, lifecycle_lock_identities: tuple[tuple[str, str], ...]):
             metadata, current_records = (
                 self._read_quote_session_metadata_for_workspace_on_connection(
                     connection,
@@ -15650,6 +17557,8 @@ class DatabaseSqagStorage:
                 retained_kinds,
                 connection=connection,
                 quote_session=False,
+                request_context={"metadata": metadata, "draft_files": rewritten_records},
+                lifecycle_lock_identities=lifecycle_lock_identities,
             )
             return {
                 "changed": True,
@@ -15721,7 +17630,7 @@ class DatabaseSqagStorage:
                 reason="object_artifact_storage_unavailable",
             )
         self.ensure_ready()
-        self.ensure_object_artifact_ready()
+        self.ensure_object_artifact_lifecycle_ready()
 
     def count_workspace_inline_draft_files_for_object_migration(self) -> int:
         self._ensure_inline_draft_object_migration_access()
@@ -15984,6 +17893,21 @@ class DatabaseSqagStorage:
             raise ValueError("Quote session metadata is not valid.")
         return normalized
 
+    def _assert_quote_publication_version_binding(
+        self, connection: Any, run_id: str, session_id: str, job_id: str
+    ) -> None:
+        prior = connection.execute(
+            "select session_id, job_id from sqag_quote_publication_versions "
+            "where workspace_id = ? and run_id = ?",
+            (self.workspace_id, run_id),
+        ).fetchone()
+        if prior is not None and (
+            prior["session_id"] != session_id or prior["job_id"] != job_id
+        ):
+            raise ObjectStorageContractError(
+                "Quote publication version binding changed."
+            )
+
     def _execute_stage_publication_version(
         self,
         connection: Any,
@@ -15996,7 +17920,15 @@ class DatabaseSqagStorage:
         pending_artifacts: list[ArtifactBatchItem],
         object_plan: ObjectArtifactBatchPlan | None,
         now: str,
+        expected_session_row: tuple[Any, ...] | None,
     ) -> None:
+        self._assert_quote_session_row_matches(
+            connection, session_id, expected_session_row
+        )
+        self._assert_quote_publication_version_binding(
+            connection, run_id, session_id, job_id
+        )
+        self._acquire_object_artifact_publication_reference_lock(connection)
         expiry = self._publication_retention_expiry(now)
         connection.execute(
             "update sqag_quote_publication_versions set state = ?, error_code = ?, "
@@ -16113,13 +18045,33 @@ class DatabaseSqagStorage:
         run_id: str,
         job_id: str,
         expected_unchanged_drafts: list[dict[str, Any]] | None = None,
+        expected_session_row: tuple[Any, ...] | None = None,
     ) -> dict[str, Any]:
-        def prepare(connection: Any | None = None) -> dict[str, Any]:
-            existing, _draft_files = (
-                self._read_quote_session_metadata_for_workspace_on_connection(connection, session_id)
-                if connection is not None
-                else self._read_quote_session_metadata_for_workspace(session_id)
-            )
+        def prepare(connection: Any | None = None, lifecycle_lock_identities: tuple[tuple[str, str], ...] = ()) -> dict[str, Any]:
+            if connection is not None:
+                self._assert_quote_session_row_matches(
+                    connection, session_id, expected_session_row
+                )
+                self._assert_quote_publication_version_binding(
+                    connection, run_id, session_id, job_id
+                )
+                existing, _draft_files = (
+                    self._read_quote_session_metadata_for_workspace_on_connection(connection, session_id)
+                )
+            else:
+                existing, _draft_files, current_session_row = (
+                    self._read_quote_session_authority_snapshot_for_workspace(session_id)
+                )
+                if current_session_row != expected_session_row:
+                    raise ObjectStorageContractError(
+                        "Quote session lifecycle state changed."
+                    )
+                with self.connection() as check:
+                    self._assert_quote_publication_version_binding(
+                        check, run_id, session_id, job_id
+                    )
+            if existing and not self._quote_session_editable_by_current_user(existing):
+                raise ObjectStorageContractError("Quote session lifecycle state changed.")
             if expected_unchanged_drafts is not None and not self._object_draft_files_match_persisted(
                 session_id,
                 expected_unchanged_drafts,
@@ -16143,6 +18095,9 @@ class DatabaseSqagStorage:
                 connection=connection,
                 object_owner_type="generated_quote_version",
                 object_owner_id=run_id,
+                job_id=job_id,
+                defer_object_plan=True,
+                lifecycle_lock_identities=lifecycle_lock_identities,
             )
             if not stored:
                 raise SqagStorageAccessError(
@@ -16166,6 +18121,16 @@ class DatabaseSqagStorage:
                     owner_id=self.user_id,
                     authority=publication_authority,
                 )
+            if configured_artifact_storage_mode() == "object":
+                object_plan = self._prepare_object_artifact_batch(
+                    "generated_quote_version", run_id, pending_artifacts,
+                    set(QUOTE_SESSION_EXPORT_KINDS),
+                    {item.artifact_kind for item in pending_artifacts},
+                    connection=connection, quote_session=True,
+                    session_id=session_id, job_id=job_id,
+                    request_context={"metadata": metadata},
+                    lifecycle_lock_identities=lifecycle_lock_identities,
+                )
             return {
                 "metadata": metadata,
                 "pending_artifacts": pending_artifacts,
@@ -16185,6 +18150,7 @@ class DatabaseSqagStorage:
                 pending_artifacts=state["pending_artifacts"],
                 object_plan=state["object_plan"],
                 now=state["now"],
+                expected_session_row=expected_session_row,
             )
             return state
 
@@ -16193,8 +18159,8 @@ class DatabaseSqagStorage:
             state, object_plan = self._run_object_lifecycle_save(
                 "generated_quote_version",
                 run_id,
-                lambda connection: (
-                    (prepared := prepare(connection)),
+                lambda connection, lifecycle_lock_identities: (
+                    (prepared := prepare(connection, lifecycle_lock_identities)),
                     prepared["object_plan"],
                 ),
                 persist,
@@ -16278,8 +18244,12 @@ class DatabaseSqagStorage:
         generation_run_id: str,
         generation_job_id: str,
         expected_unchanged_drafts: list[dict[str, Any]] | None = None,
+        expected_session_row: tuple[Any, ...] | None = None,
     ) -> dict[str, Any]:
-        def prepare_object_quote(connection: Any):
+        def prepare_object_quote(connection: Any, lifecycle_lock_identities: tuple[tuple[str, str], ...]):
+            self._assert_quote_session_row_matches(
+                connection, resolved_session_id, expected_session_row
+            )
             existing, _draft_files = (
                 self._read_quote_session_metadata_for_workspace_on_connection(
                     connection,
@@ -16345,6 +18315,9 @@ class DatabaseSqagStorage:
                 result,
                 output_dir,
                 connection=connection,
+                job_id=generation_job_id,
+                defer_object_plan=(configured_artifact_storage_mode() == "object"),
+                lifecycle_lock_identities=lifecycle_lock_identities,
             )
             draft_files = (
                 quote_session_draft_files(patch)
@@ -16371,6 +18344,7 @@ class DatabaseSqagStorage:
                     draft_kinds,
                     connection=connection,
                     quote_session=False,
+                    lifecycle_lock_identities=lifecycle_lock_identities,
                 )
             if object_plan is not None and draft_plan is not None:
                 raise ObjectStorageContractError(
@@ -16378,7 +18352,18 @@ class DatabaseSqagStorage:
                 )
             effective_plan = draft_plan or object_plan
             if stored_generated_quote:
-                publication_id = safe_reference(generation_run_id, "run-") or new_quote_publication_id()
+                publication_id = (
+                    safe_reference(generation_run_id, "run-")
+                    or "pub-" + hashlib.sha256(json.dumps(
+                        [resolved_session_id, sorted(
+                            (item.artifact_kind, artifact_checksum(item.content))
+                            for item in pending_artifacts
+                        ), metadata.get("customer_summary"),
+                         metadata.get("quote_company_profile"),
+                         metadata.get("pricing_reference"), metadata.get("commercials")],
+                        ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")).hexdigest()[:32]
+                )
                 metadata["publication"] = {
                     "state": "published" if publish else "staged",
                     "run_id": safe_reference(generation_run_id, "run-"),
@@ -16410,6 +18395,54 @@ class DatabaseSqagStorage:
                     metadata["status"][f"{kind}_exported"] = bool(
                         publish and metadata["exports"].get(kind, {}).get("filename")
                     )
+            if stored_generated_quote:
+                profile_id = explicit_profile_id_from_payload(payload)
+                pricing_reference_id = (
+                    pricing_reference_id_from_payload(payload)
+                    or safe_resource_id(payload.get("pricing_reference_id"), "")
+                )
+                metadata["generation_snapshot"] = quote_session_generation_snapshot(
+                    payload, patch, created_at=now, workspace_id=self.workspace_id,
+                    profile_detail=(self.profile_detail(profile_id, source="company") if profile_id else None),
+                    pricing_reference_detail=(
+                        self.pricing_reference_detail(pricing_reference_id, source="company")
+                        if pricing_reference_id else None
+                    ),
+                )
+            if (
+                stored_generated_quote
+                and configured_artifact_storage_mode() == "object"
+                and pending_artifacts
+            ):
+                object_plan = self._prepare_object_artifact_batch(
+                    "generated_quote", resolved_session_id, pending_artifacts,
+                    set(QUOTE_SESSION_EXPORT_KINDS),
+                    {item.artifact_kind for item in pending_artifacts},
+                    connection=connection, quote_session=True,
+                    session_id=resolved_session_id, job_id=generation_job_id,
+                    request_context={"metadata": normalized_quote_session_metadata(metadata),
+                                     "draft_files": draft_metadata},
+                    lifecycle_lock_identities=lifecycle_lock_identities,
+                )
+                effective_plan = draft_plan or object_plan
+            normalized_request = normalized_quote_session_metadata(metadata)
+            if effective_plan is not None:
+                if effective_plan.journal_persisted:
+                    # A resumed request must use the original immutable context.
+                    # Durable content and owner checks below decide whether it can resume.
+                    pass
+                else:
+                    if effective_plan.request_context is None:
+                        effective_plan.request_context = (
+                            {"metadata": normalized_request, "draft_files": draft_metadata}
+                            if effective_plan.owner_type == "uploaded_reference"
+                            else {"metadata": normalized_request, "draft_files": draft_metadata}
+                        )
+                        effective_plan.owner_digest = self._canonical_json_digest(
+                            self._normalized_object_owner_request(
+                                effective_plan.owner_type, effective_plan.request_context
+                            )
+                        )
             state = {
                 "metadata": metadata,
                 "now": now,
@@ -16423,6 +18456,9 @@ class DatabaseSqagStorage:
             return state, effective_plan
 
         def persist_object_quote(connection: Any, state: dict[str, Any]):
+            self._assert_quote_session_row_matches(
+                connection, resolved_session_id, expected_session_row
+            )
             metadata = state["metadata"]
             now = state["now"]
             stored_generated_quote = state["stored_generated_quote"]
@@ -16547,10 +18583,14 @@ class DatabaseSqagStorage:
             raise error
         patch = copy.deepcopy(quote_session_patch_payload(payload))
         resolved_session_id = safe_quote_session_id(session_id or patch.get("session_id") or payload.get("session_id"), "") or new_quote_session_id()
-        existing, _draft_files = self._read_quote_session_metadata_for_workspace(resolved_session_id)
+        existing, _draft_files, expected_session_row = (
+            self._read_quote_session_authority_snapshot_for_workspace(resolved_session_id)
+        )
         if existing and not self._quote_session_editable_by_current_user(existing):
             resolved_session_id = new_quote_session_id()
-            existing = {}
+            existing, _draft_files, expected_session_row = (
+                self._read_quote_session_authority_snapshot_for_workspace(resolved_session_id)
+            )
         if isinstance(patch.get("draft_files"), list):
             quote_session_draft_files(patch)
         expected_unchanged_drafts = None
@@ -16585,6 +18625,7 @@ class DatabaseSqagStorage:
                 publish=publish, run_id=safe_run_id,
                 job_id=safe_reference(generation_job_id, "job-"),
                 expected_unchanged_drafts=expected_unchanged_drafts,
+                expected_session_row=expected_session_row,
             )
 
 
@@ -16599,6 +18640,7 @@ class DatabaseSqagStorage:
                 generation_run_id=generation_run_id,
                 generation_job_id=generation_job_id,
                 expected_unchanged_drafts=expected_unchanged_drafts,
+                expected_session_row=expected_session_row,
             )
         now = utc_timestamp()
         metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
@@ -16690,6 +18732,9 @@ class DatabaseSqagStorage:
             draft_files = quote_session_draft_files(patch) if isinstance(patch.get("draft_files"), list) else []
 
             def persist_quote(connection: Any) -> None:
+                self._assert_quote_session_row_matches(
+                    connection, resolved_session_id, expected_session_row
+                )
                 if stored_generated_quote:
                     retained_kinds = {
                         item.artifact_kind
@@ -17342,6 +19387,7 @@ class DatabaseSqagStorage:
                         session_id,
                         delete_owner,
                         authorize,
+                        expected_owner_after_digest=lambda _connection: self._canonical_json_digest(None),
                         additional_lock_identities=(("uploaded_reference", session_id),)
                         + self._publication_version_lock_identities_for_session(session_id),
                         rows_for_delete=lambda connection: (
@@ -17513,6 +19559,7 @@ class DatabaseSqagStorage:
                     finalize_version,
                     authorize_version,
                     result_from_rows=lambda _rows: True,
+                    expected_owner_after_digest=lambda connection: (self._canonical_json_digest(None) if owner_type == "generated_quote_version" else self._object_owner_row_digest(connection, owner_type, owner_id)),
                     additional_lock_identities=(("generated_quote", safe_id),),
                 )
                 return outcome
@@ -26679,7 +28726,7 @@ def write_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
+        prefix=".sqag-",
         suffix=".tmp",
         dir=str(path.parent),
     )

@@ -20,6 +20,7 @@ chat, logs, screenshots, and command history.
 6. `007_feedback_publication_binding_postgres.sql`
 7. `008_quote_session_deletion_hold_authority_postgres.sql`
 8. `009_telemetry_events_postgres.sql`
+9. `010_object_artifact_lifecycle.sql`
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database
@@ -40,6 +41,11 @@ not include `sqag_telemetry_source_state`. The migration is source- and
 checksum-locked like the earlier migrations; this run authorizes no live
 migration.
 
+Migration 010 adds `sqag_object_artifact_operations`, the durable journal for
+object replacement publication and guarded cleanup. Runtime access is limited
+to `SELECT`, `INSERT`, and `UPDATE`; maintenance access is limited to `SELECT`
+and `UPDATE`. The migration is additive and remains an explicit operator
+migration. This G3 work did not apply it to a live database.
 The runner accepts only an exact ordered prefix of the repository manifest.
 It fails closed for checksum drift, unknown or out-of-order rows, a complete
 ledger whose required objects are missing or altered, kind-specific constraint

@@ -63,6 +63,7 @@ class ObjectArtifactLifecycleVerifierTest(unittest.TestCase):
         self.assertEqual(report["storage_modes"], ["sqlite-database", "stubbed-object-artifacts"])
         for check_name in (
             "db_metadata_backup_restore_preserved",
+            "journal_backup_restore_preserved",
             "restored_metadata_retrieves_object",
             "missing_object_detected",
             "checksum_mismatch_detected",
@@ -71,6 +72,7 @@ class ObjectArtifactLifecycleVerifierTest(unittest.TestCase):
             "local_staging_files_cleaned",
         ):
             self.assertTrue(report["checks"][check_name], check_name)
+        self.assertEqual(report["row_counts"]["object_artifact_operations"], 1)
         self.assertEqual(report["privacy"]["output"], "metadata-only")
         self.assertFalse(report["privacy"]["object_keys_printed"])
         self.assertFalse(report["privacy"]["artifact_bytes_printed"])

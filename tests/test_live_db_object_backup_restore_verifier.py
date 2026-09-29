@@ -680,15 +680,14 @@ def seed_real_s3_quote_artifact(
 ):
     if storage is None:
         database_path = root / f"{operation}.sqlite"
+        database_url = f"sqlite:///{database_path.as_posix()}"
         storage = verifier.webapp.DatabaseSqagStorage(
-            f"sqlite:///{database_path.as_posix()}",
+            database_url,
             workspace_id,
             role="admin",
             user_id=f"synthetic-{operation}-{workspace_id}",
         )
-        with storage.connection() as connection:
-            connection.executescript(verifier.webapp.SQAG_OBJECT_ARTIFACT_METADATA_SQL)
-            connection.commit()
+        verifier.webapp.apply_sqag_storage_migrations(database_url)
     if client is None:
         client = SyntheticS3Transport()
     if backend is None:
@@ -726,7 +725,24 @@ def seed_real_s3_quote_artifact(
         "updated_at": metadata.updated_at,
         "deleted_at": None,
     }
+    owner_created_at = verifier.webapp.utc_timestamp()
+    owner_metadata = verifier.webapp.blank_quote_session_metadata(
+        owner_id, owner_created_at
+    )
     with storage.connection() as connection:
+        connection.execute(
+            "insert into sqag_quote_sessions "
+            "(workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) "
+            "values (?, ?, ?, ?, ?, ?)",
+            (
+                workspace_id,
+                owner_id,
+                json.dumps(owner_metadata, ensure_ascii=True, sort_keys=True),
+                "[]",
+                owner_created_at,
+                owner_created_at,
+            ),
+        )
         columns = ", ".join(row)
         placeholders = ", ".join("?" for _ in row)
         connection.execute(
