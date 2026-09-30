@@ -21305,11 +21305,14 @@ def build_basis_chat_prompt(
     elif selected_line:
         response_schema = (
             "{\"intent\":\"answer|proposal\",\"answer\":\"\","
-            "\"proposal\":{\"message\":\"\",\"replacement_line\":{\"tag\":\"Confirm\",\"text\":\"\",\"confidence_pct\":90,\"custom_pricing\":false},\"quote_basis_sections\":[]}}"
+            "\"proposal\":{\"message\":\"\",\"replacement_line\":{\"tag\":\"Confirm\",\"text\":\"\",\"confidence_pct\":90}}}"
         )
         proposal_target_rule = (
             "For required_intent=proposal, return intent=proposal with proposal.replacement_line for selected-line edits. "
-            "For selected-line proposals, return proposal.replacement_line only; preserve unchanged wording as much as possible, and do not explain the change in the answer field. "
+            "For selected-line proposals, return proposal.message and proposal.replacement_line only. "
+            "replacement_line may contain only text, tag, confidence, confidence_pct, quantity, and unit. "
+            "Do not return quote_basis, quote_basis_sections, line_items, or pricing metadata in the proposal. "
+            "Preserve unchanged wording as much as possible, and do not explain the change in the answer field. "
         )
     else:
         response_schema = "{\"intent\":\"answer\",\"answer\":\"\"}"
@@ -21330,7 +21333,8 @@ def build_basis_chat_prompt(
         "If the operator gives only a short fragment, treat it as the requested replacement detail for the selected line and rewrite the selected line around that detail. "
         "If selected_basis_line uses `[ catalog reference ] - detail` format, edit the catalog reference inside the brackets by default and preserve the detail after the dash. "
         "Only edit the detail after the dash when the operator explicitly names that detail or when the selected line has no bracketed catalog reference. "
-        "When a bracketed catalog reference changes, return plain unbracketed replacement_line.text as `updated catalog reference - unchanged detail`, set custom_pricing=true, and do not keep pricing_keyword, catalog_description, pricing_reference_description, or catalog_unit_price. "
+        "When a bracketed catalog reference changes, return plain unbracketed replacement_line.text as `updated catalog reference - unchanged detail`. "
+        "Do not return custom_pricing, pricing_keyword, catalog_description, pricing_reference_description, or catalog_unit_price; the server derives catalog binding from the accepted replacement text. "
         "Selected-line edit mode is intentionally narrow: selected_basis_line is the only sentence being edited. "
         "For selected-line proposals, preserve every unchanged phrase, number, material, finish, location, and scope detail from selected_basis_line unless the operator explicitly asks to change it. "
         "Do not add new scope, assumptions, wrap/edge details, quantities, finishes, locations, or affected sections that are not stated in the operator's question. "
