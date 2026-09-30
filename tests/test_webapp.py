@@ -13154,7 +13154,45 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("If selected_basis_line uses `[ catalog reference ] - detail` format", prompt)
         self.assertIn("edit the catalog reference inside the brackets by default", prompt)
         self.assertIn("return plain unbracketed replacement_line.text", prompt)
-        self.assertIn("custom_pricing=true", prompt)
+        self.assertIn("Do not return custom_pricing", prompt)
+
+    def test_basis_chat_prompt_schema_quantity_edit_is_admitted_without_pricing_expansion(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "target", "title": "Target", "section_meta": {"keep": True},
+            "lines": [
+                {"tag": "Include", "text": "Synthetic panel", "quantity": 2, "unit": "sqm",
+                 "confidence": 90, "catalog_unit_price": 17.5, "pricing_keyword": "synthetic-panel",
+                 "meta": {"keep": [1, None, True]}},
+                {"tag": "Exclude", "text": "Unchanged adjacent line", "quantity": 1, "unit": "nos"},
+            ],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        payload["basis_chat"] = {
+            "question": "Correct quantity to 1.5 sqm", "field": "target", "line_index": 0,
+            "line": "Include: Synthetic panel", "quantity": 2, "unit": "sqm",
+        }
+        before = copy.deepcopy(webapp.canonical_quote_basis_sections(payload))
+        prompt = webapp.build_basis_chat_prompt(payload)
+        reply, _ = json.JSONDecoder().raw_decode(prompt.split("Use this schema: ", 1)[1])
+        reply["intent"] = "proposal"
+        reply["proposal"]["replacement_line"].update(
+            text="Synthetic panel", tag="Include", quantity=1.5, unit="sqm",
+        )
+
+        for provider in ("openai", "deepseek"):
+            with self.subTest(provider=provider):
+                result = webapp.normalize_basis_chat_result(copy.deepcopy(reply), payload, provider)
+                sections = result["proposal"]["quote_basis_sections"]
+                selected = sections[0]["lines"][0]
+                self.assertEqual(selected["quantity"], 1.5)
+                self.assertEqual(selected["unit"], "sqm")
+                self.assertEqual(selected["catalog_unit_price"], 17.5)
+                self.assertEqual(selected["pricing_keyword"], "synthetic-panel")
+                self.assertEqual(selected["meta"], before[0]["lines"][0]["meta"])
+                self.assertEqual(sections[0]["section_meta"], before[0]["section_meta"])
+                self.assertEqual(sections[0]["lines"][1], before[0]["lines"][1])
+                self.assertEqual(payload["quote_basis_sections"], before)
 
     def test_basis_chat_quote_scope_edit_prompt_is_answer_only(self):
         payload = valid_payload()
@@ -41499,6 +41537,8 @@ process.stdout.write("ok");
             for replacement in (
                 [{"text": "One"}, {"text": "Two"}],
                 {"text": "Replacement", "pricing_keyword": "forbidden"},
+                {"text": "Replacement", "custom_pricing": False},
+                {"text": "Replacement", "catalog_unit_price": 17.5},
                 {"text": "Replacement", "arbitrary_metadata": True},
             ):
                 expanded = copy.deepcopy(valid)
