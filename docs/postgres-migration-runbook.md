@@ -86,11 +86,11 @@ reads the catalog and ledger, rolls the transaction back, and prints
 privacy-safe metadata. A ready pre-apply report may have a missing or present
 ledger and may have pending IDs, but applied IDs must be the exact manifest
 prefix and pending IDs the exact manifest suffix. A target with no reserved
-public `sqag_` objects reports all eight IDs pending and is safe for a
-separately approved first application, even when unrelated provider/public
-tables, indexes, routines, or triggers are present. Known premature SQAG
-objects and unknown `sqag_` objects remain fail-closed blockers; existing
-public SQAG objects without a trusted ledger are not adopted.
+public `sqag_` objects reports all nine manifest migration IDs pending.
+This state is safe for a separately approved first application, even when
+unrelated provider/public tables, indexes, routines, or triggers are present.
+Known premature and unknown SQAG objects remain fail-closed blockers;
+existing public SQAG objects without a trusted ledger are not adopted.
 
 The command fails closed when `SQAG_MIGRATOR_DATABASE_URL` is absent,
 non-PostgreSQL, or cannot establish the true `session_user` and
@@ -171,11 +171,12 @@ objects, premature suffix objects, unrelated provider objects, malformed/
 out-of-order/checksum rows, rollback, advisory-lock serialization,
 applied-prefix drift, post-apply and no-op behavior, and the actual CLI under
 wrong runtime, maintenance, bootstrap, provider-like, and assumed-role
-authorities. The real PostgreSQL-17 applied-prefix matrix holds `001` through
-`008` applied with `009` pending and proves read-only RED behavior for a
-missing and drifted required telemetry index and trigger, while retaining the
-historical v1 routine checks from migration 008 and the exact telemetry-aware
-v2 routine checks from migration 009. It also proves
+authorities. The real PostgreSQL-17 pre-009 applied-prefix fixture applies
+manifest IDs
+`001` and `003` through `008`, leaving `009` and `010` pending, and proves
+read-only RED behavior for a missing and drifted required telemetry index and
+trigger. It retains the historical v1 routine checks from migration 008 and
+the exact telemetry-aware v2 routine checks from migration 009. It also proves
 lexically-before and lexically-after same-name trigger collisions, the
 canonical-missing plus wrong-table-extra case, missing-ledger known and unknown
 SQAG routines, an unrelated-provider-routine GREEN control, a managed-empty
@@ -206,24 +207,28 @@ After the assumed-role refusal, all generated-role sessions are closed, the
 database-local role setting is reset, membership and `CONNECT` are revoked,
 and the role is dropped. The test proves no role, membership, database ACL,
 `pg_db_role_setting`, shared dependency, or owned-object residue before
-rechecking the clean `001`-`008` / pending-`009` preflight.
+rechecking the clean pre-009 prefix (`001`, `003` through `008` applied;
+`009` and `010` pending) preflight.
 
 The causal transition is one disposable target and has no post-`009` helper
-repair: complete the ACL/default-ACL fixture first, apply `001` through `008`,
-take a mutation-relevant BEFORE snapshot, and execute the production preflight
+repair: complete the ACL/default-ACL fixture first, apply manifest IDs
+`001` and `003` through `008`, then take a mutation-relevant BEFORE
+snapshot and execute the production preflight
 script in a bounded child interpreter with a scrubbed minimal environment.
-Require the actual PRE JSON to show exactly `001` through `008` applied and
-only `009` pending, with an identical BEFORE/AFTER snapshot. Exercise every
+Require the actual PRE JSON to show exactly manifest IDs
+`001` and `003` through `008` applied and
+`009` and `010` pending, with an identical BEFORE/AFTER snapshot. Exercise every
 wrong-authority actual-CLI negative, including the assumed-role
 `session_user != current_user` case, with immutable snapshots; tear down that
 role narrowly and prove no role, membership, database ACL, database-local
 setting, owned-object, or related residue. Execute the actual PRE child process
-again on the same clean target and require the same `001`-`008` / pending-`009`
-report before applying `009`.
+again on the same clean target and require the same manifest prefix with
+`009` and `010` pending before applying both migrations.
 
-Apply `009` with the actual CLI through the dedicated migrator URL, immediately
-prove the telemetry tables, indexes, trigger bindings, and migration-ledger
-row directly from the catalog, then take a pre-POST snapshot and execute the
+Apply `009` and `010` with the actual CLI through the dedicated migrator URL.
+Immediately prove the telemetry tables, indexes, and trigger bindings, plus
+the lifecycle journal table, guard triggers, and both migration-ledger rows,
+directly from the catalog. Then take a pre-POST snapshot and execute the
 actual POST preflight child process with the dedicated migrator, runtime, and
 maintenance URLs. Require exact final heads, zero pending IDs and blockers,
 verified runtime and maintenance summaries, no URL/secret leakage, and an

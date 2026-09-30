@@ -21,6 +21,7 @@ import importlib
 import io
 import json
 import os
+import re
 import sys
 import uuid
 import zipfile
@@ -799,6 +800,24 @@ def _verifier_artifact_storage_mode(env: Mapping[str, str]) -> str:
     return configured if configured in {"database", "object"} else "object"
 
 
+def _synthetic_profile_layout_artifact_identity(
+    workspace_id: str,
+    profile_id: str,
+) -> tuple[str, str]:
+    encoded = json.dumps(
+        [workspace_id, "profile", profile_id, "quotation_layout"],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    artifact_id = "obj-v2-" + hashlib.sha256(
+        b"sqag-verifier-profile-artifact-id\0" + encoded
+    ).hexdigest()
+    artifact_incarnation = "inc-v2-" + hashlib.sha256(
+        b"sqag-verifier-profile-incarnation\0" + encoded
+    ).hexdigest()
+    return artifact_id, artifact_incarnation
+
+
 def _expected_artifact_descriptor(
     *,
     workspace_id: str,
@@ -808,6 +827,8 @@ def _expected_artifact_descriptor(
     filename: str,
     content_type: str,
     content: bytes,
+    artifact_id: str = "",
+    artifact_incarnation: str | None = None,
 ) -> dict[str, object]:
     checksum = artifact_checksum(content)
     metadata = ObjectArtifactMetadata(
@@ -826,9 +847,12 @@ def _expected_artifact_descriptor(
             artifact_kind=artifact_kind,
             filename=filename,
             checksum_sha256=checksum,
+            artifact_incarnation=artifact_incarnation,
         ),
         created_at="1970-01-01T00:00:00Z",
         updated_at="1970-01-01T00:00:00Z",
+        artifact_id=artifact_id,
+        artifact_incarnation=artifact_incarnation,
     )
     return {"metadata": metadata, "content": bytes(content)}
 
@@ -838,6 +862,12 @@ def _expected_artifact_descriptors(
     active_payload: bytes,
 ) -> dict[str, dict[str, object]]:
     profile_layout = _synthetic_profile_layout_payload()
+    profile_a_artifact_id, profile_a_incarnation = (
+        _synthetic_profile_layout_artifact_identity(ids["workspace_a"], ids["profile_a"])
+    )
+    profile_b_artifact_id, profile_b_incarnation = (
+        _synthetic_profile_layout_artifact_identity(ids["workspace_b"], ids["profile_b"])
+    )
     descriptors = {
         "active/workspace_a/profile": _expected_artifact_descriptor(
             workspace_id=ids["workspace_a"],
@@ -847,6 +877,8 @@ def _expected_artifact_descriptors(
             filename="quotation-layout.xlsx",
             content_type=SYNTHETIC_CONTENT_TYPE,
             content=profile_layout,
+            artifact_id=profile_a_artifact_id,
+            artifact_incarnation=profile_a_incarnation,
         ),
         "active/workspace_b/profile": _expected_artifact_descriptor(
             workspace_id=ids["workspace_b"],
@@ -856,6 +888,8 @@ def _expected_artifact_descriptors(
             filename="quotation-layout.xlsx",
             content_type=SYNTHETIC_CONTENT_TYPE,
             content=profile_layout,
+            artifact_id=profile_b_artifact_id,
+            artifact_incarnation=profile_b_incarnation,
         ),
         "restore/workspace_a/profile": _expected_artifact_descriptor(
             workspace_id=ids["workspace_a"],
@@ -865,6 +899,8 @@ def _expected_artifact_descriptors(
             filename="quotation-layout.xlsx",
             content_type=SYNTHETIC_CONTENT_TYPE,
             content=profile_layout,
+            artifact_id=profile_a_artifact_id,
+            artifact_incarnation=profile_a_incarnation,
         ),
         "restore/workspace_b/profile": _expected_artifact_descriptor(
             workspace_id=ids["workspace_b"],
@@ -874,6 +910,8 @@ def _expected_artifact_descriptors(
             filename="quotation-layout.xlsx",
             content_type=SYNTHETIC_CONTENT_TYPE,
             content=profile_layout,
+            artifact_id=profile_b_artifact_id,
+            artifact_incarnation=profile_b_incarnation,
         ),
         "active/workspace_a/generated_xlsx": _expected_artifact_descriptor(
             workspace_id=ids["workspace_a"],
@@ -920,6 +958,47 @@ def _artifact_receipt_matches(
     expected: ObjectArtifactMetadata,
 ) -> bool:
     return _immutable_artifact_metadata_tuple(receipt) == _immutable_artifact_metadata_tuple(expected)
+
+
+def _profile_layout_artifact_metadata_matches(
+    actual: object,
+    expected: ObjectArtifactMetadata,
+) -> bool:
+    if not isinstance(actual, ObjectArtifactMetadata):
+        return False
+    expected_fields = (
+        "workspace_id",
+        "owner_type",
+        "owner_id",
+        "artifact_kind",
+        "filename",
+        "content_type",
+        "size_bytes",
+        "checksum_sha256",
+    )
+    if any(getattr(actual, field) != getattr(expected, field) for field in expected_fields):
+        return False
+
+    if (
+        not isinstance(actual.artifact_incarnation, str)
+        or not isinstance(actual.artifact_id, str)
+        or not re.fullmatch(r"inc-v2-[a-f0-9]{64}", actual.artifact_incarnation)
+        or not re.fullmatch(r"obj-v2-[a-f0-9]{64}", actual.artifact_id)
+    ):
+        return False
+    try:
+        canonical_key = webapp.object_artifact_key(
+            workspace_id=actual.workspace_id,
+            owner_type=actual.owner_type,
+            owner_id=actual.owner_id,
+            artifact_kind=actual.artifact_kind,
+            filename=actual.filename,
+            checksum_sha256=actual.checksum_sha256,
+            artifact_incarnation=actual.artifact_incarnation,
+        )
+    except (TypeError, ValueError, ObjectStorageContractError):
+        return False
+    return actual.storage_key == canonical_key
 
 
 def _immutable_artifact_metadata_tuple(
@@ -1598,7 +1677,7 @@ def _verify_profile_layout_artifact(
     if metadata_rows is None or len(metadata_rows) != 1:
         return None
     actual = metadata_rows[0]
-    if not _artifact_receipt_matches(actual, expected):
+    if not _profile_layout_artifact_metadata_matches(actual, expected):
         return None
     try:
         actual_content = backend.retrieve_artifact(
@@ -2198,13 +2277,27 @@ def _database_unknown_evidence(
     }.get(resource_kind)
     if detail_method_name is None:
         return "failed"
+    workspace_id = _clean(getattr(storage, "workspace_id", ""))
+    if resource_kind == "profile" and artifact_storage_mode == "object":
+        if not workspace_id or not identifier:
+            return "failed"
+        operations = _database_rows(
+            storage,
+            "select operation_seq from sqag_object_artifact_operations "
+            "where workspace_id = ? and owner_type = ? and owner_id = ? "
+            "and state = 'prepared' limit 1",
+            (workspace_id, "profile", identifier),
+        )
+        if operations is None or operations is False:
+            return "failed"
+        if operations:
+            return "unresolved"
     try:
         detail = getattr(storage, detail_method_name)(identifier)
     except Exception:
         return "failed"
     if detail is not None:
         return "present"
-    workspace_id = _clean(getattr(storage, "workspace_id", ""))
     if resource_kind == "profile":
         query = "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?"
     elif resource_kind == "pricing_reference":
@@ -2283,6 +2376,11 @@ def _resolve_unknown_resource(
         if evidence == "present":
             journal.record_receipt(key, "unknown-resolution:database-present")
             journal.mark_touched(key, "unknown-resolution:database-present")
+        elif evidence == "unresolved":
+            journal.mark_cleanup_failed(
+                key,
+                "unknown-resolution:profile-lifecycle-operation-prepared",
+            )
         elif evidence == "absent":
             journal.record_receipt(key, "unknown-resolution:database-absent")
             journal.mark_absence_verified(key, "unknown-resolution:database-absent")

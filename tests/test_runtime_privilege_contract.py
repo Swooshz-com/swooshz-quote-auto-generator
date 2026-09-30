@@ -3547,7 +3547,21 @@ order by object_kind, object_schema, object_name, object_type
             with self.assertRaises(webapp.QuoteCommercialStateError):
                 webapp.payload_to_brief(writer_payloads[0])
         write_spy.assert_called_once()
-        self.assertEqual(report["status"], "passed")
+        self.assertEqual(
+            report["status"],
+            "passed",
+            {
+                "blockers": report.get("blockers"),
+                "failed_checks": sorted(
+                    name
+                    for name, value in report.get("checks", {}).items()
+                    if value is False
+                ),
+                "runtime_download_failure_stage": report.get(
+                    "runtime_download_failure_stage"
+                ),
+            },
+        )
         self.assertEqual(report["blockers"], [])
         self.assertTrue(report["checks"]["active_runtime_download_verified"])
         self.assertTrue(report["checks"]["tombstone_metadata_verified"])
@@ -5750,7 +5764,8 @@ order by owner.rolname, schema_name, grantee, acl.privilege_type
         acl_rows = self._admin_rows(
             f"""
 select c.relname as table_name, owner.rolname as owner,
-       case when acl.grantee = 0 then 'PUBLIC'
+       case when acl.grantee is null then null
+            when acl.grantee = 0 then 'PUBLIC'
             else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee,
        grantor_role.rolname as grantor,
        acl.privilege_type, acl.is_grantable

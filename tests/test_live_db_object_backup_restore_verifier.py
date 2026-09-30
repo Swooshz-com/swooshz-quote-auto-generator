@@ -3,6 +3,7 @@ from dataclasses import replace
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -191,6 +192,9 @@ class FakeStorage:
         verifier = load_verifier()
         verifier.webapp.validate_profile_layout_xlsx(layout_bytes)
         backend = verifier.webapp.configured_object_storage_backend()
+        artifact_id, artifact_incarnation = (
+            verifier._synthetic_profile_layout_artifact_identity(self.workspace_id, profile_id)
+        )
         metadata = backend.store_artifact(
             workspace_id=self.workspace_id,
             owner_type="profile",
@@ -199,11 +203,13 @@ class FakeStorage:
             filename="quotation-layout.xlsx",
             content_type=verifier.SYNTHETIC_CONTENT_TYPE,
             content=layout_bytes,
+            artifact_incarnation=artifact_incarnation,
+            artifact_id=artifact_id,
         )
         self.events.append(("storage-write", self.label, "profile_object_metadata", profile_id))
         self._maybe_fail("profile_metadata")
         row = {
-            "artifact_id": f"fake-{profile_id}-quotation-layout",
+            "artifact_id": metadata.artifact_id,
             "workspace_id": self.workspace_id,
             "owner_type": "profile",
             "owner_id": (
@@ -512,12 +518,29 @@ class FakeBackend:
         if self.fail_on == step or self.fail_on == f"{self.label}_{step}":
             raise RuntimeError(f"{self.label} private failure detail")
 
-    def store_artifact(self, *, workspace_id, owner_type, owner_id, artifact_kind, filename, content_type, content):
+    def store_artifact(
+        self,
+        *,
+        workspace_id,
+        owner_type,
+        owner_id,
+        artifact_kind,
+        filename,
+        content_type,
+        content,
+        artifact_incarnation=None,
+        artifact_id="",
+    ):
         self.events.append(("backend-store", self.label, artifact_kind, owner_id))
         self._maybe_fail("write")
         if self.fail_artifact_kind == artifact_kind:
             raise RuntimeError(f"{self.label} artifact-kind failure detail")
         checksum = __import__("hashlib").sha256(bytes(content)).hexdigest()
+        key_options = (
+            {"artifact_incarnation": artifact_incarnation}
+            if artifact_incarnation is not None
+            else {}
+        )
         key = self.object_key_fn(
             workspace_id=workspace_id,
             owner_type=owner_type,
@@ -525,6 +548,7 @@ class FakeBackend:
             artifact_kind=artifact_kind,
             filename=filename,
             checksum_sha256=checksum,
+            **key_options,
         )
         metadata = self.metadata_cls(
             workspace_id=workspace_id,
@@ -538,6 +562,8 @@ class FakeBackend:
             storage_key=key,
             created_at="2026-07-07T00:00:00Z",
             updated_at="2026-07-07T00:00:00Z",
+            artifact_id=artifact_id,
+            artifact_incarnation=artifact_incarnation,
         )
         self.store_metadata_objects.append(metadata)
         self.objects[key] = bytes(content)
@@ -1372,6 +1398,60 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
             self.assertEqual(metadata.filename, "quotation-layout.xlsx")
             self.assertEqual(metadata.content_type, verifier.SYNTHETIC_CONTENT_TYPE)
 
+    def test_profile_layout_verifier_accepts_only_canonical_v2_incarnation_metadata(self):
+        verifier = load_verifier()
+        ids = verifier._synthetic_ids()
+        descriptor = verifier._expected_artifact_descriptors(
+            ids,
+            verifier._synthetic_payload(ids),
+        )["active/workspace_a/profile"]
+        expected = descriptor["metadata"]
+        incarnation = "inc-v2-" + "a" * 64
+        actual = replace(
+            expected,
+            storage_key=verifier.webapp.object_artifact_key(
+                workspace_id=expected.workspace_id,
+                owner_type=expected.owner_type,
+                owner_id=expected.owner_id,
+                artifact_kind=expected.artifact_kind,
+                filename=expected.filename,
+                checksum_sha256=expected.checksum_sha256,
+                artifact_incarnation=incarnation,
+            ),
+            artifact_id="obj-v2-" + "b" * 64,
+            artifact_incarnation=incarnation,
+        )
+
+        self.assertTrue(verifier._profile_layout_artifact_metadata_matches(actual, expected))
+        legacy = replace(
+            expected,
+            storage_key=verifier.webapp.object_artifact_key(
+                workspace_id=expected.workspace_id,
+                owner_type=expected.owner_type,
+                owner_id=expected.owner_id,
+                artifact_kind=expected.artifact_kind,
+                filename=expected.filename,
+                checksum_sha256=expected.checksum_sha256,
+            ),
+            artifact_id="",
+            artifact_incarnation=None,
+        )
+        self.assertFalse(
+            verifier._profile_layout_artifact_metadata_matches(legacy, expected)
+        )
+        self.assertFalse(
+            verifier._profile_layout_artifact_metadata_matches(
+                replace(actual, storage_key=expected.storage_key),
+                expected,
+            )
+        )
+        self.assertFalse(
+            verifier._profile_layout_artifact_metadata_matches(
+                replace(actual, artifact_id="legacy-id"),
+                expected,
+            )
+        )
+
     def test_database_artifact_mode_fails_before_live_targets_are_opened(self):
         verifier = load_verifier()
         with mock.patch.object(verifier, "_verifier_artifact_storage_mode", return_value="database"):
@@ -1423,6 +1503,149 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
             profile_entry["touch_receipts"],
         )
         self.assertFalse(backends["active"].objects)
+
+    def test_prepared_profile_operation_preserves_unknown_v2_successor(self):
+        verifier = load_verifier()
+        ids = verifier._synthetic_ids()
+        workspace_id = ids["workspace_a"]
+        profile_id = ids["profile_a"]
+
+        class PutThenReadUnavailableTransport(SyntheticS3Transport):
+            def put_object(self, **kwargs):
+                response = super().put_object(
+                    Bucket=kwargs["Bucket"],
+                    Key=kwargs["Key"],
+                    Body=kwargs["Body"],
+                    ContentType=kwargs["ContentType"],
+                    Metadata=kwargs["Metadata"],
+                )
+                self.get_failure = "transport"
+                return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_url = f"sqlite:///{(Path(directory) / 'profile.sqlite').as_posix()}"
+            verifier.webapp.apply_sqag_storage_migrations(database_url)
+            storage = verifier.webapp.DatabaseSqagStorage(
+                database_url,
+                workspace_id,
+                role="admin",
+                user_id="synthetic-profile-lifecycle-test",
+            )
+            transport = PutThenReadUnavailableTransport()
+            backend = verifier.S3CompatibleObjectStorageBackend(
+                bucket="synthetic-profile-lifecycle-bucket",
+                client=transport,
+            )
+            profile = {
+                "id": profile_id,
+                "_pack_assets": {
+                    "quotation_layout": {
+                        "bytes": verifier._synthetic_profile_layout_payload(),
+                        "filename": "quotation-layout.xlsx",
+                    }
+                },
+            }
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "APP_MODE": "local",
+                        "SQAG_STORAGE_MODE": "database",
+                        "SQAG_ARTIFACT_STORAGE_MODE": "object",
+                        "SQAG_DATABASE_URL": database_url,
+                    },
+                ),
+                mock.patch.object(
+                    verifier.webapp,
+                    "configured_object_storage_backend",
+                    return_value=backend,
+                ),
+            ):
+                with self.assertRaises(verifier.webapp.SqagStorageAccessError):
+                    storage.save_profile(profile)
+
+            with storage.connection() as connection:
+                operation = connection.execute(
+                    "select state, plan_json from sqag_object_artifact_operations "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ?",
+                    (workspace_id, "profile", profile_id),
+                ).fetchone()
+                profile_row = connection.execute(
+                    "select 1 from sqag_profiles where workspace_id = ? and profile_id = ?",
+                    (workspace_id, profile_id),
+                ).fetchone()
+                artifact_row = connection.execute(
+                    "select 1 from sqag_object_artifacts where workspace_id = ? "
+                    "and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (workspace_id, "profile", profile_id, "quotation_layout"),
+                ).fetchone()
+            self.assertIsNotNone(operation)
+            self.assertEqual(operation["state"], "prepared")
+            plan = json.loads(operation["plan_json"])
+            self.assertTrue(plan["successors"])
+            actual_object_key = next(iter(transport.objects))[1]
+            self.assertIn("/v2/", actual_object_key)
+            self.assertEqual(
+                plan["successors"]["quotation_layout"]["object_key_ref"],
+                actual_object_key,
+            )
+            self.assertIsNone(profile_row)
+            self.assertIsNone(artifact_row)
+
+            key = "active/workspace_a/profile"
+            journal = verifier.ResourceJournal(verifier._planned_resource_specs(ids))
+            journal.mark_attempted(key, "synthetic-profile-save-dispatched")
+            journal.mark_unknown(key, "synthetic-profile-save-readback-unknown")
+            expected_artifacts = verifier._expected_artifact_descriptors(
+                ids,
+                verifier._synthetic_payload(ids),
+            )
+            synthetic_key = expected_artifacts[key]["metadata"].storage_key
+            self.assertNotEqual(actual_object_key, synthetic_key)
+            transport.get_failure = ""
+            self.assertEqual(
+                verifier._database_unknown_evidence(
+                    storage,
+                    resource_kind="profile",
+                    identifier=profile_id,
+                    artifact_storage_mode="object",
+                ),
+                "unresolved",
+            )
+            cleanup_completed = verifier._cleanup(
+                active_storage_a=storage,
+                active_storage_b=None,
+                restore_storage_a=None,
+                restore_storage_b=None,
+                active_maintenance_storage=None,
+                restore_maintenance_storage=None,
+                active_backend=backend,
+                restore_backend=None,
+                active_metadata=None,
+                restore_metadata=None,
+                ids=ids,
+                journal=journal,
+                expected_artifacts=expected_artifacts,
+                artifact_metadata={},
+                artifact_storage_mode="object",
+                active_backend_origin="synthetic",
+                restore_backend_origin="synthetic",
+                context_evidence={},
+            )
+
+            self.assertFalse(cleanup_completed)
+            self.assertEqual(journal.state(key), verifier.JOURNAL_CLEANUP_FAILED)
+            self.assertIn((backend.bucket, actual_object_key), transport.objects)
+            self.assertNotIn((backend.bucket, synthetic_key), transport.objects)
+            self.assertEqual(transport.delete_calls, [])
+            with storage.connection() as connection:
+                operation_after_cleanup = connection.execute(
+                    "select state from sqag_object_artifact_operations "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ?",
+                    (workspace_id, "profile", profile_id),
+                ).fetchone()
+            self.assertIsNotNone(operation_after_cleanup)
+            self.assertEqual(operation_after_cleanup["state"], "prepared")
 
     def test_successful_drill_has_exact_backend_counts_and_denial_order(self):
         verifier = load_verifier()
