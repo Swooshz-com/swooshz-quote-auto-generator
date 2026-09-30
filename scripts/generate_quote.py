@@ -143,8 +143,9 @@ SIGNATURE_BLOCK_PAGE_GUARD_ROWS = 0
 SIGNATURE_BLOCK_HEIGHT = SIGNATURE_CONTENT_HEIGHT + SIGNATURE_BLOCK_PAGE_GUARD_ROWS
 QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT = "18.7"
 EMU_PER_POINT = 12_700
+# Anchor in the visible right-side header column, not its hidden neighbour.
 HEADER_LOGO_ANCHOR_FROM = {
-    "col": "7",
+    "col": "8",
     "colOff": "0",
     "row": "1",
     "rowOff": "0",
@@ -2369,6 +2370,10 @@ def set_header_logo_extent(
     dimensions: tuple[int, int] | None,
     region_extent: tuple[int, int] | None = None,
 ) -> tuple[int, int]:
+    # Replacement media supplies the complete logo, without a template crop.
+    crop = pic.find(f"{NS_DRAWING}blipFill/{NS_A}srcRect")
+    if crop is not None:
+        crop.attrib.clear()
     pic_pr = pic.find(f"{NS_DRAWING}spPr")
     if pic_pr is None:
         return fitted_header_logo_extent(dimensions, region_extent)
@@ -2551,8 +2556,73 @@ def replace_header_logo(parts: dict[str, bytes], logo_data_url: str) -> None:
 
 
 def update_print_titles(xml: bytes) -> bytes:
-    """Keep the canonical repeated-print metadata supplied by the template."""
-    return xml
+    """The quotation draws its page headers explicitly, without repeat rows."""
+    return re.sub(
+        r'<definedName\b(?=[^>]*\bname="_xlnm\.Print_Titles")'
+        r'(?=[^>]*\blocalSheetId="0")[^>]*>[^<]*</definedName>',
+        "",
+        xml.decode("utf-8"),
+    ).encode("utf-8")
+
+
+def add_continuation_header_logos(parts: dict[str, bytes], last_row: int) -> None:
+    """Reuse only the profile logo on each explicitly paginated later page."""
+    drawing_name = "xl/drawings/drawing1.xml"
+    sheet_name = "xl/worksheets/sheet1.xml"
+    if drawing_name not in parts or sheet_name not in parts:
+        return
+    drawing = ET.fromstring(parts[drawing_name])
+    targets = rel_targets_by_id(parts)
+    logo = find_header_logo_anchor(drawing, targets)
+    if logo is None:
+        return
+    # A regenerated template must not carry stale continuation-logo copies.
+    for anchor in list(drawing):
+        if anchor is not logo and is_header_logo_anchor(anchor, targets):
+            drawing.remove(anchor)
+    sheet = ET.fromstring(parts[sheet_name])
+    page_starts = [
+        int(brk.attrib["id"]) + 1
+        for brk in sheet.findall(f"{NS_MAIN}rowBreaks/{NS_MAIN}brk")
+        if int(brk.attrib["id"]) < last_row
+    ]
+    sheet_format = sheet.find(f"{NS_MAIN}sheetFormatPr")
+    default_height = float(sheet_format.attrib.get("defaultRowHeight", QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT))
+    heights = {
+        int(row.attrib["r"]): 0 if row.attrib.get("hidden") == "1" else
+        round(float(row.attrib.get("ht", default_height)) * EMU_PER_POINT)
+        for row in sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row")
+    }
+    default_height_emu = round(default_height * EMU_PER_POINT)
+    row_offsets = [0]
+    for row_number in range(1, last_row + 1):
+        row_offsets.append(row_offsets[-1] + heights.get(row_number, default_height_emu))
+    next_id = max(
+        (int(node.attrib["id"]) for node in drawing.findall(f".//{NS_DRAWING}cNvPr")),
+        default=0,
+    ) + 1
+    for page_number, page_start in enumerate(page_starts, start=2):
+        anchor = copy.deepcopy(logo)
+        identity = anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}nvPicPr/{NS_DRAWING}cNvPr")
+        identity.attrib.update({"id": str(next_id), "name": f"Header Logo - Page {page_number}"})
+        next_id += 1
+        start = anchor.find(f"{NS_DRAWING}from")
+        start_row = int(start.find(f"{NS_DRAWING}row").text) + page_start - 1
+        start.find(f"{NS_DRAWING}row").text = str(start_row)
+        start_offset = int(start.find(f"{NS_DRAWING}rowOff").text)
+        transform = anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm")
+        transform.find(f"{NS_A}off").attrib["y"] = str(row_offsets[start_row] + start_offset)
+        remaining = int(transform.find(f"{NS_A}ext").attrib["cy"]) + start_offset
+        end_row = start_row
+        # Continuation rows need not have the first page's logo-row height.
+        while remaining >= heights.get(end_row + 1, default_height_emu):
+            remaining -= heights.get(end_row + 1, default_height_emu)
+            end_row += 1
+        end = anchor.find(f"{NS_DRAWING}to")
+        end.find(f"{NS_DRAWING}row").text = str(end_row)
+        end.find(f"{NS_DRAWING}rowOff").text = str(remaining)
+        drawing.append(anchor)
+    parts[drawing_name] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
 
 
 def update_print_area(xml: bytes, last_row: int, last_col: int = 9) -> bytes:
@@ -3196,6 +3266,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
         header_lines = company.get("header_lines") if isinstance(company.get("header_lines"), list) else None
         parts["xl/drawings/drawing1.xml"] = update_repeating_header_drawing(drawing_xml, project_number, header_lines, header_line_runs)
     replace_header_logo(parts, clean_text(company.get("logo_data_url")))
+    add_continuation_header_logos(parts, last_print_row)
     if "xl/workbook.xml" in parts:
         workbook_xml = update_print_titles(parts["xl/workbook.xml"])
         workbook_xml = update_print_area(workbook_xml, last_print_row)
