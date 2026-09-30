@@ -2824,7 +2824,16 @@ def ensure_quote_entry_page(
     )
 
 
+def clear_continuation_header_band(row_number: int) -> int:
+    """Advance continuation-page content past the reserved header rows."""
+    page_start = continuation_page_start_for_row(row_number)
+    if page_start is not None:
+        return max(row_number, page_start + CONTINUATION_BODY_OFFSET)
+    return row_number
+
+
 def summary_block_start_row(row_number: int, block_height: int) -> int:
+    row_number = clear_continuation_header_band(row_number)
     if row_number + block_height - 1 <= manual_page_end_for_row(row_number):
         return row_number
     page_start = next_continuation_page_start(row_number)
@@ -2832,8 +2841,10 @@ def summary_block_start_row(row_number: int, block_height: int) -> int:
 
 
 def layout_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[int, bool]:
+    candidate_row = row_number
+    row_number = clear_continuation_header_band(row_number)
     if chunk.height <= 0 or row_number + chunk.height - 1 <= manual_page_end_for_row(row_number):
-        return row_number, False
+        return row_number, row_number != candidate_row
     return next_continuation_page_start(row_number) + CONTINUATION_BODY_OFFSET, True
 
 
