@@ -515,6 +515,56 @@ def non_square_logo_data_url():
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+LOGO_EDGE_COLORS = {
+    "left": (230, 15, 35),
+    "right": (15, 210, 40),
+    "top": (20, 60, 240),
+    "bottom": (240, 20, 220),
+}
+
+
+def edge_marked_logo_data_url():
+    from PIL import Image, ImageDraw
+
+    image = Image.open(io.BytesIO(base64.b64decode(non_square_logo_data_url().split(",", 1)[1]))).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 16, 15, 143), fill=LOGO_EDGE_COLORS["left"])
+    draw.rectangle((624, 16, 639, 143), fill=LOGO_EDGE_COLORS["right"])
+    draw.rectangle((0, 0, 639, 15), fill=LOGO_EDGE_COLORS["top"])
+    draw.rectangle((0, 144, 639, 159), fill=LOGO_EDGE_COLORS["bottom"])
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def logo_edge_bbox(image, edge):
+    color = LOGO_EDGE_COLORS[edge]
+    return raster_bbox(image, lambda pixel: all(abs(pixel[i] - color[i]) < 30 for i in range(3)))
+
+
+def header_fidelity_case():
+    brief = commercial_test_brief({
+        "company": {
+            "name": "Boundary Header Co",
+            "header_lines": ["Boundary Header Co", "1 Boundary Road"],
+            "logo_data_url": edge_marked_logo_data_url(),
+        },
+        "project_number": "HEADER-FIDELITY-001",
+        "project": {"title": "Header V2 Fidelity"},
+    })
+    price = quote.PriceRow(1, "Graphics", "Boundary component", "sqm", 120, 1, 1, "")
+    lines = [
+        quote.QuoteLine(
+            section=f"Layout Section {index}", quantity=2, unit="sqm",
+            description=f"Boundary component {index:02d}", pricing_keyword="Boundary component",
+            display_price="", matched_price=price, amount=240,
+            match_status="matched", match_candidates=[],
+        )
+        for index in range(1, 46)
+    ]
+    return brief, lines
+
+
 def pdf_text_bbox(textpage, phrase):
     text = textpage.get_text_range() or ""
     start = text.find(phrase)
@@ -1407,10 +1457,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             )
             self.assertIsNotNone(print_area)
             self.assertEqual(print_area.text, f"Quotation!$A$1:$I${output_last_row}")
-            self.assertEqual(
-                defined_name_text(output_workbook, "_xlnm.Print_Titles"),
-                defined_name_text(template_workbook, "_xlnm.Print_Titles"),
-            )
+            # Right-side text belongs to page 1; later logos are explicit drawings.
+            self.assertFalse(defined_name_text(output_workbook, "_xlnm.Print_Titles"))
 
             for ref in ("A20", "B20", "C20", "E20"):
                 header_font = font_for_style(output_styles, cell_style(output_sheet, ref))
@@ -1579,6 +1627,199 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                     sort_keys=True,
                 )
             )
+
+    def test_page_specific_headers_keep_full_logo_and_content_on_manual_pages(self):
+        brief, lines = header_fidelity_case()
+        original_digest = hashlib.sha256(KONCEPT_LAYOUT.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+                drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
+                rels = ET.fromstring(zf.read("xl/drawings/_rels/drawing1.xml.rels"))
+                logo_bytes = zf.read("xl/media/header_logo.png")
+                self.assertEqual(logo_bytes, base64.b64decode(brief["company"]["logo_data_url"].split(",", 1)[1]))
+        self.assertEqual(hashlib.sha256(KONCEPT_LAYOUT.read_bytes()).hexdigest(), original_digest)
+        self.assertFalse(defined_name_text(workbook, "_xlnm.Print_Titles"))
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+        breaks = row_break_ids(sheet)
+        self.assertGreaterEqual(len(breaks), 2)
+        logos = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}pic") is not None]
+        self.assertEqual(len(logos), len(breaks) + 1)
+        self.assertEqual(
+            [int(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text) for anchor in logos],
+            [1] + [row + 1 for row in breaks],
+        )
+        identities = [anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}nvPicPr/{NS_DRAWING}cNvPr").attrib["id"] for anchor in logos]
+        self.assertEqual(len(identities), len(set(identities)))
+        image_rel_ids = {rel.attrib["Id"] for rel in rels if rel.attrib["Target"] == "../media/header_logo.png"}
+        self.assertEqual(len(image_rel_ids), 1)
+        row_heights = {int(row.attrib["r"]): float(row.attrib.get("ht", sheet.find(f"{NS_MAIN}sheetFormatPr").attrib["defaultRowHeight"])) for row in sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row")}
+        default_height = float(sheet.find(f"{NS_MAIN}sheetFormatPr").attrib["defaultRowHeight"])
+        for anchor in logos:
+            pic = anchor.find(f"{NS_DRAWING}pic")
+            ext = pic.find(f"{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
+            width, height = int(ext.attrib["cx"]), int(ext.attrib["cy"])
+            self.assertEqual(width, quote.HEADER_LOGO_CANONICAL_WIDTH_EMU)
+            self.assertAlmostEqual(width / height, 4.0, places=3)
+            self.assertFalse(pic.find(f"{NS_DRAWING}blipFill/{NS_A}srcRect").attrib)
+            self.assertIn(pic.find(f"{NS_DRAWING}blipFill/{NS_A}blip").attrib[f"{NS_REL}embed"], image_rel_ids)
+            self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "8")
+            start_row = int(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text)
+            end_row = int(anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}row").text)
+            anchored_height = sum(round(row_heights.get(row + 1, default_height) * quote.EMU_PER_POINT) for row in range(start_row, end_row))
+            anchored_height += int(anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}rowOff").text)
+            anchored_height -= int(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}rowOff").text)
+            self.assertEqual(anchored_height, height)
+        text_anchors = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}sp") is not None]
+        self.assertEqual(len(text_anchors), 1)
+        self.assertLess(int(text_anchors[0].find(f"{NS_DRAWING}to/{NS_DRAWING}row").text), quote.FIRST_PRINT_PAGE_END_ROW)
+        header_text = " ".join(node.text or "" for node in text_anchors[0].iter(f"{NS_A}t"))
+        for expected in brief["company"]["header_lines"] + [brief["project_number"]]:
+            self.assertIn(expected, header_text)
+        for row in [20] + [value + 3 for value in breaks]:
+            for column, expected in [("B", "Quantity"), ("C", "Service"), ("E", "Estimate")]:
+                self.assertEqual(cell_value(sheet, f"{column}{row}"), expected)
+        for line in lines:
+            ref = find_cell_ref(sheet, line.description)
+            self.assertTrue(ref, line.description)
+            row = quote.parse_cell_ref(ref)[0]
+            self.assertEqual(cell_value(sheet, f"B{row}"), "2 sqm")
+            self.assertEqual(float(cell_value(sheet, f"E{row}")), 328.8)
+        for label, amount in [("Total", 14796), ("GST 9%", 1331.64), ("Total including GST", 16127.64)]:
+            row = quote.parse_cell_ref(find_cell_ref(sheet, label))[0]
+            self.assertEqual(float(cell_value(sheet, f"E{row}")), amount)
+        for expected in ("Saved payment term", "Saved note", "Saved acceptance", "Saved Signatory", "Saved Title"):
+            self.assertTrue(find_cell_ref(sheet, expected), expected)
+
+    def test_real_libreoffice_pdf_full_edges_and_page_one_only_header(self):
+        if not quote.libreoffice_candidates() or shutil.which("fc-match") is None:
+            message = "Real header-v2 fidelity requires LibreOffice and fontconfig."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
+        import pypdfium2 as pdfium
+
+        brief, lines = header_fidelity_case()
+        brief["line_items"] = [
+            {"section": line.section, "quantity": line.quantity, "unit": line.unit,
+             "description": line.description, "display_price": "Included"}
+            for line in lines
+        ]
+        scale = 2.0
+        first_signature = []
+        measurements = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brief_path = root / "brief.json"
+            brief_path.write_text(json.dumps(brief), encoding="utf-8")
+            for run in ("first", "second"):
+                output = root / run
+                with mock.patch.object(sys, "argv", [
+                    "generate_quote.py", "--brief", str(brief_path), "--out", str(output),
+                    "--template", str(KONCEPT_CATALOG), "--layout-template", str(KONCEPT_LAYOUT),
+                    "--pdf-mode", "workbook",
+                ]), mock.patch.object(quote, "powershell_pdf_export", side_effect=AssertionError("LibreOffice must export the workbook")):
+                    self.assertEqual(quote.main(), 0)
+                self.assertIn("pdf_status=libreoffice_exported", (output / "export_status.txt").read_text(encoding="utf-8"))
+                with zipfile.ZipFile(output / "quotation.xlsx") as zf:
+                    sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                    margins = sheet.find(f"{NS_MAIN}pageMargins").attrib
+                    drawing_bytes = zf.read("xl/drawings/drawing1.xml")
+                if run == "first":
+                    first_drawing_bytes = drawing_bytes
+                else:
+                    self.assertEqual(drawing_bytes, first_drawing_bytes)
+                doc = pdfium.PdfDocument(str(output / "quotation.pdf"))
+                signature = []
+                all_text = []
+                try:
+                    self.assertGreaterEqual(len(doc), 3)
+                    for index, page in enumerate(doc):
+                        page_size = page.get_size()
+                        width, height = page_size
+                        self.assertAlmostEqual(width, 595.28, delta=1)
+                        self.assertAlmostEqual(height, 841.89, delta=1)
+                        self.assertLess(width, height)
+                        textpage = page.get_textpage()
+                        text = re.sub(r"\s+", " ", textpage.get_text_range() or "")
+                        all_text.append(text)
+                        self.assertTrue(text.strip())
+                        image = page.render(scale=scale).to_pil().convert("RGB")
+                        signature.append((page_size, hashlib.sha256(image.tobytes()).hexdigest()))
+                        objects = [obj for obj in page.get_objects() if obj.type == pdfium.raw.FPDF_PAGEOBJ_IMAGE
+                                   and obj.get_bounds()[0] > width * .4 and obj.get_bounds()[1] > height * .65]
+                        self.assertEqual(len(objects), 1, f"page {index + 1}")
+                        bounds = objects[0].get_bounds()
+                        self.assertGreaterEqual(bounds[0], float(margins["left"]) * 72 - 1)
+                        self.assertLessEqual(bounds[2], width - float(margins["right"]) * 72 + 1)
+                        self.assertGreaterEqual(bounds[1], float(margins["bottom"]) * 72 - 1)
+                        self.assertLessEqual(bounds[3], height - float(margins["top"]) * 72 + 1)
+                        self.assertAlmostEqual((bounds[2] - bounds[0]) / (bounds[3] - bounds[1]), 4.0, delta=.03)
+                        full = pdf_bbox_to_pixels(bounds, page_size, scale)
+                        left, top, right, bottom = full
+                        w, h = right - left, bottom - top
+                        expected_edges = {
+                            "left": (left, top + h * .1, left + w * .025, top + h * .9),
+                            "right": (right - w * .025, top + h * .1, right, top + h * .9),
+                            "top": (left, top, right, top + h * .1),
+                            "bottom": (left, bottom - h * .1, right, bottom),
+                        }
+                        edges = {}
+                        for edge, expected in expected_edges.items():
+                            actual = logo_edge_bbox(image, edge)
+                            self.assertIsNotNone(actual, f"page {index + 1}: {edge} edge is missing")
+                            for measured, intended in zip(actual, expected):
+                                self.assertAlmostEqual(measured, intended, delta=2, msg=f"page {index + 1}: {edge}")
+                            edges[edge] = actual
+                        header_words = brief["company"]["header_lines"] + [brief["project_number"]]
+                        if index == 0:
+                            for phrase in header_words:
+                                self.assertIn(phrase, text)
+                            boxes = [pdf_text_bbox(textpage, phrase) for phrase in header_words]
+                            header = (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+                            self.assertGreater(max(header[0] - bounds[2], bounds[0] - header[2], header[1] - bounds[3], bounds[1] - header[3]), 1)
+                        else:
+                            for phrase in header_words:
+                                self.assertNotIn(phrase, text, f"page {index + 1}: header text repeated")
+                        if "Boundary component" in text:
+                            for heading in ("Quantity", "Service", "Estimate"):
+                                self.assertIn(heading, text)
+                        if run == "first":
+                            measurements.append({"page": index + 1, "logo_bounds_points": bounds,
+                                                 "edge_markers": edges, "right_header_text": index == 0})
+                    combined = " ".join(all_text)
+                    for line in lines:
+                        self.assertIn(line.description, combined)
+                    for content in ("Saved payment term", "Saved note", "Saved acceptance", "Saved Signatory", "Saved Title"):
+                        self.assertIn(content, combined)
+                finally:
+                    doc.close()
+                if run == "first":
+                    first_signature = signature
+                else:
+                    self.assertEqual(signature, first_signature)
+            # A cropped, still-wide image must fail the edge oracle even though
+            # its drawing extent and bounding-box aspect have not changed.
+            with zipfile.ZipFile(root / "first" / "quotation.xlsx") as zf:
+                parts = {name: zf.read(name) for name in zf.namelist()}
+            drawing = ET.fromstring(parts["xl/drawings/drawing1.xml"])
+            for pic in drawing.findall(f".//{NS_DRAWING}pic"):
+                pic.find(f"{NS_DRAWING}blipFill/{NS_A}srcRect").attrib["r"] = "20000"
+            parts["xl/drawings/drawing1.xml"] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
+            clipped_xlsx = root / "clipped.xlsx"
+            with zipfile.ZipFile(clipped_xlsx, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, data in parts.items():
+                    zf.writestr(name, data)
+            self.assertEqual(quote.libreoffice_pdf_export(clipped_xlsx, root / "clipped.pdf"), "libreoffice_exported")
+            doc = pdfium.PdfDocument(str(root / "clipped.pdf"))
+            try:
+                self.assertIsNone(logo_edge_bbox(doc[0].render(scale=scale).to_pil().convert("RGB"), "right"))
+            finally:
+                doc.close()
+        print("SQAG header-v2 rendered fidelity: " + json.dumps({"pages": measurements, "repeated_generation": "PASS", "cropped_logo_negative_control": "PASS"}, sort_keys=True))
 
     def test_layout_strips_catalog_brackets_from_customer_output_descriptions(self):
         brief = {
@@ -2900,10 +3141,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             drawing_anchor_geometry(text_anchor, "sp"),
             drawing_anchor_geometry(template_text_anchor, "sp"),
         )
-        self.assertEqual(
-            defined_name_text(output_workbook, "_xlnm.Print_Titles"),
-            defined_name_text(template_workbook, "_xlnm.Print_Titles"),
-        )
+        # Right-side text belongs to page 1; later logos are explicit drawings.
+        self.assertFalse(defined_name_text(output_workbook, "_xlnm.Print_Titles"))
 
         text_from_row = int(text_anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text)
         logo_to_row = int(logo_anchor.find(f"{NS_DRAWING}to/{NS_DRAWING}row").text)
@@ -3367,6 +3606,9 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             "[Content_Types].xml": empty_content_types_xml(),
         }
 
+        source_drawing = ET.fromstring(parts["xl/drawings/drawing1.xml"])
+        source_drawing.find(f"{NS_DRAWING}pic/{NS_DRAWING}blipFill/{NS_A}srcRect").attrib["r"] = "20000"
+        parts["xl/drawings/drawing1.xml"] = ET.tostring(source_drawing, encoding="utf-8")
         quote.replace_header_logo(parts, non_square_logo_data_url())
 
         drawing = ET.fromstring(parts["xl/drawings/drawing1.xml"])
@@ -3375,6 +3617,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             for anchor in drawing.findall(f"{NS_DRAWING}twoCellAnchor")
             if anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}nvPicPr/{NS_DRAWING}cNvPr").attrib.get("name") == "Header Logo"
         )
+        self.assertFalse(logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}blipFill/{NS_A}srcRect").attrib)
         logo_ext = logo_anchor.find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext")
         expected_extent = quote.fitted_header_logo_extent((640, 160))
         self.assertEqual((int(logo_ext.attrib["cx"]), int(logo_ext.attrib["cy"])), expected_extent)
