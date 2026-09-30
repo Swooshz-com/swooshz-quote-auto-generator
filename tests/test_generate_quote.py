@@ -565,6 +565,12 @@ def header_fidelity_case():
     return brief, lines
 
 
+def continuation_acceptance_fidelity_case():
+    brief, lines = header_fidelity_case()
+    brief["standard_notes"].append("Final continuation note")
+    return brief, lines[:22]
+
+
 def pdf_text_bbox(textpage, phrase):
     text = textpage.get_text_range() or ""
     start = text.find(phrase)
@@ -1695,6 +1701,12 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertTrue(find_cell_ref(sheet, expected), expected)
 
     def test_real_libreoffice_pdf_full_edges_and_page_one_only_header(self):
+        self.assert_real_header_fidelity(header_fidelity_case)
+
+    def test_real_libreoffice_pdf_acceptance_clears_continuation_header(self):
+        self.assert_real_header_fidelity(continuation_acceptance_fidelity_case)
+
+    def assert_real_header_fidelity(self, fidelity_case):
         if not quote.libreoffice_candidates() or shutil.which("fc-match") is None:
             message = "Real header-v2 fidelity requires LibreOffice and fontconfig."
             if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
@@ -1702,7 +1714,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.skipTest(message)
         import pypdfium2 as pdfium
 
-        brief, lines = header_fidelity_case()
+        brief, lines = fidelity_case()
         brief["line_items"] = [
             {"section": line.section, "quantity": line.quantity, "unit": line.unit,
              "description": line.description, "display_price": "Included"}
@@ -1727,6 +1739,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 with zipfile.ZipFile(output / "quotation.xlsx") as zf:
                     sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
                     margins = sheet.find(f"{NS_MAIN}pageMargins").attrib
+                    expected_page_count = len(row_break_ids(sheet)) + 1
                     drawing_bytes = zf.read("xl/drawings/drawing1.xml")
                 if run == "first":
                     first_drawing_bytes = drawing_bytes
@@ -1736,7 +1749,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 signature = []
                 all_text = []
                 try:
-                    self.assertGreaterEqual(len(doc), 3)
+                    self.assertEqual(len(doc), expected_page_count)
                     for index, page in enumerate(doc):
                         page_size = page.get_size()
                         width, height = page_size
@@ -1784,16 +1797,30 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                         else:
                             for phrase in header_words:
                                 self.assertNotIn(phrase, text, f"page {index + 1}: header text repeated")
+                        if index == len(doc) - 1:
+                            acceptance_boxes = []
+                            for phrase in (
+                                brief["acceptance"]["text"], brief["acceptance"]["person_label"],
+                                brief["acceptance"]["stamp_label"], brief["acceptance"]["date_label"],
+                                brief["signature"]["company_signatory"], brief["signature"]["company_title"],
+                            ):
+                                self.assertIn(phrase, text)
+                                box = pdf_text_bbox(textpage, phrase)
+                                self.assertLess(box[3], bounds[1] - 1, f"page {index + 1}: {phrase} overlaps the logo")
+                                acceptance_boxes.append(box)
+                            if run == "first":
+                                final_acceptance_boxes = acceptance_boxes
                         if "Boundary component" in text:
                             for heading in ("Quantity", "Service", "Estimate"):
                                 self.assertIn(heading, text)
                         if run == "first":
                             measurements.append({"page": index + 1, "logo_bounds_points": bounds,
-                                                 "edge_markers": edges, "right_header_text": index == 0})
+                                                 "edge_markers": edges, "right_header_text": index == 0,
+                                                 "acceptance_boxes_points": final_acceptance_boxes if index == len(doc) - 1 else []})
                     combined = " ".join(all_text)
                     for line in lines:
                         self.assertIn(line.description, combined)
-                    for content in ("Saved payment term", "Saved note", "Saved acceptance", "Saved Signatory", "Saved Title"):
+                    for content in brief["payment_terms"] + brief["standard_notes"] + ["Saved acceptance", "Saved Signatory", "Saved Title"]:
                         self.assertIn(content, combined)
                 finally:
                     doc.close()
@@ -2578,6 +2605,111 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(quote.FIRST_PRINT_PAGE_END_ROW, 64)
         self.assertEqual(row_number, quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_BODY_OFFSET)
         self.assertEqual(find_cell_ref(root, "Pos."), f"A{quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_TABLE_HEADER_OFFSET}")
+
+    def test_hosted_acceptance_row_clears_continuation_logo_band(self):
+        page_start = quote.continuation_page_start_for_row(128)
+        self.assertEqual(page_start, 126)
+        self.assertIn(125, quote.manual_page_break_ids(136))
+        start_row, moved = quote.layout_chunk_start_row(
+            128, quote.LayoutChunk("acceptance_signature", quote.SIGNATURE_BLOCK_HEIGHT),
+        )
+        self.assertTrue(moved)
+        self.assertEqual(start_row, page_start + quote.CONTINUATION_BODY_OFFSET)
+        self.assertLessEqual(start_row + quote.SIGNATURE_BLOCK_HEIGHT - 1, quote.manual_page_end_for_row(start_row))
+
+    def test_hosted_summary_row_clears_continuation_logo_band(self):
+        page_start = quote.continuation_page_start_for_row(128)
+        self.assertEqual(page_start, 126)
+        start_row = quote.summary_block_start_row(128, quote.TOTAL_BLOCK_HEIGHT)
+        self.assertEqual(start_row, page_start + quote.CONTINUATION_BODY_OFFSET)
+        self.assertLessEqual(start_row + quote.TOTAL_BLOCK_HEIGHT - 1, quote.manual_page_end_for_row(start_row))
+
+    def test_summary_and_layout_clearance_preserve_first_page_and_body_rows(self):
+        candidates = [22, quote.FIRST_PRINT_PAGE_END_ROW - quote.SIGNATURE_BLOCK_HEIGHT + 1]
+        for page_index in range(3):
+            page_start = quote.CONTINUATION_PAGE_START_ROW + page_index * quote.CONTINUATION_PAGE_HEIGHT
+            candidates.extend(range(page_start, page_start + quote.CONTINUATION_BODY_OFFSET + 2))
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                page_start = quote.continuation_page_start_for_row(candidate)
+                expected = max(candidate, page_start + quote.CONTINUATION_BODY_OFFSET) if page_start is not None else candidate
+                self.assertEqual(quote.summary_block_start_row(candidate, quote.TOTAL_BLOCK_HEIGHT), expected)
+                row, moved = quote.layout_chunk_start_row(candidate, quote.LayoutChunk("signature", quote.SIGNATURE_BLOCK_HEIGHT))
+                self.assertEqual(row, expected)
+                self.assertEqual(moved, expected != candidate)
+
+    def test_header_clearance_precedes_summary_and_layout_bottom_fit(self):
+        candidate = 128
+        block_height = quote.CONTINUATION_PAGE_HEIGHT - quote.CONTINUATION_BODY_OFFSET + 1
+        expected = quote.next_continuation_page_start(candidate) + quote.CONTINUATION_BODY_OFFSET
+        self.assertEqual(quote.summary_block_start_row(candidate, block_height), expected)
+        row, moved = quote.layout_chunk_start_row(candidate, quote.LayoutChunk("footer", block_height))
+        self.assertEqual(row, expected)
+        self.assertTrue(moved)
+
+    def test_three_page_workbook_keeps_hosted_acceptance_below_logo(self):
+        brief, lines = continuation_acceptance_fidelity_case()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            with mock.patch.object(quote, "layout_chunk_start_row", wraps=quote.layout_chunk_start_row) as place_chunk:
+                quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+            self.assertEqual(place_chunk.call_args.args[0], 128)
+            with zipfile.ZipFile(path) as zf:
+                self.assertIsNone(zf.testzip())
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+                drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
+        self.assertEqual(row_break_ids(sheet), [64, 125])
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        page_start = quote.continuation_page_start_for_row(acceptance_row)
+        self.assertEqual(page_start, 126)
+        self.assertEqual(acceptance_row, page_start + quote.CONTINUATION_BODY_OFFSET)
+        for row in range(page_start, acceptance_row):
+            for column in ("B", "E"):
+                self.assertEqual(cell_value(sheet, f"{column}{row}"), "")
+        for column, offset, expected in (
+            ("B", 0, brief["acceptance"]["company_name"]),
+            ("E", 0, brief["acceptance"]["text"]),
+            ("B", 4, "_____________________________"),
+            ("E", 4, "_____________________________________"),
+            ("B", 5, brief["signature"]["company_signatory"]),
+            ("E", 5, brief["acceptance"]["person_label"]),
+            ("B", 6, brief["signature"]["company_title"]),
+            ("E", 6, brief["acceptance"]["stamp_label"]),
+            ("B", 7, brief["signature"]["company_date_label"]),
+            ("E", 7, brief["acceptance"]["date_label"]),
+        ):
+            self.assertEqual(cell_value(sheet, f"{column}{acceptance_row + offset}"), expected)
+        logos = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}pic") is not None]
+        self.assertEqual(len(logos), 3)
+        first_extent = logos[0].find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib
+        for anchor, expected_row in zip(logos, [1, 65, 126]):
+            self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, str(expected_row))
+            self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "8")
+            pic = anchor.find(f"{NS_DRAWING}pic")
+            self.assertEqual(pic.find(f"{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib, first_extent)
+            self.assertFalse(pic.find(f"{NS_DRAWING}blipFill/{NS_A}srcRect").attrib)
+        self.assertLess(int(logos[-1].find(f"{NS_DRAWING}to/{NS_DRAWING}row").text) + 1, acceptance_row)
+        text_anchors = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}sp") is not None]
+        self.assertEqual(len(text_anchors), 1)
+        self.assertLess(int(text_anchors[0].find(f"{NS_DRAWING}to/{NS_DRAWING}row").text), quote.FIRST_PRINT_PAGE_END_ROW)
+        header_text = " ".join(node.text or "" for node in text_anchors[0].iter(f"{NS_A}t"))
+        for expected in brief["company"]["header_lines"] + [brief["project_number"]]:
+            self.assertIn(expected, header_text)
+        self.assertFalse(defined_name_text(workbook, "_xlnm.Print_Titles"))
+        for header_row in (20, quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_TABLE_HEADER_OFFSET):
+            for column, expected in (("B", "Quantity"), ("C", "Service"), ("E", "Estimate")):
+                self.assertEqual(cell_value(sheet, f"{column}{header_row}"), expected)
+        for line in lines:
+            row = quote.parse_cell_ref(find_cell_ref(sheet, line.description))[0]
+            self.assertEqual(cell_value(sheet, f"B{row}"), "2 sqm")
+            self.assertEqual(float(cell_value(sheet, f"E{row}")), 328.8)
+        for expected in brief["payment_terms"] + brief["standard_notes"] + [brief["terms_heading"], brief["notes_heading"]]:
+            self.assertTrue(find_cell_ref(sheet, expected), expected)
+        for label, expected in (("Total", 7233.6), ("GST 9%", 651.02), ("Total including GST", 7884.62)):
+            row = quote.parse_cell_ref(find_cell_ref(sheet, label))[0]
+            self.assertEqual(float(cell_value(sheet, f"E{row}")), expected)
 
     def test_layout_chunk_moves_to_continuation_body_below_repeated_header(self):
         start_row, moved = quote.layout_chunk_start_row(
