@@ -235,7 +235,7 @@ class DraftRequestContractTest(unittest.TestCase):
                 server.OPENAI_DRAFT_HIGH_QUALITY_MODEL,
                 server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT,
                 (server.OPENAI_DRAFT_MODEL_ENV_NAME, server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME),
-                ("gpt-6-luna", "gpt-6.1-sol", "gpt-5.5"),
+                ("gpt-6-luna", "gpt-6-sol", "gpt-5.5"),
                 ("low", "medium", "max", "xhigh"),
                 "high_quality",
             ),
@@ -276,7 +276,8 @@ class DraftRequestContractTest(unittest.TestCase):
     def test_unknown_model_reasoning_compatibility_fails_closed(self):
         self.assertEqual(server.supported_openai_draft_reasoning_efforts("gpt-unlisted-model"), frozenset())
         self.assertEqual(server.supported_openai_draft_reasoning_efforts("gpt-6-luna"), frozenset({"high", "max"}))
-        self.assertEqual(server.supported_openai_draft_reasoning_efforts("gpt-6-sol"), frozenset({"high"}))
+        self.assertEqual(server.supported_openai_draft_reasoning_efforts("gpt-6-sol"), frozenset())
+        self.assertEqual(server.supported_openai_draft_reasoning_efforts("gpt-6.1-sol"), frozenset({"high"}))
 
     def test_normalized_unsupported_reasoning_values_are_not_exposed(self):
         branches = (

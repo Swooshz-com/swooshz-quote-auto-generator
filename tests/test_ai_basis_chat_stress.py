@@ -121,7 +121,7 @@ class AIBasisChatStressTest(unittest.TestCase):
         if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
             return "gpt-6-luna"
         if name == webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME:
-            return "gpt-6-sol"
+            return "gpt-6.1-sol"
         if name in {webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME, webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME}:
             return "gpt-6-luna"
         return ""

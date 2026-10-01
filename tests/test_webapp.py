@@ -12595,7 +12595,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         def dotenv(name):
             values = {
                 webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: "max",
-                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6-sol",
+                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6.1-sol",
                 webapp.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "high",
             }
             return values.get(name, "")
@@ -12606,7 +12606,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6-sol")
+        self.assertEqual(body["model"], "gpt-6.1-sol")
         self.assertEqual(body["reasoning"], {"effort": "high"})
 
     def test_openai_request_uses_high_quality_route_for_high_accuracy_mode(self):
@@ -12621,7 +12621,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             values = {
                 webapp.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-6-luna",
                 webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: "max",
-                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6-sol",
+                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6.1-sol",
                 webapp.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "high",
             }
             return values.get(name, "")
@@ -12632,7 +12632,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6-sol")
+        self.assertEqual(body["model"], "gpt-6.1-sol")
         self.assertEqual(body["reasoning"], {"effort": "high"})
 
     def test_openai_request_timeout_uses_env_with_longer_default(self):
