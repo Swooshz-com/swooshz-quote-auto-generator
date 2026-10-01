@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 import io
+import json
 import re
 import sys
 import tempfile
@@ -19,6 +20,27 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import scripts.validate_nixpacks_python_contract as validator  # noqa: E402
+
+
+EXPECTED_SETUP_PACKAGES = ("...", "libreoffice", "fontconfig", "carlito", "liberation_ttf")
+EXPECTED_PACKAGE_DIAGNOSTIC = (
+    "[phases.setup].nixPkgs must equal exactly " + repr(list(EXPECTED_SETUP_PACKAGES))
+)
+
+
+EXPECTED_FONT_SETUP_COMMANDS = (
+    "...",
+    'set -- /nix/store/*-fontconfig-*/etc/fonts/conf.d && '
+    'test "$#" -eq 1 && test -d "$1" && mkdir -p /etc/fonts /var/cache/fontconfig && '
+    'ln -s "$1" /etc/fonts/conf.d && printf \'%s\\n\' '
+    "'<fontconfig><dir>/root/.nix-profile/share/fonts</dir>"
+    '<include ignore_missing="no">/etc/fonts/conf.d</include>'
+    '<include ignore_missing="no">/root/.nix-profile/etc/fonts/conf.d/30-calibri.conf</include>'
+    '<alias binding="same"><family>Arial</family>'
+    '<accept><family>Liberation Sans</family></accept></alias>'
+    "<cachedir>/var/cache/fontconfig</cachedir></fontconfig>' "
+    '> /etc/fonts/fonts.conf && fc-cache -f',
+)
 
 
 class NixpacksTomlParsingTests(unittest.TestCase):
@@ -119,8 +141,9 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
             "nixpacks.toml",
             'providers = ["python"]\n'
             '[phases.setup]\n'
-            'nixPkgs = ["...", "libreoffice"]\n'
+            'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n'
             'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n'
+            f"cmds = {json.dumps(EXPECTED_FONT_SETUP_COMMANDS)}\n"
             '[start]\n'
             'cmd = "python webapp/server.py"\n',
         )
@@ -130,7 +153,7 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
 
     def _replace_setup_package_binding(self, replacement: str) -> None:
         self._replace_nixpacks_text(
-            'nixPkgs = ["...", "libreoffice"]\n',
+            'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n',
             replacement,
         )
 
@@ -176,7 +199,7 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
         self._write_valid_files()
         self._replace_setup_package_binding('nixPkgs = ["...", "libreoffice-fresh"]\n')
         self._assert_failure_contains(
-            "[phases.setup].nixPkgs must equal exactly ['...', 'libreoffice']"
+            EXPECTED_PACKAGE_DIAGNOSTIC
         )
 
     def test_fail_alternate_nix_package_field(self):
@@ -212,7 +235,7 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
     def test_fail_malformed_apt_package_field(self):
         self._write_valid_files()
         self._replace_setup_package_binding(
-            'nixPkgs = ["...", "libreoffice"]\n'
+            'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n'
             'aptPkgs = "libreoffice"\n'
         )
         self._assert_failure_contains(
@@ -222,7 +245,7 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
     def test_fail_non_string_apt_package_field(self):
         self._write_valid_files()
         self._replace_setup_package_binding(
-            'nixPkgs = ["...", "libreoffice"]\n'
+            'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n'
             "aptPkgs = [42]\n"
         )
         self._assert_failure_contains(
@@ -235,21 +258,21 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
             'nixPkgs = ["...", "libreoffice", "libreoffice"]\n'
         )
         self._assert_failure_contains(
-            "[phases.setup].nixPkgs must equal exactly ['...', 'libreoffice']"
+            EXPECTED_PACKAGE_DIAGNOSTIC
         )
 
     def test_fail_reversed_workbook_pdf_package_order(self):
         self._write_valid_files()
         self._replace_setup_package_binding('nixPkgs = ["libreoffice", "..."]\n')
         self._assert_failure_contains(
-            "[phases.setup].nixPkgs must equal exactly ['...', 'libreoffice']"
+            EXPECTED_PACKAGE_DIAGNOSTIC
         )
 
     def test_fail_missing_workbook_pdf_package_hole(self):
         self._write_valid_files()
         self._replace_setup_package_binding('nixPkgs = ["libreoffice"]\n')
         self._assert_failure_contains(
-            "[phases.setup].nixPkgs must equal exactly ['...', 'libreoffice']"
+            EXPECTED_PACKAGE_DIAGNOSTIC
         )
 
     def test_fail_extra_workbook_pdf_package(self):
@@ -258,13 +281,13 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
             'nixPkgs = ["...", "libreoffice", "curl"]\n'
         )
         self._assert_failure_contains(
-            "[phases.setup].nixPkgs must equal exactly ['...', 'libreoffice']"
+            EXPECTED_PACKAGE_DIAGNOSTIC
         )
 
     def test_fail_ambiguous_duplicate_workbook_pdf_binding(self):
         self._write_valid_files()
         self._replace_setup_package_binding(
-            'nixPkgs = ["...", "libreoffice"]\n'
+            'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n'
             'nixPackages = ["...", "libreoffice"]\n'
         )
         self._assert_failure_contains(
@@ -278,7 +301,7 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
             "nixpacks.toml",
             (self.tmp_root / "nixpacks.toml").read_text(encoding="utf-8")
             + "[phases.build]\n"
-            + 'nixPkgs = ["...", "libreoffice"]\n',
+            + 'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n',
         )
         self._assert_failure_contains(
             "workbook PDF nixPkgs must be declared only at"
@@ -287,12 +310,119 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
     def test_fail_alternate_apt_workbook_pdf_package(self):
         self._write_valid_files()
         self._replace_setup_package_binding(
-            'nixPkgs = ["...", "libreoffice"]\n'
+            'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n'
             'aptPkgs = ["libreoffice"]\n'
         )
         self._assert_failure_contains(
             "alternate phases.setup.aptPkgs"
         )
+
+    def test_fail_each_missing_required_setup_package(self):
+        for package in EXPECTED_SETUP_PACKAGES:
+            with self.subTest(package=package):
+                self._write_valid_files()
+                packages = [item for item in EXPECTED_SETUP_PACKAGES if item != package]
+                self._replace_setup_package_binding(f"nixPkgs = {json.dumps(packages)}\n")
+                self._assert_failure_contains(EXPECTED_PACKAGE_DIAGNOSTIC)
+
+    def test_fail_each_duplicate_required_font_package(self):
+        for package in ("fontconfig", "carlito", "liberation_ttf"):
+            with self.subTest(package=package):
+                self._write_valid_files()
+                packages = [*EXPECTED_SETUP_PACKAGES, package]
+                self._replace_setup_package_binding(f"nixPkgs = {json.dumps(packages)}\n")
+                self._assert_failure_contains(EXPECTED_PACKAGE_DIAGNOSTIC)
+
+    def test_fail_each_reordered_required_font_package(self):
+        for index in range(2, len(EXPECTED_SETUP_PACKAGES)):
+            with self.subTest(package=EXPECTED_SETUP_PACKAGES[index]):
+                self._write_valid_files()
+                packages = list(EXPECTED_SETUP_PACKAGES)
+                packages[index - 1], packages[index] = packages[index], packages[index - 1]
+                self._replace_setup_package_binding(f"nixPkgs = {json.dumps(packages)}\n")
+                self._assert_failure_contains(EXPECTED_PACKAGE_DIAGNOSTIC)
+
+    def test_fail_apt_substitution_for_each_font_runtime_package(self):
+        for package in (
+            "fontconfig", "carlito", "liberation_ttf", "liberation_ttf_v2",
+            "fonts-liberation", "fonts-crosextra-carlito", "libreoffice-calc",
+        ):
+            with self.subTest(package=package):
+                self._write_valid_files()
+                self._replace_setup_package_binding(
+                    f"nixPkgs = {json.dumps(EXPECTED_SETUP_PACKAGES)}\n"
+                    f"aptPkgs = {json.dumps([package])}\n"
+                )
+                self._assert_failure_contains("alternate phases.setup.aptPkgs")
+
+    def test_fail_package_binding_in_array_of_tables(self):
+        self._write_valid_files()
+        text = (self.tmp_root / "nixpacks.toml").read_text(encoding="utf-8")
+        self._write(
+            "nixpacks.toml",
+            text + '\n[[phases.build.extra]]\n'
+            + f"nixPkgs = {json.dumps(EXPECTED_SETUP_PACKAGES)}\n",
+        )
+        self._assert_failure_contains(
+            "duplicate Nix package bindings are not allowed",
+            "workbook PDF nixPkgs must be declared only at",
+        )
+
+    def test_fail_duplicate_toml_package_key(self):
+        self._write_valid_files()
+        self._replace_setup_package_binding(
+            f"nixPkgs = {json.dumps(EXPECTED_SETUP_PACKAGES)}\n"
+            f"nixPkgs = {json.dumps(EXPECTED_SETUP_PACKAGES)}\n"
+        )
+        self._assert_failure_contains("nixpacks.toml unparseable")
+
+
+    def _replace_font_registration(self, value):
+        self._replace_nixpacks_text(
+            f"cmds = {json.dumps(EXPECTED_FONT_SETUP_COMMANDS)}\n",
+            "" if value is None else f"cmds = {json.dumps(value)}\n",
+        )
+
+    def test_fail_missing_font_registration_binding(self):
+        self._write_valid_files()
+        self._replace_font_registration(None)
+        self._assert_failure_contains("font registration cmds must equal exactly")
+
+    def test_fail_malformed_font_registration_binding(self):
+        for value in ("fc-cache -f", [42], [], ["..."]):
+            with self.subTest(value=value):
+                self._write_valid_files()
+                self._replace_font_registration(value)
+                self._assert_failure_contains("font registration cmds must equal exactly")
+
+    def test_fail_missing_font_registration_provider_hole(self):
+        self._write_valid_files()
+        self._replace_font_registration([EXPECTED_FONT_SETUP_COMMANDS[1]])
+        self._assert_failure_contains("font registration cmds must equal exactly")
+
+    def test_fail_wrong_font_registration_directory_or_alias(self):
+        for original, replacement in (
+            ("/root/.nix-profile/share/fonts", "/usr/share/fonts"),
+            ("30-calibri.conf", "missing.conf"),
+            ("/etc/fonts/conf.d</include>", "/etc/fonts/missing</include>"),
+            ('test "$#" -eq 1', "true"),
+            ("Liberation Sans", "DejaVu Sans"),
+        ):
+            with self.subTest(original=original):
+                self._write_valid_files()
+                command = EXPECTED_FONT_SETUP_COMMANDS[1].replace(original, replacement)
+                self._replace_font_registration(["...", command])
+                self._assert_failure_contains("font registration cmds must equal exactly")
+
+    def test_fail_duplicate_or_reordered_font_registration(self):
+        for commands in (
+            [*EXPECTED_FONT_SETUP_COMMANDS, EXPECTED_FONT_SETUP_COMMANDS[1]],
+            list(reversed(EXPECTED_FONT_SETUP_COMMANDS)),
+        ):
+            with self.subTest(commands=commands):
+                self._write_valid_files()
+                self._replace_font_registration(commands)
+                self._assert_failure_contains("font registration cmds must equal exactly")
 
     def test_fail_missing_nixpacks_toml(self):
         self._write_valid_files()
@@ -402,7 +532,7 @@ class NixpacksPythonContractREDTests(unittest.TestCase):
         self._write_valid_files()
         self._replace_nixpacks_text(
             '[phases.setup]\n'
-            'nixPkgs = ["...", "libreoffice"]\n'
+            'nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]\n'
             'nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"\n',
             "",
         )
@@ -490,7 +620,7 @@ class NixpacksArchiveProofTests(unittest.TestCase):
         )
         self.assertEqual(
             validator.EXPECTED_SETUP_NIXPKGS,
-            ("...", "libreoffice"),
+            EXPECTED_SETUP_PACKAGES,
         )
 
 

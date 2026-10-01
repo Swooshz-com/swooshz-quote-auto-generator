@@ -59,10 +59,25 @@ The `nixpacks.toml` file enforces an exact Python-only production build contract
   `[phases.setup].nixpkgsArchive` to the immutable Nixpkgs commit
   `5c994fe2b1e540ff83aa59ba370918ad5aae4776` (python312: 3.12.12 -> 3.12.13).
 - Dependencies: `requirements.txt`.
-- Workbook-PDF converter: `[phases.setup].nixPkgs = ["...", "libreoffice"]`.
-  `libreoffice` is the verified package attribute in the locked archive and
-  provides the `soffice` binary used by the existing workbook-mode export; the
-  `...` entry preserves the Nixpacks Python provider packages.
+- Exact ordered workbook-PDF/font packages in `[phases.setup].nixPkgs`:
+  `["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]`.
+  `libreoffice` provides the existing workbook-mode `soffice` converter;
+  `fontconfig` provides runtime discovery including `fc-match`; `carlito`
+  supplies Calibri-compatible regular/bold faces and `30-calibri.conf`;
+  `liberation_ttf` resolves to the pinned `liberation_ttf_v2` Arial-compatible
+  regular/bold family. The `...` entry preserves Python provider packages.
+  Missing entries, wrong order, duplicates, malformed arrays and alternate,
+  misplaced or Apt-substituted converter/font bindings fail closed.
+- Locked `[phases.setup].cmds` preserves the provider setup hole and creates
+  `/etc/fonts/fonts.conf` during the image build. It registers the packaged
+  `/root/.nix-profile/share/fonts` directory, includes the pinned fontconfig
+  package's standard substitution rules and Carlito's `30-calibri.conf`, maps
+  Arial to Liberation Sans and builds the cache. The packaged rule directory
+  must resolve to exactly one path; an absent or ambiguous path fails the
+  build. These rules preserve the generic sans/serif/monospace substitutions.
+  Nixpacks otherwise has no default fontconfig file and can fall back to
+  DejaVu despite those fonts being installed. Registration is part of the
+  source build; it requires no runtime environment override or host changes.
 - Internal-alpha PDF is a required second export path. An explicit PDF request
   regenerates a fresh XLSX from the current reviewed quote state, converts that
   workbook with the installed LibreOffice/soffice path, persists and
@@ -78,6 +93,36 @@ Validate the contract before deployment:
 python scripts\validate_nixpacks_python_contract.py
 python -m unittest tests.test_nixpacks_python_contract
 ```
+
+CI uses Ubuntu Apt packages `libreoffice-calc`, `fontconfig`,
+`fonts-crosextra-carlito` and `fonts-liberation`. The deployed pinned Nix
+attributes are respectively `libreoffice`, `fontconfig`, `carlito` and
+`liberation_ttf`; the package-manager names are not interchangeable.
+
+Before accepting a font-runtime packaging change, build a fresh disposable
+image through the normal Nixpacks build with this archive. Do not mount host
+fonts, install packages after build or modify the built image manually. Inside
+that same image, require `soffice` and `fc-match`, then verify family/style:
+
+| Request | Required compatible family/style |
+|---|---|
+| `fc-match "Calibri"` | Carlito / Regular |
+| `fc-match "Calibri:style=Bold"` | Carlito / Bold |
+| `fc-match "Arial"` | Liberation Sans / Regular |
+| `fc-match "Arial:style=Bold"` | Liberation Sans / Bold |
+
+The actual generated-workbook PDF must also embed the Carlito-resolved regular
+and bold faces; font discovery alone is insufficient. Keep the XLSX's Calibri
+font requests, render the synthetic multi-page workbook twice, and verify bold
+Quantity/Service/Estimate headings on page 1 and a continuation page, complete
+logos, page-1-only right header text, final signature clearance, continuation
+content, expected page count and no trailing blank page. Equivalent rendered
+layout/font behavior is required; metadata-dependent PDF byte identity is not.
+Do not accept DejaVu Sans fallback or a regular/book face for bold text.
+
+This source-controlled packaging contract does not authorize a live host font
+installation, Coolify configuration/environment change or deployment. Hosted
+Alpha acceptance remains separate from disposable build/render evidence.
 
 ## Host Boundary
 
