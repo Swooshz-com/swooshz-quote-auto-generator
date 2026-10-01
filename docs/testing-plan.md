@@ -45,6 +45,12 @@ npm run playwright:smoke
   a cookie, and browser positive/negative flows. Provider behavior must use
   local synthetic adapters only.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
+- Hosted profile layout readiness, profile import/export, or object-artifact lifecycle:
+  run `python -m unittest tests.test_webapp tests.test_postgres_metadata_storage
+  tests.test_profile_layout_safety tests.test_object_storage_provider_config tests.test_object_artifact_authority tests.test_reconcile_object_artifact_lifecycle tests.test_object_artifact_lifecycle_verifier` and then full
+  Python test discovery. Use synthetic fixtures to cover all 19 exact snapshot fields, joined profile/artifact authority,
+  V2 create-only staging, journaled retries, uncertain store/delete/commit outcomes, exact and expiring SQLite cleanup guards, object-mode quote-version retention, restart, backup/restore, and complete export/import.
+  Do not validate this path by writing live Alpha or provider data.
 - PostgreSQL migration manifest, ledger, preflight, or operator command: run
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL
   service and require fresh apply, complete schema, exact checksums, no-op

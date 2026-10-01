@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import contextlib
 import datetime as dt
@@ -2206,7 +2207,11 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(self._verify()["status"], "verified")
 
     def test_real_pg17_callable_session_hold_authority_v2_metadata_acl_and_relations_are_exact(self):
-        spec = migration_contract.ROUTINE_SPECS[3]
+        spec = next(
+            item
+            for item in migration_contract.ROUTINE_SPECS
+            if item.name == "sqag_quote_session_deletion_hold_blocked_v2"
+        )
         row = self._admin_row(
             "select n.nspname as schema_name, p.proname as name, "
             "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
@@ -3542,7 +3547,21 @@ order by object_kind, object_schema, object_name, object_type
             with self.assertRaises(webapp.QuoteCommercialStateError):
                 webapp.payload_to_brief(writer_payloads[0])
         write_spy.assert_called_once()
-        self.assertEqual(report["status"], "passed")
+        self.assertEqual(
+            report["status"],
+            "passed",
+            {
+                "blockers": report.get("blockers"),
+                "failed_checks": sorted(
+                    name
+                    for name, value in report.get("checks", {}).items()
+                    if value is False
+                ),
+                "runtime_download_failure_stage": report.get(
+                    "runtime_download_failure_stage"
+                ),
+            },
+        )
         self.assertEqual(report["blockers"], [])
         self.assertTrue(report["checks"]["active_runtime_download_verified"])
         self.assertTrue(report["checks"]["tombstone_metadata_verified"])
@@ -3573,14 +3592,7 @@ order by object_kind, object_schema, object_name, object_type
             "verify_live_db_object_backup_restore.py",
             "run146_verify_live_db_object_backup_restore",
         )
-        expected_layout = webapp.DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.read_bytes()
-        if not webapp.embedded_layout_rules_from_xlsx_bytes(expected_layout):
-            default_rules = webapp.default_layout_rules_payload()
-            if default_rules:
-                expected_layout = webapp.xlsx_bytes_with_embedded_layout_rules(
-                    expected_layout,
-                    default_rules,
-                )
+        expected_layout = verifier._synthetic_profile_layout_payload()
         webapp.validate_profile_layout_xlsx(expected_layout)
 
         def verifier_env(restore_database_name):
@@ -3988,7 +4000,18 @@ order by object_kind, object_schema, object_name, object_type
             active_backend,
             restore_backend,
         )
-        self.assertEqual(report["status"], "passed")
+        self.assertEqual(
+            report["status"],
+            "passed",
+            {
+                "blockers": report.get("blockers"),
+                "failed_checks": sorted(
+                    name
+                    for name, value in report.get("checks", {}).items()
+                    if value is False
+                ),
+            },
+        )
         self.assertEqual(report["blockers"], [])
         self.assertTrue(binding_restored)
         self.assertEqual(factory_calls, {"active": 1, "restore": 1})
@@ -4004,10 +4027,10 @@ order by object_kind, object_schema, object_name, object_type
         self.assertTrue(report["checks"]["active_object_cannot_read_restore_synthetic_object"])
         self.assertTrue(report["checks"]["bidirectional_backend_isolation_verified"])
         self.assertTrue(report["checks"]["cleanup_completed"])
-        self.assertEqual(report["active_db_synthetic_rows_written"], 7)
-        self.assertEqual(report["restore_db_synthetic_rows_written"], 7)
-        self.assertEqual(report["active_object_synthetic_objects_written"], 1)
-        self.assertEqual(report["restore_object_synthetic_objects_written"], 1)
+        self.assertEqual(report["active_db_synthetic_rows_written"], 9)
+        self.assertEqual(report["restore_db_synthetic_rows_written"], 9)
+        self.assertEqual(report["active_object_synthetic_objects_written"], 3)
+        self.assertEqual(report["restore_object_synthetic_objects_written"], 3)
 
         active_layout_calls = assert_layout_calls(active_backend)
         restore_layout_calls = assert_layout_calls(restore_backend)
@@ -4201,30 +4224,108 @@ order by object_kind, object_schema, object_name, object_type
             runtime_url, "workspace-beta", role="admin", user_id="user-beta",
             expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
         )
+        synthetic_profile_fixture = (
+            ROOT
+            / "tests"
+            / "fixtures"
+            / "quote-generator"
+            / "profiles"
+            / "synthetic-exhibition-fixture-template"
+        )
+        synthetic_layout_bytes = (synthetic_profile_fixture / "quotation-layout.xlsx").read_bytes()
+        webapp.validate_profile_layout_xlsx(synthetic_layout_bytes)
+        synthetic_layout_data_url = (
+            "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+            + base64.b64encode(synthetic_layout_bytes).decode("ascii")
+        )
+        synthetic_layout_rules = json.loads(
+            (synthetic_profile_fixture / "layout-rules.json").read_text(encoding="utf-8")
+        )
+
+        def complete_synthetic_profile(workspace_id, profile_id, label):
+            profile_rules = copy.deepcopy(synthetic_layout_rules)
+            profile_rules["profile_id"] = profile_id
+            profile_rules["test_fixture_binding"] = {
+                "workspace_id": workspace_id,
+                "profile_id": profile_id,
+            }
+            normalized = webapp.normalize_profile_payload(
+                {
+                    "id": profile_id,
+                    "label": label,
+                    "description": "Synthetic runtime privilege integration fixture.",
+                    "pack": {
+                        "quotation_layout": {
+                            "filename": "quotation-layout.xlsx",
+                            "data_url": synthetic_layout_data_url,
+                        },
+                        "layout_rules": {
+                            "filename": "layout-rules.json",
+                            "json": profile_rules,
+                        },
+                    },
+                }
+            )
+            layout = normalized["_pack_assets"]["quotation_layout"]["bytes"]
+            embedded_rules = webapp.embedded_layout_rules_from_xlsx_bytes(layout)
+            self.assertEqual(embedded_rules["profile_id"], profile_id)
+            self.assertEqual(
+                embedded_rules["test_fixture_binding"],
+                {"workspace_id": workspace_id, "profile_id": profile_id},
+            )
+            return normalized
+
         with mock.patch.dict(
             os.environ,
             {
                 webapp.SQAG_STORAGE_MODE_ENV_NAME: "database",
-                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "local",
+                webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: "object",
             },
             clear=False,
+        ), mock.patch.object(
+            webapp,
+            "configured_object_storage_backend",
+            return_value=webapp.InMemoryObjectStorageBackend(),
         ):
-            stored_a = storage_a.save_profile(
-                {"id": "shared-profile", "label": "alpha-only", "notes": "synthetic"}
+            profile_a = complete_synthetic_profile(
+                "workspace-alpha", "shared-profile", "alpha-only"
             )
-            stored_b = storage_b.save_profile(
-                {"id": "shared-profile", "label": "beta-only", "notes": "synthetic"}
+            profile_b = complete_synthetic_profile(
+                "workspace-beta", "shared-profile", "beta-only"
             )
-            storage_b.save_profile(
-                {"id": "beta-only-profile", "label": "beta-only-record", "notes": "synthetic"}
+            profile_b_only = complete_synthetic_profile(
+                "workspace-beta", "beta-only-profile", "beta-only-record"
             )
+            stored_a = storage_a.save_profile(profile_a)
+            stored_b = storage_b.save_profile(profile_b)
+            storage_b.save_profile(profile_b_only)
+            for storage, workspace_id, profile in (
+                (storage_a, "workspace-alpha", profile_a),
+                (storage_b, "workspace-beta", profile_b),
+                (storage_b, "workspace-beta", profile_b_only),
+            ):
+                artifact = storage.profile_layout_artifact(profile["id"])
+                self.assertIsNotNone(artifact)
+                self.assertEqual(artifact["filename"], "quotation-layout.xlsx")
+                self.assertEqual(
+                    artifact["content"],
+                    profile["_pack_assets"]["quotation_layout"]["bytes"],
+                )
+                self.assertEqual(
+                    webapp.embedded_layout_rules_from_xlsx_bytes(artifact["content"])[
+                        "test_fixture_binding"
+                    ],
+                    {"workspace_id": workspace_id, "profile_id": profile["id"]},
+                )
             storage_unknown = webapp.DatabaseSqagStorage(
                 runtime_url, "workspace-missing", role="admin", user_id="user-missing",
                 expected_session_role=webapp.SQAG_RUNTIME_DATABASE_ROLE,
             )
             self.assertIsNone(storage_unknown.profile_detail("shared-profile"))
+            self.assertIsNone(storage_unknown.profile_layout_artifact("shared-profile"))
             self.assertEqual(storage_unknown.list_company_profiles(), [])
             self.assertIsNone(storage_a.profile_detail("beta-only-profile"))
+            self.assertIsNone(storage_a.profile_layout_artifact("beta-only-profile"))
             self.assertEqual(stored_a["label"], "alpha-only")
             self.assertEqual(stored_b["label"], "beta-only")
             self.assertEqual(storage_a.profile_detail("shared-profile")["label"], "alpha-only")
@@ -4677,7 +4778,7 @@ order by object_kind, object_schema, object_name, object_type
         self.assertFalse(maintenance_ledger["allowed"])
         self.assertTrue(migrator_ledger["allowed"])
 
-    def test_real_pg17_causal_001_008_cli_009_and_runtime_hold_denial(self):
+    def test_real_pg17_causal_001_008_cli_009_010_and_runtime_hold_denial(self):
         partial_database = self._create_isolated_database_fixture(
             self.migrations[:7],
             configure_acl=False,
@@ -4835,6 +4936,7 @@ order by object_kind, object_schema, object_name, object_type
             "Applied migration IDs: " + self.migrations[7].migration_id,
             completed.stdout,
         )
+        self.assertIn(self.migrations[8].migration_id, completed.stdout)
         self.assertNotIn(
             "Applied migration IDs: " + self.migrations[6].migration_id,
             completed.stdout,
@@ -4849,32 +4951,39 @@ order by object_kind, object_schema, object_name, object_type
                 migration_contract.ROUTINE_SPECS[2],
             ),
         )
-        post_009 = self._inspect(partial_database)
-        self.assertEqual(post_009["status"], "ready")
-        self.assertIs(post_009["safeToApply"], True)
-        self.assertEqual(post_009["pendingMigrationIds"], [])
+        post_apply_state = self._inspect(partial_database)
+        self.assertEqual(post_apply_state["status"], "ready")
+        self.assertIs(post_apply_state["safeToApply"], True)
+        self.assertEqual(post_apply_state["pendingMigrationIds"], [])
         self.assertEqual(
-            post_009["appliedMigrationIds"],
+            post_apply_state["appliedMigrationIds"],
             [migration.migration_id for migration in self.migrations],
         )
+        pre_apply_ids = clean_pre_apply["appliedMigrationIds"]
         self.assertEqual(
-            post_009["appliedMigrationIds"][:-1],
-            clean_pre_apply["appliedMigrationIds"],
+            post_apply_state["appliedMigrationIds"][:len(pre_apply_ids)],
+            pre_apply_ids,
+        )
+        newly_applied_ids = [migration.migration_id for migration in self.migrations[7:]]
+        self.assertEqual(
+            post_apply_state["appliedMigrationIds"][len(pre_apply_ids):],
+            newly_applied_ids,
         )
         self.assertEqual(
-            set(post_009["appliedMigrationIds"])
-            - set(clean_pre_apply["appliedMigrationIds"]),
-            {self.migrations[7].migration_id},
+            set(post_apply_state["appliedMigrationIds"]) - set(pre_apply_ids),
+            set(newly_applied_ids),
         )
-        ledger_row = self._admin_row(
-            "select sequence_no, migration_id, checksum_sha256, applied_at "
-            "from public.sqag_schema_migrations where sequence_no = %s",
-            (self.migrations[7].sequence_no,),
-            database_name=partial_database,
-        )
-        self.assertEqual(ledger_row["migration_id"], self.migrations[7].migration_id)
-        self.assertEqual(ledger_row["checksum_sha256"], self.migrations[7].checksum_sha256)
-        self.assertIsNotNone(ledger_row["applied_at"])
+        for migration in self.migrations[7:]:
+            with self.subTest(migration=migration.migration_id):
+                ledger_row = self._admin_row(
+                    "select sequence_no, migration_id, checksum_sha256, applied_at "
+                    "from public.sqag_schema_migrations where sequence_no = %s",
+                    (migration.sequence_no,),
+                    database_name=partial_database,
+                )
+                self.assertEqual(ledger_row["migration_id"], migration.migration_id)
+                self.assertEqual(ledger_row["checksum_sha256"], migration.checksum_sha256)
+                self.assertIsNotNone(ledger_row["applied_at"])
         self.assertEqual(
             self._default_table_acl_snapshot(partial_database),
             default_acl_before_009,
@@ -5655,7 +5764,8 @@ order by owner.rolname, schema_name, grantee, acl.privilege_type
         acl_rows = self._admin_rows(
             f"""
 select c.relname as table_name, owner.rolname as owner,
-       case when acl.grantee = 0 then 'PUBLIC'
+       case when acl.grantee is null then null
+            when acl.grantee = 0 then 'PUBLIC'
             else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee,
        grantor_role.rolname as grantor,
        acl.privilege_type, acl.is_grantable

@@ -453,8 +453,26 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                             "quote-compensate",
                             [self.inline_record("compensate-reference")],
                         )
-                self.assertEqual(backend._objects, before)
+                self.assertEqual(len(backend._objects), len(before) + 1)
                 with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                    prepared_states = [
+                        row[0]
+                        for row in connection.execute(
+                            "select state from sqag_object_artifact_operations "
+                            "where workspace_id = ? and owner_type = ? and owner_id = ? "
+                            "order by operation_seq",
+                            ("workspace-lazy", "uploaded_reference", "quote-compensate"),
+                        ).fetchall()
+                    ]
+                    self.assertEqual(prepared_states, ["prepared"])
+                    self.assertEqual(
+                        connection.execute(
+                            "select count(*) from sqag_object_artifacts "
+                            "where workspace_id = ? and owner_type = ? and owner_id = ?",
+                            ("workspace-lazy", "uploaded_reference", "quote-compensate"),
+                        ).fetchone()[0],
+                        0,
+                    )
                     stored = json.loads(
                         connection.execute(
                             "select draft_files_json from sqag_quote_sessions "
@@ -768,7 +786,17 @@ class InlineDraftObjectMigrationTest(unittest.TestCase):
                             connection.execute("select count(*) from sqag_object_artifacts").fetchone()[0],
                             0,
                         )
-                    self.assertEqual(backend._objects, {})
+                        operation_states = [
+                            row[0]
+                            for row in connection.execute(
+                                "select state from sqag_object_artifact_operations "
+                                "where workspace_id = ? order by owner_type, owner_id, operation_seq",
+                                (f"workspace-post-{failure_kind}",),
+                            ).fetchall()
+                        ]
+                    self.assertTrue(operation_states)
+                    self.assertEqual(set(operation_states), {"prepared"})
+                    self.assertEqual(len(backend._objects), int(failure_kind == "metadata"))
 
     def test_cli_defaults_to_count_only_then_applies_a_bounded_batch(self):
         backend = webapp.InMemoryObjectStorageBackend()

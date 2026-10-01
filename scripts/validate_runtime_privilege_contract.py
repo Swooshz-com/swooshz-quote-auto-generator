@@ -38,6 +38,7 @@ CONTRACT_PATH = ROOT / "docs" / "runtime-privilege-contract.json"
 SOURCE_SQL_FILES = (
     "webapp/server.py",
     "webapp/forensics.py",
+    "scripts/reconcile_object_artifact_lifecycle.py",
     "scripts/enforce_forensic_retention.py",
 )
 UNSUPPORTED_SOURCE_RELATIONS = frozenset({"sqag_file_artifacts", "sqag_quote_artifacts"})
@@ -68,6 +69,7 @@ RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_feedback": ("SELECT", "INSERT", "UPDATE"),
     "sqag_feedback_status_history": ("SELECT", "INSERT"),
     "sqag_object_artifacts": ("SELECT", "INSERT", "UPDATE"),
+    "sqag_object_artifact_operations": ("SELECT", "INSERT", "UPDATE"),
     "sqag_quote_publication_versions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_publication_artifacts": ("SELECT", "INSERT", "DELETE"),
     "sqag_telemetry_events": ("SELECT", "INSERT"),
@@ -76,6 +78,7 @@ RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
 MAINTENANCE_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_quote_sessions": ("SELECT", "DELETE"),
     "sqag_object_artifacts": ("SELECT", "UPDATE"),
+    "sqag_object_artifact_operations": ("SELECT", "UPDATE"),
     "sqag_generation_runs": ("SELECT", "UPDATE", "DELETE"),
     "sqag_generation_evidence": ("SELECT", "DELETE"),
     "sqag_audit_events": ("SELECT", "INSERT", "DELETE"),

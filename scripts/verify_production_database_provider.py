@@ -408,6 +408,51 @@ def _contains_id(items: list[dict[str, object]], item_id: str, id_key: str = "id
     return any(_clean(item.get(id_key)) == item_id for item in items if isinstance(item, dict))
 
 
+def _row_value(row: object, key: str, index: int) -> object:
+    if isinstance(row, Mapping):
+        return row.get(key)
+    try:
+        return row[key]  # type: ignore[index]
+    except Exception:
+        try:
+            return row[index]  # type: ignore[index]
+        except Exception:
+            return None
+
+
+def _synthetic_profile_metadata_rows(
+    storage: object,
+    ids: Mapping[str, str],
+) -> list[dict[str, object]] | None:
+    workspace_id = _clean(getattr(storage, "workspace_id", ""))
+    profile_a = ids["profile_a"]
+    profile_b = ids["profile_b"]
+    try:
+        with storage.connection() as connection:
+            rows = connection.execute(
+                "select workspace_id, profile_id, payload_json from sqag_profiles "
+                "where workspace_id = ? and profile_id in (?, ?)",
+                (workspace_id, profile_a, profile_b),
+            ).fetchall()
+    except Exception:
+        return None
+
+    observed: list[dict[str, object]] = []
+    for row in rows:
+        row_workspace = _clean(_row_value(row, "workspace_id", 0))
+        profile_id = _clean(_row_value(row, "profile_id", 1))
+        try:
+            payload = json.loads(_row_value(row, "payload_json", 2))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not row_workspace or not profile_id or not isinstance(payload, Mapping):
+            return None
+        if _clean(payload.get("id")) != profile_id:
+            return None
+        observed.append({"workspace_id": row_workspace, "id": profile_id})
+    return observed
+
+
 def _insert_synthetic_metadata_rows(
     storage: object,
     ids: Mapping[str, str],
@@ -552,14 +597,18 @@ def _workspace_isolation_observed(
     storage_b: object,
     ids: Mapping[str, str],
 ) -> bool:
-    profiles_a = storage_a.list_company_profiles()
-    profiles_b = storage_b.list_company_profiles()
+    profiles_a = _synthetic_profile_metadata_rows(storage_a, ids)
+    profiles_b = _synthetic_profile_metadata_rows(storage_b, ids)
+    if profiles_a is None or profiles_b is None:
+        return False
     pricing_a = storage_a.list_pricing_references()
     pricing_b = storage_b.list_pricing_references()
     sessions_a = storage_a.list_quote_sessions()
     sessions_b = storage_b.list_quote_sessions()
     return all(
         (
+            all(_clean(item.get("workspace_id")) == ids["workspace_a"] for item in profiles_a),
+            all(_clean(item.get("workspace_id")) == ids["workspace_b"] for item in profiles_b),
             _contains_id(profiles_a, ids["profile_a"]),
             not _contains_id(profiles_a, ids["profile_b"]),
             _contains_id(profiles_b, ids["profile_b"]),

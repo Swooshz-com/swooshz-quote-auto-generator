@@ -33,6 +33,8 @@ from webapp.postgres_migrations import (
     Migration,
     MigrationSafetyError,
     TableSpec,
+    TRIGGER_SPECS,
+    _trigger_matches,
     _fetch_public_indexes,
     _constraint_fingerprint,
     _observed_constraint_fingerprint,
@@ -423,6 +425,33 @@ class MigrationPayloadCanonicalizationTest(unittest.TestCase):
         )
 
 
+class PostgresMigrationTriggerCatalogContractTest(unittest.TestCase):
+    def test_artifact_cleanup_trigger_events_match_postgres_catalog_order(self):
+        expected_names = {
+            "sqag_object_artifact_cleanup_version_lock",
+            "sqag_object_artifact_cleanup_hold_lock",
+        }
+        specs = [item for item in TRIGGER_SPECS if item.name in expected_names]
+        self.assertEqual({item.name for item in specs}, expected_names)
+        for spec in specs:
+            with self.subTest(trigger=spec.name):
+                self.assertEqual(spec.events, ("insert", "delete", "update"))
+                self.assertTrue(
+                    _trigger_matches(
+                        {
+                            "name": spec.name,
+                            "table_schema": "public",
+                            "table_name": spec.table_name,
+                            "tgtype": 31,
+                            "columns": (),
+                            "enabled": "O",
+                            "routine_key": spec.routine_key,
+                        },
+                        spec,
+                    )
+                )
+
+
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
     @classmethod
@@ -652,6 +681,8 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             {
                 ("sqag_reject_immutable_change", ""),
                 ("sqag_require_retention_delete_authorization", ""),
+                ("sqag_object_artifact_operations_guard", ""),
+                ("sqag_object_artifact_cleanup_policy_lock", ""),
             },
         )
 

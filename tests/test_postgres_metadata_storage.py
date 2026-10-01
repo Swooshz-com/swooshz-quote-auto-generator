@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -65,6 +66,7 @@ class FakePostgresConnection:
         "sqag_quote_publication_versions",
         "sqag_quote_sessions",
         "sqag_object_artifacts",
+        "sqag_object_artifact_operations",
     }
 
     def __init__(self, *, missing_tables=None, current_user=webapp.SQAG_RUNTIME_DATABASE_ROLE, session_user=None):
@@ -78,6 +80,7 @@ class FakePostgresConnection:
         self.pricing_references = {}
         self.quote_sessions = {}
         self.object_artifacts = {}
+        self.object_artifact_operations = {}
 
     def execute(self, sql, params=None):
         params = tuple(params or ())
@@ -115,20 +118,70 @@ class FakePostgresConnection:
                     "deleted_at",
                 },
                 "sqag_quote_publication_versions": webapp.SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS,
+                "sqag_object_artifact_operations": webapp.SQAG_OBJECT_ARTIFACT_LIFECYCLE_REQUIRED_COLUMNS["sqag_object_artifact_operations"],
             }
             for table in sorted(self.required_tables - self.missing_tables):
                 if table not in params:
                     continue
                 rows.extend({"table_name": table, "column_name": column} for column in sorted(column_map[table]))
             return FakePostgresCursor(rows)
+        if normalized.startswith("select max(operation_seq) as max_seq from sqag_object_artifact_operations"):
+            workspace_id, owner_type, owner_id = params
+            values = [
+                row["operation_seq"]
+                for row in self.object_artifact_operations.values()
+                if (row["workspace_id"], row["owner_type"], row["owner_id"])
+                == (workspace_id, owner_type, owner_id)
+            ]
+            return FakePostgresCursor([{"max_seq": max(values) if values else None}])
+        if normalized.startswith("insert into sqag_object_artifact_operations"):
+            names = (
+                "workspace_id", "owner_type", "owner_id", "operation_seq",
+                "operation_id", "request_sha256", "plan_json", "state",
+                "cleanup_json", "created_at", "updated_at",
+            )
+            row = dict(zip(names, params))
+            self.object_artifact_operations[(row["workspace_id"], row["owner_type"], row["owner_id"], row["operation_seq"])] = row
+            return FakePostgresCursor(rowcount=1)
+        if normalized.startswith("select ") and "from sqag_object_artifact_operations" in normalized:
+            rows = list(self.object_artifact_operations.values())
+            if "where workspace_id = %s and owner_type = %s and owner_id = %s and operation_seq = %s" in normalized:
+                workspace_id, owner_type, owner_id, operation_seq = params
+                rows = [row for row in rows if (row["workspace_id"], row["owner_type"], row["owner_id"], row["operation_seq"]) == (workspace_id, owner_type, owner_id, operation_seq)]
+            elif "where workspace_id = %s and owner_type = %s and owner_id = %s and request_sha256 = %s" in normalized:
+                workspace_id, owner_type, owner_id, request_sha256 = params
+                rows = [row for row in rows if (row["workspace_id"], row["owner_type"], row["owner_id"], row["request_sha256"]) == (workspace_id, owner_type, owner_id, request_sha256)]
+            elif "where workspace_id = %s and owner_type = %s and owner_id = %s" in normalized:
+                workspace_id, owner_type, owner_id = params[:3]
+                rows = [row for row in rows if (row["workspace_id"], row["owner_type"], row["owner_id"]) == (workspace_id, owner_type, owner_id)]
+            if "state = 'prepared'" in normalized:
+                rows = [row for row in rows if row["state"] == "prepared"]
+            elif "state = 'published'" in normalized:
+                rows = [row for row in rows if row["state"] == "published"]
+            rows.sort(key=lambda row: row["operation_seq"], reverse="desc" in normalized)
+            return FakePostgresCursor(rows)
+        if normalized.startswith("update sqag_object_artifact_operations set state ="):
+            state, cleanup_json, updated_at, workspace_id, owner_type, owner_id, sequence, operation_id, request_sha256, plan_json = params
+            key = (workspace_id, owner_type, owner_id, sequence)
+            row = self.object_artifact_operations.get(key)
+            if row is None or row["state"] != "prepared" or row["operation_id"] != operation_id or row["request_sha256"] != request_sha256 or row["plan_json"] != plan_json:
+                return FakePostgresCursor()
+            row.update(state=state, cleanup_json=cleanup_json, updated_at=updated_at)
+            return FakePostgresCursor(rowcount=1)
         if normalized.startswith("insert into sqag_profiles"):
             workspace_id, profile_id, payload_json, created_at, updated_at = params
             self.profiles[(workspace_id, profile_id)] = {
+                "workspace_id": workspace_id,
+                "profile_id": profile_id,
                 "payload_json": payload_json,
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
             return FakePostgresCursor(rowcount=1)
+        if normalized.startswith("select * from sqag_profiles where workspace_id = %s and profile_id = %s"):
+            workspace_id, profile_id = params
+            row = self.profiles.get((workspace_id, profile_id))
+            return FakePostgresCursor([row] if row else [])
         if normalized.startswith("select payload_json from sqag_profiles"):
             workspace_id = params[0]
             rows = [
@@ -391,6 +444,7 @@ class SqliteSqagMigrationTest(unittest.TestCase):
             "007_feedback_publication_binding_postgres.sql",
             "008_quote_session_deletion_hold_authority_postgres.sql",
             "009_telemetry_events_postgres.sql",
+            "010_object_artifact_lifecycle.sql",
         ]
 
         with mock.patch(
@@ -446,11 +500,16 @@ class PostgresMetadataStorageTest(unittest.TestCase):
             return_value=backend,
         ):
             storage = webapp.app_storage_for_auth_session(platform_session("workspace-alpha"))
-            saved = storage.save_profile({"id": "profile-a", "label": "Profile A"})
-            listed = storage.list_company_profiles()
+            layout = ROOT / "tests" / "fixtures" / "quote-generator" / "profiles" / "synthetic-exhibition-fixture-template" / "quotation-layout.xlsx"
+            data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(layout.read_bytes()).decode("ascii")
+            saved = storage.save_profile(webapp.normalize_profile_payload({
+                "id": "profile-a",
+                "label": "Synthetic Profile A",
+                "pack": {"quotation_layout": {"filename": "synthetic-layout.xlsx", "data_url": data_url}},
+            }))
 
         self.assertEqual(saved["id"], "profile-a")
-        self.assertEqual([item["id"] for item in listed], ["profile-a"])
+        self.assertIn(("workspace-alpha", "profile", "profile-a", "quotation_layout"), connection.object_artifacts)
         self.assertTrue(connection.closed)
         self.assertTrue(
             any("workspace_id = %s" in query and params[0] == "workspace-alpha" for query, params in connection.queries),

@@ -26,6 +26,7 @@ MIGRATION_FILE_NAMES = (
     "007_feedback_publication_binding_postgres.sql",
     "008_quote_session_deletion_hold_authority_postgres.sql",
     "009_telemetry_events_postgres.sql",
+    "010_object_artifact_lifecycle.sql",
 )
 
 EXPECTED_TABLES = frozenset(
@@ -47,6 +48,7 @@ EXPECTED_TABLES = frozenset(
         "sqag_quote_publication_artifacts",
         "sqag_telemetry_source_state",
         "sqag_telemetry_events",
+        "sqag_object_artifact_operations",
     }
 )
 EXPECTED_INDEXES = frozenset(
@@ -91,6 +93,10 @@ EXPECTED_TRIGGERS = frozenset(
         "sqag_telemetry_source_state_no_delete",
         "sqag_telemetry_events_no_update",
         "sqag_telemetry_events_guard_delete",
+        "sqag_object_artifact_operations_guard_update",
+        "sqag_object_artifact_operations_guard_delete",
+        "sqag_object_artifact_cleanup_version_lock",
+        "sqag_object_artifact_cleanup_hold_lock",
     }
 )
 EXPECTED_TRIGGER_KEYS = frozenset(
@@ -103,6 +109,10 @@ EXPECTED_TRIGGER_KEYS = frozenset(
         ("public", "sqag_telemetry_source_state", "sqag_telemetry_source_state_no_delete"),
         ("public", "sqag_telemetry_events", "sqag_telemetry_events_no_update"),
         ("public", "sqag_telemetry_events", "sqag_telemetry_events_guard_delete"),
+        ("public", "sqag_object_artifact_operations", "sqag_object_artifact_operations_guard_update"),
+        ("public", "sqag_object_artifact_operations", "sqag_object_artifact_operations_guard_delete"),
+        ("public", "sqag_quote_publication_versions", "sqag_object_artifact_cleanup_version_lock"),
+        ("public", "sqag_legal_holds", "sqag_object_artifact_cleanup_hold_lock"),
     }
 )
 EXPECTED_ROUTINES = frozenset(
@@ -111,12 +121,16 @@ EXPECTED_ROUTINES = frozenset(
         "sqag_require_retention_delete_authorization",
         "sqag_quote_session_deletion_hold_blocked",
         "sqag_quote_session_deletion_hold_blocked_v2",
+        "sqag_object_artifact_operations_guard",
+        "sqag_object_artifact_cleanup_policy_lock",
     }
 )
 EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
     {
         ("sqag_reject_immutable_change", ""),
         ("sqag_require_retention_delete_authorization", ""),
+        ("sqag_object_artifact_operations_guard", ""),
+        ("sqag_object_artifact_cleanup_policy_lock", ""),
     }
 )
 EXPECTED_CALLABLE_ROUTINE_KEYS = frozenset(
@@ -141,6 +155,18 @@ EXPECTED_TRIGGER_ROUTINE_LINKS = {
             ("sqag_generation_evidence_guard_delete", "sqag_generation_evidence"),
             ("sqag_audit_events_guard_delete", "sqag_audit_events"),
             ("sqag_telemetry_events_guard_delete", "sqag_telemetry_events"),
+        }
+    ),
+    "sqag_object_artifact_operations_guard": frozenset(
+        {
+            ("sqag_object_artifact_operations_guard_update", "sqag_object_artifact_operations"),
+            ("sqag_object_artifact_operations_guard_delete", "sqag_object_artifact_operations"),
+        }
+    ),
+    "sqag_object_artifact_cleanup_policy_lock": frozenset(
+        {
+            ("sqag_object_artifact_cleanup_version_lock", "sqag_quote_publication_versions"),
+            ("sqag_object_artifact_cleanup_hold_lock", "sqag_legal_holds"),
         }
     ),
 }
@@ -538,6 +564,22 @@ TABLE_SPECS = (
         ),
     ),
     TableSpec(
+        "sqag_object_artifact_operations",
+        _cols(
+            "workspace_id:text", "owner_type:text", "owner_id:text",
+            "operation_seq:integer", "operation_id:text", "request_sha256:text",
+            "plan_json:text", "state:text", "cleanup_json:text",
+            "created_at:text", "updated_at:text",
+        ),
+        (
+            _c("p", "workspace_id,owner_type,owner_id,operation_seq"),
+            _c("u", "workspace_id,operation_id"),
+            _c("c", expression="operation_seq > 0"),
+            _c("c", expression="length(request_sha256) = 64"),
+            _c("c", expression="state in ('prepared', 'published', 'aborted')"),
+        ),
+    ),
+    TableSpec(
         "sqag_telemetry_events",
         _cols(
             "workspace_id:text", "event_id:text", "source_product:text",
@@ -668,6 +710,10 @@ TRIGGER_SPECS = (
         routine_name="sqag_reject_immutable_change",
     ),
     _trigger("sqag_telemetry_events_guard_delete", "sqag_telemetry_events", ("delete",), routine_name="sqag_require_retention_delete_authorization"),
+    _trigger("sqag_object_artifact_operations_guard_update", "sqag_object_artifact_operations", ("update",), routine_name="sqag_object_artifact_operations_guard"),
+    _trigger("sqag_object_artifact_operations_guard_delete", "sqag_object_artifact_operations", ("delete",), routine_name="sqag_object_artifact_operations_guard"),
+    _trigger("sqag_object_artifact_cleanup_version_lock", "sqag_quote_publication_versions", ("insert", "delete", "update"), routine_name="sqag_object_artifact_cleanup_policy_lock"),
+    _trigger("sqag_object_artifact_cleanup_hold_lock", "sqag_legal_holds", ("insert", "delete", "update"), routine_name="sqag_object_artifact_cleanup_policy_lock"),
 )
 TRIGGER_SPECS_BY_KEY = MappingProxyType(
     {("public", item.table_name, item.name): item for item in TRIGGER_SPECS}
@@ -700,6 +746,34 @@ ROUTINE_SPECS = (
             "sqag_quote_sessions",
         ),
         (("sqag_runtime", "EXECUTE", False),),
+    ),
+    RoutineSpec(
+        "public",
+        "sqag_object_artifact_operations_guard",
+        "",
+        "trigger",
+        "plpgsql",
+        "sqag_migrator",
+        False,
+        "v",
+        "u",
+        False,
+        ("search_path=pg_catalog, public",),
+        "010_object_artifact_lifecycle.sql",
+    ),
+    RoutineSpec(
+        "public",
+        "sqag_object_artifact_cleanup_policy_lock",
+        "",
+        "trigger",
+        "plpgsql",
+        "sqag_migrator",
+        False,
+        "v",
+        "u",
+        False,
+        ("search_path=pg_catalog, public",),
+        "010_object_artifact_lifecycle.sql",
     ),
     RoutineSpec(
         "public",
@@ -772,7 +846,13 @@ MIGRATION_OBJECTS = (
         tables=tuple(TABLE_SPECS_BY_NAME[name] for name in ("sqag_telemetry_source_state", "sqag_telemetry_events")),
         indexes=tuple(INDEX_SPECS[22:28]),
         triggers=tuple(TRIGGER_SPECS[5:8]),
-        routines=(ROUTINE_SPECS[3],),
+        routines=(ROUTINE_SPECS[5],),
+    ),
+    MigrationObjectSpec(
+        MIGRATION_FILE_NAMES[8],
+        tables=(TABLE_SPECS_BY_NAME["sqag_object_artifact_operations"],),
+        triggers=tuple(TRIGGER_SPECS[8:12]),
+        routines=(ROUTINE_SPECS[3], ROUTINE_SPECS[4]),
     ),
 )
 

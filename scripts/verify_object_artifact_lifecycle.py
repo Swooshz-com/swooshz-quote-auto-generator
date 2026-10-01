@@ -71,6 +71,25 @@ def object_metadata_digest(database_path: Path) -> str:
     return digest.hexdigest()
 
 
+def journal_digest(database_path: Path) -> str:
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            "select workspace_id, owner_type, owner_id, operation_seq, operation_id, "
+            "request_sha256, plan_json, state, cleanup_json, created_at, updated_at "
+            "from sqag_object_artifact_operations "
+            "order by workspace_id, owner_type, owner_id, operation_seq"
+        ).fetchall()
+    finally:
+        connection.close()
+    digest = hashlib.sha256()
+    for row in rows:
+        for value in row:
+            digest.update(str(value).encode("utf-8"))
+            digest.update(b"\0")
+        digest.update(b"\n")
+    return digest.hexdigest()
+
 def row_count(database_path: Path, table: str) -> int:
     connection = sqlite3.connect(database_path)
     try:
@@ -79,16 +98,37 @@ def row_count(database_path: Path, table: str) -> int:
         connection.close()
 
 
-def seed_matching_backend() -> InMemoryObjectStorageBackend:
+def seed_matching_backend(database_path: Path) -> InMemoryObjectStorageBackend:
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "select * from sqag_object_artifacts where workspace_id = ? "
+            "and owner_type = ? and owner_id = ? and artifact_kind = ?",
+            (WORKSPACE_ID, "generated_quote", SESSION_ID, "xlsx"),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("Synthetic object artifact metadata is unavailable.")
+    metadata = storage_for(database_path)._object_metadata_from_row(row)
     backend = InMemoryObjectStorageBackend()
     backend.store_artifact(
-        workspace_id=WORKSPACE_ID,
-        owner_type="generated_quote",
-        owner_id=SESSION_ID,
-        artifact_kind="xlsx",
-        filename="quotation.xlsx",
-        content_type=CONTENT_TYPE,
+        workspace_id=metadata.workspace_id,
+        owner_type=metadata.owner_type,
+        owner_id=metadata.owner_id,
+        artifact_kind=metadata.artifact_kind,
+        filename=metadata.filename,
+        content_type=metadata.content_type,
         content=ARTIFACT_CONTENT,
+        artifact_incarnation=metadata.artifact_incarnation,
+        artifact_id=metadata.artifact_id,
+        platform_user_id=metadata.platform_user_id,
+        session_id=metadata.session_id,
+        job_id=metadata.job_id,
+        binding_sha256=metadata.binding_sha256,
+        created_at=metadata.created_at,
+        updated_at=metadata.updated_at,
     )
     return backend
 
@@ -183,23 +223,26 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
 
     seed_checks = seed_source_database(source, staging_root)
     before_digest = object_metadata_digest(source)
+    before_journal_digest = journal_digest(source)
     backup_sqlite_database(source, backup)
     backup_sqlite_database(backup, restored)
     backup_sqlite_database(backup, restored_missing)
     backup_sqlite_database(backup, restored_checksum)
     backup_sqlite_database(backup, restored_tombstone)
     after_digest = object_metadata_digest(restored)
+    after_journal_digest = journal_digest(restored)
 
-    restored_content = restored_artifact(restored, seed_matching_backend())
+    restored_content = restored_artifact(restored, seed_matching_backend(restored))
     missing_object = restored_artifact(restored_missing, InMemoryObjectStorageBackend())
     corrupt_checksum(restored_checksum)
-    checksum_mismatch = restored_artifact(restored_checksum, seed_matching_backend())
+    checksum_mismatch = restored_artifact(restored_checksum, seed_matching_backend(restored))
     mark_tombstoned(restored_tombstone)
-    tombstoned = restored_artifact(restored_tombstone, seed_matching_backend())
-    wrong_workspace = restored_artifact(restored, seed_matching_backend(), workspace_id=OTHER_WORKSPACE_ID)
+    tombstoned = restored_artifact(restored_tombstone, seed_matching_backend(restored))
+    wrong_workspace = restored_artifact(restored, seed_matching_backend(restored), workspace_id=OTHER_WORKSPACE_ID)
 
     checks = {
         "db_metadata_backup_restore_preserved": before_digest == after_digest and row_count(restored, "sqag_object_artifacts") == 1,
+        "journal_backup_restore_preserved": before_journal_digest == after_journal_digest and row_count(restored, "sqag_object_artifact_operations") == 1,
         "restored_metadata_retrieves_object": bool(restored_content and restored_content.get("content") == ARTIFACT_CONTENT),
         "missing_object_detected": missing_object is None,
         "checksum_mismatch_detected": checksum_mismatch is None,
@@ -216,6 +259,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "checks": checks,
         "row_counts": {
             "object_artifacts": row_count(restored, "sqag_object_artifacts"),
+            "object_artifact_operations": row_count(restored, "sqag_object_artifact_operations"),
             "quote_artifacts_blob_rows": row_count(restored, "sqag_quote_artifacts"),
         },
         "privacy": {

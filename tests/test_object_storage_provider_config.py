@@ -20,6 +20,8 @@ class FakeS3Client:
 
     def put_object(self, **kwargs):
         key = (kwargs["Bucket"], kwargs["Key"])
+        if kwargs.get("IfNoneMatch") == "*" and key in self.objects:
+            raise RuntimeError("synthetic create-only collision")
         self.objects[key] = {
             "body": bytes(kwargs["Body"]),
             "content_type": kwargs.get("ContentType"),
@@ -264,6 +266,25 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
         client.head_bucket = mock.Mock(side_effect=RuntimeError("private-provider-response"))
         self.assertFalse(backend.readiness_probe())
 
+    def test_s3_remote_content_type_must_match_artifact_metadata(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(bucket="synthetic", client=client)
+        metadata = backend.store_artifact(
+            workspace_id="workspace-content-type",
+            owner_type="profile",
+            owner_id="synthetic-profile",
+            artifact_kind="quotation_layout",
+            filename="synthetic-layout.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            content=b"synthetic-layout-object",
+        )
+        stored = client.objects[("synthetic", metadata.storage_key)]
+        stored["content_type"] = "application/octet-stream"
+
+        with self.assertRaises(object_storage.ObjectStorageContractError):
+            backend.retrieve_artifact(metadata, workspace_id="workspace-content-type")
+        self.assertFalse(backend.verify_metadata(metadata, workspace_id="workspace-content-type"))
+
     def test_s3_adapter_distinguishes_authoritative_missing_from_provider_outage(self):
         client = FakeS3Client()
         backend = object_storage.S3CompatibleObjectStorageBackend(bucket="synthetic", client=client)
@@ -306,6 +327,99 @@ class ObjectStorageProviderConfigTest(unittest.TestCase):
             "workspaces/workspace-a/profile/profile-a/layout/"
             "aaaaaaaaaaaaaaaa-layout.json",
         )
+
+    def test_v2_object_artifact_key_uses_full_digest_and_reserved_incarnation(self):
+        incarnation = "inc-v2-" + "c" * 64
+        key = object_storage.object_artifact_key(
+            workspace_id="workspace-a",
+            owner_type="profile",
+            owner_id="profile-a",
+            artifact_kind="layout",
+            filename="layout.json",
+            checksum_sha256="a" * 64,
+            artifact_incarnation=incarnation,
+        )
+
+        self.assertEqual(
+            key,
+            "workspaces/workspace-a/profile/profile-a/layout/v2/"
+            f"{incarnation}/{'a' * 64}-layout.json",
+        )
+
+    def test_v2_s3_store_is_create_only_and_reconciles_exact_existing_object(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(
+            bucket="example-artifact-bucket",
+            client=client,
+        )
+        request = {
+            "workspace_id": "workspace-a",
+            "owner_type": "profile",
+            "owner_id": "profile-a",
+            "artifact_kind": "layout",
+            "filename": "layout.json",
+            "content_type": "application/json",
+            "content": b"synthetic-layout-content",
+            "artifact_incarnation": "inc-v2-" + "c" * 64,
+            "artifact_id": "obj-v2-" + "d" * 64,
+        }
+
+        first = backend.store_artifact(**request)
+        retry = backend.store_artifact(**request)
+
+        self.assertEqual(first, retry)
+        self.assertEqual(
+            client.objects[("example-artifact-bucket", first.storage_key)]["body"],
+            b"synthetic-layout-content",
+        )
+        self.assertIn("/v2/inc-v2-", first.storage_key)
+
+    def test_v2_s3_store_rejects_foreign_existing_key_without_overwrite(self):
+        client = FakeS3Client()
+        backend = object_storage.S3CompatibleObjectStorageBackend(
+            bucket="example-artifact-bucket",
+            client=client,
+        )
+        request = {
+            "workspace_id": "workspace-a",
+            "owner_type": "profile",
+            "owner_id": "profile-a",
+            "artifact_kind": "layout",
+            "filename": "layout.json",
+            "content_type": "application/json",
+            "content": b"authorized-layout-content",
+            "artifact_incarnation": "inc-v2-" + "c" * 64,
+            "artifact_id": "obj-v2-" + "d" * 64,
+        }
+        checksum = object_storage.artifact_checksum(request["content"])
+        key = object_storage.object_artifact_key(
+            workspace_id=request["workspace_id"],
+            owner_type=request["owner_type"],
+            owner_id=request["owner_id"],
+            artifact_kind=request["artifact_kind"],
+            filename=request["filename"],
+            checksum_sha256=checksum,
+            artifact_incarnation=request["artifact_incarnation"],
+        )
+        foreign = {
+            "body": b"foreign-object-bytes",
+            "content_type": "application/json",
+            "metadata": {
+                "sqag-workspace-id": "workspace-other",
+                "sqag-owner-type": "profile",
+                "sqag-owner-id": "profile-other",
+                "sqag-artifact-kind": "layout",
+                "sqag-checksum-sha256": object_storage.artifact_checksum(b"foreign-object-bytes"),
+                "sqag-artifact-id": "obj-v2-" + "e" * 64,
+                "sqag-artifact-incarnation": "inc-v2-" + "f" * 64,
+            },
+        }
+        client.objects[("example-artifact-bucket", key)] = foreign.copy()
+
+        with self.assertRaises(object_storage.ObjectStorageContractError):
+            backend.store_artifact(**request)
+
+        self.assertEqual(client.objects[("example-artifact-bucket", key)], foreign)
 
     def test_identity_segment_separates_unchanged_and_transformed_owner_domains(self):
         long_owner = "b" * 121

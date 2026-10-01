@@ -55,8 +55,6 @@ class ObjectStorageNotFoundError(ObjectStorageContractError):
 
 
 def _provider_object_missing_error(exc: Exception) -> bool:
-    if isinstance(exc, KeyError):
-        return True
     response = getattr(exc, "response", None)
     if not isinstance(response, Mapping):
         return False
@@ -80,10 +78,21 @@ class ObjectArtifactMetadata:
     storage_key: str
     created_at: str
     updated_at: str
+    artifact_id: str = ""
+    platform_user_id: str | None = None
+    session_id: str | None = None
+    job_id: str | None = None
+    artifact_incarnation: str | None = None
+    binding_sha256: str | None = None
 
     def public_metadata(self) -> dict[str, object]:
         payload = asdict(self)
         payload.pop("storage_key", None)
+        for field_name in (
+            "artifact_id", "platform_user_id", "session_id", "job_id",
+            "artifact_incarnation", "binding_sha256",
+        ):
+            payload.pop(field_name, None)
         return payload
 
 
@@ -103,6 +112,14 @@ class ObjectStorageBackend(Protocol):
         filename: str,
         content_type: str,
         content: bytes,
+        artifact_incarnation: str | None = None,
+        artifact_id: str = "",
+        platform_user_id: str | None = None,
+        session_id: str | None = None,
+        job_id: str | None = None,
+        binding_sha256: str | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
     ) -> ObjectArtifactMetadata:
         ...
 
@@ -321,14 +338,24 @@ class S3CompatibleObjectStorageBackend:
         owner_id: str,
         artifact_kind: str,
         checksum_sha256: str,
+        artifact_id: str = "",
+        artifact_incarnation: str | None = None,
+        binding_sha256: str | None = None,
     ) -> dict[str, str]:
-        return {
+        result = {
             "sqag-workspace-id": canonical_identity(workspace_id),
             "sqag-owner-type": normalize_owner_type(owner_type),
             "sqag-owner-id": canonical_identity(owner_id),
             "sqag-artifact-kind": safe_segment(artifact_kind, ""),
             "sqag-checksum-sha256": checksum_sha256,
         }
+        if artifact_incarnation is not None:
+            result.update({
+                "sqag-artifact-id": artifact_id,
+                "sqag-artifact-incarnation": artifact_incarnation,
+                "sqag-row-snapshot-sha256": str(binding_sha256 or ""),
+            })
+        return result
 
     def _validate_remote_metadata(self, metadata: ObjectArtifactMetadata, response: Mapping[str, object]) -> None:
         remote_metadata = response.get("Metadata") if isinstance(response.get("Metadata"), Mapping) else {}
@@ -339,9 +366,29 @@ class S3CompatibleObjectStorageBackend:
             owner_id=metadata.owner_id,
             artifact_kind=metadata.artifact_kind,
             checksum_sha256=metadata.checksum_sha256,
+            artifact_id=metadata.artifact_id,
+            artifact_incarnation=metadata.artifact_incarnation,
+            binding_sha256=metadata.binding_sha256,
         )
         for key, value in expected.items():
             if normalized_remote.get(key) != value:
+                raise ObjectStorageContractError("Artifact metadata verification failed.")
+        remote_content_type = str(response.get("ContentType") or "").strip()
+        require_remote_content_type = metadata.artifact_incarnation is not None or (
+            metadata.owner_type == "profile"
+            and metadata.artifact_kind == "quotation_layout"
+        )
+        if (
+            (require_remote_content_type and remote_content_type != metadata.content_type)
+            or (remote_content_type and remote_content_type != metadata.content_type)
+        ):
+            raise ObjectStorageContractError("Artifact content type verification failed.")
+        if metadata.artifact_incarnation is not None:
+            try:
+                remote_size = int(response.get("ContentLength"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ObjectStorageContractError("Artifact metadata verification failed.") from exc
+            if remote_size != metadata.size_bytes:
                 raise ObjectStorageContractError("Artifact metadata verification failed.")
 
     def store_artifact(
@@ -354,6 +401,14 @@ class S3CompatibleObjectStorageBackend:
         filename: str,
         content_type: str,
         content: bytes,
+        artifact_incarnation: str | None = None,
+        artifact_id: str = "",
+        platform_user_id: str | None = None,
+        session_id: str | None = None,
+        job_id: str | None = None,
+        binding_sha256: str | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
     ) -> ObjectArtifactMetadata:
         if not content:
             raise ObjectStorageContractError("Artifact content is required.")
@@ -365,6 +420,7 @@ class S3CompatibleObjectStorageBackend:
             artifact_kind=artifact_kind,
             filename=filename,
             checksum_sha256=checksum,
+            artifact_incarnation=artifact_incarnation,
         )
         now = utc_timestamp()
         metadata = ObjectArtifactMetadata(
@@ -377,24 +433,49 @@ class S3CompatibleObjectStorageBackend:
             size_bytes=len(content),
             checksum_sha256=checksum,
             storage_key=key,
-            created_at=now,
-            updated_at=now,
+            created_at=created_at or now,
+            updated_at=updated_at or now,
+            artifact_id=artifact_id,
+            platform_user_id=platform_user_id,
+            session_id=session_id,
+            job_id=job_id,
+            artifact_incarnation=artifact_incarnation,
+            binding_sha256=binding_sha256,
         )
         try:
-            self.client.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=bytes(content),
-                ContentType=metadata.content_type,
-                Metadata=self._object_metadata(
+            put_arguments = {
+                "Bucket": self.bucket,
+                "Key": key,
+                "Body": bytes(content),
+                "ContentType": metadata.content_type,
+                "Metadata": self._object_metadata(
                     workspace_id=metadata.workspace_id,
                     owner_type=metadata.owner_type,
                     owner_id=metadata.owner_id,
                     artifact_kind=metadata.artifact_kind,
                     checksum_sha256=metadata.checksum_sha256,
+                    artifact_id=metadata.artifact_id,
+                    artifact_incarnation=metadata.artifact_incarnation,
+                    binding_sha256=metadata.binding_sha256,
                 ),
-            )
+            }
+            if artifact_incarnation is not None:
+                put_arguments["IfNoneMatch"] = "*"
+            self.client.put_object(**put_arguments)
         except Exception as exc:
+            if artifact_incarnation is not None:
+                try:
+                    existing = self.retrieve_artifact(
+                        metadata, workspace_id=metadata.workspace_id
+                    )
+                    if existing == bytes(content):
+                        return metadata
+                except ObjectStorageNotFoundError:
+                    pass
+                except Exception as readback_exc:
+                    raise ObjectStorageContractError(
+                        "Artifact store outcome is unavailable."
+                    ) from readback_exc
             raise ObjectStorageContractError("Artifact could not be stored.") from exc
         return metadata
 
@@ -445,6 +526,7 @@ def object_artifact_key(
     artifact_kind: str,
     filename: str,
     checksum_sha256: str,
+    artifact_incarnation: str | None = None,
 ) -> str:
     safe_workspace = identity_segment(workspace_id, "")
     safe_owner_type = normalize_owner_type(owner_type)
@@ -454,6 +536,15 @@ def object_artifact_key(
     safe_checksum = checksum_sha256 if re.fullmatch(r"[a-f0-9]{64}", checksum_sha256) else ""
     if not all((safe_workspace, safe_owner_id, safe_kind, safe_checksum)):
         raise ObjectStorageContractError("Artifact metadata is incomplete.")
+    if artifact_incarnation is not None:
+        safe_incarnation = safe_segment(artifact_incarnation, "")
+        if not re.fullmatch(r"inc-v2-[a-f0-9]{64}", safe_incarnation):
+            raise ObjectStorageContractError("Artifact incarnation is invalid.")
+        return "/".join((
+            "workspaces", safe_workspace, safe_owner_type, safe_owner_id,
+            safe_kind, "v2", safe_incarnation,
+            f"{safe_checksum}-{safe_filename}",
+        ))
     return "/".join(
         (
             "workspaces",
@@ -488,6 +579,14 @@ class InMemoryObjectStorageBackend:
         filename: str,
         content_type: str,
         content: bytes,
+        artifact_incarnation: str | None = None,
+        artifact_id: str = "",
+        platform_user_id: str | None = None,
+        session_id: str | None = None,
+        job_id: str | None = None,
+        binding_sha256: str | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
     ) -> ObjectArtifactMetadata:
         if not content:
             raise ObjectStorageContractError("Artifact content is required.")
@@ -499,6 +598,7 @@ class InMemoryObjectStorageBackend:
             artifact_kind=artifact_kind,
             filename=filename,
             checksum_sha256=checksum,
+            artifact_incarnation=artifact_incarnation,
         )
         now = utc_timestamp()
         metadata = ObjectArtifactMetadata(
@@ -511,9 +611,20 @@ class InMemoryObjectStorageBackend:
             size_bytes=len(content),
             checksum_sha256=checksum,
             storage_key=key,
-            created_at=now,
-            updated_at=now,
+            created_at=created_at or now,
+            updated_at=updated_at or now,
+            artifact_id=artifact_id,
+            platform_user_id=platform_user_id,
+            session_id=session_id,
+            job_id=job_id,
+            artifact_incarnation=artifact_incarnation,
+            binding_sha256=binding_sha256,
         )
+        existing = self._metadata.get(key)
+        if existing is not None:
+            if existing == metadata and self._objects.get(key) == bytes(content):
+                return metadata
+            raise ObjectStorageContractError("Reserved artifact identity is occupied.")
         self._objects[key] = bytes(content)
         self._metadata[key] = metadata
         return metadata
@@ -525,18 +636,45 @@ class InMemoryObjectStorageBackend:
     def retrieve_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bytes:
         self._require_workspace(metadata, workspace_id)
         content = self._objects.get(metadata.storage_key)
+        stored_metadata = self._metadata.get(metadata.storage_key)
         if content is None:
             raise ObjectStorageNotFoundError("Artifact is not available.")
+        if stored_metadata is None or not self._stored_metadata_matches(
+            stored_metadata, metadata
+        ):
+            raise ObjectStorageContractError("Artifact metadata verification failed.")
         if len(content) != metadata.size_bytes or artifact_checksum(content) != metadata.checksum_sha256:
             raise ObjectStorageContractError("Artifact integrity check failed.")
         return bytes(content)
 
+    @staticmethod
+    def _stored_metadata_matches(
+        stored: ObjectArtifactMetadata, expected: ObjectArtifactMetadata
+    ) -> bool:
+        if expected.artifact_incarnation is not None:
+            return stored == expected
+        legacy_fields = (
+            "workspace_id", "owner_type", "owner_id", "artifact_kind", "filename",
+            "content_type", "size_bytes", "checksum_sha256", "storage_key",
+        )
+        return all(
+            getattr(stored, field) == getattr(expected, field)
+            for field in legacy_fields
+        ) and stored.artifact_incarnation is None
+
     def delete_artifact(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bool:
         self._require_workspace(metadata, workspace_id)
         existed = metadata.storage_key in self._objects
+        stored_metadata = self._metadata.get(metadata.storage_key)
+        if not existed:
+            return False
+        if stored_metadata is None or not self._stored_metadata_matches(
+            stored_metadata, metadata
+        ):
+            raise ObjectStorageContractError("Artifact metadata verification failed.")
         self._objects.pop(metadata.storage_key, None)
         self._metadata.pop(metadata.storage_key, None)
-        return existed
+        return True
 
     def verify_metadata(self, metadata: ObjectArtifactMetadata, *, workspace_id: str) -> bool:
         try:

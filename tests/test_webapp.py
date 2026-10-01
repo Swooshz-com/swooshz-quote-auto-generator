@@ -1467,6 +1467,7 @@ class WebappServerTest(unittest.TestCase):
         delete_operation,
         save_operation,
         expected_save_failure=None,
+        release_save_commit_before_delete_done=False,
     ):
         boundary_entered = threading.Event()
         boundary_release = threading.Event()
@@ -1530,15 +1531,18 @@ class WebappServerTest(unittest.TestCase):
                     boundary_release.set()
                 elif first_event == 'lock_attempt':
                     boundary_release.set()
-                    self.assertTrue(
-                        delete_done.wait(5),
-                        'Serialized delete did not finish.',
-                    )
-                    if expected_save_failure is None:
-                        self.assertEqual(events.get(timeout=5), 'commit_ready')
+                    if release_save_commit_before_delete_done:
                         commit_gate.set()
                     else:
-                        self.assertTrue(save_done.wait(5), 'Expected save failure did not finish.')
+                        self.assertTrue(
+                            delete_done.wait(5),
+                            'Serialized delete did not finish.',
+                        )
+                        if expected_save_failure is None:
+                            self.assertEqual(events.get(timeout=5), 'commit_ready')
+                            commit_gate.set()
+                        else:
+                            self.assertTrue(save_done.wait(5), 'Expected save failure did not finish.')
                 else:
                     self.fail(f'Unexpected lifecycle event: {first_event}')
                 self.assertTrue(delete_done.wait(5), 'Delete thread did not finish.')
@@ -1554,7 +1558,7 @@ class WebappServerTest(unittest.TestCase):
             outcome = results.get(operation_name)
             if isinstance(outcome, Exception):
                 if operation_name != 'save' or expected_save_failure is None or not isinstance(outcome, expected_save_failure):
-                    self.fail(f'{operation_name} unexpectedly failed: {outcome}')
+                    self.fail(f"{operation_name} unexpectedly failed: {outcome!r}; cause={getattr(outcome, '__cause__', None)!r}; reason={getattr(outcome, 'reason', None)!r}")
         return results, first_event
 
     def http_json(self, runner, method: str, path: str, *, cookie: str = "", body: dict | None = None, headers: dict | None = None) -> dict:
@@ -3293,12 +3297,12 @@ class WebappServerTest(unittest.TestCase):
                 self.assertEqual(webapp.profile_selection_error(template_payload), "")
                 self.assertEqual(webapp.profile_selection_error(template_b_payload), "")
                 self.assertEqual(
-                    webapp.profile_defaults_source_for_payload(template_payload).quotation_layout_path,
-                    template_a / "quotation-layout.xlsx",
+                    webapp.profile_defaults_source_for_payload(template_payload).quotation_layout_path.resolve(),
+                    (template_a / "quotation-layout.xlsx").resolve(),
                 )
                 self.assertEqual(
-                    webapp.profile_defaults_source_for_payload(template_b_payload).quotation_layout_path,
-                    template_b / "quotation-layout.xlsx",
+                    webapp.profile_defaults_source_for_payload(template_b_payload).quotation_layout_path.resolve(),
+                    (template_b / "quotation-layout.xlsx").resolve(),
                 )
                 self.assertEqual(webapp.pricing_reference_id_from_payload(template_payload), "")
                 self.assertEqual(webapp.pricing_reference_id_from_payload(template_b_payload), "")
@@ -3324,8 +3328,8 @@ class WebappServerTest(unittest.TestCase):
                 self.assertEqual(webapp.profile_selection_error(template_payload), "")
                 self.assertEqual(webapp.load_template_profile_pack("default").id, "default")
                 self.assertEqual(
-                    webapp.load_template_profile_pack("default").quotation_layout_path,
-                    template_default / "quotation-layout.xlsx",
+                    webapp.load_template_profile_pack("default").quotation_layout_path.resolve(),
+                    (template_default / "quotation-layout.xlsx").resolve(),
                 )
                 missing_template_payload = copy.deepcopy(template_payload)
                 missing_template_payload["profile_id"] = "profile:missing-template"
@@ -4559,6 +4563,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         env = isolated_env(
             APP_MODE="deploy",
             SQAG_STORAGE_MODE="database",
+            SQAG_ARTIFACT_STORAGE_MODE="database",
             SQAG_DATABASE_URL=database_url,
             OPENAI_API_KEY="sk-test-redacted",
         )
@@ -4575,20 +4580,18 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
             "line_items": [],
         }
-        workspace_profile = {
-            "id": "hosted-draft-profile",
-            "label": "Hosted Draft Profile",
-            "default_quote_basis": {"surfaces": "Confirm: Workspace-specific walling."},
-            "fallback_line_items": [
-                {
-                    "section": "Workspace Section",
-                    "quantity_formula": "area",
-                    "unit": "sqm",
-                    "description": "Workspace fallback item",
-                    "pricing_keyword": "workspace-fallback",
-                }
-            ],
-        }
+        workspace_profile = workspace_profile_with_layout("hosted-draft-profile")
+        workspace_profile["label"] = "Hosted Draft Profile"
+        workspace_profile["default_quote_basis"] = {"surfaces": "Confirm: Workspace-specific walling."}
+        workspace_profile["fallback_line_items"] = [
+            {
+                "section": "Workspace Section",
+                "quantity_formula": "area",
+                "unit": "sqm",
+                "description": "Workspace fallback item",
+                "pricing_keyword": "workspace-fallback",
+            }
+        ]
 
         with (
             mock.patch.dict(os.environ, env, clear=True),
@@ -17087,7 +17090,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 original_cleanup = webapp._remove_quote_session_tree_without_following_redirects
 
                 def remove_metadata_then_interrupt(directory):
-                    self.assertEqual(Path(directory), session_dir)
+                    self.assertEqual(Path(directory).resolve(), session_dir.resolve())
                     metadata_path.unlink()
                     raise OSError("synthetic interruption after metadata removal")
 
@@ -31812,17 +31815,15 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
     def test_database_storage_scopes_profiles_pricing_and_sessions_by_platform_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             database_url = f"sqlite:///{(Path(tmp) / 'sqag-storage.sqlite3').as_posix()}"
-            env = {"SQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
+            env = {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_sqag_storage_migrations(database_url)
                 workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-a", membership_role="operator"))
                 workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-b", membership_role="operator"))
 
-                profile = webapp.normalize_profile_payload({
-                    "id": "team-profile",
-                    "label": "Team Profile",
-                    "defaults": {"company": {"name": "Workspace A Quote Co"}},
-                })
+                profile = workspace_profile_with_layout("team-profile")
+                profile["label"] = "Team Profile"
+                profile["defaults"]["company"]["name"] = "Workspace A Quote Co"
                 saved_profile = workspace_a.save_profile(profile)
                 self.assertEqual(saved_profile["id"], "team-profile")
                 self.assertEqual([item["id"] for item in workspace_a.list_company_profiles()], ["team-profile"])
@@ -32792,13 +32793,152 @@ main().catch((error) => {
                 self.assertIsNone(workspace_b.profile_detail("team-layout-profile", source="company"))
                 self.assertIsNone(workspace_b.profile_layout_artifact("team-layout-profile"))
 
+    def test_database_profile_save_serializes_with_delete_before_layout_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_url = f"sqlite:///{(root / 'sqag-storage.sqlite3').as_posix()}"
+            workspace_id = "workspace-database-profile-save-delete-race"
+            profile_id = "database-profile-race"
+            env = {
+                "SQAG_STORAGE_MODE": "database",
+                "SQAG_ARTIFACT_STORAGE_MODE": "database",
+                "SQAG_DATABASE_URL": database_url,
+            }
+            validation_reached = threading.Event()
+            allow_validation = threading.Event()
+            delete_begin_attempted = threading.Event()
+            delete_begin_returned = threading.Event()
+            delete_done = threading.Event()
+            save_done = threading.Event()
+            results = {}
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                seed_storage = webapp.app_storage_for_auth_session(
+                    self.platform_auth_session(workspace_id)
+                )
+                seed_storage.save_profile(workspace_profile_with_layout(profile_id))
+                save_storage = webapp.app_storage_for_auth_session(
+                    self.platform_auth_session(workspace_id)
+                )
+                delete_storage = webapp.app_storage_for_auth_session(
+                    self.platform_auth_session(workspace_id)
+                )
+                original_validate_layout = save_storage._validated_profile_layout_record
+                original_delete_connection = delete_storage.connection
+
+                def pause_after_valid_layout(candidate_id, *args, **kwargs):
+                    validated = original_validate_layout(candidate_id, *args, **kwargs)
+                    if validated is not None:
+                        validation_reached.set()
+                        if not allow_validation.wait(5):
+                            raise AssertionError("Timed out waiting to release profile validation.")
+                    return validated
+
+                @contextlib.contextmanager
+                def observed_delete_connection():
+                    with original_delete_connection() as connection:
+                        class ObservedConnection:
+                            def execute(self, sql, params=()):
+                                if clean_sql(sql).startswith("begin immediate"):
+                                    delete_begin_attempted.set()
+                                    result = connection.execute(sql, params)
+                                    delete_begin_returned.set()
+                                    return result
+                                return connection.execute(sql, params)
+
+                            def commit(self):
+                                return connection.commit()
+
+                            def rollback(self):
+                                return connection.rollback()
+
+                            def __getattr__(self, name):
+                                return getattr(connection, name)
+
+                        yield ObservedConnection()
+
+                def save_operation():
+                    return save_storage.save_profile(
+                        {"id": profile_id, "label": "Metadata-only update"}
+                    )
+
+                def delete_operation():
+                    return delete_storage.delete_profile(profile_id)
+
+                save_thread = threading.Thread(
+                    target=run_thread_operation,
+                    args=(results, "save", save_done, save_operation),
+                    daemon=True,
+                )
+                delete_thread = threading.Thread(
+                    target=run_thread_operation,
+                    args=(results, "delete", delete_done, delete_operation),
+                    daemon=True,
+                )
+                try:
+                    with (
+                        mock.patch.object(
+                            save_storage,
+                            "_validated_profile_layout_record",
+                            side_effect=pause_after_valid_layout,
+                        ),
+                        mock.patch.object(
+                            delete_storage,
+                            "connection",
+                            new=observed_delete_connection,
+                        ),
+                    ):
+                        save_thread.start()
+                        self.assertTrue(
+                            validation_reached.wait(5),
+                            "Metadata-only save did not validate its existing layout.",
+                        )
+                        delete_thread.start()
+                        self.assertTrue(
+                            delete_begin_attempted.wait(5),
+                            "Concurrent delete did not reach its SQLite write lock.",
+                        )
+                        self.assertFalse(
+                            delete_begin_returned.wait(0.1),
+                            "Delete passed its write lock while profile validation was in flight.",
+                        )
+                        allow_validation.set()
+                        self.assertTrue(save_done.wait(5), "Profile save did not finish.")
+                        self.assertTrue(delete_done.wait(5), "Profile delete did not finish.")
+                finally:
+                    allow_validation.set()
+                    save_thread.join(timeout=5)
+                    delete_thread.join(timeout=5)
+
+                with seed_storage.connection() as connection:
+                    row = connection.execute(
+                        "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                        (workspace_id, profile_id),
+                    ).fetchone()
+                    layout_row = connection.execute(
+                        "select 1 from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                        (workspace_id, "profile", profile_id, "quotation_layout"),
+                    ).fetchone()
+
+            self.assertFalse(save_thread.is_alive(), "Profile save thread remained blocked.")
+            self.assertFalse(delete_thread.is_alive(), "Profile delete thread remained blocked.")
+            self.assertIsInstance(results.get("save"), dict)
+            self.assertTrue(results.get("delete"))
+            self.assertTrue(row)
+            self.assertTrue(
+                json.loads(row["payload_json"]).get(webapp.DELETED_PROFILE_MARKER_KEY)
+            )
+            self.assertIsNone(layout_row)
+            self.assertIsNone(seed_storage.profile_detail(profile_id, source="company"))
+
     def test_database_storage_profiles_are_workspace_db_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             database_url = f"sqlite:///{(root / 'sqag-storage.sqlite3').as_posix()}"
             local_profiles_root = root / "local-profiles"
             write_test_profile_pack(local_profiles_root, "local-only-profile", "local-pricing")
-            env = {"SQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
+            env = {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(webapp, "profiles_root", return_value=local_profiles_root),
@@ -32806,11 +32946,10 @@ main().catch((error) => {
                 webapp.apply_sqag_storage_migrations(database_url)
                 workspace_a = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-profile-a"))
                 workspace_b = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-profile-b"))
-                workspace_a.save_profile(webapp.normalize_profile_payload({
-                    "id": "workspace-only-profile",
-                    "label": "Workspace Only Profile",
-                    "defaults": {"company": {"name": "Workspace A Quote Co"}},
-                }))
+                profile = workspace_profile_with_layout("workspace-only-profile")
+                profile["label"] = "Workspace Only Profile"
+                profile["defaults"]["company"]["name"] = "Workspace A Quote Co"
+                workspace_a.save_profile(profile)
 
                 self.assertEqual(
                     [(item.get("source"), item["id"]) for item in workspace_a.list_profiles()],
@@ -32910,6 +33049,70 @@ main().catch((error) => {
         self.assertIn(str(root / "tmp"), layout_path_text)
         self.assertEqual(brief["company"]["name"], valid_payload()["company"]["name"])
         self.assertEqual(brief["_webapp"]["profile"]["id"], "workspace-profile")
+
+    def test_object_mode_generation_rejects_profile_change_during_layout_read(self):
+        class MutatingBackend(webapp.InMemoryObjectStorageBackend):
+            database_path = None
+            workspace_id = ""
+            profile_id = ""
+            mutation_count = 0
+            mutate_profile = False
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                content = super().retrieve_artifact(metadata, workspace_id=workspace_id)
+                if (
+                    self.mutate_profile
+                    and self.mutation_count == 0
+                    and getattr(metadata, "owner_type", None) == "profile"
+                    and getattr(metadata, "owner_id", None) == self.profile_id
+                    and getattr(metadata, "artifact_kind", None) == "quotation_layout"
+                    and getattr(metadata, "workspace_id", None) == self.workspace_id
+                ):
+                    with contextlib.closing(sqlite3.connect(self.database_path)) as connection:
+                        cursor = connection.execute(
+                            "update sqag_profiles set updated_at = ? "
+                            "where workspace_id = ? and profile_id = ?",
+                            ("2000-01-01T00:00:00Z", self.workspace_id, self.profile_id),
+                        )
+                        connection.commit()
+                        if cursor.rowcount != 1:
+                            raise AssertionError("Expected exactly one profile row to mutate during retrieval.")
+                    self.mutation_count += 1
+                return content
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database_path = root / "sqag-storage.sqlite3"
+            database_url = f"sqlite:///{database_path.as_posix()}"
+            profile_id = "object-profile-generate-race"
+            platform_session = self.platform_auth_session("workspace-profile-generate-race")
+            payload = payload_with_workspace_pricing("workspace-pricing")
+            payload["profile_id"] = profile_id
+            env = self.hosted_storage_env(
+                SQAG_DATABASE_URL=database_url,
+                QUOTE_DATA_ROOT=str(root / "data"),
+                QUOTE_OUTPUT_ROOT=str(root / "output"),
+                QUOTE_TMP_ROOT=str(root / "tmp"),
+                QUOTE_LOG_ROOT=str(root / "logs"),
+            )
+            backend = MutatingBackend()
+            backend.database_path = database_path
+            backend.profile_id = profile_id
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            ):
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(platform_session)
+                backend.workspace_id = storage.workspace_id
+                storage.save_pricing_reference(workspace_pricing_reference("workspace-pricing"))
+                storage.save_profile(workspace_profile_with_layout(profile_id))
+                backend.mutate_profile = True
+
+                errors = webapp.validate_generation_payload(payload, auth_session=platform_session)
+
+        self.assertEqual(backend.mutation_count, 1)
+        self.assertIn(webapp.PROFILE_SELECTION_ERROR_MESSAGE, errors)
 
     def test_database_storage_pricing_references_are_workspace_db_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -33202,11 +33405,10 @@ main().catch((error) => {
             other_workspace = webapp.app_storage_for_auth_session(
                 self.platform_auth_session("workspace-snapshot-b", membership_role="admin", user_id="snapshot-admin")
             )
-            storage.save_profile(webapp.normalize_profile_payload({
-                "id": "snapshot-profile",
-                "label": "Original Snapshot Profile",
-                "defaults": {"company": {"name": "Workspace Snapshot Quote Co"}},
-            }))
+            snapshot_profile = workspace_profile_with_layout("snapshot-profile")
+            snapshot_profile["label"] = "Original Snapshot Profile"
+            snapshot_profile["defaults"]["company"]["name"] = "Workspace Snapshot Quote Co"
+            storage.save_profile(snapshot_profile)
             storage.save_pricing_reference(webapp.normalize_pricing_reference_payload({
                 "id": "snapshot-pricing",
                 "label": "Original Snapshot Pricing",
@@ -33290,7 +33492,9 @@ main().catch((error) => {
             storage = webapp.app_storage_for_auth_session(
                 self.platform_auth_session("workspace-snapshot-edit", membership_role="operator", user_id="snapshot-owner")
             )
-            storage.save_profile(webapp.normalize_profile_payload({"id": "generated-profile", "label": "Generated Profile"}))
+            generated_profile = workspace_profile_with_layout("generated-profile")
+            generated_profile["label"] = "Generated Profile"
+            storage.save_profile(generated_profile)
             storage.save_pricing_reference(workspace_pricing_reference("generated-pricing") | {"label": "Generated Pricing"})
             generated_payload = valid_payload()
             generated_payload["profile_id"] = "generated-profile"
@@ -33393,11 +33597,13 @@ main().catch((error) => {
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "sqag-storage.sqlite3"
             database_url = f"sqlite:///{db_path.as_posix()}"
-            env = {"SQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
+            env = {"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url}
             with mock.patch.dict(os.environ, env, clear=True):
                 webapp.apply_sqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-token-check"))
-                storage.save_profile(webapp.normalize_profile_payload({"id": "safe-profile", "label": "Safe Profile"}))
+                safe_profile = workspace_profile_with_layout("safe-profile")
+                safe_profile["label"] = "Safe Profile"
+                storage.save_profile(safe_profile)
                 storage.create_or_update_quote_session({
                     "quote_session": {
                         "session_id": "quote-token-safe",
@@ -33538,6 +33744,8 @@ main().catch((error) => {
     def test_object_artifact_store_failure_does_not_fallback_to_local_links_or_db_blob(self):
         class StoreFailingBackend(webapp.InMemoryObjectStorageBackend):
             def store_artifact(self, **kwargs):
+                if kwargs.get("artifact_kind") == "quotation_layout":
+                    return super().store_artifact(**kwargs)
                 raise webapp.ObjectStorageContractError("synthetic store failure")
 
         xlsx_bytes = b"synthetic-object-store-failure-xlsx"
@@ -33591,15 +33799,7 @@ main().catch((error) => {
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(platform_session)
-            profile = workspace_profile_with_layout("object-store-failure-profile")
-            profile.pop("pack", None)
-            profile.pop("_pack_assets", None)
-            storage._upsert_payload(
-                "sqag_profiles",
-                "profile_id",
-                profile["id"],
-                profile,
-            )
+            storage.save_profile(workspace_profile_with_layout("object-store-failure-profile"))
             storage.save_pricing_reference(workspace_pricing_reference("object-store-failure-pricing"))
             result = webapp.run_quote_job(
                 payload,
@@ -33612,18 +33812,25 @@ main().catch((error) => {
         with sqlite3.connect(db_path) as connection:
             quote_session_rows = connection.execute("select count(*) from sqag_quote_sessions").fetchone()[0]
             object_rows = connection.execute("select count(*) from sqag_object_artifacts").fetchone()[0]
+            quote_object_rows = connection.execute(
+                "select count(*) from sqag_object_artifacts where owner_type = 'generated_quote'"
+            ).fetchone()[0]
             blob_rows = connection.execute("select count(*) from sqag_quote_artifacts").fetchone()[0]
 
         result_text = json.dumps(result, sort_keys=True)
         self.assertEqual(run.call_count, 1)
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["errors"], ["Quote artifact storage is not available in this environment."])
+        self.assertRegex(
+            result["errors"][0],
+            r"^Failed\. Please try again\. Contact support if this keeps happening\. Reference: ERR-[A-F0-9]{8}\.$",
+        )
         self.assertNotIn("files", result)
         self.assertNotIn("/api/jobs/", result_text)
         self.assertNotIn("synthetic-object-store-failure-xlsx", result_text)
         self.assertNotIn(str(tmp_path), result_text)
         self.assertEqual(quote_session_rows, 0)
-        self.assertEqual(object_rows, 0)
+        self.assertEqual(object_rows, 1)
+        self.assertEqual(quote_object_rows, 0)
         self.assertEqual(blob_rows, 0)
 
     def test_database_artifact_storage_requires_platform_context_and_migration(self):
@@ -34317,6 +34524,9 @@ main().catch((error) => {
                     "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
                     (workspace_id, profile_id),
                 ).fetchone()
+            seed_storage.reconcile_object_artifact_lifecycle(
+                "profile", profile_id, apply_cleanup=True
+            )
 
         self.assertFalse(
             owner is None and bool(active_rows),
@@ -34406,6 +34616,7 @@ main().catch((error) => {
                 save_operation=lambda: save_storage.save_pricing_reference(
                     pricing('Replacement Concurrent Pricing', b'replacement')
                 ),
+                release_save_commit_before_delete_done=True,
             )
             owner = seed_storage.pricing_reference_detail(
                 reference_id,
@@ -34422,6 +34633,14 @@ main().catch((error) => {
                 )
                 for row in active_rows
             }
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            seed_storage.reconcile_object_artifact_lifecycle(
+                "pricing_reference", reference_id, apply_cleanup=True
+            )
 
         self.assertFalse(
             owner is None and bool(active_rows),
@@ -34443,6 +34662,130 @@ main().catch((error) => {
             {b'replacement-one', b'replacement-two'},
         )
         self.assertEqual(len(backend._objects), 2)
+
+    def test_published_receipt_survives_a_later_same_owner_operation(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"object-published-receipt-order-{time.time_ns()}"
+        database_url = f"sqlite:///{(tmp_path / 'sqag-storage.sqlite3').as_posix()}"
+        workspace_id = "workspace-published-receipt-order"
+        reference_id = "ordered-pricing"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+
+        def pricing(label, marker):
+            visual_one = (
+                "data:image/png;base64,"
+                + base64.b64encode(marker + b"-one").decode("ascii")
+            )
+            visual_two = (
+                "data:image/png;base64,"
+                + base64.b64encode(marker + b"-two").decode("ascii")
+            )
+            return webapp.normalize_pricing_reference_payload({
+                "id": reference_id,
+                "label": label,
+                "items": [with_required_pricing_metadata({
+                    "id": "ordered-pricing-row",
+                    "section": "Graphics",
+                    "description": "Ordered printed graphics",
+                    "unit_hint": "sqm",
+                    "internal_cost": 10,
+                    "markup_multiplier": 2,
+                    "visual_references": [
+                        {
+                            "source": "xl/media/visual-one.png",
+                            "anchor_row": 7,
+                            "data_url": visual_one,
+                        },
+                        {
+                            "source": "xl/media/visual-two.png",
+                            "anchor_row": 8,
+                            "data_url": visual_two,
+                        },
+                    ],
+                })],
+            })
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                webapp,
+                "configured_object_storage_backend",
+                return_value=backend,
+            ),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session(workspace_id)
+            )
+            storage.save_pricing_reference(pricing("Initial Ordered Pricing", b"initial"))
+            original_verify = storage._verify_published_object_artifact_batch
+            verified_plans = []
+
+            def record_verify(plan):
+                verified_plans.append(plan)
+                return original_verify(plan)
+
+            with mock.patch.object(
+                storage,
+                "_verify_published_object_artifact_batch",
+                side_effect=record_verify,
+            ):
+                storage.save_pricing_reference(
+                    pricing("First Published Pricing", b"first")
+                )
+                first_save_plan = verified_plans[-1]
+                self.assertTrue(
+                    storage.delete_pricing_reference(reference_id, source="company")
+                )
+                delete_plan = verified_plans[-1]
+
+                # The later delete is a valid serialized publication, so the
+                # first save's durable receipt remains verifiable.
+                self.assertTrue(
+                    storage._verify_published_object_artifact_batch(first_save_plan)
+                )
+
+                storage.save_pricing_reference(
+                    pricing("Second Published Pricing", b"second")
+                )
+
+                # A later save likewise preserves the committed delete receipt.
+                self.assertTrue(
+                    storage._verify_published_object_artifact_batch(delete_plan)
+                )
+
+            active_rows = storage._active_object_artifact_rows(
+                "pricing_reference",
+                reference_id,
+            )
+            self.assertEqual(
+                {
+                    backend.retrieve_artifact(
+                        storage._object_metadata_from_row(row),
+                        workspace_id=workspace_id,
+                    )
+                    for row in active_rows
+                },
+                {b"second-one", b"second-two"},
+            )
+
+            with storage.connection() as connection:
+                connection.execute(
+                    "drop trigger if exists sqag_object_artifact_operations_guard_update"
+                )
+                connection.execute(
+                    "update sqag_object_artifact_operations set plan_json = ? "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ? "
+                    "and operation_seq = ?",
+                    (
+                        "{}", workspace_id, first_save_plan.owner_type,
+                        first_save_plan.owner_id, first_save_plan.operation_seq,
+                    ),
+                )
+                connection.commit()
+            self.assertFalse(
+                storage._verify_published_object_artifact_batch(first_save_plan)
+            )
 
     def test_object_quote_delete_and_concurrent_export_save_are_serialized(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -34515,6 +34858,8 @@ main().catch((error) => {
                     result=result,
                     output_dir=replacement_output,
                 ),
+                expected_save_failure=webapp.SqagStorageAccessError,
+                release_save_commit_before_delete_done=True,
             )
             owner = seed_storage.get_quote_session(session_id)
             active_rows = seed_storage._active_object_artifact_rows(
@@ -34529,25 +34874,27 @@ main().catch((error) => {
                 for row in active_rows
             }
 
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            seed_storage.reconcile_object_artifact_lifecycle(
+                "generated_quote", session_id, apply_cleanup=True
+            )
+
         self.assertFalse(
             owner is None and bool(active_rows),
             f'Quote owner was deleted with active exports; first event={first_event}',
         )
         self.assertEqual(first_event, 'lock_attempt')
         self.assertTrue(results['delete'])
-        self.assertEqual(results['save']['session_id'], session_id)
-        self.assertIsNotNone(owner)
-        self.assertEqual(
-            [row['artifact_kind'] for row in active_rows],
-            ['pdf', 'xlsx'],
-        )
-        self.assertEqual(
-            active_contents,
-            {b'replacement-concurrent-pdf', b'replacement-concurrent-xlsx'},
-        )
-        self.assertEqual(len(backend._objects), 2)
-        self.assertFalse((replacement_output / 'quotation.xlsx').exists())
-        self.assertFalse((replacement_output / 'quotation.pdf').exists())
+        self.assertIsInstance(results['save'], webapp.SqagStorageAccessError)
+        self.assertIsNone(owner)
+        self.assertEqual(active_rows, [])
+        self.assertEqual(active_contents, set())
+        self.assertEqual(len(backend._objects), 0)
+        self.assertTrue((replacement_output / 'quotation.xlsx').is_file())
+        self.assertTrue((replacement_output / 'quotation.pdf').is_file())
 
     def test_object_save_in_progress_blocks_same_owner_delete_until_commit(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -34603,16 +34950,15 @@ main().catch((error) => {
             delete_commit_gate.set()
             events = queue.Queue()
             results = {}
-            original_prepare = save_storage._prepare_object_artifact_batch
+            original_stage = save_storage._stage_object_artifact_successors
 
             def pause_after_provider_staging(*args, **kwargs):
-                plan = original_prepare(*args, **kwargs)
+                original_stage(*args, **kwargs)
                 prepare_entered.set()
                 if not prepare_release.wait(5):
                     raise AssertionError(
                         'Timed out waiting to release staged profile save.'
                     )
-                return plan
 
             coordinated_delete_connection = coordinated_connection_factory(
                 delete_storage.connection,
@@ -34650,7 +34996,7 @@ main().catch((error) => {
                 with (
                     mock.patch.object(
                         save_storage,
-                        '_prepare_object_artifact_batch',
+                        '_stage_object_artifact_successors',
                         side_effect=pause_after_provider_staging,
                     ),
                     mock.patch.object(
@@ -34692,7 +35038,7 @@ main().catch((error) => {
             'lock_attempt',
             'Delete reached storage work while a same-owner save was staged.',
         )
-        self.assertNotIsInstance(results.get('save'), Exception)
+        self.assertNotIsInstance(results.get('save'), Exception, f'outcomes={results!r}')
         delete_outcome = results.get('delete')
         if isinstance(delete_outcome, Exception):
             self.assertIsInstance(delete_outcome, webapp.SqagStorageAccessError)
@@ -34844,26 +35190,22 @@ main().catch((error) => {
                 return []
 
         class RecordingConnection:
-            def __init__(self, acquired=True, fail_owner=False):
-                self.acquired = acquired
-                self.fail_owner = fail_owner
+            def __init__(self):
                 self.actions = []
                 self.closed = False
 
             def execute(self, sql, params=()):
                 normalized = clean_sql(sql)
-                self.actions.append(('execute', normalized, tuple(params)))
-                if 'pg_try_advisory_xact_lock' in normalized:
-                    return RecordingResult({'lock_acquired': self.acquired})
-                if self.fail_owner and normalized.startswith('insert into sqag_profiles'):
-                    raise sqlite3.OperationalError('synthetic owner transaction failure')
+                self.actions.append(("execute", normalized, tuple(params)))
+                if "pg_try_advisory_xact_lock" in normalized:
+                    return RecordingResult({"lock_acquired": True})
                 return RecordingResult()
 
             def commit(self):
-                self.actions.append(('commit',))
+                self.actions.append(("commit",))
 
             def rollback(self):
-                self.actions.append(('rollback',))
+                self.actions.append(("rollback",))
 
         def connection_factory(connection):
             @contextlib.contextmanager
@@ -34876,99 +35218,112 @@ main().catch((error) => {
             return open_connection
 
         env = {
-            'SQAG_STORAGE_MODE': 'database',
-            'SQAG_ARTIFACT_STORAGE_MODE': 'object',
-            'SQAG_DATABASE_URL': 'postgresql://synthetic@database.test/sqag',
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "postgresql://synthetic@database.test/sqag",
         }
         storage = webapp.DatabaseSqagStorage(
-            env['SQAG_DATABASE_URL'],
-            'workspace-postgres-lifecycle-order',
-            'owner',
+            env["SQAG_DATABASE_URL"],
+            "workspace-postgres-lifecycle-order",
+            "owner",
         )
-        profile = webapp.normalize_profile_payload({
-            'id': 'postgres-lifecycle-profile',
-            'label': 'Postgres Lifecycle Profile',
-        })
-        connection = RecordingConnection()
-        backend = webapp.InMemoryObjectStorageBackend()
 
+        profile_connection = RecordingConnection()
         with (
             mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+            mock.patch.object(storage, "ensure_object_artifact_lifecycle_ready"),
+            mock.patch.object(storage, "_resume_published_object_artifact_cleanups"),
             mock.patch.object(
                 storage,
-                'connection',
-                new=connection_factory(connection),
+                "connection",
+                new=connection_factory(profile_connection),
             ),
         ):
-            saved = storage.save_profile(profile)
+            saved, _plan = storage._run_object_lifecycle_save(
+                "profile",
+                "postgres-lifecycle-profile",
+                lambda _connection, _identities: (None, None),
+                lambda connection, _state: (
+                    connection.execute("insert into sqag_profiles (profile_id) values (?)", ("postgres-lifecycle-profile",)),
+                    {"id": "postgres-lifecycle-profile"},
+                )[1],
+            )
 
         pricing_connection = RecordingConnection()
         with (
             mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(storage, "ensure_object_artifact_lifecycle_ready"),
+            mock.patch.object(storage, "_resume_published_object_artifact_cleanups"),
             mock.patch.object(
                 storage,
-                'connection',
+                "connection",
                 new=connection_factory(pricing_connection),
             ),
         ):
-            storage.save_pricing_reference({
-                'id': 'postgres-lifecycle-pricing',
-                'label': 'Postgres Lifecycle Pricing',
-                'items': [],
-            })
+            storage._run_object_lifecycle_save(
+                "pricing_reference",
+                "postgres-lifecycle-pricing",
+                lambda connection, _identities: (
+                    connection.execute(
+                        "select artifact_id from sqag_object_artifacts where owner_id = ?",
+                        ("postgres-lifecycle-pricing",),
+                    ).fetchall(),
+                    None,
+                ),
+                lambda connection, _state: connection.execute(
+                    "insert into sqag_pricing_references (reference_id) values (?)",
+                    ("postgres-lifecycle-pricing",),
+                ),
+            )
 
         statements = [
             action[1]
-            for action in connection.actions
-            if action[0] == 'execute'
+            for action in profile_connection.actions
+            if action[0] == "execute"
         ]
         lock_index = next(
             index
             for index, statement in enumerate(statements)
-            if 'pg_try_advisory_xact_lock' in statement
-        )
-        savepoint_index = next(
-            index
-            for index, statement in enumerate(statements)
-            if statement.startswith('savepoint ')
+            if "pg_try_advisory_xact_lock" in statement
         )
         owner_index = next(
             index
             for index, statement in enumerate(statements)
-            if statement.startswith('insert into sqag_profiles')
+            if statement.startswith("insert into sqag_profiles")
         )
 
-        self.assertEqual(saved['id'], 'postgres-lifecycle-profile')
-        self.assertLess(lock_index, savepoint_index)
-        self.assertLess(savepoint_index, owner_index)
-        self.assertEqual(connection.actions[-1], ('commit',))
-        self.assertTrue(connection.closed)
+        self.assertEqual(saved["id"], "postgres-lifecycle-profile")
+        self.assertLess(lock_index, owner_index)
+        self.assertEqual(profile_connection.actions[-1], ("commit",))
+        self.assertTrue(profile_connection.closed)
         self.assertFalse(
-            any('pg_advisory_unlock' in statement for statement in statements)
+            any("pg_advisory_unlock" in statement for statement in statements)
         )
+
         pricing_statements = [
             action[1]
             for action in pricing_connection.actions
-            if action[0] == 'execute'
+            if action[0] == "execute"
         ]
         pricing_lock_index = next(
             index
             for index, statement in enumerate(pricing_statements)
-            if 'pg_try_advisory_xact_lock' in statement
+            if "pg_try_advisory_xact_lock" in statement
         )
         snapshot_index = next(
             index
             for index, statement in enumerate(pricing_statements)
-            if 'from sqag_object_artifacts' in statement
+            if "from sqag_object_artifacts" in statement
         )
         pricing_owner_index = next(
             index
             for index, statement in enumerate(pricing_statements)
-            if statement.startswith('insert into sqag_pricing_references')
+            if statement.startswith("insert into sqag_pricing_references")
         )
         self.assertLess(pricing_lock_index, snapshot_index)
         self.assertLess(snapshot_index, pricing_owner_index)
+        self.assertEqual(pricing_connection.actions[-1], ("commit",))
+        self.assertTrue(pricing_connection.closed)
 
     def test_postgres_object_lifecycle_lock_failure_and_rollback_are_fail_closed(self):
         class RecordingResult:
@@ -34988,18 +35343,18 @@ main().catch((error) => {
 
             def execute(self, sql, params=()):
                 normalized = clean_sql(sql)
-                self.actions.append(('execute', normalized, tuple(params)))
-                if 'pg_try_advisory_xact_lock' in normalized:
-                    return RecordingResult({'lock_acquired': self.acquired})
-                if self.fail_owner and normalized.startswith('insert into sqag_profiles'):
-                    raise sqlite3.OperationalError('synthetic transaction failure')
+                self.actions.append(("execute", normalized, tuple(params)))
+                if "pg_try_advisory_xact_lock" in normalized:
+                    return RecordingResult({"lock_acquired": self.acquired})
+                if self.fail_owner and normalized.startswith("insert into sqag_profiles"):
+                    raise sqlite3.OperationalError("synthetic transaction failure")
                 return RecordingResult()
 
             def commit(self):
-                self.actions.append(('commit',))
+                self.actions.append(("commit",))
 
             def rollback(self):
-                self.actions.append(('rollback',))
+                self.actions.append(("rollback",))
 
         def connection_factory(connection):
             @contextlib.contextmanager
@@ -35009,14 +35364,10 @@ main().catch((error) => {
             return open_connection
 
         env = {
-            'SQAG_STORAGE_MODE': 'database',
-            'SQAG_ARTIFACT_STORAGE_MODE': 'object',
-            'SQAG_DATABASE_URL': 'postgresql://synthetic@database.test/sqag',
+            "SQAG_STORAGE_MODE": "database",
+            "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "postgresql://synthetic@database.test/sqag",
         }
-        profile = webapp.normalize_profile_payload({
-            'id': 'postgres-lock-failure-profile',
-            'label': 'Postgres Lock Failure Profile',
-        })
         for connection in (
             RecordingConnection(acquired=False),
             RecordingConnection(acquired=True, fail_owner=True),
@@ -35026,29 +35377,38 @@ main().catch((error) => {
                 fail_owner=connection.fail_owner,
             ):
                 storage = webapp.DatabaseSqagStorage(
-                    env['SQAG_DATABASE_URL'],
-                    'workspace-postgres-lock-failure',
-                    'owner',
+                    env["SQAG_DATABASE_URL"],
+                    "workspace-postgres-lock-failure",
+                    "owner",
+                )
+                error_type = (
+                    webapp.ObjectStorageContractError
+                    if not connection.acquired
+                    else sqlite3.OperationalError
                 )
                 with (
                     mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(storage, "ensure_object_artifact_lifecycle_ready"),
+                    mock.patch.object(storage, "_resume_published_object_artifact_cleanups"),
                     mock.patch.object(
                         storage,
-                        'connection',
+                        "connection",
                         new=connection_factory(connection),
                     ),
-                    self.assertRaises(webapp.SqagStorageAccessError) as raised,
+                    self.assertRaises(error_type),
                 ):
-                    storage.save_profile(profile)
+                    storage._run_object_lifecycle_save(
+                        "profile",
+                        "postgres-lock-failure-profile",
+                        lambda _connection, _identities: (None, None),
+                        lambda active_connection, _state: active_connection.execute(
+                            "insert into sqag_profiles (profile_id) values (?)",
+                            ("postgres-lock-failure-profile",),
+                        ),
+                    )
 
-                self.assertEqual(raised.exception.status, 503)
-                self.assertEqual(
-                    str(raised.exception),
-                    webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-                )
-                self.assertNotIn('workspace-postgres-lock-failure', str(raised.exception))
-                self.assertNotIn('postgres-lock-failure-profile', str(raised.exception))
-                self.assertIn(('rollback',), connection.actions)
+                self.assertIn(("rollback",), connection.actions)
+                self.assertFalse(("commit",) in connection.actions)
 
     def test_object_quote_lifecycle_lock_failure_is_generic_and_retains_staging(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -35165,11 +35525,29 @@ main().catch((error) => {
                 'generated_quote',
                 session_id,
             )
+            self.assertEqual(len(backend._objects), 1)
+            cleanup_result = storage.reconcile_object_artifact_lifecycle(
+                "generated_quote",
+                session_id,
+                apply_cleanup=True,
+            )
+            self.assertEqual(cleanup_result["pending_cleanup_targets"], 0)
 
         self.assertEqual(tombstoned, 1)
         self.assertIsNotNone(owner)
         self.assertEqual(active_rows, [])
-        self.assertEqual(backend._objects, {})
+        self.assertEqual(len(backend._objects), 1)
+        with sqlite3.connect(db_path) as connection:
+            cleanup_json = connection.execute(
+                "select cleanup_json from sqag_object_artifact_operations "
+                "where workspace_id = ? and owner_type = ? and owner_id = ? "
+                "order by operation_seq desc limit 1",
+                (workspace_id, "generated_quote", session_id),
+            ).fetchone()[0]
+        self.assertEqual(
+            [item["state"] for item in json.loads(cleanup_json)],
+            ["retained_policy"],
+        )
 
     def test_object_artifact_storage_delete_session_tombstones_metadata_and_backend_object(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -35209,6 +35587,17 @@ main().catch((error) => {
             )
 
             self.assertTrue(storage.delete_quote_session("quote-object-delete-session"))
+            fresh_storage = webapp.DatabaseSqagStorage(
+                database_url,
+                "workspace-object-delete-session",
+                role="maintenance",
+                user_id="synthetic-reconciler",
+            )
+            cleanup_result = fresh_storage.reconcile_object_artifact_lifecycle(
+                "generated_quote",
+                "quote-object-delete-session",
+                apply_cleanup=True,
+            )
             session = storage.get_quote_session("quote-object-delete-session")
             artifact = storage.quote_session_export_artifact("quote-object-delete-session", "xlsx")
             with sqlite3.connect(db_path) as connection:
@@ -35222,6 +35611,7 @@ main().catch((error) => {
         self.assertEqual(tombstone[0], "deleted")
         self.assertEqual(tombstone[1], "deleted")
         self.assertTrue(tombstone[2])
+        self.assertEqual(cleanup_result["pending_cleanup_targets"], 0)
         with self.assertRaises(webapp.ObjectStorageContractError):
             backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-session")
 
@@ -35298,11 +35688,15 @@ main().catch((error) => {
         self.assertEqual(row_after["retention_status"], "active")
         self.assertEqual(restored, content)
 
-    def test_object_artifact_delete_failure_preserves_session_and_active_metadata(self):
+    def test_object_artifact_delete_failure_records_tombstone_and_retryable_cleanup(self):
         class DeleteFailingBackend(webapp.InMemoryObjectStorageBackend):
+            fail_deletes = True
+
             def delete_artifact(self, metadata, *, workspace_id):
-                self._require_workspace(metadata, workspace_id)
-                raise webapp.ObjectStorageContractError("synthetic delete failure")
+                if self.fail_deletes:
+                    self._require_workspace(metadata, workspace_id)
+                    raise webapp.ObjectStorageContractError("synthetic delete failure")
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
 
         backend = DeleteFailingBackend()
         tmp_path = test_temp_root() / f"object-artifact-delete-failure-{time.time_ns()}"
@@ -35339,8 +35733,7 @@ main().catch((error) => {
             storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
             row_before = storage._object_quote_artifact_row("quote-object-delete-failure", "xlsx")
             metadata_before = storage._object_metadata_from_row(row_before)
-            with self.assertRaises(webapp.SqagStorageAccessError) as raised:
-                storage.delete_quote_session("quote-object-delete-failure")
+            self.assertTrue(storage.delete_quote_session("quote-object-delete-failure"))
             session = storage.get_quote_session("quote-object-delete-failure")
             artifact = storage.quote_session_export_artifact("quote-object-delete-failure", "xlsx")
 
@@ -35350,16 +35743,67 @@ main().catch((error) => {
                 ("workspace-object-delete-failure", "quote-object-delete-failure"),
             ).fetchone()
             blob_rows = connection.execute("select count(*) from sqag_quote_artifacts").fetchone()[0]
+            cleanup_json = connection.execute(
+                "select cleanup_json from sqag_object_artifact_operations where workspace_id = ? "
+                "and owner_type = ? and owner_id = ? order by operation_seq desc limit 1",
+                ("workspace-object-delete-failure", "generated_quote", "quote-object-delete-failure"),
+            ).fetchone()[0]
 
-        self.assertEqual(raised.exception.status, 503)
-        self.assertIsNotNone(session)
-        self.assertEqual(artifact["content"], xlsx_bytes)
-        self.assertEqual(tombstone[0], "active")
-        self.assertEqual(tombstone[1], "active")
-        self.assertIsNone(tombstone[2])
+        self.assertIsNone(session)
+        self.assertIsNone(artifact)
+        self.assertEqual(tombstone[0], "deleted")
+        self.assertEqual(tombstone[1], "deleted")
+        self.assertIsNotNone(tombstone[2])
         self.assertEqual(blob_rows, 0)
         self.assertFalse((output_dir / "quotation.xlsx").exists())
         self.assertEqual(backend.retrieve_artifact(metadata_before, workspace_id="workspace-object-delete-failure"), xlsx_bytes)
+        self.assertIn('"state":"uncertain"', cleanup_json)
+        fresh_storage = webapp.DatabaseSqagStorage(
+            database_url,
+            "workspace-object-delete-failure",
+            role="maintenance",
+            user_id="synthetic-reconciler",
+        )
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            pending_result = fresh_storage.reconcile_object_artifact_lifecycle(
+                "generated_quote", "quote-object-delete-failure", apply_cleanup=True
+            )
+        self.assertEqual(pending_result["uncertain_cleanup_targets"], 1)
+        backend.fail_deletes = False
+        fresh_storage = webapp.DatabaseSqagStorage(
+            database_url,
+            "workspace-object-delete-failure",
+            role="maintenance",
+            user_id="synthetic-reconciler-restarted",
+        )
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            result = fresh_storage.reconcile_object_artifact_lifecycle(
+                "generated_quote", "quote-object-delete-failure", apply_cleanup=True
+            )
+        self.assertEqual(result["pending_cleanup_targets"], 0)
+        with sqlite3.connect(db_path) as connection:
+            final_cleanup = connection.execute(
+                "select cleanup_json from sqag_object_artifact_operations where workspace_id = ? "
+                "and owner_type = ? and owner_id = ? order by operation_seq desc limit 1",
+                ("workspace-object-delete-failure", "generated_quote", "quote-object-delete-failure"),
+            ).fetchone()[0]
+        cleanup_entries = json.loads(final_cleanup)
+        target_cleanup = [
+            entry for entry in cleanup_entries
+            if entry["snapshot"]["artifact_id"] == metadata_before.artifact_id
+        ]
+        self.assertEqual(len(target_cleanup), 1)
+        self.assertEqual(target_cleanup[0]["state"], "deleted")
+        with self.assertRaises(webapp.ObjectStorageNotFoundError):
+            backend.retrieve_artifact(
+                metadata_before, workspace_id="workspace-object-delete-failure"
+            )
 
     def test_object_profile_and_pricing_deletes_remove_remote_artifacts_before_owner_records(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -35437,12 +35881,12 @@ main().catch((error) => {
                 ("workspace-object-owner-delete", "reusable-profile-id"),
             ).fetchone()
         self.assertTrue(json.loads(tombstone[0])[webapp.DELETED_PROFILE_MARKER_KEY])
-        with self.assertRaises(webapp.ObjectStorageContractError):
+        with self.assertRaises(webapp.ObjectStorageNotFoundError):
             backend.retrieve_artifact(profile_metadata, workspace_id="workspace-object-owner-delete")
-        with self.assertRaises(webapp.ObjectStorageContractError):
+        with self.assertRaises(webapp.ObjectStorageNotFoundError):
             backend.retrieve_artifact(pricing_metadata, workspace_id="workspace-object-owner-delete")
 
-    def test_object_owner_delete_and_replacement_fail_closed_when_remote_delete_fails(self):
+    def test_object_owner_delete_publishes_tombstones_before_retryable_cleanup(self):
         class ToggleDeleteFailingBackend(webapp.InMemoryObjectStorageBackend):
             failing_keys = None
 
@@ -35492,34 +35936,51 @@ main().catch((error) => {
             original_profile_key = original_profile_row["object_key_ref"]
             backend.failing_keys = set(backend._objects)
 
-            with self.assertRaises(webapp.SqagStorageAccessError) as profile_delete:
-                storage.delete_profile("protected-profile")
-            with self.assertRaises(webapp.SqagStorageAccessError) as pricing_delete:
-                storage.delete_pricing_reference("protected-pricing")
-            with self.assertRaises(webapp.SqagStorageAccessError) as profile_replace:
+            self.assertTrue(storage.delete_profile("protected-profile"))
+            self.assertTrue(storage.delete_pricing_reference("protected-pricing"))
+            with self.assertRaises(ValueError) as profile_replace:
                 storage.save_profile(webapp.normalize_profile_payload({
                     "id": "protected-profile",
                     "label": "Replacement Profile",
                     "pack": {"quotation_layout": {"filename": "replacement-layout.xlsx", "data_url": layout_data_url}},
                 }))
 
-            current_profile_row = storage._object_artifact_row("profile", "protected-profile", "quotation_layout")
+            with sqlite3.connect(db_path) as connection:
+                current_profile_tuple = connection.execute(
+                    "select object_key_ref, status from sqag_object_artifacts "
+                    "where workspace_id = ? and artifact_id = ?",
+                    ("workspace-object-owner-delete-failure", original_profile_row["artifact_id"]),
+                ).fetchone()
+            current_profile_row = {
+                "object_key_ref": current_profile_tuple[0],
+                "status": current_profile_tuple[1],
+            }
             profiles = storage.list_company_profiles()
             pricing = storage.pricing_reference_detail("protected-pricing", source="company")
 
-        self.assertEqual(profile_delete.exception.status, 503)
-        self.assertEqual(pricing_delete.exception.status, 503)
-        self.assertEqual(profile_replace.exception.status, 503)
+        self.assertIn(webapp.DELETED_PROFILE_UPDATE_MESSAGE, str(profile_replace.exception))
         self.assertEqual(current_profile_row["object_key_ref"], original_profile_key)
-        self.assertEqual(profiles[0]["label"], "Original Profile")
-        self.assertIsNotNone(pricing)
+        self.assertEqual(current_profile_row["status"], "deleted")
+        self.assertEqual(profiles, [])
+        self.assertIsNone(pricing)
         self.assertEqual(len(backend._objects), 2)
         with sqlite3.connect(db_path) as connection:
             active_rows = connection.execute(
                 "select count(*) from sqag_object_artifacts where workspace_id = ? and status = ? and deleted_at is null",
                 ("workspace-object-owner-delete-failure", "active"),
             ).fetchone()[0]
-        self.assertEqual(active_rows, 2)
+            deleted_rows = connection.execute(
+                "select count(*) from sqag_object_artifacts where workspace_id = ? and status = ? and deleted_at is not null",
+                ("workspace-object-owner-delete-failure", "deleted"),
+            ).fetchone()[0]
+            pending_ops = connection.execute(
+                "select count(*) from sqag_object_artifact_operations where workspace_id = ? "
+                "and state = 'published' and cleanup_json like ?",
+                ("workspace-object-owner-delete-failure", '%"state":"uncertain"%'),
+            ).fetchone()[0]
+        self.assertEqual(active_rows, 0)
+        self.assertEqual(deleted_rows, 2)
+        self.assertEqual(pending_ops, 2)
 
     def test_object_owner_delete_records_partial_success_and_retries_remaining_artifacts(self):
         class FailSecondArtifactOnceBackend(webapp.InMemoryObjectStorageBackend):
@@ -35562,8 +36023,7 @@ main().catch((error) => {
                 })],
             }))
 
-            with self.assertRaises(webapp.SqagStorageAccessError):
-                storage.delete_pricing_reference("partial-delete-pricing")
+            self.assertTrue(storage.delete_pricing_reference("partial-delete-pricing"))
             reference_after_failure = storage.pricing_reference_detail("partial-delete-pricing", source="company")
             with sqlite3.connect(db_path) as connection:
                 rows_after_failure = connection.execute(
@@ -35571,19 +36031,51 @@ main().catch((error) => {
                     "where workspace_id = ? and owner_id = ? order by artifact_kind",
                     ("workspace-object-partial-delete", "partial-delete-pricing"),
                 ).fetchall()
+                cleanup_json = connection.execute(
+                    "select cleanup_json from sqag_object_artifact_operations where workspace_id = ? "
+                    "and owner_type = ? and owner_id = ? order by operation_seq desc limit 1",
+                    ("workspace-object-partial-delete", "pricing_reference", "partial-delete-pricing"),
+                ).fetchone()[0]
+            fresh_storage = webapp.DatabaseSqagStorage(
+                database_url,
+                "workspace-object-partial-delete",
+                role="maintenance",
+                user_id="synthetic-reconciler",
+            )
+            reconcile_result = fresh_storage.reconcile_object_artifact_lifecycle(
+                "pricing_reference", "partial-delete-pricing", apply_cleanup=True
+            )
+            with sqlite3.connect(db_path) as connection:
+                cleanup_after_first = connection.execute(
+                    "select cleanup_json from sqag_object_artifact_operations where workspace_id = ? "
+                    "and owner_type = ? and owner_id = ? order by operation_seq desc limit 1",
+                    ("workspace-object-partial-delete", "pricing_reference", "partial-delete-pricing"),
+                ).fetchone()[0]
+            fresh_storage = webapp.DatabaseSqagStorage(
+                database_url,
+                "workspace-object-partial-delete",
+                role="maintenance",
+                user_id="synthetic-reconciler-restarted",
+            )
+            final_reconcile = fresh_storage.reconcile_object_artifact_lifecycle(
+                "pricing_reference", "partial-delete-pricing", apply_cleanup=True
+            )
 
-            self.assertTrue(storage.delete_pricing_reference("partial-delete-pricing"))
-            reference_after_retry = storage.pricing_reference_detail("partial-delete-pricing", source="company")
-
-        self.assertIsNotNone(reference_after_failure)
+        self.assertIsNone(reference_after_failure)
         self.assertEqual(
             [(row[0], row[1], row[2], bool(row[3])) for row in rows_after_failure],
             [
                 ("visual_1_1", "deleted", "deleted", True),
-                ("visual_1_2", "active", "active", False),
+                ("visual_1_2", "deleted", "deleted", True),
             ],
         )
-        self.assertIsNone(reference_after_retry)
+        self.assertEqual(cleanup_json.count('"state":"uncertain"'), 1)
+        self.assertEqual(cleanup_json.count('"state":"deleted"'), 1)
+        self.assertEqual(cleanup_after_first.count('"state":"deleted"'), 2)
+        self.assertNotIn('"state":"pending"', cleanup_after_first)
+        self.assertNotIn('"state":"uncertain"', cleanup_after_first)
+        self.assertEqual(reconcile_result["pending_cleanup_targets"], 0)
+        self.assertEqual(final_reconcile["pending_cleanup_targets"], 0)
         self.assertEqual(backend._objects, {})
         with sqlite3.connect(db_path) as connection:
             deleted_rows = connection.execute(
@@ -35720,14 +36212,26 @@ main().catch((error) => {
             after_retry = snapshot(storage)
 
         self.assertEqual(raised.exception.status, 503)
-        self.assertEqual(after_failure, before)
+        self.assertEqual(after_failure[0], before[0])
+        self.assertEqual(after_failure[1], before[1])
+        self.assertEqual(len(after_failure[2]), 2)
         self.assertEqual(retry["label"], "Retried Atomic Profile")
         self.assertEqual(after_retry[0]["label"], "Retried Atomic Profile")
         self.assertNotEqual(
             after_retry[1]["object_key_ref"],
             before[1]["object_key_ref"],
         )
-        self.assertEqual(len(after_retry[2]), 1)
+        self.assertEqual(len(after_retry[2]), 2)
+        with sqlite3.connect(db_path) as connection:
+            operation_states = [
+                row[0]
+                for row in connection.execute(
+                    "select state from sqag_object_artifact_operations "
+                    "where owner_type = ? and owner_id = ? order by operation_seq",
+                    ("profile", "atomic-object-profile"),
+                ).fetchall()
+            ]
+        self.assertEqual(operation_states, ["published", "aborted", "published"])
 
     def test_database_profile_batch_rolls_back_layout_when_owner_upsert_fails_and_retry_succeeds(self):
         layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
@@ -35811,10 +36315,8 @@ main().catch((error) => {
         self.assertNotEqual(after_retry, before)
         self.assertEqual(after_retry[1][1], "replacement-layout.xlsx")
 
-    def test_profile_metadata_only_updates_retain_layout_without_object_provider_access(self):
+    def test_profile_metadata_only_updates_verify_and_retain_existing_layout(self):
         class CountingBackend(webapp.InMemoryObjectStorageBackend):
-            calls = None
-
             def __init__(self):
                 super().__init__()
                 self.calls = []
@@ -35843,244 +36345,720 @@ main().catch((error) => {
                     "SQAG_ARTIFACT_STORAGE_MODE": artifact_mode,
                     "SQAG_DATABASE_URL": database_url,
                 }
-                patches = [mock.patch.dict(os.environ, env, clear=True)]
-                if artifact_mode == "object":
-                    patches.append(
-                        mock.patch.object(
-                            webapp,
-                            "configured_object_storage_backend",
-                            return_value=backend,
-                        )
+                with mock.patch.dict(os.environ, env, clear=True):
+                    provider_patch = (
+                        mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend)
+                        if artifact_mode == "object"
+                        else contextlib.nullcontext()
                     )
-                with patches[0]:
-                    provider_patch = patches[1] if len(patches) > 1 else contextlib.nullcontext()
                     with provider_patch:
                         webapp.apply_sqag_storage_migrations(database_url)
                         storage = webapp.app_storage_for_auth_session(
-                            self.platform_auth_session(
-                                f"workspace-profile-metadata-only-{artifact_mode}"
-                            )
+                            self.platform_auth_session(f"workspace-profile-metadata-only-{artifact_mode}")
                         )
                         storage.save_profile(webapp.normalize_profile_payload({
                             "id": "metadata-only-profile",
                             "label": "Original Metadata Profile",
-                            "pack": {
-                                "quotation_layout": {
-                                    "filename": "quotation-layout.xlsx",
-                                    "data_url": layout_data_url,
-                                }
-                            },
+                            "pack": {"quotation_layout": {"filename": "quotation-layout.xlsx", "data_url": layout_data_url}},
                         }))
-                        original_layout = storage.profile_layout_artifact(
-                            "metadata-only-profile"
-                        )
+                        original_layout = storage.profile_layout_artifact("metadata-only-profile")
                         backend.calls.clear()
-                        saved = storage.save_profile(
-                            webapp.normalize_profile_payload({
-                                "id": "metadata-only-profile",
-                                "label": "Updated Metadata Profile",
-                            })
-                        )
+                        saved = storage.save_profile(webapp.normalize_profile_payload({
+                            "id": "metadata-only-profile",
+                            "label": "Updated Metadata Profile",
+                        }))
                         calls_after_save = list(backend.calls)
                         layout = storage.profile_layout_artifact("metadata-only-profile")
 
                 self.assertEqual(saved["label"], "Updated Metadata Profile")
-                self.assertEqual(calls_after_save, [])
+                expected_calls = [("retrieve", "quotation_layout")] if artifact_mode == "object" else []
+                self.assertEqual(calls_after_save, expected_calls)
                 self.assertEqual(layout["content"], original_layout["content"])
 
-    def test_metadata_only_profile_save_materializes_canonical_default_layout_once(self):
+    def test_database_profile_layout_with_invalid_size_fails_closed(self):
+        tmp_path = test_temp_root() / f"profile-layout-invalid-size-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url, SQAG_ARTIFACT_STORAGE_MODE="database")
+        profile_id = "synthetic-invalid-layout-size"
+        with mock.patch.dict(os.environ, env, clear=True):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-invalid-layout-size")
+            )
+            storage.save_profile(workspace_profile_with_layout(profile_id))
+            with storage.connection() as connection:
+                connection.execute(
+                    "update sqag_file_artifacts set size_bytes = ? "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    ("invalid-size", storage.workspace_id, "profile", profile_id, "quotation_layout"),
+                )
+                connection.commit()
+
+            self.assertIsNone(storage.profile_layout_artifact(profile_id))
+            self.assertNotIn(profile_id, [item["id"] for item in storage.list_company_profiles()])
+            self.assertIsNone(storage.profile_detail(profile_id, source="company"))
+            self.assertIsNone(storage.company_profile_export_payload(profile_id))
+
+    def test_metadata_only_profile_save_rejects_before_publication_without_fallbacks(self):
         class CountingBackend(webapp.InMemoryObjectStorageBackend):
             def __init__(self):
                 super().__init__()
-                self.store_calls = 0
+                self.calls = []
 
             def store_artifact(self, **kwargs):
-                self.store_calls += 1
+                self.calls.append(("store", kwargs.get("artifact_kind")))
                 return super().store_artifact(**kwargs)
 
-        expected_layout = webapp.DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.read_bytes()
-        if not webapp.embedded_layout_rules_from_xlsx_bytes(expected_layout):
-            default_rules = webapp.default_layout_rules_payload()
-            if default_rules:
-                expected_layout = webapp.xlsx_bytes_with_embedded_layout_rules(
-                    expected_layout,
-                    default_rules,
-                )
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                self.calls.append(("retrieve", metadata.artifact_kind))
+                return super().retrieve_artifact(metadata, workspace_id=workspace_id)
 
         for artifact_mode in ("database", "object"):
             with self.subTest(artifact_mode=artifact_mode):
                 backend = CountingBackend()
-                tmp_path = test_temp_root() / f"profile-default-layout-{artifact_mode}-{time.time_ns()}"
+                tmp_path = test_temp_root() / f"profile-metadata-reject-{artifact_mode}-{time.time_ns()}"
                 db_path = tmp_path / "sqag-storage.sqlite3"
                 database_url = f"sqlite:///{db_path.as_posix()}"
-                profile_id = f"metadata-default-{artifact_mode}"
                 env = {
                     "SQAG_STORAGE_MODE": "database",
                     "SQAG_ARTIFACT_STORAGE_MODE": artifact_mode,
                     "SQAG_DATABASE_URL": database_url,
                 }
-                profile = webapp.normalize_profile_payload({
-                    "id": profile_id,
-                    "label": "Metadata Default Profile",
-                })
                 with mock.patch.dict(os.environ, env, clear=True):
                     provider_patch = (
-                        mock.patch.object(
-                            webapp,
-                            "configured_object_storage_backend",
-                            return_value=backend,
-                        )
+                        mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend)
                         if artifact_mode == "object"
                         else contextlib.nullcontext()
                     )
                     with provider_patch:
                         webapp.apply_sqag_storage_migrations(database_url)
                         storage = webapp.app_storage_for_auth_session(
-                            self.platform_auth_session(
-                                f"workspace-profile-default-{artifact_mode}"
-                            )
+                            self.platform_auth_session(f"workspace-profile-metadata-reject-{artifact_mode}")
                         )
-                        first = storage.save_profile(profile)
-                        first_artifact = storage.profile_layout_artifact(profile_id)
-                        with storage.connection() as connection:
-                            first_row = connection.execute(
-                                "select updated_at from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                                (
-                                    storage.workspace_id,
-                                    "profile",
-                                    profile_id,
-                                    "quotation_layout",
-                                ),
-                            ).fetchone() if artifact_mode == "database" else None
-                        first_store_calls = backend.store_calls
+                        profile = webapp.normalize_profile_payload({
+                            "id": "metadata-only-new-profile",
+                            "label": "Synthetic Metadata Only Profile",
+                        })
+                        with (
+                            mock.patch.object(
+                                storage,
+                                "_prepare_default_profile_layout_artifact",
+                                side_effect=AssertionError("hosted saves cannot materialize a default workbook"),
+                            ),
+                            mock.patch.object(
+                                webapp,
+                                "default_layout_rules_payload",
+                                side_effect=AssertionError("hosted saves cannot read fallback layout rules"),
+                            ),
+                            self.assertRaises(ValueError),
+                        ):
+                            storage.save_profile(profile)
+                        self.assertEqual(storage.list_company_profiles(), [])
+                        self.assertIsNone(storage.profile_detail("metadata-only-new-profile", source="company"))
+                        self.assertIsNone(storage.company_profile_export_payload("metadata-only-new-profile"))
 
-                        second = storage.save_profile(profile)
-                        second_artifact = storage.profile_layout_artifact(profile_id)
-                        with storage.connection() as connection:
-                            second_row = connection.execute(
-                                "select updated_at from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                                (
-                                    storage.workspace_id,
-                                    "profile",
-                                    profile_id,
-                                    "quotation_layout",
-                                ),
-                            ).fetchone() if artifact_mode == "database" else None
+                with sqlite3.connect(db_path) as connection:
+                    profile_count = connection.execute("select count(*) from sqag_profiles").fetchone()[0]
+                    file_count = connection.execute("select count(*) from sqag_file_artifacts").fetchone()[0]
+                    object_count = connection.execute("select count(*) from sqag_object_artifacts").fetchone()[0]
+                self.assertEqual((profile_count, file_count, object_count), (0, 0, 0))
+                self.assertEqual(backend.calls, [])
 
-                self.assertEqual(first["id"], profile_id)
-                self.assertEqual(second["id"], profile_id)
-                self.assertIsNotNone(first_artifact)
-                self.assertIsNotNone(second_artifact)
-                self.assertEqual(first_artifact["content"], expected_layout)
-                self.assertEqual(second_artifact["content"], expected_layout)
-                webapp.validate_profile_layout_xlsx(first_artifact["content"])
-                if artifact_mode == "object":
-                    self.assertEqual(first_store_calls, 1)
-                    self.assertEqual(backend.store_calls, first_store_calls)
-                else:
-                    self.assertIsNotNone(first_row)
-                    self.assertEqual(first_row["updated_at"], second_row["updated_at"])
+    def test_synthetic_alpha_metadata_only_profile_stays_blocked_until_complete_reimport(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        layout_data_url = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + base64.b64encode(KONCEPT_LAYOUT.read_bytes()).decode("ascii")
+        tmp_path = test_temp_root() / f"synthetic-alpha-profile-reimport-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        profile_id = "koncept-images-pte-ltd"
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-synthetic-alpha"))
+            metadata_only = webapp.normalize_profile_payload({
+                "id": profile_id,
+                "label": "Synthetic Legacy Profile",
+            })
+            storage._upsert_payload("sqag_profiles", "profile_id", profile_id, metadata_only)
+            generated_quote = backend.store_artifact(
+                workspace_id=storage.workspace_id,
+                owner_type="generated_quote",
+                owner_id="synthetic-quote-receipt",
+                artifact_kind="xlsx",
+                filename="quotation.xlsx",
+                content_type=webapp.QUOTE_SESSION_EXPORT_CONTENT_TYPES["xlsx"],
+                content=b"synthetic-generated-quotation-workbook",
+            )
 
-    def test_metadata_only_profile_save_repairs_existing_profile_without_layout(self):
-        class CountingBackend(webapp.InMemoryObjectStorageBackend):
-            def __init__(self):
-                super().__init__()
-                self.store_calls = 0
+            self.assertEqual(storage.list_company_profiles(), [])
+            self.assertIsNone(storage.profile_detail(profile_id, source="company"))
+            self.assertIsNone(storage.profile_layout_artifact(profile_id))
+            self.assertIsNone(storage.company_profile_export_payload(profile_id))
+            with self.assertRaises(ValueError):
+                storage.save_profile(metadata_only)
+            self.assertIsNone(storage.profile_layout_artifact(profile_id))
 
-            def store_artifact(self, **kwargs):
-                self.store_calls += 1
-                return super().store_artifact(**kwargs)
+            complete_reimport = webapp.normalize_profile_payload({
+                "id": profile_id,
+                "label": "Synthetic Reimported Profile",
+                "pack": {"quotation_layout": {"filename": "synthetic-layout.xlsx", "data_url": layout_data_url}},
+            })
+            saved = storage.save_profile(complete_reimport)
+            layout = storage.profile_layout_artifact(profile_id)
+            exported = storage.company_profile_export_payload(profile_id)
 
-        expected_layout = webapp.DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.read_bytes()
-        if not webapp.embedded_layout_rules_from_xlsx_bytes(expected_layout):
-            default_rules = webapp.default_layout_rules_payload()
-            if default_rules:
-                expected_layout = webapp.xlsx_bytes_with_embedded_layout_rules(
-                    expected_layout,
-                    default_rules,
-                )
+        self.assertEqual(saved["id"], profile_id)
+        expected_layout = complete_reimport["_pack_assets"]["quotation_layout"]["bytes"]
+        self.assertEqual(layout["content"], expected_layout)
+        self.assertEqual(exported["profile"]["id"], profile_id)
+        self.assertIn("quotation_layout", exported["pack"])
+        self.assertIn(generated_quote.storage_key, backend._objects)
 
-        for artifact_mode in ("database", "object"):
-            with self.subTest(artifact_mode=artifact_mode):
-                backend = CountingBackend()
-                tmp_path = test_temp_root() / f"profile-repair-layout-{artifact_mode}-{time.time_ns()}"
-                db_path = tmp_path / "sqag-storage.sqlite3"
-                database_url = f"sqlite:///{db_path.as_posix()}"
-                profile_id = f"metadata-repair-{artifact_mode}"
-                workspace_id = f"workspace-profile-repair-{artifact_mode}"
-                env = {
-                    "SQAG_STORAGE_MODE": "database",
-                    "SQAG_ARTIFACT_STORAGE_MODE": artifact_mode,
-                    "SQAG_DATABASE_URL": database_url,
-                }
-                profile = webapp.normalize_profile_payload({
-                    "id": profile_id,
-                    "label": "Existing Metadata Profile",
-                })
-                with mock.patch.dict(os.environ, env, clear=True):
-                    provider_patch = (
-                        mock.patch.object(
-                            webapp,
-                            "configured_object_storage_backend",
-                            return_value=backend,
+    def test_profile_layout_requires_exact_workspace_profile_owner_and_binding(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        tmp_path = test_temp_root() / f"profile-layout-binding-matrix-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        profile_id = "synthetic-binding-profile"
+        workspace_id = "workspace-synthetic-binding"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        layout = workspace_profile_with_layout(profile_id)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session(workspace_id))
+            storage_other_workspace = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-synthetic-binding-other")
+            )
+            storage_other_workspace.save_profile(workspace_profile_with_layout(profile_id))
+            metadata_only_same_id = webapp.normalize_profile_payload({
+                "id": profile_id,
+                "label": "Synthetic Same-ID Metadata Only Profile",
+            })
+            storage._upsert_payload("sqag_profiles", "profile_id", profile_id, metadata_only_same_id)
+            self.assertIsNotNone(storage_other_workspace.profile_layout_artifact(profile_id))
+            self.assertIsNone(storage.profile_layout_artifact(profile_id))
+            storage.save_profile(layout)
+            storage.save_profile(workspace_profile_with_layout("synthetic-layout-donor"))
+            row = dict(storage._object_artifact_row("profile", profile_id, "quotation_layout"))
+            profile_b = webapp.normalize_profile_payload({"id": "synthetic-other-profile", "label": "Synthetic Other Profile"})
+            storage._upsert_payload("sqag_profiles", "profile_id", "synthetic-other-profile", profile_b)
+            self.assertIsNone(storage.profile_layout_artifact("synthetic-other-profile"))
+
+            corruptions = {
+                "wrong_artifact_id": {"artifact_id": "obj-v2-0000000000000000000000000000000000000000000000000000000000000000"},
+                "wrong_workspace": {"workspace_id": "workspace-other"},
+                "wrong_created_at": {"created_at": "2026-09-28T00:00:00Z"},
+                "null_session_id": {"session_id": None},
+                "whitespace_filename": {"filename": " quotation-layout.xlsx "},
+                "wrong_owner_type": {"owner_type": "generated_quote"},
+                "wrong_owner_id": {"owner_id": "synthetic-other-profile"},
+                "wrong_kind": {"artifact_kind": "visual_1_1"},
+                "deleted": {"status": "deleted", "retention_status": "deleted", "deleted_at": "2026-09-29T00:00:00Z"},
+                "stale": {"status": "stale"},
+                "stale_retention": {"retention_status": "stale"},
+                "wrong_provider": {"object_provider_type": "unsupported"},
+                "wrong_content_type": {"content_type": "application/octet-stream"},
+                "wrong_key": {"object_key_ref": "workspaces/workspace-other/profile/other/layout/object.xlsx"},
+                "wrong_size": {"size_bytes": int(row["size_bytes"]) + 1},
+                "wrong_checksum": {"checksum_sha256": "0" * 64},
+            }
+            field_names = (
+                "artifact_id", "workspace_id", "owner_type", "owner_id", "platform_user_id", "session_id", "job_id",
+                "artifact_kind", "filename", "content_type", "size_bytes", "checksum_sha256",
+                "object_provider_type", "object_key_ref", "status", "retention_status", "created_at", "updated_at", "deleted_at",
+            )
+            assignments = ", ".join(f"{field} = ?" for field in field_names)
+            for case_name, updates in corruptions.items():
+                with self.subTest(case=case_name):
+                    with storage.connection() as connection:
+                        connection.execute(
+                            f"update sqag_object_artifacts set {assignments} where artifact_id = ?",
+                            tuple(updates.get(field, row[field]) for field in field_names) + (row["artifact_id"],),
                         )
-                        if artifact_mode == "object"
-                        else contextlib.nullcontext()
-                    )
-                    with provider_patch:
-                        webapp.apply_sqag_storage_migrations(database_url)
-                        storage = webapp.app_storage_for_auth_session(
-                            self.platform_auth_session(workspace_id)
+                        connection.commit()
+                    self.assertIsNone(storage.profile_layout_artifact(profile_id))
+                    self.assertNotIn(profile_id, [item["id"] for item in storage.list_company_profiles()])
+                    with self.assertRaises(ValueError):
+                        storage.save_profile(metadata_only_same_id)
+                    with storage.connection() as connection:
+                        connection.execute(
+                            f"update sqag_object_artifacts set {assignments} where artifact_id = ?",
+                            tuple(row[field] for field in field_names) + (updates.get("artifact_id", row["artifact_id"]),),
                         )
-                        storage._upsert_payload(
-                            "sqag_profiles",
-                            "profile_id",
-                            profile_id,
-                            profile,
+                        connection.commit()
+
+    def test_profile_layout_rejects_artifact_change_during_provider_read(self):
+        tmp_path = test_temp_root() / f"profile-layout-read-race-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+
+        class ReplacingBackend(webapp.InMemoryObjectStorageBackend):
+            race = False
+            artifact_id = ""
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                content = super().retrieve_artifact(metadata, workspace_id=workspace_id)
+                if self.race:
+                    self.race = False
+                    with sqlite3.connect(db_path) as connection:
+                        connection.execute(
+                            "update sqag_object_artifacts set updated_at = ? where artifact_id = ?",
+                            ("2026-09-29T00:00:00Z", self.artifact_id),
                         )
-                        self.assertIsNone(storage.profile_layout_artifact(profile_id))
+                return content
 
-                        repaired = storage.save_profile(profile)
-                        repaired_artifact = storage.profile_layout_artifact(profile_id)
-                        with storage.connection() as connection:
-                            repaired_row = connection.execute(
-                                "select updated_at from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                                (
-                                    workspace_id,
-                                    "profile",
-                                    profile_id,
-                                    "quotation_layout",
-                                ),
-                            ).fetchone() if artifact_mode == "database" else None
-                        first_store_calls = backend.store_calls
+        backend = ReplacingBackend()
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-profile-read-race"))
+            storage.save_profile(workspace_profile_with_layout("synthetic-read-race-profile"))
+            row = storage._object_artifact_row("profile", "synthetic-read-race-profile", "quotation_layout")
+            backend.artifact_id = row["artifact_id"]
+            backend.race = True
+            artifact = storage.profile_layout_artifact("synthetic-read-race-profile")
 
-                        storage.save_profile(profile)
-                        repaired_again = storage.profile_layout_artifact(profile_id)
-                        with storage.connection() as connection:
-                            repaired_again_row = connection.execute(
-                                "select updated_at from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
-                                (
-                                    workspace_id,
-                                    "profile",
-                                    profile_id,
-                                    "quotation_layout",
-                                ),
-                            ).fetchone() if artifact_mode == "database" else None
+        self.assertIsNone(artifact)
 
-                self.assertEqual(repaired["id"], profile_id)
-                self.assertIsNotNone(repaired_artifact)
-                self.assertIsNotNone(repaired_again)
-                self.assertEqual(repaired_artifact["content"], expected_layout)
-                self.assertEqual(repaired_again["content"], expected_layout)
-                if artifact_mode == "object":
-                    self.assertEqual(first_store_calls, 1)
-                    self.assertEqual(backend.store_calls, first_store_calls)
-                else:
-                    self.assertIsNotNone(repaired_row)
+    def test_profile_layout_rejects_each_snapshot_field_changed_during_provider_read(self):
+        class MutatingBackend(webapp.InMemoryObjectStorageBackend):
+            database_path = None
+            artifact_rowid = 0
+            mutation = None
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                content = super().retrieve_artifact(metadata, workspace_id=workspace_id)
+                mutation = self.mutation
+                self.mutation = None
+                if mutation is not None:
+                    field, value = mutation
+                    with contextlib.closing(sqlite3.connect(self.database_path)) as connection:
+                        connection.execute(
+                            f"update sqag_object_artifacts set {field} = ? where rowid = ?",
+                            (value, self.artifact_rowid),
+                        )
+                        connection.commit()
+                return content
+
+        profile_id = "synthetic-all-snapshot-fields"
+        tmp_path = test_temp_root() / f"profile-all-snapshot-fields-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        backend = MutatingBackend()
+        backend.database_path = db_path
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-all-snapshot-fields")
+            )
+            storage.save_profile(workspace_profile_with_layout(profile_id))
+            row = dict(storage._object_artifact_row("profile", profile_id, "quotation_layout"))
+            with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                backend.artifact_rowid = connection.execute(
+                    "select rowid from sqag_object_artifacts where workspace_id = ? "
+                    "and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (storage.workspace_id, "profile", profile_id, "quotation_layout"),
+                ).fetchone()[0]
+
+            alternate_key = webapp.object_artifact_key(
+                workspace_id=row["workspace_id"],
+                owner_type=row["owner_type"],
+                owner_id=row["owner_id"],
+                artifact_kind=row["artifact_kind"],
+                filename=row["filename"],
+                checksum_sha256=row["checksum_sha256"],
+                artifact_incarnation="inc-v2-" + "f" * 64,
+            )
+            changes = {
+                "artifact_id": "obj-v2-" + "f" * 64,
+                "workspace_id": "workspace-other-snapshot",
+                "owner_type": "uploaded_reference",
+                "owner_id": "other-profile-snapshot",
+                "platform_user_id": "other-platform-user",
+                "session_id": "other-session",
+                "job_id": "other-job",
+                "artifact_kind": "visual_1_1",
+                "filename": "changed-layout.xlsx",
+                "content_type": "application/octet-stream",
+                "size_bytes": row["size_bytes"] + 1,
+                "checksum_sha256": "1" * 64,
+                "object_provider_type": "unsupported-provider",
+                "object_key_ref": alternate_key,
+                "status": "stale",
+                "retention_status": "stale",
+                "created_at": "2000-01-01T00:00:00Z",
+                "updated_at": "2000-01-01T00:00:00Z",
+                "deleted_at": "2000-01-01T00:00:00Z",
+            }
+            self.assertEqual(len(changes), 19)
+            for field, value in changes.items():
+                with self.subTest(field=field):
+                    backend.mutation = (field, value)
+                    self.assertIsNone(storage.profile_layout_artifact(profile_id))
+                    with contextlib.closing(sqlite3.connect(db_path)) as connection:
+                        connection.execute(
+                            f"update sqag_object_artifacts set {field} = ? where rowid = ?",
+                            (row[field], backend.artifact_rowid),
+                        )
+                        connection.commit()
                     self.assertEqual(
-                        repaired_row["updated_at"],
-                        repaired_again_row["updated_at"],
+                        dict(storage._object_artifact_row("profile", profile_id, "quotation_layout")),
+                        row,
                     )
+
+    def test_profile_layout_rejects_profile_change_or_deletion_after_provider_read(self):
+        class MutatingBackend(webapp.InMemoryObjectStorageBackend):
+            def __init__(self, database_path):
+                super().__init__()
+                self.database_path = database_path
+                self.profile_id = ""
+                self.mutation = ""
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                content = super().retrieve_artifact(metadata, workspace_id=workspace_id)
+                mutation = self.mutation
+                self.mutation = ""
+                if mutation == "change":
+                    with sqlite3.connect(self.database_path) as connection:
+                        row = connection.execute(
+                            "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+                            (workspace_id, self.profile_id),
+                        ).fetchone()
+                        payload = json.loads(row[0])
+                        payload["label"] = "Changed during provider retrieval"
+                        connection.execute(
+                            "update sqag_profiles set payload_json = ? where workspace_id = ? and profile_id = ?",
+                            (json.dumps(payload, ensure_ascii=True, sort_keys=True), workspace_id, self.profile_id),
+                        )
+                elif mutation == "delete":
+                    with sqlite3.connect(self.database_path) as connection:
+                        connection.execute(
+                            "delete from sqag_profiles where workspace_id = ? and profile_id = ?",
+                            (workspace_id, self.profile_id),
+                        )
+                return content
+
+        for mutation in ("change", "delete"):
+            with self.subTest(mutation=mutation):
+                profile_id = f"synthetic-profile-snapshot-{mutation}"
+                tmp_path = test_temp_root() / f"profile-snapshot-{mutation}-{time.time_ns()}"
+                db_path = tmp_path / "sqag-storage.sqlite3"
+                database_url = f"sqlite:///{db_path.as_posix()}"
+                backend = MutatingBackend(db_path)
+                backend.profile_id = profile_id
+                env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+                ):
+                    webapp.apply_sqag_storage_migrations(database_url)
+                    storage = webapp.app_storage_for_auth_session(
+                        self.platform_auth_session(f"workspace-profile-snapshot-{mutation}")
+                    )
+                    storage.save_profile(workspace_profile_with_layout(profile_id))
+                    row = storage._object_artifact_row(
+                        "profile", profile_id, "quotation_layout"
+                    )
+                    metadata = storage._object_metadata_from_row(row)
+                    original = backend.retrieve_artifact(
+                        metadata, workspace_id=storage.workspace_id
+                    )
+
+                    backend.mutation = mutation
+                    self.assertIsNone(storage.profile_layout_artifact(profile_id))
+                    self.assertEqual(
+                        backend.retrieve_artifact(metadata, workspace_id=storage.workspace_id),
+                        original,
+                    )
+                    self.assertEqual(
+                        storage._object_artifact_row("profile", profile_id, "quotation_layout")["status"],
+                        "active",
+                    )
+
+    def test_profile_layout_rejects_same_bytes_at_substituted_incarnation(self):
+        class RebindingBackend(webapp.InMemoryObjectStorageBackend):
+            database_path = None
+            artifact_id = ""
+            replacement_key = ""
+            rebind_next_read = False
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                if self.rebind_next_read:
+                    self.rebind_next_read = False
+                    with sqlite3.connect(self.database_path) as connection:
+                        connection.execute(
+                            "update sqag_object_artifacts set object_key_ref = ? where workspace_id = ? and artifact_id = ?",
+                            (self.replacement_key, workspace_id, self.artifact_id),
+                        )
+                return super().retrieve_artifact(metadata, workspace_id=workspace_id)
+
+        backend = RebindingBackend()
+        profile_id = "synthetic-substituted-incarnation"
+        tmp_path = test_temp_root() / f"profile-substituted-incarnation-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        backend.database_path = db_path
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-substituted-incarnation")
+            )
+            profile = workspace_profile_with_layout(profile_id)
+            content = profile["_pack_assets"]["quotation_layout"]["bytes"]
+            storage.save_profile(profile)
+            row = dict(storage._object_artifact_row("profile", profile_id, "quotation_layout"))
+            original_snapshot = storage._artifact_row_snapshot(row)
+            original_metadata = storage._object_metadata_from_snapshot(original_snapshot)
+            replacement_incarnation = "inc-v2-" + "e" * 64
+            replacement_key = webapp.object_artifact_key(
+                workspace_id=row["workspace_id"],
+                owner_type=row["owner_type"],
+                owner_id=row["owner_id"],
+                artifact_kind=row["artifact_kind"],
+                filename=row["filename"],
+                checksum_sha256=row["checksum_sha256"],
+                artifact_incarnation=replacement_incarnation,
+            )
+            replacement_row = dict(row)
+            replacement_row["object_key_ref"] = replacement_key
+            replacement_metadata = storage._object_metadata_from_snapshot(
+                storage._artifact_row_snapshot(replacement_row)
+            )
+            stored = backend.store_artifact(
+                workspace_id=replacement_metadata.workspace_id,
+                owner_type=replacement_metadata.owner_type,
+                owner_id=replacement_metadata.owner_id,
+                artifact_kind=replacement_metadata.artifact_kind,
+                filename=replacement_metadata.filename,
+                content_type=replacement_metadata.content_type,
+                content=content,
+                artifact_incarnation=replacement_metadata.artifact_incarnation,
+                artifact_id=replacement_metadata.artifact_id,
+                platform_user_id=replacement_metadata.platform_user_id,
+                session_id=replacement_metadata.session_id,
+                job_id=replacement_metadata.job_id,
+                binding_sha256=replacement_metadata.binding_sha256,
+                created_at=replacement_metadata.created_at,
+                updated_at=replacement_metadata.updated_at,
+            )
+            self.assertEqual(stored, replacement_metadata)
+            self.assertEqual(
+                backend.retrieve_artifact(replacement_metadata, workspace_id=storage.workspace_id),
+                content,
+            )
+
+            backend.artifact_id = row["artifact_id"]
+            backend.replacement_key = replacement_key
+            backend.rebind_next_read = True
+            self.assertIsNone(storage.profile_layout_artifact(profile_id))
+            self.assertEqual(
+                backend.retrieve_artifact(original_metadata, workspace_id=storage.workspace_id),
+                content,
+            )
+            current = storage._object_artifact_row("profile", profile_id, "quotation_layout")
+            self.assertEqual(current["object_key_ref"], replacement_key)
+
+    def test_hosted_profile_export_import_round_trip_preserves_layout_and_idempotency(self):
+        class CountingBackend(webapp.InMemoryObjectStorageBackend):
+            def __init__(self):
+                super().__init__()
+                self.stores = 0
+                self.deletes = 0
+
+            def store_artifact(self, **kwargs):
+                self.stores += 1
+                return super().store_artifact(**kwargs)
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                self.deletes += 1
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
+
+        backend = CountingBackend()
+        tmp_path = test_temp_root() / f"hosted-profile-export-roundtrip-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-profile-export-roundtrip"))
+            storage.save_profile(workspace_profile_with_layout("synthetic-export-roundtrip"))
+            before = dict(storage._object_artifact_row("profile", "synthetic-export-roundtrip", "quotation_layout"))
+            exported = storage.company_profile_export_payload("synthetic-export-roundtrip")
+            self.assertIn("quotation_layout", exported["pack"])
+            imported = webapp.normalize_profile_payload(exported)
+            storage.save_profile(imported)
+            after = dict(storage._object_artifact_row("profile", "synthetic-export-roundtrip", "quotation_layout"))
+            layout = storage.profile_layout_artifact("synthetic-export-roundtrip")
+            exported_bytes = base64.b64decode(exported["pack"]["quotation_layout"]["data_url"].split(",", 1)[1])
+
+        self.assertEqual(layout["content"], exported_bytes)
+        imported_layout_bytes = imported["_pack_assets"]["quotation_layout"]["bytes"]
+        self.assertEqual(layout["content"], imported_layout_bytes)
+        self.assertEqual(after["artifact_id"], before["artifact_id"])
+        self.assertEqual(after["object_key_ref"], before["object_key_ref"])
+        self.assertEqual(after["updated_at"], before["updated_at"])
+        self.assertEqual(after["platform_user_id"], before["platform_user_id"])
+        self.assertEqual(backend.stores, 1)
+        self.assertEqual(backend.deletes, 0)
+
+    def test_hosted_profile_import_retry_after_lost_commit_response_reuses_binding(self):
+        class CountingBackend(webapp.InMemoryObjectStorageBackend):
+            def __init__(self):
+                super().__init__()
+                self.store_count = 0
+                self.delete_count = 0
+
+            def store_artifact(self, **kwargs):
+                self.store_count += 1
+                return super().store_artifact(**kwargs)
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                self.delete_count += 1
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
+
+        backend = CountingBackend()
+        tmp_path = test_temp_root() / f"profile-lost-commit-response-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        profile_id = "synthetic-lost-commit-response"
+        profile = workspace_profile_with_layout(profile_id)
+        state = {"commit_count": 0, "lost_publication_response": False}
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-lost-commit-response")
+            )
+            original_connection = storage.connection
+
+            @contextlib.contextmanager
+            def connection_with_lost_commit_response():
+                with original_connection() as connection:
+                    class LostCommitResponse:
+                        def commit(self):
+                            connection.commit()
+                            state["commit_count"] += 1
+                            if state["commit_count"] == 2:
+                                state["lost_publication_response"] = True
+                                raise sqlite3.OperationalError(
+                                    "synthetic publication commit response lost"
+                                )
+
+                        def __getattr__(self, name):
+                            return getattr(connection, name)
+
+                    yield LostCommitResponse()
+
+            with mock.patch.object(
+                storage,
+                "connection",
+                connection_with_lost_commit_response,
+            ):
+                saved = storage.save_profile(profile)
+                first_row = dict(
+                    storage._object_artifact_row(
+                        "profile",
+                        profile_id,
+                        "quotation_layout",
+                    )
+                )
+                self.assertIsNotNone(storage.profile_detail(profile_id, source="company"))
+                retried = storage.save_profile(profile)
+                second_row = dict(
+                    storage._object_artifact_row(
+                        "profile",
+                        profile_id,
+                        "quotation_layout",
+                    )
+                )
+                self.assertEqual(saved["id"], profile_id)
+                self.assertEqual(retried["id"], profile_id)
+                self.assertEqual(first_row, second_row)
+                self.assertTrue(state["lost_publication_response"])
+                self.assertEqual(backend.store_count, 1)
+                self.assertEqual(backend.delete_count, 0)
+
+            with sqlite3.connect(db_path) as connection:
+                profile_rows = connection.execute(
+                    "select count(*) from sqag_profiles where workspace_id = ? and profile_id = ?",
+                    (storage.workspace_id, profile_id),
+                ).fetchone()[0]
+                artifact_rows = connection.execute(
+                    "select count(*) from sqag_object_artifacts where workspace_id = ? "
+                    "and owner_type = ? and owner_id = ? and artifact_kind = ? "
+                    "and status = ? and retention_status = ? and deleted_at is null",
+                    (
+                        storage.workspace_id,
+                        "profile",
+                        profile_id,
+                        "quotation_layout",
+                        "active",
+                        "active",
+                    ),
+                ).fetchone()[0]
+
+        self.assertEqual((profile_rows, artifact_rows), (1, 1))
+
+    def test_metadata_only_profile_update_rejects_unavailable_layout_provider(self):
+        class ReadUnavailableBackend(webapp.InMemoryObjectStorageBackend):
+            fail_reads = False
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                if self.fail_reads:
+                    raise webapp.ObjectStorageContractError(
+                        "synthetic object provider unavailable"
+                    )
+                return super().retrieve_artifact(metadata, workspace_id=workspace_id)
+
+        backend = ReadUnavailableBackend()
+        tmp_path = test_temp_root() / f"profile-layout-provider-unavailable-{time.time_ns()}"
+        db_path = tmp_path / "sqag-storage.sqlite3"
+        database_url = f"sqlite:///{db_path.as_posix()}"
+        env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+        profile_id = "synthetic-unavailable-layout-update"
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+        ):
+            webapp.apply_sqag_storage_migrations(database_url)
+            storage = webapp.app_storage_for_auth_session(
+                self.platform_auth_session("workspace-unavailable-layout-update")
+            )
+            storage.save_profile(workspace_profile_with_layout(profile_id))
+            backend.fail_reads = True
+            with self.assertRaises(ValueError):
+                storage.save_profile({"id": profile_id, "label": "Must Not Publish"})
+            self.assertEqual(storage.list_company_profiles(), [])
+            self.assertIsNone(storage.profile_detail(profile_id, source="company"))
+            self.assertIsNone(storage.company_profile_export_payload(profile_id))
+            backend.fail_reads = False
+            detail = storage.profile_detail(profile_id, source="company")
+
+        self.assertEqual(detail["label"], "Workspace Profile")
 
     def test_explicit_custom_profile_layout_is_idempotent_and_changed_content_updates_once(self):
         class CountingBackend(webapp.InMemoryObjectStorageBackend):
@@ -36117,8 +37095,13 @@ main().catch((error) => {
         with zipfile.ZipFile(io.BytesIO(original_layout)) as source:
             with zipfile.ZipFile(changed_buffer, "w", compression=zipfile.ZIP_DEFLATED) as target:
                 for info in source.infolist():
-                    target.writestr(info, source.read(info.filename))
-                target.comment = b"sqag-run-377-custom-layout-change"
+                    content = source.read(info.filename)
+                    if info.filename == "xl/workbook.xml":
+                        content = content.replace(
+                            b"</workbook>",
+                            b"<!--synthetic-layout-revision--></workbook>",
+                        )
+                    target.writestr(info, content)
         changed_layout = changed_buffer.getvalue()
         webapp.validate_profile_layout_xlsx(changed_layout)
 
@@ -36138,6 +37121,8 @@ main().catch((error) => {
                     }
                 }
             return webapp.normalize_profile_payload(payload)
+
+        changed_canonical_layout = profile(changed_layout, "Changed Custom Layout")["_pack_assets"]["quotation_layout"]["bytes"]
 
         for artifact_mode in ("database", "object"):
             with self.subTest(artifact_mode=artifact_mode):
@@ -36289,8 +37274,8 @@ main().catch((error) => {
                                 changed_row["updated_at"],
                             )
                             self.assertEqual(changed_snapshot[:2], first_snapshot[:2])
-                            self.assertEqual(changed_snapshot[2], len(changed_layout))
-                            self.assertEqual(changed_snapshot[3], changed_layout)
+                            self.assertEqual(changed_snapshot[2], len(changed_canonical_layout))
+                            self.assertEqual(changed_snapshot[3], changed_canonical_layout)
                             self.assertEqual(changed_snapshot[4], first_snapshot[4])
                         else:
                             backend.calls.clear()
@@ -36312,19 +37297,19 @@ main().catch((error) => {
                             ))
                             self.assertNotEqual(changed_row["object_key_ref"], first_snapshot["object_key_ref"])
                             self.assertNotEqual(changed_row["artifact_id"], first_snapshot["artifact_id"])
-                            self.assertEqual(changed_row["created_at"], first_snapshot["created_at"])
+                            self.assertNotEqual(changed_row["created_at"], first_snapshot["created_at"])
                             self.assertEqual(
                                 backend.retrieve_artifact(
                                     storage._object_metadata_from_row(changed_row),
                                     workspace_id=workspace_id,
                                 ),
-                                changed_layout,
+                                changed_canonical_layout,
                             )
 
                         metadata_only = storage.save_profile(profile(label="Metadata Only Update"))
                         self.assertEqual(metadata_only["label"], "Metadata Only Update")
                         preserved = storage.profile_layout_artifact("idempotent-custom-profile")
-                        self.assertEqual(preserved["content"], changed_layout)
+                        self.assertEqual(preserved["content"], changed_canonical_layout)
 
     def test_object_custom_profile_layout_cross_user_idempotency_preserves_attribution(self):
         class CountingBackend(webapp.InMemoryObjectStorageBackend):
@@ -36358,8 +37343,13 @@ main().catch((error) => {
         with zipfile.ZipFile(io.BytesIO(original_layout)) as source:
             with zipfile.ZipFile(changed_buffer, "w", compression=zipfile.ZIP_DEFLATED) as target:
                 for info in source.infolist():
-                    target.writestr(info, source.read(info.filename))
-                target.comment = b"sqag-run-384-custom-layout-change"
+                    content = source.read(info.filename)
+                    if info.filename == "xl/workbook.xml":
+                        content = content.replace(
+                            b"</workbook>",
+                            b"<!--synthetic-layout-revision--></workbook>",
+                        )
+                    target.writestr(info, content)
         changed_layout = changed_buffer.getvalue()
         webapp.validate_profile_layout_xlsx(changed_layout)
 
@@ -36379,6 +37369,8 @@ main().catch((error) => {
                     }
                 }
             return webapp.normalize_profile_payload(payload)
+
+        changed_canonical_layout = profile(changed_layout, "Cross User Changed Layout")["_pack_assets"]["quotation_layout"]["bytes"]
 
         object_artifact_columns = (
             "artifact_id",
@@ -36525,7 +37517,7 @@ main().catch((error) => {
                 storage_b.save_profile(profile(changed_layout, "Cross User Changed Layout"))
             changed_row = object_row()
             changed_metadata = storage_b._object_metadata_from_row(changed_row)
-            changed_checksum = webapp.artifact_checksum(changed_layout)
+            changed_checksum = webapp.artifact_checksum(changed_canonical_layout)
             changed_key = webapp.object_artifact_key(
                 workspace_id=workspace_id,
                 owner_type="profile",
@@ -36533,6 +37525,9 @@ main().catch((error) => {
                 artifact_kind="quotation_layout",
                 filename="custom-layout.xlsx",
                 checksum_sha256=changed_checksum,
+                artifact_incarnation=storage_b._artifact_incarnation_from_key(
+                    changed_row["object_key_ref"]
+                ),
             )
 
             self.assertEqual(changed_upsert.call_count, 1)
@@ -36548,13 +37543,13 @@ main().catch((error) => {
             self.assertNotEqual(changed_row["updated_at"], second_row["updated_at"])
             self.assertEqual(changed_row["filename"], second_row["filename"])
             self.assertEqual(changed_row["content_type"], second_row["content_type"])
-            self.assertEqual(changed_row["size_bytes"], len(changed_layout))
+            self.assertEqual(changed_row["size_bytes"], len(changed_canonical_layout))
             self.assertEqual(changed_row["status"], "active")
             self.assertEqual(changed_row["retention_status"], "active")
             self.assertIsNone(changed_row["deleted_at"])
             self.assertNotIn(second_row["object_key_ref"], backend._objects)
             self.assertEqual(len(backend._objects), 1)
-            self.assertEqual(profile_layout_bytes(storage_b, changed_row), changed_layout)
+            self.assertEqual(profile_layout_bytes(storage_b, changed_row), changed_canonical_layout)
             with self.assertRaises(webapp.ObjectStorageContractError):
                 backend.retrieve_artifact(
                     storage_b._object_metadata_from_row(second_row),
@@ -36738,19 +37733,13 @@ main().catch((error) => {
         self.assertEqual(
             [(row["artifact_kind"], row["status"], bool(row["deleted_at"])) for row in rows_after_failure],
             [
-                ("visual_1_1", "deleted", True),
+                ("visual_1_1", "active", False),
                 ("visual_1_2", "active", False),
             ],
         )
-        self.assertEqual(len(objects_after_failure), 1)
-        self.assertEqual(
-            deletes_before_retry,
-            ["visual_1_1", "visual_1_2"],
-        )
-        self.assertEqual(
-            backend.deleted_kinds,
-            ["visual_1_1", "visual_1_2", "visual_1_2"],
-        )
+        self.assertEqual(len(objects_after_failure), 2)
+        self.assertEqual(deletes_before_retry, [])
+        self.assertEqual(backend.deleted_kinds, ["visual_1_1", "visual_1_2"])
         self.assertTrue(retry)
         self.assertEqual(backend._objects, {})
 
@@ -37277,18 +38266,16 @@ main().catch((error) => {
             )
 
             backend.fail_kind = "visual_1_2"
-            with self.assertRaises(webapp.SqagStorageAccessError) as pricing_failure:
-                storage.save_pricing_reference(pricing(1, "Failed Pricing"))
+            storage.save_pricing_reference(pricing(1, "Updated Pricing"))
             backend.fail_kind = "pdf"
             new_output = tmp_path / "out" / "new"
             new_output.mkdir(parents=True)
             (new_output / "quotation.xlsx").write_bytes(b"new-xlsx")
-            with self.assertRaises(webapp.SqagStorageAccessError) as quote_failure:
-                storage.create_or_update_quote_session(
-                    payload,
-                    result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
-                    output_dir=new_output,
-                )
+            storage.create_or_update_quote_session(
+                payload,
+                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                output_dir=new_output,
+            )
 
             reference = storage.pricing_reference_detail("protected-omitted-pricing", source="company")
             session = storage.get_quote_session("quote-object-omitted-failure")
@@ -37307,12 +38294,10 @@ main().catch((error) => {
                 )
             ]
 
-        self.assertEqual(pricing_failure.exception.status, 503)
-        self.assertEqual(quote_failure.exception.status, 503)
-        self.assertEqual(reference["label"], "Original Pricing")
-        self.assertEqual(pricing_kinds, ["visual_1_1", "visual_1_2"])
-        self.assertEqual(quote_kinds, ["pdf", "xlsx"])
-        self.assertTrue(session["exports"]["pdf"]["exists"])
+        self.assertEqual(reference["label"], "Updated Pricing")
+        self.assertEqual(pricing_kinds, ["visual_1_1"])
+        self.assertEqual(quote_kinds, ["xlsx"])
+        self.assertFalse(session["exports"]["pdf"]["exists"])
         self.assertEqual(len(backend._objects), 4)
 
     def test_database_replacements_remove_omitted_pricing_visuals_and_quote_exports(self):
@@ -37533,7 +38518,20 @@ main().catch((error) => {
             public_after = storage.get_quote_session("quote-batch-pdf-failure")
 
         self.assertEqual(raised.exception.status, 503)
-        self.assertEqual(after, before)
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[2], before[2])
+        self.assertEqual(len(after[1]), len(before[1]) + 1)
+        self.assertTrue(set(before[1].items()).issubset(set(after[1].items())))
+        staged_keys = set(after[1]) - set(before[1])
+        self.assertEqual(len(staged_keys), 1)
+        self.assertTrue(all("/v2/" in key for key in staged_keys))
+        with sqlite3.connect(db_path) as connection:
+            journal_state = connection.execute(
+                "select state from sqag_object_artifact_operations where workspace_id = ? "
+                "and owner_type = ? and owner_id = ? order by operation_seq desc limit 1",
+                ("workspace-object-quote-batch-pdf-failure", "generated_quote", "quote-batch-pdf-failure"),
+            ).fetchone()[0]
+        self.assertEqual(journal_state, "prepared")
         self.assertTrue(public_after["exports"]["xlsx"]["exists"])
         self.assertTrue(public_after["exports"]["pdf"]["exists"])
         self.assertTrue((new_output / "quotation.xlsx").is_file())
@@ -37698,7 +38696,20 @@ main().catch((error) => {
             after = snapshot(storage)
 
         self.assertEqual(raised.exception.status, 503)
-        self.assertEqual(after, before)
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[2], before[2])
+        self.assertEqual(len(after[1]), len(before[1]) + 1)
+        self.assertTrue(set(before[1].items()).issubset(set(after[1].items())))
+        staged_keys = set(after[1]) - set(before[1])
+        self.assertEqual(len(staged_keys), 1)
+        self.assertTrue(all("/v2/" in key for key in staged_keys))
+        with sqlite3.connect(db_path) as connection:
+            journal_state = connection.execute(
+                "select state from sqag_object_artifact_operations where workspace_id = ? "
+                "and owner_type = ? and owner_id = ? order by operation_seq desc limit 1",
+                ("workspace-object-pricing-batch-failure", "pricing_reference", "pricing-batch-failure"),
+            ).fetchone()[0]
+        self.assertEqual(journal_state, "prepared")
 
     def test_database_multi_artifact_batches_roll_back_pricing_and_quote_state(self):
         tmp_path = test_temp_root() / f"database-artifact-batch-rollback-{time.time_ns()}"
@@ -37890,12 +38901,13 @@ main().catch((error) => {
                 return False
 
             def execute(self, sql, params=()):
-                self.queries.append((sql, tuple(params)))
+                normalized = sql.lower()
+                self.queries.append((normalized, tuple(params)))
                 result = types.SimpleNamespace(rowcount=1)
-                if "pg_try_advisory_xact_lock" in sql.lower():
-                    result.fetchone = lambda: {"lock_acquired": True}
-                elif "legal_hold = ?" in sql.lower():
+                if "legal_hold = ?" in normalized:
                     result.fetchone = lambda: None
+                elif "select payload_json from sqag_profiles" in normalized:
+                    result.fetchone = lambda: {"payload_json": "{}"}
                 else:
                     result.fetchone = lambda: {"active_count": 0}
                 result.fetchall = lambda: []
@@ -37914,15 +38926,20 @@ main().catch((error) => {
             user_id="postgres-delete-user",
         )
         connection = RecordingConnection()
-        backend = webapp.InMemoryObjectStorageBackend()
         metadata = webapp.blank_quote_session_metadata(
             "quote-object-postgres-delete",
             "2026-07-11T00:00:00Z",
         )
+
+        def run_owner_delete(owner_type, owner_id, delete_owner, authorize=None, **_kwargs):
+            if authorize is not None and not authorize(connection):
+                return False
+            return delete_owner(connection)
+
         with (
             mock.patch.object(webapp, "configured_artifact_storage_mode", return_value="object"),
-            mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
             mock.patch.object(storage, "connection", return_value=connection),
+            mock.patch.object(storage, "_run_object_owner_delete", side_effect=run_owner_delete),
             mock.patch.object(
                 storage,
                 "_read_quote_session_metadata_for_workspace",
@@ -37939,7 +38956,7 @@ main().catch((error) => {
             self.assertTrue(storage.delete_pricing_reference("postgres-object-pricing"))
             self.assertTrue(storage.delete_quote_session("quote-object-postgres-delete"))
 
-        executed_sql = " ".join(sql.lower() for sql, _params in connection.queries)
+        executed_sql = " ".join(sql for sql, _params in connection.queries)
         self.assertNotIn("sqag_file_artifacts", executed_sql)
         self.assertNotIn("sqag_quote_artifacts", executed_sql)
         self.assertIn("sqag_profiles", executed_sql)
@@ -38287,6 +39304,67 @@ main().catch((error) => {
         self.assertEqual(profile_rows, 0)
         self.assertEqual(object_rows, 0)
         self.assertEqual(blob_rows, 0)
+
+    def test_profile_layout_readback_and_compensation_fail_closed(self):
+        class ReadbackBackend(webapp.InMemoryObjectStorageBackend):
+            def __init__(self, *, fail_compensation):
+                super().__init__()
+                self.fail_compensation = fail_compensation
+                self.delete_attempts = 0
+
+            def retrieve_artifact(self, metadata, *, workspace_id):
+                content = super().retrieve_artifact(metadata, workspace_id=workspace_id)
+                return bytes([content[0] ^ 1]) + content[1:]
+
+            def delete_artifact(self, metadata, *, workspace_id):
+                self.delete_attempts += 1
+                if self.fail_compensation:
+                    raise webapp.ObjectStorageContractError("synthetic compensation failure")
+                return super().delete_artifact(metadata, workspace_id=workspace_id)
+
+        for fail_compensation in (False, True):
+            with self.subTest(fail_compensation=fail_compensation):
+                backend = ReadbackBackend(fail_compensation=fail_compensation)
+                tmp_path = test_temp_root() / f"profile-layout-readback-{int(fail_compensation)}-{time.time_ns()}"
+                db_path = tmp_path / "sqag-storage.sqlite3"
+                database_url = f"sqlite:///{db_path.as_posix()}"
+                env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
+                profile_id = f"synthetic-readback-profile-{int(fail_compensation)}"
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+                ):
+                    webapp.apply_sqag_storage_migrations(database_url)
+                    storage = webapp.app_storage_for_auth_session(
+                        self.platform_auth_session(f"workspace-profile-readback-{int(fail_compensation)}")
+                    )
+                    with self.assertRaises(webapp.SqagStorageAccessError) as raised:
+                        storage.save_profile(workspace_profile_with_layout(profile_id))
+                    self.assertEqual(
+                        str(raised.exception),
+                        webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                    )
+                    self.assertEqual(storage.list_company_profiles(), [])
+                    self.assertIsNone(storage.profile_detail(profile_id, source="company"))
+                    self.assertIsNone(storage.profile_layout_artifact(profile_id))
+                    self.assertIsNone(storage.company_profile_export_payload(profile_id))
+
+                with sqlite3.connect(db_path) as connection:
+                    profile_rows = connection.execute("select count(*) from sqag_profiles").fetchone()[0]
+                    object_rows = connection.execute("select count(*) from sqag_object_artifacts").fetchone()[0]
+                    operation_states = [
+                        row[0]
+                        for row in connection.execute(
+                            "select state from sqag_object_artifact_operations "
+                            "where workspace_id = ? and owner_type = ? and owner_id = ? "
+                            "order by operation_seq",
+                            (f"workspace-profile-readback-{int(fail_compensation)}", "profile", profile_id),
+                        ).fetchall()
+                    ]
+                self.assertEqual((profile_rows, object_rows), (0, 0))
+                self.assertEqual(operation_states, ["prepared"])
+                self.assertEqual(backend.delete_attempts, 0)
+                self.assertEqual(len(backend._objects), 1)
 
     def test_database_artifact_storage_does_not_persist_raw_platform_launch_token(self):
         raw_launch_token = self.synthetic_platform_launch_token()
