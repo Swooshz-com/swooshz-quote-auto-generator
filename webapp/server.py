@@ -642,21 +642,24 @@ RICH_TEXT_DETAIL_KEYS = {
 DRAFT_ANALYSIS_MODE_STANDARD = "standard"
 DRAFT_ANALYSIS_MODE_HIGH_QUALITY = "high_quality"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-OPENAI_DRAFT_MODEL = "gpt-5.5"
-OPENAI_BASIS_LINE_MODEL = "gpt-5.4-mini"
-OPENAI_BASIS_ANSWER_MODEL = "gpt-5.4-nano"
-OPENAI_DRAFT_REASONING_EFFORT = "high"
-OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT = "xhigh"
+OPENAI_DRAFT_MODEL = "gpt-6-luna"
+OPENAI_DRAFT_HIGH_QUALITY_MODEL = "gpt-6-sol"
+OPENAI_BASIS_LINE_MODEL = "gpt-6-luna"
+OPENAI_BASIS_ANSWER_MODEL = "gpt-6-luna"
+OPENAI_DRAFT_REASONING_EFFORT = "max"
+OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT = "high"
+OPENAI_SMALL_REASONING_EFFORT = "high"
 OPENAI_API_KEY_ENV_NAME = "OPENAI_API_KEY"
 OPENAI_DRAFT_MODEL_ENV_NAME = "OPENAI_DRAFT_MODEL"
+OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_MODEL"
 OPENAI_BASIS_LINE_MODEL_ENV_NAME = "OPENAI_BASIS_LINE_MODEL"
 OPENAI_BASIS_ANSWER_MODEL_ENV_NAME = "OPENAI_BASIS_ANSWER_MODEL"
 OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_REASONING_EFFORT"
 OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
 OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
-OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 OPENAI_MODEL_REASONING_EFFORTS = {
-    "gpt-5.5": frozenset({"none", "low", "high", "xhigh"}),
+    "gpt-6-luna": frozenset({"high", "max"}),
+    "gpt-6-sol": frozenset({"high"}),
 }
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
@@ -9790,9 +9793,12 @@ def request_deepseek_json_object(
 
 
 def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: dict[str, Any], api_key: str) -> dict[str, Any]:
+    model = configured_openai_basis_line_model()
+    validate_openai_small_route_model(model)
     body = {
-        "model": configured_openai_basis_line_model(),
+        "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": build_pricing_catalog_import_prompt(source_name, content, tax)}]}],
+        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
         "max_output_tokens": 4000,
     }
     request = urllib.request.Request(OPENAI_RESPONSES_URL, data=json.dumps(body).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
@@ -9807,9 +9813,12 @@ def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: d
 
 
 def request_openai_pricing_catalog_metadata(source_name: str, items: list[dict[str, Any]], api_key: str) -> dict[str, Any]:
+    model = configured_openai_basis_line_model()
+    validate_openai_small_route_model(model)
     body = {
-        "model": configured_openai_basis_line_model(),
+        "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": build_pricing_catalog_metadata_prompt(source_name, items)}]}],
+        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
         "max_output_tokens": 12000,
     }
     request = urllib.request.Request(OPENAI_RESPONSES_URL, data=json.dumps(body).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
@@ -18403,7 +18412,11 @@ def draft_analysis_mode(payload: dict[str, Any] | None = None) -> str:
 
 
 def configured_openai_draft_model(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
-    _ = mode
+    if mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
+        return safe_segment(
+            read_dotenv_value(OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME),
+            OPENAI_DRAFT_HIGH_QUALITY_MODEL,
+        )
     return safe_segment(read_dotenv_value(OPENAI_DRAFT_MODEL_ENV_NAME), OPENAI_DRAFT_MODEL)
 
 
@@ -18416,7 +18429,23 @@ def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STA
 
 
 def supported_openai_draft_reasoning_efforts(model: str) -> set[str] | frozenset[str]:
-    return OPENAI_MODEL_REASONING_EFFORTS.get(model, OPENAI_REASONING_EFFORTS)
+    return OPENAI_MODEL_REASONING_EFFORTS.get(model, frozenset())
+
+
+def openai_request_configuration_invalid() -> None:
+    raise OpenAIAnalysisError(
+        "AI request configuration is invalid.",
+        diagnostics={"failure_boundary": "request_validation", "attempt_number": 0},
+    )
+
+
+def validate_openai_small_route_model(model: str, effort: str = OPENAI_SMALL_REASONING_EFFORT) -> None:
+    if (
+        model != OPENAI_BASIS_LINE_MODEL
+        or effort != OPENAI_SMALL_REASONING_EFFORT
+        or effort not in supported_openai_draft_reasoning_efforts(model)
+    ):
+        openai_request_configuration_invalid()
 
 
 def configured_openai_basis_line_model() -> str:
@@ -23326,6 +23355,18 @@ def validate_draft_responses_envelope(body: Any, analysis_mode: str) -> tuple[by
         draft_request_invalid()
     configured_model = configured_openai_draft_model(analysis_mode)
     configured_effort = configured_openai_draft_reasoning_effort(analysis_mode)
+    expected_model = (
+        OPENAI_DRAFT_HIGH_QUALITY_MODEL
+        if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY
+        else OPENAI_DRAFT_MODEL
+    )
+    expected_effort = (
+        OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
+        if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY
+        else OPENAI_DRAFT_REASONING_EFFORT
+    )
+    if configured_model != expected_model or configured_effort != expected_effort:
+        draft_request_invalid()
     if body["model"] != configured_model:
         draft_request_invalid()
     if body["reasoning"] != {"effort": configured_effort}:
@@ -23591,9 +23632,11 @@ def request_openai_basis_chat_with_model(
     model: str,
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    validate_openai_small_route_model(model)
     body = {
         "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": build_basis_chat_prompt(payload, auth_session=auth_session)}]}],
+        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
         "max_output_tokens": 1200,
     }
     request = urllib.request.Request(
@@ -23664,6 +23707,8 @@ def request_openai_basis_chat(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     models = openai_basis_chat_models(payload)
+    for model in models:
+        validate_openai_small_route_model(model)
     errors: list[str] = []
     for index, model in enumerate(models):
         attempt_started_at = time.perf_counter()

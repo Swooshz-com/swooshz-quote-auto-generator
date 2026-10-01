@@ -119,11 +119,11 @@ def openai_response(payload: dict) -> mock.MagicMock:
 class AIBasisChatStressTest(unittest.TestCase):
     def openai_models(self, name: str) -> str:
         if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-            return "gpt-draft-pro-test"
-        if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-            return "gpt-basis-line-mini-test"
-        if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-            return "gpt-basis-answer-nano-test"
+            return "gpt-6-luna"
+        if name == webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME:
+            return "gpt-6-sol"
+        if name in {webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME, webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME}:
+            return "gpt-6-luna"
         return ""
 
     def test_re_chaos_prompts_start_on_basis_line_model(self):
@@ -146,10 +146,13 @@ class AIBasisChatStressTest(unittest.TestCase):
                             self.assertNotIn("{", str(exc))
 
                 bodies = [json.loads(call.args[0].data.decode("utf-8")) for call in urlopen.call_args_list]
-                self.assertEqual(bodies[0]["model"], "gpt-basis-line-mini-test")
-                self.assertNotIn("gpt-draft-pro-test", [body["model"] for body in bodies])
+                self.assertEqual(bodies[0]["model"], "gpt-6-luna")
+                self.assertEqual(bodies[0]["reasoning"], {"effort": "high"})
+                self.assertNotIn("gpt-6-sol", [body["model"] for body in bodies])
                 if result:
                     self.assertEqual(result["status"], "answered")
+                    self.assertEqual(result["type"], "proposal")
+                    self.assertEqual(set(result["proposal"]), {"message", "quote_basis", "quote_basis_sections", "line_items"})
 
     def test_re_bad_basis_line_output_does_not_retry_draft_model(self):
         payload = stress_payload()
@@ -169,7 +172,9 @@ class AIBasisChatStressTest(unittest.TestCase):
                     webapp.request_openai_basis_chat(payload, "sk-test-redacted")
 
         models = [json.loads(call.args[0].data.decode("utf-8"))["model"] for call in urlopen.call_args_list]
-        self.assertEqual(models, ["gpt-basis-line-mini-test"])
+        self.assertEqual(models, ["gpt-6-luna"])
+        sent_body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(sent_body["reasoning"], {"effort": "high"})
 
     def test_ask_for_changes_chaos_prompts_use_answer_model(self):
         for prompt in ASK_FOR_CHANGES_CHAOS_PROMPTS:
@@ -188,8 +193,36 @@ class AIBasisChatStressTest(unittest.TestCase):
 
                 body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
                 self.assertEqual(webapp.basis_chat_required_intent(payload), "answer")
-                self.assertEqual(body["model"], "gpt-basis-answer-nano-test")
+                self.assertEqual(body["model"], "gpt-6-luna")
+                self.assertEqual(body["reasoning"], {"effort": "high"})
                 self.assertEqual(result["status"], "answered")
+                self.assertEqual(result["type"], "answer")
+                self.assertEqual(set(result), {"status", "type", "source", "ai_used", "answer"})
+
+    def test_invalid_explicit_openai_small_route_model_fails_before_transport(self):
+        payload = stress_payload()
+        payload["basis_chat"] = {
+            "question": "what does this mean?",
+            "scope": "quote",
+            "field": "",
+            "line_index": -1,
+            "line": "",
+        }
+        def dotenv(name):
+            if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
+                return "gpt-6-sol"
+            if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
+                return "gpt-6-luna"
+            return ""
+
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
+            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+                with self.assertRaises(webapp.OpenAIAnalysisError) as caught:
+                    webapp.request_openai_basis_chat(payload, "sk-test-redacted")
+        urlopen.assert_not_called()
+        self.assertEqual(caught.exception.diagnostics["failure_boundary"], "request_validation")
+        self.assertEqual(caught.exception.diagnostics["attempt_number"], 0)
+        self.assertNotIn("gpt-6-sol", str(caught.exception) + json.dumps(caught.exception.diagnostics))
 
     def test_wrong_shape_responses_fail_cleanly_without_mutating_payload(self):
         cases = [

@@ -76,25 +76,25 @@ classes. Prompt text, filenames, media/base64, private identifiers/URLs, model
 configuration values, credentials, headers, and raw provider bodies are excluded.
 The fingerprint is not evidence of historical failure causation.
 
-The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates configured reasoning effort against the configured model; current `gpt-5.5` accepts only `none`, `low`, `high`, and `xhigh`.
+The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates each full-draft model and reasoning pair: normal Analyse is `gpt-6-luna` with `max`; High Quality is `gpt-6-sol` with `high`. The model and effort are configured independently for the two modes.
 
-Reasoning configuration is fail-closed at that final boundary. The standard path reads
-`OPENAI_DRAFT_REASONING_EFFORT`; the High Quality path reads
-`OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT` independently. After existing
-normalization, blank effective values use `high` and `xhigh` respectively, while
-every nonempty value is preserved for model compatibility validation. For each
-selected variable, the deterministic matrix is: absent, empty, or whitespace-only
-maps to the mode default; `none`, `low`, `high`, and `xhigh` send exactly once;
-`minimal`, `medium`, `bogus`, `max`, `ultra`, and synthetic private canaries reject
-with `failure_boundary=request_validation`, `attempt_number=0`, and zero sends.
-Normalized accepted input such as ` HIGH ` remains accepted, normalized unsupported
-input such as ` BoGuS ` remains rejected, and the unselected variable cannot affect
-the selected mode. High Quality aliases retain their existing mode semantics.
-Reader tests cover missing, empty, whitespace, dotenv, and process-override values
-using mocked dotenv access. Final-envelope tests cover unsupported configured/body
-efforts, configured/body mismatch, and model mismatch; `draft_quote_basis` must
-propagate request validation without local starter fallback. Run the focused oracle
-with `python -m unittest tests.test_openai_draft_request_contract`.
+Reasoning configuration is fail-closed at that final boundary. Normal Analyse reads
+`OPENAI_DRAFT_MODEL` and `OPENAI_DRAFT_REASONING_EFFORT`; High Quality reads
+`OPENAI_DRAFT_HIGH_QUALITY_MODEL` and
+`OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Blank effective values use the
+mode defaults. Explicit model or effort mismatches reject with
+`failure_boundary=request_validation`, `attempt_number=0`, and zero sends. The
+normal route accepts only Luna/max; the current High Quality fallback is
+Sol/high. Luna low and medium reasoning are not accepted. Unknown model IDs
+fail closed. Use `gpt-6.1-sol` for High Quality only after a privacy-safe,
+read-only check confirms that exact API model ID for the configured account.
+High Quality aliases retain their existing mode semantics. Reader tests cover
+missing, empty, whitespace, dotenv, and process-override values using mocked
+dotenv access. Final-envelope tests cover unsupported configured/body efforts,
+configured/body mismatch, invalid explicit models, and model mismatch;
+`draft_quote_basis` must propagate request validation without local starter
+fallback. Run the focused oracle with
+`python -m unittest tests.test_openai_draft_request_contract`.
 
 Contract coverage includes exact Responses field sets, invalid envelopes, whole
 request rejection, one-send failures, privacy canaries, and N-1/N/N+1 boundaries
