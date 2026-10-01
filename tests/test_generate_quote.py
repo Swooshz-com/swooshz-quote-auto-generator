@@ -571,6 +571,91 @@ def continuation_acceptance_fidelity_case():
     return brief, lines[:22]
 
 
+def run016_optional_text_pagination_case():
+    brief, lines = header_fidelity_case()
+    lines = lines[:19]
+    lines[-1].description = (
+        "Run-016 synthetic render and print clearance detail "
+        + "with repeated measurements and documentation " * 2
+    )
+    notes = [
+        f"Run-016 note {index:02d}: long optional text requires controlled horizontal reflow and continuation admission across the print page boundary."
+        for index in range(1, 11)
+    ]
+    brief.update({
+        "payment_terms": [],
+        "terms_heading": "",
+        "notes_heading": "Notes",
+        "standard_notes": notes,
+    })
+    return brief, lines
+
+
+def long_optional_text_pagination_case():
+    brief, lines = run016_optional_text_pagination_case()
+    payment_terms = [
+        "PAYMENT MILESTONE: 50% deposit becomes due after the approved quotation and scope are received in writing by the project team before fabrication begins.",
+        "FINAL MILESTONE: Remaining 50% is due before delivery after the completed exhibit has been reviewed and approved by the client at the venue.",
+    ]
+    notes = [
+        f"Standard note {index:02d}: the client must confirm dimensions, surface finishes, electrical details, delivery windows, and site access in writing before fabrication starts; later changes require a written scope review."
+        for index in range(1, 7)
+    ]
+    rich_payment_terms = [
+        "<div>PAYMENT MILESTONE: <strong>50% deposit</strong> becomes due after the approved quotation and scope are received in writing by the project team before fabrication begins.</div>",
+        "<div>FINAL MILESTONE: <em>Remaining 50%</em> is due before delivery after the completed exhibit has been reviewed and approved by the client at the venue.</div>",
+    ]
+    rich_notes = [
+        "<div>Standard note 01: the client must confirm dimensions, surface finishes, electrical details, delivery windows, and <u>site access</u> in writing before fabrication starts; later changes require a written scope review.</div>",
+        *[f"<div>{html.escape(note)}</div>" for note in notes[1:]],
+    ]
+    brief.update({
+        "terms_heading": "Payment Terms",
+        "payment_terms": payment_terms,
+        "notes_heading": "Standard Notes",
+        "standard_notes": notes,
+        "rich_text": {
+            "termsHeading": "<div><strong>Payment Terms</strong></div>",
+            "paymentTerms": "".join(rich_payment_terms),
+            "notesHeading": "<div><strong>Standard Notes</strong></div>",
+            "standardNotes": "".join(rich_notes),
+        },
+    })
+    return brief, lines
+
+
+def optional_text_capacity_case(entry_kind, row_count):
+    brief, lines = header_fidelity_case()
+    lines = lines[:14]
+    for line in lines:
+        line.section = "Capacity Boundary"
+    row_texts = ["BOLDITALICUNDERLINE" + "x" * 45]
+    row_texts.extend(f"R{index:03d}" + "x" * 60 for index in range(1, row_count))
+    full_text = "".join(row_texts)
+    rich_html = (
+        "<div><strong>"
+        + row_texts[0][:4]
+        + "</strong><em>"
+        + row_texts[0][4:10]
+        + "</em><u>"
+        + row_texts[0][10:19]
+        + "</u>"
+        + html.escape(row_texts[0][19:] + "".join(row_texts[1:]))
+        + "</div>"
+    )
+    brief.update({
+        "terms_heading": "",
+        "payment_terms": [full_text] if entry_kind == "payment_terms" else [],
+        "notes_heading": "",
+        "standard_notes": [full_text] if entry_kind == "standard_notes" else [],
+        "rich_text": {
+            "paymentTerms": rich_html if entry_kind == "payment_terms" else "",
+            "standardNotes": rich_html if entry_kind == "standard_notes" else "",
+        },
+    })
+    return brief, lines, full_text, row_texts
+
+
 def pdf_text_bbox(textpage, phrase):
     text = textpage.get_text_range() or ""
     start = text.find(phrase)
@@ -583,6 +668,42 @@ def pdf_text_bbox(textpage, phrase):
     ]
     if not boxes:
         raise AssertionError(f"PDF text phrase has no measurable characters: {phrase!r}")
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def normalized_pdf_phrase_bbox(textpage, phrase):
+    text = textpage.get_text_range() or ""
+    normalized_characters = []
+    source_indexes = []
+    previous_space = False
+    for index, character in enumerate(text):
+        if character.isspace():
+            if normalized_characters and not previous_space:
+                normalized_characters.append(" ")
+                source_indexes.append(index)
+            previous_space = True
+        else:
+            normalized_characters.append(character)
+            source_indexes.append(index)
+            previous_space = False
+
+    normalized = "".join(normalized_characters).strip()
+    expected = re.sub(r"\s+", " ", phrase).strip()
+    start = normalized.find(expected)
+    if start < 0:
+        raise AssertionError(f"PDF text does not contain {expected!r}: {normalized[:400]!r}")
+    boxes = [
+        textpage.get_charbox(source_indexes[index])
+        for index in range(start, start + len(expected))
+        if not normalized[index].isspace()
+    ]
+    if not boxes:
+        raise AssertionError(f"PDF text phrase has no measurable characters: {expected!r}")
     return (
         min(box[0] for box in boxes),
         min(box[1] for box in boxes),
@@ -607,6 +728,24 @@ def pdf_phrase_font_weights(textpage, phrase):
         if font is not None:
             weights.append(font.get_weight())
     return weights
+
+
+def pdf_phrase_font_names(textpage, phrase):
+    text = textpage.get_text_range() or ""
+    start = text.find(phrase)
+    if start < 0:
+        raise AssertionError(f"PDF text does not contain {phrase!r}")
+    names = []
+    for index in range(start, start + len(phrase)):
+        if text[index].isspace():
+            continue
+        text_object = textpage.get_textobj(index)
+        if text_object is None:
+            continue
+        font = text_object.get_font()
+        if font is not None:
+            names.append(font.get_base_name())
+    return names
 
 
 def raster_bbox(image, pixel_predicate):
@@ -2735,6 +2874,666 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             row = quote.parse_cell_ref(find_cell_ref(sheet, label))[0]
             self.assertEqual(float(cell_value(sheet, f"E{row}")), expected)
 
+    def test_run016_optional_text_is_wrapped_and_admitted_to_manual_pages(self):
+        brief, lines = run016_optional_text_pagination_case()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+                styles = ET.fromstring(zf.read("xl/styles.xml"))
+                drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
+
+        breaks = row_break_ids(sheet)
+        self.assertEqual(breaks, [55, 116])
+        planned_pages = len(breaks) + 1
+        self.assertEqual(planned_pages, 3)
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+
+        grand_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total including GST"))[0]
+        legacy_heading_row = grand_row + 3
+        legacy_first_note_row = legacy_heading_row + 1
+        legacy_last_note_row = legacy_first_note_row + len(brief["standard_notes"]) - 1
+        self.assertEqual((legacy_first_note_row, legacy_last_note_row), (114, 123))
+        self.assertEqual(quote.manual_page_end_for_row(legacy_first_note_row), 116)
+        self.assertLessEqual(legacy_first_note_row, 116)
+        self.assertGreater(legacy_last_note_row, 116)
+        self.assertEqual(
+            quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT,
+            117,
+        )
+
+        heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Notes"))[0]
+        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        self.assertEqual(heading_row, 122)
+        numbered_rows = {}
+        for row_number in range(heading_row + 1, acceptance_row):
+            label = cell_value(sheet, f"A{row_number}")
+            if label in {f"{index:.2f}" for index in range(1, len(brief["standard_notes"]) + 1)}:
+                numbered_rows[int(float(label))] = row_number
+        self.assertEqual(numbered_rows[1], 123)
+        self.assertGreaterEqual(numbered_rows[2], quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT + quote.CONTINUATION_BODY_OFFSET)
+
+        merges = set(merge_refs(sheet))
+        self.assertIn(f"A{heading_row}:I{heading_row}", merges)
+        self.assertEqual(alignment_for_style(styles, cell_style(sheet, f"A{heading_row}")).attrib.get("wrapText"), "1")
+        for index, note in enumerate(brief["standard_notes"], start=1):
+            first_row = numbered_rows[index]
+            next_row = numbered_rows.get(index + 1, acceptance_row)
+            actual = " ".join(cell_value(sheet, f"B{row_number}") for row_number in range(first_row, next_row))
+            self.assertEqual(re.sub(r"\s+", " ", actual).strip(), re.sub(r"\s+", " ", note).strip())
+            content_rows = [
+                row_number
+                for row_number in range(first_row, next_row)
+                if cell_value(sheet, f"B{row_number}")
+            ]
+            self.assertEqual(
+                {manual_print_page_for_row(row_number) for row_number in content_rows},
+                {manual_print_page_for_row(first_row)},
+            )
+            for row_number in range(first_row, next_row):
+                text = cell_value(sheet, f"B{row_number}")
+                if not text:
+                    continue
+                page_start = quote.continuation_page_start_for_row(row_number)
+                self.assertIsNotNone(page_start)
+                self.assertGreaterEqual(row_number, page_start + quote.CONTINUATION_BODY_OFFSET)
+                self.assertLessEqual(row_number, quote.manual_page_end_for_row(row_number))
+                self.assertIn(f"B{row_number}:I{row_number}", merges)
+                style = cell_style(sheet, f"B{row_number}")
+                self.assertEqual(alignment_for_style(styles, style).attrib.get("wrapText"), "1")
+                self.assertLessEqual(
+                    sum(quote.optional_text_character_width(character) for character in text),
+                    quote.OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
+                )
+
+        for row_number in range(117, 122):
+            self.assertEqual(cell_value(sheet, f"B{row_number}"), "")
+        self.assertEqual(find_cell_refs(sheet, "Pos."), ["A20", "A58"])
+
+        logos = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}pic") is not None]
+        self.assertEqual(len(logos), planned_pages)
+        first_extent = logos[0].find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib
+        for anchor, expected_row in zip(logos, [1] + [break_id + 1 for break_id in breaks]):
+            self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, str(expected_row))
+            self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "8")
+            pic = anchor.find(f"{NS_DRAWING}pic")
+            self.assertEqual(pic.find(f"{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib, first_extent)
+            self.assertFalse(pic.find(f"{NS_DRAWING}blipFill/{NS_A}srcRect").attrib)
+
+    def test_long_terms_and_notes_wrap_completely_and_preserve_rich_text(self):
+        brief, lines = long_optional_text_pagination_case()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+                styles = ET.fromstring(zf.read("xl/styles.xml"))
+
+        breaks = row_break_ids(sheet)
+        self.assertEqual(breaks, [55, 116])
+        self.assertEqual(len(breaks) + 1, 3)
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+
+        terms_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Payment Terms"))[0]
+        notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Standard Notes"))[0]
+        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        terms_rows = [
+            row_number
+            for row_number in range(terms_heading_row + 1, notes_heading_row)
+            if cell_value(sheet, f"B{row_number}")
+        ]
+        notes_rows = [
+            row_number
+            for row_number in range(notes_heading_row + 1, acceptance_row)
+            if cell_value(sheet, f"B{row_number}")
+        ]
+        normalize = lambda value: re.sub(r"\s+", " ", value).strip()
+        self.assertEqual(
+            normalize(" ".join(cell_value(sheet, f"B{row}") for row in terms_rows)),
+            normalize(" ".join(brief["payment_terms"])),
+        )
+        self.assertEqual(
+            normalize(" ".join(cell_value(sheet, f"B{row}") for row in notes_rows)),
+            normalize(" ".join(brief["standard_notes"])),
+        )
+
+        merges = set(merge_refs(sheet))
+        self.assertIn(f"A{terms_heading_row}:I{terms_heading_row}", merges)
+        self.assertIn(f"A{notes_heading_row}:I{notes_heading_row}", merges)
+        for row_number in terms_rows + notes_rows:
+            self.assertIn(f"B{row_number}:I{row_number}", merges)
+            self.assertEqual(alignment_for_style(styles, cell_style(sheet, f"B{row_number}")).attrib.get("wrapText"), "1")
+            self.assertLessEqual(
+                sum(quote.optional_text_character_width(character) for character in cell_value(sheet, f"B{row_number}")),
+                quote.OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
+            )
+            page_start = quote.continuation_page_start_for_row(row_number)
+            if page_start is not None:
+                self.assertGreaterEqual(row_number, page_start + quote.CONTINUATION_BODY_OFFSET)
+                self.assertLessEqual(row_number, quote.manual_page_end_for_row(row_number))
+
+        term_runs = [run for row_number in terms_rows for run in cell_inline_runs(sheet, f"B{row_number}")]
+        note_runs = [run for row_number in notes_rows for run in cell_inline_runs(sheet, f"B{row_number}")]
+        self.assertIn("50% deposit", "".join(text for text, bold, _, _ in term_runs if bold))
+        self.assertIn("Remaining 50%", "".join(text for text, _, italic, _ in term_runs if italic))
+        self.assertIn("site access", "".join(text for text, _, _, underline in note_runs if underline))
+
+        signature_rows = [acceptance_row + offset for offset in (0, 4, 5, 6, 7)]
+        signature_pages = {manual_print_page_for_row(row_number) for row_number in signature_rows}
+        self.assertEqual(len(signature_pages), 1)
+        for expected in (
+            brief["acceptance"]["company_name"],
+            brief["acceptance"]["text"],
+            brief["acceptance"]["person_label"],
+            brief["acceptance"]["stamp_label"],
+            brief["acceptance"]["date_label"],
+            brief["signature"]["company_signatory"],
+            brief["signature"]["company_title"],
+            brief["signature"]["company_date_label"],
+        ):
+            self.assertTrue(find_cell_ref(sheet, expected), expected)
+
+    def _assert_optional_text_capacity_boundary(self, entry_kind, row_count):
+        brief, lines, expected_text, expected_lines = optional_text_capacity_case(entry_kind, row_count)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+                drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
+
+        self.assertEqual(
+            (
+                quote.FIRST_PRINT_PAGE_END_ROW,
+                quote.CONTINUATION_PAGE_START_ROW,
+                quote.CONTINUATION_PAGE_HEIGHT,
+                quote.CONTINUATION_TABLE_HEADER_OFFSET,
+                quote.CONTINUATION_CURRENCY_OFFSET,
+                quote.CONTINUATION_BODY_OFFSET,
+            ),
+            (55, 56, 61, 2, 3, 5),
+        )
+        self.assertEqual(quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS, 3)
+
+        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        content_rows = [
+            row_number
+            for row_number in range(quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_BODY_OFFSET, acceptance_row)
+            if cell_value(sheet, f"B{row_number}")
+        ]
+        fresh_page_capacity = (
+            quote.CONTINUATION_PAGE_HEIGHT
+            - quote.CONTINUATION_BODY_OFFSET
+            - quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
+        )
+        expected_content_rows = [
+            quote.CONTINUATION_PAGE_START_ROW
+            + quote.CONTINUATION_BODY_OFFSET
+            + (line_index // fresh_page_capacity) * quote.CONTINUATION_PAGE_HEIGHT
+            + line_index % fresh_page_capacity
+            for line_index in range(row_count)
+        ]
+        self.assertEqual(content_rows, expected_content_rows)
+        self.assertEqual(content_rows[0], 61)
+        self.assertEqual([cell_value(sheet, f"B{row}") for row in content_rows], expected_lines)
+        self.assertEqual("".join(cell_value(sheet, f"B{row}") for row in content_rows), expected_text)
+
+        content_pages = {manual_print_page_for_row(row) for row in content_rows}
+        self.assertIn(2, content_pages)
+        breaks = row_break_ids(sheet)
+        planned_pages = len(breaks) + 1
+        expected_breaks = [55, 116] if row_count <= 57 else [55, 116, 177]
+        self.assertEqual(breaks, expected_breaks)
+        self.assertEqual(planned_pages, 3 if row_count <= 57 else 4)
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+        for intermediate_page in range(2, planned_pages):
+            self.assertIn(intermediate_page, content_pages, f"continuation page {intermediate_page} has no optional text")
+
+        runs = [run for row_number in content_rows for run in cell_inline_runs(sheet, f"B{row_number}")]
+        self.assertIn("BOLD", "".join(text for text, bold, _, _ in runs if bold))
+        self.assertIn("ITALIC", "".join(text for text, _, italic, _ in runs if italic))
+        self.assertIn("UNDERLINE", "".join(text for text, _, _, underline in runs if underline))
+
+        logos = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}pic") is not None]
+        self.assertEqual(len(logos), planned_pages)
+        first_extent = logos[0].find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib
+        for anchor, expected_row in zip(logos, [1] + [break_id + 1 for break_id in breaks]):
+            self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, str(expected_row))
+            pic = anchor.find(f"{NS_DRAWING}pic")
+            self.assertEqual(pic.find(f"{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib, first_extent)
+            self.assertFalse(pic.find(f"{NS_DRAWING}blipFill/{NS_A}srcRect").attrib)
+
+        signature_rows = [acceptance_row + offset for offset in (0, 4, 5, 6, 7)]
+        self.assertEqual({manual_print_page_for_row(row) for row in signature_rows}, {planned_pages})
+        for expected in (
+            brief["acceptance"]["company_name"],
+            brief["acceptance"]["text"],
+            brief["acceptance"]["person_label"],
+            brief["acceptance"]["stamp_label"],
+            brief["acceptance"]["date_label"],
+            brief["signature"]["company_signatory"],
+            brief["signature"]["company_title"],
+            brief["signature"]["company_date_label"],
+        ):
+            self.assertTrue(find_cell_ref(sheet, expected), expected)
+
+    def test_payment_terms_capacity_boundaries_are_split_without_skipping(self):
+        for row_count in (53, 54, 55, 56, 57, 106):
+            with self.subTest(row_count=row_count):
+                self._assert_optional_text_capacity_boundary("payment_terms", row_count)
+
+    def test_standard_notes_capacity_boundaries_are_split_without_skipping(self):
+        for row_count in (53, 54, 55, 56, 57, 106):
+            with self.subTest(row_count=row_count):
+                self._assert_optional_text_capacity_boundary("standard_notes", row_count)
+
+    def test_real_libreoffice_optional_text_pagination_proof(self):
+        running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
+        executables = quote.libreoffice_candidates()
+        if not executables:
+            message = "LibreOffice is unavailable locally; hosted CI must run the optional-text pagination proof."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+        if shutil.which("fc-match") is None:
+            message = "fontconfig fc-match is unavailable; hosted CI must prove Carlito font readiness."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+
+        for family in ("Arial", "Calibri"):
+            result = subprocess.run(
+                ["fc-match", "-f", "%{family}\\n", family],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, family)
+            self.assertTrue(result.stdout.strip(), family)
+
+        import pypdfium2 as pdfium
+
+        brief, lines = long_optional_text_pagination_case()
+        paragraphs = brief["payment_terms"] + brief["standard_notes"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_output = root / "first"
+            repeat_output = root / "repeat"
+            first_output.mkdir()
+            repeat_output.mkdir()
+            xlsx_path = root / "quotation.xlsx"
+            first_pdf = first_output / "quotation.pdf"
+            repeat_pdf = repeat_output / "quotation.pdf"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, xlsx_path, brief, lines)
+            with zipfile.ZipFile(xlsx_path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as template_archive:
+                template_sheet = ET.fromstring(template_archive.read("xl/worksheets/sheet1.xml"))
+            right_margin_inches = float(template_sheet.find(f"{NS_MAIN}pageMargins").attrib["right"])
+            breaks = row_break_ids(sheet)
+            planned_pages = len(breaks) + 1
+            self.assertEqual(breaks, [55, 116])
+            self.assertEqual(planned_pages, 3)
+            self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, first_pdf), "libreoffice_exported")
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, repeat_pdf), "libreoffice_exported")
+            for pdf_path in (first_pdf, repeat_pdf):
+                self.assertTrue(pdf_path.exists())
+                self.assertGreater(pdf_path.stat().st_size, 100)
+                self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF-"))
+
+            right_print_edge = None
+
+            def render_pdf(pdf_path):
+                document = pdfium.PdfDocument(str(pdf_path))
+                try:
+                    pages = []
+                    for page in document:
+                        page_size = page.get_size()
+                        textpage = page.get_textpage()
+                        raw_text = textpage.get_text_range() or ""
+                        normalized_text = re.sub(r"\s+", " ", raw_text).strip()
+                        image = page.render(scale=2.0).to_pil().convert("RGB")
+                        logo_bbox = synthetic_logo_bbox(image)
+                        page_phrases = {}
+                        for phrase in paragraphs:
+                            normalized_phrase = re.sub(r"\s+", " ", phrase).strip()
+                            if normalized_phrase in normalized_text:
+                                page_phrases[phrase] = normalized_pdf_phrase_bbox(textpage, phrase)
+                        pages.append({
+                            "size": page_size,
+                            "text": normalized_text,
+                            "image": image,
+                            "logo_bbox": logo_bbox,
+                            "phrases": page_phrases,
+                            "normal_font_names": pdf_phrase_font_names(textpage, "Boundary component 01")
+                            if "Boundary component 01" in normalized_text else [],
+                            "bold_font_names": pdf_phrase_font_names(textpage, "Quantity")
+                            if "Quantity" in normalized_text else [],
+                            "rich_bold_font_names": pdf_phrase_font_names(textpage, "50% deposit")
+                            if "50% deposit" in normalized_text else [],
+                        })
+                    return pages
+                finally:
+                    document.close()
+
+            first_pages = render_pdf(first_pdf)
+            repeat_pages = render_pdf(repeat_pdf)
+            self.assertEqual(len(first_pages), planned_pages)
+            self.assertEqual(len(repeat_pages), planned_pages)
+            self.assertTrue(all(page["logo_bbox"] is not None for page in first_pages))
+
+            note_pages = set()
+            rightmost_optional_text = 0.0
+            note_logo_overlaps = 0
+            for phrase in paragraphs:
+                matches = [
+                    (page_index, page_data, page_data["phrases"][phrase])
+                    for page_index, page_data in enumerate(first_pages)
+                    if phrase in page_data["phrases"]
+                ]
+                self.assertEqual(len(matches), 1, phrase)
+                page_index, page_data, bbox = matches[0]
+                note_pages.add(page_index)
+                page_width = page_data["size"][0]
+                right_print_edge = page_width - right_margin_inches * 72
+                self.assertLessEqual(bbox[2], right_print_edge - 1.0, phrase)
+                rightmost_optional_text = max(rightmost_optional_text, bbox[2])
+                pixel_bbox = pdf_bbox_to_pixels(bbox, page_data["size"], 2.0)
+                logo_bbox = page_data["logo_bbox"]
+                overlaps = not (
+                    pixel_bbox[2] <= logo_bbox[0]
+                    or pixel_bbox[0] >= logo_bbox[2]
+                    or pixel_bbox[3] <= logo_bbox[1]
+                    or pixel_bbox[1] >= logo_bbox[3]
+                )
+                if overlaps:
+                    note_logo_overlaps += 1
+                self.assertFalse(overlaps, phrase)
+
+            self.assertEqual(note_logo_overlaps, 0)
+            self.assertTrue(note_pages)
+            first_logo_bbox = first_pages[0]["logo_bbox"]
+            first_logo_size = (
+                first_logo_bbox[2] - first_logo_bbox[0],
+                first_logo_bbox[3] - first_logo_bbox[1],
+            )
+            for page_index in note_pages:
+                logo_bbox = first_pages[page_index]["logo_bbox"]
+                logo_width = logo_bbox[2] - logo_bbox[0]
+                logo_height = logo_bbox[3] - logo_bbox[1]
+                self.assertGreater(logo_width, 20)
+                self.assertGreater(logo_height, 5)
+                self.assertAlmostEqual(logo_width, first_logo_size[0], delta=1)
+                self.assertAlmostEqual(logo_height, first_logo_size[1], delta=1)
+
+            acceptance_and_signatures = (
+                brief["acceptance"]["company_name"],
+                brief["acceptance"]["text"],
+                brief["acceptance"]["person_label"],
+                brief["acceptance"]["stamp_label"],
+                brief["acceptance"]["date_label"],
+                brief["signature"]["company_signatory"],
+                brief["signature"]["company_title"],
+                brief["signature"]["company_date_label"],
+            )
+            all_pdf_text = " ".join(page["text"] for page in first_pages)
+            final_page_text = first_pages[-1]["text"]
+            for expected in acceptance_and_signatures:
+                self.assertIn(re.sub(r"\s+", " ", expected).strip(), all_pdf_text)
+                self.assertIn(re.sub(r"\s+", " ", expected).strip(), final_page_text)
+
+            quote_line_text = [line.description for line in lines]
+            notes_only_pages = [
+                page_index
+                for page_index, page_data in enumerate(first_pages)
+                if any(note in page_data["phrases"] for note in brief["standard_notes"])
+                and not any(
+                    re.sub(r"\s+", " ", expected).strip() in page_data["text"]
+                    for expected in acceptance_and_signatures
+                )
+                and not any(
+                    re.sub(r"\s+", " ", phrase).strip() in page_data["text"]
+                    for phrase in quote_line_text
+                )
+            ]
+            self.assertEqual(notes_only_pages, [])
+            continuation_body_phrases = paragraphs + quote_line_text + list(acceptance_and_signatures)
+            for page_index, page_data in enumerate(first_pages[1:], start=2):
+                self.assertTrue(
+                    any(
+                        re.sub(r"\s+", " ", phrase).strip() in page_data["text"]
+                        for phrase in continuation_body_phrases
+                    ),
+                    f"continuation page {page_index} contains only its repeated header/logo",
+                )
+
+            normal_fonts = {
+                name
+                for page_data in first_pages
+                for name in page_data["normal_font_names"]
+            }
+            bold_fonts = {
+                name
+                for page_data in first_pages
+                for name in page_data["bold_font_names"]
+            }
+            rich_bold_fonts = {
+                name
+                for page_data in first_pages
+                for name in page_data["rich_bold_font_names"]
+            }
+            self.assertIn("Carlito", normal_fonts)
+            self.assertIn("Carlito-Bold", bold_fonts)
+            self.assertTrue(any("Bold" in name for name in rich_bold_fonts), rich_bold_fonts)
+
+            first_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in first_pages
+            ]
+            repeat_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in repeat_pages
+            ]
+            self.assertEqual(first_signature, repeat_signature)
+            print(
+                "SQAG optional-text pagination proof: "
+                + json.dumps(
+                    {
+                        "planned_pages": planned_pages,
+                        "actual_pdf_pages": len(first_pages),
+                        "unplanned_notes_only_pages": len(notes_only_pages),
+                        "pages_with_full_logo": sum(page["logo_bbox"] is not None for page in first_pages),
+                        "terms_complete": len(brief["payment_terms"]),
+                        "notes_complete": len(brief["standard_notes"]),
+                        "note_logo_overlaps": note_logo_overlaps,
+                        "rightmost_optional_text_pt": round(rightmost_optional_text, 2),
+                        "right_print_edge_pt": round(right_print_edge, 2),
+                        "acceptance_and_signatures_complete": True,
+                        "fonts": sorted(normal_fonts | bold_fonts | rich_bold_fonts),
+                        "repeat_render_equivalent": True,
+                    },
+                    sort_keys=True,
+                )
+            )
+
+    def test_real_libreoffice_54_row_optional_text_pagination_proof(self):
+        running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
+        executables = quote.libreoffice_candidates()
+        if not executables:
+            message = "LibreOffice is unavailable locally; hosted CI must run the 54-row optional-text proof."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+        if shutil.which("fc-match") is None:
+            message = "fontconfig fc-match is unavailable; hosted CI must prove Carlito font readiness."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+
+        import pypdfium2 as pdfium
+
+        brief, lines, expected_text, row_texts = optional_text_capacity_case("standard_notes", 54)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xlsx_path = root / "quotation.xlsx"
+            first_pdf = root / "first.pdf"
+            repeat_pdf = root / "repeat.pdf"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, xlsx_path, brief, lines)
+            with zipfile.ZipFile(xlsx_path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as template_archive:
+                template_sheet = ET.fromstring(template_archive.read("xl/worksheets/sheet1.xml"))
+
+            breaks = row_break_ids(sheet)
+            planned_pages = len(breaks) + 1
+            self.assertEqual(breaks, [55, 116])
+            self.assertEqual(planned_pages, 3)
+            self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+            acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+            entry_rows = [
+                row_number
+                for row_number in range(61, acceptance_row)
+                if cell_value(sheet, f"B{row_number}")
+            ]
+            self.assertEqual(len(entry_rows), 54)
+            self.assertEqual(entry_rows[0], 61)
+            self.assertEqual("".join(cell_value(sheet, f"B{row}") for row in entry_rows), expected_text)
+
+            right_margin_inches = float(template_sheet.find(f"{NS_MAIN}pageMargins").attrib["right"])
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, first_pdf), "libreoffice_exported")
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, repeat_pdf), "libreoffice_exported")
+            for pdf_path in (first_pdf, repeat_pdf):
+                self.assertTrue(pdf_path.exists())
+                self.assertGreater(pdf_path.stat().st_size, 100)
+                self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF-"))
+
+            def render_pdf(pdf_path):
+                document = pdfium.PdfDocument(str(pdf_path))
+                try:
+                    pages = []
+                    for page in document:
+                        page_size = page.get_size()
+                        textpage = page.get_textpage()
+                        raw_text = textpage.get_text_range() or ""
+                        normalized_text = re.sub(r"\s+", " ", raw_text).strip()
+                        image = page.render(scale=2.0).to_pil().convert("RGB")
+                        phrases = {}
+                        for phrase in row_texts:
+                            try:
+                                phrases[phrase] = normalized_pdf_phrase_bbox(textpage, phrase)
+                            except AssertionError:
+                                continue
+                        pages.append({
+                            "size": page_size,
+                            "text": normalized_text,
+                            "image": image,
+                            "logo_bbox": synthetic_logo_bbox(image),
+                            "phrases": phrases,
+                        })
+                    return pages
+                finally:
+                    document.close()
+
+            first_pages = render_pdf(first_pdf)
+            repeat_pages = render_pdf(repeat_pdf)
+            self.assertEqual(len(first_pages), planned_pages)
+            self.assertEqual(len(repeat_pages), planned_pages)
+            self.assertTrue(all(page["logo_bbox"] is not None for page in first_pages))
+            first_logo_bbox = first_pages[0]["logo_bbox"]
+            first_logo_size = (
+                first_logo_bbox[2] - first_logo_bbox[0],
+                first_logo_bbox[3] - first_logo_bbox[1],
+            )
+            for page_index, page in enumerate(first_pages):
+                logo_bbox = page["logo_bbox"]
+                self.assertAlmostEqual(logo_bbox[2] - logo_bbox[0], first_logo_size[0], delta=1)
+                self.assertAlmostEqual(logo_bbox[3] - logo_bbox[1], first_logo_size[1], delta=1)
+                if page_index > 0:
+                    self.assertTrue(page["text"], f"page {page_index + 1} is blank/logo-only")
+
+            page_matches = {}
+            note_logo_overlaps = 0
+            rightmost_optional_text = 0.0
+            for phrase in row_texts:
+                matches = [
+                    (page_index, page, page["phrases"][phrase])
+                    for page_index, page in enumerate(first_pages)
+                    if phrase in page["phrases"]
+                ]
+                self.assertEqual(len(matches), 1, phrase)
+                page_index, page, bbox = matches[0]
+                page_matches[phrase] = page_index
+                right_print_edge = page["size"][0] - right_margin_inches * 72
+                self.assertLessEqual(bbox[2], right_print_edge - 1.0, phrase)
+                rightmost_optional_text = max(rightmost_optional_text, bbox[2])
+                pixel_bbox = pdf_bbox_to_pixels(bbox, page["size"], 2.0)
+                logo_bbox = page["logo_bbox"]
+                overlaps = not (
+                    pixel_bbox[2] <= logo_bbox[0]
+                    or pixel_bbox[0] >= logo_bbox[2]
+                    or pixel_bbox[3] <= logo_bbox[1]
+                    or pixel_bbox[1] >= logo_bbox[3]
+                )
+                self.assertFalse(overlaps, phrase)
+                note_logo_overlaps += int(overlaps)
+
+            self.assertEqual(note_logo_overlaps, 0)
+            self.assertTrue(any(page_matches[phrase] == 1 for phrase in row_texts))
+            self.assertTrue(any(page_matches[phrase] == 2 for phrase in row_texts))
+            self.assertIn(row_texts[0], first_pages[1]["phrases"])
+
+            acceptance_and_signatures = (
+                brief["acceptance"]["company_name"],
+                brief["acceptance"]["text"],
+                brief["acceptance"]["person_label"],
+                brief["acceptance"]["stamp_label"],
+                brief["acceptance"]["date_label"],
+                brief["signature"]["company_signatory"],
+                brief["signature"]["company_title"],
+                brief["signature"]["company_date_label"],
+            )
+            for expected in acceptance_and_signatures:
+                normalized = re.sub(r"\s+", " ", expected).strip()
+                self.assertIn(normalized, first_pages[-1]["text"])
+
+            first_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in first_pages
+            ]
+            repeat_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in repeat_pages
+            ]
+            self.assertEqual(first_signature, repeat_signature)
+            print(
+                "SQAG 54-row optional-text render proof: "
+                + json.dumps(
+                    {
+                        "planned_pages": planned_pages,
+                        "actual_pdf_pages": len(first_pages),
+                        "page_2_contains_optional_text": any(page_matches[phrase] == 1 for phrase in row_texts),
+                        "optional_entry_complete": len(page_matches) == 54,
+                        "skipped_usable_continuation_page": False,
+                        "blank_logo_only_pages": 0,
+                        "note_logo_overlaps": note_logo_overlaps,
+                        "rightmost_optional_text_pt": round(rightmost_optional_text, 2),
+                        "acceptance_and_signatures_complete": True,
+                        "pages_with_full_logo": sum(page["logo_bbox"] is not None for page in first_pages),
+                        "repeat_render_equivalent": True,
+                    },
+                    sort_keys=True,
+                )
+            )
+
     def test_layout_chunk_moves_to_continuation_body_below_repeated_header(self):
         start_row, moved = quote.layout_chunk_start_row(
             quote.FIRST_PRINT_PAGE_END_ROW - 3,
@@ -3130,7 +3929,17 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             quote.parse_cell_ref(find_cell_ref(sheet, "Director"))[0],
         ]
 
-        self.assertTrue(find_cell_ref(sheet, brief["standard_notes"][0]))
+        notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["notes_heading"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        rendered_note = " ".join(
+            cell_value(sheet, f"B{row_number}")
+            for row_number in range(notes_heading_row + 1, acceptance_row)
+            if cell_value(sheet, f"B{row_number}")
+        )
+        self.assertEqual(
+            re.sub(r"\s+", " ", rendered_note).strip(),
+            re.sub(r"\s+", " ", brief["standard_notes"][0]).strip(),
+        )
         self.assertTrue(all(row <= quote.FIRST_PRINT_PAGE_END_ROW for row in acceptance_rows))
         self.assertEqual(row_break_ids(sheet), [])
         self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
@@ -3517,11 +4326,26 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(find_cell_ref(sheet, "Commercial Terms"), "A32")
         self.assertEqual(find_cell_ref(sheet, "50% deposit"), "B33")
         self.assertEqual(find_cell_ref(sheet, "Warranty excluded"), "B35")
-        self.assertEqual(find_cell_ref(sheet, "All cheques should be crossed and made payable to Other Company Pte Ltd"), "B36")
+        notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Editable Notes"))[0]
+        cheque_start_row = next(
+            quote.parse_cell_ref(cell_node.attrib["r"])[0]
+            for cell_node in sheet.iter(f"{NS_MAIN}c")
+            if cell_node.attrib.get("r", "").startswith("B")
+            and cell_value(sheet, cell_node.attrib["r"]).startswith("All cheques")
+        )
+        cheque_text = " ".join(
+            cell_value(sheet, f"B{row_number}")
+            for row_number in range(cheque_start_row, notes_heading_row)
+        )
+        self.assertEqual(
+            re.sub(r"\s+", " ", cheque_text).strip(),
+            "All cheques should be crossed and made payable to Other Company Pte Ltd",
+        )
         self.assertTrue(find_cell_ref(sheet, "Editable Notes").startswith("A"))
         self.assertTrue(find_cell_ref(sheet, "First editable note").startswith("B"))
         self.assertTrue(find_cell_ref(sheet, "Second editable note").startswith("B"))
-        self.assertTrue(find_cell_ref(sheet, "Other Company Pte Ltd").startswith("B"))
+        normalized_cheque_text = re.sub(r"\s+", " ", cheque_text).strip()
+        self.assertIn("Other Company Pte Ltd", normalized_cheque_text)
         self.assertTrue(find_cell_ref(sheet, "Accepted by customer").startswith("E"))
         self.assertTrue(find_cell_ref(sheet, "Authorised signer").startswith("E"))
         self.assertTrue(find_cell_ref(sheet, "Customer stamp").startswith("E"))
@@ -3542,6 +4366,13 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             "Signed date:",
         ):
             ref = find_cell_ref(sheet, expected_text)
+            if not ref and expected_text == "Other Company Pte Ltd":
+                ref = next(
+                    cell_node.attrib["r"]
+                    for cell_node in sheet.iter(f"{NS_MAIN}c")
+                    if cell_node.attrib.get("r", "").startswith("B")
+                    and expected_text in re.sub(r"\s+", " ", cell_value(sheet, cell_node.attrib["r"]))
+                )
             self.assertTrue(ref, f"Missing generated cell for {expected_text!r}")
             font = font_for_style(styles, cell_style(sheet, ref))
             self.assertEqual(font_name(font), "Calibri", expected_text)
@@ -3594,16 +4425,28 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         with zipfile.ZipFile(path) as zf:
             sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
 
-        self.assertEqual(find_cell_refs(sheet, cheque_instruction), ["B34"])
+        notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Editable Notes"))[0]
+        term_row = quote.parse_cell_ref(find_cell_ref(sheet, "2.00"))[0]
+        term_rows = range(term_row, notes_heading_row)
         self.assertEqual(
-            cell_inline_runs(sheet, "B34"),
-            [
-                ("All cheques should be crossed and made payable to ", False, False, False),
-                ("Other Company Pte Ltd", True, False, False),
-            ],
+            re.sub(r"\s+", " ", " ".join(cell_value(sheet, f"B{row}") for row in term_rows)).strip(),
+            cheque_instruction,
         )
-        self.assertEqual(cell_value(sheet, "B35"), "")
-        self.assertEqual(find_cell_ref(sheet, "Editable Notes"), "A36")
+        rich_runs = [
+            run
+            for row in term_rows
+            if cell_value(sheet, f"B{row}")
+            for run in cell_inline_runs(sheet, f"B{row}")
+        ]
+        self.assertEqual("".join(text for text, _, _, _ in rich_runs), cheque_instruction)
+        self.assertEqual(
+            "".join(text for text, bold, _, _ in rich_runs if bold),
+            "Other Company Pte Ltd",
+        )
+        self.assertEqual(
+            re.sub(r"\s+", " ", " ".join(cell_value(sheet, f"B{row}") for row in term_rows)).count(cheque_instruction),
+            1,
+        )
 
     def test_quote_detail_rich_text_runs_are_written_to_layout_output(self):
         tmp = tempfile.TemporaryDirectory()
