@@ -2,7 +2,12 @@ providers = ["python"]
 
 [phases.setup]
 nixpkgsArchive = "5c994fe2b1e540ff83aa59ba370918ad5aae4776"
-nixPkgs = ["...", "libreoffice"]
+nixPkgs = ["...", "libreoffice", "fontconfig", "carlito", "liberation_ttf"]
+# Register the packaged fontconfig rules and fonts in the image build.
+cmds = [
+  "...",
+  '''set -- /nix/store/*-fontconfig-*/etc/fonts/conf.d && test "$#" -eq 1 && test -d "$1" && mkdir -p /etc/fonts /var/cache/fontconfig && ln -s "$1" /etc/fonts/conf.d && printf '%s\n' '<fontconfig><dir>/root/.nix-profile/share/fonts</dir><include ignore_missing="no">/etc/fonts/conf.d</include><include ignore_missing="no">/root/.nix-profile/etc/fonts/conf.d/30-calibri.conf</include><alias binding="same"><family>Arial</family><accept><family>Liberation Sans</family></accept></alias><cachedir>/var/cache/fontconfig</cachedir></fontconfig>' > /etc/fonts/fonts.conf && fc-cache -f''',
+]
 
 [start]
 cmd = "python webapp/server.py"

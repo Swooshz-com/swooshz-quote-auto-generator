@@ -6,9 +6,9 @@ Checks that the repository enforces:
 - [phases.setup] section present with an exact 40-char lowercase hex nixpkgsArchive.
 - The archive matches the locked immutable NixOS/nixpkgs commit for python312==3.12.13.
 - Start command is exactly python webapp/server.py.
-- The setup package contract includes exactly ["...", "libreoffice"] for the
-  workbook-PDF converter.
-- Missing, wrong, malformed, duplicate, misplaced, or alternate converter bindings fail closed.
+- The exact ordered setup packages bind the workbook-PDF converter, fontconfig,
+  and Calibri/Arial-compatible regular and bold font faces.
+- Missing, wrong, malformed, duplicate, misplaced, or alternate package bindings fail closed.
 - .python-version contains exactly 3.12.13.
 - No Node provider, Dockerfile, Procfile or alternate runtime is configured.
 - requirements.txt is the production dependency source.
@@ -50,12 +50,17 @@ LOCKED_PROVIDERS = ("python",)
 
 # The locked Nixpkgs archive exposes `libreoffice` in all-packages.nix as the
 # preferred alias for the still release, and its wrapper provides `soffice`.
+# Carlito supplies Calibri-compatible regular/bold faces and its fontconfig alias.
+# liberation_ttf resolves to the pinned Liberation v2 Arial-compatible family.
 # Nixpacks' `...` setup-package hole preserves the Python provider packages.
 REQUIRED_WORKBOOK_PDF_NIXPKG = "libreoffice"
 NIXPACKS_SETUP_PACKAGE_HOLE = "..."
 EXPECTED_SETUP_NIXPKGS = (
     NIXPACKS_SETUP_PACKAGE_HOLE,
     REQUIRED_WORKBOOK_PDF_NIXPKG,
+    "fontconfig",
+    "carlito",
+    "liberation_ttf",
 )
 WORKBOOK_PDF_PACKAGE_ALIASES = frozenset(
     {
@@ -63,7 +68,29 @@ WORKBOOK_PDF_PACKAGE_ALIASES = frozenset(
         "libreoffice-fresh",
         "libreoffice-still",
         "soffice",
+        "libreoffice-calc",
+        "fontconfig",
+        "carlito",
+        "liberation_ttf",
+        "liberation_ttf_v2",
+        "fonts-liberation",
+        "fonts-crosextra-carlito",
     }
+)
+# Register packaged font files, aliases and standard substitution rules during
+# the image build. Nix packages alone leave no default fontconfig configuration.
+LOCKED_FONTCONFIG_SETUP_CMDS = (
+    "...",
+    'set -- /nix/store/*-fontconfig-*/etc/fonts/conf.d && '
+    'test "$#" -eq 1 && test -d "$1" && mkdir -p /etc/fonts /var/cache/fontconfig && '
+    'ln -s "$1" /etc/fonts/conf.d && printf \'%s\\n\' '
+    "'<fontconfig><dir>/root/.nix-profile/share/fonts</dir>"
+    '<include ignore_missing="no">/etc/fonts/conf.d</include>'
+    '<include ignore_missing="no">/root/.nix-profile/etc/fonts/conf.d/30-calibri.conf</include>'
+    '<alias binding="same"><family>Arial</family>'
+    '<accept><family>Liberation Sans</family></accept></alias>'
+    "<cachedir>/var/cache/fontconfig</cachedir></fontconfig>' "
+    '> /etc/fonts/fonts.conf && fc-cache -f',
 )
 NIX_PACKAGE_FIELD_NAMES = frozenset({"nixpkgs", "nixpackages"})
 APT_PACKAGE_FIELD_NAMES = frozenset({"aptpkgs", "aptpackages"})
@@ -152,6 +179,10 @@ def _dependency_bindings(
     bindings: list[tuple[tuple[str, ...], str, object]] = []
 
     def walk(value: object, path: tuple[str, ...]) -> None:
+        if isinstance(value, list):
+            for index, nested in enumerate(value):
+                walk(nested, path + (str(index),))
+            return
         if not isinstance(value, dict):
             return
         for key, nested in value.items():
@@ -201,7 +232,7 @@ def _validate_workbook_pdf_dependency(document: dict[str, object]) -> list[str]:
     if not canonical_bindings:
         issues.append(
             "nixpacks.toml: [phases.setup].nixPkgs must bind the required "
-            f"workbook PDF package {REQUIRED_WORKBOOK_PDF_NIXPKG!r}"
+            f"workbook PDF package {REQUIRED_WORKBOOK_PDF_NIXPKG!r} and font providers"
         )
     elif len(canonical_bindings) != 1:
         issues.append(
@@ -243,11 +274,23 @@ def _validate_workbook_pdf_dependency(document: dict[str, object]) -> list[str]:
             if alternate:
                 dotted_path = ".".join(path)
                 issues.append(
-                    "nixpacks.toml: workbook PDF converter must not be bound through "
+                    "nixpacks.toml: workbook PDF converter/fonts must not be bound through "
                     f"alternate {dotted_path}: {alternate}"
                 )
 
     return issues
+
+
+def _validate_fontconfig_setup(document: dict[str, object]) -> list[str]:
+    phases = document.get("phases")
+    setup = phases.get("setup") if isinstance(phases, dict) else None
+    commands = setup.get("cmds") if isinstance(setup, dict) else None
+    if commands != list(LOCKED_FONTCONFIG_SETUP_CMDS):
+        return [
+            "nixpacks.toml: [phases.setup] font registration cmds must equal exactly "
+            f"{list(LOCKED_FONTCONFIG_SETUP_CMDS)!r}"
+        ]
+    return []
 
 
 def validate() -> int:
@@ -274,6 +317,7 @@ def validate() -> int:
             document = _load_nixpacks_document(nixpacks_path)
             providers, start_cmd, nixpkgs_archive = _contract_values(document)
             issues.extend(_validate_workbook_pdf_dependency(document))
+            issues.extend(_validate_fontconfig_setup(document))
         except Exception as exc:
             providers, start_cmd, nixpkgs_archive = None, None, None
             issues.append(f"nixpacks.toml unparseable: {exc}")

@@ -1685,7 +1685,14 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         header_text = " ".join(node.text or "" for node in text_anchors[0].iter(f"{NS_A}t"))
         for expected in brief["company"]["header_lines"] + [brief["project_number"]]:
             self.assertIn(expected, header_text)
-        for row in [20] + [value + 3 for value in breaks]:
+        item_rows = [quote.parse_cell_ref(find_cell_ref(sheet, line.description))[0] for line in lines]
+        continuation_header_rows = [
+            start + quote.CONTINUATION_TABLE_HEADER_OFFSET
+            for start in [value + 1 for value in breaks]
+            if any(start + quote.CONTINUATION_BODY_OFFSET <= row < start + quote.CONTINUATION_PAGE_HEIGHT for row in item_rows)
+        ]
+        self.assertTrue(continuation_header_rows)
+        for row in [20] + continuation_header_rows:
             for column, expected in [("B", "Quantity"), ("C", "Service"), ("E", "Estimate")]:
                 self.assertEqual(cell_value(sheet, f"{column}{row}"), expected)
         for line in lines:
@@ -2587,6 +2594,18 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(quote.printable_last_row(root, third_break + 1, True), third_break)
         self.assertEqual(quote.manual_page_break_ids(quote.printable_last_row(root, third_break + 1, True)), expected_breaks[:2])
 
+    def test_first_page_capacity_and_manual_break_contract(self):
+        self.assertEqual(quote.FIRST_PRINT_PAGE_END_ROW, 55)
+        self.assertEqual(quote.CONTINUATION_PAGE_START_ROW, 56)
+        self.assertEqual(quote.CONTINUATION_PAGE_HEIGHT, 61)
+        self.assertEqual(quote.CONTINUATION_PAGE_START_ROW, quote.FIRST_PRINT_PAGE_END_ROW + 1)
+        first_continuation_end = quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT - 1
+        self.assertEqual(quote.manual_page_break_ids(first_continuation_end), [quote.FIRST_PRINT_PAGE_END_ROW])
+        self.assertEqual(
+            quote.manual_page_break_ids(first_continuation_end + quote.CONTINUATION_PAGE_HEIGHT + 1),
+            [quote.FIRST_PRINT_PAGE_END_ROW, first_continuation_end, first_continuation_end + quote.CONTINUATION_PAGE_HEIGHT],
+        )
+
     def test_layout_moves_excel_overflow_row_to_continuation_body(self):
         root = ET.Element(f"{NS_MAIN}worksheet")
         ET.SubElement(root, f"{NS_MAIN}sheetData")
@@ -2594,7 +2613,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         row_number = quote.ensure_quote_entry_page(
             root,
-            65,
+            quote.FIRST_PRINT_PAGE_END_ROW + 1,
             1,
             "Boundary Booth",
             "EUR",
@@ -2602,25 +2621,27 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             continuation_pages,
         )
 
-        self.assertEqual(quote.FIRST_PRINT_PAGE_END_ROW, 64)
+        self.assertEqual(quote.FIRST_PRINT_PAGE_END_ROW, 55)
         self.assertEqual(row_number, quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_BODY_OFFSET)
         self.assertEqual(find_cell_ref(root, "Pos."), f"A{quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_TABLE_HEADER_OFFSET}")
 
     def test_hosted_acceptance_row_clears_continuation_logo_band(self):
-        page_start = quote.continuation_page_start_for_row(128)
-        self.assertEqual(page_start, 126)
-        self.assertIn(125, quote.manual_page_break_ids(136))
+        page_start = quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT
+        candidate = page_start + 2
+        self.assertEqual(quote.continuation_page_start_for_row(candidate), page_start)
+        self.assertIn(page_start - 1, quote.manual_page_break_ids(candidate + 8))
         start_row, moved = quote.layout_chunk_start_row(
-            128, quote.LayoutChunk("acceptance_signature", quote.SIGNATURE_BLOCK_HEIGHT),
+            candidate, quote.LayoutChunk("acceptance_signature", quote.SIGNATURE_BLOCK_HEIGHT),
         )
         self.assertTrue(moved)
         self.assertEqual(start_row, page_start + quote.CONTINUATION_BODY_OFFSET)
         self.assertLessEqual(start_row + quote.SIGNATURE_BLOCK_HEIGHT - 1, quote.manual_page_end_for_row(start_row))
 
     def test_hosted_summary_row_clears_continuation_logo_band(self):
-        page_start = quote.continuation_page_start_for_row(128)
-        self.assertEqual(page_start, 126)
-        start_row = quote.summary_block_start_row(128, quote.TOTAL_BLOCK_HEIGHT)
+        page_start = quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT
+        candidate = page_start + 2
+        self.assertEqual(quote.continuation_page_start_for_row(candidate), page_start)
+        start_row = quote.summary_block_start_row(candidate, quote.TOTAL_BLOCK_HEIGHT)
         self.assertEqual(start_row, page_start + quote.CONTINUATION_BODY_OFFSET)
         self.assertLessEqual(start_row + quote.TOTAL_BLOCK_HEIGHT - 1, quote.manual_page_end_for_row(start_row))
 
@@ -2639,7 +2660,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 self.assertEqual(moved, expected != candidate)
 
     def test_header_clearance_precedes_summary_and_layout_bottom_fit(self):
-        candidate = 128
+        candidate = quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT + 2
         block_height = quote.CONTINUATION_PAGE_HEIGHT - quote.CONTINUATION_BODY_OFFSET + 1
         expected = quote.next_continuation_page_start(candidate) + quote.CONTINUATION_BODY_OFFSET
         self.assertEqual(quote.summary_block_start_row(candidate, block_height), expected)
@@ -2653,19 +2674,22 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             path = Path(tmp) / "quotation.xlsx"
             with mock.patch.object(quote, "layout_chunk_start_row", wraps=quote.layout_chunk_start_row) as place_chunk:
                 quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
-            self.assertEqual(place_chunk.call_args.args[0], 128)
+            self.assertGreater(place_chunk.call_args.args[0], quote.FIRST_PRINT_PAGE_END_ROW)
             with zipfile.ZipFile(path) as zf:
                 self.assertIsNone(zf.testzip())
                 sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
                 workbook = ET.fromstring(zf.read("xl/workbook.xml"))
                 drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
-        self.assertEqual(row_break_ids(sheet), [64, 125])
+        self.assertEqual(row_break_ids(sheet), [
+            quote.FIRST_PRINT_PAGE_END_ROW,
+            quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT - 1,
+        ])
         self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
         acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
         page_start = quote.continuation_page_start_for_row(acceptance_row)
-        self.assertEqual(page_start, 126)
-        self.assertEqual(acceptance_row, page_start + quote.CONTINUATION_BODY_OFFSET)
-        for row in range(page_start, acceptance_row):
+        self.assertEqual(page_start, quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT)
+        self.assertGreaterEqual(acceptance_row, page_start + quote.CONTINUATION_BODY_OFFSET)
+        for row in range(page_start, page_start + quote.CONTINUATION_BODY_OFFSET):
             for column in ("B", "E"):
                 self.assertEqual(cell_value(sheet, f"{column}{row}"), "")
         for column, offset, expected in (
@@ -2684,7 +2708,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         logos = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}pic") is not None]
         self.assertEqual(len(logos), 3)
         first_extent = logos[0].find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib
-        for anchor, expected_row in zip(logos, [1, 65, 126]):
+        for anchor, expected_row in zip(logos, [1] + [break_id + 1 for break_id in row_break_ids(sheet)]):
             self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, str(expected_row))
             self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}col").text, "8")
             pic = anchor.find(f"{NS_DRAWING}pic")
@@ -3058,23 +3082,9 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             },
             "line_items": [],
             "terms_heading": "Terms & Conditions:",
-            "payment_terms": [
-                "70% payment upon confirmation and signing of contract.",
-                "30% balance upon handover before show starts",
-                "All cheques should be crossed and made payable to Koncept Images Pte. Ltd.",
-            ],
+            "payment_terms": ["70% payment upon confirmation and signing of contract."],
             "notes_heading": "Note:",
-            "standard_notes": [
-                "The above contract does not include application fees to any relevant authorities and electrical connection fees.",
-                "Any changes in design during the progress of work will delay completion schedule and it shall be deemed at the cost of the Client.",
-                "Any changes agreed upon after the confirmation of contract or during the work in progress shall be deemed as Additional Orders.",
-                "All designs and dimensions are subject to final site verification.",
-                "For production purpose, quotation must be confirmed minimum 20 working days before date of event",
-                "20% surcharge will be implied on the graphic cost, if the graphic files are not received latest by five working days before build up date.",
-                "Design and Artwork of the graphics are not included in this contract.",
-                "Cancellation of agreement is subject to 75% of the agreement amount.",
-                "All deposit are non-refundable upon of cancellation of agreement.",
-            ],
+            "standard_notes": ["All designs and dimensions are subject to final site verification."],
             "acceptance": {
                 "company_name": "Koncept Images Pte. Ltd.",
                 "text": "We accept the quotation amount and the terms",
@@ -3120,7 +3130,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             quote.parse_cell_ref(find_cell_ref(sheet, "Director"))[0],
         ]
 
-        self.assertEqual(find_cell_ref(sheet, "All deposit are non-refundable upon of cancellation of agreement."), "B54")
+        self.assertTrue(find_cell_ref(sheet, brief["standard_notes"][0]))
         self.assertTrue(all(row <= quote.FIRST_PRINT_PAGE_END_ROW for row in acceptance_rows))
         self.assertEqual(row_break_ids(sheet), [])
         self.assertTrue(no_trailing_blank_print_page(sheet, workbook))

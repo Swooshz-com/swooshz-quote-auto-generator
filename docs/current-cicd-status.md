@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-09-18
+Last updated: 2026-09-30
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -44,11 +44,33 @@ Source of truth: `.github/workflows/ci.yml`
 - `Nixpacks Python-only contract`: runs `python scripts/validate_nixpacks_python_contract.py`
   and `python -m unittest tests.test_nixpacks_python_contract`. It requires
   the locked Python-only provider/archive/start contract and exact
-  `[phases.setup].nixPkgs = ["...", "libreoffice"]`; missing, wrong, malformed,
-  duplicate, misplaced, or alternate converter bindings fail closed.
+  `[phases.setup].nixPkgs = ["...", "libreoffice", "fontconfig", "carlito",
+  "liberation_ttf"]`; missing entries, wrong order, malformed arrays, duplicate,
+  misplaced, alternate or Apt-substituted converter/font bindings fail closed.
 - Before the readiness check, `Validate app` provisions the hosted Ubuntu
   runtime with `libreoffice-calc`, `fontconfig`, `fonts-liberation`, and
   `fonts-crosextra-carlito` using the runner's package manager.
+- Deployed Nixpacks uses the already-pinned Nixpkgs archive and Nix package
+  attributes, rather than the Ubuntu Apt names used by CI:
+
+  | Purpose | CI Ubuntu package | Pinned Nix package |
+  |---|---|---|
+  | Workbook PDF conversion | `libreoffice-calc` | `libreoffice` |
+  | Font discovery | `fontconfig` | `fontconfig` |
+  | Calibri-compatible regular/bold faces | `fonts-crosextra-carlito` | `carlito` |
+  | Arial-compatible regular/bold faces | `fonts-liberation` | `liberation_ttf` |
+
+  These are equivalent runtime requirements, not interchangeable package-manager
+  names. The pinned `carlito` package includes the Calibri fontconfig alias;
+  `liberation_ttf` resolves to `liberation_ttf_v2` in that archive. No proprietary
+  Microsoft fonts or font binaries are added to the repository.
+- Nix package installation alone does not create a default fontconfig file in
+  the Nixpacks image. Locked source-controlled setup commands register the
+  Nix profile font directory, include the pinned fontconfig package's standard
+  substitution rules and Carlito's `30-calibri.conf`, map Arial to Liberation
+  Sans and build the cache before the image is published. The rule directory
+  must resolve to exactly one packaged path; an ambiguous or missing path fails
+  the build. Generic families retain the packaged sans/serif/monospace rules. Missing or altered registration fails the contract validator.
 - `Validate app` also proves the hosted LibreOffice executable/version and
   fontconfig resolution for the canonical Arial/Calibri presentation families
   (including the pinned Linux metric-compatible Liberation Sans/Carlito
