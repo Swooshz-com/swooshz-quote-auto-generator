@@ -624,6 +624,38 @@ def long_optional_text_pagination_case():
     return brief, lines
 
 
+def optional_text_capacity_case(entry_kind, row_count):
+    brief, lines = header_fidelity_case()
+    lines = lines[:14]
+    for line in lines:
+        line.section = "Capacity Boundary"
+    row_texts = ["BOLDITALICUNDERLINE" + "x" * 45]
+    row_texts.extend(f"R{index:03d}" + "x" * 60 for index in range(1, row_count))
+    full_text = "".join(row_texts)
+    rich_html = (
+        "<div><strong>"
+        + row_texts[0][:4]
+        + "</strong><em>"
+        + row_texts[0][4:10]
+        + "</em><u>"
+        + row_texts[0][10:19]
+        + "</u>"
+        + html.escape(row_texts[0][19:] + "".join(row_texts[1:]))
+        + "</div>"
+    )
+    brief.update({
+        "terms_heading": "",
+        "payment_terms": [full_text] if entry_kind == "payment_terms" else [],
+        "notes_heading": "",
+        "standard_notes": [full_text] if entry_kind == "standard_notes" else [],
+        "rich_text": {
+            "paymentTerms": rich_html if entry_kind == "payment_terms" else "",
+            "standardNotes": rich_html if entry_kind == "standard_notes" else "",
+        },
+    })
+    return brief, lines, full_text, row_texts
+
+
 def pdf_text_bbox(textpage, phrase):
     text = textpage.get_text_range() or ""
     start = text.find(phrase)
@@ -3004,6 +3036,101 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         ):
             self.assertTrue(find_cell_ref(sheet, expected), expected)
 
+    def _assert_optional_text_capacity_boundary(self, entry_kind, row_count):
+        brief, lines, expected_text, expected_lines = optional_text_capacity_case(entry_kind, row_count)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+            with zipfile.ZipFile(path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+                drawing = ET.fromstring(zf.read("xl/drawings/drawing1.xml"))
+
+        self.assertEqual(
+            (
+                quote.FIRST_PRINT_PAGE_END_ROW,
+                quote.CONTINUATION_PAGE_START_ROW,
+                quote.CONTINUATION_PAGE_HEIGHT,
+                quote.CONTINUATION_TABLE_HEADER_OFFSET,
+                quote.CONTINUATION_CURRENCY_OFFSET,
+                quote.CONTINUATION_BODY_OFFSET,
+            ),
+            (55, 56, 61, 2, 3, 5),
+        )
+        self.assertEqual(quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS, 3)
+
+        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        content_rows = [
+            row_number
+            for row_number in range(quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_BODY_OFFSET, acceptance_row)
+            if cell_value(sheet, f"B{row_number}")
+        ]
+        fresh_page_capacity = (
+            quote.CONTINUATION_PAGE_HEIGHT
+            - quote.CONTINUATION_BODY_OFFSET
+            - quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
+        )
+        expected_content_rows = [
+            quote.CONTINUATION_PAGE_START_ROW
+            + quote.CONTINUATION_BODY_OFFSET
+            + (line_index // fresh_page_capacity) * quote.CONTINUATION_PAGE_HEIGHT
+            + line_index % fresh_page_capacity
+            for line_index in range(row_count)
+        ]
+        self.assertEqual(content_rows, expected_content_rows)
+        self.assertEqual(content_rows[0], 61)
+        self.assertEqual([cell_value(sheet, f"B{row}") for row in content_rows], expected_lines)
+        self.assertEqual("".join(cell_value(sheet, f"B{row}") for row in content_rows), expected_text)
+
+        content_pages = {manual_print_page_for_row(row) for row in content_rows}
+        self.assertIn(2, content_pages)
+        breaks = row_break_ids(sheet)
+        planned_pages = len(breaks) + 1
+        expected_breaks = [55, 116] if row_count <= 57 else [55, 116, 177]
+        self.assertEqual(breaks, expected_breaks)
+        self.assertEqual(planned_pages, 3 if row_count <= 57 else 4)
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+        for intermediate_page in range(2, planned_pages):
+            self.assertIn(intermediate_page, content_pages, f"continuation page {intermediate_page} has no optional text")
+
+        runs = [run for row_number in content_rows for run in cell_inline_runs(sheet, f"B{row_number}")]
+        self.assertIn("BOLD", "".join(text for text, bold, _, _ in runs if bold))
+        self.assertIn("ITALIC", "".join(text for text, _, italic, _ in runs if italic))
+        self.assertIn("UNDERLINE", "".join(text for text, _, _, underline in runs if underline))
+
+        logos = [anchor for anchor in drawing if anchor.find(f"{NS_DRAWING}pic") is not None]
+        self.assertEqual(len(logos), planned_pages)
+        first_extent = logos[0].find(f"{NS_DRAWING}pic/{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib
+        for anchor, expected_row in zip(logos, [1] + [break_id + 1 for break_id in breaks]):
+            self.assertEqual(anchor.find(f"{NS_DRAWING}from/{NS_DRAWING}row").text, str(expected_row))
+            pic = anchor.find(f"{NS_DRAWING}pic")
+            self.assertEqual(pic.find(f"{NS_DRAWING}spPr/{NS_A}xfrm/{NS_A}ext").attrib, first_extent)
+            self.assertFalse(pic.find(f"{NS_DRAWING}blipFill/{NS_A}srcRect").attrib)
+
+        signature_rows = [acceptance_row + offset for offset in (0, 4, 5, 6, 7)]
+        self.assertEqual({manual_print_page_for_row(row) for row in signature_rows}, {planned_pages})
+        for expected in (
+            brief["acceptance"]["company_name"],
+            brief["acceptance"]["text"],
+            brief["acceptance"]["person_label"],
+            brief["acceptance"]["stamp_label"],
+            brief["acceptance"]["date_label"],
+            brief["signature"]["company_signatory"],
+            brief["signature"]["company_title"],
+            brief["signature"]["company_date_label"],
+        ):
+            self.assertTrue(find_cell_ref(sheet, expected), expected)
+
+    def test_payment_terms_capacity_boundaries_are_split_without_skipping(self):
+        for row_count in (53, 54, 55, 56, 57, 106):
+            with self.subTest(row_count=row_count):
+                self._assert_optional_text_capacity_boundary("payment_terms", row_count)
+
+    def test_standard_notes_capacity_boundaries_are_split_without_skipping(self):
+        for row_count in (53, 54, 55, 56, 57, 106):
+            with self.subTest(row_count=row_count):
+                self._assert_optional_text_capacity_boundary("standard_notes", row_count)
+
     def test_real_libreoffice_optional_text_pagination_proof(self):
         running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
         executables = quote.libreoffice_candidates()
@@ -3178,6 +3305,15 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 )
             ]
             self.assertEqual(notes_only_pages, [])
+            continuation_body_phrases = paragraphs + quote_line_text + list(acceptance_and_signatures)
+            for page_index, page_data in enumerate(first_pages[1:], start=2):
+                self.assertTrue(
+                    any(
+                        re.sub(r"\s+", " ", phrase).strip() in page_data["text"]
+                        for phrase in continuation_body_phrases
+                    ),
+                    f"continuation page {page_index} contains only its repeated header/logo",
+                )
 
             normal_fonts = {
                 name
@@ -3222,6 +3358,176 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                         "right_print_edge_pt": round(right_print_edge, 2),
                         "acceptance_and_signatures_complete": True,
                         "fonts": sorted(normal_fonts | bold_fonts | rich_bold_fonts),
+                        "repeat_render_equivalent": True,
+                    },
+                    sort_keys=True,
+                )
+            )
+
+    def test_real_libreoffice_54_row_optional_text_pagination_proof(self):
+        running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
+        executables = quote.libreoffice_candidates()
+        if not executables:
+            message = "LibreOffice is unavailable locally; hosted CI must run the 54-row optional-text proof."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+        if shutil.which("fc-match") is None:
+            message = "fontconfig fc-match is unavailable; hosted CI must prove Carlito font readiness."
+            if running_in_ci:
+                self.fail(message)
+            self.skipTest(message)
+
+        import pypdfium2 as pdfium
+
+        brief, lines, expected_text, row_texts = optional_text_capacity_case("standard_notes", 54)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xlsx_path = root / "quotation.xlsx"
+            first_pdf = root / "first.pdf"
+            repeat_pdf = root / "repeat.pdf"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, xlsx_path, brief, lines)
+            with zipfile.ZipFile(xlsx_path) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+                workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as template_archive:
+                template_sheet = ET.fromstring(template_archive.read("xl/worksheets/sheet1.xml"))
+
+            breaks = row_break_ids(sheet)
+            planned_pages = len(breaks) + 1
+            self.assertEqual(breaks, [55, 116])
+            self.assertEqual(planned_pages, 3)
+            self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+            acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+            entry_rows = [
+                row_number
+                for row_number in range(61, acceptance_row)
+                if cell_value(sheet, f"B{row_number}")
+            ]
+            self.assertEqual(len(entry_rows), 54)
+            self.assertEqual(entry_rows[0], 61)
+            self.assertEqual("".join(cell_value(sheet, f"B{row}") for row in entry_rows), expected_text)
+
+            right_margin_inches = float(template_sheet.find(f"{NS_MAIN}pageMargins").attrib["right"])
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, first_pdf), "libreoffice_exported")
+            self.assertEqual(quote.libreoffice_pdf_export(xlsx_path, repeat_pdf), "libreoffice_exported")
+            for pdf_path in (first_pdf, repeat_pdf):
+                self.assertTrue(pdf_path.exists())
+                self.assertGreater(pdf_path.stat().st_size, 100)
+                self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF-"))
+
+            def render_pdf(pdf_path):
+                document = pdfium.PdfDocument(str(pdf_path))
+                try:
+                    pages = []
+                    for page in document:
+                        page_size = page.get_size()
+                        textpage = page.get_textpage()
+                        raw_text = textpage.get_text_range() or ""
+                        normalized_text = re.sub(r"\s+", " ", raw_text).strip()
+                        image = page.render(scale=2.0).to_pil().convert("RGB")
+                        phrases = {}
+                        for phrase in row_texts:
+                            try:
+                                phrases[phrase] = normalized_pdf_phrase_bbox(textpage, phrase)
+                            except AssertionError:
+                                continue
+                        pages.append({
+                            "size": page_size,
+                            "text": normalized_text,
+                            "image": image,
+                            "logo_bbox": synthetic_logo_bbox(image),
+                            "phrases": phrases,
+                        })
+                    return pages
+                finally:
+                    document.close()
+
+            first_pages = render_pdf(first_pdf)
+            repeat_pages = render_pdf(repeat_pdf)
+            self.assertEqual(len(first_pages), planned_pages)
+            self.assertEqual(len(repeat_pages), planned_pages)
+            self.assertTrue(all(page["logo_bbox"] is not None for page in first_pages))
+            first_logo_bbox = first_pages[0]["logo_bbox"]
+            first_logo_size = (
+                first_logo_bbox[2] - first_logo_bbox[0],
+                first_logo_bbox[3] - first_logo_bbox[1],
+            )
+            for page_index, page in enumerate(first_pages):
+                logo_bbox = page["logo_bbox"]
+                self.assertAlmostEqual(logo_bbox[2] - logo_bbox[0], first_logo_size[0], delta=1)
+                self.assertAlmostEqual(logo_bbox[3] - logo_bbox[1], first_logo_size[1], delta=1)
+                if page_index > 0:
+                    self.assertTrue(page["text"], f"page {page_index + 1} is blank/logo-only")
+
+            page_matches = {}
+            note_logo_overlaps = 0
+            rightmost_optional_text = 0.0
+            for phrase in row_texts:
+                matches = [
+                    (page_index, page, page["phrases"][phrase])
+                    for page_index, page in enumerate(first_pages)
+                    if phrase in page["phrases"]
+                ]
+                self.assertEqual(len(matches), 1, phrase)
+                page_index, page, bbox = matches[0]
+                page_matches[phrase] = page_index
+                right_print_edge = page["size"][0] - right_margin_inches * 72
+                self.assertLessEqual(bbox[2], right_print_edge - 1.0, phrase)
+                rightmost_optional_text = max(rightmost_optional_text, bbox[2])
+                pixel_bbox = pdf_bbox_to_pixels(bbox, page["size"], 2.0)
+                logo_bbox = page["logo_bbox"]
+                overlaps = not (
+                    pixel_bbox[2] <= logo_bbox[0]
+                    or pixel_bbox[0] >= logo_bbox[2]
+                    or pixel_bbox[3] <= logo_bbox[1]
+                    or pixel_bbox[1] >= logo_bbox[3]
+                )
+                self.assertFalse(overlaps, phrase)
+                note_logo_overlaps += int(overlaps)
+
+            self.assertEqual(note_logo_overlaps, 0)
+            self.assertTrue(any(page_matches[phrase] == 1 for phrase in row_texts))
+            self.assertTrue(any(page_matches[phrase] == 2 for phrase in row_texts))
+            self.assertIn(row_texts[0], first_pages[1]["phrases"])
+
+            acceptance_and_signatures = (
+                brief["acceptance"]["company_name"],
+                brief["acceptance"]["text"],
+                brief["acceptance"]["person_label"],
+                brief["acceptance"]["stamp_label"],
+                brief["acceptance"]["date_label"],
+                brief["signature"]["company_signatory"],
+                brief["signature"]["company_title"],
+                brief["signature"]["company_date_label"],
+            )
+            for expected in acceptance_and_signatures:
+                normalized = re.sub(r"\s+", " ", expected).strip()
+                self.assertIn(normalized, first_pages[-1]["text"])
+
+            first_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in first_pages
+            ]
+            repeat_signature = [
+                (page["size"], hashlib.sha256(page["image"].tobytes()).hexdigest())
+                for page in repeat_pages
+            ]
+            self.assertEqual(first_signature, repeat_signature)
+            print(
+                "SQAG 54-row optional-text render proof: "
+                + json.dumps(
+                    {
+                        "planned_pages": planned_pages,
+                        "actual_pdf_pages": len(first_pages),
+                        "page_2_contains_optional_text": any(page_matches[phrase] == 1 for phrase in row_texts),
+                        "optional_entry_complete": len(page_matches) == 54,
+                        "skipped_usable_continuation_page": False,
+                        "blank_logo_only_pages": 0,
+                        "note_logo_overlaps": note_logo_overlaps,
+                        "rightmost_optional_text_pt": round(rightmost_optional_text, 2),
+                        "acceptance_and_signatures_complete": True,
+                        "pages_with_full_logo": sum(page["logo_bbox"] is not None for page in first_pages),
                         "repeat_render_equivalent": True,
                     },
                     sort_keys=True,

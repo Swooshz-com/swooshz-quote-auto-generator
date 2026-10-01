@@ -2860,9 +2860,17 @@ def optional_text_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[
     page_end = manual_page_end_for_row(row_number)
     if continuation_page_start_for_row(row_number) is not None:
         page_end -= OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
-    if chunk.height <= 0 or row_number + chunk.height - 1 <= page_end:
+    remaining_page_rows = page_end - row_number + 1
+    if chunk.height <= 0 or chunk.height <= remaining_page_rows:
         return row_number, row_number != candidate_row
-    return next_continuation_page_start(row_number) + CONTINUATION_BODY_OFFSET, True
+    fresh_continuation_capacity = (
+        CONTINUATION_PAGE_HEIGHT
+        - CONTINUATION_BODY_OFFSET
+        - OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
+    )
+    if chunk.height <= fresh_continuation_capacity:
+        return next_continuation_page_start(row_number) + CONTINUATION_BODY_OFFSET, True
+    return row_number, row_number != candidate_row
 
 
 def optional_text_character_width(character: str) -> int:
