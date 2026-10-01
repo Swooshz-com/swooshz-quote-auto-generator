@@ -18411,13 +18411,17 @@ def draft_analysis_mode(payload: dict[str, Any] | None = None) -> str:
     return DRAFT_ANALYSIS_MODE_STANDARD
 
 
+def configured_openai_route_model(env_name: str, fallback: str) -> str:
+    return clean_text(read_dotenv_value(env_name)) or fallback
+
+
 def configured_openai_draft_model(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
     if mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
-        return safe_segment(
-            read_dotenv_value(OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME),
+        return configured_openai_route_model(
+            OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME,
             OPENAI_DRAFT_HIGH_QUALITY_MODEL,
         )
-    return safe_segment(read_dotenv_value(OPENAI_DRAFT_MODEL_ENV_NAME), OPENAI_DRAFT_MODEL)
+    return configured_openai_route_model(OPENAI_DRAFT_MODEL_ENV_NAME, OPENAI_DRAFT_MODEL)
 
 
 def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
@@ -18449,11 +18453,11 @@ def validate_openai_small_route_model(model: str, effort: str = OPENAI_SMALL_REA
 
 
 def configured_openai_basis_line_model() -> str:
-    return safe_segment(read_dotenv_value(OPENAI_BASIS_LINE_MODEL_ENV_NAME), OPENAI_BASIS_LINE_MODEL)
+    return configured_openai_route_model(OPENAI_BASIS_LINE_MODEL_ENV_NAME, OPENAI_BASIS_LINE_MODEL)
 
 
 def configured_openai_basis_answer_model() -> str:
-    return safe_segment(read_dotenv_value(OPENAI_BASIS_ANSWER_MODEL_ENV_NAME), OPENAI_BASIS_ANSWER_MODEL)
+    return configured_openai_route_model(OPENAI_BASIS_ANSWER_MODEL_ENV_NAME, OPENAI_BASIS_ANSWER_MODEL)
 
 
 def configured_text_ai_provider(env_name: str, fallback: str = AI_PROVIDER_OPENAI) -> str:
@@ -23845,14 +23849,22 @@ def request_configured_basis_chat(
             return result
         except OpenAIAnalysisError as exc:
             errors.append(str(exc))
+            request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
             log_ai_call_attempt(
                 feature="basis_chat",
                 provider=provider,
-                model=model,
+                model="" if request_validation else model,
                 status="failed",
                 duration_ms=elapsed_milliseconds(attempt_started_at),
                 details={"errors": safe_error_messages([str(exc)])},
+                **(
+                    {"failure_boundary": "request_validation", "attempt_number": 0}
+                    if request_validation
+                    else {}
+                ),
             )
+            if request_validation:
+                raise
             if index + 1 < len(candidates):
                 write_local_log("basis_chat_model_retry", {
                     "from_provider": provider,
@@ -24330,6 +24342,7 @@ def answer_basis_chat(
         return request_configured_basis_chat(payload, auth_session=auth_session)
     except OpenAIAnalysisError as exc:
         error = str(exc)
+        request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
         provider = configured_text_ai_provider(basis_chat_provider_env_name(payload))
         write_local_log("basis_chat_failed", {
             "selected_provider": provider,
@@ -24340,7 +24353,15 @@ def answer_basis_chat(
             f"AI basis chat is not configured or failed. Selected provider is {text_ai_provider_label(provider)}. "
             f"Add {text_ai_provider_key_env_name(provider)}, or configure OPENAI_API_KEY for fallback. {fallback_note} {error}"
         )
-        raise OpenAIAnalysisError(" ".join(safe_error_messages([message]))) from exc
+        diagnostics = (
+            {"failure_boundary": "request_validation", "attempt_number": 0}
+            if request_validation
+            else {}
+        )
+        raise OpenAIAnalysisError(
+            " ".join(safe_error_messages([message])),
+            diagnostics=diagnostics,
+        ) from exc
 
 
 def save_uploaded_images(images: list[dict[str, Any]], job_dir: Path) -> list[dict[str, Any]]:

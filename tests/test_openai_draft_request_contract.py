@@ -224,7 +224,7 @@ class DraftRequestContractTest(unittest.TestCase):
                 server.OPENAI_DRAFT_MODEL,
                 server.OPENAI_DRAFT_REASONING_EFFORT,
                 (server.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME, server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME),
-                ("gpt-6-sol", "gpt-6.1-sol", "gpt-5.5"),
+                ("!!!", "gpt-6-sol", "gpt-6.1-sol", "gpt-5.5"),
                 ("high", "low", "medium", "xhigh"),
                 None,
             ),
@@ -235,7 +235,7 @@ class DraftRequestContractTest(unittest.TestCase):
                 server.OPENAI_DRAFT_HIGH_QUALITY_MODEL,
                 server.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT,
                 (server.OPENAI_DRAFT_MODEL_ENV_NAME, server.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME),
-                ("gpt-6-luna", "gpt-6-sol", "gpt-5.5"),
+                ("!!!", "gpt-6-luna", "gpt-6-sol", "gpt-5.5"),
                 ("low", "medium", "max", "xhigh"),
                 "high_quality",
             ),
@@ -465,23 +465,25 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.assertEqual(parsed, output)
 
     def test_invalid_small_route_models_reject_before_provider_transport(self):
-        invalid_values = {
-            server.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-sol",
-            server.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "gpt-6-luna",
-        }
-        for request_fn, args in (
+        routes = (
             (server.request_openai_pricing_catalog_import, ("synthetic.csv", {"headers": [], "rows": []}, {"label": "GST", "rate": 0})),
             (server.request_openai_pricing_catalog_metadata, ("synthetic.csv", [{"id": "synthetic-row", "description": "Synthetic panel"}])),
-        ):
-            with self.subTest(route=request_fn.__name__):
-                self.send.reset_mock()
-                with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(invalid_values)):
-                    with self.assertRaises(server.OpenAIAnalysisError) as error:
-                        request_fn(*args, "synthetic-key")
-                self.assertEqual(error.exception.diagnostics["failure_boundary"], "request_validation")
-                self.assertEqual(error.exception.diagnostics["attempt_number"], 0)
-                self.send.assert_not_called()
-                self.assertNotIn("gpt-6-sol", str(error.exception) + json.dumps(error.exception.diagnostics))
+        )
+        for invalid_model in ("!!!", "gpt-6-sol"):
+            invalid_values = {
+                server.OPENAI_BASIS_LINE_MODEL_ENV_NAME: invalid_model,
+                server.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "gpt-6-luna",
+            }
+            for request_fn, args in routes:
+                with self.subTest(route=request_fn.__name__, model=invalid_model):
+                    self.send.reset_mock()
+                    with mock.patch.object(server, "read_dotenv_value", side_effect=self.dotenv_reader(invalid_values)):
+                        with self.assertRaises(server.OpenAIAnalysisError) as error:
+                            request_fn(*args, "synthetic-key")
+                    self.assertEqual(error.exception.diagnostics["failure_boundary"], "request_validation")
+                    self.assertEqual(error.exception.diagnostics["attempt_number"], 0)
+                    self.send.assert_not_called()
+                    self.assertNotIn(invalid_model, str(error.exception) + json.dumps(error.exception.diagnostics))
 
     def test_pricing_metadata_enrichment_preserves_source_pricing_authority(self):
         source = [{

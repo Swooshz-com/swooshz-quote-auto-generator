@@ -118,6 +118,8 @@ def openai_response(payload: dict) -> mock.MagicMock:
 
 class AIBasisChatStressTest(unittest.TestCase):
     def openai_models(self, name: str) -> str:
+        if name == webapp.OPENAI_API_KEY_ENV_NAME:
+            return "sk-test-redacted"
         if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
             return "gpt-6-luna"
         if name == webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME:
@@ -140,12 +142,13 @@ class AIBasisChatStressTest(unittest.TestCase):
                 with mock.patch.object(webapp, "read_dotenv_value", side_effect=self.openai_models):
                     with mock.patch.object(webapp.urllib.request, "urlopen", return_value=openai_response(payload)) as urlopen:
                         try:
-                            result = webapp.request_openai_basis_chat(payload, "sk-test-redacted")
+                            result = webapp.request_configured_basis_chat(payload)
                         except webapp.OpenAIAnalysisError as exc:
                             result = None
                             self.assertNotIn("{", str(exc))
 
                 bodies = [json.loads(call.args[0].data.decode("utf-8")) for call in urlopen.call_args_list]
+                urlopen.assert_called_once()
                 self.assertEqual(bodies[0]["model"], "gpt-6-luna")
                 self.assertEqual(bodies[0]["reasoning"], {"effort": "high"})
                 self.assertNotIn("gpt-6-sol", [body["model"] for body in bodies])
@@ -189,9 +192,10 @@ class AIBasisChatStressTest(unittest.TestCase):
                 }
                 with mock.patch.object(webapp, "read_dotenv_value", side_effect=self.openai_models):
                     with mock.patch.object(webapp.urllib.request, "urlopen", return_value=openai_response(payload)) as urlopen:
-                        result = webapp.request_openai_basis_chat(payload, "sk-test-redacted")
+                        result = webapp.request_configured_basis_chat(payload)
 
                 body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+                urlopen.assert_called_once()
                 self.assertEqual(webapp.basis_chat_required_intent(payload), "answer")
                 self.assertEqual(body["model"], "gpt-6-luna")
                 self.assertEqual(body["reasoning"], {"effort": "high"})
@@ -199,7 +203,46 @@ class AIBasisChatStressTest(unittest.TestCase):
                 self.assertEqual(result["type"], "answer")
                 self.assertEqual(set(result), {"status", "type", "source", "ai_used", "answer"})
 
-    def test_invalid_explicit_openai_small_route_model_fails_before_transport(self):
+    def test_invalid_explicit_openai_small_route_models_fail_before_transport(self):
+        routes = (
+            (
+                "selected line",
+                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME,
+                {
+                    "question": "change 100mm to 150mm",
+                    "scope": "line",
+                    "field": "platform",
+                    "line_index": 0,
+                    "line": "Confirm: 100mm raised platform with needle punch carpet.",
+                },
+            ),
+            (
+                "answer",
+                webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME,
+                {"question": "what does this mean?", "scope": "quote", "field": "", "line_index": -1, "line": ""},
+            ),
+        )
+        for label, model_env_name, basis_chat in routes:
+            for invalid_model in ("!!!", "gpt-6-sol"):
+                with self.subTest(route=label, model=invalid_model):
+                    payload = stress_payload()
+                    payload["basis_chat"] = basis_chat
+                    values = {
+                        webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
+                        webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
+                        webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "gpt-6-luna",
+                    }
+                    values[model_env_name] = invalid_model
+                    with mock.patch.object(webapp, "read_dotenv_value", side_effect=values.get):
+                        with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+                            with self.assertRaises(webapp.OpenAIAnalysisError) as caught:
+                                webapp.request_configured_basis_chat(payload)
+                    urlopen.assert_not_called()
+                    self.assertEqual(caught.exception.diagnostics["failure_boundary"], "request_validation")
+                    self.assertEqual(caught.exception.diagnostics["attempt_number"], 0)
+                    self.assertNotIn(invalid_model, str(caught.exception) + json.dumps(caught.exception.diagnostics))
+
+    def test_request_validation_is_terminal_before_valid_openai_basis_line_fallback(self):
         payload = stress_payload()
         payload["basis_chat"] = {
             "question": "what does this mean?",
@@ -208,21 +251,22 @@ class AIBasisChatStressTest(unittest.TestCase):
             "line_index": -1,
             "line": "",
         }
-        def dotenv(name):
-            if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-6-sol"
-            if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            return ""
+        values = {
+            webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
+            webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "!!!",
+            webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
+        }
 
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
-                with self.assertRaises(webapp.OpenAIAnalysisError) as caught:
-                    webapp.request_openai_basis_chat(payload, "sk-test-redacted")
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=values.get):
+            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=openai_response(payload)) as urlopen:
+                with mock.patch.object(webapp, "write_local_log") as write_log:
+                    with self.assertRaises(webapp.OpenAIAnalysisError) as caught:
+                        webapp.request_configured_basis_chat(payload)
+
         urlopen.assert_not_called()
         self.assertEqual(caught.exception.diagnostics["failure_boundary"], "request_validation")
         self.assertEqual(caught.exception.diagnostics["attempt_number"], 0)
-        self.assertNotIn("gpt-6-sol", str(caught.exception) + json.dumps(caught.exception.diagnostics))
+        self.assertFalse(any(call.args[0] == "basis_chat_model_retry" for call in write_log.call_args_list))
 
     def test_wrong_shape_responses_fail_cleanly_without_mutating_payload(self):
         cases = [

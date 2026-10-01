@@ -95,6 +95,18 @@ configured/body mismatch, invalid explicit models, and model mismatch;
 fallback. Run the focused oracle with
 `python -m unittest tests.test_openai_draft_request_contract`.
 
+Configured OpenAI model readers apply route defaults only to absent or blank
+values. Every explicit nonblank model value must reach route validation unchanged
+enough to be rejected when unsupported. Exercise `!!!` and unsupported
+`gpt-6-sol` through normal and High Quality full-draft construction,
+selected-line and answer basis-chat dispatch, and OpenAI pricing import and
+metadata requests. Each invalid configuration must report
+`failure_boundary=request_validation`, `attempt_number=0`, and zero provider
+sends. A basis-chat request-validation failure is terminal; it must not fall
+through from an invalid answer route to a valid selected-line model. Provider,
+runtime, and model-output fallback tests must continue to prove the existing
+alternate-provider behavior.
+
 Contract coverage includes exact Responses field sets, invalid envelopes, whole
 request rejection, one-send failures, privacy canaries, and N-1/N/N+1 boundaries
 for reference/catalog counts, decoded media/derived-image bytes, dimensions,

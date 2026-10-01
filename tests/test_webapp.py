@@ -14595,6 +14595,45 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(body["reasoning"], {"effort": "high"})
         self.assertEqual(result["type"], "answer")
 
+    def test_basis_chat_facade_preserves_request_validation_diagnostics_and_redacts_model(self):
+        payload = valid_payload()
+        payload["basis_chat"] = {
+            "question": "what does this mean?",
+            "scope": "quote",
+            "field": "",
+            "line_index": -1,
+            "line": "",
+        }
+
+        def dotenv(name):
+            return {
+                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
+                webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "PRIVATE_CANARY/model.invalid",
+                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
+            }.get(name, "")
+
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
+            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+                with mock.patch.object(webapp, "write_local_log") as write_log:
+                    with self.assertRaises(webapp.OpenAIAnalysisError) as caught:
+                        webapp.answer_basis_chat(payload)
+
+        urlopen.assert_not_called()
+        self.assertEqual(caught.exception.diagnostics["failure_boundary"], "request_validation")
+        self.assertEqual(caught.exception.diagnostics["attempt_number"], 0)
+        logged_text = json.dumps([call.args for call in write_log.call_args_list], default=str)
+        self.assertNotIn("PRIVATE_CANARY/model.invalid", str(caught.exception) + logged_text)
+        self.assertFalse(any(call.args[0] == "basis_chat_model_retry" for call in write_log.call_args_list))
+        attempts = [
+            call.args[1]
+            for call in write_log.call_args_list
+            if call.args[0] == "ai_call_attempt"
+        ]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["model"], "")
+        self.assertEqual(attempts[0]["failure_boundary"], "request_validation")
+        self.assertEqual(attempts[0]["attempt_number"], 0)
+
     def test_openai_line_basis_chat_does_not_retry_draft_model_after_invalid_basis_line_output(self):
         payload = valid_payload()
         payload["basis_chat"] = {
