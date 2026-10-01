@@ -141,6 +141,9 @@ TOTAL_BLOCK_HEIGHT = 3
 SIGNATURE_CONTENT_HEIGHT = 8
 SIGNATURE_BLOCK_PAGE_GUARD_ROWS = 0
 SIGNATURE_BLOCK_HEIGHT = SIGNATURE_CONTENT_HEIGHT + SIGNATURE_BLOCK_PAGE_GUARD_ROWS
+OPTIONAL_TEXT_LINE_MAX_WIDTH_EM = 64
+# LibreOffice advances past three bottom rows before the declared continuation break.
+OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS = 3
 QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT = "18.7"
 EMU_PER_POINT = 12_700
 # Anchor in the visible right-side header column, not its hidden neighbour.
@@ -1887,6 +1890,7 @@ def clone_cell_style(
     num_fmt_id: str | None = None,
     horizontal: str | None = None,
     vertical: str | None = None,
+    wrap_text: bool | None = None,
 ) -> str:
     cell_xfs = styles_root.find(f"{NS_MAIN}cellXfs")
     if cell_xfs is None:
@@ -1902,7 +1906,7 @@ def clone_cell_style(
     if num_fmt_id is not None:
         style.attrib["numFmtId"] = num_fmt_id
         style.attrib["applyNumberFormat"] = "1"
-    if horizontal is not None or vertical is not None:
+    if horizontal is not None or vertical is not None or wrap_text is not None:
         alignment = style.find(f"{NS_MAIN}alignment")
         if alignment is None:
             alignment = ET.SubElement(style, f"{NS_MAIN}alignment")
@@ -1910,6 +1914,8 @@ def clone_cell_style(
             alignment.attrib["horizontal"] = horizontal
         if vertical is not None:
             alignment.attrib["vertical"] = vertical
+        if wrap_text is not None:
+            alignment.attrib["wrapText"] = "1" if wrap_text else "0"
         style.attrib["applyAlignment"] = "1"
     cell_xfs.append(style)
     cell_xfs.attrib["count"] = str(len(cell_xfs))
@@ -2017,9 +2023,9 @@ def add_quote_layout_styles(parts: dict[str, bytes]) -> dict[str, str]:
         "grand_label": clone_cell_style(styles_root, "34", border_id=grand_border, horizontal="right", vertical="center"),
         "grand_amount": clone_cell_style(styles_root, "5", font_id=bold_amount_font, border_id=grand_border, num_fmt_id="4", horizontal="right", vertical="center"),
         "grand_currency": clone_cell_style(styles_root, "84", border_id=grand_border, horizontal="center", vertical="center"),
-        "terms_heading": clone_cell_style(styles_root, "37", font_id=small_heading_font),
+        "terms_heading": clone_cell_style(styles_root, "37", font_id=small_heading_font, wrap_text=True),
         "terms_number": clone_cell_style(styles_root, "40", font_id=small_number_font),
-        "terms_body": clone_cell_style(styles_root, "41", font_id=small_body_font),
+        "terms_body": clone_cell_style(styles_root, "41", font_id=small_body_font, wrap_text=True),
         "signature_text": clone_cell_style(styles_root, "2", font_id=signature_text_font),
         "signature_line": clone_cell_style(styles_root, "33", font_id=signature_line_font),
     }
@@ -2848,6 +2854,125 @@ def layout_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[int, bo
     return next_continuation_page_start(row_number) + CONTINUATION_BODY_OFFSET, True
 
 
+def optional_text_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[int, bool]:
+    candidate_row = row_number
+    row_number = clear_continuation_header_band(row_number)
+    page_end = manual_page_end_for_row(row_number)
+    if continuation_page_start_for_row(row_number) is not None:
+        page_end -= OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
+    if chunk.height <= 0 or row_number + chunk.height - 1 <= page_end:
+        return row_number, row_number != candidate_row
+    return next_continuation_page_start(row_number) + CONTINUATION_BODY_OFFSET, True
+
+
+def optional_text_character_width(character: str) -> int:
+    if character == "\t":
+        return 4
+    if unicodedata.combining(character):
+        return 0
+    if unicodedata.east_asian_width(character) in {"F", "W"}:
+        return 2
+    return 1
+
+
+def rich_text_line_runs(characters: list[tuple[str, tuple[bool, bool, bool]]]) -> list[RichTextRun]:
+    runs: list[RichTextRun] = []
+    for character, formatting in characters:
+        if runs and (runs[-1].bold, runs[-1].italic, runs[-1].underline) == formatting:
+            runs[-1].text += character
+        else:
+            runs.append(RichTextRun(character, bold=formatting[0], italic=formatting[1], underline=formatting[2]))
+    return runs
+
+
+def wrap_optional_text_segment(
+    characters: list[tuple[str, tuple[bool, bool, bool]]],
+) -> list[list[RichTextRun]]:
+    lines: list[list[RichTextRun]] = []
+    current: list[tuple[str, tuple[bool, bool, bool]]] = []
+    current_width = 0
+    last_break_after: int | None = None
+
+    def refresh_line_metrics() -> tuple[int, int | None]:
+        width = 0
+        break_after = None
+        for index, (character, _) in enumerate(current, start=1):
+            width += optional_text_character_width(character)
+            if character.isspace():
+                break_after = index
+        return width, break_after
+
+    for item in characters:
+        character_width = optional_text_character_width(item[0])
+        while current and current_width + character_width > OPTIONAL_TEXT_LINE_MAX_WIDTH_EM:
+            cut = last_break_after if last_break_after is not None else len(current)
+            if cut <= 0:
+                cut = len(current)
+            lines.append(rich_text_line_runs(current[:cut]))
+            current = current[cut:]
+            current_width, last_break_after = refresh_line_metrics()
+        current.append(item)
+        current_width += character_width
+        if item[0].isspace():
+            last_break_after = len(current)
+
+    if current or not lines:
+        lines.append(rich_text_line_runs(current))
+    return lines
+
+
+def wrap_rich_text_runs(runs: list[Any]) -> list[list[RichTextRun]]:
+    """Reflow rich text into printable-width rows without losing run emphasis."""
+    segments: list[list[tuple[str, tuple[bool, bool, bool]]]] = [[]]
+    for value in runs:
+        run = normalize_ooxml_text_run(value)
+        formatting = (run.bold, run.italic, run.underline)
+        for character in run.text.replace("\r\n", "\n").replace("\r", "\n"):
+            if character == "\n":
+                segments.append([])
+            else:
+                segments[-1].append((character, formatting))
+    return [line for segment in segments for line in wrap_optional_text_segment(segment)]
+
+
+def write_optional_text_block(
+    root: ET.Element,
+    row_number: int,
+    runs: list[Any],
+    *,
+    name: str,
+    text_column: int,
+    style: str,
+    number: int | None = None,
+    number_style: str | None = None,
+    admission_height: int | None = None,
+) -> tuple[int, int, bool]:
+    lines = wrap_rich_text_runs(runs)
+    if not lines:
+        return row_number, row_number - 1, False
+
+    block_row, moved = optional_text_chunk_start_row(
+        row_number,
+        LayoutChunk(name, admission_height if admission_height is not None else len(lines)),
+    )
+    row_number = block_row
+    merge_start_column = "A" if text_column == 1 else "B"
+    last_row = block_row - 1
+    for line_index, line_runs in enumerate(lines):
+        row_number, line_moved = optional_text_chunk_start_row(
+            row_number,
+            LayoutChunk(f"{name}_line", 1),
+        )
+        moved = moved or line_moved
+        if number is not None and line_index == 0:
+            set_ooxml_cell(root, row_number, 1, f"{number:.2f}", number_style)
+        set_ooxml_rich_text_cell(root, row_number, text_column, line_runs, style)
+        ensure_merge_ref(root, f"{merge_start_column}{row_number}:I{row_number}")
+        last_row = row_number
+        row_number += 1
+    return row_number, last_row, moved
+
+
 def manual_page_break_ids(last_row: int) -> list[int]:
     if last_row <= FIRST_PRINT_PAGE_END_ROW:
         return []
@@ -3217,36 +3342,91 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     signature = brief.get("signature") if isinstance(brief.get("signature"), dict) else {}
     next_text_row = grand_row + 3
     last_optional_row = 0
+    optional_text_moved = False
 
     terms_heading = clean_text(brief.get("terms_heading"))
     payment_terms = brief.get("payment_terms") or []
     payment_term_runs = brief_rich_text_lines(brief, "paymentTerms", payment_terms)
     if terms_heading or payment_terms:
+        heading_runs = brief_rich_text_cell_runs(brief, "termsHeading", terms_heading)
+        heading_admission_height = len(wrap_rich_text_runs(heading_runs))
+        if terms_heading and payment_terms:
+            first_term_runs = (
+                payment_term_runs[0]
+                if payment_term_runs
+                else [RichTextRun(clean_text(payment_terms[0]))]
+            )
+            first_section_height = heading_admission_height + len(wrap_rich_text_runs(first_term_runs))
+            if first_section_height <= CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET:
+                heading_admission_height = first_section_height
         if terms_heading:
-            set_ooxml_rich_text_cell(root, next_text_row, 1, brief_rich_text_cell_runs(brief, "termsHeading", terms_heading), layout_styles["terms_heading"])
-            next_text_row += 1
+            next_text_row, last_optional_row, moved = write_optional_text_block(
+                root,
+                next_text_row,
+                heading_runs,
+                name="terms_heading",
+                text_column=1,
+                style=layout_styles["terms_heading"],
+                admission_height=heading_admission_height,
+            )
+            optional_text_moved = optional_text_moved or moved
         for index, term in enumerate(payment_terms, start=1):
-            set_ooxml_cell(root, next_text_row, 1, f"{index:.2f}", layout_styles["terms_number"])
-            runs = payment_term_runs[index - 1] if index - 1 < len(payment_term_runs) else [RichTextRun(term)]
-            set_ooxml_rich_text_cell(root, next_text_row, 2, runs, layout_styles["terms_body"])
-            next_text_row += 1
-        last_optional_row = next_text_row - 1
-        next_text_row = last_optional_row + 2
+            runs = payment_term_runs[index - 1] if index - 1 < len(payment_term_runs) else [RichTextRun(clean_text(term))]
+            next_text_row, last_optional_row, moved = write_optional_text_block(
+                root,
+                next_text_row,
+                runs,
+                name="payment_term",
+                text_column=2,
+                style=layout_styles["terms_body"],
+                number=index,
+                number_style=layout_styles["terms_number"],
+            )
+            optional_text_moved = optional_text_moved or moved
+        if last_optional_row:
+            next_text_row = last_optional_row + 2
 
     notes_heading = clean_text(brief.get("notes_heading"))
     standard_notes = brief.get("standard_notes") or []
     standard_note_runs = brief_rich_text_lines(brief, "standardNotes", standard_notes)
     if notes_heading or standard_notes:
+        heading_runs = brief_rich_text_cell_runs(brief, "notesHeading", notes_heading)
+        heading_admission_height = len(wrap_rich_text_runs(heading_runs))
+        if notes_heading and standard_notes:
+            first_note_runs = (
+                standard_note_runs[0]
+                if standard_note_runs
+                else [RichTextRun(clean_text(standard_notes[0]))]
+            )
+            first_section_height = heading_admission_height + len(wrap_rich_text_runs(first_note_runs))
+            if first_section_height <= CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET:
+                heading_admission_height = first_section_height
         if notes_heading:
-            set_ooxml_rich_text_cell(root, next_text_row, 1, brief_rich_text_cell_runs(brief, "notesHeading", notes_heading), layout_styles["terms_heading"])
-            next_text_row += 1
+            next_text_row, last_optional_row, moved = write_optional_text_block(
+                root,
+                next_text_row,
+                heading_runs,
+                name="notes_heading",
+                text_column=1,
+                style=layout_styles["terms_heading"],
+                admission_height=heading_admission_height,
+            )
+            optional_text_moved = optional_text_moved or moved
         for index, note in enumerate(standard_notes, start=1):
-            set_ooxml_cell(root, next_text_row, 1, f"{index:.2f}", layout_styles["terms_number"])
-            runs = standard_note_runs[index - 1] if index - 1 < len(standard_note_runs) else [RichTextRun(note)]
-            set_ooxml_rich_text_cell(root, next_text_row, 2, runs, layout_styles["terms_body"])
-            next_text_row += 1
-        last_optional_row = next_text_row - 1
+            runs = standard_note_runs[index - 1] if index - 1 < len(standard_note_runs) else [RichTextRun(clean_text(note))]
+            next_text_row, last_optional_row, moved = write_optional_text_block(
+                root,
+                next_text_row,
+                runs,
+                name="standard_note",
+                text_column=2,
+                style=layout_styles["terms_body"],
+                number=index,
+                number_style=layout_styles["terms_number"],
+            )
+            optional_text_moved = optional_text_moved or moved
 
+    manual_pagination_enabled = manual_pagination_enabled or optional_text_moved
     acceptance_candidate_row = last_optional_row + 3 if last_optional_row else next_text_row
     acceptance_row, acceptance_moved = layout_chunk_start_row(
         acceptance_candidate_row,
