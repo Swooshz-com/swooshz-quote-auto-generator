@@ -12522,28 +12522,18 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_openai_request_body_omits_temperature_for_default_model(self):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "quote_basis_sections": [
-                    {
-                        "id": "surfaces",
-                        "title": "Surfaces / Structures",
-                        "lines": [{"tag": "Confirm", "text": "AI surfaces", "confidence_pct": 88}],
-                    }
-                ],
-                "line_items": [],
-            })
+            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
         }).encode("utf-8")
 
         with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
             with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
-                result = webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
+                webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual(body["model"], webapp.OPENAI_DRAFT_MODEL)
         self.assertNotIn("temperature", body)
-        self.assertEqual(body["reasoning"], {"effort": "high"})
-        self.assertEqual(result["quote_basis"]["surfaces"], "Confirm: AI surfaces")
+        self.assertEqual(body["reasoning"], {"effort": "max"})
 
     def test_openai_request_ignores_client_model_override(self):
         payload = valid_payload()
@@ -12562,11 +12552,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(body["model"], webapp.OPENAI_DRAFT_MODEL)
         self.assertNotEqual(body["model"], "user-supplied-model")
 
-    def test_openai_request_uses_model_from_env(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+    def test_openai_request_rejects_unsupported_model_from_env_before_transport(self):
+        payload = valid_payload()
 
         def dotenv(name):
             if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
@@ -12574,19 +12561,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             return ""
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
+            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+                with self.assertRaises(webapp.OpenAIAnalysisError) as raised:
+                    webapp.request_openai_quote_basis(payload, "sk-test-redacted")
 
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-custom-model")
-        self.assertEqual(body["reasoning"], {"effort": "high"})
+        urlopen.assert_not_called()
+        self.assertNotIn("gpt-custom-model", str(raised.exception))
 
-    def test_openai_request_uses_draft_reasoning_effort_from_env(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+    def test_openai_request_rejects_noncontract_draft_reasoning_effort_before_transport(self):
+        payload = valid_payload()
 
         def dotenv(name):
             if name == webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME:
@@ -12594,14 +12577,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             return ""
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
+            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
+                with self.assertRaises(webapp.OpenAIAnalysisError) as raised:
+                    webapp.request_openai_quote_basis(payload, "sk-test-redacted")
 
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["reasoning"], {"effort": "high"})
+        urlopen.assert_not_called()
+        self.assertNotIn("high", str(raised.exception))
 
-    def test_openai_request_uses_high_quality_reasoning_effort_from_env(self):
+    def test_openai_request_uses_high_quality_model_and_reasoning_effort_from_env(self):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({
             "output_text": json.dumps({"quote_basis": {}, "line_items": []})
@@ -12610,11 +12593,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload["analysis_mode"] = "high_quality"
 
         def dotenv(name):
-            if name == webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME:
-                return "medium"
-            if name == webapp.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME:
-                return "xhigh"
-            return ""
+            values = {
+                webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: "max",
+                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6-sol",
+                webapp.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "high",
+            }
+            return values.get(name, "")
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
             with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
@@ -12622,9 +12606,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["reasoning"], {"effort": "xhigh"})
+        self.assertEqual(body["model"], "gpt-6-sol")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
 
-    def test_openai_request_ignores_high_accuracy_mode_and_uses_draft_model(self):
+    def test_openai_request_uses_high_quality_route_for_high_accuracy_mode(self):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({
             "output_text": json.dumps({"quote_basis": {}, "line_items": []})
@@ -12633,9 +12618,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload["analysis_mode"] = "high_accuracy"
 
         def dotenv(name):
-            if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-5.5-test"
-            return ""
+            values = {
+                webapp.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-6-luna",
+                webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: "max",
+                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6-sol",
+                webapp.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "high",
+            }
+            return values.get(name, "")
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
             with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
@@ -12643,7 +12632,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-5.5-test")
+        self.assertEqual(body["model"], "gpt-6-sol")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
 
     def test_openai_request_timeout_uses_env_with_longer_default(self):
         response = mock.MagicMock()
@@ -13895,9 +13885,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         def dotenv(name):
             if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-basis-answer-test"
+                return "gpt-6-luna"
             if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-basis-line-mini-test"
+                return "gpt-6-luna"
             return ""
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
@@ -13906,7 +13896,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-basis-answer-test")
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
         self.assertEqual(body["max_output_tokens"], 1200)
         self.assertEqual(result["answer"], "- **Meaning:** Platform height.")
 
@@ -14101,7 +14092,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         def dotenv(name):
             values = {
-                "OPENAI_BASIS_LINE_MODEL": "gpt-basis-line-test",
+                "OPENAI_BASIS_LINE_MODEL": "gpt-6-luna",
             }
             return values.get(name, "")
 
@@ -14119,8 +14110,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 )
 
         body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-basis-line-test")
-        self.assertEqual(route_model, "gpt-basis-line-test")
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
+        self.assertEqual(route_model, "gpt-6-luna")
         self.assertEqual(result["currency"], "SGD")
 
     def test_openai_pricing_metadata_uses_basis_line_model(self):
@@ -14139,7 +14131,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         def dotenv(name):
             values = {
-                "OPENAI_BASIS_LINE_MODEL": "gpt-basis-line-test",
+                "OPENAI_BASIS_LINE_MODEL": "gpt-6-luna",
             }
             return values.get(name, "")
 
@@ -14163,8 +14155,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 )
 
         body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-basis-line-test")
-        self.assertEqual(route_model, "gpt-basis-line-test")
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
+        self.assertEqual(route_model, "gpt-6-luna")
         self.assertEqual(result["items"][0]["object_families"], ["flooring"])
 
     def test_deepseek_pricing_import_default_timeout_allows_full_attempt(self):
@@ -14484,8 +14477,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             values = {
                 webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
                 webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-basis-line-mini-test",
-                webapp.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-draft-pro-test",
+                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
+                webapp.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-6-luna",
             }
             return values.get(name, "")
 
@@ -14498,7 +14491,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         third_body = json.loads(urlopen.call_args_list[2].args[0].data.decode("utf-8"))
         self.assertEqual(first_body["model"], "deepseek-v4-flash")
         self.assertEqual(second_body["model"], "deepseek-v4-pro")
-        self.assertEqual(third_body["model"], "gpt-basis-line-mini-test")
+        self.assertEqual(third_body["model"], "gpt-6-luna")
+        self.assertEqual(third_body["reasoning"], {"effort": "high"})
         self.assertEqual(result["type"], "proposal")
 
     def test_basis_chat_fallback_logs_ai_call_attempts(self):
@@ -14515,7 +14509,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             values = {
                 webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
                 webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-basis-line-mini-test",
+                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
             }
             return values.get(name, "")
 
@@ -14584,11 +14578,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         def dotenv(name):
             if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-draft-mini-test"
+                return "gpt-6-luna"
             if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-basis-line-mini-test"
+                return "gpt-6-luna"
             if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-basis-answer-nano-test"
+                return "gpt-6-luna"
             return ""
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
@@ -14597,7 +14591,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-basis-answer-nano-test")
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
         self.assertEqual(result["type"], "answer")
 
     def test_openai_line_basis_chat_does_not_retry_draft_model_after_invalid_basis_line_output(self):
@@ -14630,11 +14625,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         def dotenv(name):
             if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-draft-mini-test"
+                return "gpt-6-luna"
             if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-basis-line-mini-test"
+                return "gpt-6-luna"
             if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-basis-answer-nano-test"
+                return "gpt-6-luna"
             return ""
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
@@ -14644,7 +14639,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(urlopen.call_count, 1)
         first_body = json.loads(urlopen.call_args_list[0].args[0].data.decode("utf-8"))
-        self.assertEqual(first_body["model"], "gpt-basis-line-mini-test")
+        self.assertEqual(first_body["model"], "gpt-6-luna")
+        self.assertEqual(first_body["reasoning"], {"effort": "high"})
 
     def test_openai_line_basis_chat_http_error_does_not_retry_draft_model(self):
         payload = valid_payload()
@@ -14665,11 +14661,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         def dotenv(name):
             if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-draft-mini-test"
+                return "gpt-6-luna"
             if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-basis-line-mini-test"
+                return "gpt-6-luna"
             if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-basis-answer-nano-test"
+                return "gpt-6-luna"
             return ""
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
@@ -14679,7 +14675,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(urlopen.call_count, 1)
         body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-basis-line-mini-test")
+        self.assertEqual(body["model"], "gpt-6-luna")
+        self.assertEqual(body["reasoning"], {"effort": "high"})
         self.assertIn("HTTP 401", str(context.exception))
 
     def test_basis_chat_without_provider_does_not_use_local_fallback(self):
