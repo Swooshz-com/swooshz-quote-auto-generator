@@ -7,7 +7,9 @@ import hashlib
 import json
 import re
 import secrets
+import sqlite3
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -260,27 +262,235 @@ def telemetry_attempt_integer(value: Any, *, field: str) -> int | None:
     return parsed
 
 
-def apply_telemetry_attempt_semantics_migration(connection: Any) -> None:
-    row = connection.execute(
-        "select sql from sqlite_master where type = 'table' and name = 'sqag_telemetry_events'"
-    ).fetchone()
-    table_sql = row[0] if row else None
-    if not isinstance(table_sql, str):
-        raise RuntimeError("SQLite telemetry events table is missing.")
-    normalized = re.sub(r"\s+", "", table_sql.lower())
-    canonical_attempt_check = (
-        "check(attempt_numberisnullorattempt_number>=1or(attempt_number=0and"
-        "event_type='validation'andevent_status='blocked'andpurposeisnotnullandpurpose='request_validation'"
-        "andfailure_classisnotnullandfailure_class='configuration'andmodelisnull"
-        "andusage_availableisnotnullandusage_available=0andcost_availableisnotnullandcost_available=0"
-        "andinput_tokensisnullandoutput_tokensisnullandtotal_tokensisnullandcache_read_tokensisnull"
-        "andcache_write_tokensisnullandestimated_costisnullandactual_costisnullandcurrencyisnull"
-        "andcost_versionisnull))"
+SQLITE_TELEMETRY_INVALID = "INVALID_OR_DRIFTED"
+SQLITE_TELEMETRY_HISTORICAL_009 = "COMPLETE_HISTORICAL_009"
+SQLITE_TELEMETRY_SUCCESSOR_010 = "COMPLETE_SUCCESSOR_010"
+SQLITE_TELEMETRY_EVENT_COLUMNS = (
+    "workspace_id", "event_id", "source_product", "source_sequence",
+    "event_type", "event_status", "actor_tracking_id", "actor_key_version",
+    "action_reference", "run_reference", "session_reference", "support_reference",
+    "retry_lineage_id", "attempt_number", "provider", "model", "reasoning_level",
+    "operation_route", "purpose", "failure_class", "duration_ms", "usage_available",
+    "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+    "cache_write_tokens", "cost_available", "estimated_cost", "actual_cost",
+    "currency", "cost_version", "quota_decision", "rate_limit_decision",
+    "abuse_decision", "deployment_revision", "occurred_at",
+    "immutable_metadata_digest", "retention_expires_at",
+    "original_retention_expires_at", "legal_hold", "deletion_state",
+    "deletion_error_code", "deletion_claimed_at",
+)
+SQLITE_TELEMETRY_SOURCE_STATE_COLUMNS = (
+    "workspace_id", "source_product", "next_source_sequence", "high_watermark",
+    "reconciliation_state", "last_reconciled_at", "reconciliation_reference",
+    "created_at", "updated_at",
+)
+SQLITE_TELEMETRY_TABLES = (
+    "sqag_telemetry_events", "sqag_telemetry_source_state",
+)
+SQLITE_TELEMETRY_SCRATCH = "sqag_telemetry_events_010_legacy"
+SQLITE_TELEMETRY_OBJECT_NAMES = frozenset({
+    *SQLITE_TELEMETRY_TABLES,
+    SQLITE_TELEMETRY_SCRATCH,
+    "sqag_telemetry_source_state_workspace_idx",
+    "sqag_telemetry_source_state_no_delete",
+    "sqag_telemetry_events_feed_idx",
+    "sqag_telemetry_events_source_sequence_uidx",
+    "sqag_telemetry_events_retention_idx",
+    "sqag_telemetry_events_actor_idx",
+    "sqag_telemetry_events_retry_uidx",
+    "sqag_telemetry_events_no_update",
+    "sqag_telemetry_events_guard_delete",
+    "sqag_telemetry_events_cleanup_delete_auth",
+})
+
+
+def _sqlite_telemetry_schema_snapshot(connection: Any) -> tuple[Any, ...]:
+    placeholders = ",".join("?" for _ in SQLITE_TELEMETRY_OBJECT_NAMES)
+    table_placeholders = ",".join("?" for _ in SQLITE_TELEMETRY_TABLES)
+    object_rows = connection.execute(
+        "select type, name, tbl_name, sql from sqlite_master "
+        f"where name collate nocase in ({placeholders}) "
+        f"or tbl_name collate nocase in ({table_placeholders})",
+        (*sorted(SQLITE_TELEMETRY_OBJECT_NAMES), *SQLITE_TELEMETRY_TABLES),
+    ).fetchall()
+    objects = tuple(
+        sorted(
+            (tuple(row) for row in object_rows),
+            key=lambda row: (str(row[0]), str(row[1]), str(row[2])),
+        )
     )
-    if normalized.count(canonical_attempt_check) == 1:
+    table_list_rows = connection.execute("pragma table_list").fetchall()
+    table_list = tuple(
+        sorted(
+            (
+                tuple(row)
+                for row in table_list_rows
+                if row[0] == "main" and str(row[1]).lower() in SQLITE_TELEMETRY_TABLES
+            ),
+            key=lambda row: str(row[1]),
+        )
+    )
+    tables: list[tuple[Any, ...]] = []
+    for table in SQLITE_TELEMETRY_TABLES:
+        table_xinfo = tuple(
+            tuple(row)
+            for row in connection.execute(f'pragma table_xinfo("{table}")').fetchall()
+        )
+        index_rows = connection.execute(f'pragma index_list("{table}")').fetchall()
+        indexes: list[tuple[Any, ...]] = []
+        for index_row in sorted(index_rows, key=lambda row: str(row[1])):
+            index_name = str(index_row[1])
+            index_xinfo = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    f'pragma index_xinfo("{index_name}")'
+                ).fetchall()
+            )
+            indexes.append((tuple(index_row), index_xinfo))
+        foreign_keys = tuple(
+            tuple(row)
+            for row in connection.execute(f'pragma foreign_key_list("{table}")').fetchall()
+        )
+        tables.append((table, table_xinfo, tuple(indexes), foreign_keys))
+    return objects, table_list, tuple(tables)
+
+
+def _sqlite_telemetry_temp_conflict_exists(connection: Any) -> bool:
+    placeholders = ",".join("?" for _ in SQLITE_TELEMETRY_OBJECT_NAMES)
+    table_placeholders = ",".join("?" for _ in SQLITE_TELEMETRY_TABLES)
+    row = connection.execute(
+        "select 1 from sqlite_temp_master "
+        f"where name collate nocase in ({placeholders}) "
+        f"or tbl_name collate nocase in ({table_placeholders}) limit 1",
+        (*sorted(SQLITE_TELEMETRY_OBJECT_NAMES), *SQLITE_TELEMETRY_TABLES),
+    ).fetchone()
+    return row is not None
+
+
+def sqlite_telemetry_schema_objects_present(connection: Any) -> bool:
+    """Return whether any canonical, reserved, or attached telemetry object exists."""
+    try:
+        placeholders = ",".join("?" for _ in SQLITE_TELEMETRY_OBJECT_NAMES)
+        table_placeholders = ",".join("?" for _ in SQLITE_TELEMETRY_TABLES)
+        parameters = (*sorted(SQLITE_TELEMETRY_OBJECT_NAMES), *SQLITE_TELEMETRY_TABLES)
+        for query in (
+            "select 1 from sqlite_master "
+            f"where name collate nocase in ({placeholders}) "
+            f"or tbl_name collate nocase in ({table_placeholders}) limit 1",
+            "select 1 from sqlite_temp_master "
+            f"where name collate nocase in ({placeholders}) "
+            f"or tbl_name collate nocase in ({table_placeholders}) limit 1",
+        ):
+            row = connection.execute(query, parameters).fetchone()
+            if row is not None:
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def _execute_sql_statements(connection: Any, sql: str) -> None:
+    pending = ""
+    for line in sql.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            pending = ""
+            if statement:
+                connection.execute(statement)
+    if pending.strip():
+        raise RuntimeError("SQLite telemetry migration contains an incomplete statement.")
+
+
+@lru_cache(maxsize=1)
+def _expected_sqlite_telemetry_schema_snapshots() -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    migration_root = Path(__file__).resolve().parents[1] / "migrations"
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(
+            (migration_root / "004_generation_forensics_feedback_retention.sql").read_text(encoding="utf-8")
+        )
+        connection.executescript(
+            (migration_root / "009_telemetry_events.sql").read_text(encoding="utf-8")
+        )
+        historical = _sqlite_telemetry_schema_snapshot(connection)
+        connection.execute("begin immediate")
+        _execute_sql_statements(
+            connection,
+            (migration_root / "010_telemetry_attempt_semantics.sql").read_text(encoding="utf-8"),
+        )
+        connection.commit()
+        successor = _sqlite_telemetry_schema_snapshot(connection)
+        return historical, successor
+    finally:
+        connection.close()
+
+
+def classify_sqlite_telemetry_schema(connection: Any) -> str:
+    """Classify only the complete immutable 009 or complete authorized 010 schema."""
+    try:
+        if _sqlite_telemetry_temp_conflict_exists(connection):
+            return SQLITE_TELEMETRY_INVALID
+        actual = _sqlite_telemetry_schema_snapshot(connection)
+        historical, successor = _expected_sqlite_telemetry_schema_snapshots()
+        if actual == historical:
+            return SQLITE_TELEMETRY_HISTORICAL_009
+        if actual == successor:
+            return SQLITE_TELEMETRY_SUCCESSOR_010
+    except Exception:
+        return SQLITE_TELEMETRY_INVALID
+    return SQLITE_TELEMETRY_INVALID
+
+
+def _sqlite_telemetry_rows_snapshot(
+    connection: Any, table: str, columns: tuple[str, ...], order_by: tuple[str, ...]
+) -> tuple[tuple[tuple[Any, ...], tuple[Any, ...]], ...]:
+    selected = ", ".join(f'"{column}"' for column in columns)
+    storage_types = ", ".join(f'typeof("{column}")' for column in columns)
+    ordering = ", ".join(f'"{column}"' for column in order_by)
+    rows = connection.execute(
+        f"select {selected}, {storage_types} from \"{table}\" order by {ordering}"
+    ).fetchall()
+    width = len(columns)
+    return tuple((tuple(row[:width]), tuple(row[width:])) for row in rows)
+
+
+def _verify_sqlite_telemetry_migration_preservation(
+    connection: Any,
+    event_rows: tuple[tuple[tuple[Any, ...], tuple[Any, ...]], ...],
+    source_state_rows: tuple[tuple[tuple[Any, ...], tuple[Any, ...]], ...],
+) -> None:
+    migrated_events = _sqlite_telemetry_rows_snapshot(
+        connection,
+        "sqag_telemetry_events",
+        SQLITE_TELEMETRY_EVENT_COLUMNS,
+        ("workspace_id", "event_id"),
+    )
+    preserved_source_state = _sqlite_telemetry_rows_snapshot(
+        connection,
+        "sqag_telemetry_source_state",
+        SQLITE_TELEMETRY_SOURCE_STATE_COLUMNS,
+        ("workspace_id", "source_product"),
+    )
+    before_keys = {row[0][:2] for row in event_rows}
+    after_keys = {row[0][:2] for row in migrated_events}
+    if (
+        len(migrated_events) != len(event_rows)
+        or before_keys != after_keys
+        or migrated_events != event_rows
+        or preserved_source_state != source_state_rows
+    ):
+        raise RuntimeError("SQLite telemetry migration did not preserve canonical rows.")
+
+
+def apply_telemetry_attempt_semantics_migration(connection: Any) -> None:
+    schema_state = classify_sqlite_telemetry_schema(connection)
+    if schema_state == SQLITE_TELEMETRY_SUCCESSOR_010:
+        if connection.execute("pragma foreign_key_check").fetchone() is not None:
+            raise RuntimeError("SQLite telemetry successor has foreign-key violations.")
         return
-    if "attempt_numberintegercheck(attempt_numberisnullorattempt_number>=1)" not in normalized:
-        raise RuntimeError("SQLite telemetry attempt constraint drifted.")
+    if schema_state != SQLITE_TELEMETRY_HISTORICAL_009:
+        raise RuntimeError("SQLite telemetry schema is invalid or drifted.")
     if connection.in_transaction:
         raise RuntimeError("SQLite telemetry attempt migration cannot run inside an active transaction.")
     migration_path = Path(__file__).resolve().parents[1] / "migrations" / "010_telemetry_attempt_semantics.sql"
@@ -288,17 +498,38 @@ def apply_telemetry_attempt_semantics_migration(connection: Any) -> None:
         migration_sql = migration_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise RuntimeError("SQLite telemetry attempt migration is unavailable.") from exc
+    foreign_keys_before = connection.execute("pragma foreign_keys").fetchone()[0]
     try:
-        connection.executescript(migration_sql)
-    except Exception:
-        connection.rollback()
+        connection.execute("begin immediate")
+        if classify_sqlite_telemetry_schema(connection) != SQLITE_TELEMETRY_HISTORICAL_009:
+            raise RuntimeError("SQLite telemetry schema changed before migration ownership.")
+        event_rows = _sqlite_telemetry_rows_snapshot(
+            connection,
+            "sqag_telemetry_events",
+            SQLITE_TELEMETRY_EVENT_COLUMNS,
+            ("workspace_id", "event_id"),
+        )
+        source_state_rows = _sqlite_telemetry_rows_snapshot(
+            connection,
+            "sqag_telemetry_source_state",
+            SQLITE_TELEMETRY_SOURCE_STATE_COLUMNS,
+            ("workspace_id", "source_product"),
+        )
+        _execute_sql_statements(connection, migration_sql)
+        _verify_sqlite_telemetry_migration_preservation(
+            connection, event_rows, source_state_rows
+        )
+        if classify_sqlite_telemetry_schema(connection) != SQLITE_TELEMETRY_SUCCESSOR_010:
+            raise RuntimeError("SQLite telemetry successor schema verification failed.")
+        if connection.execute("pragma foreign_key_check").fetchone() is not None:
+            raise RuntimeError("SQLite telemetry migration produced foreign-key violations.")
+        if connection.execute("pragma foreign_keys").fetchone()[0] != foreign_keys_before:
+            raise RuntimeError("SQLite foreign-key enforcement state changed during migration.")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
         raise
-    migrated = connection.execute(
-        "select sql from sqlite_master where type = 'table' and name = 'sqag_telemetry_events'"
-    ).fetchone()
-    migrated_sql = re.sub(r"\s+", "", str(migrated[0] if migrated else "").lower())
-    if migrated_sql.count(canonical_attempt_check) != 1:
-        raise RuntimeError("SQLite telemetry attempt migration did not install its constraint.")
 
 
 def telemetry_number(value: Any, *, field: str) -> int | float | None:

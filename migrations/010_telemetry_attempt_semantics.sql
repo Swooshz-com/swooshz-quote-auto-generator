@@ -2,9 +2,6 @@
 -- The SQLite table is rebuilt transactionally because SQLite cannot drop a
 -- table CHECK constraint in place. Historical migration 009 remains immutable.
 
-pragma foreign_keys = on;
-begin immediate;
-
 alter table sqag_telemetry_events rename to sqag_telemetry_events_010_legacy;
 
 create table sqag_telemetry_events (
@@ -79,7 +76,98 @@ create table sqag_telemetry_events (
   )
 );
 
-insert into sqag_telemetry_events select * from sqag_telemetry_events_010_legacy;
+insert into sqag_telemetry_events (
+  workspace_id,
+  event_id,
+  source_product,
+  source_sequence,
+  event_type,
+  event_status,
+  actor_tracking_id,
+  actor_key_version,
+  action_reference,
+  run_reference,
+  session_reference,
+  support_reference,
+  retry_lineage_id,
+  attempt_number,
+  provider,
+  model,
+  reasoning_level,
+  operation_route,
+  purpose,
+  failure_class,
+  duration_ms,
+  usage_available,
+  input_tokens,
+  output_tokens,
+  total_tokens,
+  cache_read_tokens,
+  cache_write_tokens,
+  cost_available,
+  estimated_cost,
+  actual_cost,
+  currency,
+  cost_version,
+  quota_decision,
+  rate_limit_decision,
+  abuse_decision,
+  deployment_revision,
+  occurred_at,
+  immutable_metadata_digest,
+  retention_expires_at,
+  original_retention_expires_at,
+  legal_hold,
+  deletion_state,
+  deletion_error_code,
+  deletion_claimed_at
+)
+select
+  workspace_id,
+  event_id,
+  source_product,
+  source_sequence,
+  event_type,
+  event_status,
+  actor_tracking_id,
+  actor_key_version,
+  action_reference,
+  run_reference,
+  session_reference,
+  support_reference,
+  retry_lineage_id,
+  attempt_number,
+  provider,
+  model,
+  reasoning_level,
+  operation_route,
+  purpose,
+  failure_class,
+  duration_ms,
+  usage_available,
+  input_tokens,
+  output_tokens,
+  total_tokens,
+  cache_read_tokens,
+  cache_write_tokens,
+  cost_available,
+  estimated_cost,
+  actual_cost,
+  currency,
+  cost_version,
+  quota_decision,
+  rate_limit_decision,
+  abuse_decision,
+  deployment_revision,
+  occurred_at,
+  immutable_metadata_digest,
+  retention_expires_at,
+  original_retention_expires_at,
+  legal_hold,
+  deletion_state,
+  deletion_error_code,
+  deletion_claimed_at
+from sqag_telemetry_events_010_legacy;
 drop table sqag_telemetry_events_010_legacy;
 
 create index sqag_telemetry_events_feed_idx
@@ -124,5 +212,3 @@ after delete on sqag_telemetry_events begin
     and record_type = 'sqag_telemetry_events'
     and record_id = old.event_id;
 end;
-
-commit;

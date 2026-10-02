@@ -16,10 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 from webapp import server
 from webapp.forensics import (
     ForensicStore,
+    SQLITE_TELEMETRY_EVENT_COLUMNS,
+    SQLITE_TELEMETRY_HISTORICAL_009,
+    SQLITE_TELEMETRY_INVALID,
+    SQLITE_TELEMETRY_SOURCE_STATE_COLUMNS,
+    SQLITE_TELEMETRY_SUCCESSOR_010,
     TELEMETRY_EVENT_TYPES,
     TelemetryConflictError,
     TelemetryUnavailableError,
     apply_telemetry_attempt_semantics_migration,
+    classify_sqlite_telemetry_schema,
 )
 
 
@@ -36,6 +42,395 @@ def connection_with_telemetry() -> sqlite3.Connection:
     connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
     apply_telemetry_attempt_semantics_migration(connection)
     return connection
+
+
+def connection_with_historical_telemetry(migration_sql: str | None = None) -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(FORENSIC_MIGRATION.read_text(encoding="utf-8"))
+    connection.executescript(
+        migration_sql if migration_sql is not None else TELEMETRY_MIGRATION.read_text(encoding="utf-8")
+    )
+    return connection
+
+
+def sentinel_event_values(event_id: str, source_sequence: int, *, null_optional: bool = False) -> dict[str, object]:
+    values: dict[str, object] = {
+        "workspace_id": "workspace-g3",
+        "event_id": event_id,
+        "source_product": "sqag",
+        "source_sequence": source_sequence,
+        "event_type": "ai_provider_attempt",
+        "event_status": "failed",
+        "actor_tracking_id": "pid-v1-sentinel",
+        "actor_key_version": "v1",
+        "action_reference": f"ACTION-{event_id}",
+        "run_reference": f"RUN-{event_id}",
+        "session_reference": f"SESSION-{event_id}",
+        "support_reference": f"SUPPORT-{event_id}",
+        "retry_lineage_id": f"LINEAGE-{event_id}",
+        "attempt_number": 1,
+        "provider": "openai",
+        "model": "gpt-6-luna",
+        "reasoning_level": "high",
+        "operation_route": "/api/synthetic",
+        "purpose": "migration-preservation",
+        "failure_class": "provider_error",
+        "duration_ms": 37,
+        "usage_available": 1,
+        "input_tokens": 101,
+        "output_tokens": 202,
+        "total_tokens": 303,
+        "cache_read_tokens": 11,
+        "cache_write_tokens": 12,
+        "cost_available": 1,
+        "estimated_cost": 1.125,
+        "actual_cost": 1.25,
+        "currency": "USD",
+        "cost_version": "cost-v1",
+        "quota_decision": "allowed",
+        "rate_limit_decision": "not_evaluated",
+        "abuse_decision": "allowed",
+        "deployment_revision": "revision-g3",
+        "occurred_at": "2026-10-02T00:00:00Z",
+        "immutable_metadata_digest": "c" * 64,
+        "retention_expires_at": "2029-10-02T00:00:00Z",
+        "original_retention_expires_at": "2029-10-02T00:00:00Z",
+        "legal_hold": 1,
+        "deletion_state": "active",
+        "deletion_error_code": "delete-sentinel",
+        "deletion_claimed_at": "2026-10-02T00:01:00Z",
+    }
+    if null_optional:
+        required = {
+            "workspace_id", "event_id", "source_product", "source_sequence",
+            "event_type", "event_status", "actor_tracking_id", "actor_key_version",
+            "occurred_at", "immutable_metadata_digest", "retention_expires_at",
+            "original_retention_expires_at", "legal_hold", "deletion_state",
+        }
+        for name in set(values) - required:
+            values[name] = None
+    return values
+
+
+def seed_historical_telemetry_rows(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "insert into sqag_telemetry_source_state ("
+        + ", ".join(SQLITE_TELEMETRY_SOURCE_STATE_COLUMNS)
+        + ") values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "workspace-g3", "sqag", 10, 9, "reconciling",
+            "2026-10-02T00:02:00Z", "source-state-sentinel",
+            "2026-10-01T00:00:00Z", "2026-10-02T00:02:00Z",
+        ),
+    )
+    for event_id, sequence, null_optional in (
+        ("event-preserve-all", 7, False),
+        ("event-preserve-null", 8, True),
+    ):
+        values = sentinel_event_values(event_id, sequence, null_optional=null_optional)
+        connection.execute(
+            "insert into sqag_telemetry_events ("
+            + ", ".join(SQLITE_TELEMETRY_EVENT_COLUMNS)
+            + ") values ("
+            + ", ".join("?" for _ in SQLITE_TELEMETRY_EVENT_COLUMNS)
+            + ")",
+            tuple(values[name] for name in SQLITE_TELEMETRY_EVENT_COLUMNS),
+        )
+    connection.commit()
+
+
+def telemetry_database_snapshot(connection: sqlite3.Connection) -> tuple[object, ...]:
+    schema = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "select type, name, tbl_name, sql from sqlite_master "
+            "where name like 'sqag_telemetry%' or tbl_name in "
+            "('sqag_telemetry_events', 'sqag_telemetry_source_state') "
+            "order by type, name"
+        ).fetchall()
+    )
+    temp_schema = tuple(
+        tuple(row)
+        for row in connection.execute(
+            "select type, name, tbl_name, sql from sqlite_temp_master "
+            "where name like 'sqag_telemetry%' or tbl_name in "
+            "('sqag_telemetry_events', 'sqag_telemetry_source_state') "
+            "order by type, name"
+        ).fetchall()
+    )
+    events = None
+    if connection.execute(
+        "select 1 from sqlite_master where type='table' and name='sqag_telemetry_events'"
+    ).fetchone():
+        selected = ", ".join(SQLITE_TELEMETRY_EVENT_COLUMNS)
+        typed = ", ".join(f"typeof({name})" for name in SQLITE_TELEMETRY_EVENT_COLUMNS)
+        events = tuple(
+            tuple(row)
+            for row in connection.execute(
+                f"select {selected}, {typed} from sqag_telemetry_events order by workspace_id, event_id"
+            ).fetchall()
+        )
+    source_state = None
+    if connection.execute(
+        "select 1 from sqlite_master where type='table' and name='sqag_telemetry_source_state'"
+    ).fetchone():
+        selected = ", ".join(SQLITE_TELEMETRY_SOURCE_STATE_COLUMNS)
+        typed = ", ".join(f"typeof({name})" for name in SQLITE_TELEMETRY_SOURCE_STATE_COLUMNS)
+        source_state = tuple(
+            tuple(row)
+            for row in connection.execute(
+                f"select {selected}, {typed} from sqag_telemetry_source_state order by workspace_id, source_product"
+            ).fetchall()
+        )
+    foreign_keys = connection.execute("pragma foreign_keys").fetchone()[0]
+    return schema, temp_schema, events, source_state, foreign_keys
+
+
+class TelemetryMigrationAdmissionTest(unittest.TestCase):
+    def assert_rejected_without_mutation(self, connection: sqlite3.Connection) -> None:
+        self.assertEqual(classify_sqlite_telemetry_schema(connection), SQLITE_TELEMETRY_INVALID)
+        before = telemetry_database_snapshot(connection)
+        with self.assertRaisesRegex(RuntimeError, "invalid or drifted"):
+            apply_telemetry_attempt_semantics_migration(connection)
+        self.assertEqual(telemetry_database_snapshot(connection), before)
+
+    def test_canonical_009_migrates_with_exact_mapping_and_all_field_preservation(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            seed_historical_telemetry_rows(connection)
+            before = telemetry_database_snapshot(connection)
+            apply_telemetry_attempt_semantics_migration(connection)
+            after = telemetry_database_snapshot(connection)
+            self.assertEqual(classify_sqlite_telemetry_schema(connection), SQLITE_TELEMETRY_SUCCESSOR_010)
+            self.assertEqual(after[2], before[2])
+            self.assertEqual(after[3], before[3])
+            self.assertEqual(after[4], before[4])
+            self.assertIsNone(connection.execute(
+                "select 1 from sqlite_master where name = 'sqag_telemetry_events_010_legacy'"
+            ).fetchone())
+            self.assertIsNone(connection.execute("pragma foreign_key_check").fetchone())
+
+            migration_sql = TELEMETRY_ATTEMPT_MIGRATION.read_text(encoding="utf-8")
+            import re
+
+            match = re.search(
+                r"insert\s+into\s+sqag_telemetry_events\s*\((.*?)\)\s*select\s*(.*?)\s*from\s+sqag_telemetry_events_010_legacy",
+                migration_sql,
+                re.IGNORECASE | re.DOTALL,
+            )
+            self.assertIsNotNone(match)
+            target_columns = tuple(part.strip() for part in match.group(1).split(","))
+            source_columns = tuple(part.strip() for part in match.group(2).split(","))
+            self.assertEqual(target_columns, SQLITE_TELEMETRY_EVENT_COLUMNS)
+            self.assertEqual(source_columns, SQLITE_TELEMETRY_EVENT_COLUMNS)
+            normalized = migration_sql.lower()
+            self.assertNotIn("select *", normalized)
+            self.assertNotIn("cast(", normalized)
+            self.assertNotIn("or ignore", normalized)
+            self.assertNotIn("replace", normalized)
+        finally:
+            connection.close()
+
+    def test_reordered_action_and_run_columns_are_rejected_before_mutation(self):
+        historical_sql = TELEMETRY_MIGRATION.read_text(encoding="utf-8")
+        historical_sql = historical_sql.replace(
+            "  action_reference text,\n  run_reference text,",
+            "  run_reference text,\n  action_reference text,",
+            1,
+        )
+        connection = connection_with_historical_telemetry(historical_sql)
+        try:
+            seed_historical_telemetry_rows(connection)
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_successor_missing_delete_guard_is_rejected(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            apply_telemetry_attempt_semantics_migration(connection)
+            connection.execute("drop trigger sqag_telemetry_events_guard_delete")
+            connection.commit()
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_reserved_scratch_object_is_rejected_in_main_and_temp_schemas(self):
+        for schema in ("main", "temp"):
+            connection = connection_with_historical_telemetry()
+            try:
+                qualifier = "temp." if schema == "temp" else ""
+                connection.execute(
+                    f"create table {qualifier}sqag_telemetry_events_010_legacy (value text)"
+                )
+                connection.commit()
+                self.assert_rejected_without_mutation(connection)
+            finally:
+                connection.close()
+
+    def test_successor_reserved_scratch_object_is_case_insensitive_in_main_and_temp(self):
+        for schema in ("main", "temp"):
+            connection = connection_with_historical_telemetry()
+            try:
+                apply_telemetry_attempt_semantics_migration(connection)
+                qualifier = "temp." if schema == "temp" else "main."
+                connection.execute(
+                    f"create table {qualifier}SQAG_TELEMETRY_EVENTS_010_LEGACY (value text)"
+                )
+                connection.commit()
+                self.assert_rejected_without_mutation(connection)
+            finally:
+                connection.close()
+
+    def test_missing_required_index_is_rejected(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            connection.execute("drop index sqag_telemetry_events_actor_idx")
+            connection.commit()
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_retry_index_predicate_drift_is_rejected(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            connection.execute("drop index sqag_telemetry_events_retry_uidx")
+            connection.execute(
+                "create unique index sqag_telemetry_events_retry_uidx "
+                "on sqag_telemetry_events (workspace_id, retry_lineage_id, attempt_number) "
+                "where retry_lineage_id is not null"
+            )
+            connection.commit()
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_primary_key_drift_is_rejected(self):
+        historical_sql = TELEMETRY_MIGRATION.read_text(encoding="utf-8").replace(
+            "primary key (workspace_id, event_id)",
+            "primary key (event_id, workspace_id)",
+            1,
+        )
+        connection = connection_with_historical_telemetry(historical_sql)
+        try:
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_foreign_key_drift_is_rejected(self):
+        historical_sql = TELEMETRY_MIGRATION.read_text(encoding="utf-8").replace(
+            "  primary key (workspace_id, event_id),\n"
+            "  foreign key (workspace_id, source_product) references sqag_telemetry_source_state(workspace_id, source_product)",
+            "  primary key (workspace_id, event_id)",
+            1,
+        )
+        connection = connection_with_historical_telemetry(historical_sql)
+        try:
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_changed_immutable_trigger_body_is_rejected(self):
+        historical_sql = TELEMETRY_MIGRATION.read_text(encoding="utf-8").replace(
+            "telemetry events are immutable",
+            "telemetry event body drifted",
+            1,
+        )
+        connection = connection_with_historical_telemetry(historical_sql)
+        try:
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_changed_immutable_trigger_column_list_is_rejected(self):
+        historical_sql = TELEMETRY_MIGRATION.read_text(encoding="utf-8").replace(
+            "retry_lineage_id, attempt_number, provider, model, reasoning_level,",
+            "retry_lineage_id, provider, model, reasoning_level,",
+            1,
+        )
+        connection = connection_with_historical_telemetry(historical_sql)
+        try:
+            self.assert_rejected_without_mutation(connection)
+        finally:
+            connection.close()
+
+    def test_failure_after_copy_before_commit_rolls_back_exactly(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            seed_historical_telemetry_rows(connection)
+            before = telemetry_database_snapshot(connection)
+            with mock.patch(
+                "webapp.forensics._verify_sqlite_telemetry_migration_preservation",
+                side_effect=RuntimeError("injected post-copy verification failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected post-copy"):
+                    apply_telemetry_attempt_semantics_migration(connection)
+            self.assertEqual(telemetry_database_snapshot(connection), before)
+            self.assertFalse(connection.in_transaction)
+            self.assertEqual(classify_sqlite_telemetry_schema(connection), SQLITE_TELEMETRY_HISTORICAL_009)
+        finally:
+            connection.close()
+
+    def test_cancellation_after_copy_before_commit_rolls_back_exactly(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            seed_historical_telemetry_rows(connection)
+            before = telemetry_database_snapshot(connection)
+            with mock.patch(
+                "webapp.forensics._verify_sqlite_telemetry_migration_preservation",
+                side_effect=KeyboardInterrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    apply_telemetry_attempt_semantics_migration(connection)
+            self.assertEqual(telemetry_database_snapshot(connection), before)
+            self.assertFalse(connection.in_transaction)
+            self.assertEqual(classify_sqlite_telemetry_schema(connection), SQLITE_TELEMETRY_HISTORICAL_009)
+        finally:
+            connection.close()
+
+    def test_complete_successor_second_invocation_is_a_verified_noop(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            seed_historical_telemetry_rows(connection)
+            apply_telemetry_attempt_semantics_migration(connection)
+            before = telemetry_database_snapshot(connection)
+            connection.execute("create table caller_transaction (value text)")
+            connection.execute("insert into caller_transaction values ('pending')")
+            self.assertTrue(connection.in_transaction)
+            apply_telemetry_attempt_semantics_migration(connection)
+            self.assertEqual(telemetry_database_snapshot(connection), before)
+            self.assertTrue(connection.in_transaction)
+            connection.rollback()
+        finally:
+            connection.close()
+
+    def test_caller_owned_transaction_refuses_historical_upgrade_without_state_change(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            connection.execute("create table caller_transaction (value text)")
+            connection.execute("insert into caller_transaction values ('pending')")
+            before = telemetry_database_snapshot(connection)
+            self.assertTrue(connection.in_transaction)
+            with self.assertRaisesRegex(RuntimeError, "active transaction"):
+                apply_telemetry_attempt_semantics_migration(connection)
+            self.assertEqual(telemetry_database_snapshot(connection), before)
+            self.assertTrue(connection.in_transaction)
+            connection.rollback()
+        finally:
+            connection.close()
+
+    def test_foreign_key_enforcement_entry_state_is_preserved(self):
+        connection = connection_with_historical_telemetry()
+        try:
+            connection.execute("pragma foreign_keys = off")
+            seed_historical_telemetry_rows(connection)
+            self.assertEqual(connection.execute("pragma foreign_keys").fetchone()[0], 0)
+            apply_telemetry_attempt_semantics_migration(connection)
+            self.assertEqual(connection.execute("pragma foreign_keys").fetchone()[0], 0)
+            self.assertIsNone(connection.execute("pragma foreign_key_check").fetchone())
+        finally:
+            connection.close()
 
 
 class TelemetryProducerTest(unittest.TestCase):
@@ -813,7 +1208,7 @@ class TelemetryProducerTest(unittest.TestCase):
             "attempt_number is null or attempt_number >= 1 or ("
             "attempt_number = 0 and purpose = 'request_validation')))"
         )
-        with self.assertRaisesRegex(RuntimeError, "attempt constraint drifted"):
+        with self.assertRaisesRegex(RuntimeError, "invalid or drifted"):
             apply_telemetry_attempt_semantics_migration(connection)
         connection.close()
 

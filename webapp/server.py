@@ -66,16 +66,20 @@ import pricing_reference_cleanup
 import pricing_reference_enrichment
 from webapp.forensics import (
     MAX_GENERATION_MANIFEST_BYTES,
+    SQLITE_TELEMETRY_HISTORICAL_009,
+    SQLITE_TELEMETRY_SUCCESSOR_010,
     ForensicStore,
     RetentionGraphHeld,
     TELEMETRY_FAILURE_CLASSES,
     TelemetryConflictError,
     TelemetryUnavailableError,
     apply_telemetry_attempt_semantics_migration,
+    classify_sqlite_telemetry_schema,
     iso_timestamp,
     safe_telemetry_label,
     safe_telemetry_route,
     safe_reference,
+    sqlite_telemetry_schema_objects_present,
     trusted_workspace_id,
     utc_now,
 )
@@ -11956,9 +11960,11 @@ def postgres_storage_connection(
         connection.close()
 
 
-def sqag_storage_migration_sql() -> str:
+def sqag_storage_migration_sql(*, include_telemetry: bool = True) -> str:
     sql_parts: list[str] = []
     for path in SQAG_STORAGE_MIGRATION_PATHS:
+        if not include_telemetry and path.name == "009_telemetry_events.sql":
+            continue
         try:
             sql_parts.append(path.read_text(encoding="utf-8"))
         except OSError:
@@ -12002,9 +12008,20 @@ def apply_sqag_storage_migrations(database_url: str | None = None) -> dict[str, 
     family = database_family_from_url(url)
     if family == "sqlite":
         with sqlite_storage_connection(url) as connection:
+            telemetry_state = classify_sqlite_telemetry_schema(connection)
+            telemetry_objects_present = sqlite_telemetry_schema_objects_present(connection)
+            if telemetry_state not in {
+                SQLITE_TELEMETRY_HISTORICAL_009,
+                SQLITE_TELEMETRY_SUCCESSOR_010,
+            } and telemetry_objects_present:
+                raise RuntimeError("SQLite telemetry schema is invalid or drifted.")
             migrate_legacy_sqag_tables_sqlite(connection)
             upgrade_legacy_local_forensic_schema(connection)
-            connection.executescript(sqag_storage_migration_sql())
+            connection.executescript(
+                sqag_storage_migration_sql(
+                    include_telemetry=not telemetry_objects_present
+                )
+            )
             apply_telemetry_attempt_semantics_migration(connection)
             upgrade_legacy_local_forensic_schema(connection)
             connection.commit()
@@ -12342,7 +12359,11 @@ class DatabaseSqagStorage:
         return sqlite_storage_connection(self.database_url)
 
     def ensure_ready(self) -> None:
-        self._ensure_schema(SQAG_APP_METADATA_REQUIRED_COLUMNS, reason="storage_database_not_migrated")
+        self._ensure_schema(
+            SQAG_APP_METADATA_REQUIRED_COLUMNS,
+            reason="storage_database_not_migrated",
+            require_telemetry_successor=True,
+        )
 
     def ensure_retention_ready(self) -> None:
         """Check only the forensic surfaces required by retention maintenance."""
@@ -12356,6 +12377,7 @@ class DatabaseSqagStorage:
         self._ensure_schema(
             SQAG_RUNTIME_FORENSIC_REQUIRED_COLUMNS,
             reason="storage_runtime_forensics_not_migrated",
+            require_telemetry_successor=True,
         )
 
     def ensure_artifact_ready(self) -> None:
@@ -12365,12 +12387,26 @@ class DatabaseSqagStorage:
                 status=503,
                 reason="storage_database_blob_artifacts_unsupported",
             )
-        self._ensure_schema(SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS, reason="storage_artifact_database_not_migrated")
+        self._ensure_schema(
+            SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS,
+            reason="storage_artifact_database_not_migrated",
+            require_telemetry_successor=True,
+        )
 
     def ensure_object_artifact_ready(self) -> None:
-        self._ensure_schema(SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS, reason="storage_object_artifact_database_not_migrated")
+        self._ensure_schema(
+            SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+            reason="storage_object_artifact_database_not_migrated",
+            require_telemetry_successor=True,
+        )
 
-    def _ensure_schema(self, required: dict[str, set[str]], *, reason: str) -> None:
+    def _ensure_schema(
+        self,
+        required: dict[str, set[str]],
+        *,
+        reason: str,
+        require_telemetry_successor: bool = False,
+    ) -> None:
         objects: dict[str, set[str]] = {}
         try:
             with self.connection() as connection:
@@ -12382,6 +12418,17 @@ class DatabaseSqagStorage:
                     }:
                         objects = self._postgres_forensic_schema_objects(connection)
                 else:
+                    if require_telemetry_successor and (
+                        classify_sqlite_telemetry_schema(connection)
+                        != SQLITE_TELEMETRY_SUCCESSOR_010
+                        or connection.execute("pragma foreign_key_check").fetchone()
+                        is not None
+                    ):
+                        raise SqagStorageAccessError(
+                            "SQAG database storage migration has not been applied.",
+                            status=503,
+                            reason=reason,
+                        )
                     rows = self._sqlite_schema_columns(connection, set(required))
                     if reason in {
                         "storage_forensics_database_not_migrated",
@@ -18552,6 +18599,99 @@ def validated_provider_model_label(provider: str, value: Any) -> str:
     if provider_value == AI_PROVIDER_DEEPSEEK and value in {DEEPSEEK_PRO_MODEL, DEEPSEEK_FLASH_MODEL}:
         return value
     return ""
+
+
+def project_generation_configuration_evidence(
+    value: Any,
+    *,
+    model_source_provider: str = AI_PROVIDER_OPENAI,
+) -> Any:
+    """Copy evidence and project only generation-configuration provider/model fields."""
+    model_fields = {
+        "model", "from_model", "to_model", "source_model", "destination_model",
+        "selected_model", "configured_model", "default_model", "model_name",
+    }
+    model_list_fields = {"models", "model_candidates", "candidate_models", "model_sequence"}
+    model_derived_fields = {
+        "model_classification", "model_excerpt", "model_fingerprint", "model_hash",
+        "model_input_length", "model_length", "model_sha256", "model_summary",
+    }
+
+    def provider_label(raw: Any) -> str:
+        return raw if isinstance(raw, str) and raw in SUPPORTED_TEXT_AI_PROVIDERS else ""
+
+    def project_record(record: Any, inherited_provider: str) -> Any:
+        if isinstance(record, list):
+            return [project_record(item, inherited_provider) for item in record]
+        if isinstance(record, tuple):
+            return tuple(project_record(item, inherited_provider) for item in record)
+        if not isinstance(record, dict):
+            return copy.deepcopy(record)
+
+        raw_provider = record.get("provider")
+        explicit_provider = provider_label(raw_provider)
+        provider_is_missing = "provider" not in record or raw_provider in (None, "")
+        if explicit_provider:
+            model_provider = explicit_provider
+        elif provider_is_missing:
+            model_provider = inherited_provider
+        else:
+            model_provider = ""
+
+        projected: dict[Any, Any] = {}
+        for key, item in record.items():
+            key_text = key.lower() if isinstance(key, str) else ""
+            if key_text == "provider" or key_text.endswith("_provider"):
+                projected[key] = provider_label(item)
+            elif key_text in model_derived_fields:
+                projected[key] = ""
+            elif key_text in model_fields or key_text.endswith("_model"):
+                provider_key = f"{key_text.removesuffix('_model')}_provider"
+                if key_text == "model":
+                    provider_key = "model_provider"
+                if provider_key in record:
+                    raw_field_provider = record[provider_key]
+                    field_provider = (
+                        provider_label(raw_field_provider)
+                        if isinstance(raw_field_provider, str)
+                        else ""
+                    )
+                    if raw_field_provider in (None, ""):
+                        field_provider = model_provider
+                else:
+                    field_provider = model_provider
+                projected[key] = validated_provider_model_label(
+                    field_provider, item
+                )
+            elif key_text in model_list_fields:
+                if isinstance(item, (list, tuple)):
+                    candidates = [
+                        validated_provider_model_label(model_provider, candidate)
+                        for candidate in item
+                    ]
+                    projected[key] = tuple(candidates) if isinstance(item, tuple) else candidates
+                else:
+                    projected[key] = []
+            else:
+                projected[key] = project_record(item, model_provider)
+        return projected
+
+    def find_configuration_records(item: Any) -> Any:
+        if isinstance(item, list):
+            return [find_configuration_records(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(find_configuration_records(child) for child in item)
+        if not isinstance(item, dict):
+            return copy.deepcopy(item)
+        projected: dict[Any, Any] = {}
+        for key, child in item.items():
+            if isinstance(key, str) and key.lower() == "generation_configuration":
+                projected[key] = project_record(child, model_source_provider)
+            else:
+                projected[key] = find_configuration_records(child)
+        return projected
+
+    return find_configuration_records(value)
 
 
 def project_provider_model_fields(value: Any, inherited_provider: str = "") -> Any:
@@ -28208,11 +28348,19 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
     database_path = configured_data_root() / "forensics.sqlite3"
     database_url = f"sqlite:///{database_path.as_posix()}"
     with sqlite_storage_connection(database_url) as connection:
+        telemetry_state = classify_sqlite_telemetry_schema(connection)
+        telemetry_objects_present = sqlite_telemetry_schema_objects_present(connection)
+        if telemetry_state not in {
+            SQLITE_TELEMETRY_HISTORICAL_009,
+            SQLITE_TELEMETRY_SUCCESSOR_010,
+        } and telemetry_objects_present:
+            raise RuntimeError("SQLite telemetry schema is invalid or drifted.")
         migration_path = PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
         telemetry_migration_path = PROJECT_ROOT / "migrations" / "009_telemetry_events.sql"
         upgrade_legacy_local_forensic_schema(connection)
         connection.executescript(migration_path.read_text(encoding="utf-8"))
-        connection.executescript(telemetry_migration_path.read_text(encoding="utf-8"))
+        if not telemetry_objects_present:
+            connection.executescript(telemetry_migration_path.read_text(encoding="utf-8"))
         apply_telemetry_attempt_semantics_migration(connection)
         connection.commit()
         yield ForensicStore(connection, workspace_id, actor_tracking_id, local_mode=True, actor_key_version_value="local-v1")
@@ -28458,6 +28606,7 @@ def compact_generation_canonical_manifest(
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
     """Keep terminal evidence bounded while preserving hashes and shape receipts."""
+    manifest = project_generation_configuration_evidence(manifest)
     body_limit = (
         MAX_GENERATION_MANIFEST_BYTES
         - FORENSIC_MANIFEST_ENVELOPE_RESERVE_BYTES
@@ -28838,6 +28987,10 @@ def finish_generation_forensics(
 ) -> dict[str, Any]:
     if not run_id:
         return result
+    if canonical_manifest is not None:
+        canonical_manifest = project_generation_configuration_evidence(
+            canonical_manifest
+        )
     enriched = dict(result)
     enriched["generation_run_id"] = run_id
     validated_session = safe_quote_session_id(validated_session_id, "")
@@ -30028,6 +30181,14 @@ def _run_quote_job(
         for item in transient_outputs
         if isinstance(item, dict) and "." in clean_text(item.get("name"))
     })
+    generation_configuration = project_generation_configuration_evidence({
+        "generation_configuration": {
+            "pdf_mode": normalized_pdf_mode,
+            "provider": read_dotenv_value("AI_PROVIDER"),
+            "model": read_dotenv_value("OPENAI_MODEL"),
+            "app_revision": clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")),
+        }
+    })["generation_configuration"]
     canonical_manifest = {
         "generation_schema_version": 1,
         "job_id": job_id,
@@ -30037,7 +30198,7 @@ def _run_quote_job(
         "profile": {"snapshot": profile_snapshot, "sha256": hashlib.sha256(json.dumps(profile_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
         "pricing_reference": {"snapshot": json.loads(pricing_bytes.decode("utf-8")), "sha256": hashlib.sha256(pricing_bytes).hexdigest()},
         "layout_template": {"filename": layout_template_path.name, "sha256": hashlib.sha256(layout_bytes).hexdigest(), "size_bytes": len(layout_bytes)},
-        "generation_configuration": {"pdf_mode": normalized_pdf_mode, "provider": clean_text(read_dotenv_value("AI_PROVIDER")), "model": clean_text(read_dotenv_value("OPENAI_MODEL")), "app_revision": clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA"))},
+        "generation_configuration": generation_configuration,
         "inputs": input_references,
         "layout_rules": {"snapshot": layout_rules_snapshot, "sha256": hashlib.sha256(json.dumps(layout_rules_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
         "artifacts": durable_artifacts,

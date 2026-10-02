@@ -55,6 +55,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import build_pricing_catalog as pricing_catalog
 import verify_internal_uat_deploy_template as deploy_template
 from webapp import server as webapp
+from webapp import forensics as forensic_module
 from tests.test_openai_draft_request_contract import synthetic_image, synthetic_pdf
 
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
@@ -247,6 +248,43 @@ def valid_payload():
             "standardNotes": "<div>Editable <em>note</em> one</div>",
         },
     }
+
+
+def sqlite_database_snapshot(path: Path) -> tuple[object, ...]:
+    connection = sqlite3.connect(path)
+    try:
+        schema = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "select type, name, tbl_name, sql from sqlite_master order by type, name"
+            ).fetchall()
+        )
+        table_rows: list[tuple[str, tuple[tuple[object, ...], ...]]] = []
+        tables = connection.execute(
+            "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name"
+        ).fetchall()
+        for (table_name,) in tables:
+            columns = [
+                str(row[1])
+                for row in connection.execute(
+                    f'pragma table_xinfo("{table_name}")'
+                ).fetchall()
+                if int(row[6]) == 0
+            ]
+            if not columns:
+                table_rows.append((table_name, ()))
+                continue
+            quoted = ", ".join(f'"{column}"' for column in columns)
+            rows = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    f'select {quoted} from "{table_name}"'
+                ).fetchall()
+            )
+            table_rows.append((table_name, rows))
+        return schema, tuple(table_rows)
+    finally:
+        connection.close()
 
 
 def durable_missing_snapshot_review():
@@ -31772,6 +31810,447 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertEqual(run.call_args.kwargs["job_id"], "job-pdf-view")
         self.assertEqual(run.call_args.kwargs["pdf_mode"], "workbook")
 
+    def test_generation_configuration_projection_is_scoped_idempotent_and_provenance_aware(self):
+        source = {
+            "generation_configuration": {
+                "provider": " OpenAI ",
+                "model": "gpt-6-luna",
+                "model_hash": "PRIVATE_CANARY",
+                "nested": {
+                    "provider": "deepseek",
+                    "model": webapp.DEEPSEEK_PRO_MODEL,
+                    "model_candidates": [webapp.DEEPSEEK_FLASH_MODEL, "PRIVATE_CANARY"],
+                    "model_summary": "PRIVATE_CANARY",
+                },
+            },
+            "business": {"model": "business-model-keep", "provider": "business-provider"},
+        }
+        before = copy.deepcopy(source)
+        projected = webapp.project_generation_configuration_evidence(source)
+        self.assertEqual(source, before)
+        self.assertEqual(
+            projected["generation_configuration"],
+            {
+                "provider": "",
+                "model": "",
+                "model_hash": "",
+                "nested": {
+                    "provider": "deepseek",
+                    "model": webapp.DEEPSEEK_PRO_MODEL,
+                    "model_candidates": [webapp.DEEPSEEK_FLASH_MODEL, ""],
+                    "model_summary": "",
+                },
+            },
+        )
+        self.assertEqual(projected["business"], source["business"])
+        self.assertEqual(
+            webapp.project_generation_configuration_evidence(projected), projected
+        )
+        tuple_source = {
+            "records": ({
+                "generation_configuration": {
+                    "provider": "openai",
+                    "nested": ({"model": "private@example.invalid"},),
+                    "model_candidates": ("gpt-6.1-sol", "private@example.invalid"),
+                }
+            },)
+        }
+        tuple_before = copy.deepcopy(tuple_source)
+        tuple_projected = webapp.project_generation_configuration_evidence(tuple_source)
+        self.assertEqual(tuple_source, tuple_before)
+        self.assertEqual(
+            tuple_projected["records"][0]["generation_configuration"],
+            {
+                "provider": "openai",
+                "nested": ({"model": ""},),
+                "model_candidates": ("gpt-6.1-sol", ""),
+            },
+        )
+        self.assertEqual(
+            webapp.project_generation_configuration_evidence(tuple_projected),
+            tuple_projected,
+        )
+        missing_provider = webapp.project_generation_configuration_evidence({
+            "generation_configuration": {"model": "gpt-6.1-sol"}
+        })
+        self.assertEqual(
+            missing_provider["generation_configuration"],
+            {"model": "gpt-6.1-sol"},
+        )
+        unknown_pair = webapp.project_generation_configuration_evidence({
+            "generation_configuration": {
+                "provider": "deepseek",
+                "model": "gpt-6-luna",
+            }
+        })
+        self.assertEqual(
+            unknown_pair["generation_configuration"],
+            {"provider": "deepseek", "model": ""},
+        )
+
+    def test_generation_model_canaries_are_projected_before_compaction_and_actual_persistence(self):
+        canaries = (
+            "PRIVATE_CANARY/customer confidential note",
+            "!!!",
+            "private@example.invalid",
+            "model\nPRIVATE_CANARY",
+            r"model\nPRIVATE_CANARY",
+            "gpt-6-sol",
+            "gpt-6-luna!!!",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_root = root / "output"
+            tmp_root = root / "scratch"
+            data_root = root / "data"
+
+            def read_value(name):
+                return model_value if name == "OPENAI_MODEL" else ""
+
+            def synthetic_generator(command, **_kwargs):
+                output_dir = Path(command[command.index("--out") + 1])
+                (output_dir / "quotation.xlsx").write_bytes(b"synthetic-quote-output")
+                (output_dir / "pricing_matches.csv").write_text("", encoding="utf-8")
+                (output_dir / "export_status.txt").write_text(
+                    "status=synthetic\n", encoding="utf-8"
+                )
+                return webapp.subprocess.CompletedProcess(
+                    args=command,
+                    returncode=0,
+                    stdout="Wrote quotation.xlsx\n",
+                    stderr="",
+                )
+
+            for mode in ("ordinary", "snapshot", "field_summaries"):
+                for index, model_value in enumerate(canaries):
+                    job_id = f"job-f01-{mode}-{index}"
+                    fingerprint_inputs = []
+                    summary_inputs = []
+                    digest_inputs = []
+                    compaction_inputs = []
+                    original_fingerprint = webapp.forensic_json_fingerprint
+                    original_summary = webapp.forensic_compacted_value
+                    original_compact = webapp.compact_generation_canonical_manifest
+                    original_bounded_digest = forensic_module.bounded_digest_json
+
+                    def fingerprint(value):
+                        fingerprint_inputs.append(copy.deepcopy(value))
+                        return original_fingerprint(value)
+
+                    def compacted_value(value):
+                        summary_inputs.append(copy.deepcopy(value))
+                        return original_summary(value)
+
+                    def compact_manifest(manifest):
+                        candidate = copy.deepcopy(manifest)
+                        if mode == "snapshot":
+                            candidate["profile"]["snapshot"]["_f01_size_probe"] = "x" * 30_000
+                        elif mode == "field_summaries":
+                            candidate["_f01_size_probe"] = "x" * 50_000
+                        compaction_inputs.append(copy.deepcopy(candidate))
+                        return original_compact(candidate)
+
+                    def bounded_digest(
+                        value,
+                        *,
+                        max_bytes=forensic_module.MAX_GENERATION_MANIFEST_BYTES,
+                    ):
+                        digest_inputs.append(copy.deepcopy(value))
+                        return original_bounded_digest(value, max_bytes=max_bytes)
+
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            "APP_MODE": "local",
+                            "QUOTE_DATA_ROOT": str(data_root),
+                            "GIT_REVISION": "",
+                            "COMMIT_SHA": "",
+                        },
+                        clear=False,
+                    ), mock.patch.object(
+                        webapp, "configured_output_root", return_value=output_root
+                    ), mock.patch.object(
+                        webapp, "configured_tmp_root", return_value=tmp_root
+                    ), mock.patch.object(
+                        webapp, "read_dotenv_value", side_effect=read_value
+                    ), mock.patch.object(
+                        webapp.subprocess, "run", side_effect=synthetic_generator
+                    ), mock.patch.object(
+                        webapp, "write_local_log"
+                    ), mock.patch.object(
+                        webapp, "forensic_json_fingerprint", side_effect=fingerprint
+                    ), mock.patch.object(
+                        webapp, "forensic_compacted_value", side_effect=compacted_value
+                    ), mock.patch.object(
+                        webapp, "compact_generation_canonical_manifest", side_effect=compact_manifest
+                    ), mock.patch.object(
+                        forensic_module, "bounded_digest_json", side_effect=bounded_digest
+                    ), (
+                        mock.patch.object(webapp, "MAX_GENERATION_MANIFEST_BYTES", 20_000)
+                        if mode != "ordinary"
+                        else contextlib.nullcontext()
+                    ):
+                        webapp.finish_generate_job(job_id, valid_payload())
+
+                    connection = sqlite3.connect(data_root / "forensics.sqlite3")
+                    try:
+                        run_row = connection.execute(
+                            "select run_id from sqag_generation_runs where job_id = ?",
+                            (job_id,),
+                        ).fetchone()
+                        self.assertIsNotNone(run_row, (mode, index))
+                        evidence_row = connection.execute(
+                            "select evidence_json, evidence_sha256 from sqag_generation_evidence "
+                            "where run_id = ? and evidence_type = 'generation_manifest'",
+                            (run_row[0],),
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                    self.assertIsNotNone(evidence_row, (mode, index))
+                    evidence_json, evidence_sha256 = evidence_row
+                    stored = json.loads(evidence_json)
+                    self.assertEqual(
+                        hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+                        evidence_sha256,
+                    )
+                    expected_model = webapp.validated_provider_model_label(
+                        webapp.AI_PROVIDER_OPENAI, model_value
+                    )
+                    expected_configuration = {
+                        "pdf_mode": "none",
+                        "provider": "",
+                        "model": expected_model,
+                        "app_revision": "",
+                    }
+                    expected_projected = webapp.project_generation_configuration_evidence({
+                        "generation_configuration": expected_configuration
+                    })["generation_configuration"]
+                    if "generation_configuration" in stored:
+                        self.assertEqual(
+                            stored["generation_configuration"], expected_projected
+                        )
+                    else:
+                        self.assertIn("generation_configuration", stored["field_summaries"])
+                        self.assertEqual(
+                            stored["field_summaries"]["generation_configuration"],
+                            webapp.forensic_compacted_value(expected_projected),
+                        )
+                    self.assertTrue(compaction_inputs)
+                    self.assertEqual(
+                        compaction_inputs[0]["generation_configuration"],
+                        expected_projected,
+                    )
+                    self.assertTrue(digest_inputs)
+                    self.assertEqual(digest_inputs[-1], stored)
+                    all_derivation_inputs = (
+                        fingerprint_inputs
+                        + summary_inputs
+                        + digest_inputs
+                        + compaction_inputs
+                        + [stored, evidence_json]
+                    )
+                    for derivation_input in all_derivation_inputs:
+                        serialized = (
+                            derivation_input
+                            if isinstance(derivation_input, str)
+                            else json.dumps(derivation_input, ensure_ascii=True, sort_keys=True)
+                        )
+                        if not expected_model:
+                            for private_marker in (
+                                "PRIVATE_CANARY",
+                                "customer confidential note",
+                                "private@example.invalid",
+                            ):
+                                self.assertNotIn(private_marker, serialized)
+                            self.assertNotIn(model_value, serialized)
+                    if mode == "snapshot":
+                        self.assertTrue(stored.get("evidence_compaction", {}).get("compacted"))
+                    elif mode == "field_summaries":
+                        self.assertIn("field_summaries", stored)
+                        self.assertIn(expected_projected, summary_inputs)
+                    else:
+                        self.assertNotIn("evidence_compaction", stored)
+
+    def test_final_forensic_finalization_projects_manifest_that_bypasses_compaction(self):
+        raw_manifest = {
+            "generation_configuration": {
+                "provider": "openai",
+                "model": "private@example.invalid",
+                "model_hash": "private@example.invalid",
+            },
+            "business": {"model": "business-model-keep"},
+        }
+        original_manifest = copy.deepcopy(raw_manifest)
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "data"
+            with mock.patch.dict(
+                os.environ,
+                {"APP_MODE": "local", "QUOTE_DATA_ROOT": str(data_root)},
+                clear=False,
+            ), mock.patch.object(webapp, "read_dotenv_value", return_value=""), mock.patch.object(
+                webapp, "write_local_log"
+            ):
+                run_id = webapp.begin_generation_forensics(
+                    "generate", {}, job_id="job-f01-finalization-bypass"
+                )
+                webapp.finish_generation_forensics(
+                    run_id,
+                    {"job_id": "job-f01-finalization-bypass", "status": "failed", "errors": []},
+                    canonical_manifest=raw_manifest,
+                    error_category="synthetic_test",
+                )
+            self.assertEqual(raw_manifest, original_manifest)
+            connection = sqlite3.connect(data_root / "forensics.sqlite3")
+            try:
+                evidence_json, evidence_sha256 = connection.execute(
+                    "select evidence_json, evidence_sha256 from sqag_generation_evidence "
+                    "where run_id = ? and evidence_type = 'generation_manifest'",
+                    (run_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            stored = json.loads(evidence_json)
+            self.assertEqual(stored["generation_configuration"]["provider"], "openai")
+            self.assertEqual(stored["generation_configuration"]["model"], "")
+            self.assertEqual(stored["generation_configuration"]["model_hash"], "")
+            self.assertEqual(stored["business"], {"model": "business-model-keep"})
+            self.assertEqual(
+                hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+                evidence_sha256,
+            )
+
+    def test_sqlite_telemetry_migration_callers_preflight_drift_before_historical_replay(self):
+        def database_snapshot(path):
+            connection = sqlite3.connect(path)
+            try:
+                schema = tuple(
+                    tuple(row)
+                    for row in connection.execute(
+                        "select type, name, tbl_name, sql from sqlite_master order by type, name"
+                    ).fetchall()
+                )
+                event_rows = tuple(
+                    tuple(row)
+                    for row in connection.execute(
+                        "select * from sqag_telemetry_events order by workspace_id, event_id"
+                    ).fetchall()
+                )
+                return schema, event_rows
+            finally:
+                connection.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            apply_path = Path(tmp) / "apply.sqlite3"
+            apply_connection = sqlite3.connect(apply_path)
+            apply_connection.executescript(
+                (ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql").read_text(encoding="utf-8")
+            )
+            apply_connection.executescript(
+                (ROOT / "migrations" / "009_telemetry_events.sql").read_text(encoding="utf-8")
+            )
+            apply_connection.execute("drop index sqag_telemetry_events_actor_idx")
+            apply_connection.commit()
+            apply_connection.close()
+            before_apply = database_snapshot(apply_path)
+            with self.assertRaisesRegex(RuntimeError, "invalid or drifted"):
+                webapp.apply_sqag_storage_migrations(
+                    f"sqlite:///{apply_path.as_posix()}"
+                )
+            self.assertEqual(database_snapshot(apply_path), before_apply)
+
+            forensic_root = Path(tmp) / "forensic-data"
+            forensic_root.mkdir()
+            forensic_path = forensic_root / "forensics.sqlite3"
+            forensic_connection = sqlite3.connect(forensic_path)
+            forensic_connection.executescript(
+                (ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql").read_text(encoding="utf-8")
+            )
+            forensic_connection.executescript(
+                (ROOT / "migrations" / "009_telemetry_events.sql").read_text(encoding="utf-8")
+            )
+            forensic_connection.execute("drop index sqag_telemetry_events_actor_idx")
+            forensic_connection.commit()
+            forensic_connection.close()
+            before_forensic = database_snapshot(forensic_path)
+            with mock.patch.dict(
+                os.environ,
+                {"APP_MODE": "local", "QUOTE_DATA_ROOT": str(forensic_root)},
+                clear=False,
+            ), mock.patch.object(webapp, "read_dotenv_value", return_value=""):
+                with self.assertRaisesRegex(RuntimeError, "invalid or drifted"):
+                    with webapp.forensic_store_for_auth_session(None):
+                        self.fail("Drifted local telemetry schema must not open a store.")
+            self.assertEqual(database_snapshot(forensic_path), before_forensic)
+
+    def test_sqlite_telemetry_fresh_bootstrap_and_partial_bootstrap_rules(self):
+        database_snapshot = sqlite_database_snapshot
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "fresh.sqlite3"
+            database_url = f"sqlite:///{database_path.as_posix()}"
+            webapp.apply_sqag_storage_migrations(database_url)
+            connection = sqlite3.connect(database_path)
+            try:
+                self.assertEqual(
+                    forensic_module.classify_sqlite_telemetry_schema(connection),
+                    forensic_module.SQLITE_TELEMETRY_SUCCESSOR_010,
+                )
+            finally:
+                connection.close()
+
+            partial_path = Path(tmp) / "partial.sqlite3"
+            partial_connection = sqlite3.connect(partial_path)
+            partial_connection.execute(
+                "create table sqag_telemetry_source_state (workspace_id text)"
+            )
+            partial_connection.commit()
+            partial_connection.close()
+            before = database_snapshot(partial_path)
+            with self.assertRaisesRegex(RuntimeError, "invalid or drifted"):
+                webapp.apply_sqag_storage_migrations(
+                    f"sqlite:///{partial_path.as_posix()}"
+                )
+            self.assertEqual(database_snapshot(partial_path), before)
+
+            local_root = Path(tmp) / "local-forensics"
+            with mock.patch.dict(
+                os.environ,
+                {"APP_MODE": "local", "QUOTE_DATA_ROOT": str(local_root)},
+                clear=False,
+            ), mock.patch.object(webapp, "read_dotenv_value", return_value=""):
+                with webapp.forensic_store_for_auth_session(None) as store:
+                    self.assertIsInstance(store, forensic_module.ForensicStore)
+            local_connection = sqlite3.connect(local_root / "forensics.sqlite3")
+            try:
+                self.assertEqual(
+                    forensic_module.classify_sqlite_telemetry_schema(local_connection),
+                    forensic_module.SQLITE_TELEMETRY_SUCCESSOR_010,
+                )
+            finally:
+                local_connection.close()
+
+    def test_sqlite_runtime_readiness_rejects_telemetry_drift_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "runtime.sqlite3"
+            database_url = f"sqlite:///{database_path.as_posix()}"
+            webapp.apply_sqag_storage_migrations(database_url)
+            connection = sqlite3.connect(database_path)
+            connection.execute("drop index sqag_telemetry_events_feed_idx")
+            connection.commit()
+            connection.close()
+            before = sqlite_database_snapshot(database_path)
+            storage = webapp.DatabaseSqagStorage(database_url, "workspace-runtime")
+            for ready in (storage.ensure_ready, storage.ensure_runtime_forensic_ready):
+                with self.assertRaises(webapp.SqagStorageAccessError) as failure:
+                    ready()
+                self.assertIn(
+                    failure.exception.reason,
+                    {"storage_database_not_migrated", "storage_runtime_forensics_not_migrated"},
+                )
+                after = sqlite_database_snapshot(database_path)
+                self.assertEqual(after, before)
+
     def test_generate_pdf_job_uses_workbook_pdf_export(self):
         payload = valid_payload()
 
@@ -33686,7 +34165,7 @@ main().catch((error) => {
                 with self.assertRaises(webapp.SqagStorageAccessError) as missing_migration:
                     webapp.app_storage_for_auth_session(platform_session)
         self.assertEqual(missing_migration.exception.status, 503)
-        self.assertEqual(missing_migration.exception.reason, "storage_artifact_database_not_migrated")
+        self.assertEqual(missing_migration.exception.reason, "storage_database_not_migrated")
 
     def test_database_artifact_storage_saves_workspace_scoped_generated_exports(self):
         with tempfile.TemporaryDirectory() as tmp:
