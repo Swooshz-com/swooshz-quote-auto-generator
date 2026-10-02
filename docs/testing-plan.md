@@ -49,8 +49,20 @@ npm run playwright:smoke
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL
   service and require fresh apply, complete schema, exact checksums, no-op
   replay, drift refusal, concurrency serialization, read-only preflight, and
-  failed-transaction rollback evidence. Never point this CI test at a provider
-  or production database.
+  failed-transaction rollback evidence. For the telemetry attempt evolution,
+  also prove the 009-to-010 prefix transition, renamed historical CHECK
+  discovery, successor constraint name and validation, row preservation, and
+  refusal of missing, duplicate, unvalidated, drifted, premature, and stale
+  attempt constraints on disposable PostgreSQL 17. Never point this CI test
+  at a provider or production database.
+
+- AI telemetry attempt numbering, pre-transport validation, provider fallback,
+  or model privacy: run `tests.test_telemetry_producer`,
+  `tests.test_openai_draft_request_contract`, and
+  `tests.test_ai_basis_chat_stress`. Assert attempts count actual sends,
+  request-validation events persist only the canonical zero-send tuple, and
+  invalid model labels are projected before logs, summaries, fingerprints,
+  and telemetry.
 
 ## Regression Standard
 

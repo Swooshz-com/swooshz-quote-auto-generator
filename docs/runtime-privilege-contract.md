@@ -22,7 +22,7 @@ The read-only admission path is
 
 The declared set is deliberately bounded to `public.sqag_*` application objects:
 
-- eight canonical PostgreSQL migrations and their canonical migration-ledger checksums;
+- nine canonical PostgreSQL migrations and their canonical migration-ledger checksums;
 - the 17 application tables plus `sqag_schema_migrations`;
 - the 28 canonical indexes;
 - the two migrator-owned invoker trigger routines and two migrator-owned,
@@ -164,6 +164,13 @@ direct forensic authority.
 The 009 telemetry relations are included in the same namespace, index, trigger,
 privilege, and source-binding proof; no separate telemetry service or database
 authority is introduced.
+Migration 010 narrows the telemetry event attempt-number check to 1-based
+provider sends plus the canonical zero-send request-validation event. The exception
+requires non-null `purpose`, `failure_class`, `usage_available`, and
+`cost_available` values; explicit guards prevent SQL CHECK `UNKNOWN` from admitting
+malformed rows. It changes
+no tables, indexes, triggers, routines, or privileges; its checksum is part of
+the migration-ledger contract.
 
 The verifier performs a small source binding over the actual SQL relation names
 in the canonical application files. Supported PostgreSQL relations must be in

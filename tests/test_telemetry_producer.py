@@ -1,5 +1,6 @@
 import contextlib
 import datetime as dt
+import io
 import json
 import os
 import sqlite3
@@ -18,10 +19,12 @@ from webapp.forensics import (
     TELEMETRY_EVENT_TYPES,
     TelemetryConflictError,
     TelemetryUnavailableError,
+    apply_telemetry_attempt_semantics_migration,
 )
 
 
 TELEMETRY_MIGRATION = ROOT / "migrations" / "009_telemetry_events.sql"
+TELEMETRY_ATTEMPT_MIGRATION = ROOT / "migrations" / "010_telemetry_attempt_semantics.sql"
 FORENSIC_MIGRATION = ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
 FIXED_NOW = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
 
@@ -31,6 +34,7 @@ def connection_with_telemetry() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.executescript(FORENSIC_MIGRATION.read_text(encoding="utf-8"))
     connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
+    apply_telemetry_attempt_semantics_migration(connection)
     return connection
 
 
@@ -274,9 +278,13 @@ class TelemetryProducerTest(unittest.TestCase):
             ).fetchone()[0],
             2,
         )
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(TelemetryConflictError):
             self.append("event-attempt-duplicate", attempt_number=1, **common)
-        self.connection.rollback()
+        state = self.connection.execute(
+            "select next_source_sequence, high_watermark from sqag_telemetry_source_state where workspace_id = ?",
+            ("workspace-alpha",),
+        ).fetchone()
+        self.assertEqual(tuple(state), (3, 2))
 
     def test_usage_and_cost_remain_nullable_unless_truthfully_available(self):
         unavailable = self.append("event-no-usage", event_type="ai_provider_attempt", provider="openai")
@@ -457,17 +465,23 @@ class TelemetryProducerTest(unittest.TestCase):
         self.assertIn('"restore"', verifier)
 
     def test_ai_attempt_adapter_is_metadata_only_and_preserves_available_evidence(self):
-        auth_session = {"auth_mode": "platform"}
+        auth_session = {
+            "auth_mode": server.INTERNAL_AUTH_MODE,
+            "user": {
+                "subject": "telemetry-test",
+                "account": "workspace-alpha",
+                "internal_role": "owner",
+            },
+        }
         record = {
             "feature": "basis_chat",
             "provider": "OpenAI",
-            "model": "gpt-5.6",
+            "model": "gpt-6-luna",
             "reasoning_level": "high",
             "operation_route": "/api/ai/basis-chat",
             "status": "success",
             "retry_lineage_id": "retry-ai-alpha",
-            "attempt_index": 2,
-            "batch_index": 3,
+            "attempt_number": 1,
             "duration_ms": 125,
             "usage_available": 1,
             "input_tokens": 12,
@@ -499,7 +513,7 @@ class TelemetryProducerTest(unittest.TestCase):
         self.assertEqual(row["provider"], "openai")
         self.assertEqual(row["reasoning_level"], "high")
         self.assertEqual(row["operation_route"], "/api/ai/basis-chat")
-        self.assertEqual(row["attempt_number"], 2003)
+        self.assertEqual(row["attempt_number"], 1)
         self.assertEqual(row["usage_available"], 1)
         self.assertEqual(row["cost_available"], 1)
         self.assertEqual(row["deployment_revision"], "run-356-revision")
@@ -507,6 +521,301 @@ class TelemetryProducerTest(unittest.TestCase):
         self.assertNotIn("output", row)
         self.assertNotIn("request", row)
         self.assertNotIn("private prompt must not persist", json.dumps(row, sort_keys=True))
+
+    def test_zero_send_validation_persists_only_canonical_semantics(self):
+        auth_session = {"auth_mode": "platform"}
+        record = {
+            "feature": "basis_chat",
+            "provider": "openai",
+            "model": "model\\nPRIVATE_CANARY",
+            "status": "failed",
+            "retry_lineage_id": "retry-validation-alpha",
+            "attempt_number": 0,
+            "failure_boundary": "request_validation",
+            "failure_kind": "configuration",
+            "usage_available": 1,
+            "input_tokens": 11,
+            "estimated_cost_usd": 0.4,
+        }
+        with mock.patch.object(
+            server,
+            "forensic_store_for_auth_session",
+            return_value=contextlib.nullcontext(self.store),
+        ):
+            result = server.append_ai_attempt_telemetry(auth_session, record)
+        row = dict(
+            self.connection.execute(
+                "select * from sqag_telemetry_events where event_id = ?",
+                (result["event_id"],),
+            ).fetchone()
+        )
+        self.assertEqual(row["event_type"], "validation")
+        self.assertEqual(row["event_status"], "blocked")
+        self.assertEqual(row["attempt_number"], 0)
+        self.assertEqual(row["purpose"], "request_validation")
+        self.assertEqual(row["failure_class"], "configuration")
+        self.assertIsNone(row["model"])
+        self.assertEqual(row["usage_available"], 0)
+        self.assertEqual(row["cost_available"], 0)
+        for field in (
+            "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
+            "cache_write_tokens", "estimated_cost", "actual_cost", "currency", "cost_version",
+        ):
+            self.assertIsNone(row[field])
+        self.assertNotIn("PRIVATE_CANARY", json.dumps(row, sort_keys=True))
+        nullable_fields = ("purpose", "failure_class", "usage_available", "cost_available")
+        columns = tuple(row)
+        placeholders = ",".join("?" for _ in columns)
+        for index, field in enumerate(nullable_fields, start=1):
+            malformed = dict(row)
+            malformed.update({
+                "event_id": f"event-invalid-zero-null-{field}",
+                "source_sequence": int(row["source_sequence"]) + index,
+                "retry_lineage_id": None,
+                field: None,
+            })
+            with self.subTest(field=field):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.connection.execute(
+                        f"insert into sqag_telemetry_events ({','.join(columns)}) values ({placeholders})",
+                        tuple(malformed[column] for column in columns),
+                    )
+
+    def test_transport_operation_clears_when_telemetry_append_fails(self):
+        auth_session = {
+            "auth_mode": server.INTERNAL_AUTH_MODE,
+            "user": {"subject": "telemetry-test", "account": "workspace-alpha", "internal_role": "owner"},
+        }
+        with server.ai_log_tracking_scope({}, auth_session=auth_session):
+            operation = server.begin_ai_transport_operation(
+                "basis_chat",
+                server.AI_PROVIDER_OPENAI,
+                server.OPENAI_BASIS_LINE_MODEL,
+            )
+            attempt_number = server.next_ai_transport_send_number(
+                "basis_chat",
+                server.AI_PROVIDER_OPENAI,
+                server.OPENAI_BASIS_LINE_MODEL,
+            )
+            with mock.patch.object(server, "write_local_log", return_value=True), mock.patch.object(
+                server,
+                "append_ai_attempt_telemetry",
+                side_effect=RuntimeError("telemetry persistence failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "telemetry persistence failed"):
+                    server.log_ai_call_attempt(
+                        feature="basis_chat",
+                        provider=server.AI_PROVIDER_OPENAI,
+                        model=server.OPENAI_BASIS_LINE_MODEL,
+                        status="failed",
+                        retry_lineage_id=operation["retry_lineage_id"],
+                        attempt_number=attempt_number,
+                    )
+            self.assertIsNone(getattr(server.AI_LOG_TRACKING_CONTEXT, "transport_operation", None))
+
+    def test_recursive_model_projection_keeps_only_supported_provider_labels(self):
+        value = {
+            "provider": "openai",
+            "model": "gpt-6-luna",
+            "provider_attempts": [
+                {"provider": "deepseek", "model": "deepseek-v4-flash"},
+                {"provider": "openai", "model": "gpt-6-sol"},
+                {
+                    "from_provider": "openai",
+                    "from_model": "gpt-6-luna",
+                    "to_provider": "openai",
+                    "to_model": "model\nPRIVATE_CANARY",
+                },
+                {"provider": "openai", "model": "model\\nPRIVATE_CANARY"},
+                {"provider": "openai", "model": "model\\\\nPRIVATE_CANARY"},
+                {"provider": "openai", "model": "!!!"},
+                {"provider": "openai", "model": "private@example.invalid"},
+                {"provider": "openai", "model": "PRIVATE_CANARY/customer confidential note"},
+            ],
+        }
+        projected = server.project_provider_model_fields(value)
+        encoded = json.dumps(projected, sort_keys=True)
+        self.assertIn("gpt-6-luna", encoded)
+        self.assertIn("deepseek-v4-flash", encoded)
+        self.assertNotIn("gpt-6-sol", encoded)
+        self.assertNotIn("PRIVATE_CANARY", encoded)
+        self.assertNotIn("private@example.invalid", encoded)
+        self.assertNotIn("customer confidential note", encoded)
+        self.assertNotIn("!!!", encoded)
+
+    def test_later_invalid_model_preserves_prior_actual_send_and_stops_fallback(self):
+        auth_session = {
+            "auth_mode": server.INTERNAL_AUTH_MODE,
+            "user": {
+                "subject": "telemetry-test",
+                "account": "workspace-alpha",
+                "internal_role": "owner",
+            },
+        }
+        candidates = [
+            {"provider": "deepseek", "model": server.DEEPSEEK_PRO_MODEL},
+            {"provider": "deepseek", "model": "deepseek-v4-pro\nPRIVATE_CANARY"},
+        ]
+
+        def env_value(name: str) -> str:
+            return "sk-test-redacted" if name == server.DEEPSEEK_API_KEY_ENV_NAME else ""
+
+        def fail_with_http_error(request, **kwargs):
+            raise server.urllib.error.HTTPError(
+                "https://api.deepseek.com/chat/completions",
+                400,
+                "bad request",
+                {},
+                io.BytesIO(b"{}"),
+            )
+
+        with (
+            mock.patch.object(server, "read_dotenv_value", side_effect=env_value),
+            mock.patch.object(server, "basis_chat_provider_model_candidates", return_value=candidates),
+            mock.patch.object(server.urllib.request, "urlopen", side_effect=fail_with_http_error) as urlopen,
+            mock.patch.object(server, "write_local_log") as write_local_log,
+            mock.patch.object(
+                server,
+                "forensic_store_for_auth_session",
+                return_value=contextlib.nullcontext(self.store),
+            ),
+            server.ai_log_tracking_scope({}, auth_session=auth_session),
+        ):
+            with self.assertRaises(server.OpenAIAnalysisError) as raised:
+                server.request_configured_basis_chat({
+                    "basis_chat": {
+                        "question": "what does this mean?",
+                        "scope": "quote",
+                        "field": "",
+                        "line_index": -1,
+                        "line": "",
+                    }
+                })
+
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(raised.exception.diagnostics["failure_boundary"], "request_validation")
+        self.assertNotIn("PRIVATE_CANARY", str(raised.exception) + json.dumps(raised.exception.diagnostics))
+        rows = [
+            dict(row)
+            for row in self.connection.execute(
+                "select event_type, event_status, attempt_number, retry_lineage_id, provider, model, "
+                "usage_available, cost_available from sqag_telemetry_events order by source_sequence"
+            )
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [(row["event_type"], row["event_status"], row["attempt_number"]) for row in rows],
+            [("ai_provider_attempt", "failed", 1), ("validation", "blocked", 0)],
+        )
+        self.assertEqual(rows[0]["model"], server.DEEPSEEK_PRO_MODEL)
+        self.assertIsNone(rows[1]["model"])
+        self.assertNotEqual(rows[0]["retry_lineage_id"], rows[1]["retry_lineage_id"])
+        self.assertEqual((rows[1]["usage_available"], rows[1]["cost_available"]), (0, 0))
+        retry_details = [
+            server.project_provider_model_fields(call.args[1])
+            for call in write_local_log.call_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict)
+        ]
+        self.assertNotIn("PRIVATE_CANARY", json.dumps(retry_details, sort_keys=True))
+
+    def test_sqlite_010_rebuild_preserves_existing_rows_and_rejects_unbounded_zero(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(FORENSIC_MIGRATION.read_text(encoding="utf-8"))
+        connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
+        legacy_store = ForensicStore(connection, "workspace-upgrade", "pid-v1-upgrade")
+        legacy_store.append_telemetry_event(
+            "ai_provider_attempt",
+            "success",
+            event_id="event-before-010",
+            retry_lineage_id="lineage-before-010",
+            attempt_number=1,
+            provider="openai",
+            model="gpt-6-luna",
+            now=FIXED_NOW,
+        )
+        before = dict(
+            connection.execute(
+                "select * from sqag_telemetry_events where event_id = ?",
+                ("event-before-010",),
+            ).fetchone()
+        )
+
+        apply_telemetry_attempt_semantics_migration(connection)
+        apply_telemetry_attempt_semantics_migration(connection)
+        after = dict(
+            connection.execute(
+                "select * from sqag_telemetry_events where event_id = ?",
+                ("event-before-010",),
+            ).fetchone()
+        )
+        self.assertEqual(after, before)
+
+        invalid = dict(after)
+        invalid.update({
+            "event_id": "event-invalid-zero",
+            "source_sequence": 2,
+            "attempt_number": 0,
+            "event_type": "ai_provider_attempt",
+            "event_status": "failed",
+            "purpose": "basis_chat",
+            "failure_class": "provider_error",
+            "model": "gpt-6-luna",
+            "immutable_metadata_digest": "a" * 64,
+        })
+        columns = tuple(invalid)
+        placeholders = ",".join("?" for _ in columns)
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                f"insert into sqag_telemetry_events ({','.join(columns)}) values ({placeholders})",
+                tuple(invalid[column] for column in columns),
+            )
+        connection.close()
+
+    def test_sqlite_010_preserves_caller_transaction_ownership(self):
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.executescript(FORENSIC_MIGRATION.read_text(encoding="utf-8"))
+            connection.executescript(TELEMETRY_MIGRATION.read_text(encoding="utf-8"))
+            connection.execute("create table caller_state (value text not null)")
+            connection.execute(
+                "insert into caller_state (value) values (?)",
+                ("uncommitted-upgrade",),
+            )
+            self.assertTrue(connection.in_transaction)
+            with self.assertRaisesRegex(RuntimeError, "active transaction"):
+                apply_telemetry_attempt_semantics_migration(connection)
+            self.assertTrue(connection.in_transaction)
+            self.assertEqual(
+                connection.execute("select value from caller_state").fetchone()[0],
+                "uncommitted-upgrade",
+            )
+            connection.rollback()
+            self.assertEqual(connection.execute("select value from caller_state").fetchall(), [])
+
+            apply_telemetry_attempt_semantics_migration(connection)
+            connection.execute(
+                "insert into caller_state (value) values (?)",
+                ("uncommitted-canonical-noop",),
+            )
+            self.assertTrue(connection.in_transaction)
+            apply_telemetry_attempt_semantics_migration(connection)
+            self.assertTrue(connection.in_transaction)
+            connection.rollback()
+            self.assertEqual(connection.execute("select value from caller_state").fetchall(), [])
+        finally:
+            connection.close()
+
+    def test_sqlite_010_rejects_partial_attempt_zero_schema_marker(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "create table sqag_telemetry_events (attempt_number integer, purpose text, check ("
+            "attempt_number is null or attempt_number >= 1 or ("
+            "attempt_number = 0 and purpose = 'request_validation')))"
+        )
+        with self.assertRaisesRegex(RuntimeError, "attempt constraint drifted"):
+            apply_telemetry_attempt_semantics_migration(connection)
+        connection.close()
 
     def test_feed_cursor_auth_tenant_binding_and_query_validation(self):
         self.append("event-cursor")

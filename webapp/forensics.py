@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
@@ -236,6 +237,70 @@ def telemetry_integer(value: Any, *, field: str) -> int | None:
     return parsed
 
 
+def telemetry_attempt_integer(value: Any, *, field: str) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Telemetry {field} is invalid.")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if value != value or value in {float("inf"), float("-inf")} or not value.is_integer():
+            raise ValueError(f"Telemetry {field} is invalid.")
+        parsed = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?\d{1,19}", value):
+        try:
+            parsed = int(value, 10)
+        except ValueError as exc:
+            raise ValueError(f"Telemetry {field} is invalid.") from exc
+    else:
+        raise ValueError(f"Telemetry {field} is invalid.")
+    if parsed < -(2**63) or parsed > (2**63) - 1:
+        raise ValueError(f"Telemetry {field} is invalid.")
+    return parsed
+
+
+def apply_telemetry_attempt_semantics_migration(connection: Any) -> None:
+    row = connection.execute(
+        "select sql from sqlite_master where type = 'table' and name = 'sqag_telemetry_events'"
+    ).fetchone()
+    table_sql = row[0] if row else None
+    if not isinstance(table_sql, str):
+        raise RuntimeError("SQLite telemetry events table is missing.")
+    normalized = re.sub(r"\s+", "", table_sql.lower())
+    canonical_attempt_check = (
+        "check(attempt_numberisnullorattempt_number>=1or(attempt_number=0and"
+        "event_type='validation'andevent_status='blocked'andpurposeisnotnullandpurpose='request_validation'"
+        "andfailure_classisnotnullandfailure_class='configuration'andmodelisnull"
+        "andusage_availableisnotnullandusage_available=0andcost_availableisnotnullandcost_available=0"
+        "andinput_tokensisnullandoutput_tokensisnullandtotal_tokensisnullandcache_read_tokensisnull"
+        "andcache_write_tokensisnullandestimated_costisnullandactual_costisnullandcurrencyisnull"
+        "andcost_versionisnull))"
+    )
+    if normalized.count(canonical_attempt_check) == 1:
+        return
+    if "attempt_numberintegercheck(attempt_numberisnullorattempt_number>=1)" not in normalized:
+        raise RuntimeError("SQLite telemetry attempt constraint drifted.")
+    if connection.in_transaction:
+        raise RuntimeError("SQLite telemetry attempt migration cannot run inside an active transaction.")
+    migration_path = Path(__file__).resolve().parents[1] / "migrations" / "010_telemetry_attempt_semantics.sql"
+    try:
+        migration_sql = migration_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError("SQLite telemetry attempt migration is unavailable.") from exc
+    try:
+        connection.executescript(migration_sql)
+    except Exception:
+        connection.rollback()
+        raise
+    migrated = connection.execute(
+        "select sql from sqlite_master where type = 'table' and name = 'sqag_telemetry_events'"
+    ).fetchone()
+    migrated_sql = re.sub(r"\s+", "", str(migrated[0] if migrated else "").lower())
+    if migrated_sql.count(canonical_attempt_check) != 1:
+        raise RuntimeError("SQLite telemetry attempt migration did not install its constraint.")
+
+
 def telemetry_number(value: Any, *, field: str) -> int | float | None:
     if value is None or value == "":
         return None
@@ -435,7 +500,36 @@ class ForensicStore:
         )
         return {field: row.get(field) for field in fields}
 
-    def append_telemetry_event(
+    def append_telemetry_event(self, *args: Any, commit: bool = True, **kwargs: Any) -> dict[str, Any]:
+        transaction_status = getattr(self.connection, "in_transaction", None)
+        if transaction_status is None:
+            transaction_status = getattr(
+                getattr(self.connection, "_connection", None),
+                "in_transaction",
+                False,
+            )
+        owns_transaction = not bool(transaction_status)
+        if owns_transaction and self.connection.__class__.__module__.startswith("sqlite3"):
+            self.connection.execute("BEGIN IMMEDIATE")
+        savepoint = "sqag_telemetry_append"
+        self.connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            result = self._append_telemetry_event_impl(*args, commit=False, **kwargs)
+        except Exception as exc:
+            self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if owns_transaction:
+                self.connection.rollback()
+            message = str(exc).lower()
+            if "unique constraint" in message or "duplicate key" in message:
+                raise TelemetryConflictError("Telemetry event identity conflicts with immutable data.") from exc
+            raise
+        self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+        if commit:
+            self.connection.commit()
+        return result
+
+    def _append_telemetry_event_impl(
         self,
         event_type: str,
         event_status: str,
@@ -499,8 +593,8 @@ class ForensicStore:
         session_ref = label(session_reference, "session_reference")
         support_ref = label(support_reference, "support_reference")
         retry_ref = label(retry_lineage_id, "retry_lineage_id")
-        attempt = telemetry_integer(attempt_number, field="attempt_number")
-        if attempt is not None and attempt < 1:
+        attempt = telemetry_attempt_integer(attempt_number, field="attempt_number")
+        if attempt is not None and attempt < 0:
             raise ValueError("Telemetry attempt_number is invalid.")
         provider_value = label(provider, "provider", lowercase=True)
         if provider_value and provider_value not in TELEMETRY_PROVIDERS:
@@ -608,6 +702,21 @@ class ForensicStore:
             "retention_expires_at": expiry,
             "original_retention_expires_at": original,
         }
+        if attempt == 0 and not (
+            event_type == "validation"
+            and event_status == "blocked"
+            and purpose_value == "request_validation"
+            and failure_value == "configuration"
+            and model_value is None
+            and usage == 0
+            and cost_available_value == 0
+            and all(value is None for value in token_values.values())
+            and estimated is None
+            and actual is None
+            and currency_value is None
+            and cost_version_value is None
+        ):
+            raise ValueError("Telemetry attempt_number is invalid.")
         digest_material = {
             field: values.get(field)
             for field in TELEMETRY_IMMUTABLE_FIELDS

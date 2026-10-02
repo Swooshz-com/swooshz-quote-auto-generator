@@ -380,6 +380,21 @@ class SqliteSqagMigrationTest(unittest.TestCase):
         self.assertIn("on conflict do nothing", executed_sql.lower())
         self.assertIn("drop table", executed_sql.lower())
 
+    def test_postgres_adapter_reports_libpq_transaction_status(self):
+        class Status:
+            name = "IDLE"
+
+        class Info:
+            transaction_status = Status()
+
+        class RawConnection:
+            info = Info()
+
+        adapter = webapp.PostgresConnectionAdapter(RawConnection())
+        self.assertFalse(adapter.in_transaction)
+        adapter._connection.info.transaction_status = type("Status", (), {"name": "INTRANS"})()
+        self.assertTrue(adapter.in_transaction)
+
     def test_empty_postgres_database_path_reaches_ordered_metadata_migrations(self):
         connection = PsycopgParsingConnection()
         expected_migrations = [
@@ -391,6 +406,7 @@ class SqliteSqagMigrationTest(unittest.TestCase):
             "007_feedback_publication_binding_postgres.sql",
             "008_quote_session_deletion_hold_authority_postgres.sql",
             "009_telemetry_events_postgres.sql",
+            "010_telemetry_attempt_semantics_postgres.sql",
         ]
 
         with mock.patch(

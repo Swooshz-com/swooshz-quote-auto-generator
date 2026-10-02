@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import sys
 import unittest
@@ -267,6 +268,56 @@ class AIBasisChatStressTest(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostics["failure_boundary"], "request_validation")
         self.assertEqual(caught.exception.diagnostics["attempt_number"], 0)
         self.assertFalse(any(call.args[0] == "basis_chat_model_retry" for call in write_log.call_args_list))
+
+    def test_retry_attempt_ordinals_follow_sends_and_use_independent_lineages(self):
+        payload = stress_payload()
+        payload["basis_chat"] = {
+            "question": "what does this mean?",
+            "scope": "quote",
+            "field": "",
+            "line_index": -1,
+            "line": "",
+        }
+        auth_session = {
+            "auth_mode": webapp.INTERNAL_AUTH_MODE,
+            "user": {
+                "subject": "basis-chat-test",
+                "account": "workspace-test",
+                "internal_role": "owner",
+            },
+        }
+        rate_limit = webapp.urllib.error.HTTPError(
+            "https://api.openai.com/v1/responses",
+            503,
+            "service unavailable",
+            {},
+            io.BytesIO(b"{}"),
+        )
+        records = []
+        responses = [
+            rate_limit,
+            openai_response(payload),
+            openai_response(payload),
+        ]
+
+        def capture_telemetry(session, record):
+            records.append(dict(record))
+
+        with (
+            mock.patch.object(webapp, "read_dotenv_value", side_effect=self.openai_models),
+            mock.patch.object(webapp.urllib.request, "urlopen", side_effect=responses) as urlopen,
+            mock.patch.object(webapp.time, "sleep"),
+            mock.patch.object(webapp, "write_local_log"),
+            mock.patch.object(webapp, "append_ai_attempt_telemetry", side_effect=capture_telemetry),
+            webapp.ai_log_tracking_scope({}, auth_session=auth_session),
+        ):
+            webapp.request_configured_basis_chat(payload)
+            webapp.request_configured_basis_chat(payload)
+
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual([item["attempt_number"] for item in records], [1, 2, 1])
+        self.assertEqual(records[0]["retry_lineage_id"], records[1]["retry_lineage_id"])
+        self.assertNotEqual(records[1]["retry_lineage_id"], records[2]["retry_lineage_id"])
 
     def test_wrong_shape_responses_fail_cleanly_without_mutating_payload(self):
         cases = [

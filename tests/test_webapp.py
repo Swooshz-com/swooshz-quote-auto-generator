@@ -14191,7 +14191,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         def dotenv(name):
             values = {
-                webapp.DEEPSEEK_MODEL_ENV_NAME: "deepseek-test-model",
+                webapp.DEEPSEEK_MODEL_ENV_NAME: webapp.DEEPSEEK_PRO_MODEL,
                 webapp.DEEPSEEK_PRICING_IMPORT_TIMEOUT_ENV_NAME: "17",
             }
             return values.get(name, "")
@@ -14208,7 +14208,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 17)
-        self.assertEqual(body["model"], "deepseek-test-model")
+        self.assertEqual(body["model"], webapp.DEEPSEEK_PRO_MODEL)
         self.assertEqual(body["response_format"], {"type": "json_object"})
         self.assertEqual(body["messages"][0]["role"], "system")
         self.assertEqual(body["messages"][1]["role"], "user")
@@ -14243,7 +14243,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         def dotenv(name):
             values = {
                 webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.DEEPSEEK_MODEL_ENV_NAME: "deepseek-test-model",
+                webapp.DEEPSEEK_MODEL_ENV_NAME: webapp.DEEPSEEK_PRO_MODEL,
             }
             return values.get(name, "")
 
@@ -14815,7 +14815,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             logged = webapp.log_ai_call_attempt(
                 feature="basis_chat",
                 provider=webapp.AI_PROVIDER_OPENAI,
-                model="gpt-test",
+                model="gpt-6-luna",
                 status="success",
                 duration_ms=1234,
                 input_tokens=321,
@@ -14839,7 +14839,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(log_record["event"], "ai_call_attempt")
         self.assertEqual(log_record["details"]["feature"], "basis_chat")
         self.assertEqual(log_record["details"]["provider"], webapp.AI_PROVIDER_OPENAI)
-        self.assertEqual(log_record["details"]["model"], "gpt-test")
+        self.assertEqual(log_record["details"]["model"], "gpt-6-luna")
         self.assertEqual(log_record["details"]["status"], "success")
         self.assertEqual(log_record["details"]["duration_ms"], 1234)
         self.assertEqual(log_record["details"]["input_tokens"], 321)
@@ -14850,7 +14850,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "run": "test",
             "task": "Quote basis chat",
             "provider": webapp.AI_PROVIDER_OPENAI,
-            "model": "gpt-test",
+            "model": "gpt-6-luna",
             "status": "success",
             "ok": True,
         })
@@ -14972,7 +14972,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 {
                     "feature": "draft_quote_basis",
                     "provider": webapp.AI_PROVIDER_OPENAI,
-                    "model": "gpt-test",
+                    "model": "gpt-6-luna",
                     "status": "success",
                     "duration_ms": 390797,
                     "image_count": 0,
@@ -14994,7 +14994,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             log_record["summary"],
         )
         self.assertIn(
-            "| TEST | OK | ai_call_attempt | Quote basis draft | openai/gpt-test | success | duration=390797ms; media=0 img/1 pdf; sections=11; lines=39; mode=standard |  | local-dev |",
+            "| TEST | OK | ai_call_attempt | Quote basis draft | openai/gpt-6-luna | success | duration=390797ms; media=0 img/1 pdf; sections=11; lines=39; mode=standard |  | local-dev |",
             summary_text,
         )
 
