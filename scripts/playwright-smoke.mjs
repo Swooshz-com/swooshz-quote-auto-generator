@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import fsSync from "node:fs";
@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { deflateSync } from "node:zlib";
 import { chromium } from "playwright";
 import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playwright-test-seeded-setup.mjs";
 
@@ -24,6 +25,7 @@ const options = {
   screenshots: args.includes("--screenshots") || args.includes("--screenshot"),
   headed: args.includes("--headed"),
   keepServer: args.includes("--keep-server"),
+  g3Pricing: args.includes("--g3-pricing"),
   host: readArg("--host", "127.0.0.1"),
   port: Number(readArg("--port", process.env.PLAYWRIGHT_PORT || "8765")),
 };
@@ -31,6 +33,41 @@ const options = {
 let baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
+
+function g3SyntheticPngDataUrl() {
+  const crc32 = (bytes) => {
+    let crc = 0xffffffff;
+    for (const byte of bytes) {
+      crc ^= byte;
+      for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const typeBytes = Buffer.from(type, "ascii");
+    const contents = Buffer.concat([typeBytes, data]);
+    const encoded = Buffer.alloc(12 + data.length);
+    encoded.writeUInt32BE(data.length, 0);
+    contents.copy(encoded, 4);
+    encoded.writeUInt32BE(crc32(contents), 8 + data.length);
+    return encoded;
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(1, 0);
+  header.writeUInt32BE(1, 4);
+  header[8] = 8;
+  header[9] = 2;
+  const png = Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(Buffer.from([0, 255, 255, 255]))),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString("base64")}`;
+}
+
+const G3_SYNTHETIC_PNG_DATA_URL = g3SyntheticPngDataUrl();
+const G3_SYNTHETIC_PNG_SIZE = Buffer.from(G3_SYNTHETIC_PNG_DATA_URL.split(",", 2)[1], "base64").length;
 
 function stableJson(value) {
   if (Array.isArray(value)) return value.map(stableJson);
@@ -66,13 +103,112 @@ async function waitForHealth(timeoutMs = 15000) {
   return false;
 }
 
-function startServer() {
+function g3MockProviderBootstrap() {
+  return String.raw`
+from webapp import server
+
+def g3_mock_provider(payload, api_key, auth_session=None):
+    authority = server.exact_pricing_reference_authority(payload, auth_session=auth_session)
+    if not authority.get("ok"):
+        raise RuntimeError("Synthetic provider requires a resolved pricing reference.")
+    lookup = server.pricing_catalog_runtime_lookup_for_payload(
+        payload, server.profile_id_from_payload(payload), auth_session=auth_session
+    )
+    catalog_items = []
+    seen = set()
+    for item in lookup.values():
+        item_id = server.clean_text(item.get("id")) if isinstance(item, dict) else ""
+        if item_id and item_id not in seen:
+            seen.add(item_id)
+            catalog_items.append(item)
+    if len(catalog_items) < 4:
+        raise RuntimeError("Synthetic provider needs four authoritative catalogue rows.")
+    rows = []
+    basis_lines = []
+    for index in range(8):
+        catalog_item = catalog_items[index] if index < 4 else None
+        row = {
+            "section": catalog_item.get("section") if catalog_item else "Custom",
+            "source_basis_line_id": "mock-provider-row-" + str(index + 1),
+            "quantity": 2,
+            "unit": server.clean_text(catalog_item.get("unit_hint")) if catalog_item else "nos",
+            "description": server.clean_text(catalog_item.get("description")) if catalog_item else "Synthetic bespoke unpriced item " + str(index + 1),
+            "pricing_keyword": server.clean_text(catalog_item.get("id")) if catalog_item else "synthetic-nonexistent-selector-" + str(index + 1),
+            "price_mode": "Priced",
+            "status": "matched",
+            "unit_price_override": 987654.32,
+            "effective_unit_price": 987654.32,
+            "catalog_unit_price": 987654.32,
+            "pricing_basis_amount": 1975308.64,
+            "pricing_reference_source": "company",
+            "pricing_reference_id": "forged-reference",
+            "pricing_basis_digest": "sha256:" + ("0" * 64),
+            "pricing_basis_currency": "USD",
+        }
+        if index == 0:
+            row["pricing_authority"] = {
+                "schema": server.PRICING_AUTHORITY_SCHEMA,
+                "version": server.PRICING_AUTHORITY_VERSION,
+                "variant": "catalog",
+                "context": server.pricing_authority_context(row),
+                "currency": "USD",
+                "price": 987654.32,
+                "catalog_source": "company",
+                "catalog_digest": "sha256:" + ("0" * 64),
+                "catalog_item_id": server.clean_text(catalog_item.get("id")),
+            }
+        elif index == 1:
+            row["pricing_authority"] = server.build_pricing_authority("historical", row)
+        elif index == 2:
+            row["pricing_authority"] = {"variant": "none"}
+        rows.append(row)
+        basis_lines.append({
+            "id": row["source_basis_line_id"],
+            "tag": "Confirm",
+            "text": row["description"],
+            "quantity": row["quantity"],
+            "unit": row["unit"],
+            "pricing_keyword": row["pricing_keyword"],
+            "confidence_pct": 95,
+        })
+    parsed = {
+        "analysis_findings": [],
+        "blocking_clarification_questions": [],
+        "quote_basis_sections": [{"id": "synthetic-booth-scope", "title": "Synthetic Booth Scope", "lines": basis_lines}],
+        "line_items": rows,
+    }
+    return server.normalize_ai_draft(parsed, payload, require_confidence=True, auth_session=auth_session)
+
+_real_reader = server.read_dotenv_value
+def _mock_provider_key_reader(name):
+    if name == server.OPENAI_API_KEY_ENV_NAME:
+        return "synthetic-playwright-provider-key"
+    return _real_reader(name)
+
+server.read_dotenv_value = _mock_provider_key_reader
+server.text_ai_provider_api_key = lambda provider: ""
+server.request_openai_quote_basis = g3_mock_provider
+raise SystemExit(server.main())
+`;
+}
+
+function startServer({ mockProvider = false, dataRoot = quoteDataRoot } = {}) {
+  const serverArgs = mockProvider
+    ? ["-c", g3MockProviderBootstrap(), "--host", options.host, "--port", String(options.port)]
+    : ["webapp/server.py", "--host", options.host, "--port", String(options.port)];
+  const runtimeEnv = { ...process.env, APP_MODE: "local" };
+  if (mockProvider) {
+    runtimeEnv.QUOTE_DATA_ROOT = dataRoot;
+    runtimeEnv.SQAG_LOCAL_PRICING_REFERENCES_ROOT = path.join(dataRoot, "pricing-references");
+  } else {
+    runtimeEnv.QUOTE_DATA_ROOT = process.env.QUOTE_DATA_ROOT || quoteDataRoot;
+  }
   const server = spawn(
     pythonCommand(),
-    ["webapp/server.py", "--host", options.host, "--port", String(options.port)],
+    serverArgs,
     {
       cwd: root,
-      env: { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot },
+      env: runtimeEnv,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     },
@@ -85,6 +221,19 @@ function startServer() {
   server.stdout.on("data", collect);
   server.stderr.on("data", collect);
   return { server, output };
+}
+
+async function unusedLoopbackPort() {
+  const probe = createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, options.host, resolve);
+  });
+  const address = probe.address();
+  const port = address && typeof address === "object" ? address.port : 0;
+  await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+  if (!port) throw new Error("Could not reserve an isolated Playwright port.");
+  return port;
 }
 
 async function stopServer(serverInfo) {
@@ -1440,6 +1589,402 @@ async function saveSmokePricingReference(page, internalCost) {
     update_existing: true,
     editing_reference_id: "synthetic-exhibition-fixture-pricing",
   }), { internalCost });
+}
+
+function g3PricingItems(multiplier = 1) {
+  return [
+    { id: "synthetic-g3-wall-light", section: "Lighting", description: "nos synthetic wall light", unit_hint: "nos", internal_cost: 20 * multiplier, markup_multiplier: 1.5, match_terms: ["wall light"] },
+    { id: "synthetic-g3-ceiling-light", section: "Lighting", description: "nos synthetic ceiling light", unit_hint: "nos", internal_cost: 25 * multiplier, markup_multiplier: 2, match_terms: ["ceiling light"] },
+    { id: "synthetic-g3-display-panel", section: "Displays", description: "nos synthetic display panel", unit_hint: "nos", internal_cost: 30 * multiplier, markup_multiplier: 2.5, match_terms: ["display panel"] },
+    { id: "synthetic-g3-carpet-floor", section: "Floor Design", description: "sqm synthetic carpet floor", unit_hint: "sqm", internal_cost: 10 * multiplier, markup_multiplier: 1.5, match_terms: ["carpet floor"] },
+  ];
+}
+
+async function saveG3PricingReference(page, id, label, items, updateExisting = false) {
+  return page.evaluate(async ({ id, label, items, updateExisting }) => postJson("/api/settings/pricing-references", {
+    id,
+    label,
+    description: "Synthetic G3 Playwright reference.",
+    source: "local",
+    currency: "SGD",
+    tax: { label: "GST", rate: 0.09 },
+    items,
+    update_existing: updateExisting,
+    editing_reference_id: updateExisting ? id : "",
+  }), { id, label, items, updateExisting });
+}
+
+async function verifyPricingReferenceImmediateRefresh(page) {
+  const id = "synthetic-g3-pricing-refresh-042";
+  const label = "Synthetic G3 Pricing Refresh";
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const initial = await saveG3PricingReference(page, id, label, g3PricingItems(1), false);
+  if (!initial.ok || initial.data?.status !== "saved") {
+    throw new Error(`Could not establish synthetic refresh reference: ${JSON.stringify(initial)}.`);
+  }
+  const started = await page.evaluate(async ({ id }) => {
+    if (!await loadProfiles()) throw new Error("Initial pricing reference list refresh failed.");
+    const reference = state.pricingReferences.find((item) => item.id === id && item.source === "local");
+    if (!reference) throw new Error("Initial synthetic reference is absent from Settings options.");
+    selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference));
+    return {
+      digest: reference.digest_sha256,
+      selected: elements.profileSelect.value,
+      navigationCount: performance.getEntriesByType("navigation").length,
+    };
+  }, { id });
+
+  const updated = await page.evaluate(async ({ id, label, items }) => {
+    const columns = ["section", "description", "unit_hint", "internal_cost", "markup_multiplier"];
+    state.editingPricingReferenceId = id;
+    state.editingPricingReferenceSource = "local";
+    state.pricingReferenceSettingsMode = PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
+    state.pricingReferenceEditSnapshot = "";
+    state.pendingPricingReference = pricingReferenceValidationResult(items, columns, 0, "Synthetic G3 Pricing Refresh");
+    elements.pricingReferenceName.value = label;
+    setPricingReferenceTaxControls({ label: "GST", rate: 0.09 });
+    setPricingReferenceCurrencyControls("SGD");
+    await savePricingReferenceFromModal({ preventDefault() {} });
+    const current = state.pricingReferences.find((item) => item.id === id && item.source === "local");
+    return {
+      digest: current?.digest_sha256 || "",
+      selected: elements.profileSelect.value,
+      current: currentPricingReference()?.digest_sha256 || "",
+      notice: state.pricingReferenceSavedNotice,
+      errorCount: state.pendingPricingReference?.errors?.length ?? -1,
+      navigationCount: performance.getEntriesByType("navigation").length,
+      settingsOptionValues: [...elements.deletePricingReferenceSelect.options].map((option) => option.value),
+    };
+  }, { id, label, items: g3PricingItems(1.4) });
+  if (
+    !updated.digest
+    || updated.digest === started.digest
+    || updated.current !== updated.digest
+    || updated.selected !== `local::${id}`
+    || updated.navigationCount !== started.navigationCount
+    || !updated.settingsOptionValues.includes(`local::${id}`)
+  ) {
+    throw new Error(`Same-id pricing reference save did not refresh both selectors immediately: ${JSON.stringify({ started, updated })}.`);
+  }
+
+  const deleted = await page.evaluate(async ({ id }) => {
+    await deleteRepoPricingReference(id, "local");
+    return {
+      remaining: state.pricingReferences.some((item) => item.id === id && item.source === "local"),
+      quoteOptionValues: [...elements.profileSelect.options].map((option) => option.value),
+      settingsOptionValues: [...elements.deletePricingReferenceSelect.options].map((option) => option.value),
+      review: state.quoteCommercialReview,
+      navigationCount: performance.getEntriesByType("navigation").length,
+    };
+  }, { id });
+  if (
+    deleted.remaining
+    || deleted.quoteOptionValues.includes(`local::${id}`)
+    || deleted.settingsOptionValues.includes(`local::${id}`)
+    || deleted.navigationCount !== started.navigationCount
+  ) {
+    throw new Error(`Pricing reference delete left a stale selector option: ${JSON.stringify(deleted)}.`);
+  }
+
+  const recreated = await saveG3PricingReference(page, id, label, g3PricingItems(2.1), false);
+  if (!recreated.ok || recreated.data?.status !== "saved") {
+    throw new Error(`Could not recreate synthetic same-id pricing reference: ${JSON.stringify(recreated)}.`);
+  }
+  const refreshed = await page.evaluate(async ({ id }) => {
+    if (!await loadProfiles()) throw new Error("Recreated pricing reference list refresh failed.");
+    const current = currentPricingReference();
+    return {
+      digest: current?.digest_sha256 || "",
+      selected: elements.profileSelect.value,
+      quoteOptionValues: [...elements.profileSelect.options].map((option) => option.value),
+      settingsOptionValues: [...elements.deletePricingReferenceSelect.options].map((option) => option.value),
+      review: state.quoteCommercialReview,
+      navigationCount: performance.getEntriesByType("navigation").length,
+    };
+  }, { id });
+  if (
+    !refreshed.digest
+    || refreshed.digest === updated.digest
+    || !refreshed.quoteOptionValues.includes(`local::${id}`)
+    || !refreshed.settingsOptionValues.includes(`local::${id}`)
+    || refreshed.navigationCount !== started.navigationCount
+  ) {
+    throw new Error(`Same-id recreation did not replace the current object without a reload: ${JSON.stringify({ updated, refreshed })}.`);
+  }
+  return { savedDigest: updated.digest, recreatedDigest: refreshed.digest, deletedReview: deleted.review };
+}
+
+async function inspectG3ForensicEvidence(jobId, dataRoot = quoteDataRoot) {
+  const code = String.raw`
+import json, sys
+from webapp import server
+with server.forensic_store_for_auth_session(None) as store:
+    run = store.run_for_job(sys.argv[1])
+    evidence = {}
+    for row in store.connection.execute(
+        "select evidence_type, evidence_json from sqag_generation_evidence where run_id = ?",
+        (run.get("run_id", ""),),
+    ):
+        evidence[row["evidence_type"]] = json.loads(row["evidence_json"])
+    print(json.dumps({"run": run, "evidence": evidence}, sort_keys=True))
+`;
+  const inspected = spawnSync(pythonCommand(), ["-c", code, jobId], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      APP_MODE: "local",
+      QUOTE_DATA_ROOT: dataRoot,
+      SQAG_LOCAL_PRICING_REFERENCES_ROOT: path.join(dataRoot, "pricing-references"),
+    },
+    timeout: 10000,
+    windowsHide: true,
+  });
+  if (inspected.status !== 0) throw new Error(`Could not inspect synthetic Analyse evidence: ${inspected.stderr || inspected.stdout}`);
+  return JSON.parse(inspected.stdout.trim());
+}
+
+async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot) {
+  const id = "synthetic-g3-pricing-binding-042";
+  const label = "Synthetic G3 Pricing Binding";
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
+  await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
+  const saved = await saveG3PricingReference(page, id, label, g3PricingItems(1), false);
+  if (!saved.ok || saved.data?.status !== "saved") {
+    throw new Error(`Could not establish synthetic Analyse reference: ${JSON.stringify(saved)}.`);
+  }
+  await page.evaluate(async ({ id }) => {
+    if (!await loadProfiles()) throw new Error("Analyse pricing reference list refresh failed.");
+    const reference = state.pricingReferences.find((item) => item.id === id && item.source === "local");
+    if (!reference || !selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference))) {
+      throw new Error("Synthetic Analyse pricing reference could not be selected.");
+    }
+  }, { id });
+
+  const newQuoteButton = page.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
+  if (await newQuoteButton.isVisible()) await newQuoteButton.click();
+  else await page.locator("#newQuoteButton:not([disabled])").click();
+  await seedQuoteDraftFromTestFixture(page, { fileName: "synthetic-g3-booth-render.png" });
+  await page.evaluate(async ({ dataUrl, size }) => {
+    state.images = [await ensureContentFingerprint({
+      name: "synthetic-g3-booth-render.png",
+      type: "image/png",
+      size,
+      data_url: dataUrl,
+    })];
+    await persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
+    renderFiles();
+    setImageUploadStatus("1 synthetic booth render loaded.");
+    saveSessionState();
+    const reference = state.pricingReferences.find((item) => item.id === "synthetic-g3-pricing-binding-042" && item.source === "local");
+    if (!reference || !selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference))) {
+      throw new Error("Synthetic Analyse reference was lost before request start.");
+    }
+  }, { dataUrl: G3_SYNTHETIC_PNG_DATA_URL, size: G3_SYNTHETIC_PNG_SIZE });
+
+  const acceptedJobs = [];
+  const onJobResponse = async (response) => {
+    if (new URL(response.url()).pathname !== "/api/jobs" || response.request().method() !== "POST") return;
+    try { acceptedJobs.push(await response.json()); } catch { /* retain no response body */ }
+  };
+  page.on("response", onJobResponse);
+  try {
+    await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+    await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.evaluate(({ dataUrl, size }) => {
+      [
+        [elements.headerDetails, "Synthetic G3 Quotation Co"],
+        [elements.quoteCompanyName, "Synthetic G3 Quotation Co"],
+        [elements.companySignatory, "Synthetic Test Signatory"],
+        [elements.companyTitle, "Director"],
+      ].forEach(([input, value]) => setInputValue(input, value));
+      state.headerLogo = {
+        name: "synthetic-g3-logo.png",
+        type: "image/png",
+        size,
+        data_url: dataUrl,
+      };
+      renderHeaderLogoPreview();
+      saveSessionState();
+      syncControlStates();
+    }, { dataUrl: G3_SYNTHETIC_PNG_DATA_URL, size: G3_SYNTHETIC_PNG_SIZE });
+    await page.locator("#sideNextButton", { hasText: "Start Analysis" }).click();
+    await page.locator("#analysisConfirmModal").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#analysisConfirmStartButton").click();
+    try {
+      await page.waitForFunction(() => !state.isAnalysisRunning && state.workflowStage === "basis_review" && state.lineItems.length === 8, null, { timeout: 45000 });
+      await page.waitForFunction(() => {
+        const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+        if (!sessionId || !quoteSessionDraftStateCanSave()) return false;
+        const draftState = currentQuoteSessionDraftState();
+        const draftFiles = sessionFileRecordsFromDraft();
+        return quoteSessionDraftIsConfirmed(
+          sessionId,
+          quoteSessionDraftComparisonKey(draftState),
+          quoteSessionDraftFileComparisonKey(draftFiles),
+        );
+      }, null, { timeout: 15000 });
+    } catch (error) {
+      const diagnostic = await page.evaluate(() => ({
+        workflowStage: state.workflowStage,
+        isAnalysisRunning: state.isAnalysisRunning,
+        quoteSessionId: state.quoteSessionId,
+        runContext: currentGenerationContext(),
+        activeJob: state.activeJob ? {
+          job_id: state.activeJob.job_id,
+          status: state.activeJob.status,
+          result_status: state.activeJob.result?.status,
+          errors: state.activeJob.errors || state.activeJob.result?.errors || [],
+        } : null,
+        lineItemCount: state.lineItems.length,
+        pricingReview: state.quoteCommercialReview,
+      }));
+      const latestJob = acceptedJobs[0]?.job_id
+        ? await page.evaluate((jobId) => getJson(`/api/jobs/${encodeURIComponent(jobId)}`), acceptedJobs[0].job_id)
+        : null;
+      const jobs = acceptedJobs.map((job) => ({
+        job_id: job?.job_id,
+        status: job?.status,
+        generation_run_id: job?.generation_run_id,
+        result_status: job?.result?.status,
+        errors: job?.errors || job?.result?.errors || [],
+      }));
+      throw new Error(`Synthetic Analyse did not reach Basis Review: ${JSON.stringify({ diagnostic, jobs, latestJob })}. ${error.message}`);
+    }
+  } finally {
+    page.off("response", onJobResponse);
+  }
+
+  const browserResult = await page.evaluate(() => ({
+    quoteSessionId: state.quoteSessionId,
+    selected: { id: state.pricingReferenceId, source: state.pricingReferenceSource },
+    currentReferenceDigest: currentPricingReference()?.digest_sha256 || "",
+    commercialBasis: quoteCommercialSnapshotPricingBasis(),
+    runContext: currentGenerationContext(),
+    rows: state.lineItems.map((row) => ({
+      pricingKeyword: row.pricing_keyword,
+      status: row.status,
+      price: row.effective_unit_price,
+      amount: row.pricing_basis_amount,
+      authority: row.pricing_authority,
+    })),
+  }));
+  const accepted = acceptedJobs.find((job) => job?.job_id && job?.generation_run_id);
+  if (!accepted) throw new Error(`Analyse did not return durable job/run linkage: ${JSON.stringify(acceptedJobs)}.`);
+  if (
+    browserResult.selected.id !== id
+    || browserResult.selected.source !== "local"
+    || browserResult.currentReferenceDigest !== browserResult.commercialBasis?.digest
+    || browserResult.runContext.run_id !== accepted.generation_run_id
+    || browserResult.runContext.session_id !== browserResult.quoteSessionId
+    || browserResult.rows.length !== 8
+  ) {
+    throw new Error(`Browser Analyse state is not bound to the selected reference/run: ${JSON.stringify(browserResult)}.`);
+  }
+  const expected = [30, 50, 75, 15];
+  for (let index = 0; index < 4; index += 1) {
+    const row = browserResult.rows[index];
+    if (
+      row.authority?.variant !== "catalog"
+      || row.authority?.catalog_source !== "local"
+      || row.authority?.catalog_digest !== browserResult.commercialBasis.digest
+      || row.authority?.currency !== "SGD"
+      || row.authority?.catalog_item_id !== row.pricingKeyword
+      || row.price !== expected[index]
+      || row.amount !== expected[index] * 2
+    ) {
+      throw new Error(`Exact provider selector ${index + 1} did not retain server price authority: ${JSON.stringify(row)}.`);
+    }
+  }
+  for (const row of browserResult.rows.slice(4)) {
+    const status = String(row.status || "").trim().toLowerCase();
+    if (
+      ["matched", "priced", "catalog", "resolved"].includes(status)
+      || row.price !== undefined
+      || row.amount !== undefined
+      || row.authority?.variant !== "none"
+    ) {
+      throw new Error(`Custom provider line was priced or marked resolved: ${JSON.stringify(row)}.`);
+    }
+  }
+  const feedback = await page.evaluate(async ({ runId, sessionId }) => getJson(
+    `/api/feedback/context?run_id=${encodeURIComponent(runId)}&session_id=${encodeURIComponent(sessionId)}`,
+  ), { runId: accepted.generation_run_id, sessionId: browserResult.quoteSessionId });
+  if (
+    !feedback.ok
+    || feedback.data?.context?.run_id !== accepted.generation_run_id
+    || feedback.data?.context?.session_id !== browserResult.quoteSessionId
+  ) {
+    throw new Error(`Feedback context could not resolve this Analyse run: ${JSON.stringify(feedback)}.`);
+  }
+  const persisted = await dashboardQuoteSessionDetail(page, browserResult.quoteSessionId);
+  const draftState = persisted.quote_session?.draft_state || {};
+  const persistedLines = Array.isArray(draftState.lineItems) ? draftState.lineItems : [];
+  const persistedPricing = persistedLines.map((row) => ({
+    status: row.status,
+    keyword: row.pricing_keyword,
+    price: row.effective_unit_price ?? row.unit_price_override ?? row.catalog_unit_price ?? row.price,
+    amount: row.pricing_basis_amount ?? row.amount,
+    authority: row.pricing_authority ? {
+      variant: row.pricing_authority.variant,
+      source: row.pricing_authority.catalog_source,
+      digest: row.pricing_authority.catalog_digest,
+      currency: row.pricing_authority.currency,
+      itemId: row.pricing_authority.catalog_item_id,
+    } : null,
+  }));
+  const persistedExactRowsValid = persistedPricing.length === 8 && persistedPricing.slice(0, 4).every((row, index) => (
+    row.authority?.variant === "catalog"
+    && row.authority.source === "local"
+    && row.authority.digest === browserResult.commercialBasis.digest
+    && row.authority.currency === "SGD"
+    && row.authority.itemId === browserResult.rows[index].pricingKeyword
+    && row.price === expected[index]
+    && row.amount === expected[index] * 2
+  ));
+  const persistedCustomRowsUnresolved = persistedPricing.slice(4).length === 4 && persistedPricing.slice(4).every((row) => (
+    !["matched", "priced", "catalog", "resolved"].includes(String(row.status || "").trim().toLowerCase())
+    && (row.price === undefined || row.price === null || row.price === "")
+    && (row.amount === undefined || row.amount === null || row.amount === "")
+    && row.authority?.variant === "none"
+  ));
+  if (
+    persisted.status !== "ok"
+    || draftState.quoteDetails?.commercial_snapshot?.pricing_basis?.digest !== browserResult.commercialBasis.digest
+    || !persistedExactRowsValid
+    || !persistedCustomRowsUnresolved
+  ) {
+    throw new Error(`Persisted draft lost the selected pricing authority: ${JSON.stringify({ persistedStatus: persisted.status, draftDigest: draftState.quoteDetails?.commercial_snapshot?.pricing_basis?.digest, lineCount: persistedLines.length, pricing: persistedPricing })}.`);
+  }
+
+  const forensic = await inspectG3ForensicEvidence(accepted.job_id, dataRoot);
+  const request = forensic.evidence?.request_manifest || {};
+  const result = forensic.evidence?.result_summary || {};
+  const counts = result.pricing_draft_counts || {};
+  if (
+    forensic.run?.run_id !== accepted.generation_run_id
+    || forensic.run?.job_id !== accepted.job_id
+    || forensic.run?.quote_session_id !== browserResult.quoteSessionId
+    || request.pricing_reference_digest !== browserResult.commercialBasis.digest
+    || request.attempt_number !== 1
+    || request.catalogue_row_count !== 4
+    || counts.raw_provider_row_count !== 8
+    || counts.rows_carrying_pricing_keyword !== 8
+    || counts.exact_authoritative_selector_match_count !== 4
+    || counts.trusted_count_after_canonicalization !== 4
+    || counts.post_normalization_authority_variant_counts?.catalog !== 4
+    || JSON.stringify(forensic).includes("987654.32")
+  ) {
+    throw new Error(`Analyse forensic linkage or safe count evidence is incomplete: ${JSON.stringify({ run: forensic.run, request, counts })}.`);
+  }
+  await page.evaluate(async (sessionId) => deleteQuoteSessionRecord(sessionId), browserResult.quoteSessionId);
+  await page.evaluate(() => clearSessionState());
+  return { jobId: accepted.job_id, runId: accepted.generation_run_id, rows: browserResult.rows.length, digest: browserResult.commercialBasis.digest };
 }
 
 async function verifyServerPricingReferenceReviewDurability(page) {
@@ -3702,6 +4247,49 @@ async function run573LoadedAppTwice() {
 async function main() {
   if (args.includes("--run573-loaded-app")) {
     await run573LoadedAppTwice();
+    return;
+  }
+  if (options.g3Pricing) {
+    const temporaryQuoteDataRoot = await fs.mkdtemp(path.join(root, "_tmp", "sqag-g3-pricing-"));
+    options.port = await unusedLoopbackPort();
+    baseUrl = `http://${options.host}:${options.port}`;
+    let serverInfo = null;
+    let browser = null;
+    try {
+      serverInfo = startServer({ mockProvider: true, dataRoot: temporaryQuoteDataRoot });
+      if (!(await waitForHealth())) {
+        const serverOutput = serverInfo.output.join("").trim();
+        throw new Error(`Could not start isolated G3 webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
+      }
+      browser = await chromium.launch({ headless: !options.headed });
+      const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+      const page = await context.newPage();
+      const consoleProblems = [];
+      const networkProblems = [];
+      page.on("console", (message) => {
+        if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
+      });
+      page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
+      page.on("response", (response) => {
+        if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
+      });
+      const refresh = await verifyPricingReferenceImmediateRefresh(page);
+      let analysis;
+      try {
+        analysis = await verifyRun030DraftBoundary(page, temporaryQuoteDataRoot);
+      } catch (error) {
+        const serverOutput = serverInfo.output.join("").slice(-10000);
+        throw new Error(`${error.message}\nIsolated server output:\n${serverOutput}`);
+      }
+      if (consoleProblems.length || networkProblems.length) {
+        throw new Error(`G3 browser diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);
+      }
+      console.log(JSON.stringify({ status: "ok", mode: "g3-pricing", refresh, analysis }, null, 2));
+    } finally {
+      if (browser) await browser.close();
+      await stopServer(serverInfo);
+      await fs.rm(temporaryQuoteDataRoot, { recursive: true, force: true });
+    }
     return;
   }
   let serverInfo = null;

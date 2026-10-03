@@ -40,6 +40,70 @@ class ForensicsFeedbackRetentionTest(unittest.TestCase):
         self.assertTrue(all(len(row["evidence_sha256"]) == 64 for row in evidence))
         self.assertGreaterEqual(set(events), {"generation_received", "generation_blocked"})
 
+    def test_draft_run_links_exact_job_quote_session_and_safe_pricing_counts(self):
+        job_id = "job-g3-synthetic-042"
+        run_id = "run-g3-synthetic-042"
+        quote_session_id = "quote-g3-synthetic"
+        request_summary = {
+            "schema": "swooshz.sqag.generation-request-evidence.v2",
+            "job_id": job_id,
+            "run_id": run_id,
+            "quote_session_id": quote_session_id,
+            "app_revision": "a" * 40,
+            "attempt_number": 1,
+            "pricing_reference_source": "company",
+            "pricing_reference_id": "synthetic-reference",
+            "pricing_reference_digest": "sha256:" + ("b" * 64),
+            "catalogue_row_count": 4,
+            "payload_shape_sha256": "c" * 64,
+        }
+        self.assertEqual(
+            self.store.record_run_started(
+                "draft",
+                request_summary,
+                run_id=run_id,
+                job_id=job_id,
+                idempotency_key=job_id,
+                quote_session_id=quote_session_id,
+                attempt_number=1,
+                app_revision="a" * 40,
+            ),
+            run_id,
+        )
+        self.store.finish_run(
+            run_id,
+            "completed",
+            quote_session_id=quote_session_id,
+            result_summary={
+                "pricing_draft_counts": {
+                    "raw_provider_row_count": 8,
+                    "exact_authoritative_selector_match_count": 4,
+                    "trusted_count_after_canonicalization": 4,
+                    "provider_authority_variant_counts": {"historical": 4, "absent": 4},
+                },
+            },
+        )
+
+        run = self.store.run_for_job(job_id)
+        evidence = [
+            (row["evidence_type"], json.loads(row["evidence_json"]))
+            for row in self.connection.execute(
+                "select evidence_type, evidence_json from sqag_generation_evidence where run_id = ? order by evidence_id",
+                (run_id,),
+            )
+        ]
+        self.assertEqual(run["run_id"], run_id)
+        self.assertEqual(run["job_id"], job_id)
+        self.assertEqual(run["quote_session_id"], quote_session_id)
+        self.assertEqual(run["app_revision"], "a" * 40)
+        request = next(item for evidence_type, item in evidence if evidence_type == "request_manifest")
+        result = next(item for evidence_type, item in evidence if evidence_type == "result_summary")
+        self.assertEqual(request["pricing_reference_digest"], "sha256:" + ("b" * 64))
+        self.assertEqual(request["payload_shape_sha256"], "c" * 64)
+        self.assertEqual(result["pricing_draft_counts"]["trusted_count_after_canonicalization"], 4)
+        self.assertNotIn("raw_prompt", request)
+        self.assertNotIn("provider_response", result)
+
     def test_unknown_run_cannot_receive_a_fabricated_terminal_state(self):
         with self.assertRaisesRegex(ValueError, "could not be finalized"):
             self.store.finish_run("run-does-not-exist", "completed")
