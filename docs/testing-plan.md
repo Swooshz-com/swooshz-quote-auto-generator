@@ -63,6 +63,21 @@ npm run playwright:smoke
   request-validation events persist only the canonical zero-send tuple, and
   invalid model labels are projected before logs, summaries, fingerprints,
   and telemetry.
+- Draft pricing authority binding, run-to-session forensic linkage, or live
+  Settings selector refresh after a same-id pricing-reference save/delete:
+  run the focused pricing-draft regressions in `tests.test_webapp`,
+  `tests.test_forensics_feedback_retention`, and
+  `tests.test_openai_draft_request_contract`, plus
+  `node scripts/playwright-smoke.mjs --g3-pricing`. The browser mode starts a
+  temporary local server and deterministic synthetic provider; it checks exact
+  catalogue rebinding, unresolved custom rows, persisted quote state, safe
+  forensic counts, feedback lookup, and immediate selector refresh without a
+  live provider call. Also run `tests.test_generate_quote` to retain the XLSX
+  boundary checks.
+  Cover mixed identified/unidentified rows, duplicate IDs, and repeated text
+  with differing quantities or units. Basis ownership must not transfer a
+  selector to another row; alignment must recalculate trusted amounts and
+  repeated normalization must preserve the result.
 
 ## Regression Standard
 

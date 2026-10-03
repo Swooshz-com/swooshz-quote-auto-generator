@@ -5484,7 +5484,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         lines = draft["quote_basis_sections"][0]["lines"]
         self.assertEqual(lines[0]["text"], "[ sqm synthetic raised deck panel ]")
-        self.assertEqual(lines[1]["text"], "[ sqm synthetic raised deck panel ] - Detail edge")
+        self.assertEqual(lines[0]["pricing_keyword"], "synthetic-floors-synthetic-raised-deck-panel")
+        self.assertEqual(lines[1]["text"], "synthetic raised deck panel detail edge")
+        self.assertEqual(lines[1]["tag"], "Custom")
+        self.assertNotIn("pricing_keyword", lines[1])
+        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "synthetic-floors-synthetic-raised-deck-panel")
         self.assertEqual(draft["line_items"][0]["description"], "sqm synthetic raised deck panel")
 
     def test_normalize_ai_draft_trusts_leading_item_count_before_dimensions(self):
@@ -5572,10 +5576,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         by_title = {section["title"]: section for section in draft["quote_basis_sections"]}
         self.assertEqual(
             [line["text"] for line in by_title["Synthetic Structures"]["lines"]],
-            [
-                "[ m length synthetic wall rail ]"
-            ],
+            ["synthetic wall rail."],
         )
+        wall_rail = by_title["Synthetic Structures"]["lines"][0]
+        self.assertEqual(wall_rail["tag"], "Confirm")
+        self.assertNotIn("pricing_keyword", wall_rail)
         counters_line = by_title["Synthetic Rentals"]["lines"][0]
         self.assertEqual(counters_line["text"], "[ nos. synthetic storage cabinet ]")
         self.assertEqual(counters_line["confidence"], 77)
@@ -5620,12 +5625,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         line = draft["quote_basis_sections"][0]["lines"][0]
         self.assertEqual(line["tag"], "Confirm")
         self.assertEqual(line["text"], "[ nos. synthetic spotlight 3 inch ]")
-        self.assertEqual(line["quantity"], "10")
+        self.assertEqual(line["quantity"], 10)
         self.assertEqual(line["unit"], "nos")
         self.assertNotIn("custom_pricing", line)
         self.assertNotIn("custom_confirmed", line)
 
-    def test_normalize_ai_draft_clears_custom_flag_for_exact_catalog_basis_text(self):
+    def test_normalize_ai_draft_keeps_unselected_custom_catalog_text_unpriced(self):
         parsed = {
             "quote_basis_sections": [
                 {
@@ -5653,13 +5658,20 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["tag"], "Confirm")
-        self.assertEqual(line["text"], "[ nos. synthetic storage cabinet ]")
+        self.assertEqual(line["tag"], "Custom")
+        self.assertTrue(line["custom_pricing"])
+        self.assertEqual(line["text"], "nos. synthetic storage cabinet")
         self.assertEqual(line["quantity"], "4")
         self.assertEqual(line["unit"], "nos")
-        self.assertNotIn("custom_pricing", line)
+        self.assertNotIn("pricing_keyword", line)
+        self.assertNotIn("catalog_unit_price", line)
+        for item in draft["line_items"]:
+            authority = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
+            self.assertNotEqual(authority.get("variant"), "catalog")
+            self.assertNotEqual(item.get("pricing_keyword"), "synthetic-rentals-synthetic-storage-cabinet")
+            self.assertNotIn("catalog_unit_price", item)
 
-    def test_normalize_ai_draft_clears_custom_flag_for_exact_partition_catalog_text(self):
+    def test_normalize_ai_draft_keeps_unselected_custom_partition_text_unpriced(self):
         text = "m length synthetic double side partition"
         parsed = {
             "quote_basis_sections": [
@@ -5688,15 +5700,18 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["tag"], "Confirm")
-        self.assertEqual(line["text"], f"[ {text} ]")
+        self.assertEqual(line["tag"], "Custom")
+        self.assertTrue(line["custom_pricing"])
+        self.assertEqual(line["text"], text)
         self.assertEqual(line["quantity"], "10")
         self.assertEqual(line["unit"], "m length")
-        self.assertEqual(
-            line["pricing_keyword"],
-            "synthetic-structures-synthetic-double-side-partition",
-        )
-        self.assertNotIn("custom_pricing", line)
+        self.assertNotIn("pricing_keyword", line)
+        self.assertNotIn("catalog_unit_price", line)
+        for item in draft["line_items"]:
+            authority = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
+            self.assertNotEqual(authority.get("variant"), "catalog")
+            self.assertNotEqual(item.get("pricing_keyword"), "synthetic-structures-synthetic-double-side-partition")
+            self.assertNotIn("catalog_unit_price", item)
 
     def test_normalize_ai_draft_reviews_graphics_line_with_competing_catalog_family(self):
         parsed = {
@@ -5746,7 +5761,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("pricing_reference_description", line)
         self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
 
-    def test_normalize_ai_draft_preserves_basis_text_when_line_item_is_catalog_text(self):
+    def test_normalize_ai_draft_keeps_mismatched_basis_text_unpriced(self):
         parsed = {
             "quote_basis_sections": [
                 {
@@ -5782,12 +5797,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         lines = draft["quote_basis_sections"][0]["lines"]
-        self.assertEqual(len(lines), 1)
-        line = lines[0]
-        self.assertEqual(line["text"], "[ sqm synthetic printed wall graphic ] - Synthetic printed brand fascia graphics")
-        self.assertEqual(line["pricing_keyword"], "synthetic-graphics-synthetic-printed-wall-graphic")
-        self.assertEqual(line["catalog_description"], "sqm synthetic printed wall graphic")
-        self.assertEqual(line["pricing_reference_description"], "sqm synthetic printed wall graphic")
+        selected_line = next(line for line in lines if line.get("pricing_keyword"))
+        custom_line = next(line for line in lines if line.get("tag") == "Custom")
+        self.assertEqual(selected_line["pricing_keyword"], "synthetic-graphics-synthetic-printed-wall-graphic")
+        self.assertEqual(selected_line["catalog_description"], "sqm synthetic printed wall graphic")
+        self.assertEqual(selected_line["pricing_reference_description"], "sqm synthetic printed wall graphic")
+        self.assertEqual(custom_line["text"], "synthetic printed brand fascia graphics")
+        self.assertNotIn("pricing_keyword", custom_line)
+        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(draft["line_items"][0]["status"], "matched")
 
     def test_normalize_ai_draft_does_not_copy_invented_keyword_into_catalog_metadata(self):
         text = "synthetic printed brand fascia graphics"
@@ -5828,12 +5846,18 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["text"], "[ sqm synthetic printed wall graphic ] - Synthetic printed brand fascia graphics")
-        self.assertEqual(line["pricing_keyword"], "synthetic-graphics-synthetic-printed-wall-graphic")
-        self.assertEqual(line["catalog_description"], "sqm synthetic printed wall graphic")
-        self.assertEqual(line["pricing_reference_description"], "sqm synthetic printed wall graphic")
-        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "synthetic-graphics-synthetic-printed-wall-graphic")
-        self.assertEqual(draft["line_items"][0]["pricing_reference_description"], "sqm synthetic printed wall graphic")
+        self.assertEqual(line["text"], text)
+        self.assertEqual(line["tag"], "Custom")
+        self.assertTrue(line["custom_pricing"])
+        self.assertNotIn("pricing_keyword", line)
+        self.assertNotIn("catalog_description", line)
+        self.assertNotIn("pricing_reference_description", line)
+        self.assertNotIn("catalog_unit_price", line)
+        self.assertEqual(draft["line_items"][0]["pricing_keyword"], text)
+        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "none")
+        self.assertEqual(draft["line_items"][0]["status"], "unmatched")
+        self.assertNotIn("catalog_description", draft["line_items"][0])
+        self.assertNotIn("pricing_reference_description", draft["line_items"][0])
 
     def test_normalize_ai_draft_marks_unmatched_invented_keyword_for_custom_review(self):
         text = "Fictional hover stool around central planter seating"
@@ -5880,9 +5904,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("pricing_keyword", line)
         self.assertNotIn("catalog_description", line)
         self.assertNotIn("pricing_reference_description", line)
-        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
+        self.assertEqual(
+            draft["line_items"][0]["pricing_keyword"],
+            "furniture-rental-small-timber-side-table",
+        )
+        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "none")
+        self.assertEqual(draft["line_items"][0]["status"], "unmatched")
 
-    def test_normalize_ai_draft_replaces_invented_id_like_keyword_with_matching_catalog_row(self):
+    def test_normalize_ai_draft_keeps_invented_id_like_keyword_unresolved(self):
         text = "synthetic round table with dark frame for lounge area"
         parsed = {
             "quote_basis_sections": [
@@ -5921,14 +5950,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["tag"], "Confirm")
-        self.assertNotIn("custom_pricing", line)
-        self.assertEqual(line["text"], "[ nos. synthetic round table ] - With dark frame for lounge area")
-        self.assertEqual(line["pricing_keyword"], "synthetic-rentals-synthetic-round-table")
-        self.assertEqual(line["catalog_description"], "nos. synthetic round table")
-        self.assertEqual(line["pricing_reference_description"], "nos. synthetic round table")
-        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "synthetic-rentals-synthetic-round-table")
-        self.assertEqual(draft["line_items"][0]["pricing_reference_description"], "nos. synthetic round table")
+        self.assertEqual(line["tag"], "Custom")
+        self.assertTrue(line["custom_pricing"])
+        self.assertEqual(line["text"], text)
+        self.assertNotIn("pricing_keyword", line)
+        self.assertNotIn("catalog_description", line)
+        self.assertNotIn("pricing_reference_description", line)
+        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
+        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "none")
 
     def test_normalize_ai_draft_drops_valid_keyword_when_object_family_contradicts_line(self):
         parsed = {
@@ -5941,7 +5970,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                             "id": "meeting-table",
                             "tag": "Confirm",
                             "text": "Meeting table for 6-pax meeting room",
-                            "pricing_keyword": "furniture-rental-white-folding-chairs",
+                            "pricing_keyword": "synthetic-rentals-synthetic-cafe-chair",
                             "quantity": 1,
                             "unit": "nos",
                             "confidence_pct": 88,
@@ -5955,7 +5984,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "quantity": 1,
                     "unit": "nos",
                     "description": "Meeting table for 6-pax meeting room",
-                    "pricing_keyword": "furniture-rental-white-folding-chairs",
+                    "pricing_keyword": "synthetic-rentals-synthetic-cafe-chair",
                     "source_basis_line_id": "meeting-table",
                 }
             ],
@@ -6145,7 +6174,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("pricing_keyword", line)
         self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
 
-    def test_normalize_ai_draft_maps_positive_water_connection_to_catalog_row(self):
+    def test_normalize_ai_draft_keeps_selectorless_water_connection_unpriced(self):
         reference_id = "water-metadata-test"
         catalog_items = [
             {
@@ -6187,15 +6216,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 })
 
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["tag"], "Confirm")
-        self.assertEqual(line["pricing_keyword"], "water-connection-water-inlet-and-outlet")
-        self.assertEqual(line["pricing_reference_description"], "nos. water inlet and outlet")
-        self.assertEqual(line["unit"], "nos")
-        self.assertEqual(line["quantity"], "1")
-        self.assertTrue(line["text"].startswith("[ nos. water inlet and outlet ] - "))
-        self.assertNotIn("custom_pricing", line)
+        self.assertEqual(line["tag"], "Custom")
+        self.assertEqual(line["text"], "Water connection allowance for coffee counter, subject to venue and organiser approval")
+        self.assertTrue(line["custom_pricing"])
+        self.assertNotIn("pricing_keyword", line)
+        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
+        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "none")
+        self.assertEqual(draft["line_items"][0]["status"], "unmatched")
 
-    def test_normalize_ai_draft_maps_positive_graphics_proposals_to_catalog_rows(self):
+    def test_normalize_ai_draft_keeps_custom_graphics_proposals_unpriced_without_exact_selectors(self):
         reference_id = "graphics-metadata-test"
         catalog_items = [
             {
@@ -6290,13 +6319,25 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         lines = draft["quote_basis_sections"][0]["lines"]
         self.assertEqual(len(lines), 4)
         for line in lines:
-            self.assertEqual(line["tag"], "Confirm")
-            self.assertTrue(line["pricing_keyword"].startswith("graphics-"))
-            self.assertIn("pricing_reference_description", line)
-            self.assertNotIn("custom_pricing", line)
-        self.assertIn("graphics-vinyl-printed-graphics", {line["pricing_keyword"] for line in lines})
+            self.assertEqual(line["tag"], "Custom")
+            self.assertTrue(line["custom_pricing"])
+            for field in (
+                "pricing_keyword", "catalog_description", "pricing_reference_description",
+                "catalog_unit_price",
+            ):
+                self.assertNotIn(field, line)
+        self.assertEqual(len(draft["line_items"]), len(lines))
+        for item in draft["line_items"]:
+            self.assertEqual(item["pricing_keyword"], "")
+            authority = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
+            self.assertNotEqual(authority.get("variant"), "catalog")
+            for field in (
+                "catalog_unit_price", "effective_unit_price", "pricing_basis_amount",
+                "approved_quote_amount", "catalog_description", "pricing_reference_description",
+            ):
+                self.assertNotIn(field, item)
 
-    def test_normalize_ai_draft_reviews_composite_booth_row_and_resolves_unambiguous_catalog_rows(self):
+    def test_normalize_ai_draft_keeps_custom_composite_booth_rows_unpriced_without_exact_selectors(self):
         reference_id = "booth-structure-metadata-test"
         catalog_items = [
             {
@@ -6372,36 +6413,26 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 })
 
         lines = draft["quote_basis_sections"][0]["lines"]
-        self.assertEqual(lines[0]["tag"], "Custom")
-        self.assertTrue(lines[0]["custom_pricing"])
-        self.assertEqual(
-            lines[0]["text"],
-            "Custom perimeter booth wall and room build with dark navy exterior, white interior finishes, meeting room, lounge, store enclosure, rounded corners, doorway openings, top fascia, and feature side opening",
-        )
-        self.assertNotIn("pricing_keyword", lines[0])
-        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
-        by_keyword = {
-            line["pricing_keyword"]: line
-            for line in lines
-            if line.get("pricing_keyword")
-        }
-        self.assertNotIn(
-            "booth-structure-double-side-partition-wall-at-height-2-5m-for-meeting-room-wooden-construct-in-painted-finished-as-per-design-proposal",
-            by_keyword,
-        )
-        self.assertIn(
-            "booth-structure-top-fascia-structure-at-height-3-99m-wooden-construct-in-painted-finished-as-per-design-proposal",
-            by_keyword,
-        )
-        self.assertIn("booth-structure-vertical-support-pillars-in-painted-finished", by_keyword)
-        for keyword, line in by_keyword.items():
-            self.assertEqual(line["tag"], "Confirm")
-            self.assertNotIn("custom_pricing", line)
-            self.assertTrue(line["text"].startswith("[ "))
-            if line["unit"] == "m length":
-                self.assertEqual(line["quantity"], "", keyword)
-            else:
-                self.assertEqual(line["quantity"], "1")
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0]["text"], "Custom perimeter booth wall and room build with dark navy exterior, white interior finishes, meeting room, lounge, store enclosure, rounded corners, doorway openings, top fascia, and feature side opening")
+        for line in lines:
+            self.assertEqual(line["tag"], "Custom")
+            self.assertTrue(line["custom_pricing"])
+            for field in (
+                "pricing_keyword", "catalog_description", "pricing_reference_description",
+                "catalog_unit_price",
+            ):
+                self.assertNotIn(field, line)
+        self.assertEqual(len(draft["line_items"]), len(lines))
+        for item in draft["line_items"]:
+            self.assertEqual(item["pricing_keyword"], "")
+            authority = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
+            self.assertNotEqual(authority.get("variant"), "catalog")
+            for field in (
+                "catalog_unit_price", "effective_unit_price", "pricing_basis_amount",
+                "approved_quote_amount", "catalog_description", "pricing_reference_description",
+            ):
+                self.assertNotIn(field, item)
 
     def test_normalize_ai_draft_rebuilds_brackets_from_resolved_catalog_keyword(self):
         parsed = {
@@ -6455,12 +6486,16 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "pricing_reference_source": "local",
         })
 
-        lines = draft["quote_basis_sections"][0]["lines"]
-        self.assertEqual(
-            lines[0]["text"],
-            "[ nos. synthetic rigging point ] - For circular overhead synthetic sign",
-        )
-        self.assertEqual(lines[1]["text"], "[ nos. synthetic rigging point ]")
+        lines = {
+            line.get("id"): line
+            for line in draft["quote_basis_sections"][0]["lines"]
+        }
+        mismatched_line = lines["boom-lift"]
+        self.assertEqual(mismatched_line["tag"], "Custom")
+        self.assertTrue(mismatched_line["custom_pricing"])
+        self.assertNotIn("pricing_keyword", mismatched_line)
+        self.assertEqual(mismatched_line["text"], "For circular overhead synthetic sign")
+        self.assertEqual(lines["pe-hanging"]["text"], "[ nos. synthetic rigging point ]")
 
     def test_finalized_remote_draft_reapplies_catalog_and_custom_review_rules(self):
         ai_basis = {
@@ -6759,7 +6794,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(draft["quote_basis_sections"][0]["lines"][0]["tag"], "Confirm")
         self.assertEqual(draft["quote_basis_sections"][0]["lines"][0]["confidence"], 91)
 
-    def test_normalize_ai_draft_keeps_meeting_area_catalog_conflict_for_review(self):
+    def test_normalize_ai_draft_keeps_selectorless_meeting_area_item_unpriced(self):
         parsed = {
             "quote_basis_sections": [
                 {
@@ -6785,13 +6820,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "pricing_reference_source": "local",
         })
 
-        self.assertEqual(draft["quote_basis_sections"][0]["title"], "Synthetic Rentals")
+        self.assertEqual(draft["quote_basis_sections"][0]["title"], "Synthetic Lighting And AV")
         line = draft["quote_basis_sections"][0]["lines"][0]
         self.assertEqual(line["tag"], "Custom")
         self.assertEqual(line["text"], "synthetic cafe chair for meeting area seating")
         self.assertTrue(line["custom_pricing"])
         self.assertNotIn("pricing_keyword", line)
         self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
+        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "none")
+        self.assertEqual(draft["line_items"][0]["status"], "unmatched")
 
     def test_normalize_ai_draft_splits_embedded_basis_decisions_for_review(self):
         parsed = {
@@ -10914,11 +10951,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual([section["title"] for section in draft["quote_basis_sections"][:2]], ["AV Equipment Rental Items", "Graphics"])
         self.assertEqual([item["section"] for item in draft["line_items"][:2]], ["AV Equipment Rental Items", "Graphics"])
-        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "av.42-led-tv-monitor")
+        self.assertEqual(draft["line_items"][0]["pricing_keyword"], "")
+        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "none")
+        self.assertEqual(draft["line_items"][0]["status"], "unmatched")
         av_line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(av_line["tag"], "Confirm")
-        self.assertEqual(av_line["pricing_keyword"], "av.42-led-tv-monitor")
-        self.assertIn('42" LED TV Monitor', av_line["pricing_reference_description"])
+        self.assertEqual(av_line["tag"], "Custom")
+        self.assertNotIn("pricing_keyword", av_line)
+        graphics_item = next(item for item in draft["line_items"] if item["section"] == "Graphics")
+        self.assertEqual(graphics_item["pricing_keyword"], "graphics-vinyl-printed-graphics")
+        self.assertEqual(graphics_item["pricing_authority"]["variant"], "catalog")
 
     def test_normalize_ai_draft_rehomes_catalog_keyworded_line_to_catalog_section_before_sorting(self):
         reference_id = "rehome-order-test"
@@ -12290,7 +12331,16 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("counters", result["quote_basis"])
         self.assertEqual(result["line_items"][0]["description"], "AI vinyl graphics")
         self.assertEqual(result["line_items"][0]["quantity"], 12.0)
-        request.assert_called_once_with(payload, "sk-test-redacted", auth_session=None)
+        request.assert_called_once()
+        submitted_payload = request.call_args.args[0]
+        self.assertEqual(request.call_args.args[1:], ("sk-test-redacted",))
+        self.assertIsNone(request.call_args.kwargs["auth_session"])
+        self.assertEqual(submitted_payload["pricing_reference_id"], payload["pricing_reference_id"])
+        self.assertEqual(
+            submitted_payload["_pricing_reference_snapshot"].detail()["digest_sha256"],
+            webapp.exact_pricing_reference_authority(submitted_payload)["detail"]["digest_sha256"],
+        )
+        self.assertNotIn("_pricing_reference_snapshot", payload)
         self.assertNotIn("ai_api_key", webapp.payload_to_brief(payload))
 
     def test_draft_quote_basis_logs_ai_call_attempt_metadata(self):
@@ -12488,7 +12538,17 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertGreaterEqual(len(result["line_items"]), 2)
         self.assertEqual(result["line_items"][0]["quantity"], 36.0)
         self.assertEqual(result["line_items"][0]["pricing_keyword"], "synthetic-floors-synthetic-carpet-tile")
-        openai.assert_called_once_with(payload, "sk-test-redacted", auth_session=None)
+        openai.assert_called_once()
+        submitted_payload = openai.call_args.args[0]
+        self.assertEqual(
+            {key: value for key, value in submitted_payload.items() if key != "_pricing_reference_snapshot"},
+            payload,
+        )
+        snapshot = submitted_payload["_pricing_reference_snapshot"]
+        self.assertEqual(snapshot.reference_id, payload["pricing_reference_id"])
+        self.assertEqual(snapshot.source, payload["pricing_reference_source"])
+        self.assertEqual(openai.call_args.args[1:], ("sk-test-redacted",))
+        self.assertEqual(openai.call_args.kwargs, {"auth_session": None})
 
     def test_draft_quote_basis_rewrites_default_booth_size_as_confirm_line(self):
         payload = valid_payload()
@@ -25268,7 +25328,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn("state.pricingReferenceSavedNotice", save_reference_body)
         self.assertIn("Matching clues updated.", save_reference_body)
         self.assertIn("Saved, but matching clue enrichment did not complete.", save_reference_body)
-        self.assertIn("await loadProfiles();", save_reference_body)
+        self.assertIn("if (!await loadProfiles())", save_reference_body)
         self.assertIn("syncSelectedPricingReference();", save_reference_body)
         self.assertNotIn("state.pricingReferenceId = savedReference.id || \"\";", save_reference_body)
         self.assertIn("updatePricingReferenceDeleteButton();", save_reference_body)
@@ -25328,7 +25388,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertNotIn("window.alert", js)
         delete_reference_body = js.split("async function deleteRepoPricingReference", 1)[1].split("async function deleteSelectedPricingReference", 1)[0]
         self.assertIn("clearPricingReferenceDraft({ clearFile: true, resetMetadata: true });", delete_reference_body)
-        self.assertIn("await loadProfiles();", delete_reference_body)
+        self.assertIn("if (!await loadProfiles())", delete_reference_body)
         self.assertIn("editSelectedPricingReference", js)
         self.assertIn("pricingReferencePreviewFromReference", js)
         self.assertIn("fetchPricingReferenceDetail", js)
@@ -28357,7 +28417,7 @@ state.pricingReferences = [];
 assert.strictEqual(quoteCommercialSnapshotForDetails(emptyDetails), null);
 
 const saveBody = source.split("async function savePricingReferenceFromModal")[1].split("async function deleteRepoPricingReference")[0];
-assert.ok(saveBody.includes("await loadProfiles();"));
+assert.ok(saveBody.includes("if (!await loadProfiles())"));
 assert.ok(!saveBody.includes("state.pricingReferenceId = savedReference.id"));
 assert.ok(!saveBody.includes("state.pricingReferenceSource = pricingReferenceSelectionFromValue(pricingReferenceSelectValue(savedReference)).source"));
 assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReference)"));
@@ -40333,7 +40393,7 @@ main().catch((error) => {
         payload["quote_basis_sections"][0]["lines"][0]["tag"] = "Exclude"
         self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(payload), [])
 
-    def test_line_item_normalize_endpoint_prices_accepted_ai_confirm_bracketed_catalog_line(self):
+    def test_line_item_normalize_keeps_custom_confirmed_line_without_selector_unpriced(self):
         partition_keyword = "synthetic-structures-synthetic-double-side-partition"
         partition_description = "m length synthetic double side partition"
         payload = {
@@ -40368,8 +40428,11 @@ main().catch((error) => {
         }
         basis_only_items = webapp.normalize_line_items_for_quote_basis_review({**payload, "line_items": []})
         self.assertEqual(len(basis_only_items), 1)
-        self.assertEqual(basis_only_items[0]["pricing_keyword"], partition_keyword)
-        self.assertEqual(basis_only_items[0]["catalog_unit_price"], 40.25)
+        self.assertEqual(basis_only_items[0]["pricing_keyword"], "")
+        self.assertEqual(basis_only_items[0]["pricing_authority"]["variant"], "none")
+        self.assertEqual(basis_only_items[0]["status"], "unmatched")
+        for field in ("catalog_unit_price", "effective_unit_price", "pricing_basis_amount"):
+            self.assertNotIn(field, basis_only_items[0])
 
         with mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "operator"}, clear=False):
             with LocalRunnerServer() as runner:
@@ -40388,9 +40451,11 @@ main().catch((error) => {
         self.assertEqual(body["status"], "normalized")
         self.assertEqual(len(body["line_items"]), 1)
         item = body["line_items"][0]
-        self.assertEqual(item["pricing_keyword"], partition_keyword)
-        self.assertEqual(item["catalog_unit_price"], koncept_catalog_sale_unit_price(partition_keyword))
-        self.assertEqual(item["catalog_unit_price"], 40.25)
+        self.assertEqual(item["pricing_keyword"], "")
+        self.assertEqual(item["pricing_authority"]["variant"], "none")
+        self.assertEqual(item["status"], "unmatched")
+        for field in ("catalog_unit_price", "effective_unit_price", "pricing_basis_amount"):
+            self.assertNotIn(field, item)
         self.assertEqual(item["description"], partition_description)
         self.assertEqual(item["source_basis_line_id"], "basis-double-side-partition")
 
@@ -44748,3 +44813,886 @@ process.stdout.write("ok");
 
 if __name__ == "__main__":
     unittest.main()
+
+class PricingDraftG3Regression(unittest.TestCase):
+    @staticmethod
+    def bind_test_snapshot(payload, reference):
+        detail = reference["detail"]
+        payload["_pricing_reference_snapshot"] = webapp.PricingReferenceSnapshot(
+            source=reference["source"],
+            reference_id=reference["id"],
+            digest=detail["digest_sha256"],
+            currency=detail["currency"],
+            detail_json=json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        )
+
+    def test_provider_exact_selectors_are_rebound_to_server_snapshot(self):
+        fixture = WebappServerTest()
+        items = fixture.sqag_212_catalog_items() + [
+            {
+                "id": "synthetic-display-panel-03", "section": "Displays",
+                "description": "nos display panel", "pricing_reference_description": "nos display panel",
+                "unit_hint": "nos", "sale_unit_price": 210,
+                "match_terms": ["display panel"], "object_families": ["display panel"],
+            },
+            {
+                "id": "synthetic-counter-unit-04", "section": "Furniture",
+                "description": "nos reception counter", "pricing_reference_description": "nos reception counter",
+                "unit_hint": "nos", "sale_unit_price": 320,
+                "match_terms": ["reception counter"], "object_families": ["reception counter"],
+            },
+        ]
+        payload = fixture.sqag_212_payload(items)
+        catalog = webapp.pricing_catalog_runtime_lookup_for_payload(payload)
+        reference = webapp.exact_pricing_reference_authority(payload)
+        current_digest = reference["detail"]["digest_sha256"]
+        self.bind_test_snapshot(payload, reference)
+        rows = []
+        expected_prices = []
+        for index in range(8):
+            catalog_item = list(catalog.values())[index] if index < 4 else None
+            row = {
+                "section": catalog_item["section"] if catalog_item else "Custom",
+                "source_basis_line_id": f"provider-row-{index + 1}",
+                "quantity": 2,
+                "unit": "nos",
+                "description": (
+                    webapp.clean_customer_quote_line_text(catalog_item["description"])
+                    if catalog_item
+                    else f"bespoke unpriced fixture {index}"
+                ),
+                "pricing_keyword": catalog_item["id"] if catalog_item else f"nonexistent-{index}",
+                "price_mode": "Priced",
+                "status": "matched",
+                "unit_price_override": 987654.32,
+                "effective_unit_price": 987654.32,
+                "catalog_unit_price": 987654.32,
+                "pricing_basis_amount": 1975308.64,
+            }
+            if index == 0:
+                row["pricing_authority"] = {
+                    "schema": webapp.PRICING_AUTHORITY_SCHEMA,
+                    "version": webapp.PRICING_AUTHORITY_VERSION,
+                    "variant": "catalog",
+                    "context": webapp.pricing_authority_context(row),
+                    "currency": "USD",
+                    "price": 987654.32,
+                    "catalog_source": "company",
+                    "catalog_digest": "sha256:" + ("0" * 64),
+                    "catalog_item_id": catalog_item["id"] if catalog_item else "forged-item",
+                }
+            elif index == 1:
+                row["pricing_authority"] = webapp.build_pricing_authority("historical", row)
+            elif index == 2:
+                row["pricing_authority"] = {"variant": "none"}
+            rows.append(row)
+            if catalog_item:
+                expected_prices.append(webapp.pricing_reference_sale_unit_price(catalog_item))
+
+        parsed = {"line_items": rows, "quote_basis_sections": [], "analysis_findings": []}
+        normalized = webapp.normalize_ai_draft(parsed, payload)
+        self.assertEqual(len(normalized["line_items"]), 8)
+        exact_rows = normalized["line_items"][:4]
+        for row, expected_price in zip(exact_rows, expected_prices):
+            self.assertEqual(row["pricing_authority"]["variant"], "catalog")
+            self.assertEqual(row["pricing_authority"]["currency"], reference["detail"]["currency"])
+            self.assertEqual(row["pricing_authority"]["catalog_source"], reference["source"])
+            self.assertEqual(row["pricing_authority"]["catalog_digest"], current_digest)
+            self.assertEqual(row["pricing_authority"]["catalog_item_id"], row["pricing_keyword"])
+            self.assertEqual(row["pricing_authority"]["price"], expected_price)
+            self.assertEqual(row["effective_unit_price"], expected_price)
+            self.assertEqual(row["pricing_basis_amount"], expected_price * 2)
+            self.assertNotEqual(row["effective_unit_price"], 987654.32)
+        for row in normalized["line_items"][4:]:
+            self.assertIn(row["pricing_authority"]["variant"], {"none", "historical"})
+            self.assertEqual(row["status"], "unmatched")
+            self.assertNotIn("effective_unit_price", row)
+            self.assertNotIn("pricing_basis_amount", row)
+        normalized_twice = webapp.normalize_ai_draft(normalized, payload)
+        self.assertEqual(normalized_twice["line_items"], normalized["line_items"])
+
+    def test_unknown_provider_selector_stays_unresolved_through_finalize_and_quote_review(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        reference = webapp.exact_pricing_reference_authority(payload)
+        self.bind_test_snapshot(payload, reference)
+        provider_draft = {
+            "project": {"booth_width": 6, "booth_depth": 6},
+            "quote_basis_sections": [{
+                "id": "lighting",
+                "title": "Lighting",
+                "lines": [{
+                    "id": "unknown-wall-light-row",
+                    "tag": "Confirm",
+                    "text": "nos wall light",
+                    "pricing_keyword": "nonexistent-selector",
+                    "quantity": 2,
+                    "unit": "nos",
+                    "confidence_pct": 90,
+                }],
+            }],
+            "line_items": [{
+                "section": "Lighting",
+                "source_basis_line_id": "unknown-wall-light-row",
+                "quantity": 2,
+                "unit": "nos",
+                "description": "nos wall light",
+                "pricing_keyword": "nonexistent-selector",
+            }],
+        }
+
+        normalized = webapp.normalize_ai_draft(provider_draft, payload)
+        [normalized_row] = normalized["line_items"]
+        self.assertEqual(normalized_row["pricing_keyword"], "nonexistent-selector")
+        self.assertEqual(normalized_row["pricing_authority"]["variant"], "none")
+        self.assertEqual(normalized_row["status"], "unmatched")
+        self.assertNotIn("effective_unit_price", normalized_row)
+
+        finalized = webapp.finalized_remote_draft_result(
+            payload,
+            normalized,
+            "openai",
+            "OpenAI",
+            {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+            [],
+        )
+        [finalized_row] = finalized["line_items"]
+        self.assertEqual(finalized_row["pricing_keyword"], "nonexistent-selector")
+        self.assertEqual(finalized_row["pricing_authority"]["variant"], "none")
+        self.assertEqual(finalized_row["status"], "unmatched")
+        self.assertNotIn("effective_unit_price", finalized_row)
+        self.assertNotIn("catalog_unit_price", finalized_row)
+
+        review_sections = copy.deepcopy(finalized["quote_basis_sections"])
+        for section in review_sections:
+            for line in section.get("lines", []):
+                if line.get("id") == "unknown-wall-light-row":
+                    line["custom_confirmed"] = True
+        review_payload = {
+            **payload,
+            "line_items": finalized["line_items"],
+            "quote_basis_sections": review_sections,
+        }
+        [review_row] = webapp.normalize_line_items_for_quote_basis_review(review_payload)
+        self.assertEqual(review_row["pricing_keyword"], "nonexistent-selector")
+        self.assertEqual(review_row["pricing_authority"]["variant"], "none")
+        self.assertNotIn("effective_unit_price", review_row)
+        self.assertNotIn("catalog_unit_price", review_row)
+
+        repeated = webapp.normalize_ai_draft(normalized, payload)
+        self.assertEqual(repeated["line_items"], normalized["line_items"])
+        repeated_finalized = webapp.finalized_remote_draft_result(
+            payload,
+            repeated,
+            "openai",
+            "OpenAI",
+            {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+            [],
+        )
+        [repeated_row] = repeated_finalized["line_items"]
+        self.assertEqual(repeated_row["pricing_keyword"], "nonexistent-selector")
+        self.assertEqual(repeated_row["pricing_authority"]["variant"], "none")
+        self.assertEqual(repeated_row["status"], "unmatched")
+        self.assertNotIn("effective_unit_price", repeated_row)
+
+    def test_custom_provider_row_without_selector_stays_unpriced_and_stable(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        reference = webapp.exact_pricing_reference_authority(payload)
+        self.bind_test_snapshot(payload, reference)
+
+        scenarios = (
+            ("basis-id", True, True),
+            ("basis-without-id", True, False),
+            ("no-basis-sections", False, False),
+        )
+
+        def assert_unpriced(stage, rows):
+            self.assertEqual(len(rows), 1, stage)
+            row = rows[0]
+            self.assertEqual(row["pricing_keyword"], "", stage)
+            self.assertEqual(row["pricing_authority"]["variant"], "none", stage)
+            self.assertEqual(row["status"], "unmatched", stage)
+            for field in (
+                "catalog_unit_price", "effective_unit_price", "pricing_basis_amount",
+                "approved_quote_amount", "catalog_description", "pricing_reference_description",
+            ):
+                self.assertNotIn(field, row, stage)
+
+        for suffix, include_basis, include_basis_id in scenarios:
+            with self.subTest(scenario=suffix):
+                row_id = f"custom-wall-light-{suffix}"
+                basis_sections = []
+                if include_basis:
+                    basis_line = {
+                        "tag": "Custom",
+                        "custom_pricing": True,
+                        "text": "nos wall light",
+                        "quantity": 2,
+                        "unit": "nos",
+                        "confidence_pct": 90,
+                    }
+                    if include_basis_id:
+                        basis_line["id"] = row_id
+                    basis_sections = [{
+                        "id": "lighting",
+                        "title": "Lighting",
+                        "lines": [basis_line],
+                    }]
+                provider_row = {
+                    "section": "Lighting",
+                    "quantity": 2,
+                    "unit": "nos",
+                    "description": "nos wall light",
+                    "pricing_keyword": "",
+                }
+                if include_basis_id:
+                    provider_row["source_basis_line_id"] = row_id
+                provider_draft = {
+                    "project": {"booth_width": 6, "booth_depth": 6},
+                    "quote_basis_sections": basis_sections,
+                    "line_items": [provider_row],
+                }
+
+                normalized = webapp.normalize_ai_draft(provider_draft, payload)
+                assert_unpriced("normalized", normalized["line_items"])
+
+                repeated = webapp.normalize_ai_draft(normalized, payload)
+                assert_unpriced("normalized twice", repeated["line_items"])
+
+                finalized = webapp.finalized_remote_draft_result(
+                    payload,
+                    repeated,
+                    "openai",
+                    "OpenAI",
+                    {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+                    [],
+                )
+                assert_unpriced("finalized", finalized["line_items"])
+
+                review_sections = copy.deepcopy(finalized["quote_basis_sections"])
+                for section in review_sections:
+                    for line in section.get("lines", []):
+                        if isinstance(line, dict) and webapp.normalize_basis_tag(line.get("tag")) == "Custom":
+                            line["custom_confirmed"] = True
+                review_payload = {
+                    **payload,
+                    "line_items": finalized["line_items"],
+                    "quote_basis_sections": review_sections,
+                }
+                reviewed = webapp.normalize_line_items_for_quote_basis_review(review_payload)
+                assert_unpriced("quote review", reviewed)
+
+                repeated_finalized = webapp.finalized_remote_draft_result(
+                    payload,
+                    webapp.normalize_ai_draft(finalized, payload),
+                    "openai",
+                    "OpenAI",
+                    {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+                    [],
+                )
+                assert_unpriced("finalized twice", repeated_finalized["line_items"])
+
+    def test_manual_and_included_authority_are_restored_from_server_owned_rows(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        reference = webapp.exact_pricing_reference_authority(payload)
+        self.bind_test_snapshot(payload, reference)
+        payload["line_items"] = [
+            {
+                "section": "Custom", "source_basis_line_id": "manual-source-row",
+                "quantity": 2, "unit": "nos", "description": "Custom manual service",
+                "pricing_keyword": "", "unit_price_override": 17.5,
+            },
+            {
+                "section": "Custom", "source_basis_line_id": "included-source-row",
+                "quantity": 1, "unit": "lot", "description": "Included handling",
+                "pricing_keyword": "", "price_mode": "Included", "display_price": "Included",
+            },
+        ]
+        provider_rows = copy.deepcopy(payload["line_items"])
+        for row in provider_rows:
+            row.update({
+                "unit_price_override": 987654.32,
+                "effective_unit_price": 987654.32,
+                "pricing_basis_amount": 987654.32,
+                "status": "matched",
+            })
+            row.pop("display_price", None)
+            row.pop("price_mode", None)
+        normalized = webapp.normalize_ai_draft({"line_items": provider_rows}, payload)
+        manual, included = normalized["line_items"]
+        self.assertEqual(manual["pricing_authority"]["variant"], "manual")
+        self.assertEqual(manual["effective_unit_price"], 17.5)
+        self.assertEqual(manual["pricing_basis_amount"], 35)
+        self.assertEqual(included["pricing_authority"]["variant"], "included")
+        self.assertEqual(included["price_mode"], "Included")
+        self.assertNotIn("effective_unit_price", included)
+
+    def test_quote_review_preserves_manual_and_included_authority_without_basis_ids(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        self.bind_test_snapshot(payload, webapp.exact_pricing_reference_authority(payload))
+        payload["line_items"] = [
+            {
+                "section": "Custom", "quantity": 2, "unit": "nos",
+                "description": "Custom manual service", "pricing_keyword": "",
+                "unit_price_override": 17.5,
+            },
+            {
+                "section": "Custom", "quantity": 1, "unit": "lot",
+                "description": "Included handling", "pricing_keyword": "",
+                "price_mode": "Included", "display_price": "Included",
+            },
+        ]
+
+        manual, included = webapp.normalize_line_items_for_quote_basis_review(payload)
+
+        self.assertEqual(manual["pricing_authority"]["variant"], "manual")
+        self.assertEqual(manual["effective_unit_price"], 17.5)
+        self.assertEqual(manual["pricing_basis_amount"], 35)
+        self.assertEqual(included["pricing_authority"]["variant"], "included")
+        self.assertEqual(included["price_mode"], "Included")
+        self.assertEqual(included["display_price"], "Included")
+        self.assertNotIn("effective_unit_price", included)
+
+    def test_selectorless_provider_confirm_rows_never_acquire_catalog_authority(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        self.bind_test_snapshot(payload, webapp.exact_pricing_reference_authority(payload))
+        row_id = "selectorless-wall-light-row"
+        provider_draft = {
+            "project": {"booth_width": 6, "booth_depth": 6},
+            "quote_basis_sections": [{
+                "id": "lighting",
+                "title": "Lighting",
+                "lines": [{
+                    "id": row_id,
+                    "tag": "Confirm",
+                    "text": "nos wall light",
+                    "quantity": 2,
+                    "unit": "nos",
+                    "confidence_pct": 90,
+                }],
+            }],
+            "line_items": [{
+                "section": "Lighting",
+                "source_basis_line_id": row_id,
+                "quantity": 2,
+                "unit": "nos",
+                "description": "nos wall light",
+                "pricing_keyword": "",
+            }],
+        }
+
+        def assert_unresolved(rows, stage):
+            self.assertEqual(len(rows), 1, stage)
+            row = rows[0]
+            self.assertEqual(row["pricing_keyword"], "", stage)
+            self.assertEqual(row["pricing_authority"]["variant"], "none", stage)
+            self.assertEqual(row["status"], "unmatched", stage)
+            for key in ("effective_unit_price", "unit_price_override", "catalog_unit_price", "pricing_basis_amount"):
+                self.assertNotIn(key, row, stage)
+
+        normalized = webapp.normalize_ai_draft(provider_draft, payload)
+        assert_unresolved(normalized["line_items"], "normalized")
+        repeated = webapp.normalize_ai_draft(normalized, payload)
+        assert_unresolved(repeated["line_items"], "normalized twice")
+
+        finalized = webapp.finalized_remote_draft_result(
+            payload,
+            repeated,
+            "openai",
+            "OpenAI",
+            {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+            [],
+        )
+        assert_unresolved(finalized["line_items"], "finalized")
+        review_sections = copy.deepcopy(finalized["quote_basis_sections"])
+        for section in review_sections:
+            for line in section.get("lines", []):
+                if isinstance(line, dict) and webapp.normalize_basis_tag(line.get("tag")) == "Custom":
+                    line["custom_confirmed"] = True
+        review_payload = {
+            **payload,
+            "line_items": finalized["line_items"],
+            "quote_basis_sections": review_sections,
+        }
+        reviewed = webapp.normalize_line_items_for_quote_basis_review(review_payload)
+        assert_unresolved(reviewed, "quote review")
+
+    def test_provider_selector_cannot_cross_distinct_basis_line_ids_with_same_description(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        self.bind_test_snapshot(payload, webapp.exact_pricing_reference_authority(payload))
+        provider_draft = {
+            "project": {"booth_width": 6, "booth_depth": 6},
+            "quote_basis_sections": [{
+                "id": "lighting",
+                "title": "Lighting",
+                "lines": [{
+                    "id": "provider-row-b",
+                    "tag": "Confirm",
+                    "text": "nos wall light",
+                    "quantity": 9,
+                    "unit": "nos",
+                    "confidence_pct": 90,
+                }],
+            }],
+            "line_items": [{
+                "section": "Lighting",
+                "source_basis_line_id": "provider-row-a",
+                "quantity": 2,
+                "unit": "nos",
+                "description": "nos wall light",
+                "pricing_keyword": "arbitrary-wall-luminaire-01",
+            }, {
+                "section": "Lighting",
+                "source_basis_line_id": "provider-row-b",
+                "quantity": 9,
+                "unit": "nos",
+                "description": "nos wall light",
+                "pricing_keyword": "",
+            }],
+        }
+
+        def assert_rows(rows, stage):
+            row_a = next(row for row in rows if row.get("source_basis_line_id") == "provider-row-a")
+            self.assertEqual(row_a["pricing_authority"]["variant"], "catalog", stage)
+            self.assertEqual(row_a["pricing_authority"]["price"], 40, stage)
+            self.assertEqual(row_a["effective_unit_price"], 40, stage)
+            row_b = next(row for row in rows if row.get("source_basis_line_id") == "provider-row-b")
+            self.assertEqual(row_b.get("pricing_keyword", ""), "", stage)
+            self.assertEqual(row_b["pricing_authority"]["variant"], "none", stage)
+            self.assertEqual(row_b["status"], "unmatched", stage)
+            for key in ("effective_unit_price", "catalog_unit_price", "pricing_basis_amount"):
+                self.assertNotIn(key, row_b, stage)
+
+        normalized = webapp.normalize_ai_draft(provider_draft, payload)
+        assert_rows(normalized["line_items"], "normalized")
+        repeated = webapp.normalize_ai_draft(normalized, payload)
+        assert_rows(repeated["line_items"], "normalized twice")
+
+        finalized = webapp.finalized_remote_draft_result(
+            payload,
+            repeated,
+            "openai",
+            "OpenAI",
+            {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+            [],
+        )
+        assert_rows(finalized["line_items"], "finalized")
+
+        review_sections = copy.deepcopy(finalized["quote_basis_sections"])
+        for section in review_sections:
+            for line in section.get("lines", []):
+                if line.get("id") == "provider-row-b":
+                    line["tag"] = "Include"
+        review_payload = {
+            **payload,
+            "line_items": finalized["line_items"],
+            "quote_basis_sections": review_sections,
+        }
+        reviewed = webapp.normalize_line_items_for_quote_basis_review(review_payload)
+        row_b = next(row for row in reviewed if row.get("source_basis_line_id") == "provider-row-b")
+        self.assertEqual(row_b.get("pricing_keyword", ""), "")
+        self.assertEqual(row_b["pricing_authority"]["variant"], "none")
+        self.assertNotIn("effective_unit_price", row_b)
+        self.assertNotIn("catalog_unit_price", row_b)
+
+    def test_provider_selector_cannot_cross_from_owned_basis_to_unidentified_row(self):
+        fixture = WebappServerTest()
+        for tag in ("Confirm", "Include", "Custom"):
+            with self.subTest(tag=tag):
+                payload = fixture.sqag_212_payload()
+                self.bind_test_snapshot(payload, webapp.exact_pricing_reference_authority(payload))
+                provider_draft = {
+                    "project": {"booth_width": 6, "booth_depth": 6},
+                    "quote_basis_sections": [{
+                        "id": "lighting", "title": "Lighting", "lines": [{
+                            "id": "provider-row-a", "tag": tag, "text": "nos wall light",
+                            "quantity": 9, "unit": "nos", "confidence_pct": 90,
+                        }],
+                    }],
+                    "line_items": [{
+                        "section": "Lighting", "source_basis_line_id": "provider-row-a",
+                        "quantity": 2, "unit": "nos", "description": "nos wall light",
+                        "pricing_keyword": "arbitrary-wall-luminaire-01",
+                    }, {
+                        "section": "Lighting", "quantity": 9, "unit": "nos",
+                        "description": "nos wall light", "pricing_keyword": "",
+                    }],
+                }
+
+                def assert_rows(result, stage):
+                    self.assertEqual(len(result["line_items"]), 2, stage)
+                    [selected] = [row for row in result["line_items"] if row.get("pricing_keyword")]
+                    self.assertEqual(selected["source_basis_line_id"], "provider-row-a", stage)
+                    self.assertEqual(selected["quantity"], 9, stage)
+                    self.assertEqual(selected["pricing_authority"]["variant"], "catalog", stage)
+                    self.assertEqual(selected["effective_unit_price"], 40, stage)
+                    self.assertEqual(selected["pricing_basis_amount"], 360, stage)
+                    self.assertEqual(selected["approved_quote_amount"], 360, stage)
+                    [unselected] = [row for row in result["line_items"] if not row.get("pricing_keyword")]
+                    self.assertEqual(unselected["pricing_authority"]["variant"], "none", stage)
+                    self.assertEqual(unselected["status"], "unmatched", stage)
+                    for key in ("effective_unit_price", "catalog_unit_price", "pricing_basis_amount"):
+                        self.assertNotIn(key, unselected, stage)
+
+                normalized = webapp.normalize_ai_draft(provider_draft, payload)
+                assert_rows(normalized, "normalized")
+                repeated = webapp.normalize_ai_draft(normalized, payload)
+                assert_rows(repeated, "normalized twice")
+                self.assertEqual(repeated["line_items"], normalized["line_items"])
+                finalized = webapp.finalized_remote_draft_result(
+                    payload, repeated, "openai", "OpenAI",
+                    {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+                    [],
+                )
+                assert_rows(finalized, "finalized")
+                review_sections = copy.deepcopy(finalized["quote_basis_sections"])
+                for section in review_sections:
+                    for line in section.get("lines", []):
+                        if line.get("id") == "provider-row-a":
+                            line["tag"] = "Include"
+                reviewed = webapp.normalize_line_items_for_quote_basis_review({
+                    **payload, "line_items": finalized["line_items"],
+                    "quote_basis_sections": review_sections,
+                })
+                self.assertEqual(len(reviewed), 1)
+                self.assertEqual(reviewed[0]["source_basis_line_id"], "provider-row-a")
+                self.assertEqual(reviewed[0]["pricing_basis_amount"], 360)
+
+    def test_provider_selector_cannot_cross_ambiguous_rows_without_basis_ids(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        self.bind_test_snapshot(payload, webapp.exact_pricing_reference_authority(payload))
+        provider_draft = {
+            "project": {"booth_width": 6, "booth_depth": 6},
+            "quote_basis_sections": [{
+                "id": "lighting",
+                "title": "Lighting",
+                "lines": [{
+                    "tag": "Confirm",
+                    "text": "nos wall light",
+                    "quantity": 9,
+                    "unit": "nos",
+                    "confidence_pct": 90,
+                }],
+            }],
+            "line_items": [{
+                "section": "Lighting",
+                "quantity": 2,
+                "unit": "nos",
+                "description": "nos wall light",
+                "pricing_keyword": "arbitrary-wall-luminaire-01",
+            }, {
+                "section": "Lighting",
+                "quantity": 9,
+                "unit": "nos",
+                "description": "nos wall light",
+                "pricing_keyword": "",
+            }],
+        }
+
+        def assert_unambiguous_rows(rows, stage):
+            self.assertEqual(len(rows), 2, stage)
+            row_a = next(row for row in rows if row.get("quantity") == 2)
+            self.assertEqual(row_a["pricing_keyword"], "arbitrary-wall-luminaire-01", stage)
+            self.assertEqual(row_a["pricing_authority"]["variant"], "catalog", stage)
+            self.assertEqual(row_a["effective_unit_price"], 40, stage)
+            row_b = next(row for row in rows if row.get("quantity") == 9)
+            self.assertEqual(row_b.get("pricing_keyword", ""), "", stage)
+            self.assertEqual(row_b["pricing_authority"]["variant"], "none", stage)
+            self.assertEqual(row_b["status"], "unmatched", stage)
+            for key in ("effective_unit_price", "catalog_unit_price", "pricing_basis_amount"):
+                self.assertNotIn(key, row_b, stage)
+
+        normalized = webapp.normalize_ai_draft(provider_draft, payload)
+        assert_unambiguous_rows(normalized["line_items"], "normalized")
+        repeated = webapp.normalize_ai_draft(normalized, payload)
+        assert_unambiguous_rows(repeated["line_items"], "normalized twice")
+        self.assertEqual(repeated["line_items"], normalized["line_items"])
+
+        finalized = webapp.finalized_remote_draft_result(
+            payload,
+            repeated,
+            "openai",
+            "OpenAI",
+            {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+            [],
+        )
+        assert_unambiguous_rows(finalized["line_items"], "finalized")
+
+        review_sections = copy.deepcopy(finalized["quote_basis_sections"])
+        for section in review_sections:
+            for line in section.get("lines", []):
+                line["tag"] = "Custom"
+                line["custom_pricing"] = True
+                line["custom_confirmed"] = True
+        review_payload = {
+            **payload,
+            "line_items": finalized["line_items"],
+            "quote_basis_sections": review_sections,
+        }
+        reviewed = webapp.normalize_line_items_for_quote_basis_review(review_payload)
+        self.assertEqual(len(reviewed), 2)
+        review_a = next(row for row in reviewed if row.get("quantity") == 2)
+        self.assertEqual(review_a["pricing_keyword"], "arbitrary-wall-luminaire-01")
+        self.assertEqual(review_a["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(review_a["effective_unit_price"], 40)
+        review_b = next(row for row in reviewed if row.get("quantity") == 9)
+        self.assertEqual(review_b.get("pricing_keyword", ""), "")
+        self.assertEqual(review_b["pricing_authority"]["variant"], "none")
+        self.assertNotIn("effective_unit_price", review_b)
+        self.assertNotIn("catalog_unit_price", review_b)
+
+    def test_inline_client_reference_is_not_an_authoritative_request_snapshot(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        self.assertIsNone(webapp.capture_pricing_reference_snapshot(payload))
+
+    def test_ambiguous_same_context_provider_rows_do_not_multiply_or_cross_bind(self):
+        fixture = WebappServerTest()
+        for duplicate_source_id in ("", "ambiguous-provider-row"):
+            with self.subTest(source_id=duplicate_source_id):
+                payload = fixture.sqag_212_payload()
+                self.bind_test_snapshot(payload, webapp.exact_pricing_reference_authority(payload))
+                basis_line = {
+                    "tag": "Confirm", "text": "nos wall light", "quantity": 2,
+                    "unit": "nos", "confidence_pct": 90,
+                }
+                rows = [
+                    {
+                        "section": "Lighting", "quantity": 2, "unit": "nos",
+                        "description": "nos wall light",
+                        "pricing_keyword": selector,
+                    }
+                    for selector in ("arbitrary-wall-luminaire-01", "")
+                ]
+                if duplicate_source_id:
+                    basis_line["id"] = duplicate_source_id
+                    for row in rows:
+                        row["source_basis_line_id"] = duplicate_source_id
+                provider_draft = {
+                    "project": {"booth_width": 6, "booth_depth": 6},
+                    "quote_basis_sections": [{
+                        "id": "lighting", "title": "Lighting", "lines": [basis_line],
+                    }],
+                    "line_items": rows,
+                }
+
+                def assert_rows(result, stage):
+                    self.assertEqual(len(result["line_items"]), 2, stage)
+                    [selected] = [
+                        row for row in result["line_items"]
+                        if row.get("pricing_keyword") == "arbitrary-wall-luminaire-01"
+                    ]
+                    self.assertEqual(selected["pricing_authority"]["variant"], "catalog", stage)
+                    self.assertEqual(selected["effective_unit_price"], 40, stage)
+                    [unselected] = [row for row in result["line_items"] if not row.get("pricing_keyword")]
+                    self.assertEqual(unselected["pricing_authority"]["variant"], "none", stage)
+                    self.assertEqual(unselected["status"], "unmatched", stage)
+                    self.assertNotIn("effective_unit_price", unselected, stage)
+                    self.assertNotIn("catalog_unit_price", unselected, stage)
+
+                normalized = webapp.normalize_ai_draft(provider_draft, payload)
+                assert_rows(normalized, "normalized")
+                repeated = webapp.normalize_ai_draft(normalized, payload)
+                assert_rows(repeated, "normalized twice")
+                self.assertEqual(repeated["line_items"], normalized["line_items"])
+                finalized = webapp.finalized_remote_draft_result(
+                    payload, repeated, "openai", "OpenAI",
+                    {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
+                    [],
+                )
+                assert_rows(finalized, "finalized")
+                review_sections = copy.deepcopy(finalized["quote_basis_sections"])
+                for section in review_sections:
+                    for line in section.get("lines", []):
+                        line.update({"tag": "Custom", "custom_pricing": True, "custom_confirmed": True})
+                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review({
+                    **payload,
+                    "line_items": finalized["line_items"],
+                    "quote_basis_sections": review_sections,
+                }), [])
+
+    def test_owned_quote_draft_still_sanitizes_provider_prices_and_rebinds_exact_selector(self):
+        fixture = WebappServerTest()
+        payload = recovered_convergence_payload(include_included_row=False)
+        synthetic_payload = fixture.sqag_212_payload()
+        payload["pricing_reference"] = copy.deepcopy(synthetic_payload["pricing_reference"])
+        payload["pricing_reference_id"] = synthetic_payload["pricing_reference_id"]
+        payload["pricing_reference_source"] = synthetic_payload["pricing_reference_source"]
+        payload["profile_id"] = synthetic_payload["profile_id"]
+        reference = webapp.exact_pricing_reference_authority(payload)
+        self.assertTrue(reference["ok"])
+        snapshot = payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]
+        snapshot["pricing_basis"] = {
+            "currency": reference["detail"]["currency"],
+            "source": reference["source"],
+            "id": reference["id"],
+            "digest": reference["detail"]["digest_sha256"],
+        }
+        payload["line_items"] = []
+        self.bind_test_snapshot(payload, reference)
+        self.assertTrue(webapp.quote_commercial_state(payload)["owned"])
+        self.assertFalse(webapp.quote_commercial_state(payload)["review_required"])
+
+        forged_provider_row = {
+            "section": "Lighting",
+            "source_basis_line_id": "owned-provider-row",
+            "quantity": 2,
+            "unit": "nos",
+            "description": "nos wall light",
+            "pricing_keyword": "arbitrary-wall-luminaire-01",
+            "price_mode": "Priced",
+            "unit_price_override": 987654.32,
+            "effective_unit_price": 987654.32,
+            "pricing_basis_amount": 1975308.64,
+            "pricing_authority": {"variant": "manual", "price": 987654.32},
+        }
+        draft = webapp.normalize_ai_draft({"line_items": [forged_provider_row]}, payload)
+        row = draft["line_items"][0]
+        self.assertEqual(row["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(row["pricing_authority"]["price"], 40)
+        self.assertEqual(row["effective_unit_price"], 40)
+        self.assertEqual(row["pricing_basis_amount"], 80)
+
+    def test_bundled_runtime_and_prompt_use_the_captured_request_snapshot(self):
+        detail = {
+            "id": "g3-captured-bundled-reference",
+            "source": "bundled",
+            "currency": "SGD",
+            "digest_sha256": "sha256:" + ("a" * 64),
+            "items": [{
+                "id": "captured.old-row", "section": "Captured",
+                "description": "nos old fixture", "unit_hint": "nos",
+            }],
+        }
+        payload = {
+            "pricing_reference_id": detail["id"],
+            "pricing_reference_source": "bundled",
+            "pricing_reference": {"id": detail["id"], "source": "bundled"},
+            "_pricing_reference_snapshot": webapp.PricingReferenceSnapshot(
+                source="bundled",
+                reference_id=detail["id"],
+                digest=detail["digest_sha256"],
+                currency="SGD",
+                detail_json=json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+            ),
+        }
+        self.assertEqual(webapp.runtime_pricing_reference_from_payload(payload), detail)
+        with mock.patch.object(
+            webapp,
+            "pricing_catalog_prompt_rows",
+            return_value=[{"id": "replacement-row", "sale_unit_price": 99}],
+        ) as reread:
+            prompt_rows = webapp.pricing_catalog_prompt_rows_for_payload(payload)
+        self.assertEqual([row["id"] for row in prompt_rows], ["captured.old-row"])
+        reread.assert_not_called()
+
+    def test_pricing_reference_detail_digest_and_items_share_one_catalog_read(self):
+        item_a = {"id": "captured-row", "description": "nos captured fixture", "sale_unit_price": 10}
+        item_b = {"id": "replacement-row", "description": "nos replacement fixture", "sale_unit_price": 99}
+        catalog_a = {"schema_version": 1, "currency": "SGD", "items": [item_a]}
+        catalog_b = {"schema_version": 1, "currency": "SGD", "items": [item_b]}
+        pack = webapp.PricingReferencePack(
+            id="g3-single-read-reference",
+            directory=Path("."),
+            config={"id": "g3-single-read-reference", "currency": "SGD"},
+            source="bundled",
+        )
+        with mock.patch.object(webapp, "load_json_file", side_effect=[catalog_a, catalog_b]) as read_catalog:
+            detail = pack.public_detail()
+        self.assertEqual(read_catalog.call_count, 1)
+        self.assertEqual(detail["items"][0]["id"], "captured-row")
+        self.assertEqual(detail["digest_sha256"], webapp.pricing_reference_catalog_digest(catalog_a))
+
+    def test_bundled_request_snapshot_keeps_catalog_visual_images(self):
+        reference_id = "g3-visual-snapshot"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reference_dir = write_test_pricing_reference(root, reference_id, [{
+                "id": "synthetic.visual-item",
+                "section": "Furniture",
+                "description": "nos synthetic chair",
+                "unit_hint": "nos",
+                "internal_cost": 10,
+                "markup_multiplier": 2,
+                "visual_references": [{
+                    "source": "xl/media/chair.png",
+                    "path": "pricing-catalog-images/chair.png",
+                    "anchor_row": 2,
+                }],
+            }])
+            image_path = reference_dir / "pricing-catalog-images" / "chair.png"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(base64.b64decode(synthetic_image().split(",", 1)[1]))
+            payload = {
+                "pricing_reference_id": reference_id,
+                "pricing_reference_source": "bundled",
+                "pricing_reference": {"id": reference_id, "source": "bundled"},
+            }
+            with mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root):
+                snapshot = webapp.capture_pricing_reference_snapshot(payload)
+                self.assertIsNotNone(snapshot)
+                payload["_pricing_reference_snapshot"] = snapshot
+                images = webapp.catalog_visual_image_entries_for_payload(payload)
+                prompt_rows = webapp.pricing_catalog_prompt_rows_for_payload(payload)
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["id"], "synthetic.visual-item")
+        self.assertTrue(images[0]["data_url"].startswith("data:image/png;base64,"))
+        self.assertEqual([row["id"] for row in prompt_rows], ["synthetic.visual-item"])
+
+    def test_ai_draft_diagnostics_do_not_persist_basis_or_section_text(self):
+        diagnostics = webapp.ai_draft_diagnostic_details(
+            "openai",
+            {"PRIVATE-QUOTE-BASIS-MARKER": "private quote text"},
+            [{"title": "PRIVATE-SECTION-TITLE-MARKER", "lines": [{"text": "private output"}]}],
+            [{"description": "private line text"}],
+        )
+        serialized = json.dumps(diagnostics)
+        self.assertNotIn("PRIVATE-QUOTE-BASIS-MARKER", serialized)
+        self.assertNotIn("PRIVATE-SECTION-TITLE-MARKER", serialized)
+        self.assertNotIn("private quote text", serialized)
+        self.assertNotIn("private output", serialized)
+        self.assertNotIn("private line text", serialized)
+        self.assertEqual(diagnostics["quote_basis_key_count"], 1)
+        self.assertEqual(diagnostics["quote_basis_section_count"], 1)
+        self.assertEqual(diagnostics["line_item_count"], 1)
+
+    def test_forensic_summaries_keep_linkage_and_bounded_counts_without_private_content(self):
+        fixture = WebappServerTest()
+        payload = fixture.sqag_212_payload()
+        reference = webapp.exact_pricing_reference_authority(payload)
+        self.bind_test_snapshot(payload, reference)
+        payload["quote_session"] = {"session_id": "quote-g3-synthetic"}
+        request_summary = webapp.minimal_forensic_request_summary(payload)
+        self.assertEqual(request_summary["pricing_reference_source"], reference["source"])
+        self.assertEqual(request_summary["pricing_reference_id"], reference["id"])
+        self.assertEqual(request_summary["pricing_reference_digest"], reference["detail"]["digest_sha256"])
+        self.assertEqual(request_summary["catalogue_row_count"], len(reference["detail"]["items"]))
+        self.assertRegex(request_summary["payload_shape_sha256"], r"^[a-f0-9]{64}$")
+        self.assertNotIn("sale_unit_price", json.dumps(request_summary))
+
+        result_summary = webapp.forensic_result_summary({
+            "status": "drafted",
+            "_forensic_pricing_counts": {
+                "raw_provider_row_count": 8,
+                "rows_carrying_pricing_keyword": 4,
+                "exact_authoritative_selector_match_count": 4,
+                "trusted_count_before_canonicalization": 1,
+                "trusted_count_after_canonicalization": 4,
+                "provider_authority_variant_counts": {"absent": 3, "catalog": 1, "historical": 4},
+                "post_normalization_authority_variant_counts": {"catalog": 4, "historical": 4},
+                "raw_prompt": "PRIVATE-PROMPT-MARKER",
+                "provider_response": "PRIVATE-PROVIDER-MARKER",
+                "catalogue_prices": [987654.32],
+            },
+        })
+        serialized = json.dumps(result_summary)
+        self.assertEqual(result_summary["pricing_draft_counts"]["trusted_count_after_canonicalization"], 4)
+        self.assertNotIn("PRIVATE-PROMPT-MARKER", serialized)
+        self.assertNotIn("PRIVATE-PROVIDER-MARKER", serialized)
+        self.assertNotIn("987654.32", serialized)
