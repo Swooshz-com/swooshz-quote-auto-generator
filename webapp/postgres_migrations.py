@@ -26,6 +26,7 @@ MIGRATION_FILE_NAMES = (
     "007_feedback_publication_binding_postgres.sql",
     "008_quote_session_deletion_hold_authority_postgres.sql",
     "009_telemetry_events_postgres.sql",
+    "010_telemetry_attempt_semantics_postgres.sql",
 )
 
 EXPECTED_TABLES = frozenset(
@@ -190,6 +191,7 @@ class ConstraintSpec:
     deferred: bool = False
     referenced_schema: str | None = None
     match_type: str = "s"
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -258,6 +260,14 @@ class MigrationObjectSpec:
     triggers: tuple[TriggerSpec, ...] = ()
     routines: tuple[RoutineSpec, ...] = ()
     table_mutations: tuple[TableMutationSpec, ...] = ()
+    constraint_mutations: tuple["ConstraintMutationSpec", ...] = ()
+
+
+@dataclass(frozen=True)
+class ConstraintMutationSpec:
+    table_name: str
+    historical: ConstraintSpec
+    successor: ConstraintSpec
 
 
 def _column(name: str, type_name: str, *, nullable: bool = False, default_sql: str | None = None) -> ColumnSpec:
@@ -289,6 +299,7 @@ def _c(
     on_delete: str = "a",
     on_update: str = "a",
     expression: str | None = None,
+    name: str | None = None,
 ) -> ConstraintSpec:
     local = tuple(columns.split(",")) if isinstance(columns, str) and columns else tuple(columns)
     foreign = (
@@ -306,6 +317,7 @@ def _c(
         on_delete=on_delete,
         on_update=on_update,
         expression=expression,
+        name=name,
         referenced_schema=referenced_schema,
         match_type=match_type,
     )
@@ -563,7 +575,23 @@ TABLE_SPECS = (
             _c("c", expression="source_sequence >= 1"),
             _c("c", expression="event_type in ('generation', 'validation', 'ai_provider_attempt', 'pricing_change', 'profile_change', 'publication', 'download', 'feedback', 'security', 'rate_limit', 'abuse', 'cancellation', 'timeout', 'abandonment', 'supersession', 'storage_staging', 'storage_finalization', 'storage_compensation', 'configuration', 'operator_action', 'reconciliation', 'retention', 'legal_hold', 'deletion', 'backup', 'restore')"),
             _c("c", expression="event_status in ('started', 'queued', 'running', 'success', 'failed', 'blocked', 'denied', 'completed', 'needs_confirmation', 'needs_review', 'completed_with_review_required', 'degraded', 'cancelled', 'timed_out', 'abandoned', 'superseded', 'available', 'unavailable', 'held', 'deleted', 'reconciled', 'staged', 'finalized', 'compensated', 'requested', 'updated', 'restored', 'rate_limited')"),
-            _c("c", expression="(attempt_number is null) or (attempt_number >= 1)"),
+            _c(
+                "c",
+                expression=(
+                    "(attempt_number is null) or (attempt_number >= 1) or "
+                    "((attempt_number = 0) and (event_type = 'validation') and "
+                    "(event_status = 'blocked') and (purpose is not null) and "
+                    "(purpose = 'request_validation') and (failure_class is not null) and "
+                    "(failure_class = 'configuration') and (model is null) and "
+                    "(usage_available is not null) and (usage_available = 0) and "
+                    "(cost_available is not null) and (cost_available = 0) and "
+                    "(input_tokens is null) and (output_tokens is null) and "
+                    "(total_tokens is null) and (cache_read_tokens is null) and "
+                    "(cache_write_tokens is null) and (estimated_cost is null) and "
+                    "(actual_cost is null) and (currency is null) and (cost_version is null))"
+                ),
+                name="sqag_telemetry_events_attempt_semantics_ck",
+            ),
             _c("c", expression="(failure_class is null) or (failure_class in ('missing_api_key', 'timeout', 'rate_limited', 'upstream_unavailable', 'http_error', 'network_error', 'invalid_json', 'schema_validation_failed', 'model_output_invalid', 'provider_error', 'generator_error', 'configuration', 'storage', 'authorization', 'unknown'))"),
             _c("c", expression="(duration_ms is null) or (duration_ms >= 0)"),
             _c("c", expression="(usage_available is null) or (usage_available in (0, 1))"),
@@ -730,6 +758,16 @@ ROUTINE_SPECS = (
 )
 ROUTINE_SPECS_BY_KEY = MappingProxyType({item.key: item for item in ROUTINE_SPECS})
 
+TELEMETRY_ATTEMPT_HISTORICAL_CONSTRAINT = _c(
+    "c",
+    expression="(attempt_number is null) or (attempt_number >= 1)",
+)
+TELEMETRY_ATTEMPT_SUCCESSOR_CONSTRAINT = next(
+    constraint
+    for constraint in TABLE_SPECS_BY_NAME["sqag_telemetry_events"].constraints
+    if constraint.name == "sqag_telemetry_events_attempt_semantics_ck"
+)
+
 MIGRATION_OBJECTS = (
     MigrationObjectSpec(
         MIGRATION_FILE_NAMES[0],
@@ -773,6 +811,16 @@ MIGRATION_OBJECTS = (
         indexes=tuple(INDEX_SPECS[22:28]),
         triggers=tuple(TRIGGER_SPECS[5:8]),
         routines=(ROUTINE_SPECS[3],),
+    ),
+    MigrationObjectSpec(
+        MIGRATION_FILE_NAMES[8],
+        constraint_mutations=(
+            ConstraintMutationSpec(
+                "sqag_telemetry_events",
+                TELEMETRY_ATTEMPT_HISTORICAL_CONSTRAINT,
+                TELEMETRY_ATTEMPT_SUCCESSOR_CONSTRAINT,
+            ),
+        ),
     ),
 )
 
@@ -850,9 +898,27 @@ def _effective_table_spec(table_name: str, applied_count: int) -> TableSpec:
         if mutation.table_name == table_name
         for column_name in mutation.added_columns
     }
-    if not pending_columns:
+    pending_constraint_mutations = [
+        mutation
+        for item in MIGRATION_OBJECTS[applied_count:]
+        for mutation in item.constraint_mutations
+        if mutation.table_name == table_name
+    ]
+    constraints = spec.constraints
+    if pending_constraint_mutations:
+        replacements = {
+            mutation.successor: mutation.historical
+            for mutation in pending_constraint_mutations
+        }
+        constraints = tuple(replacements.get(constraint, constraint) for constraint in constraints)
+    if not pending_columns and constraints == spec.constraints:
         return spec
-    return TableSpec(spec.name, tuple(column for column in spec.columns if column.name not in pending_columns), spec.constraints, spec.owner)
+    return TableSpec(
+        spec.name,
+        tuple(column for column in spec.columns if column.name not in pending_columns),
+        constraints,
+        spec.owner,
+    )
 
 
 def canonical_migration_payload(path: Path) -> bytes:
@@ -1349,7 +1415,7 @@ order by c.relname, a.attnum
 
     rows = connection.execute(
         """
-select c.conrelid as relation_oid, c.contype,
+select c.conrelid as relation_oid, c.contype, c.conname as constraint_name,
        array(
          select local_attribute.attname
           from pg_catalog.unnest(c.conkey) with ordinality as local_key(attnum, ordinal)
@@ -1383,7 +1449,7 @@ order by table_class.relname, c.oid
 """
     ).fetchall()
     constraint_fields = (
-        "relation_oid", "contype", "columns", "referenced_columns", "referenced_table",
+        "relation_oid", "contype", "constraint_name", "columns", "referenced_columns", "referenced_table",
         "referenced_schema", "match_type",
         "on_delete", "on_update", "expression", "convalidated", "condeferrable", "condeferred",
     )
@@ -1392,6 +1458,7 @@ order by table_class.relname, c.oid
         if (
             type(_row_value(row, "relation_oid")) is not int
             or not isinstance(_row_value(row, "contype"), str)
+            or not isinstance(_row_value(row, "constraint_name"), str)
             or (_row_value(row, "columns") is not None and not isinstance(_row_value(row, "columns"), (list, tuple)))
             or (_row_value(row, "referenced_columns") is not None and not isinstance(_row_value(row, "referenced_columns"), (list, tuple)))
             or (_row_value(row, "referenced_table") is not None and not isinstance(_row_value(row, "referenced_table"), str))
@@ -1422,6 +1489,7 @@ order by table_class.relname, c.oid
             )
             table["constraints"].append(
                 {
+                    "name": str(_row_value(row, "constraint_name")),
                     "kind": constraint_kind,
                     "columns": tuple(str(item) for item in _as_tuple(_row_value(row, "columns"))),
                     "referenced_table": (
@@ -1800,7 +1868,20 @@ def _table_matches(table: dict[str, Any], spec: TableSpec) -> bool:
         return False
     expected = Counter(_constraint_fingerprint(item, spec) for item in spec.constraints)
     actual = Counter(_observed_constraint_fingerprint(item, spec) for item in table["constraints"])
-    return actual == expected
+    if actual != expected:
+        return False
+    for expected_constraint in spec.constraints:
+        if expected_constraint.name is None:
+            continue
+        expected_fingerprint = _constraint_fingerprint(expected_constraint, spec)
+        matching = [
+            observed
+            for observed in table["constraints"]
+            if _observed_constraint_fingerprint(observed, spec) == expected_fingerprint
+        ]
+        if len(matching) != 1 or matching[0].get("name") != expected_constraint.name:
+            return False
+    return True
 
 
 def _index_matches(observed: Mapping[str, Any], spec: IndexSpec) -> bool:

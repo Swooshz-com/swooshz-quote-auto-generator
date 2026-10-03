@@ -61,7 +61,7 @@ AI provider routing:
 - DeepSeek pricing import normalization uses `DEEPSEEK_PRICING_IMPORT_MODEL`, defaulting to `deepseek-v4-pro`.
 - DeepSeek pricing metadata enrichment uses `DEEPSEEK_PRICING_METADATA_MODEL`, defaulting to `deepseek-v4-flash`.
 - `DEEPSEEK_MODEL` remains the legacy/global DeepSeek fallback model, defaulting to `deepseek-v4-pro`. A custom non-Pro value still acts as a global override, but `DEEPSEEK_MODEL=deepseek-v4-pro` does not suppress Flash route defaults.
-- OpenAI remains the fallback provider and uses `OPENAI_BASIS_LINE_MODEL`.
+- OpenAI remains the fallback provider and uses `OPENAI_BASIS_LINE_MODEL`, defaulting to `gpt-6-luna` with explicit `high` reasoning, for both messy-import normalization and pricing metadata enrichment. Defaults apply only when the setting is absent or blank; any explicit unsupported model fails request validation before OpenAI transport.
 - DeepSeek pricing import normalization uses a dedicated failover timeout, `DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS` (default 120 seconds), so messy imports give DeepSeek a full bounded attempt before malformed or stalled responses fall back to OpenAI. Other DeepSeek routes continue to use `DEEPSEEK_REQUEST_TIMEOUT_SECONDS`.
 
 ## Saved order and matching metadata

@@ -66,15 +66,20 @@ import pricing_reference_cleanup
 import pricing_reference_enrichment
 from webapp.forensics import (
     MAX_GENERATION_MANIFEST_BYTES,
+    SQLITE_TELEMETRY_HISTORICAL_009,
+    SQLITE_TELEMETRY_SUCCESSOR_010,
     ForensicStore,
     RetentionGraphHeld,
     TELEMETRY_FAILURE_CLASSES,
     TelemetryConflictError,
     TelemetryUnavailableError,
+    apply_telemetry_attempt_semantics_migration,
+    classify_sqlite_telemetry_schema,
     iso_timestamp,
     safe_telemetry_label,
     safe_telemetry_route,
     safe_reference,
+    sqlite_telemetry_schema_objects_present,
     trusted_workspace_id,
     utc_now,
 )
@@ -642,21 +647,24 @@ RICH_TEXT_DETAIL_KEYS = {
 DRAFT_ANALYSIS_MODE_STANDARD = "standard"
 DRAFT_ANALYSIS_MODE_HIGH_QUALITY = "high_quality"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-OPENAI_DRAFT_MODEL = "gpt-5.5"
-OPENAI_BASIS_LINE_MODEL = "gpt-5.4-mini"
-OPENAI_BASIS_ANSWER_MODEL = "gpt-5.4-nano"
-OPENAI_DRAFT_REASONING_EFFORT = "high"
-OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT = "xhigh"
+OPENAI_DRAFT_MODEL = "gpt-6-luna"
+OPENAI_DRAFT_HIGH_QUALITY_MODEL = "gpt-6.1-sol"
+OPENAI_BASIS_LINE_MODEL = "gpt-6-luna"
+OPENAI_BASIS_ANSWER_MODEL = "gpt-6-luna"
+OPENAI_DRAFT_REASONING_EFFORT = "max"
+OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT = "high"
+OPENAI_SMALL_REASONING_EFFORT = "high"
 OPENAI_API_KEY_ENV_NAME = "OPENAI_API_KEY"
 OPENAI_DRAFT_MODEL_ENV_NAME = "OPENAI_DRAFT_MODEL"
+OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_MODEL"
 OPENAI_BASIS_LINE_MODEL_ENV_NAME = "OPENAI_BASIS_LINE_MODEL"
 OPENAI_BASIS_ANSWER_MODEL_ENV_NAME = "OPENAI_BASIS_ANSWER_MODEL"
 OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_REASONING_EFFORT"
 OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
 OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
-OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 OPENAI_MODEL_REASONING_EFFORTS = {
-    "gpt-5.5": frozenset({"none", "low", "high", "xhigh"}),
+    "gpt-6-luna": frozenset({"high", "max"}),
+    "gpt-6.1-sol": frozenset({"high"}),
 }
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
@@ -1171,12 +1179,14 @@ def ai_log_tracking_scope(
 ):
     previous = getattr(AI_LOG_TRACKING_CONTEXT, "metadata", None)
     previous_session = getattr(AI_LOG_TRACKING_CONTEXT, "auth_session", None)
+    previous_transport_operation = getattr(AI_LOG_TRACKING_CONTEXT, "transport_operation", None)
     AI_LOG_TRACKING_CONTEXT.metadata = normalized_ai_log_tracking_metadata(metadata)
     AI_LOG_TRACKING_CONTEXT.auth_session = (
         safe_auth_session_for_async(auth_session)
         if isinstance(auth_session, dict)
         else None
     )
+    AI_LOG_TRACKING_CONTEXT.transport_operation = None
     try:
         yield
     finally:
@@ -1194,6 +1204,13 @@ def ai_log_tracking_scope(
                 pass
         else:
             AI_LOG_TRACKING_CONTEXT.auth_session = previous_session
+        if previous_transport_operation is None:
+            try:
+                delattr(AI_LOG_TRACKING_CONTEXT, "transport_operation")
+            except AttributeError:
+                pass
+        else:
+            AI_LOG_TRACKING_CONTEXT.transport_operation = previous_transport_operation
 
 
 def log_ai_call_attempt(
@@ -1212,12 +1229,15 @@ def log_ai_call_attempt(
     error_reference: str = "",
     details: dict[str, Any] | None = None,
     log_root: Path | None = None,
+    preserve_transport_operation: bool = False,
     **metadata: Any,
 ) -> bool:
+    raw_model = model
+    provider_label = clean_text(provider).lower()
     record: dict[str, Any] = {
         "feature": log_event_name(feature),
-        "provider": clean_text(provider).lower(),
-        "model": clean_text(model),
+        "provider": provider_label,
+        "model": validated_provider_model_label(provider_label, raw_model),
         "status": log_event_name(status),
     }
     if duration_ms is not None:
@@ -1252,15 +1272,45 @@ def log_ai_call_attempt(
             record["error_count"] = len(error_values)
         if safe_details:
             record["details"] = safe_details
+    operation = getattr(AI_LOG_TRACKING_CONTEXT, "transport_operation", None)
+    failure_boundary = clean_text(record.get("failure_boundary")).lower()
+    operation_matches = (
+        isinstance(operation, dict)
+        and operation.get("feature") == record["feature"]
+        and operation.get("provider") == provider_label
+        and (
+            operation.get("model") == raw_model
+            or failure_boundary == "request_validation"
+            or operation.get("request_validation") is True
+        )
+    )
+    if operation_matches:
+        if failure_boundary == "request_validation" and operation.get("attempt_number", 0) == 0:
+            operation["request_validation"] = True
+            record.setdefault("attempt_number", 0)
+            record.setdefault("failure_boundary", "request_validation")
+            record.setdefault("failure_kind", "configuration")
+            record.setdefault("retry_lineage_id", operation.get("retry_lineage_id"))
+        elif operation.get("attempt_number", 0) > 0:
+            record.setdefault("attempt_number", operation["attempt_number"])
+            record.setdefault("retry_lineage_id", operation.get("retry_lineage_id"))
     record.update(current_ai_log_tracking_metadata())
-    local_result = write_local_log("ai_call_attempt", record, log_root=log_root)
-    auth_session = getattr(AI_LOG_TRACKING_CONTEXT, "auth_session", None)
-    if isinstance(auth_session, dict):
-        append_ai_attempt_telemetry(auth_session, record)
-    return local_result
+    try:
+        local_result = write_local_log("ai_call_attempt", record, log_root=log_root)
+        auth_session = getattr(AI_LOG_TRACKING_CONTEXT, "auth_session", None)
+        if isinstance(auth_session, dict):
+            append_ai_attempt_telemetry(auth_session, record)
+        return local_result
+    finally:
+        if operation_matches and not preserve_transport_operation:
+            AI_LOG_TRACKING_CONTEXT.transport_operation = None
 
 
 def sanitize_log_value(value: Any) -> Any:
+    return _sanitize_log_value(project_provider_model_fields(value))
+
+
+def _sanitize_log_value(value: Any) -> Any:
     if isinstance(value, dict):
         sanitized: dict[str, Any] = {}
         for key, item in value.items():
@@ -1272,10 +1322,10 @@ def sanitize_log_value(value: Any) -> Any:
             elif key_text in {"path", "url", "request_target"} and isinstance(item, str):
                 sanitized[key] = scrub_sensitive_text(redact_request_target_for_log(item))[:5000]
             else:
-                sanitized[key] = sanitize_log_value(item)
+                sanitized[key] = _sanitize_log_value(item)
         return sanitized
     if isinstance(value, list):
-        return [sanitize_log_value(item) for item in value]
+        return [_sanitize_log_value(item) for item in value]
     if isinstance(value, str):
         return scrub_sensitive_text(value)[:5000]
     return value
@@ -9726,6 +9776,11 @@ def request_deepseek_chat_completion_json_data(
     error_context: str,
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    feature = {
+        "pricing import": "pricing_reference_import",
+        "pricing metadata enrichment": "pricing_reference_metadata_enrichment",
+    }.get(clean_text(error_context).lower(), "basis_chat")
+    operation = begin_ai_transport_operation(feature, AI_PROVIDER_DEEPSEEK, model)
     body = {
         "model": model,
         "messages": [
@@ -9753,17 +9808,45 @@ def request_deepseek_chat_completion_json_data(
     request_timeout = timeout_seconds if timeout_seconds is not None else configured_deepseek_timeout_seconds()
     retry_delays = list(OPENAI_RETRY_DELAYS_SECONDS)
     for attempt in range(len(retry_delays) + 1):
+        send_number = next_ai_transport_send_number(feature, AI_PROVIDER_DEEPSEEK, model)
+        send_started_at = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
             if attempt < len(retry_delays) and is_transient_openai_error(exc):
+                failure_message = provider_http_error_message("DeepSeek", exc)
+                log_ai_call_attempt(
+                    feature=feature,
+                    provider=AI_PROVIDER_DEEPSEEK,
+                    model=model,
+                    status="failed",
+                    duration_ms=elapsed_milliseconds(send_started_at),
+                    details={"errors": [failure_message]},
+                    retry_lineage_id=operation["retry_lineage_id"],
+                    attempt_number=send_number,
+                    **ai_failure_metadata(exc, provider=AI_PROVIDER_DEEPSEEK, timeout_seconds=request_timeout),
+                    preserve_transport_operation=True,
+                )
                 time.sleep(retry_delays[attempt])
                 continue
             raise OpenAIAnalysisError(provider_http_error_message("DeepSeek", exc)) from exc
         except PROVIDER_CONNECTION_EXCEPTIONS as exc:
             if attempt < len(retry_delays) and is_transient_openai_error(exc):
+                failure_message = provider_connection_error_message("DeepSeek", exc)
+                log_ai_call_attempt(
+                    feature=feature,
+                    provider=AI_PROVIDER_DEEPSEEK,
+                    model=model,
+                    status="failed",
+                    duration_ms=elapsed_milliseconds(send_started_at),
+                    details={"errors": [failure_message]},
+                    retry_lineage_id=operation["retry_lineage_id"],
+                    attempt_number=send_number,
+                    **ai_failure_metadata(exc, provider=AI_PROVIDER_DEEPSEEK, timeout_seconds=request_timeout),
+                    preserve_transport_operation=True,
+                )
                 time.sleep(retry_delays[attempt])
                 continue
             raise OpenAIAnalysisError(provider_connection_error_message("DeepSeek", exc)) from exc
@@ -9790,13 +9873,17 @@ def request_deepseek_json_object(
 
 
 def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: dict[str, Any], api_key: str) -> dict[str, Any]:
+    model = configured_openai_basis_line_model()
+    begin_openai_small_transport_operation("pricing_reference_import", model)
     body = {
-        "model": configured_openai_basis_line_model(),
+        "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": build_pricing_catalog_import_prompt(source_name, content, tax)}]}],
+        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
         "max_output_tokens": 4000,
     }
     request = urllib.request.Request(OPENAI_RESPONSES_URL, data=json.dumps(body).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     try:
+        next_ai_transport_send_number("pricing_reference_import", AI_PROVIDER_OPENAI, model)
         with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -9807,13 +9894,17 @@ def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: d
 
 
 def request_openai_pricing_catalog_metadata(source_name: str, items: list[dict[str, Any]], api_key: str) -> dict[str, Any]:
+    model = configured_openai_basis_line_model()
+    begin_openai_small_transport_operation("pricing_reference_metadata_enrichment", model)
     body = {
-        "model": configured_openai_basis_line_model(),
+        "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": build_pricing_catalog_metadata_prompt(source_name, items)}]}],
+        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
         "max_output_tokens": 12000,
     }
     request = urllib.request.Request(OPENAI_RESPONSES_URL, data=json.dumps(body).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
     try:
+        next_ai_transport_send_number("pricing_reference_metadata_enrichment", AI_PROVIDER_OPENAI, model)
         with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -10028,6 +10119,8 @@ def ai_pricing_reference_metadata_enrichment(
                     raw_metadata_items.extend([item for item in parsed_items if isinstance(item, dict)])
             except OpenAIAnalysisError as exc:
                 errors.append(str(exc))
+                if exc.diagnostics.get("failure_boundary") == "request_validation":
+                    raise
                 continue
             enriched, merge_errors = merge_pricing_reference_ai_metadata(items, raw_metadata_items)
             if not merge_errors:
@@ -10137,6 +10230,7 @@ def ai_pricing_reference_import_preview(filename: str, content: Any, tax: dict[s
                     parsed = request_openai_pricing_catalog_import(filename, content, tax, api_key)
             except OpenAIAnalysisError as exc:
                 duration_ms = elapsed_milliseconds(attempt_started_at)
+                request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
                 failure_metadata = ai_failure_metadata(
                     exc,
                     provider=candidate_provider,
@@ -10150,7 +10244,11 @@ def ai_pricing_reference_import_preview(filename: str, content: Any, tax: dict[s
                     "duration_ms": duration_ms,
                     "attempt_index": provider_index,
                     "attempt_count": len(provider_order),
-                    "fallback_to": provider_order[provider_index] if provider_index < len(provider_order) else "",
+                    **(
+                        {"fallback_to": provider_order[provider_index]}
+                        if not request_validation and provider_index < len(provider_order)
+                        else {}
+                    ),
                     **failure_metadata,
                 })
                 log_ai_call_attempt(
@@ -10163,10 +10261,16 @@ def ai_pricing_reference_import_preview(filename: str, content: Any, tax: dict[s
                     operator_stage="import_cleanup",
                     attempt_index=provider_index,
                     attempt_count=len(provider_order),
-                    fallback_to=provider_order[provider_index] if provider_index < len(provider_order) else "",
+                    **(
+                        {"fallback_to": provider_order[provider_index]}
+                        if not request_validation and provider_index < len(provider_order)
+                        else {}
+                    ),
                     **source_metadata,
                     **failure_metadata,
                 )
+                if request_validation:
+                    raise
                 previous_provider = candidate_provider
                 continue
             duration_ms = elapsed_milliseconds(attempt_started_at)
@@ -11134,6 +11238,7 @@ SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding_postgres.sql",
     PROJECT_ROOT / "migrations" / "008_quote_session_deletion_hold_authority_postgres.sql",
     PROJECT_ROOT / "migrations" / "009_telemetry_events_postgres.sql",
+    PROJECT_ROOT / "migrations" / "010_telemetry_attempt_semantics_postgres.sql",
 ]
 SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS = {
     "workspace_id", "session_id", "run_id", "job_id", "state",
@@ -11603,6 +11708,19 @@ class PostgresConnectionAdapter:
     def __init__(self, connection: Any) -> None:
         self._connection = connection
 
+    @property
+    def in_transaction(self) -> bool:
+        status = getattr(getattr(self._connection, "info", None), "transaction_status", None)
+        if status is None:
+            return bool(getattr(self._connection, "in_transaction", False))
+        name = getattr(status, "name", None)
+        if isinstance(name, str):
+            return name.upper() != "IDLE"
+        try:
+            return int(status) != 0
+        except (TypeError, ValueError):
+            return bool(status)
+
     def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> Any:
         return self._connection.execute(postgres_query(sql), tuple(params or ()))
 
@@ -11842,9 +11960,11 @@ def postgres_storage_connection(
         connection.close()
 
 
-def sqag_storage_migration_sql() -> str:
+def sqag_storage_migration_sql(*, include_telemetry: bool = True) -> str:
     sql_parts: list[str] = []
     for path in SQAG_STORAGE_MIGRATION_PATHS:
+        if not include_telemetry and path.name == "009_telemetry_events.sql":
+            continue
         try:
             sql_parts.append(path.read_text(encoding="utf-8"))
         except OSError:
@@ -11888,9 +12008,21 @@ def apply_sqag_storage_migrations(database_url: str | None = None) -> dict[str, 
     family = database_family_from_url(url)
     if family == "sqlite":
         with sqlite_storage_connection(url) as connection:
+            telemetry_state = classify_sqlite_telemetry_schema(connection)
+            telemetry_objects_present = sqlite_telemetry_schema_objects_present(connection)
+            if telemetry_state not in {
+                SQLITE_TELEMETRY_HISTORICAL_009,
+                SQLITE_TELEMETRY_SUCCESSOR_010,
+            } and telemetry_objects_present:
+                raise RuntimeError("SQLite telemetry schema is invalid or drifted.")
             migrate_legacy_sqag_tables_sqlite(connection)
             upgrade_legacy_local_forensic_schema(connection)
-            connection.executescript(sqag_storage_migration_sql())
+            connection.executescript(
+                sqag_storage_migration_sql(
+                    include_telemetry=not telemetry_objects_present
+                )
+            )
+            apply_telemetry_attempt_semantics_migration(connection)
             upgrade_legacy_local_forensic_schema(connection)
             connection.commit()
         return
@@ -12227,7 +12359,11 @@ class DatabaseSqagStorage:
         return sqlite_storage_connection(self.database_url)
 
     def ensure_ready(self) -> None:
-        self._ensure_schema(SQAG_APP_METADATA_REQUIRED_COLUMNS, reason="storage_database_not_migrated")
+        self._ensure_schema(
+            SQAG_APP_METADATA_REQUIRED_COLUMNS,
+            reason="storage_database_not_migrated",
+            require_telemetry_successor=True,
+        )
 
     def ensure_retention_ready(self) -> None:
         """Check only the forensic surfaces required by retention maintenance."""
@@ -12241,6 +12377,7 @@ class DatabaseSqagStorage:
         self._ensure_schema(
             SQAG_RUNTIME_FORENSIC_REQUIRED_COLUMNS,
             reason="storage_runtime_forensics_not_migrated",
+            require_telemetry_successor=True,
         )
 
     def ensure_artifact_ready(self) -> None:
@@ -12250,12 +12387,26 @@ class DatabaseSqagStorage:
                 status=503,
                 reason="storage_database_blob_artifacts_unsupported",
             )
-        self._ensure_schema(SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS, reason="storage_artifact_database_not_migrated")
+        self._ensure_schema(
+            SQAG_DATABASE_ARTIFACT_REQUIRED_COLUMNS,
+            reason="storage_artifact_database_not_migrated",
+            require_telemetry_successor=True,
+        )
 
     def ensure_object_artifact_ready(self) -> None:
-        self._ensure_schema(SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS, reason="storage_object_artifact_database_not_migrated")
+        self._ensure_schema(
+            SQAG_OBJECT_ARTIFACT_METADATA_REQUIRED_COLUMNS,
+            reason="storage_object_artifact_database_not_migrated",
+            require_telemetry_successor=True,
+        )
 
-    def _ensure_schema(self, required: dict[str, set[str]], *, reason: str) -> None:
+    def _ensure_schema(
+        self,
+        required: dict[str, set[str]],
+        *,
+        reason: str,
+        require_telemetry_successor: bool = False,
+    ) -> None:
         objects: dict[str, set[str]] = {}
         try:
             with self.connection() as connection:
@@ -12267,6 +12418,17 @@ class DatabaseSqagStorage:
                     }:
                         objects = self._postgres_forensic_schema_objects(connection)
                 else:
+                    if require_telemetry_successor and (
+                        classify_sqlite_telemetry_schema(connection)
+                        != SQLITE_TELEMETRY_SUCCESSOR_010
+                        or connection.execute("pragma foreign_key_check").fetchone()
+                        is not None
+                    ):
+                        raise SqagStorageAccessError(
+                            "SQAG database storage migration has not been applied.",
+                            status=503,
+                            reason=reason,
+                        )
                     rows = self._sqlite_schema_columns(connection, set(required))
                     if reason in {
                         "storage_forensics_database_not_migrated",
@@ -18402,9 +18564,18 @@ def draft_analysis_mode(payload: dict[str, Any] | None = None) -> str:
     return DRAFT_ANALYSIS_MODE_STANDARD
 
 
+def configured_openai_route_model(env_name: str, fallback: str) -> str:
+    raw = read_dotenv_value(env_name)
+    return raw if raw != "" else fallback
+
+
 def configured_openai_draft_model(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
-    _ = mode
-    return safe_segment(read_dotenv_value(OPENAI_DRAFT_MODEL_ENV_NAME), OPENAI_DRAFT_MODEL)
+    if mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
+        return configured_openai_route_model(
+            OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME,
+            OPENAI_DRAFT_HIGH_QUALITY_MODEL,
+        )
+    return configured_openai_route_model(OPENAI_DRAFT_MODEL_ENV_NAME, OPENAI_DRAFT_MODEL)
 
 
 def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
@@ -18416,15 +18587,227 @@ def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STA
 
 
 def supported_openai_draft_reasoning_efforts(model: str) -> set[str] | frozenset[str]:
-    return OPENAI_MODEL_REASONING_EFFORTS.get(model, OPENAI_REASONING_EFFORTS)
+    return OPENAI_MODEL_REASONING_EFFORTS.get(model, frozenset())
+
+
+def validated_provider_model_label(provider: str, value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    provider_value = clean_text(provider).lower()
+    if provider_value == AI_PROVIDER_OPENAI and value in OPENAI_MODEL_REASONING_EFFORTS:
+        return value
+    if provider_value == AI_PROVIDER_DEEPSEEK and value in {DEEPSEEK_PRO_MODEL, DEEPSEEK_FLASH_MODEL}:
+        return value
+    return ""
+
+
+def project_generation_configuration_evidence(
+    value: Any,
+    *,
+    model_source_provider: str = AI_PROVIDER_OPENAI,
+) -> Any:
+    """Copy evidence and project only generation-configuration provider/model fields."""
+    model_fields = {
+        "model", "from_model", "to_model", "source_model", "destination_model",
+        "selected_model", "configured_model", "default_model", "model_name",
+    }
+    model_list_fields = {"models", "model_candidates", "candidate_models", "model_sequence"}
+    model_derived_fields = {
+        "model_classification", "model_excerpt", "model_fingerprint", "model_hash",
+        "model_input_length", "model_length", "model_sha256", "model_summary",
+    }
+
+    def provider_label(raw: Any) -> str:
+        return raw if isinstance(raw, str) and raw in SUPPORTED_TEXT_AI_PROVIDERS else ""
+
+    def project_record(record: Any, inherited_provider: str) -> Any:
+        if isinstance(record, list):
+            return [project_record(item, inherited_provider) for item in record]
+        if isinstance(record, tuple):
+            return tuple(project_record(item, inherited_provider) for item in record)
+        if not isinstance(record, dict):
+            return copy.deepcopy(record)
+
+        raw_provider = record.get("provider")
+        explicit_provider = provider_label(raw_provider)
+        provider_is_missing = "provider" not in record or raw_provider in (None, "")
+        if explicit_provider:
+            model_provider = explicit_provider
+        elif provider_is_missing:
+            model_provider = inherited_provider
+        else:
+            model_provider = ""
+
+        projected: dict[Any, Any] = {}
+        for key, item in record.items():
+            key_text = key.lower() if isinstance(key, str) else ""
+            if key_text == "provider" or key_text.endswith("_provider"):
+                projected[key] = provider_label(item)
+            elif key_text in model_derived_fields:
+                projected[key] = ""
+            elif key_text in model_fields or key_text.endswith("_model"):
+                provider_key = f"{key_text.removesuffix('_model')}_provider"
+                if key_text == "model":
+                    provider_key = "model_provider"
+                if provider_key in record:
+                    raw_field_provider = record[provider_key]
+                    field_provider = (
+                        provider_label(raw_field_provider)
+                        if isinstance(raw_field_provider, str)
+                        else ""
+                    )
+                    if raw_field_provider in (None, ""):
+                        field_provider = model_provider
+                else:
+                    field_provider = model_provider
+                projected[key] = validated_provider_model_label(
+                    field_provider, item
+                )
+            elif key_text in model_list_fields:
+                if isinstance(item, (list, tuple)):
+                    candidates = [
+                        validated_provider_model_label(model_provider, candidate)
+                        for candidate in item
+                    ]
+                    projected[key] = tuple(candidates) if isinstance(item, tuple) else candidates
+                else:
+                    projected[key] = []
+            else:
+                projected[key] = project_record(item, model_provider)
+        return projected
+
+    def find_configuration_records(item: Any) -> Any:
+        if isinstance(item, list):
+            return [find_configuration_records(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(find_configuration_records(child) for child in item)
+        if not isinstance(item, dict):
+            return copy.deepcopy(item)
+        projected: dict[Any, Any] = {}
+        for key, child in item.items():
+            if isinstance(key, str) and key.lower() == "generation_configuration":
+                projected[key] = project_record(child, model_source_provider)
+            else:
+                projected[key] = find_configuration_records(child)
+        return projected
+
+    return find_configuration_records(value)
+
+
+def project_provider_model_fields(value: Any, inherited_provider: str = "") -> Any:
+    model_fields = {
+        "model", "from_model", "to_model", "source_model", "destination_model",
+        "selected_model", "configured_model", "default_model", "model_name",
+    }
+    model_list_fields = {"models", "model_candidates", "candidate_models", "model_sequence"}
+    if isinstance(value, dict):
+        raw_provider = value.get("provider")
+        provider = (
+            clean_text(raw_provider).lower()
+            if isinstance(raw_provider, str) and clean_text(raw_provider).lower() in SUPPORTED_TEXT_AI_PROVIDERS
+            else inherited_provider
+        )
+        projected: dict[Any, Any] = {}
+        for key, item in value.items():
+            key_text = clean_text(key).lower()
+            if key_text in model_fields or key_text.endswith("_model"):
+                provider_key = f"{key_text.removesuffix('_model')}_provider"
+                field_provider = value.get(provider_key)
+                model_provider = (
+                    clean_text(field_provider).lower()
+                    if isinstance(field_provider, str)
+                    and clean_text(field_provider).lower() in SUPPORTED_TEXT_AI_PROVIDERS
+                    else provider
+                )
+                if isinstance(item, (dict, list)):
+                    projected[key] = project_provider_model_fields(item, model_provider)
+                else:
+                    projected[key] = validated_provider_model_label(model_provider, item)
+            elif key_text in model_list_fields:
+                if isinstance(item, list):
+                    projected[key] = [
+                        validated_provider_model_label(provider, candidate)
+                        if isinstance(candidate, str)
+                        else project_provider_model_fields(candidate, provider)
+                        for candidate in item
+                    ]
+                else:
+                    projected[key] = project_provider_model_fields(item, provider)
+            else:
+                projected[key] = project_provider_model_fields(item, provider)
+        return projected
+    if isinstance(value, list):
+        return [project_provider_model_fields(item, inherited_provider) for item in value]
+    return value
+
+
+def openai_request_configuration_invalid() -> None:
+    raise OpenAIAnalysisError(
+        "AI request configuration is invalid.",
+        diagnostics={"failure_boundary": "request_validation", "attempt_number": 0},
+    )
+
+
+def validate_openai_small_route_model(model: str, effort: str = OPENAI_SMALL_REASONING_EFFORT) -> None:
+    if (
+        model != OPENAI_BASIS_LINE_MODEL
+        or effort != OPENAI_SMALL_REASONING_EFFORT
+        or effort not in supported_openai_draft_reasoning_efforts(model)
+    ):
+        openai_request_configuration_invalid()
+
+
+def begin_ai_transport_operation(feature: str, provider: str, model: str) -> dict[str, Any]:
+    provider_value = clean_text(provider).lower()
+    operation = {
+        "feature": log_event_name(feature),
+        "provider": provider_value,
+        "model": model if isinstance(model, str) else "",
+        "retry_lineage_id": new_ai_run_id(),
+        "attempt_number": 0,
+        "request_validation": False,
+    }
+    AI_LOG_TRACKING_CONTEXT.transport_operation = operation
+    if not validated_provider_model_label(provider_value, model):
+        operation["request_validation"] = True
+        openai_request_configuration_invalid()
+    return operation
+
+
+def begin_openai_small_transport_operation(feature: str, model: str) -> dict[str, Any]:
+    operation = begin_ai_transport_operation(feature, AI_PROVIDER_OPENAI, model)
+    try:
+        validate_openai_small_route_model(model)
+    except OpenAIAnalysisError:
+        operation["request_validation"] = True
+        raise
+    return operation
+
+
+def next_ai_transport_send_number(feature: str, provider: str, model: str) -> int:
+    operation = getattr(AI_LOG_TRACKING_CONTEXT, "transport_operation", None)
+    if not (
+        isinstance(operation, dict)
+        and operation.get("feature") == log_event_name(feature)
+        and operation.get("provider") == clean_text(provider).lower()
+        and operation.get("model") == model
+    ):
+        operation = begin_ai_transport_operation(feature, provider, model)
+    if operation.get("request_validation") is True:
+        openai_request_configuration_invalid()
+    if not validated_provider_model_label(provider, model):
+        operation["request_validation"] = True
+        openai_request_configuration_invalid()
+    operation["attempt_number"] = int(operation.get("attempt_number", 0)) + 1
+    return operation["attempt_number"]
 
 
 def configured_openai_basis_line_model() -> str:
-    return safe_segment(read_dotenv_value(OPENAI_BASIS_LINE_MODEL_ENV_NAME), OPENAI_BASIS_LINE_MODEL)
+    return configured_openai_route_model(OPENAI_BASIS_LINE_MODEL_ENV_NAME, OPENAI_BASIS_LINE_MODEL)
 
 
 def configured_openai_basis_answer_model() -> str:
-    return safe_segment(read_dotenv_value(OPENAI_BASIS_ANSWER_MODEL_ENV_NAME), OPENAI_BASIS_ANSWER_MODEL)
+    return configured_openai_route_model(OPENAI_BASIS_ANSWER_MODEL_ENV_NAME, OPENAI_BASIS_ANSWER_MODEL)
 
 
 def configured_text_ai_provider(env_name: str, fallback: str = AI_PROVIDER_OPENAI) -> str:
@@ -18492,14 +18875,15 @@ def configured_deepseek_chat_completions_url() -> str:
 
 
 def configured_deepseek_model() -> str:
-    return safe_segment(read_dotenv_value(DEEPSEEK_MODEL_ENV_NAME), DEEPSEEK_PRO_MODEL)
+    raw = read_dotenv_value(DEEPSEEK_MODEL_ENV_NAME)
+    return raw if raw != "" else DEEPSEEK_PRO_MODEL
 
 
 def configured_deepseek_route_model(env_name: str, fallback: str) -> str:
-    route_model = safe_segment(read_dotenv_value(env_name), "")
-    if route_model:
+    route_model = read_dotenv_value(env_name)
+    if route_model != "":
         return route_model
-    global_model = safe_segment(read_dotenv_value(DEEPSEEK_MODEL_ENV_NAME), "")
+    global_model = read_dotenv_value(DEEPSEEK_MODEL_ENV_NAME)
     if global_model and global_model != DEEPSEEK_PRO_MODEL:
         return global_model
     return fallback
@@ -18530,7 +18914,7 @@ def unique_model_sequence(*models: str) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for model in models:
-        cleaned = clean_text(model)
+        cleaned = model if isinstance(model, str) else ""
         if cleaned and cleaned not in seen:
             seen.add(cleaned)
             result.append(cleaned)
@@ -23326,6 +23710,18 @@ def validate_draft_responses_envelope(body: Any, analysis_mode: str) -> tuple[by
         draft_request_invalid()
     configured_model = configured_openai_draft_model(analysis_mode)
     configured_effort = configured_openai_draft_reasoning_effort(analysis_mode)
+    expected_model = (
+        OPENAI_DRAFT_HIGH_QUALITY_MODEL
+        if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY
+        else OPENAI_DRAFT_MODEL
+    )
+    expected_effort = (
+        OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
+        if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY
+        else OPENAI_DRAFT_REASONING_EFFORT
+    )
+    if configured_model != expected_model or configured_effort != expected_effort:
+        draft_request_invalid()
     if body["model"] != configured_model:
         draft_request_invalid()
     if body["reasoning"] != {"effort": configured_effort}:
@@ -23428,6 +23824,9 @@ def request_openai_quote_basis(
     api_key: str,
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    analysis_mode = draft_analysis_mode(payload)
+    model = configured_openai_draft_model(analysis_mode)
+    begin_ai_transport_operation("draft_quote_basis", AI_PROVIDER_OPENAI, model)
     references = validate_draft_references(payload)
     prompt = build_quote_draft_prompt(payload, auth_session=auth_session)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
@@ -23475,9 +23874,8 @@ def request_openai_quote_basis(
         for image in catalog_visuals:
             content.append({"type": "input_image", "image_url": image["data_url"], "detail": "low"})
 
-    analysis_mode = draft_analysis_mode(payload)
     body = {
-        "model": configured_openai_draft_model(analysis_mode),
+        "model": model,
         "input": [{"role": "user", "content": content}],
         "reasoning": {"effort": configured_openai_draft_reasoning_effort(analysis_mode)},
     }
@@ -23491,8 +23889,11 @@ def request_openai_quote_basis(
         },
         method="POST",
     )
-    send_diagnostics = {"attempt_number": 1, "request_shape_sha256": shape_fingerprint}
+    send_diagnostics = {"request_shape_sha256": shape_fingerprint}
     try:
+        send_diagnostics["attempt_number"] = next_ai_transport_send_number(
+            "draft_quote_basis", AI_PROVIDER_OPENAI, model
+        )
         with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -23591,9 +23992,11 @@ def request_openai_basis_chat_with_model(
     model: str,
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    operation = begin_openai_small_transport_operation("basis_chat", model)
     body = {
         "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": build_basis_chat_prompt(payload, auth_session=auth_session)}]}],
+        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
         "max_output_tokens": 1200,
     }
     request = urllib.request.Request(
@@ -23607,17 +24010,45 @@ def request_openai_basis_chat_with_model(
     )
     retry_delays = list(OPENAI_RETRY_DELAYS_SECONDS)
     for attempt in range(len(retry_delays) + 1):
+        send_number = next_ai_transport_send_number("basis_chat", AI_PROVIDER_OPENAI, model)
+        send_started_at = time.perf_counter()
         try:
             with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
                 data = json.loads(response.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
             if attempt < len(retry_delays) and is_transient_openai_error(exc):
+                failure_message = openai_http_error_message(exc)
+                log_ai_call_attempt(
+                    feature="basis_chat",
+                    provider=AI_PROVIDER_OPENAI,
+                    model=model,
+                    status="failed",
+                    duration_ms=elapsed_milliseconds(send_started_at),
+                    details={"errors": [failure_message]},
+                    retry_lineage_id=operation["retry_lineage_id"],
+                    attempt_number=send_number,
+                    **ai_failure_metadata(exc, provider=AI_PROVIDER_OPENAI, timeout_seconds=configured_openai_timeout_seconds()),
+                    preserve_transport_operation=True,
+                )
                 time.sleep(retry_delays[attempt])
                 continue
             raise OpenAIAnalysisError(openai_http_error_message(exc)) from exc
         except PROVIDER_CONNECTION_EXCEPTIONS as exc:
             if attempt < len(retry_delays) and is_transient_openai_error(exc):
+                failure_message = provider_connection_error_message("OpenAI", exc)
+                log_ai_call_attempt(
+                    feature="basis_chat",
+                    provider=AI_PROVIDER_OPENAI,
+                    model=model,
+                    status="failed",
+                    duration_ms=elapsed_milliseconds(send_started_at),
+                    details={"errors": [failure_message]},
+                    retry_lineage_id=operation["retry_lineage_id"],
+                    attempt_number=send_number,
+                    **ai_failure_metadata(exc, provider=AI_PROVIDER_OPENAI, timeout_seconds=configured_openai_timeout_seconds()),
+                    preserve_transport_operation=True,
+                )
                 time.sleep(retry_delays[attempt])
                 continue
             raise OpenAIAnalysisError(provider_connection_error_message("OpenAI", exc)) from exc
@@ -23683,14 +24114,22 @@ def request_openai_basis_chat(
             )
             return result
         except OpenAIAnalysisError as exc:
+            request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
             log_ai_call_attempt(
                 feature="basis_chat",
                 provider=AI_PROVIDER_OPENAI,
-                model=model,
+                model="" if request_validation else model,
                 status="failed",
                 duration_ms=elapsed_milliseconds(attempt_started_at),
                 details={"errors": safe_error_messages([str(exc)])},
+                **(
+                    {"failure_boundary": "request_validation", "attempt_number": 0}
+                    if request_validation
+                    else {}
+                ),
             )
+            if request_validation:
+                raise
             if not isinstance(exc, AIModelOutputError):
                 raise
             errors.append(str(exc))
@@ -23800,14 +24239,22 @@ def request_configured_basis_chat(
             return result
         except OpenAIAnalysisError as exc:
             errors.append(str(exc))
+            request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
             log_ai_call_attempt(
                 feature="basis_chat",
                 provider=provider,
-                model=model,
+                model="" if request_validation else model,
                 status="failed",
                 duration_ms=elapsed_milliseconds(attempt_started_at),
                 details={"errors": safe_error_messages([str(exc)])},
+                **(
+                    {"failure_boundary": "request_validation", "attempt_number": 0}
+                    if request_validation
+                    else {}
+                ),
             )
+            if request_validation:
+                raise
             if index + 1 < len(candidates):
                 write_local_log("basis_chat_model_retry", {
                     "from_provider": provider,
@@ -24152,6 +24599,26 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             return result
         except OpenAIAnalysisError as exc:
             if exc.diagnostics.get("failure_boundary") == "request_validation":
+                validation_metadata = ai_failure_metadata(
+                    exc,
+                    provider=AI_PROVIDER_OPENAI,
+                    timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENAI, "draft_quote_basis"),
+                )
+                validation_metadata.update({
+                    "failure_boundary": "request_validation",
+                    "attempt_number": 0,
+                })
+                log_ai_call_attempt(
+                    feature="draft_quote_basis",
+                    provider=AI_PROVIDER_OPENAI,
+                    model="",
+                    status="failed",
+                    duration_ms=elapsed_milliseconds(attempt_started_at),
+                    analysis_mode=analysis_mode,
+                    image_count=image_count,
+                    pdf_count=pdf_count,
+                    **validation_metadata,
+                )
                 raise
             openai_error = str(exc)
             remote_errors.append(openai_error)
@@ -24285,6 +24752,7 @@ def answer_basis_chat(
         return request_configured_basis_chat(payload, auth_session=auth_session)
     except OpenAIAnalysisError as exc:
         error = str(exc)
+        request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
         provider = configured_text_ai_provider(basis_chat_provider_env_name(payload))
         write_local_log("basis_chat_failed", {
             "selected_provider": provider,
@@ -24295,7 +24763,15 @@ def answer_basis_chat(
             f"AI basis chat is not configured or failed. Selected provider is {text_ai_provider_label(provider)}. "
             f"Add {text_ai_provider_key_env_name(provider)}, or configure OPENAI_API_KEY for fallback. {fallback_note} {error}"
         )
-        raise OpenAIAnalysisError(" ".join(safe_error_messages([message]))) from exc
+        diagnostics = (
+            {"failure_boundary": "request_validation", "attempt_number": 0}
+            if request_validation
+            else {}
+        )
+        raise OpenAIAnalysisError(
+            " ".join(safe_error_messages([message])),
+            diagnostics=diagnostics,
+        ) from exc
 
 
 def save_uploaded_images(images: list[dict[str, Any]], job_dir: Path) -> list[dict[str, Any]]:
@@ -27872,11 +28348,20 @@ def forensic_store_for_auth_session(auth_session: dict[str, Any] | None = None):
     database_path = configured_data_root() / "forensics.sqlite3"
     database_url = f"sqlite:///{database_path.as_posix()}"
     with sqlite_storage_connection(database_url) as connection:
+        telemetry_state = classify_sqlite_telemetry_schema(connection)
+        telemetry_objects_present = sqlite_telemetry_schema_objects_present(connection)
+        if telemetry_state not in {
+            SQLITE_TELEMETRY_HISTORICAL_009,
+            SQLITE_TELEMETRY_SUCCESSOR_010,
+        } and telemetry_objects_present:
+            raise RuntimeError("SQLite telemetry schema is invalid or drifted.")
         migration_path = PROJECT_ROOT / "migrations" / "004_generation_forensics_feedback_retention.sql"
         telemetry_migration_path = PROJECT_ROOT / "migrations" / "009_telemetry_events.sql"
         upgrade_legacy_local_forensic_schema(connection)
         connection.executescript(migration_path.read_text(encoding="utf-8"))
-        connection.executescript(telemetry_migration_path.read_text(encoding="utf-8"))
+        if not telemetry_objects_present:
+            connection.executescript(telemetry_migration_path.read_text(encoding="utf-8"))
+        apply_telemetry_attempt_semantics_migration(connection)
         connection.commit()
         yield ForensicStore(connection, workspace_id, actor_tracking_id, local_mode=True, actor_key_version_value="local-v1")
 
@@ -27937,6 +28422,7 @@ def append_ai_attempt_telemetry(
     auth_session: dict[str, Any],
     record: dict[str, Any],
 ) -> dict[str, Any]:
+    record = project_provider_model_fields(record)
     raw_status = log_event_name(record.get("status"))
     status = (
         "success"
@@ -27947,7 +28433,7 @@ def append_ai_attempt_telemetry(
     )
     provider = clean_text(record.get("provider")).lower()
     provider = provider if provider in {"openai", "deepseek"} else ""
-    model = safe_telemetry_label(record.get("model")) or ""
+    model = validated_provider_model_label(provider, record.get("model")) or ""
     reasoning = clean_text(
         record.get("reasoning_level") or record.get("analysis_mode")
     ).lower()
@@ -27963,8 +28449,15 @@ def append_ai_attempt_telemetry(
     failure_class = clean_text(record.get("failure_kind")).lower()
     if failure_class not in TELEMETRY_FAILURE_CLASSES:
         failure_class = ""
+    operation = getattr(AI_LOG_TRACKING_CONTEXT, "transport_operation", None)
+    operation_matches = (
+        isinstance(operation, dict)
+        and operation.get("feature") == feature
+        and operation.get("provider") == provider
+    )
     lineage = safe_telemetry_label(
-        record.get("retry_lineage_id") or record.get("ai_run_id")
+        record.get("retry_lineage_id")
+        or (operation.get("retry_lineage_id") if operation_matches else "")
     ) or ""
 
     def safe_int(value: Any) -> int | None:
@@ -27976,14 +28469,36 @@ def append_ai_attempt_telemetry(
             return None
         return result if result >= 0 else None
 
-    attempt_index = safe_int(record.get("attempt_index"))
-    batch_index = safe_int(record.get("batch_index"))
+    raw_attempt_number = record.get("attempt_number")
+    attempt_number = raw_attempt_number if type(raw_attempt_number) is int else None
+    if attempt_number is None and operation_matches:
+        active_attempt = operation.get("attempt_number")
+        attempt_number = active_attempt if type(active_attempt) is int else None
+    request_validation = (
+        clean_text(record.get("failure_boundary")).lower() == "request_validation"
+        or attempt_number == 0
+        or (operation_matches and operation.get("request_validation") is True)
+    )
+    if request_validation:
+        attempt_number = 0
+        model = ""
+        reasoning = ""
+        purpose = "request_validation"
+        failure_class = "configuration"
+        zero_send = True
+    else:
+        zero_send = False
+        if attempt_number is None or attempt_number < 1:
+            return {}
+        if not lineage:
+            lineage = new_ai_run_id()
+    if not lineage:
+        lineage = new_ai_run_id()
     usage_available = safe_int(record.get("usage_available"))
     if usage_available not in {0, 1}:
         usage_available = None
-    attempt_number = attempt_index
-    if attempt_number is not None and batch_index is not None:
-        attempt_number = attempt_number * 1000 + batch_index
+    if zero_send:
+        usage_available = 0
     event_id = ""
     if lineage and attempt_number is not None:
         event_seed = "|".join(
@@ -28006,8 +28521,8 @@ def append_ai_attempt_telemetry(
             return None
         return result if math.isfinite(result) and result >= 0 else None
 
-    estimated_cost = safe_cost(record.get("estimated_cost_usd"))
-    actual_cost = safe_cost(record.get("actual_cost_usd"))
+    estimated_cost = None if zero_send else safe_cost(record.get("estimated_cost_usd"))
+    actual_cost = None if zero_send else safe_cost(record.get("actual_cost_usd"))
     revision = clean_text(
         record.get("deployment_revision")
         or os.getenv("GIT_REVISION")
@@ -28025,35 +28540,36 @@ def append_ai_attempt_telemetry(
     action_reference = safe_telemetry_label(record.get("error_reference")) or ""
     with forensic_store_for_auth_session(auth_session) as store:
         return store.append_telemetry_event(
-            "ai_provider_attempt",
-            status,
+            "validation" if zero_send else "ai_provider_attempt",
+            "blocked" if zero_send else status,
             event_id=event_id,
             action_reference=action_reference,
             run_reference=run_reference,
             session_reference=session_reference,
             retry_lineage_id=lineage,
             attempt_number=attempt_number,
-            provider=provider,
-            model=model,
-            reasoning_level=reasoning,
+            provider=provider or None,
+            model=None if zero_send else model,
+            reasoning_level=None if zero_send else reasoning,
             operation_route=operation_route,
-            purpose=purpose,
-            failure_class=failure_class,
-            duration_ms=safe_int(record.get("duration_ms")),
+            purpose="request_validation" if zero_send else purpose,
+            failure_class="configuration" if zero_send else failure_class,
+            duration_ms=None if zero_send else safe_int(record.get("duration_ms")),
             usage_available=usage_available,
-            input_tokens=safe_int(record.get("input_tokens")),
-            output_tokens=safe_int(record.get("output_tokens")),
-            total_tokens=safe_int(record.get("total_tokens")),
-            cache_read_tokens=safe_int(record.get("cache_read_tokens")),
-            cache_write_tokens=safe_int(record.get("cache_write_tokens")),
+            input_tokens=None if zero_send else safe_int(record.get("input_tokens")),
+            output_tokens=None if zero_send else safe_int(record.get("output_tokens")),
+            total_tokens=None if zero_send else safe_int(record.get("total_tokens")),
+            cache_read_tokens=None if zero_send else safe_int(record.get("cache_read_tokens")),
+            cache_write_tokens=None if zero_send else safe_int(record.get("cache_write_tokens")),
+            cost_available=0 if zero_send else None,
             estimated_cost=estimated_cost,
             actual_cost=actual_cost,
-            currency="USD" if estimated_cost is not None or actual_cost is not None else "",
-            cost_version=record.get("cost_version", ""),
-            quota_decision=decision_value(record.get("quota_decision")),
-            rate_limit_decision=decision_value(record.get("rate_limit_decision")),
-            abuse_decision=decision_value(record.get("abuse_decision")),
-            deployment_revision=revision,
+            currency="" if zero_send else ("USD" if estimated_cost is not None or actual_cost is not None else ""),
+            cost_version="" if zero_send else record.get("cost_version", ""),
+            quota_decision="" if zero_send else decision_value(record.get("quota_decision")),
+            rate_limit_decision="" if zero_send else decision_value(record.get("rate_limit_decision")),
+            abuse_decision="" if zero_send else decision_value(record.get("abuse_decision")),
+            deployment_revision="" if zero_send else revision,
         )
 
 
@@ -28090,6 +28606,7 @@ def compact_generation_canonical_manifest(
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
     """Keep terminal evidence bounded while preserving hashes and shape receipts."""
+    manifest = project_generation_configuration_evidence(manifest)
     body_limit = (
         MAX_GENERATION_MANIFEST_BYTES
         - FORENSIC_MANIFEST_ENVELOPE_RESERVE_BYTES
@@ -28470,6 +28987,10 @@ def finish_generation_forensics(
 ) -> dict[str, Any]:
     if not run_id:
         return result
+    if canonical_manifest is not None:
+        canonical_manifest = project_generation_configuration_evidence(
+            canonical_manifest
+        )
     enriched = dict(result)
     enriched["generation_run_id"] = run_id
     validated_session = safe_quote_session_id(validated_session_id, "")
@@ -29660,6 +30181,14 @@ def _run_quote_job(
         for item in transient_outputs
         if isinstance(item, dict) and "." in clean_text(item.get("name"))
     })
+    generation_configuration = project_generation_configuration_evidence({
+        "generation_configuration": {
+            "pdf_mode": normalized_pdf_mode,
+            "provider": read_dotenv_value("AI_PROVIDER"),
+            "model": read_dotenv_value("OPENAI_MODEL"),
+            "app_revision": clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")),
+        }
+    })["generation_configuration"]
     canonical_manifest = {
         "generation_schema_version": 1,
         "job_id": job_id,
@@ -29669,7 +30198,7 @@ def _run_quote_job(
         "profile": {"snapshot": profile_snapshot, "sha256": hashlib.sha256(json.dumps(profile_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
         "pricing_reference": {"snapshot": json.loads(pricing_bytes.decode("utf-8")), "sha256": hashlib.sha256(pricing_bytes).hexdigest()},
         "layout_template": {"filename": layout_template_path.name, "sha256": hashlib.sha256(layout_bytes).hexdigest(), "size_bytes": len(layout_bytes)},
-        "generation_configuration": {"pdf_mode": normalized_pdf_mode, "provider": clean_text(read_dotenv_value("AI_PROVIDER")), "model": clean_text(read_dotenv_value("OPENAI_MODEL")), "app_revision": clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA"))},
+        "generation_configuration": generation_configuration,
         "inputs": input_references,
         "layout_rules": {"snapshot": layout_rules_snapshot, "sha256": hashlib.sha256(json.dumps(layout_rules_snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()},
         "artifacts": durable_artifacts,

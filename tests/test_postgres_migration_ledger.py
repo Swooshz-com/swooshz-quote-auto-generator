@@ -35,7 +35,10 @@ from webapp.postgres_migrations import (
     TableSpec,
     _fetch_public_indexes,
     _constraint_fingerprint,
+    _effective_table_spec,
     _observed_constraint_fingerprint,
+    _table_matches,
+    TABLE_SPECS_BY_NAME,
     canonicalize_check_expression,
     execute_migration_sql,
     apply_postgres_migrations,
@@ -90,6 +93,87 @@ class RecordingConnection:
 
 
 class MigrationPayloadCanonicalizationTest(unittest.TestCase):
+    def test_telemetry_attempt_constraint_is_prefix_aware_and_named_at_010(self):
+        final_spec = TABLE_SPECS_BY_NAME["sqag_telemetry_events"]
+        before_010 = _effective_table_spec("sqag_telemetry_events", 8)
+        self.assertEqual(
+            len([item for item in before_010.constraints if item.kind == "c" and "attempt_number" in (item.expression or "")]),
+            1,
+        )
+        self.assertNotIn("attempt_number = 0", next(
+            item.expression for item in before_010.constraints
+            if item.kind == "c" and "attempt_number" in (item.expression or "")
+        ))
+
+        def observed_table(spec, *, attempt_name=None, attempt_validated=True, duplicate_attempt=False):
+            constraints = []
+            for index, item in enumerate(spec.constraints):
+                observed = {
+                    "name": item.name or f"sqag_events_check_{index}",
+                    "kind": item.kind,
+                    "columns": item.columns,
+                    "referenced_schema": item.referenced_schema,
+                    "referenced_table": item.referenced_table,
+                    "referenced_columns": item.referenced_columns,
+                    "match_type": item.match_type,
+                    "on_delete": item.on_delete,
+                    "on_update": item.on_update,
+                    "expression": item.expression,
+                    "validated": attempt_validated if "attempt_number" in (item.expression or "") else item.validated,
+                    "deferrable": item.deferrable,
+                    "deferred": item.deferred,
+                }
+                if "attempt_number" in (item.expression or "") and attempt_name is not None:
+                    observed["name"] = attempt_name
+                constraints.append(observed)
+                if "attempt_number" in (item.expression or "") and duplicate_attempt:
+                    constraints.append(dict(observed, name="sqag_duplicate_attempt_check"))
+            return {
+                "relation": {
+                    "name": spec.name,
+                    "relkind": "r",
+                    "relpersistence": "p",
+                    "relispartition": False,
+                    "owner": spec.owner,
+                },
+                "columns": [
+                    (
+                        column.name,
+                        column.type_name,
+                        column.nullable,
+                        column.default_sql,
+                        column.identity,
+                        column.generated,
+                    )
+                    for column in spec.columns
+                ],
+                "constraints": constraints,
+            }
+
+        historical_actual = observed_table(before_010, attempt_name="sqag_telemetry_events_attempt_number_check")
+        self.assertTrue(_table_matches(historical_actual, before_010))
+        successor_actual = observed_table(final_spec)
+        self.assertTrue(_table_matches(successor_actual, final_spec))
+        self.assertFalse(_table_matches(successor_actual, before_010))
+        self.assertFalse(_table_matches(
+            observed_table(final_spec, attempt_name="renamed_attempt_check"),
+            final_spec,
+        ))
+        self.assertFalse(_table_matches(
+            observed_table(final_spec, duplicate_attempt=True),
+            final_spec,
+        ))
+        self.assertFalse(_table_matches(
+            observed_table(final_spec, attempt_validated=False),
+            final_spec,
+        ))
+        missing_attempt = observed_table(before_010)
+        missing_attempt["constraints"] = [
+            item for item in missing_attempt["constraints"]
+            if "attempt_number" not in (item.get("expression") or "")
+        ]
+        self.assertFalse(_table_matches(missing_attempt, before_010))
+
     def test_check_deparse_canonicalizer_allows_only_bounded_equivalences(self):
         table = TableSpec(
             "fixture",
@@ -558,6 +642,236 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         finally:
             connection.rollback()
             connection.close()
+
+    def attempt_constraints(self, connection):
+        return connection.execute(
+            "select constraint_row.conname, constraint_row.convalidated, "
+            "pg_catalog.pg_get_constraintdef(constraint_row.oid) as definition "
+            "from pg_catalog.pg_constraint constraint_row "
+            "where constraint_row.conrelid = 'public.sqag_telemetry_events'::regclass "
+            "and constraint_row.contype = 'c' "
+            "and pg_catalog.pg_get_constraintdef(constraint_row.oid) ilike '%%attempt_number%%' "
+            "order by constraint_row.conname"
+        ).fetchall()
+
+    def replace_attempt_constraint(self, connection, name: str, expression: str, *, not_valid: bool = False):
+        for row in self.attempt_constraints(connection):
+            connection._connection.execute(
+                self.sql.SQL("alter table public.sqag_telemetry_events drop constraint {}").format(
+                    self.sql.Identifier(row["conname"])
+                )
+            )
+        suffix = " not valid" if not_valid else ""
+        connection._connection.execute(
+            self.sql.SQL("alter table public.sqag_telemetry_events add constraint {} check ({})" + suffix).format(
+                self.sql.Identifier(name),
+                self.sql.SQL(expression),
+            )
+        )
+
+    def test_attempt_semantics_010_migrates_renamed_check_and_preserves_rows(self):
+        self.apply(self.manifest[:8])
+        connection = self.connect()
+        try:
+            now = "2026-10-02T00:00:00Z"
+            connection.execute(
+                "insert into public.sqag_telemetry_source_state "
+                "(workspace_id, source_product, created_at, updated_at) values (%s, %s, %s, %s)",
+                ("workspace-010", "sqag", now, now),
+            )
+            connection.execute(
+                "insert into public.sqag_telemetry_events "
+                "(workspace_id, event_id, source_product, source_sequence, event_type, event_status, "
+                "actor_tracking_id, actor_key_version, retry_lineage_id, attempt_number, provider, model, "
+                "occurred_at, immutable_metadata_digest, retention_expires_at, original_retention_expires_at) "
+                "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    "workspace-010", "event-before-010", "sqag", 1, "ai_provider_attempt", "success",
+                    "actor-010", "actor-key-v1", "lineage-010", 1, "openai", "gpt-6-luna",
+                    now, "a" * 64, "2027-10-02T00:00:00Z", "2027-07-02T00:00:00Z",
+                ),
+            )
+            historical = self.attempt_constraints(connection)
+            self.assertEqual(len(historical), 1)
+            old_name = historical[0]["conname"]
+            connection._connection.execute(
+                self.sql.SQL(
+                    "alter table public.sqag_telemetry_events rename constraint {} to {}"
+                ).format(
+                    self.sql.Identifier(old_name),
+                    self.sql.Identifier("sqag_telemetry_events_attempt_history_renamed"),
+                )
+            )
+            before = connection.execute(
+                "select workspace_id, event_id, source_sequence, retry_lineage_id, attempt_number, model "
+                "from public.sqag_telemetry_events where event_id = %s",
+                ("event-before-010",),
+            ).fetchone()
+            connection.commit()
+        finally:
+            connection.close()
+
+        result = self.apply(self.manifest[:9])
+        self.assertEqual(result["appliedNow"], [self.manifest[8].migration_id])
+        report = self.inspect()
+        self.assertEqual(report["status"], "ready")
+        connection = self.connect()
+        try:
+            successor = self.attempt_constraints(connection)
+            self.assertEqual(len(successor), 1)
+            self.assertEqual(successor[0]["conname"], "sqag_telemetry_events_attempt_semantics_ck")
+            self.assertTrue(successor[0]["convalidated"])
+            after = connection.execute(
+                "select workspace_id, event_id, source_sequence, retry_lineage_id, attempt_number, model "
+                "from public.sqag_telemetry_events where event_id = %s",
+                ("event-before-010",),
+            ).fetchone()
+            self.assertEqual(after, before)
+            now = "2026-10-02T00:00:00Z"
+            connection.execute(
+                "insert into public.sqag_telemetry_events "
+                "(workspace_id, event_id, source_product, source_sequence, event_type, event_status, "
+                "actor_tracking_id, actor_key_version, retry_lineage_id, attempt_number, purpose, failure_class, "
+                "usage_available, cost_available, occurred_at, immutable_metadata_digest, retention_expires_at, "
+                "original_retention_expires_at) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    "workspace-010", "event-zero-valid", "sqag", 2, "validation", "blocked",
+                    "actor-010", "actor-key-v1", "lineage-zero-010", 0, "request_validation", "configuration",
+                    0, 0, now, "b" * 64, "2027-10-02T00:00:00Z", "2027-07-02T00:00:00Z",
+                ),
+            )
+            connection.commit()
+            with self.assertRaises(self.psycopg.errors.CheckViolation):
+                connection.execute(
+                    "insert into public.sqag_telemetry_events "
+                    "(workspace_id, event_id, source_product, source_sequence, event_type, event_status, "
+                    "actor_tracking_id, actor_key_version, retry_lineage_id, attempt_number, purpose, failure_class, "
+                    "model, usage_available, cost_available, occurred_at, immutable_metadata_digest, retention_expires_at, "
+                    "original_retention_expires_at) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        "workspace-010", "event-zero-invalid", "sqag", 3, "ai_provider_attempt", "failed",
+                        "actor-010", "actor-key-v1", "lineage-zero-invalid", 0, "basis_chat", "provider_error",
+                        "gpt-6-luna", 0, 0, now, "c" * 64, "2027-10-02T00:00:00Z", "2027-07-02T00:00:00Z",
+                    ),
+                )
+            connection.rollback()
+            zero_columns = (
+                "workspace_id", "event_id", "source_product", "source_sequence",
+                "event_type", "event_status", "actor_tracking_id", "actor_key_version",
+                "retry_lineage_id", "attempt_number", "purpose", "failure_class",
+                "usage_available", "cost_available", "occurred_at",
+                "immutable_metadata_digest", "retention_expires_at",
+                "original_retention_expires_at",
+            )
+            insert_zero_sql = (
+                "insert into public.sqag_telemetry_events ("
+                + ", ".join(zero_columns)
+                + ") values ("
+                + ", ".join(["%s"] * len(zero_columns))
+                + ")"
+            )
+            for index, nullable_field in enumerate(
+                ("purpose", "failure_class", "usage_available", "cost_available"),
+                start=1,
+            ):
+                malformed_zero = {
+                    "workspace_id": "workspace-010",
+                    "event_id": f"event-zero-null-{nullable_field}",
+                    "source_product": "sqag",
+                    "source_sequence": 3 + index,
+                    "event_type": "validation",
+                    "event_status": "blocked",
+                    "actor_tracking_id": "actor-010",
+                    "actor_key_version": "actor-key-v1",
+                    "retry_lineage_id": None,
+                    "attempt_number": 0,
+                    "purpose": "request_validation",
+                    "failure_class": "configuration",
+                    "usage_available": 0,
+                    "cost_available": 0,
+                    "occurred_at": now,
+                    "immutable_metadata_digest": "d" * 64,
+                    "retention_expires_at": "2027-10-02T00:00:00Z",
+                    "original_retention_expires_at": "2027-07-02T00:00:00Z",
+                }
+                malformed_zero[nullable_field] = None
+                with self.subTest(nullable_field=nullable_field):
+                    with self.assertRaises(self.psycopg.errors.CheckViolation):
+                        connection.execute(
+                            insert_zero_sql,
+                            tuple(malformed_zero[column] for column in zero_columns),
+                        )
+                    connection.rollback()
+        finally:
+            connection.close()
+        self.assertEqual(self.apply()["appliedNow"], [])
+
+    def test_attempt_semantics_prefix_mismatches_fail_closed(self):
+        historical_expression = "attempt_number is null or attempt_number >= 1"
+        successor_expression = (
+            "attempt_number is null or attempt_number >= 1 or ("
+            "(attempt_number = 0) and (event_type = 'validation') and (event_status = 'blocked') and "
+            "(purpose is not null) and (purpose = 'request_validation') and (failure_class is not null) and "
+            "(failure_class = 'configuration') and (model is null) and "
+            "(usage_available is not null) and (usage_available = 0) and "
+            "(cost_available is not null) and (cost_available = 0) and (input_tokens is null) and (output_tokens is null) and "
+            "(total_tokens is null) and (cache_read_tokens is null) and (cache_write_tokens is null) and "
+            "(estimated_cost is null) and (actual_cost is null) and (currency is null) and (cost_version is null))"
+        )
+
+        for case in ("missing", "duplicate", "drifted", "unvalidated", "premature"):
+            with self.subTest(case=case):
+                database_name = self.create_database()
+                self.apply(self.manifest[:8], database_name)
+                connection = self.connect(database_name)
+                try:
+                    if case == "missing":
+                        row = self.attempt_constraints(connection)[0]
+                        connection._connection.execute(
+                            self.sql.SQL("alter table public.sqag_telemetry_events drop constraint {}").format(
+                                self.sql.Identifier(row["conname"])
+                            )
+                        )
+                    elif case == "duplicate":
+                        connection.execute(
+                            "alter table public.sqag_telemetry_events add constraint sqag_duplicate_attempt_check "
+                            "check (attempt_number is null or attempt_number >= 1)"
+                        )
+                    elif case == "drifted":
+                        self.replace_attempt_constraint(connection, "sqag_drifted_attempt_check", "attempt_number is null or attempt_number >= 2")
+                    elif case == "unvalidated":
+                        self.replace_attempt_constraint(
+                            connection,
+                            "sqag_unvalidated_attempt_check",
+                            historical_expression,
+                            not_valid=True,
+                        )
+                    else:
+                        self.replace_attempt_constraint(
+                            connection,
+                            "sqag_telemetry_events_attempt_semantics_ck",
+                            successor_expression,
+                        )
+                    connection.commit()
+                finally:
+                    connection.close()
+                report = self.inspect(self.manifest[:9], database_name)
+                self.assertNotEqual(report["status"], "ready")
+                with self.assertRaises(MigrationSafetyError):
+                    self.apply(self.manifest[:9], database_name)
+
+        stale_database = self.create_database()
+        self.apply(self.manifest, stale_database)
+        connection = self.connect(stale_database)
+        try:
+            self.replace_attempt_constraint(connection, "sqag_old_attempt_check", historical_expression)
+            connection.commit()
+        finally:
+            connection.close()
+        report = self.inspect(self.manifest, stale_database)
+        self.assertNotEqual(report["status"], "ready")
+        with self.assertRaises(MigrationSafetyError):
+            self.apply(self.manifest, stale_database)
 
     def test_fresh_apply_complete_ledger_and_second_run_noop(self):
         first = self.apply()

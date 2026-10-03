@@ -20,6 +20,7 @@ chat, logs, screenshots, and command history.
 6. `007_feedback_publication_binding_postgres.sql`
 7. `008_quote_session_deletion_hold_authority_postgres.sql`
 8. `009_telemetry_events_postgres.sql`
+9. `010_telemetry_attempt_semantics_postgres.sql`
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database
@@ -38,7 +39,12 @@ authority remains bound to migration 008; the independent telemetry-aware v2
 authority is bound to migration 009 and its callable relation inventory does
 not include `sqag_telemetry_source_state`. The migration is source- and
 checksum-locked like the earlier migrations; this run authorizes no live
-migration.
+migration. Migration 010 replaces only the validated historical attempt-number
+CHECK on sqag_telemetry_events. It discovers the historical constraint by
+its exact expression on the exact public table, refuses missing, duplicate,
+unvalidated, or drifted checks, and installs a deterministic successor that
+permits zero only for the canonical request-validation event. It changes no
+rows and widens no privileges.
 
 The runner accepts only an exact ordered prefix of the repository manifest.
 It fails closed for checksum drift, unknown or out-of-order rows, a complete

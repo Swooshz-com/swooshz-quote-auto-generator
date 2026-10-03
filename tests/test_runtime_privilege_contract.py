@@ -4438,6 +4438,7 @@ order by object_kind, object_schema, object_name, object_type
                         f"{routine.name}({routine.identity_arguments})"
                         for routine in migration_contract.MIGRATION_OBJECTS[-1].routines
                     ),
+                    "applied_prefix_drift:table:public.sqag_telemetry_events",
                 },
             )
         finally:
@@ -4858,13 +4859,13 @@ order by object_kind, object_schema, object_name, object_type
             [migration.migration_id for migration in self.migrations],
         )
         self.assertEqual(
-            post_009["appliedMigrationIds"][:-1],
+            post_009["appliedMigrationIds"][:-2],
             clean_pre_apply["appliedMigrationIds"],
         )
         self.assertEqual(
             set(post_009["appliedMigrationIds"])
             - set(clean_pre_apply["appliedMigrationIds"]),
-            {self.migrations[7].migration_id},
+            {self.migrations[7].migration_id, self.migrations[8].migration_id},
         )
         ledger_row = self._admin_row(
             "select sequence_no, migration_id, checksum_sha256, applied_at "
@@ -4875,6 +4876,15 @@ order by object_kind, object_schema, object_name, object_type
         self.assertEqual(ledger_row["migration_id"], self.migrations[7].migration_id)
         self.assertEqual(ledger_row["checksum_sha256"], self.migrations[7].checksum_sha256)
         self.assertIsNotNone(ledger_row["applied_at"])
+        attempt_semantics_ledger_row = self._admin_row(
+            "select sequence_no, migration_id, checksum_sha256, applied_at "
+            "from public.sqag_schema_migrations where sequence_no = %s",
+            (self.migrations[8].sequence_no,),
+            database_name=partial_database,
+        )
+        self.assertEqual(attempt_semantics_ledger_row["migration_id"], self.migrations[8].migration_id)
+        self.assertEqual(attempt_semantics_ledger_row["checksum_sha256"], self.migrations[8].checksum_sha256)
+        self.assertIsNotNone(attempt_semantics_ledger_row["applied_at"])
         self.assertEqual(
             self._default_table_acl_snapshot(partial_database),
             default_acl_before_009,
@@ -5600,7 +5610,7 @@ order by owner.rolname, schema_name, grantee, acl.privilege_type
         )
 
     def _assert_causal_telemetry_catalog_and_acl_contract(self, database_name: str) -> None:
-        migration = migration_contract.MIGRATION_OBJECTS[-1]
+        migration = migration_contract.MIGRATION_OBJECTS[-2]
         telemetry_tables = {table.name for table in migration.tables}
         with self._admin_connection(database_name) as raw_connection:
             connection = webapp.PostgresConnectionAdapter(raw_connection)

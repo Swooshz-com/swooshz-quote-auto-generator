@@ -49,8 +49,20 @@ npm run playwright:smoke
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL
   service and require fresh apply, complete schema, exact checksums, no-op
   replay, drift refusal, concurrency serialization, read-only preflight, and
-  failed-transaction rollback evidence. Never point this CI test at a provider
-  or production database.
+  failed-transaction rollback evidence. For the telemetry attempt evolution,
+  also prove the 009-to-010 prefix transition, renamed historical CHECK
+  discovery, successor constraint name and validation, row preservation, and
+  refusal of missing, duplicate, unvalidated, drifted, premature, and stale
+  attempt constraints on disposable PostgreSQL 17. Never point this CI test
+  at a provider or production database.
+
+- AI telemetry attempt numbering, pre-transport validation, provider fallback,
+  or model privacy: run `tests.test_telemetry_producer`,
+  `tests.test_openai_draft_request_contract`, and
+  `tests.test_ai_basis_chat_stress`. Assert attempts count actual sends,
+  request-validation events persist only the canonical zero-send tuple, and
+  invalid model labels are projected before logs, summaries, fingerprints,
+  and telemetry.
 
 ## Regression Standard
 
@@ -76,25 +88,36 @@ classes. Prompt text, filenames, media/base64, private identifiers/URLs, model
 configuration values, credentials, headers, and raw provider bodies are excluded.
 The fingerprint is not evidence of historical failure causation.
 
-The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates configured reasoning effort against the configured model; current `gpt-5.5` accepts only `none`, `low`, `high`, and `xhigh`.
+The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates each full-draft model and reasoning pair: normal Analyse is `gpt-6-luna` with `max`; High Quality is `gpt-6.1-sol` with `high`. The model and effort are configured independently for the two modes.
 
-Reasoning configuration is fail-closed at that final boundary. The standard path reads
-`OPENAI_DRAFT_REASONING_EFFORT`; the High Quality path reads
-`OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT` independently. After existing
-normalization, blank effective values use `high` and `xhigh` respectively, while
-every nonempty value is preserved for model compatibility validation. For each
-selected variable, the deterministic matrix is: absent, empty, or whitespace-only
-maps to the mode default; `none`, `low`, `high`, and `xhigh` send exactly once;
-`minimal`, `medium`, `bogus`, `max`, `ultra`, and synthetic private canaries reject
-with `failure_boundary=request_validation`, `attempt_number=0`, and zero sends.
-Normalized accepted input such as ` HIGH ` remains accepted, normalized unsupported
-input such as ` BoGuS ` remains rejected, and the unselected variable cannot affect
-the selected mode. High Quality aliases retain their existing mode semantics.
-Reader tests cover missing, empty, whitespace, dotenv, and process-override values
-using mocked dotenv access. Final-envelope tests cover unsupported configured/body
-efforts, configured/body mismatch, and model mismatch; `draft_quote_basis` must
-propagate request validation without local starter fallback. Run the focused oracle
-with `python -m unittest tests.test_openai_draft_request_contract`.
+Reasoning configuration is fail-closed at that final boundary. Normal Analyse reads
+`OPENAI_DRAFT_MODEL` and `OPENAI_DRAFT_REASONING_EFFORT`; High Quality reads
+`OPENAI_DRAFT_HIGH_QUALITY_MODEL` and
+`OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Blank effective values use the
+mode defaults. Explicit model or effort mismatches reject with
+`failure_boundary=request_validation`, `attempt_number=0`, and zero sends. The
+normal route accepts only Luna/max; High Quality accepts only
+gpt-6.1-sol/high, with no fallback to gpt-6-sol. Luna low and medium
+reasoning are not accepted. Unknown model IDs fail closed. High Quality
+aliases retain their existing mode semantics. Reader tests cover missing,
+empty, whitespace, dotenv, and process-override values using mocked
+dotenv access. Final-envelope tests cover unsupported configured/body efforts,
+configured/body mismatch, invalid explicit models, and model mismatch;
+`draft_quote_basis` must propagate request validation without local starter
+fallback. Run the focused oracle with
+`python -m unittest tests.test_openai_draft_request_contract`.
+
+Configured OpenAI model readers apply route defaults only to absent or blank
+values. Every explicit nonblank model value must reach route validation unchanged
+enough to be rejected when unsupported. Exercise `!!!` and unsupported
+`gpt-6-sol` through normal and High Quality full-draft construction,
+selected-line and answer basis-chat dispatch, and OpenAI pricing import and
+metadata requests. Each invalid configuration must report
+`failure_boundary=request_validation`, `attempt_number=0`, and zero provider
+sends. A basis-chat request-validation failure is terminal; it must not fall
+through from an invalid answer route to a valid selected-line model. Provider,
+runtime, and model-output fallback tests must continue to prove the existing
+alternate-provider behavior.
 
 Contract coverage includes exact Responses field sets, invalid envelopes, whole
 request rejection, one-send failures, privacy canaries, and N-1/N/N+1 boundaries

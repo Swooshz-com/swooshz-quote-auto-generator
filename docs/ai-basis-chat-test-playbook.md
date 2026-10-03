@@ -18,8 +18,9 @@ This playbook covers:
 
 ## Model Routing
 
-- Without `DEEPSEEK_API_KEY`, `Re` selected-line edits use `OPENAI_BASIS_LINE_MODEL`, and answer-style `Ask For Changes` uses `OPENAI_BASIS_ANSWER_MODEL`.
-- OpenAI basis chat does not fall back to `OPENAI_DRAFT_MODEL`; that model remains reserved for full quote-basis drafting.
+- Without `DEEPSEEK_API_KEY`, `Re` selected-line edits use `OPENAI_BASIS_LINE_MODEL`, and answer-style `Ask For Changes` uses `OPENAI_BASIS_ANSWER_MODEL`. Both OpenAI routes default to `gpt-6-luna` and send `high` reasoning. Explicit model mismatches reject before OpenAI transport.
+- OpenAI basis chat does not fall back to either full-draft model; `OPENAI_DRAFT_MODEL` and `OPENAI_DRAFT_HIGH_QUALITY_MODEL` remain reserved for full quote-basis drafting.
+- OpenAI model defaults apply only when a route setting is absent or blank. An explicit unsupported model must fail route validation before provider transport. Request-validation failures are terminal and must not fall through from an invalid answer route to a valid selected-line model; provider, runtime, and model-output fallback behavior stays covered by its existing regression tests.
 - With `DEEPSEEK_API_KEY`, text-only basis chat uses route-specific DeepSeek model defaults: `Re` selected-line edits use `DEEPSEEK_BASIS_LINE_MODEL` defaulting to `deepseek-v4-flash`, and answer-style `Ask For Changes` uses `DEEPSEEK_BASIS_ANSWER_MODEL` defaulting to `deepseek-v4-flash`.
 - `DEEPSEEK_MODEL` remains the legacy/global DeepSeek fallback model, defaulting to `deepseek-v4-pro`. A custom non-Pro value still acts as a global override, but `DEEPSEEK_MODEL=deepseek-v4-pro` does not suppress Flash route defaults.
 - Flash-routed DeepSeek basis chat must retry the Pro/global DeepSeek model before falling back to OpenAI.
