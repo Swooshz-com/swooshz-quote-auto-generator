@@ -724,15 +724,14 @@ function pricingReferenceSelectionFromValue(value = "") {
 }
 
 function mergePricingReferences(bundled = []) {
-  const seen = new Set();
-  return [...bundled].filter((reference) => {
+  const latestBySelection = new Map();
+  for (const reference of Array.isArray(bundled) ? bundled : []) {
     const source = String(reference?.source || "").trim();
-    if (!PRICING_REFERENCE_SOURCES.has(source)) return false;
+    if (!PRICING_REFERENCE_SOURCES.has(source)) continue;
     const key = pricingReferenceSelectValue(reference);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    if (key) latestBySelection.set(key, reference);
+  }
+  return [...latestBySelection.values()];
 }
 
 function sortedPricingReferencesForDisplay(references = []) {
@@ -2525,6 +2524,78 @@ function pricingReferenceAuthorityBasis(reference = null) {
     || !/^sha256:[a-f0-9]{64}$/.test(pricingBasis.digest)
   ) return null;
   return pricingBasis;
+}
+
+function samePricingReferenceBasis(left = null, right = null) {
+  if (!left || !right) return false;
+  return ["currency", "source", "id", "digest"].every((key) => left[key] === right[key]);
+}
+
+function normalizedDraftPricingReferenceBasis(value = null) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 4 || !["currency", "source", "id", "digest"].every((key) => keys.includes(key))) return null;
+  return pricingReferenceAuthorityBasis({
+    currency: value.currency,
+    source: value.source,
+    id: value.id,
+    digest_sha256: value.digest,
+  });
+}
+
+function applyDraftPricingReferenceReview(result = null) {
+  const review = normalizeQuoteCommercialReview(result?.quoteCommercialReview);
+  if (!review) return false;
+  setQuoteCommercialReview(
+    review.reason_code,
+    review.blocked_identity.id,
+    review.blocked_identity.source,
+  );
+  return true;
+}
+
+async function draftPricingReferenceBasisIsCurrent(value = null) {
+  const requestBasis = normalizedDraftPricingReferenceBasis(value);
+  if (!requestBasis) return false;
+  let reference = currentPricingReference();
+  let currentBasis = pricingReferenceAuthorityBasis(reference);
+  if (!samePricingReferenceBasis(requestBasis, currentBasis)) {
+    if (!await loadProfiles()) {
+      const established = quoteCommercialSnapshotPricingBasis() || requestBasis;
+      setQuoteCommercialReview("pricing_reference_digest_mismatch", established.id, established.source);
+      return false;
+    }
+    reference = currentPricingReference();
+    currentBasis = pricingReferenceAuthorityBasis(reference);
+  }
+  if (quoteCommercialReviewRequired()) return false;
+  const establishedBasis = quoteCommercialSnapshotPricingBasis();
+  if (
+    !samePricingReferenceBasis(requestBasis, currentBasis)
+    || (establishedBasis && !samePricingReferenceBasis(requestBasis, establishedBasis))
+  ) {
+    const blockedBasis = establishedBasis || requestBasis;
+    const reason = reference
+      ? pricingReferenceAuthorityReviewReason(blockedBasis, reference)
+      : "pricing_reference_unavailable";
+    setQuoteCommercialReview(reason || "pricing_reference_digest_mismatch", blockedBasis.id, blockedBasis.source);
+    return false;
+  }
+  if (!establishedBasis) {
+    const details = collectQuoteDetails();
+    const candidate = quoteCommercialSnapshotForDetails(details, {
+      reference,
+      replacePricingAuthority: true,
+    });
+    const normalized = normalizeQuoteCommercialSnapshot(
+      candidate,
+      state.quoteCommercialLifecycle,
+      details,
+    );
+    if (!normalized || !samePricingReferenceBasis(requestBasis, normalized.pricing_basis)) return false;
+    state.quoteCommercialSnapshot = normalized;
+  }
+  return true;
 }
 
 function canonicalPricingAuthorityText(value = "") {
@@ -8505,7 +8576,7 @@ async function savePricingReferenceFromModal(event) {
     }
     didSave = true;
     const savedReference = data.pricing_reference || {};
-    await loadProfiles();
+    if (!await loadProfiles()) throw new Error("settings_list_refresh_failed");
     syncSelectedPricingReference();
     renderProfileOptions();
     renderPricingReferenceDeleteOptions();
@@ -8605,17 +8676,21 @@ async function deleteRepoPricingReference(referenceId, source = "") {
       renderPricingReferenceDeleteConfirm();
       return;
     }
-    state.pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : state.pricingReferences);
+    if (!Array.isArray(data.pricing_references)) throw new Error("settings_list_refresh_failed");
+    state.pricingReferences = mergePricingReferences(data.pricing_references);
     if (
       state.pricingReferenceId === reference.id
       && String(state.pricingReferenceSource || "").trim() === normalizedSource
     ) {
       setQuoteCommercialReview("pricing_reference_unavailable", reference.id, normalizedSource);
     }
+    syncSelectedPricingReference();
+    renderProfileOptions();
+    renderPricingReferenceDeleteOptions();
     hidePricingReferenceDeleteConfirm();
     clearPricingReferenceDraft({ clearFile: true, resetMetadata: true });
     state.pricingReferenceSettingsMode = PRICING_REFERENCE_SETTINGS_MODE_MANAGE;
-    await loadProfiles();
+    if (!await loadProfiles()) throw new Error("settings_list_refresh_failed");
     syncSelectedPricingReference();
     renderProfileOptions();
     renderPricingReferenceDeleteOptions();
@@ -8655,25 +8730,18 @@ async function loadProfiles() {
   const context = beginAuthorityProfileRequest();
   const { ok, data } = await getJson("/api/profiles");
   if (!authorityProfileRequestIsFresh(context)) return false;
-  let profiles = state.profiles;
-  let workspace = state.workspace;
-  let defaultProfileId = state.defaultProfileId;
-  let defaultPricingReferenceId = state.defaultPricingReferenceId;
-  let pricingReferences = state.pricingReferences;
-  let companyProfiles = state.companyProfiles;
-  if (ok && Array.isArray(data.profiles)) {
-    profiles = data.profiles;
-    workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
-    defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
-    defaultPricingReferenceId = data.default_pricing_reference_id || DEFAULT_PRICING_REFERENCE_ID;
-    pricingReferences = mergePricingReferences(Array.isArray(data.pricing_references) ? data.pricing_references : []);
-    const canReadCompanyProfiles = state.permissions?.canGenerateQuote !== false;
-    companyProfiles = canReadCompanyProfiles && Array.isArray(data.company_profiles)
-      ? data.company_profiles
-        .map(normalizeCompanyProfile)
-        .sort((left, right) => String(left.label || left.id || "").localeCompare(String(right.label || right.id || ""), undefined, { sensitivity: "base" }))
-      : [];
-  }
+  if (!ok || !Array.isArray(data.profiles) || !Array.isArray(data.pricing_references)) return false;
+  const profiles = data.profiles;
+  const workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
+  const defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
+  const defaultPricingReferenceId = data.default_pricing_reference_id || DEFAULT_PRICING_REFERENCE_ID;
+  const pricingReferences = mergePricingReferences(data.pricing_references);
+  const canReadCompanyProfiles = state.permissions?.canGenerateQuote !== false;
+  const companyProfiles = canReadCompanyProfiles && Array.isArray(data.company_profiles)
+    ? data.company_profiles
+      .map(normalizeCompanyProfile)
+      .sort((left, right) => String(left.label || left.id || "").localeCompare(String(right.label || right.id || ""), undefined, { sensitivity: "base" }))
+    : [];
   const refreshedContext = refreshAuthorityProfileRequestContext(context);
   const hydrated = refreshedContext
     ? await hydrateProfileLogoFingerprints({
@@ -15320,8 +15388,11 @@ async function handleDraftBasis(options = {}) {
     includeBoothDimensions: state.boothDimensions.dimension_source !== "default",
     includeDraftContext: hasFeedback,
   }), { jobId: operation.id });
+  const startedRunId = safeGenerationRunId(started.data?.generation_run_id || "");
+  if (startedRunId) transitionGenerationContext(synchronizedSessionId, startedRunId);
   if (!started.ok) {
     if (started.data?.page_unloading) return;
+    applyDraftPricingReferenceReview(started.data);
     state.isAnalysisRunning = false;
     clearActiveJob();
     const errors = started.data.errors || ["Draft failed."];
@@ -15333,6 +15404,16 @@ async function handleDraftBasis(options = {}) {
       showAiFailureBanner(genericFailureMessage(started.data));
     }
     restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_start_failed" });
+    syncControlStates();
+    return;
+  }
+  if (!startedRunId) {
+    state.isAnalysisRunning = false;
+    clearActiveJob();
+    transitionGenerationContext(synchronizedSessionId, "");
+    setWorkflowStage("ready_to_analyze");
+    showAiFailureBanner();
+    restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_run_link_missing" });
     syncControlStates();
     return;
   }
@@ -15354,7 +15435,22 @@ async function handleDraftBasis(options = {}) {
   state.isAnalysisRunning = false;
   clearActiveJob();
 
+  const finishedResult = polled.data.result || {};
+  const finishedRunId = safeGenerationRunId(
+    finishedResult.generation_run_id || polled.data.generation_run_id || "",
+  );
+  if (!finishedRunId || finishedRunId !== startedRunId) {
+    transitionGenerationContext(synchronizedSessionId, "");
+    setWorkflowStage("ready_to_analyze");
+    showAiFailureBanner();
+    restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_run_link_mismatch" });
+    syncControlStates();
+    return;
+  }
+  transitionGenerationContext(synchronizedSessionId, finishedRunId);
+
   if (!polled.ok || ["blocked", "failed"].includes(polled.data.status)) {
+    applyDraftPricingReferenceReview(polled.data.result || polled.data);
     const errors = polled.data.errors || polled.data.result?.errors || ["Draft failed."];
     const wasBlocked = polled.data.status === "blocked";
     setWorkflowStage(wasBlocked ? "details_review" : "ready_to_analyze");
@@ -15369,6 +15465,13 @@ async function handleDraftBasis(options = {}) {
   }
 
   const data = polled.data.result || {};
+  if (!await draftPricingReferenceBasisIsCurrent(data.pricing_reference_basis)) {
+    restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_pricing_reference_changed" });
+    setWorkflowStage("details_review");
+    showAiBlockedBanner(QUOTE_COMMERCIAL_REVIEW_MESSAGE);
+    syncControlStates();
+    return;
+  }
   if (Array.isArray(data.blocking_clarification_questions) && data.blocking_clarification_questions.length) {
     clearAiFailureBanner();
     openBlockingClarifications(data.blocking_clarification_questions, data.analysis_findings || state.analysisFindings || [], data.project || state.boothDimensions || {});

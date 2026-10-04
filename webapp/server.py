@@ -6366,6 +6366,34 @@ def pricing_authority_context_matches(authority: Any, row: Any) -> bool:
     } == pricing_authority_context(row)
 
 
+def trusted_input_authority_lookup_key(row: Any) -> str:
+    source_line_id = safe_resource_id(row.get("source_basis_line_id"), "") if isinstance(row, dict) else ""
+    if source_line_id:
+        return f"id:{source_line_id}"
+    context = pricing_authority_context(row)
+    quantity = parse_float_or_none(row.get("quantity")) if isinstance(row, dict) else None
+    encoded = json.dumps([context, quantity], ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return f"context:{encoded}"
+
+
+def trusted_manual_included_input_authorities(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    candidates: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        authority = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
+        variant = clean_text(authority.get("variant")).lower()
+        if variant not in {"manual", "included"}:
+            continue
+        key = trusted_input_authority_lookup_key(item)
+        candidates.setdefault(key, []).append(item)
+    return {
+        key: rows[0]
+        for key, rows in candidates.items()
+        if len(rows) == 1
+    }
+
+
 def pricing_authority_number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -17523,6 +17551,118 @@ def pricing_reference_id_from_payload(payload: dict[str, Any]) -> str:
     return selection["id"] if selection["ok"] else ""
 
 
+@dataclass(frozen=True)
+class PricingReferenceSnapshot:
+    source: str
+    reference_id: str
+    digest: str
+    currency: str
+    detail_json: str
+    visual_images_json: str = "[]"
+
+    def detail(self) -> dict[str, Any]:
+        value = json.loads(self.detail_json)
+        return value if isinstance(value, dict) else {}
+
+    def visual_images(self) -> list[dict[str, Any]]:
+        value = json.loads(self.visual_images_json)
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def pricing_reference_snapshot_for_payload(
+    payload: dict[str, Any],
+) -> PricingReferenceSnapshot | None:
+    snapshot = payload.get("_pricing_reference_snapshot")
+    return snapshot if isinstance(snapshot, PricingReferenceSnapshot) else None
+
+
+def pricing_reference_snapshot_basis(
+    snapshot: PricingReferenceSnapshot | None,
+) -> dict[str, str]:
+    if not isinstance(snapshot, PricingReferenceSnapshot):
+        return {}
+    return {
+        "currency": snapshot.currency,
+        "source": snapshot.source,
+        "id": snapshot.reference_id,
+        "digest": snapshot.digest,
+    }
+
+
+def capture_pricing_reference_snapshot(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> PricingReferenceSnapshot | None:
+    authority = exact_pricing_reference_authority(
+        payload,
+        auth_session=auth_session,
+        use_snapshot=False,
+        authoritative_reload=True,
+    )
+    detail = authority.get("detail") if authority.get("ok") and isinstance(authority.get("detail"), dict) else None
+    items = detail.get("items") if isinstance(detail, dict) else None
+    digest = clean_text(detail.get("digest_sha256")) if isinstance(detail, dict) else ""
+    currency = normalize_currency_label(detail.get("currency")) if isinstance(detail, dict) else ""
+    if (
+        not isinstance(detail, dict)
+        or not isinstance(items, list)
+        or detail.get("id") != authority.get("id")
+        or detail.get("source") != authority.get("source")
+        or not digest
+        or not currency
+    ):
+        return None
+    visual_images = catalog_visual_image_entries_for_snapshot_detail(detail, authority["source"], authority["id"])
+    detail_json = json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    visual_images_json = json.dumps(visual_images, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return PricingReferenceSnapshot(
+        source=authority["source"],
+        reference_id=authority["id"],
+        digest=digest,
+        currency=currency,
+        detail_json=detail_json,
+        visual_images_json=visual_images_json,
+    )
+
+
+def pricing_reference_snapshot_changed_review(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    snapshot = pricing_reference_snapshot_for_payload(payload)
+    if snapshot is None:
+        return None
+    current = exact_pricing_reference_authority(
+        payload,
+        auth_session=auth_session,
+        use_snapshot=False,
+        authoritative_reload=True,
+    )
+    reason = ""
+    detail = current.get("detail") if isinstance(current.get("detail"), dict) else {}
+    if not current.get("ok"):
+        reason = (
+            "pricing_reference_source_mismatch"
+            if current.get("reason") == "pricing_reference_source_mismatch"
+            else "pricing_reference_digest_mismatch"
+        )
+    elif current.get("id") != snapshot.reference_id:
+        reason = "pricing_reference_identity_mismatch"
+    elif current.get("source") != snapshot.source:
+        reason = "pricing_reference_source_mismatch"
+    elif (
+        clean_text(detail.get("digest_sha256")) != snapshot.digest
+        or normalize_currency_label(detail.get("currency")) != snapshot.currency
+    ):
+        reason = "pricing_reference_digest_mismatch"
+    if not reason:
+        return None
+    return build_quote_commercial_review(
+        reason,
+        pricing_basis=pricing_reference_snapshot_basis(snapshot),
+    )
+
+
 def pricing_reference_payload(payload: dict[str, Any]) -> dict[str, Any]:
     reference = payload.get("pricing_reference")
     return reference if isinstance(reference, dict) else {}
@@ -17607,17 +17747,26 @@ def database_pricing_reference_detail_for_payload(payload: dict[str, Any], auth_
 def exact_pricing_reference_detail_for_payload(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
+    *,
+    use_snapshot: bool = True,
+    authoritative_reload: bool = False,
 ) -> dict[str, Any] | None:
     selection = explicit_pricing_reference_selection(payload)
     if not selection["ok"]:
         return None
+    snapshot = pricing_reference_snapshot_for_payload(payload) if use_snapshot else None
+    if snapshot is not None:
+        if snapshot.reference_id != selection["id"] or snapshot.source != selection["source"]:
+            return None
+        return snapshot.detail()
     reference = pricing_reference_payload(payload)
     if configured_storage_mode() == "database":
         return database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
     if selection["source"] in {"local", "bundled"}:
         inline_items = reference.get("items")
         if (
-            isinstance(inline_items, list)
+            not authoritative_reload
+            and isinstance(inline_items, list)
             and reference.get("id") == selection["id"]
             and reference.get("source") == selection["source"]
             and inline_items
@@ -17646,7 +17795,12 @@ def exact_pricing_reference_detail_for_payload(
             detail["item_count"] = len(detail["items"])
             detail["digest_sha256"] = pricing_reference_catalog_digest(detail)
             return detail if detail.get("digest_sha256") else None
-    if reference.get("id") == selection["id"] and reference.get("source") == "company" and reference.get("items"):
+    if (
+        not authoritative_reload
+        and reference.get("id") == selection["id"]
+        and reference.get("source") == "company"
+        and reference.get("items")
+    ):
         detail = copy.deepcopy(reference)
         detail["digest_sha256"] = pricing_reference_catalog_digest(detail)
         return detail if detail.get("digest_sha256") else None
@@ -17656,11 +17810,19 @@ def exact_pricing_reference_detail_for_payload(
 def exact_pricing_reference_authority(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
+    *,
+    use_snapshot: bool = True,
+    authoritative_reload: bool = False,
 ) -> dict[str, Any]:
     selection = explicit_pricing_reference_selection(payload)
     if not selection["ok"]:
         return {**selection, "detail": None}
-    detail = exact_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
+    detail = exact_pricing_reference_detail_for_payload(
+        payload,
+        auth_session=auth_session,
+        use_snapshot=use_snapshot,
+        authoritative_reload=authoritative_reload,
+    )
     if detail is None:
         return {**selection, "ok": False, "reason": "pricing_reference_unavailable", "detail": None}
     if detail.get("id") != selection["id"] or detail.get("source") != selection["source"]:
@@ -17902,7 +18064,14 @@ def runtime_pricing_reference_from_payload(
     reference = pricing_reference_payload(payload)
     source = pricing_reference_source_from_payload(payload)
     selection = explicit_pricing_reference_selection(payload)
-    if not selection["ok"] or selection["source"] == "bundled":
+    if not selection["ok"]:
+        return {}
+    snapshot = pricing_reference_snapshot_for_payload(payload)
+    if snapshot is not None:
+        if snapshot.reference_id == selection["id"] and snapshot.source == selection["source"]:
+            return snapshot.detail()
+        return {}
+    if selection["source"] == "bundled":
         return {}
     if configured_storage_mode() == "database":
         detail = database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
@@ -17957,6 +18126,13 @@ def log_database_pricing_reference_resolution_block(payload: dict[str, Any], rea
 
 
 def payload_with_database_pricing_reference_detail(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    snapshot = pricing_reference_snapshot_for_payload(payload)
+    if snapshot is not None:
+        next_payload = copy.deepcopy(payload)
+        next_payload["pricing_reference_id"] = snapshot.reference_id
+        next_payload["pricing_reference_source"] = snapshot.source
+        next_payload["pricing_reference"] = snapshot.detail()
+        return next_payload
     if configured_storage_mode() != "database":
         return payload
     pricing_detail = database_pricing_reference_detail_for_payload(payload, auth_session=auth_session)
@@ -18273,8 +18449,9 @@ class PricingReferencePack:
     def pricing_reference_path(self) -> Path:
         return self.asset_path("pricing_reference", "pricing-catalog.ai-reference.md")
 
-    def public_summary(self) -> dict[str, Any]:
-        catalog = load_json_file(self.pricing_catalog_path)
+    def public_summary(self, catalog: dict[str, Any] | None = None) -> dict[str, Any]:
+        if catalog is None:
+            catalog = load_json_file(self.pricing_catalog_path)
         items = catalog.get("items") if isinstance(catalog.get("items"), list) else []
         return {
             "id": self.id or DEFAULT_PRICING_REFERENCE_ID,
@@ -18293,7 +18470,7 @@ class PricingReferencePack:
         raw_items = catalog.get("items") if isinstance(catalog.get("items"), list) else []
         items = [dict(item) for item in raw_items if isinstance(item, dict)]
         ensure_pricing_reference_order_fields(items)
-        detail = self.public_summary()
+        detail = self.public_summary(catalog)
         detail.update({
             "schema_version": int(parse_pricing_number(catalog.get("schema_version")) or 1),
             "items": sorted_pricing_reference_items(items),
@@ -20181,6 +20358,9 @@ def normalize_line_items(
     payload: dict[str, Any],
     use_catalog: bool = True,
     auth_session: dict[str, Any] | None = None,
+    *,
+    provider_result: bool = False,
+    trusted_input_authorities: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     raw_items = payload.get("line_items")
     if not isinstance(raw_items, list):
@@ -20207,7 +20387,7 @@ def normalize_line_items(
     authority_currency = normalize_currency_label(reference_detail.get("currency"))
     authority_digest = reference_detail.get("digest_sha256") if isinstance(reference_detail.get("digest_sha256"), str) else ""
 
-    if commercial_state.get("owned"):
+    if commercial_state.get("owned") and not provider_result:
         needs_catalog_validation = any(
             isinstance(raw, dict)
             and isinstance(raw.get("pricing_authority"), dict)
@@ -20260,9 +20440,32 @@ def normalize_line_items(
         authority_supplied = "pricing_authority" in raw
         authority_hint = raw.get("pricing_authority") if isinstance(raw.get("pricing_authority"), dict) else {}
         authority_variant_hint = authority_hint.get("variant") if isinstance(authority_hint.get("variant"), str) else ""
-        raw_price_mode_hint = clean_text(raw.get("price_mode")).title()
+        if provider_result:
+            raw = dict(raw)
+            for untrusted_field in (
+                "pricing_authority",
+                "display_price",
+                "status",
+                "unit_price_override",
+                "effective_unit_price",
+                "catalog_unit_price",
+                "pricing_basis_amount",
+                "approved_quote_amount",
+                "pricing_basis_currency",
+                "pricing_reference_source",
+                "pricing_reference_id",
+                "pricing_basis_digest",
+                "catalog_description",
+                "pricing_reference_description",
+            ):
+                raw.pop(untrusted_field, None)
+            raw.pop("price_mode", None)
+            display_price = ""
+            authority_supplied = False
+            authority_hint = {}
+            authority_variant_hint = ""
         raw_is_included = (
-            raw_price_mode_hint == "Included"
+            clean_text(raw.get("price_mode")).title() == "Included"
             or clean_text(raw.get("unit_price_override")).lower() == "included"
             or display_price.lower() == "included"
         ) and not (authority_supplied and authority_variant_hint == "catalog")
@@ -20276,6 +20479,37 @@ def normalize_line_items(
             else raw_unit
         )
         incoming_description = clean_customer_quote_line_text(quantity_parts["text"])
+        if provider_result:
+            source_line_id = safe_resource_id(raw.get("source_basis_line_id"), "")
+            saved_row_key = {
+                "source_basis_line_id": source_line_id,
+                "section": raw.get("section"),
+                "description": incoming_description,
+                "unit": incoming_unit,
+                "pricing_keyword": pricing_keyword,
+                "quantity": quantity,
+            }
+            saved = (trusted_input_authorities or {}).get(trusted_input_authority_lookup_key(saved_row_key))
+            saved_authority = saved.get("pricing_authority") if isinstance(saved, dict) and isinstance(saved.get("pricing_authority"), dict) else {}
+            saved_variant = clean_text(saved_authority.get("variant")).lower()
+            saved_context = {
+                "source_basis_line_id": canonical_pricing_authority_text(raw.get("source_basis_line_id")),
+                "section": canonical_pricing_authority_text(raw.get("section")) or "General",
+                "description": incoming_description,
+                "unit": incoming_unit,
+                "pricing_keyword": pricing_keyword,
+            }
+            if (
+                saved_variant in {"manual", "included"}
+                and pricing_authority_context_matches(saved_authority, saved_context)
+            ):
+                authority_supplied = True
+                authority_hint = copy.deepcopy(saved_authority)
+                authority_variant_hint = saved_variant
+                if saved_variant == "included":
+                    raw["price_mode"] = "Included"
+                    display_price = "Included"
+                    raw_is_included = True
         if authority_supplied and authority_variant_hint == "none":
             none_authority = normalize_pricing_authority(
                 authority_hint,
@@ -20289,8 +20523,11 @@ def normalize_line_items(
                 reference_authority=authority,
             )
             if none_authority and none_authority.get("variant") == "none":
-                # An explicit no-authority marker on a new draft must not block first catalog resolution.
-                authority_supplied = False
+                exact_current_item = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
+                # New rows may resolve on their first pass. A normalized unmatched row keeps its
+                # server-minted no-authority state until it gains an exact current selector.
+                if clean_text(raw.get("status")).lower() != "unmatched" or exact_current_item:
+                    authority_supplied = False
         incoming_authority = None
         catalog_item_for_family_admission = None
         if authority_supplied:
@@ -20324,21 +20561,30 @@ def normalize_line_items(
                 and catalog_item
             )
         else:
-            catalog_item = catalog_lookup.get(pricing_keyword)
-            pricing_keyword_was_explicit = bool(pricing_keyword and catalog_item)
-            if catalog_item:
-                pricing_keyword = clean_text(catalog_item.get("id"))
-            if not catalog_item:
-                inference_raw = raw
-                if pricing_keyword_looks_like_catalog_id(pricing_keyword):
-                    inference_raw = {**raw, "pricing_keyword": ""}
-                catalog_item = infer_catalog_item_for_line_item(inference_raw, catalog_lookup)
+            if provider_result:
+                actual_catalog_items = {
+                    clean_text(candidate.get("id")): candidate
+                    for candidate in catalog_items
+                    if isinstance(candidate, dict) and clean_text(candidate.get("id"))
+                }
+                catalog_item = actual_catalog_items.get(pricing_keyword)
+                pricing_keyword_was_explicit = bool(pricing_keyword and catalog_item)
                 if catalog_item:
                     pricing_keyword = clean_text(catalog_item.get("id"))
-                    if bracketed_reference_matches_catalog_item(raw.get("description"), catalog_item):
-                        pricing_keyword_was_explicit = True
-                else:
-                    pricing_keyword = ""
+            else:
+                catalog_item = catalog_lookup.get(pricing_keyword)
+                pricing_keyword_was_explicit = bool(pricing_keyword and catalog_item)
+                if catalog_item:
+                    pricing_keyword = clean_text(catalog_item.get("id"))
+                elif not pricing_keyword:
+                    inference_raw = raw
+                    catalog_item = infer_catalog_item_for_line_item(inference_raw, catalog_lookup)
+                    if catalog_item:
+                        pricing_keyword = clean_text(catalog_item.get("id"))
+                        if bracketed_reference_matches_catalog_item(raw.get("description"), catalog_item):
+                            pricing_keyword_was_explicit = True
+                    else:
+                        pricing_keyword = ""
             catalog_item_for_family_admission = catalog_item
         unit = (
             quantity_parts["unit"]
@@ -20422,6 +20668,15 @@ def normalize_line_items(
             item["status"] = "quantity-review"
             item.pop("catalog_unit_price", None)
         raw_match_status = clean_text(raw.get("status")).lower()
+        if provider_result and not catalog_item and price_mode != "Included":
+            item["status"] = "unmatched"
+        elif (
+            not catalog_item
+            and incoming_authority
+            and incoming_authority.get("variant") == "none"
+            and raw_match_status == "unmatched"
+        ):
+            item["status"] = "unmatched"
         if (
             price_mode != "Included"
             and catalog_item
@@ -20561,6 +20816,10 @@ def normalize_line_items(
                 item.pop(stale_key, None)
         trusted_price = pricing_authority_price(normalized_authority)
         trusted_variant = clean_text(normalized_authority.get("variant")).lower()
+        if provider_result and trusted_variant == "manual":
+            item["status"] = "manual-price"
+        if pricing_keyword and not catalog_item and trusted_variant not in {"manual", "included"}:
+            item["status"] = "unmatched"
         if trusted_variant == "included":
             item["price_mode"] = "Included"
             item["display_price"] = "Included"
@@ -21209,9 +21468,13 @@ def pricing_catalog_prompt_rows(reference_id: str | None = None, source: str = "
         payload = json.loads(pack.pricing_catalog_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return []
+    return pricing_catalog_prompt_rows_from_reference(payload)
+
+
+def pricing_catalog_prompt_rows_from_reference(reference: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     total_chars = 0
-    for item in payload.get("items") or []:
+    for item in reference.get("items") or []:
         if not isinstance(item, dict):
             continue
         item = pricing_reference_enrichment.enrich_pricing_reference_item(dict(item))
@@ -21262,6 +21525,8 @@ def local_pricing_reference_items(
     payload: dict[str, Any],
     limit: int | None = MAX_PROMPT_CATALOG_ROWS,
     auth_session: dict[str, Any] | None = None,
+    *,
+    include_unpriced: bool = False,
 ) -> list[dict[str, Any]]:
     reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     if not reference:
@@ -21276,7 +21541,10 @@ def local_pricing_reference_items(
         description = clean_text(raw.get("description"))[:MAX_PROMPT_CATALOG_DESCRIPTION_CHARS]
         cost = parse_float_or_none(raw.get("internal_cost"))
         markup = parse_float_or_none(raw.get("markup_multiplier"))
-        if not description or cost is None or cost <= 0 or markup is None or markup <= 0:
+        if not description or (
+            not include_unpriced
+            and (cost is None or cost <= 0 or markup is None or markup <= 0)
+        ):
             continue
         raw = pricing_reference_enrichment.enrich_pricing_reference_item(dict(raw))
         aliases = catalog_item_alias_values(raw)
@@ -21284,7 +21552,7 @@ def local_pricing_reference_items(
         remarks = raw.get("remarks") if isinstance(raw.get("remarks"), list) else []
         object_families = raw.get("object_families") if isinstance(raw.get("object_families"), list) else []
         item = {
-            "id": safe_section_id(raw.get("id"), f"local-item-{len(items) + 1}"),
+            "id": clean_text(raw.get("id")) or f"local-item-{len(items) + 1}",
             "section": clean_text(raw.get("section")),
             "reference_section": clean_basis_section_title(raw.get("reference_section") or raw.get("section")),
             "category_order": pricing_reference_order_number(raw.get("category_order")),
@@ -21329,6 +21597,13 @@ def pricing_catalog_prompt_rows_for_payload(
 ) -> list[dict[str, Any]]:
     if pricing_reference_authority_error(payload, auth_session=auth_session):
         return []
+    snapshot = pricing_reference_snapshot_for_payload(payload)
+    if snapshot is not None:
+        return local_pricing_reference_items(
+            payload,
+            auth_session=auth_session,
+            include_unpriced=True,
+        )
     if runtime_pricing_reference_from_payload(payload, auth_session=auth_session):
         return local_pricing_reference_items(payload, auth_session=auth_session)
     return pricing_catalog_prompt_rows(
@@ -21358,6 +21633,9 @@ def catalog_visual_image_entries_for_payload(
     limit: int = MAX_PROMPT_CATALOG_VISUAL_IMAGES,
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    snapshot = pricing_reference_snapshot_for_payload(payload)
+    if snapshot is not None:
+        return snapshot.visual_images()[:limit]
     if pricing_reference_authority_error(payload, auth_session=auth_session):
         return []
     if runtime_pricing_reference_from_payload(payload, auth_session=auth_session):
@@ -21371,6 +21649,39 @@ def catalog_visual_image_entries_for_payload(
     else:
         source_items = [item for item in data.get("items") or [] if isinstance(item, dict)]
         visual_base_dir = pack.directory
+    return catalog_visual_image_entries_for_items(source_items, visual_base_dir, limit=limit)
+
+
+def catalog_visual_image_entries_for_snapshot_detail(
+    detail: dict[str, Any],
+    source: str,
+    reference_id: str,
+    limit: int = MAX_PROMPT_CATALOG_VISUAL_IMAGES,
+) -> list[dict[str, Any]]:
+    if source not in {"local", "bundled"}:
+        return []
+    try:
+        visual_base_dir = (
+            pricing_reference_pack_dir(reference_id)
+            if source == "local"
+            else bundled_pricing_reference_pack_dir(reference_id)
+        )
+    except ValueError:
+        return []
+    items = detail.get("items") if isinstance(detail.get("items"), list) else []
+    return catalog_visual_image_entries_for_items(
+        [item for item in items if isinstance(item, dict)],
+        visual_base_dir,
+        limit=limit,
+    )
+
+
+def catalog_visual_image_entries_for_items(
+    source_items: list[dict[str, Any]],
+    visual_base_dir: Path | None,
+    *,
+    limit: int = MAX_PROMPT_CATALOG_VISUAL_IMAGES,
+) -> list[dict[str, Any]]:
     candidates: list[tuple[int, int, str, dict[str, Any]]] = []
     for item in source_items:
         refs = resolve_visual_references(item.get("visual_references"), visual_base_dir)
@@ -22164,8 +22475,11 @@ def quote_basis_sections_with_catalog_exact_lines(
     line_items: list[dict[str, Any]],
     catalog_items: list[dict[str, Any]] | None = None,
     mark_unmatched_confirm_custom: bool = False,
+    *,
+    provider_result: bool = False,
 ) -> list[dict[str, Any]]:
     invalid_pricing_keyword_flag = "_invalid_pricing_keyword"
+    invalid_pricing_keyword_value_flag = "_invalid_pricing_keyword_value"
     exact_catalog_items_by_id: dict[str, dict[str, Any]] = {}
     for item in catalog_items or []:
         if not isinstance(item, dict) or not clean_text(item.get("id")) or not clean_text(item.get("description")):
@@ -22179,6 +22493,8 @@ def quote_basis_sections_with_catalog_exact_lines(
             return None
         if normalized_keyword in exact_catalog_items_by_id:
             return exact_catalog_items_by_id[normalized_keyword]
+        if provider_result:
+            return None
         return next(
             (
                 item
@@ -22359,6 +22675,7 @@ def quote_basis_sections_with_catalog_exact_lines(
             if pricing_keyword and not catalog_item_for_pricing_keyword(pricing_keyword):
                 line.pop("pricing_keyword", None)
                 line[invalid_pricing_keyword_flag] = True
+                line[invalid_pricing_keyword_value_flag] = pricing_keyword
 
     def section_matches_item(section: dict[str, Any], item: dict[str, Any]) -> bool:
         item_keys = set()
@@ -22509,7 +22826,11 @@ def quote_basis_sections_with_catalog_exact_lines(
     def catalog_item_for_basis_line(line: dict[str, Any], section: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if is_default_dimension_basis_line(line):
             return None
+        if line.get(invalid_pricing_keyword_flag):
+            return None
         if clean_text(line.get("pricing_keyword")):
+            return None
+        if provider_result:
             return None
         scored = [
             (score_catalog_item_for_line(line, item, section), item)
@@ -22617,6 +22938,97 @@ def quote_basis_sections_with_catalog_exact_lines(
         text = clean_customer_quote_line_text(bracketed[0] if bracketed else value).casefold()
         return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
+    def exact_line_description_match(line: dict[str, Any], item: dict[str, Any]) -> bool:
+        line_bracketed = bracketed_catalog_reference_parts(line.get("text"))
+        line_value = line_bracketed[0] if line_bracketed else line.get("text")
+        line_keys = {
+            comparable_basis_text(line_value),
+            comparable_catalog_description_key_without_leading_unit(line_value),
+        }
+        item_keys = {
+            key
+            for value in (
+                item.get("description"),
+                item.get("catalog_description"),
+                item.get("pricing_reference_description"),
+            )
+            if clean_text(value)
+            for key in (
+                comparable_basis_text(value),
+                comparable_catalog_description_key_without_leading_unit(value),
+            )
+        }
+        return bool((line_keys - {""}) & (item_keys - {""}))
+
+    def provider_row_ids(item: dict[str, Any]) -> set[str]:
+        return {
+            safe_resource_id(value, "")
+            for value in (item.get("source_basis_line_id"), item.get("id"), item.get("source_line_item_id"))
+            if safe_resource_id(value, "")
+        }
+
+    def provider_dimensions_match(line: dict[str, Any], item: dict[str, Any]) -> bool:
+        line_quantity = parse_float_or_none(line.get("quantity"))
+        item_quantity = parse_float_or_none(item.get("quantity"))
+        if (
+            line_quantity is not None
+            and item_quantity is not None
+            and abs(line_quantity - item_quantity) > 0.001
+        ):
+            return False
+        line_unit = normalize_pricing_unit(line.get("unit"))
+        item_unit = normalize_pricing_unit(item.get("unit"))
+        return not (line_unit and item_unit and line_unit != item_unit)
+
+    def unique_unidentified_provider_match(
+        line: dict[str, Any],
+        item: dict[str, Any],
+        *,
+        allow_basis_ids: bool = False,
+    ) -> bool:
+        line_ids = {
+            safe_resource_id(value, "")
+            for value in (line.get("id"), line.get("source_line_item_id"))
+            if safe_resource_id(value, "")
+        }
+        if provider_row_ids(item) or (line_ids and not allow_basis_ids):
+            return False
+        if any(
+            safe_resource_id(candidate.get("source_basis_line_id"), "") in line_ids
+            for candidate in line_items
+        ):
+            return False
+        description_matches = [
+            candidate for candidate in line_items
+            if exact_line_description_match(line, candidate)
+        ]
+        if description_matches:
+            dimension_matches = [
+                candidate for candidate in description_matches
+                if provider_dimensions_match(line, candidate)
+                and section_matches_item(section, candidate)
+            ]
+            return len(dimension_matches) == 1 and dimension_matches[0] is item
+
+        section_items = [
+            candidate for candidate in line_items
+            if section_matches_item(section, candidate)
+        ]
+        section_lines = [
+            candidate
+            for candidate in section.get("lines") or []
+            if isinstance(candidate, dict)
+            and normalize_basis_tag(candidate.get("tag")) != "Exclude"
+            and not is_default_dimension_basis_line(candidate)
+        ]
+        return (
+            len(section_items) == 1
+            and section_items[0] is item
+            and len(section_lines) == 1
+            and section_lines[0] is line
+            and provider_dimensions_match(line, item)
+        )
+
     def item_description_is_reference_text(item: dict[str, Any]) -> bool:
         description = clean_customer_quote_line_text(item.get("description"))
         reference_values = [
@@ -22665,11 +23077,54 @@ def quote_basis_sections_with_catalog_exact_lines(
             safe_resource_id(line.get("source_line_item_id"), ""),
         }
         if source_id and source_id in line_ids:
-            return True
-        item_keyword = clean_text(item.get("pricing_keyword") or item.get("id"))
+            return not provider_result or sum(
+                safe_resource_id(candidate.get("source_basis_line_id"), "") == source_id
+                for candidate in line_items
+            ) == 1
+        if provider_result and source_id:
+            return False
+        if provider_result and any(line_ids):
+            return unique_unidentified_provider_match(line, item, allow_basis_ids=True)
+        item_keyword = clean_text(item.get("pricing_keyword"))
+        if line.get(invalid_pricing_keyword_flag):
+            return bool(
+                item_keyword
+                and item_keyword == clean_text(line.get(invalid_pricing_keyword_value_flag))
+                and not item_has_catalog_reference(item)
+                and section_matches_item(section, item)
+                and (
+                    unique_unidentified_provider_match(line, item)
+                    if provider_result
+                    else exact_line_description_match(line, item)
+                )
+            )
         line_keyword = clean_text(line.get("pricing_keyword"))
         if item_keyword and line_keyword and item_keyword == line_keyword:
-            return True
+            return not provider_result or unique_unidentified_provider_match(line, item)
+        if provider_result:
+            if line_keyword:
+                if item_keyword:
+                    return False
+                bracketed = bracketed_catalog_reference_parts(line.get("text"))
+                line_detail = bracketed[1] if bracketed and bracketed[1] else line.get("text")
+                line_key = re.sub(
+                    r"[^a-z0-9]+",
+                    " ",
+                    clean_customer_quote_line_text(line_detail).casefold(),
+                ).strip()
+                item_key = re.sub(
+                    r"[^a-z0-9]+",
+                    " ",
+                    clean_customer_quote_line_text(item.get("description")).casefold(),
+                ).strip()
+                return bool(
+                    line_key
+                    and line_key == item_key
+                    and unique_unidentified_provider_match(line, item)
+                )
+            if normalize_basis_tag(line.get("tag")) == "Custom" or line.get("custom_pricing"):
+                return False
+            return unique_unidentified_provider_match(line, item)
         return line_matches_catalog_description(line, clean_text(item.get("description"))) or line_matches_catalog_description(line, clean_text(item.get("catalog_description")))
 
     def apply_catalog_item_metadata(
@@ -22739,8 +23194,55 @@ def quote_basis_sections_with_catalog_exact_lines(
         if not section_catalog_items:
             continue
         counter_key = keys[0]
+        if provider_result:
+            candidates = [
+                line for line in section.get("lines") or []
+                if isinstance(line, dict)
+                and not line.get(invalid_pricing_keyword_flag)
+                and not clean_text(line.get("pricing_keyword"))
+                and normalize_basis_tag(line.get("tag")) == "Confirm"
+                and not is_default_dimension_basis_line(line)
+            ]
+            if len(section_catalog_items) == 1 and len(candidates) == 1:
+                item = section_catalog_items[0]
+                line = candidates[0]
+                line_source_ids = {
+                    safe_resource_id(value, "")
+                    for value in (line.get("id"), line.get("source_line_item_id"))
+                    if safe_resource_id(value, "")
+                }
+                item_source_id = safe_resource_id(item.get("source_basis_line_id"), "")
+                if line_source_ids or item_source_id:
+                    if len(line_source_ids) != 1 or not item_source_id or item_source_id not in line_source_ids:
+                        continue
+                    linked_items = [
+                        candidate_item
+                        for candidate_item in line_items
+                        if safe_resource_id(candidate_item.get("source_basis_line_id"), "") == item_source_id
+                    ]
+                    if len(linked_items) != 1:
+                        continue
+                    item = linked_items[0]
+                elif not unique_unidentified_provider_match(line, item):
+                    continue
+                if not catalog_line_contradicts_item(
+                    line.get("text"),
+                    item,
+                    catalog_items=exact_catalog_items,
+                ):
+                    apply_catalog_item_metadata(
+                        line,
+                        item,
+                        replace_text=False,
+                        prefer_existing_quantity=True,
+                    )
+            continue
         for line in section.get("lines") or []:
-            if not isinstance(line, dict) or normalize_basis_tag(line.get("tag")) in {"Custom", "Exclude"}:
+            if (
+                not isinstance(line, dict)
+                or line.get(invalid_pricing_keyword_flag)
+                or normalize_basis_tag(line.get("tag")) in {"Custom", "Exclude"}
+            ):
                 continue
             if clean_text(line.get("pricing_keyword")):
                 continue
@@ -22763,7 +23265,12 @@ def quote_basis_sections_with_catalog_exact_lines(
         for line in lines:
             if not isinstance(line, dict) or normalize_basis_tag(line.get("tag")) == "Exclude":
                 continue
-            if clean_text(line.get("pricing_keyword")):
+            if normalize_basis_tag(line.get("tag")) == "Custom" or line.get("custom_pricing"):
+                if provider_result:
+                    continue
+            if line.get(invalid_pricing_keyword_flag) or clean_text(line.get("pricing_keyword")):
+                continue
+            if provider_result:
                 continue
             match = next(
                 (
@@ -22801,6 +23308,24 @@ def quote_basis_sections_with_catalog_exact_lines(
         if not description:
             continue
         section = ensure_item_section(item)
+        if provider_result:
+            source_id = safe_resource_id(item.get("source_basis_line_id"), "")
+            if source_id and sum(
+                safe_resource_id(candidate.get("source_basis_line_id"), "") == source_id
+                for candidate in line_items
+            ) != 1:
+                continue
+            if not provider_row_ids(item):
+                item_line = {"text": description, "quantity": item.get("quantity"), "unit": item.get("unit")}
+                context_matches = [
+                    candidate
+                    for candidate in line_items
+                    if exact_line_description_match(item_line, candidate)
+                    and provider_dimensions_match(item_line, candidate)
+                    and section_matches_item(section, candidate)
+                ]
+                if len(context_matches) != 1:
+                    continue
         target_lines = section.setdefault("lines", [])
         existing_target = next(
             (
@@ -22812,6 +23337,13 @@ def quote_basis_sections_with_catalog_exact_lines(
             None,
         )
         if existing_target:
+            source_id = safe_resource_id(item.get("source_basis_line_id"), "")
+            has_existing_source_id = any(
+                safe_resource_id(existing_target.get(key), "")
+                for key in ("id", "source_line_item_id")
+            )
+            if source_id and not has_existing_source_id:
+                existing_target["id"] = source_id
             apply_catalog_item_metadata(
                 existing_target,
                 item,
@@ -22847,6 +23379,9 @@ def quote_basis_sections_with_catalog_exact_lines(
             "text": description,
             "confidence": 50,
         }
+        source_id = safe_resource_id(item.get("source_basis_line_id"), "")
+        if source_id:
+            next_line["id"] = source_id
         apply_catalog_item_metadata(next_line, item, default_confidence=50)
         target_lines.append(next_line)
     for section in next_sections:
@@ -22854,6 +23389,7 @@ def quote_basis_sections_with_catalog_exact_lines(
             if not isinstance(line, dict):
                 continue
             had_invalid_pricing_keyword = bool(line.pop(invalid_pricing_keyword_flag, False))
+            line.pop(invalid_pricing_keyword_value_flag, None)
             if not had_invalid_pricing_keyword:
                 continue
             if clean_text(line.get("pricing_keyword")) and item_has_catalog_reference(line):
@@ -22906,11 +23442,34 @@ def line_items_with_resolved_basis_catalog(
     line_items: list[dict[str, Any]],
     sections: list[dict[str, Any]],
     catalog_lookup: dict[str, dict[str, Any]],
+    *,
+    provider_result: bool = False,
 ) -> list[dict[str, Any]]:
     if not line_items or not sections or not catalog_lookup:
         return line_items
 
     basis_catalog_lines_by_id: dict[str, dict[str, Any]] = {}
+    basis_catalog_lines_by_description: dict[str, list[dict[str, Any]]] = {}
+
+    def basis_description_key(value: Any) -> str:
+        bracketed = bracketed_catalog_reference_parts(value)
+        text = bracketed[1] if bracketed and bracketed[1] else (bracketed[0] if bracketed else value)
+        text = clean_customer_quote_line_text(text).casefold()
+        return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+    def basis_dimensions_match_item(line: dict[str, Any], item: dict[str, Any]) -> bool:
+        line_quantity = parse_float_or_none(line.get("quantity"))
+        item_quantity = parse_float_or_none(item.get("quantity"))
+        if (
+            line_quantity is not None
+            and item_quantity is not None
+            and abs(line_quantity - item_quantity) > 0.001
+        ):
+            return False
+        line_unit = normalize_pricing_unit(line.get("unit"))
+        item_unit = normalize_pricing_unit(item.get("unit"))
+        return not (line_unit and item_unit and line_unit != item_unit)
+
     for section in sections:
         if not isinstance(section, dict):
             continue
@@ -22922,12 +23481,19 @@ def line_items_with_resolved_basis_catalog(
             pricing_keyword = clean_text(line.get("pricing_keyword"))
             if not pricing_keyword or pricing_keyword not in catalog_lookup:
                 continue
+            catalog_item = catalog_lookup.get(pricing_keyword)
+            catalog_item_id = clean_text(catalog_item.get("id")) if isinstance(catalog_item, dict) else ""
+            if provider_result and catalog_item_id != pricing_keyword:
+                continue
             for key in (line.get("id"), line.get("source_line_item_id")):
                 source_id = safe_resource_id(key, "")
                 if source_id:
                     basis_catalog_lines_by_id[source_id] = line
+            description_key = basis_description_key(line.get("text"))
+            if description_key:
+                basis_catalog_lines_by_description.setdefault(description_key, []).append(line)
 
-    if not basis_catalog_lines_by_id:
+    if not basis_catalog_lines_by_id and not basis_catalog_lines_by_description:
         return line_items
 
     resolved_items: list[dict[str, Any]] = []
@@ -22936,7 +23502,64 @@ def line_items_with_resolved_basis_catalog(
             continue
         source_id = safe_resource_id(item.get("source_basis_line_id"), "")
         basis_line = basis_catalog_lines_by_id.get(source_id)
+        if provider_result and source_id and sum(
+            safe_resource_id(candidate.get("source_basis_line_id"), "") == source_id
+            for candidate in line_items
+            if isinstance(candidate, dict)
+        ) != 1:
+            basis_line = None
+        if basis_line is None:
+            description_key = basis_description_key(item.get("description"))
+            description_matches = basis_catalog_lines_by_description.get(description_key, [])
+            compatible_description_matches = [
+                candidate
+                for candidate in description_matches
+                if basis_dimensions_match_item(candidate, item)
+            ]
+            if len(compatible_description_matches) == 1:
+                candidate = compatible_description_matches[0]
+                item_has_source_id = any(
+                    safe_resource_id(value, "")
+                    for value in (item.get("source_basis_line_id"), item.get("id"), item.get("source_line_item_id"))
+                )
+                matching_provider_items = [
+                    candidate_item
+                    for candidate_item in line_items
+                    if isinstance(candidate_item, dict)
+                    and basis_description_key(candidate_item.get("description")) == description_key
+                    and basis_dimensions_match_item(candidate, candidate_item)
+                ]
+                if not provider_result or (
+                    not source_id
+                    and not item_has_source_id
+                    and not any(
+                        safe_resource_id(candidate_item.get("source_basis_line_id"), "")
+                        in {
+                            safe_resource_id(value, "")
+                            for value in (candidate.get("id"), candidate.get("source_line_item_id"))
+                            if safe_resource_id(value, "")
+                        }
+                        for candidate_item in line_items
+                        if isinstance(candidate_item, dict)
+                    )
+                    and len(matching_provider_items) == 1
+                    and matching_provider_items[0] is item
+                ):
+                    basis_line = candidate
         pricing_keyword = clean_text(item.get("pricing_keyword"))
+        authority = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
+        authority_variant = clean_text(authority.get("variant")).lower()
+        selected_catalog = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
+        selected_catalog_id = clean_text(selected_catalog.get("id")) if isinstance(selected_catalog, dict) else ""
+        if provider_result and authority_variant in {"manual", "included"}:
+            resolved_items.append(item)
+            continue
+        if provider_result and pricing_keyword and selected_catalog_id != pricing_keyword:
+            resolved_items.append(item)
+            continue
+        if provider_result and not pricing_keyword and not basis_line:
+            resolved_items.append(item)
+            continue
         current_catalog_item = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
         current_evidence = [item.get("description")]
         if basis_line:
@@ -22961,6 +23584,9 @@ def line_items_with_resolved_basis_catalog(
             resolved_items.append(item)
             continue
         if not basis_line:
+            resolved_items.append(item)
+            continue
+        if pricing_keyword and pricing_keyword not in catalog_lookup:
             resolved_items.append(item)
             continue
         catalog_item = catalog_lookup.get(clean_text(basis_line.get("pricing_keyword")))
@@ -23035,6 +23661,8 @@ def line_items_aligned_to_quote_basis(
     catalog_lookup: dict[str, dict[str, Any]],
     *,
     approved_only: bool = False,
+    provider_result: bool = False,
+    exchange_rate: float | None = None,
 ) -> list[dict[str, Any]]:
     if not sections:
         return line_items
@@ -23056,7 +23684,7 @@ def line_items_aligned_to_quote_basis(
         if not isinstance(section, dict):
             continue
         for line in section.get("lines") or []:
-            if not is_informational_dimension_basis_line(line):
+            if normalize_basis_tag(line.get("tag")) != "Exclude" and not is_informational_dimension_basis_line(line):
                 continue
             for value in (line.get("id"), line.get("source_line_item_id")):
                 source_id = safe_resource_id(value, "")
@@ -23072,9 +23700,14 @@ def line_items_aligned_to_quote_basis(
         for item in line_items:
             if not isinstance(item, dict):
                 continue
+            source_values = (
+                (item.get("source_basis_line_id"),)
+                if provider_result
+                else (item.get("source_basis_line_id"), item.get("id"), item.get("source_line_item_id"))
+            )
             item_source_ids = {
                 safe_resource_id(value, "")
-                for value in (item.get("source_basis_line_id"), item.get("id"), item.get("source_line_item_id"))
+                for value in source_values
                 if safe_resource_id(value, "")
             }
             description_key = comparable_description(item.get("description"))
@@ -23094,7 +23727,12 @@ def line_items_aligned_to_quote_basis(
     for index, item in enumerate(line_items):
         if not isinstance(item, dict):
             continue
-        for key in (item.get("source_basis_line_id"), item.get("id"), item.get("source_line_item_id")):
+        source_values = (
+            (item.get("source_basis_line_id"),)
+            if provider_result
+            else (item.get("source_basis_line_id"), item.get("id"), item.get("source_line_item_id"))
+        )
+        for key in source_values:
             source_id = safe_resource_id(key, "")
             if source_id:
                 by_source_id.setdefault(source_id, []).append(index)
@@ -23121,11 +23759,51 @@ def line_items_aligned_to_quote_basis(
                 ids.append(source_id)
         return ids
 
+    def basis_line_dimensions_match_item(line: dict[str, Any], item: dict[str, Any]) -> bool:
+        line_quantity = parse_float_or_none(line.get("quantity"))
+        item_quantity = parse_float_or_none(item.get("quantity"))
+        if (
+            line_quantity is not None
+            and item_quantity is not None
+            and abs(line_quantity - item_quantity) > 0.001
+        ):
+            return False
+        line_unit = normalize_pricing_unit(line.get("unit"))
+        item_unit = normalize_pricing_unit(item.get("unit"))
+        return not (line_unit and item_unit and line_unit != item_unit)
+
     def existing_item_for_basis_line(line: dict[str, Any]) -> dict[str, Any] | None:
-        for source_id in basis_line_ids(line):
-            item = take_index(by_source_id.get(source_id, []))
-            if item:
-                return item
+        line_ids = basis_line_ids(line)
+        if provider_result:
+            source_matches = {
+                index for source_id in line_ids
+                for index in by_source_id.get(source_id, [])
+            }
+            if len(source_matches) == 1:
+                return take_index(list(source_matches))
+            if source_matches:
+                return None
+        else:
+            for source_id in line_ids:
+                item = take_index(by_source_id.get(source_id, []))
+                if item:
+                    return item
+        if provider_result:
+            description_key = comparable_description(line.get("text"))
+            candidate_indexes = [
+                index
+                for index in by_description.get(description_key, [])
+                if basis_line_dimensions_match_item(line, line_items[index])
+            ] if description_key else []
+            if len(candidate_indexes) == 1:
+                candidate = line_items[candidate_indexes[0]]
+                if any(
+                    safe_resource_id(value, "")
+                    for value in (candidate.get("source_basis_line_id"), candidate.get("id"), candidate.get("source_line_item_id"))
+                ):
+                    return None
+                return take_index(candidate_indexes)
+            return None
         pricing_keyword = clean_text(line.get("pricing_keyword"))
         if pricing_keyword:
             item = take_index(by_pricing_keyword.get(pricing_keyword, []))
@@ -23173,6 +23851,49 @@ def line_items_aligned_to_quote_basis(
             if not pricing_keyword and not is_custom:
                 continue
             existing = existing_item_for_basis_line(line) or {}
+            if provider_result and not existing:
+                description_key = comparable_description(line.get("text"))
+                existing_description_matches = [
+                    index for index in by_description.get(description_key, [])
+                    if basis_line_dimensions_match_item(line, line_items[index])
+                ] if description_key else []
+                if existing_description_matches or any(
+                    by_source_id.get(source_id) for source_id in basis_line_ids(line)
+                ):
+                    continue
+            existing_selector = clean_text(existing.get("pricing_keyword"))
+            existing_authority = (
+                existing.get("pricing_authority")
+                if isinstance(existing.get("pricing_authority"), dict)
+                else {}
+            )
+            existing_variant = clean_text(existing_authority.get("variant")).lower()
+            selected_catalog = catalog_lookup.get(existing_selector) if existing_selector else None
+            selected_catalog_id = clean_text(selected_catalog.get("id")) if isinstance(selected_catalog, dict) else ""
+            basis_catalog = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
+            basis_catalog_id = clean_text(basis_catalog.get("id")) if isinstance(basis_catalog, dict) else ""
+            if provider_result and existing_variant in {"manual", "included"}:
+                aligned.append(existing)
+                continue
+            if (
+                provider_result
+                and existing
+                and basis_catalog_id
+                and existing_selector != basis_catalog_id
+                and existing_variant not in {"manual", "included"}
+            ):
+                if existing:
+                    existing.setdefault("status", "unmatched")
+                    aligned.append(existing)
+                continue
+            if (
+                existing_selector
+                and existing_selector not in catalog_lookup
+                and existing_variant not in {"manual", "included"}
+            ):
+                existing.setdefault("status", "unmatched")
+                aligned.append(existing)
+                continue
             if catalog_item and any(
                 catalog_line_contradicts_item(
                     evidence,
@@ -23251,6 +23972,9 @@ def line_items_aligned_to_quote_basis(
                 next_item.pop("pricing_reference_description", None)
                 next_item.pop("catalog_unit_price", None)
                 next_item.setdefault("price_mode", "Priced")
+                if provider_result and not pricing_keyword and not existing:
+                    next_item["status"] = "unmatched"
+                    next_item["pricing_authority"] = build_pricing_authority("none", next_item)
             for order_key in ("category_order", "item_order"):
                 order_value = (
                     pricing_reference_order_number(line.get(order_key))
@@ -23261,13 +23985,29 @@ def line_items_aligned_to_quote_basis(
                     next_item[order_key] = order_value
                 else:
                     next_item.pop(order_key, None)
-            aligned.append(
-                rebind_pricing_authority_context(
-                    next_item,
-                    catalog_lookup=catalog_lookup,
-                    catalog_evidence_descriptions=(line.get("text"), existing.get("description")),
-                )
+            next_item = rebind_pricing_authority_context(
+                next_item,
+                catalog_lookup=catalog_lookup,
+                catalog_evidence_descriptions=(line.get("text"), existing.get("description")),
             )
+            trusted_price = pricing_authority_price(next_item.get("pricing_authority"))
+            if trusted_price is not None:
+                current_quantity = parse_float_or_none(next_item.get("quantity"))
+                if current_quantity is not None and current_quantity > 0:
+                    next_item["pricing_basis_amount"] = round_commercial_cents(current_quantity * trusted_price)
+                    next_item["approved_quote_amount"] = round_commercial_cents(
+                        next_item["pricing_basis_amount"] * (exchange_rate or 1)
+                    )
+                else:
+                    next_item.pop("pricing_basis_amount", None)
+                    next_item.pop("approved_quote_amount", None)
+            aligned.append(next_item)
+    if not approved_only:
+        aligned.extend(
+            dict(item)
+            for index, item in enumerate(line_items)
+            if index not in used_item_indexes and isinstance(item, dict)
+        )
     return aligned if approved_only else (aligned or line_items)
 
 
@@ -23280,9 +24020,18 @@ def normalize_line_items_for_quote_basis_review(
         return []
     if pricing_reference_authority_error(payload, auth_session=auth_session):
         return []
-    line_items = normalize_line_items(payload, auth_session=auth_session)
     if commercial_state.get("owned"):
+        line_items = normalize_line_items(payload, auth_session=auth_session)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
+    trusted_input_authorities: dict[str, dict[str, Any]] = {}
+    trusted_input_items = normalize_line_items(payload, auth_session=auth_session)
+    trusted_input_authorities = trusted_manual_included_input_authorities(trusted_input_items)
+    line_items = normalize_line_items(
+        payload,
+        auth_session=auth_session,
+        provider_result=True,
+        trusted_input_authorities=trusted_input_authorities,
+    )
     sections = normalize_quote_basis_sections(
         payload,
         pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
@@ -23299,13 +24048,21 @@ def normalize_line_items_for_quote_basis_review(
         sections,
         line_items,
         list(catalog_lookup.values()),
+        provider_result=True,
     )
-    line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
+    line_items = line_items_with_resolved_basis_catalog(
+        line_items,
+        sections,
+        catalog_lookup,
+        provider_result=True,
+    )
     line_items = line_items_aligned_to_quote_basis(
         line_items,
         sections,
         catalog_lookup,
         approved_only=True,
+        provider_result=True,
+        exchange_rate=quote_exchange_rate_from_payload(payload),
     )
     return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
@@ -23567,6 +24324,19 @@ def require_basis_confidence(sections: list[dict[str, Any]], provider: str = "AI
         )
 
 
+def pricing_authority_variant_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+    variants = {"none", "historical", "manual", "included", "catalog"}
+    counts = {variant: 0 for variant in (*sorted(variants), "absent", "other")}
+    for item in items:
+        authority = item.get("pricing_authority") if isinstance(item, dict) else None
+        if not isinstance(authority, dict):
+            counts["absent"] += 1
+            continue
+        variant = clean_text(authority.get("variant")).lower()
+        counts[variant if variant in variants else "other"] += 1
+    return counts
+
+
 def normalize_ai_draft(
     parsed: dict[str, Any],
     payload: dict[str, Any] | None = None,
@@ -23574,7 +24344,11 @@ def normalize_ai_draft(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     has_payload_context = payload is not None
-    payload = payload or {}
+    payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    if has_payload_context and pricing_reference_snapshot_for_payload(payload) is None:
+        snapshot = capture_pricing_reference_snapshot(payload, auth_session=auth_session)
+        if snapshot is not None:
+            payload["_pricing_reference_snapshot"] = snapshot
     raw_line_items = parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []
     raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
     dimensions = booth_dimensions_from_payload({"project": raw_project}) if raw_project else {}
@@ -23583,10 +24357,20 @@ def normalize_ai_draft(
         if has_payload_context
         else []
     )
+    trusted_input_authorities: dict[str, dict[str, Any]] = {}
+    if has_payload_context and isinstance(payload.get("line_items"), list):
+        trusted_input_items = normalize_line_items(
+            {**payload, "line_items": payload["line_items"]},
+            use_catalog=True,
+            auth_session=auth_session,
+        )
+        trusted_input_authorities = trusted_manual_included_input_authorities(trusted_input_items)
     line_items = normalize_line_items(
         {**payload, "line_items": raw_line_items},
         use_catalog=has_payload_context,
         auth_session=auth_session,
+        provider_result=has_payload_context,
+        trusted_input_authorities=trusted_input_authorities,
     )
     catalog_lookup = (
         pricing_catalog_runtime_lookup_for_payload(
@@ -23602,10 +24386,22 @@ def normalize_ai_draft(
         line_items,
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=has_payload_context,
+        provider_result=has_payload_context,
     )
-    line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
+    line_items = line_items_with_resolved_basis_catalog(
+        line_items,
+        sections,
+        catalog_lookup,
+        provider_result=has_payload_context,
+    )
     sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections, auth_session=auth_session)
-    line_items = line_items_aligned_to_quote_basis(line_items, sections, catalog_lookup)
+    line_items = line_items_aligned_to_quote_basis(
+        line_items,
+        sections,
+        catalog_lookup,
+        provider_result=has_payload_context,
+        exchange_rate=quote_exchange_rate_from_payload(payload),
+    )
     legacy_basis = quote_basis_from_sections(sections)
     blockers = normalize_blocking_clarification_questions(parsed.get("blocking_clarification_questions"))
     if blockers:
@@ -23614,7 +24410,7 @@ def normalize_ai_draft(
         legacy_basis = {}
     elif require_confidence:
         require_basis_confidence(sections)
-    return {
+    result = {
         "analysis_findings": normalize_analysis_findings(parsed.get("analysis_findings")),
         "blocking_clarification_questions": blockers,
         "quote_basis": {
@@ -23626,6 +24422,41 @@ def normalize_ai_draft(
         "line_items": line_items,
         "project": dimensions,
     }
+    if has_payload_context:
+        snapshot = pricing_reference_snapshot_for_payload(payload)
+        actual_ids = {
+            clean_text(item.get("id"))
+            for item in catalog_lookup.values()
+            if isinstance(item, dict) and clean_text(item.get("id"))
+        }
+        raw_authorities = [raw for raw in raw_line_items if isinstance(raw, dict)]
+        result["_forensic_pricing_counts"] = {
+            "raw_provider_row_count": len(raw_line_items),
+            "rows_carrying_pricing_keyword": sum(
+                1 for raw in raw_line_items
+                if isinstance(raw, dict) and clean_text(raw.get("pricing_keyword"))
+            ),
+            "provider_authority_variant_counts": pricing_authority_variant_counts(raw_authorities),
+            "exact_authoritative_selector_match_count": sum(
+                1 for raw in raw_line_items
+                if isinstance(raw, dict) and clean_text(raw.get("pricing_keyword")) in actual_ids
+            ),
+            "trusted_count_before_canonicalization": sum(
+                1 for raw in raw_authorities
+                if isinstance(raw.get("pricing_authority"), dict)
+                and clean_text(raw["pricing_authority"].get("variant")).lower() == "catalog"
+            ),
+            "trusted_count_after_canonicalization": sum(
+                1 for item in line_items
+                if isinstance(item.get("pricing_authority"), dict)
+                and item["pricing_authority"].get("variant") == "catalog"
+                and snapshot is not None
+                and item["pricing_authority"].get("catalog_source") == snapshot.source
+                and item["pricing_authority"].get("catalog_digest") == snapshot.digest
+            ),
+            "post_normalization_authority_variant_counts": pricing_authority_variant_counts(line_items),
+        }
+    return result
 
 
 def draft_request_invalid() -> None:
@@ -24281,13 +25112,25 @@ def unpack_ai_draft(
     ai_draft: dict[str, Any],
     payload: dict[str, Any] | None = None,
     auth_session: dict[str, Any] | None = None,
+    *,
+    provider_result: bool = False,
 ) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
     has_payload_context = payload is not None
     payload = payload or {}
+    trusted_input_authorities: dict[str, dict[str, Any]] = {}
+    if provider_result and isinstance(payload.get("line_items"), list):
+        trusted_input_items = normalize_line_items(
+            payload,
+            use_catalog=True,
+            auth_session=auth_session,
+        )
+        trusted_input_authorities = trusted_manual_included_input_authorities(trusted_input_items)
     line_items = normalize_line_items(
         {**payload, "line_items": ai_draft.get("line_items")},
         use_catalog=has_payload_context,
         auth_session=auth_session,
+        provider_result=provider_result,
+        trusted_input_authorities=trusted_input_authorities,
     )
     pricing_reference_sections = pricing_reference_section_names_for_payload(
         payload,
@@ -24307,10 +25150,22 @@ def unpack_ai_draft(
         line_items,
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=has_payload_context,
+        provider_result=provider_result,
     )
-    line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
+    line_items = line_items_with_resolved_basis_catalog(
+        line_items,
+        sections,
+        catalog_lookup,
+        provider_result=provider_result,
+    )
     sections = sort_quote_basis_sections_by_pricing_reference_order(payload, sections, auth_session=auth_session)
-    line_items = line_items_aligned_to_quote_basis(line_items, sections, catalog_lookup)
+    line_items = line_items_aligned_to_quote_basis(
+        line_items,
+        sections,
+        catalog_lookup,
+        provider_result=provider_result,
+        exchange_rate=quote_exchange_rate_from_payload(payload),
+    )
     require_basis_confidence(sections, provider=clean_text(ai_draft.get("source")) or "AI")
     raw_basis = quote_basis_from_sections(sections)
     basis = {
@@ -24338,9 +25193,7 @@ def ai_draft_diagnostic_details(
     return {
         "source": source,
         "quote_basis_key_count": len(basis),
-        "quote_basis_keys": list(basis.keys())[:20],
         "quote_basis_section_count": len(sections),
-        "section_titles": [clean_text(section.get("title")) for section in sections[:20] if isinstance(section, dict)],
         "line_item_count": len(line_items),
     }
 
@@ -24372,6 +25225,7 @@ def finalized_remote_draft_result(
         ai_basis,
         payload,
         auth_session=auth_session,
+        provider_result=source.strip().lower() != "local",
     )
     blockers = normalize_blocking_clarification_questions(ai_basis.get("blocking_clarification_questions"))
     if blockers:
@@ -24397,14 +25251,26 @@ def finalized_remote_draft_result(
         line_items,
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=True,
+        provider_result=source.strip().lower() != "local",
     )
-    line_items = line_items_with_resolved_basis_catalog(line_items, adjusted_sections, catalog_lookup)
+    line_items = line_items_with_resolved_basis_catalog(
+        line_items,
+        adjusted_sections,
+        catalog_lookup,
+        provider_result=source.strip().lower() != "local",
+    )
     adjusted_sections = sort_quote_basis_sections_by_pricing_reference_order(
         payload,
         adjusted_sections,
         auth_session=auth_session,
     )
-    line_items = line_items_aligned_to_quote_basis(line_items, adjusted_sections, catalog_lookup)
+    line_items = line_items_aligned_to_quote_basis(
+        line_items,
+        adjusted_sections,
+        catalog_lookup,
+        provider_result=source.strip().lower() != "local",
+        exchange_rate=quote_exchange_rate_from_payload(payload),
+    )
     for section in adjusted_sections:
         for line in section.get("lines") or []:
             if not isinstance(line, dict):
@@ -24435,6 +25301,16 @@ def finalized_remote_draft_result(
         "quote_basis_sections": adjusted_sections,
         "line_items": final_line_items,
         "project": project,
+        **(
+            {"_forensic_pricing_counts": copy.deepcopy(ai_basis["_forensic_pricing_counts"])}
+            if isinstance(ai_basis.get("_forensic_pricing_counts"), dict)
+            else {}
+        ),
+        **(
+            {"pricing_reference_basis": pricing_reference_snapshot_basis(pricing_reference_snapshot_for_payload(payload))}
+            if pricing_reference_snapshot_for_payload(payload) is not None
+            else {}
+        ),
     }
 
 
@@ -24484,7 +25360,44 @@ def log_protected_ai_draft_block(
     write_local_log("ai_draft_protected_mode_blocked", details)
 
 
+def completed_draft_with_pricing_reference_snapshot(
+    payload: dict[str, Any],
+    result: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    changed_review = pricing_reference_snapshot_changed_review(
+        payload, auth_session=auth_session
+    )
+    if changed_review:
+        return {
+            "status": "blocked",
+            "errors": [QUOTE_COMMERCIAL_REVIEW_MESSAGE],
+            "quoteCommercialReview": changed_review,
+        }
+    snapshot = pricing_reference_snapshot_for_payload(payload)
+    if snapshot is None:
+        return pricing_reference_authority_blocked_result(
+            payload,
+            [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+            auth_session=auth_session,
+        )
+    completed = dict(result)
+    completed["pricing_reference_basis"] = pricing_reference_snapshot_basis(snapshot)
+    return completed
+
+
 def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    if pricing_reference_snapshot_for_payload(payload) is None:
+        snapshot = capture_pricing_reference_snapshot(payload, auth_session=auth_session)
+        if snapshot is not None:
+            payload["_pricing_reference_snapshot"] = snapshot
+    if pricing_reference_snapshot_for_payload(payload) is None:
+        return pricing_reference_authority_blocked_result(
+            payload,
+            [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+            auth_session=auth_session,
+        )
     validate_draft_references(payload)
     pricing_reference_error = pricing_reference_authority_error(
         payload,
@@ -24583,6 +25496,11 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                     "OpenAI analysis response could not be normalized.",
                     diagnostics={"failure_boundary": "application_normalization"},
                 ) from exc
+            result = completed_draft_with_pricing_reference_snapshot(
+                payload, result, auth_session=auth_session
+            )
+            if result.get("status") == "blocked":
+                return result
             log_ai_call_attempt(
                 feature="draft_quote_basis",
                 provider=AI_PROVIDER_OPENAI,
@@ -24682,7 +25600,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 "line_item_count": len(fallback_line_items),
             },
         )
-        return {
+        return completed_draft_with_pricing_reference_snapshot(payload, {
             "status": "drafted",
             "source": "local",
             "analysis_mode": draft_analysis_mode(payload),
@@ -24694,7 +25612,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             "project": fallback_project,
             "error_reference": error_reference,
             "warnings": warnings,
-        }
+        }, auth_session=auth_session)
 
     error_reference = new_error_reference()
     try:
@@ -24730,7 +25648,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             "line_item_count": len(fallback_line_items),
         },
     )
-    return {
+    return completed_draft_with_pricing_reference_snapshot(payload, {
         "status": "drafted",
         "source": "local",
         "analysis_mode": draft_analysis_mode(payload),
@@ -24741,7 +25659,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
         "project": fallback_project,
         "error_reference": error_reference,
         "warnings": warnings,
-    }
+    }, auth_session=auth_session)
 
 
 def answer_basis_chat(
@@ -28224,22 +29142,48 @@ def set_job_state(job_id: str, **updates: Any) -> None:
 def finish_draft_job(job_id: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> None:
     try:
         result = draft_quote_basis(payload, auth_session=auth_session)
-        result_status = clean_text(result.get("status"))
-        if result_status in {"blocked", "failed"}:
-            status = result_status
-        else:
-            status = "degraded" if result.get("source") == "local" and result.get("warnings") else "completed"
-        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [])
     except OpenAIAnalysisError as exc:
         error_reference = new_error_reference()
         result = failed_result_payload(error_reference)
         write_local_log("draft_failed", ai_error_log_details(error_reference, exc, job_id=job_id))
-        set_job_state(job_id, status="failed", result=result, errors=result["errors"], error_reference=error_reference)
     except Exception as exc:  # pragma: no cover - defensive worker boundary
         error_reference = new_error_reference()
         result = failed_result_payload(error_reference)
         write_local_log("draft_worker_failed", unexpected_error_log_details(error_reference, exc, job_id=job_id))
-        set_job_state(job_id, status="failed", result=result, errors=result["errors"], error_reference=error_reference)
+
+    client_status = clean_text(result.get("status")) or "failed"
+    generation_run_id = safe_reference(payload.get("_generation_run_id"), "run-")
+    if generation_run_id:
+        forensic_result = dict(result)
+        forensic_result["job_id"] = job_id
+        forensic_result["status"] = "completed" if client_status == "drafted" else client_status
+        result = finish_generation_forensics(
+            generation_run_id,
+            forensic_result,
+            auth_session,
+            error_category=(
+                "draft_blocked" if client_status == "blocked"
+                else "draft_failed" if client_status == "failed"
+                else ""
+            ),
+            validated_session_id=safe_quote_session_id(payload.get("_forensic_quote_session_id"), ""),
+        )
+        if clean_text(result.get("status")) != "failed" or client_status == "failed":
+            result["status"] = client_status
+    result.pop("_forensic_pricing_counts", None)
+    result["job_id"] = job_id
+    result_status = clean_text(result.get("status"))
+    if result_status in {"blocked", "failed"}:
+        status = result_status
+    else:
+        status = "degraded" if result.get("source") == "local" and result.get("warnings") else "completed"
+    set_job_state(
+        job_id,
+        status=status,
+        result=result,
+        errors=result.get("errors") or [],
+        error_reference=clean_text(result.get("error_reference")) if status == "failed" else "",
+    )
 
 
 def finish_generate_job(job_id: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> None:
@@ -28742,19 +29686,27 @@ def forensic_request_evidence_error(payload: dict[str, Any]) -> str:
 
 
 def minimal_forensic_request_summary(
-    payload: dict[str, Any], assessment: dict[str, Any]
+    payload: dict[str, Any], assessment: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    assessment = assessment if isinstance(assessment, dict) else {}
+    snapshot = pricing_reference_snapshot_for_payload(payload)
+    snapshot_detail = snapshot.detail() if snapshot is not None else {}
     return {
         "schema": "swooshz.sqag.generation-request-evidence.v2",
         "image_count": len(image_entries(payload)),
         "has_quote_session": isinstance(payload.get("quote_session"), dict),
         "profile_id": safe_resource_id(profile_id_from_payload(payload), ""),
         "pricing_reference_id": safe_resource_id(
-            pricing_reference_id_from_payload(payload), ""
+            snapshot.reference_id if snapshot else pricing_reference_id_from_payload(payload), ""
         ),
+        "pricing_reference_source": snapshot.source if snapshot else "",
+        "pricing_reference_digest": snapshot.digest if snapshot else "",
+        "pricing_reference_currency": snapshot.currency if snapshot else "",
+        "catalogue_row_count": len(snapshot_detail.get("items", [])) if isinstance(snapshot_detail.get("items"), list) else 0,
         "payload_shape_sha256": hashlib.sha256(
             json.dumps(
-                sorted(str(key) for key in payload.keys()), separators=(",", ":")
+                sorted(str(key) for key in payload.keys() if key not in {"_pricing_reference_snapshot", "_generation_run_id", "_forensic_quote_session_id"}),
+                separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest(),
         "request_evidence": {
@@ -28819,6 +29771,34 @@ def forensic_result_summary(result: dict[str, Any]) -> dict[str, Any]:
         "pricing_match_count": len(result.get("pricing_matches")) if isinstance(result.get("pricing_matches"), list) else 0,
         "export_status_sha256": hashlib.sha256(clean_text(result.get("export_status")).encode("utf-8")).hexdigest(),
     }
+    raw_pricing_counts = result.get("_forensic_pricing_counts")
+    if isinstance(raw_pricing_counts, dict):
+        count_fields = (
+            "raw_provider_row_count",
+            "rows_carrying_pricing_keyword",
+            "exact_authoritative_selector_match_count",
+            "trusted_count_before_canonicalization",
+            "trusted_count_after_canonicalization",
+        )
+        safe_counts = {}
+        for key in count_fields:
+            value = raw_pricing_counts.get(key)
+            if type(value) is int and 0 <= value <= 100000:
+                safe_counts[key] = value
+        for key in ("provider_authority_variant_counts", "post_normalization_authority_variant_counts"):
+            values = raw_pricing_counts.get(key)
+            if not isinstance(values, dict):
+                continue
+            projected = {
+                variant: value
+                for variant, value in values.items()
+                if variant in {"absent", "catalog", "historical", "included", "manual", "none", "other"}
+                and type(value) is int and 0 <= value <= 100000
+            }
+            if projected:
+                safe_counts[key] = projected
+        if safe_counts:
+            summary["pricing_draft_counts"] = safe_counts
     projection_failure = result.get("_post_commit_projection_failure")
     if isinstance(committed_files, list):
         summary.update({
@@ -28925,6 +29905,46 @@ def validated_generation_session_id(
     except (SqagStorageAccessError, OSError, ValueError):
         return ""
 
+def runtime_application_revision() -> str:
+    configured = clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA"))
+    if re.fullmatch(r"[A-Fa-f0-9]{40,64}", configured):
+        return configured.lower()
+    metadata_path = PROJECT_ROOT / ".git"
+    try:
+        if metadata_path.is_file():
+            metadata = metadata_path.read_text(encoding="utf-8").strip()
+            match = re.fullmatch(r"gitdir:\s*(.+)", metadata)
+            if not match:
+                return ""
+            git_dir = Path(match.group(1).strip())
+            if not git_dir.is_absolute():
+                git_dir = PROJECT_ROOT / git_dir
+        else:
+            git_dir = metadata_path
+        head = (git_dir / "HEAD").read_text(encoding="ascii").strip()
+        if re.fullmatch(r"[A-Fa-f0-9]{40,64}", head):
+            return head.lower()
+        match = re.fullmatch(r"ref:\s*(refs/[A-Za-z0-9._/-]+)", head)
+        if not match or ".." in match.group(1).split("/"):
+            return ""
+        ref_name = match.group(1)
+        loose_ref = git_dir.joinpath(*ref_name.split("/"))
+        if loose_ref.is_file():
+            revision = loose_ref.read_text(encoding="ascii").strip().lower()
+            return revision if re.fullmatch(r"[a-f0-9]{40,64}", revision) else ""
+        packed_refs = git_dir / "packed-refs"
+        if packed_refs.is_file():
+            for line in packed_refs.read_text(encoding="ascii").splitlines():
+                if line.startswith(("#", "^")):
+                    continue
+                revision, separator, candidate = line.partition(" ")
+                if separator and candidate == ref_name and re.fullmatch(r"[A-Fa-f0-9]{40,64}", revision):
+                    return revision.lower()
+    except (OSError, UnicodeError, ValueError):
+        return ""
+    return ""
+
+
 def begin_generation_forensics(
     job_type: str,
     payload: dict[str, Any],
@@ -28937,17 +29957,29 @@ def begin_generation_forensics(
 ) -> str:
     try:
         with forensic_store_for_auth_session(auth_session) as store:
-            run_id = store.record_run_started(
-                job_type,
+            run_id = store.new_id("run")
+            app_revision = runtime_application_revision()
+            request_summary = (
                 dict(request_summary_override)
                 if request_summary_override is not None
-                else forensic_request_summary(payload),
+                else forensic_request_summary(payload)
+            )
+            request_summary.update({
+                "job_id": safe_resource_id(job_id, ""),
+                "run_id": run_id,
+                "quote_session_id": safe_quote_session_id(validated_session_id, ""),
+                "app_revision": app_revision,
+                "attempt_number": 1,
+            })
+            run_id = store.record_run_started(
+                job_type,
+                request_summary,
+                run_id=run_id,
                 job_id=job_id,
                 idempotency_key=job_id,
                 quote_session_id=validated_session_id,
-                app_revision=clean_text(
-                    os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")
-                ),
+                attempt_number=1,
+                app_revision=app_revision,
             )
             if claim_status:
                 run = store.run_for_job(job_id)
@@ -29123,6 +30155,7 @@ def finish_generation_forensics(
             failure = failed_result_payload(error_reference)
             failure["generation_run_id"] = run_id
             return failure
+    enriched.pop("_forensic_pricing_counts", None)
     return enriched
 
 
@@ -29464,8 +30497,19 @@ def create_job(
     normalized_type = job_type.strip().lower() if isinstance(job_type, str) else ""
     payload = dict(payload)
     payload.pop("_generation_run_id", None)
+    payload.pop("_forensic_quote_session_id", None)
+    payload.pop("_pricing_reference_snapshot", None)
     if normalized_type not in {"draft", "generate", "generate_pdf", "basis_chat"}:
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
+    if normalized_type == "draft":
+        snapshot = capture_pricing_reference_snapshot(payload, auth_session=auth_session)
+        if snapshot is None:
+            return pricing_reference_authority_blocked_result(
+                payload,
+                [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+                auth_session=auth_session,
+            )
+        payload["_pricing_reference_snapshot"] = snapshot
     commercial_review_block = quote_commercial_review_preflight(
         payload,
         auth_session=auth_session,
@@ -29512,7 +30556,7 @@ def create_job(
                     return {"status": "blocked", "errors": ["Job request could not be resumed."]}
                 return public_job(existing)
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
-    if normalized_type in {"generate", "generate_pdf"}:
+    if normalized_type in {"draft", "generate", "generate_pdf"}:
         validated_session_id = validated_generation_session_id(payload, auth_session)
     evidence_assessment = forensic_request_evidence_assessment(payload)
     evidence_error = clean_text(evidence_assessment.get("error"))
@@ -29625,9 +30669,26 @@ def create_job(
         )
     payload = resolved_payload
 
+    if normalized_type == "draft":
+        generation_run_id = begin_generation_forensics(
+            normalized_type,
+            payload,
+            auth_session,
+            job_id=job_id,
+            claim_status="queued",
+            validated_session_id=validated_session_id,
+            request_summary_override=minimal_forensic_request_summary(payload),
+        )
+        if not generation_run_id:
+            return {
+                "job_id": job_id,
+                "status": "blocked",
+                "errors": ["Analysis evidence storage is unavailable."],
+            }
     if generation_run_id:
         payload = dict(payload)
         payload["_generation_run_id"] = generation_run_id
+        payload["_forensic_quote_session_id"] = validated_session_id
     now = utc_timestamp()
     job = {
         "job_id": job_id,

@@ -54,9 +54,32 @@ class DraftRequestContractTest(unittest.TestCase):
         self.send = self.enterContext(mock.patch.object(server.urllib.request, "urlopen", return_value=response))
         self.image = synthetic_image()
         self.pdf = synthetic_pdf()
+        pricing_detail = {
+            "id": "synthetic-draft-contract-reference",
+            "label": "Synthetic draft contract reference",
+            "source": "local",
+            "currency": "SGD",
+            "tax": {"label": "GST", "rate": 0},
+            "items": [],
+        }
+        pricing_detail["digest_sha256"] = server.pricing_reference_catalog_digest(pricing_detail)
+        self.pricing_snapshot = server.PricingReferenceSnapshot(
+            source="local",
+            reference_id=pricing_detail["id"],
+            digest=pricing_detail["digest_sha256"],
+            currency="SGD",
+            detail_json=json.dumps(pricing_detail, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        )
+        self.pricing_detail = pricing_detail
 
     def payload(self, *urls):
-        return {"images": [{"name": f"synthetic-{i}", "data_url": url} for i, url in enumerate(urls or (self.image,))]}
+        return {
+            "images": [{"name": f"synthetic-{i}", "data_url": url} for i, url in enumerate(urls or (self.image,))],
+            "pricing_reference_id": self.pricing_snapshot.reference_id,
+            "pricing_reference_source": self.pricing_snapshot.source,
+            "pricing_reference": self.pricing_detail,
+            "_pricing_reference_snapshot": self.pricing_snapshot,
+        }
 
     def capture(self, payload=None):
         server.request_openai_quote_basis(payload or self.payload(), "synthetic-key")
@@ -117,6 +140,53 @@ class DraftRequestContractTest(unittest.TestCase):
         self.assertEqual([p["type"] for p in parts], ["input_text", "input_file", "input_text", "input_image", "input_image", "input_text", "input_image"])
         self.assertEqual([p["detail"] for p in parts if p["type"] == "input_image"], ["high", "high", "low"])
         self.assertEqual(parts[1]["file_data"], self.pdf)
+
+    def test_prompt_reads_the_captured_pricing_reference_snapshot(self):
+        payload = self.payload()
+        detail = {
+            "id": "synthetic-prompt-snapshot",
+            "label": "Synthetic prompt snapshot",
+            "source": "local",
+            "currency": "SGD",
+            "items": [{
+                "id": "synthetic-snapshot-line",
+                "section": "Synthetic",
+                "description": "nos snapshot item",
+                "unit_hint": "nos",
+                "internal_cost": 10,
+                "markup_multiplier": 1.25,
+                "sale_unit_price": 12.5,
+            }],
+        }
+        detail["digest_sha256"] = server.pricing_reference_catalog_digest(detail)
+        payload.update({
+            "pricing_reference_id": detail["id"],
+            "pricing_reference_source": detail["source"],
+            "pricing_reference": detail,
+            "_pricing_reference_snapshot": server.PricingReferenceSnapshot(
+                source=detail["source"],
+                reference_id=detail["id"],
+                digest=detail["digest_sha256"],
+                currency=detail["currency"],
+                detail_json=json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+            ),
+        })
+
+        def prompt_from_snapshot(bound_payload, auth_session=None):
+            rows = server.pricing_catalog_prompt_rows_for_payload(
+                bound_payload,
+                server.profile_id_from_payload(bound_payload),
+                auth_session=auth_session,
+            )
+            self.assertEqual([row["id"] for row in rows], ["synthetic-snapshot-line"])
+            self.assertEqual(rows[0]["internal_cost"], 10)
+            self.assertEqual(rows[0]["markup_multiplier"], 1.25)
+            return json.dumps({"pricing_catalog": rows}, sort_keys=True)
+
+        with mock.patch.object(server, "build_quote_draft_prompt", side_effect=prompt_from_snapshot):
+            body = self.capture(payload)
+        prompt_text = body["input"][0]["content"][0]["text"]
+        self.assertIn("synthetic-snapshot-line", prompt_text)
 
     def test_invalid_supplied_media_rejects_whole_request(self):
         malformed = [None, 3, "", self.image + "\n", self.image + ",extra", self.image.replace(";base64", ";charset=utf8;base64"), "data:image/png;base64,", "data:image/png;base64,!!!!", "data:image/png;base64,Zg===", "data:image/png;base64,Zh==", self.image.replace("image/png", "image/gif"), self.image.replace("image/png", "image/jpeg"), "https://private.invalid/render", "data:application/pdf;base64,JVBERi0xLjQK", "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\ncorrupt").decode()]
