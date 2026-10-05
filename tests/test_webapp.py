@@ -13282,6 +13282,112 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 self.assertEqual(sections[0]["lines"][1], before[0]["lines"][1])
                 self.assertEqual(payload["quote_basis_sections"], before)
 
+    def hosted_style_basis_chat_payload(self):
+        payload = valid_payload()
+        payload["quote_basis_sections"] = [{
+            "id": "graphics", "title": "Graphics", "section_meta": {"keep": [1, True, None]},
+            "lines": [
+                {"id": "selected-graphic", "tag": "Confirm", "text": "Existing printed wall graphic.",
+                 "quantity": 2, "unit": "sqm", "confidence": 90,
+                 "pricing_keyword": "synthetic-printed-graphic", "catalog_unit_price": 17.5,
+                 "catalog_description": "Printed graphic", "pricing_reference_description": "Printed graphic",
+                 "pricing_status": "matched", "meta": {"keep": ["saved", 2]}},
+                {"id": "adjacent-include", "tag": "Include", "text": "Adjacent included line", "quantity": 1, "unit": "nos"},
+                {"id": "adjacent-exclude", "tag": "Exclude", "text": "Adjacent excluded line", "meta": {"keep": True}},
+                {"id": "adjacent-custom", "tag": "Custom", "text": "Adjacent custom line", "custom_pricing": True},
+            ],
+        }]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        payload["basis_chat"] = {
+            "question": "Correct this line to exactly 1.5 sqm, retain the selected saved pricing-reference item and rate, and describe the blue ALPHA TEST printed wall graphic. Do not change other rows.",
+            "field": "graphics", "line_index": 0, "line": "Confirm: Existing printed wall graphic.",
+            "quantity": 2, "unit": "sqm",
+        }
+        return payload
+
+    def test_basis_chat_hosted_style_revision_derives_quantity_and_preserves_authority(self):
+        payload = self.hosted_style_basis_chat_payload()
+        before = copy.deepcopy(webapp.canonical_quote_basis_sections(payload))
+        description = "Blue ALPHA TEST printed wall graphic."
+        for provider in ("openai", "deepseek"):
+            for quantity_fields in ({}, {"quantity": 2, "unit": "sqm"}):
+                with self.subTest(provider=provider, quantity_fields=quantity_fields):
+                    reply = {"intent": "proposal", "proposal": {
+                        "replacement_line": {"text": description, **quantity_fields},
+                    }}
+                    result = webapp.normalize_basis_chat_result(reply, payload, provider)
+                    expected = copy.deepcopy(before)
+                    expected[0]["lines"][0].update(text=description, quantity=1.5)
+                    self.assertEqual(result["type"], "proposal")
+                    self.assertEqual(result["proposal"]["quote_basis_sections"], expected)
+                    self.assertEqual(payload["quote_basis_sections"], before)
+
+    def test_basis_chat_hosted_style_revision_rejects_missing_descriptive_content(self):
+        payload = self.hosted_style_basis_chat_payload()
+        words = ["Blue", "ALPHA", "TEST", "printed", "wall", "graphic"]
+        for omitted in words:
+            with self.subTest(omitted=omitted), self.assertRaises(webapp.OpenAIAnalysisError):
+                webapp.normalize_basis_chat_result({"intent": "proposal", "proposal": {
+                    "replacement_line": {"text": " ".join(word for word in words if word != omitted) + "."},
+                }}, payload, "openai")
+
+    def test_basis_chat_hosted_style_revision_rejects_untrusted_provider_fields(self):
+        payload = self.hosted_style_basis_chat_payload()
+        before = copy.deepcopy(payload)
+        for key, value in {
+            "catalog_unit_price": 0.01, "pricing_keyword": "provider-price",
+            "catalog_description": "Provider catalog", "pricing_reference_description": "Provider reference",
+            "custom_pricing": False, "arbitrary_metadata": {"provider": True},
+        }.items():
+            with self.subTest(key=key), self.assertRaises(webapp.OpenAIAnalysisError):
+                webapp.normalize_basis_chat_result({"intent": "proposal", "proposal": {
+                    "replacement_line": {"text": "Blue ALPHA TEST printed wall graphic.", key: value},
+                }}, payload, "openai")
+        for key, value in {"quote_basis_sections": [], "line_items": [], "arbitrary_state": {"provider": True}}.items():
+            with self.subTest(key=key), self.assertRaises(webapp.OpenAIAnalysisError):
+                webapp.normalize_basis_chat_result({"intent": "proposal", "proposal": {
+                    "replacement_line": {"text": "Blue ALPHA TEST printed wall graphic."}, key: value,
+                }}, payload, "openai")
+        self.assertEqual(payload, before)
+
+    def test_basis_chat_hosted_style_revision_rejects_unchanged_result(self):
+        payload = self.hosted_style_basis_chat_payload()
+        selected = payload["quote_basis_sections"][0]["lines"][0]
+        selected.update(text="Blue ALPHA TEST printed wall graphic.", quantity=1.5)
+        payload["basis_chat"].update(line="Confirm: " + selected["text"], quantity=1.5)
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        with self.assertRaisesRegex(webapp.OpenAIAnalysisError, "unchanged selected line"):
+            webapp.normalize_basis_chat_result({"intent": "proposal", "proposal": {
+                "replacement_line": {"text": selected["text"]},
+            }}, payload, "openai")
+
+    def test_basis_chat_quantity_phrases_remain_server_owned(self):
+        cases = {
+            "Correct this line to exactly 1.5 sqm": 1.5,
+            "Set the line to exactly 3.25 sqm": 3.25,
+            "Change selected line to 7 pcs": 7,
+            "make it 4 sqm": 4,
+            "set quantity to 6": 6,
+            "60 qty": 60,
+            "change from 12 to 14 chairs": 14,
+            "update this to 2 nos": 2,
+        }
+        for question, quantity in cases.items():
+            with self.subTest(question=question):
+                self.assertTrue(webapp.basis_chat_quantity_change_requested(question))
+                self.assertEqual(webapp.basis_chat_requested_quantity_value(question), quantity)
+        self.assertFalse(webapp.basis_chat_quantity_change_requested("Describe a blue graphic with 1.5 sqm artwork"))
+
+    def test_basis_chat_keywords_distinguish_preservation_from_descriptive_content(self):
+        request = self.hosted_style_basis_chat_payload()["basis_chat"]["question"]
+        self.assertEqual(webapp.basis_chat_requested_keywords(request),
+                         ["1.5", "sqm", "blue", "alpha", "test", "printed", "wall", "graphic"])
+        self.assertEqual(webapp.basis_chat_requested_keywords(
+            "Describe a blue pricing reference chart, retain the saved catalog item and rate. Do not change adjacent lines."),
+            ["blue", "pricing", "reference", "chart"])
+        self.assertEqual(webapp.basis_chat_requested_keywords(
+            "Retain blue trim and describe a red wall"), ["blue", "trim", "red", "wall"])
+
     def test_basis_chat_quote_scope_edit_prompt_is_answer_only(self):
         payload = valid_payload()
         payload["basis_chat"] = {
