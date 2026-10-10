@@ -33,12 +33,11 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from xml.etree import ElementTree as ET
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def round_commercial_cents(value: Any) -> float | None:
@@ -53,18 +52,6 @@ def round_commercial_cents(value: Any) -> float | None:
     except (InvalidOperation, ValueError):
         return None
     return float(rounded) if rounded else 0.0
-
-
-def discovered_default_resource_dir(root: Path, marker_filename: str, fallback: str = "default") -> Path:
-    try:
-        candidates = [
-            path
-            for path in sorted(root.iterdir(), key=lambda item: item.name.casefold())
-            if path.is_dir() and RESOURCE_ID_RE.fullmatch(path.name) and (path / marker_filename).is_file()
-        ]
-    except OSError:
-        candidates = []
-    return candidates[0] if candidates else root / fallback
 
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "_output"
@@ -1601,33 +1588,6 @@ def set_ooxml_formula(
     if cached_value is not None:
         value_node = ET.SubElement(cell, f"{NS_MAIN}v")
         value_node.text = cached_number_text(cached_value)
-
-
-def set_ooxml_column_width(root: ET.Element, col_number: int, width: float) -> None:
-    cols = root.find(f"{NS_MAIN}cols")
-    if cols is None:
-        cols = ET.Element(f"{NS_MAIN}cols")
-        root.insert(0, cols)
-
-    for col in cols.findall(f"{NS_MAIN}col"):
-        min_col = int(col.attrib.get("min", "0"))
-        max_col = int(col.attrib.get("max", "0"))
-        if min_col == col_number and max_col == col_number:
-            col.attrib["width"] = str(width)
-            col.attrib["customWidth"] = "1"
-            return
-
-    cols.append(
-        ET.Element(
-            f"{NS_MAIN}col",
-            {
-                "min": str(col_number),
-                "max": str(col_number),
-                "width": str(width),
-                "customWidth": "1",
-            },
-        )
-    )
 
 
 def ensure_worksheet_child(root: ET.Element, local_name: str) -> ET.Element:
