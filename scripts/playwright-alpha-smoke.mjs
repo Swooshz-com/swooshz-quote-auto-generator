@@ -505,14 +505,14 @@ async function main() {
     const basisSections = fixtureItems.map((item, index) => ({
       id: `alpha-section-${index + 1}`,
       title: item.section,
-      lines: [{ id: `alpha-basis-line-${index + 1}`, text: item.description, tag: "Include", confidence: 100, quantity: 1, unit: item.unit_hint }],
+      lines: [{ id: `alpha-basis-line-${index + 1}`, text: item.description, tag: "Include", confidence: 100, quantity: 1, unit: item.unit_hint, pricing_keyword: item.id }],
     }));
     const referenceSignature = await page.evaluate(() => referenceFilesDependencySignature());
     assert(await page.evaluate((value) => referenceFileSignatureIsStrong(value), referenceSignature), "Synthetic booth image has no stable analysis signature.");
     const seedPayload = structuredClone(createdSave.payload);
     seedPayload.draft_state.quoteBasisSections = basisSections;
     seedPayload.draft_state.lineItems = fixtureItems.map((item, index) => ({
-      section: item.section, description: item.description, quantity: 1, unit: item.unit_hint,
+      section: item.section, description: item.description, quantity: 1, unit: item.unit_hint, pricing_keyword: item.id,
       source_basis_line_id: `alpha-basis-line-${index + 1}`,
     }));
     seedPayload.draft_state.originalAnalysisSnapshot = {
