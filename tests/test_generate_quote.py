@@ -730,6 +730,10 @@ def pdf_phrase_font_weights(textpage, phrase):
     return weights
 
 
+def is_regular_carlito_font_name(name):
+    return name in ("Carlito", "Carlito-Regular")
+
+
 def pdf_phrase_font_names(textpage, phrase):
     text = textpage.get_text_range() or ""
     start = text.find(phrase)
@@ -3131,6 +3135,21 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             with self.subTest(row_count=row_count):
                 self._assert_optional_text_capacity_boundary("standard_notes", row_count)
 
+    def test_regular_carlito_font_name_accepts_exact_regular_aliases(self):
+        for name in ("Carlito", "Carlito-Regular"):
+            with self.subTest(name=name):
+                self.assertTrue(is_regular_carlito_font_name(name))
+
+    def test_regular_carlito_font_name_rejects_other_faces_and_substrings(self):
+        for name in (
+            "Carlito-Bold", "Carlito-Italic", "Carlito-BoldItalic",
+            "Arial", "LiberationSans", "NotCarlito", "NotCarlito-Regular",
+            "Carlito-Regular-Extra", "Carlito Regular", "Carlito-Regular ",
+            "carlito", "", None,
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(is_regular_carlito_font_name(name))
+
     def test_real_libreoffice_optional_text_pagination_proof(self):
         running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
         executables = quote.libreoffice_candidates()
@@ -3330,7 +3349,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 for page_data in first_pages
                 for name in page_data["rich_bold_font_names"]
             }
-            self.assertIn("Carlito", normal_fonts)
+            self.assertTrue(any(is_regular_carlito_font_name(name) for name in normal_fonts), normal_fonts)
             self.assertIn("Carlito-Bold", bold_fonts)
             self.assertTrue(any("Bold" in name for name in rich_bold_fonts), rich_bold_fonts)
 
