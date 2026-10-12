@@ -252,11 +252,28 @@ function targetOnlyBasisChatResult(payload, options = {}) {
   };
 }
 
-function draftResult() {
+function syntheticDraftProtocol(jobId) {
+  if (!/^job-[A-Za-z0-9_-]{8,64}$/.test(jobId)) {
+    throw new Error("Synthetic draft requires a valid requested job identity.");
+  }
+  return {
+    generation_run_id: `run-playwright-${jobId.slice(4)}`,
+    pricing_reference_basis: {
+      currency: syntheticPricingCatalog.currency,
+      source: "local",
+      id: syntheticPricingReferenceId,
+      digest: syntheticPricingReferenceDigest,
+    },
+  };
+}
+
+function draftResult(protocol) {
   const sections = quoteBasisSections();
   return {
     status: "drafted",
     source: "playwright-mock",
+    generation_run_id: protocol.generation_run_id,
+    pricing_reference_basis: protocol.pricing_reference_basis,
     quote_basis: quoteBasisFromSections(sections),
     quote_basis_sections: sections,
     line_items: [
@@ -392,8 +409,10 @@ async function installMockJobs(page) {
       await route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ status: "failed", errors: ["Missing requested job id"] }) });
       return;
     }
+    const draftProtocol = body.type === "draft" ? syntheticDraftProtocol(jobId) : null;
     if (body.type === "draft") {
-      jobs.set(jobId, { job_id: jobId, type: body.type, status: "completed", created_at: createdAt, updated_at: createdAt, result: draftResult() });
+      jobs.set(jobId, { job_id: jobId, type: body.type, status: "completed", created_at: createdAt, updated_at: createdAt,
+        generation_run_id: draftProtocol.generation_run_id, result: draftResult(draftProtocol) });
     } else if (body.type === "basis_chat") {
       const result = basisChatResult(body.payload || {});
       jobs.set(jobId, {
@@ -411,7 +430,8 @@ async function installMockJobs(page) {
     await route.fulfill({
       status: 202,
       contentType: "application/json",
-      body: JSON.stringify({ status: "queued", job_id: jobId, type: body.type, created_at: createdAt, updated_at: createdAt }),
+      body: JSON.stringify({ status: "queued", job_id: jobId, type: body.type, created_at: createdAt, updated_at: createdAt,
+        ...(draftProtocol ? { generation_run_id: draftProtocol.generation_run_id } : {}) }),
     });
   });
 
