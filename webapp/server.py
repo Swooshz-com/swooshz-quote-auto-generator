@@ -22110,7 +22110,9 @@ BASIS_CHAT_EDIT_STOPWORDS = {
     "chagne",
     "correct",
     "delete",
+    "describe",
     "edit",
+    "exactly",
     "exclude",
     "for",
     "from",
@@ -22120,6 +22122,7 @@ BASIS_CHAT_EDIT_STOPWORDS = {
     "include",
     "into",
     "it",
+    "keep",
     "line",
     "make",
     "many",
@@ -22127,10 +22130,12 @@ BASIS_CHAT_EDIT_STOPWORDS = {
     "numbers",
     "of",
     "please",
+    "preserve",
     "qty",
     "quantity",
     "remove",
     "replace",
+    "retain",
     "revise",
     "set",
     "should",
@@ -22159,6 +22164,20 @@ def basis_chat_requested_keywords(question: str) -> list[str]:
         text = clean_text(lines[-1]).lower()
     else:
         text = clean_text(question).lower()
+    # Pricing preservation and other-row scope are enforced by the server-owned
+    # proposal path; they are not literal replacement-description requirements.
+    clauses = re.split(r"[,;]|\.(?!\d)|\band\s+(?=(?:retain|keep|preserve|describe|do not)\b)", text)
+    text = " ".join(
+        clause for clause in clauses
+        if not re.match(
+            r"^\s*(?:retain|keep|preserve)\s+(?:the\s+)?"
+            r"(?:(?:selected|saved|existing|current)\s+)*"
+            r"(?:pricing[- ]reference|catalog|pricing|reference)\s+(?:items?|rates?|metadata)\b"
+            r"|^\s*(?:do\s+not\s+(?:change|edit|update|revise)|retain|keep|preserve)\s+"
+            r"(?:the\s+)?(?:other|adjacent|unrelated)\s+(?:rows|lines|sections)\b",
+            clause,
+        )
+    )
     replacement_match = re.search(
         r"\b(?:change|changed|changing|replace|switch|correct)\b.+\b(?:to|with)\b\s+(.+)$",
         text,
@@ -22185,7 +22204,7 @@ def basis_chat_quantity_change_requested(question: str) -> bool:
         return True
     if re.search(r"\bfrom\s+\d+(?:\.\d+)?\s+to\s+\d+(?:\.\d+)?\b", lowered):
         return True
-    if re.search(r"\b(?:make|set|change|update|revise)\s+(?:it|this|that|qty|quantity|count)?\s*(?:to\s+)?\d+(?:\.\d+)?\s*(?:nos?\.?|pcs?|pieces?|units?|lots?|sqm|m\b)", lowered):
+    if re.search(r"\b(?:make|set|change|update|revise|correct)\s+(?:it|this|that|(?:this|the|selected)\s+line|qty|quantity|count)?\s*(?:to\s+)?(?:exactly\s+)?\d+(?:\.\d+)?\s*(?:nos?\.?|pcs?|pieces?|units?|lots?|sqm|m\b)", lowered):
         return True
     return False
 
@@ -22196,7 +22215,7 @@ def basis_chat_requested_quantity_value(question: str) -> int | float | None:
         r"\b(?:qty|quantity|count)\s*(?:to|=|:|is|as)?\s*(\d+(?:\.\d+)?)\b",
         r"\b(\d+(?:\.\d+)?)\s*(?:qty|quantity|count)\b",
         r"\bfrom\s+\d+(?:\.\d+)?\s+to\s+(\d+(?:\.\d+)?)\b",
-        r"\b(?:make|set|change|update|revise)\s+(?:it|this|that|qty|quantity|count)?\s*(?:to\s+)?(\d+(?:\.\d+)?)\s*(?:nos?\.?|pcs?|pieces?|units?|lots?|sets?|each|ea|sqm)\b",
+        r"\b(?:make|set|change|update|revise|correct)\s+(?:it|this|that|(?:this|the|selected)\s+line|qty|quantity|count)?\s*(?:to\s+)?(?:exactly\s+)?(\d+(?:\.\d+)?)\s*(?:nos?\.?|pcs?|pieces?|units?|lots?|sets?|each|ea|sqm)\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, lowered)
