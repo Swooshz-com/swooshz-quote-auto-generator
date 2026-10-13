@@ -20,6 +20,7 @@ const SIDE_PANEL_SEQUENCE = ["images", "customer", "quote_company", "basis", "ou
 const MAX_REFERENCE_IMAGES = 12;
 const QUOTE_SESSION_STATE_VERSION = 1;
 const QUOTE_COMMERCIAL_REVIEW_STATUS = "review_required";
+const MISSING_PRICING_REFERENCES_MESSAGE = "No synthetic pricing references available";
 const ANALYSIS_MODE_STANDARD = "standard";
 const EMPTY_BASIS = {};
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
@@ -146,6 +147,7 @@ const functions = ["safeQuoteSessionId", "isPlainObject", "revisionNumber", "spl
   "saveQuoteSessionDraftState", "quoteSessionDraftStateCanSave", "quoteSessionSaveFailureFrom",
   "markQuoteSessionDraftSaveStartedAfterCustomerStep", "quoteSessionDraftReachedCustomerStep",
   "quoteCommercialStrictDataEqual", "customerStepCheckpointForCurrent", "customerStepCheckpointIsCurrent",
+  "customerNextBlockReason",
   "checkpointGatedSidePanel", "advanceCustomerStep", "sidePanelBlockReason", "setSidePanel",
   "activeSidePanelIndex", "updateSidePanelNav", "appIsBusy", "appBusyTitle", "quoteOutputProgressForNavigation",
   "goToNextSidePanel", "goToPreviousSidePanel", "furthestQuoteSessionSidePanel", "restoredQuoteSessionSidePanel"];
@@ -175,6 +177,12 @@ function selectB() {elements.profileSelect.value = "company::reference-b"; handl
 function committedCheckpoint() {return clone(state.customerStepCheckpoint);}
 function control(name, action) {action(); controls.push(name);}
 (async () => {
+  fresh(); state.pricingReferences = [];
+  control("missing pricing reference keeps Next disabled", () => {
+    updateSidePanelNav();
+    assert.strictEqual(elements.sideNextButton.disabled, true);
+    assert.strictEqual(elements.sideNextButton.getAttribute("aria-disabled"), "true");
+  });
   fresh(); selectB();
   control("fresh rail locked and selection remains pending", () => {
     assert.ok(rail.find(n => n.dataset.sidePanel === "quote_company").disabled);

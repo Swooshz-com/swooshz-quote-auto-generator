@@ -16217,6 +16217,12 @@ function customerStepCheckpointIsCurrent() {
     && quoteCommercialStrictDataEqual(checkpoint, current));
 }
 
+function customerNextBlockReason() {
+  if (!hasReferenceFilesForNavigation()) return "Add reference files before opening this step.";
+  if (!pendingPricingReference() && !currentPricingReference()) return MISSING_PRICING_REFERENCES_MESSAGE;
+  return customerDetailsBlockReason();
+}
+
 function checkpointGatedSidePanel(panelName) {
   return SIDE_PANEL_SEQUENCE.indexOf(panelName) >= SIDE_PANEL_SEQUENCE.indexOf("quote_company")
     && !customerStepCheckpointIsCurrent() ? "customer" : panelName;
@@ -16262,8 +16268,12 @@ async function advanceCustomerStep() {
 function sidePanelBlockReason(panelName) {
   if (panelName === "images") return "";
   if (!hasReferenceFilesForNavigation()) return "Add reference files before opening this step.";
-  if (SIDE_PANEL_SEQUENCE.indexOf(panelName) >= SIDE_PANEL_SEQUENCE.indexOf("quote_company")
+  if (["quote_company", "basis", "output"].includes(panelName)
     && !customerStepCheckpointIsCurrent()) {
+    if (panelName === "quote_company") {
+      const reason = customerDetailsBlockReason("Complete Customer details before opening Quote Company");
+      if (reason) return reason;
+    }
     return "Click Next in Customer to save this step before continuing.";
   }
   if (quoteOutputProgressForNavigation()) return "";
@@ -16412,8 +16422,7 @@ function updateSidePanelNav() {
   } else if (isBasisStep) {
     nextBlockReason = basisBlockReason;
   } else if (state.activeSidePanel === "customer") {
-    nextBlockReason = hasReferenceFilesForNavigation()
-      ? customerDetailsBlockReason() : "Add reference files before opening this step.";
+    nextBlockReason = customerNextBlockReason();
   } else {
     nextBlockReason = sidePanelBlockReason(nextPanel);
   }

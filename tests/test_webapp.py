@@ -20580,6 +20580,10 @@ const elements = {
   dateLabel: field("Date"),
 };
 
+// This component checks existing detail blockers after a verified saved checkpoint.
+let checkpointVerified = true;
+function customerStepCheckpointIsCurrent() { return checkpointVerified; }
+
 eval([
   "normalizeTextNewlines",
   "splitLines",
@@ -20677,6 +20681,9 @@ elements.acceptanceText.value = "Accepted by customer";
 assert.strictEqual(startAnalysisBlockReason(), "");
 assert.strictEqual(sidePanelBlockReason("quote_company"), "");
 assert.strictEqual(canStartAnalysis(), true);
+checkpointVerified = false;
+assert.ok(sidePanelBlockReason("quote_company").includes("Click Next in Customer"));
+checkpointVerified = true;
 state.workflowStage = "pricing_review";
 state.outputRows = [{ description: "Restored output row", quantity: 1 }];
 state.quoteBasisSections = [];
@@ -23540,6 +23547,7 @@ function currentGenerator() { return { analyzeLabel: "Start Analysis" }; }
 function sidePanelBlockReason(panelName) { return panelName === "quote_company" && !currentPricingReference() ? "Complete Customer details before opening Quote Company: Quote Pricing Reference." : ""; }
 function basisConfirmBlockReason() { return ""; }
 function startAnalysisBlockReason() { return ""; }
+function customerDetailsBlockReason() { return ""; }
 function updateDownloadButton() {}
 function activeSidePanelIndex() { return Math.max(0, SIDE_PANEL_SEQUENCE.indexOf(state.activeSidePanel)); }
 function hasReferenceFilesForNavigation() { return state.images.some((image) => image?.data_url || image?.session_file_key || image?.name); }
@@ -23571,6 +23579,11 @@ eval([
   "quoteCommercialSnapshotPricingBasis",
   "renderProfileOptions",
   "updateSidePanelNav",
+  "customerNextBlockReason",
+  "pendingPricingReference",
+  "pendingPricingReferenceSelection",
+  "pricingReferenceFromSelectionValue",
+  "isPlainObject",
 ].map(extractFunction).join("\n"));
 
 renderProfileOptions();
