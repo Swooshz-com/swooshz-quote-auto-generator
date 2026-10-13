@@ -20923,6 +20923,9 @@ global.document = {
 };
 global.window = { location: { href: "" } };
 
+const state = { downloadFileRevision: 1, outputRevision: 1 };
+eval(extractFunction("revisionNumber"));
+eval(extractFunction("downloadFileIsFresh"));
 eval(extractFunction("downloadCurrentExcelFile"));
 assert.strictEqual(downloadCurrentExcelFile({ url: "/api/download/quote.xlsx", name: "quote.xlsx" }), true);
 assert.strictEqual(anchor.href, "/api/download/quote.xlsx");
@@ -28471,6 +28474,864 @@ assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReferenc
         self.assertIn("quoteCommercialTouched: snapshot.quoteCommercialTouched", draft_state_body)
         self.assertIn("quoteDetailsCommercialTouched(savedQuoteDetails)", restore_body)
 
+    def run_sqag212_production_save_chain(self, scenario):
+        # Only transport, DOM effects and synthetic snapshot inputs are mocked.
+        # The save/queue/confirmation/postJson/adopter/start consumers are source-extracted.
+        script = r"""
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+const scenario = JSON.parse(process.argv[1]);
+function extractFunction(name) {
+  let start = source.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`Missing production function ${name}`);
+  if (source.slice(start - 6, start) === "async ") start -= 6;
+  const bodyStart = source.indexOf(") {", start) + 2;
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Unclosed production function ${name}`);
+}
+const constantNames = ["CSRF_HEADER_NAME", "GENERIC_FAILURE_MESSAGE", "QUOTE_COMMERCIAL_REVIEW_SCHEMA",
+  "QUOTE_COMMERCIAL_REVIEW_VERSION", "QUOTE_COMMERCIAL_REVIEW_STATUS", "QUOTE_COMMERCIAL_REVIEW_MESSAGE",
+  "QUOTE_COMMERCIAL_REVIEW_REASONS", "PRICING_REFERENCE_ID_RE", "PRICING_REFERENCE_SOURCES",
+  "SERVER_JOB_TYPES", "ACTIVE_JOB_STARTING_MAX_AGE_MS", "ACTIVE_JOB_CLOCK_SKEW_MS",
+  "ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS", "ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS",
+  "ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS", "ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS"];
+if (scenario.kind === "excel") constantNames.push("FINAL_JOB_STATUSES");
+if (scenario.path === "duplicate") constantNames.push("QUOTE_SESSION_FILE_STORE_NAME",
+  "QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA", "QUOTE_COMMERCIAL_SNAPSHOT_VERSION", "QUOTE_COMMERCIAL_LIFECYCLES",
+  "QUOTE_COMMERCIAL_SNAPSHOT_ORIGINS", "QUOTE_COMMERCIAL_PRESENCE_VALUES",
+  "QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS", "PRICING_REFERENCE_DIGEST_RE", "PRICING_REFERENCE_SETTINGS_MODE_MANAGE",
+  "DEFAULT_CURRENCY_LABEL");
+if (scenario.originalBoundary || scenario.path === "duplicate") constantNames.push("QUOTE_SESSION_STORAGE_KEY", "QUOTE_SESSION_STATE_VERSION",
+  "MAX_REFERENCE_IMAGES");
+const constantSource = constantNames.map(name => {
+  const match = source.match(new RegExp(`const ${name} = [\\s\\S]*?;`));
+  assert(match, name);
+  return match[0];
+}).join("\n");
+const window = { clearTimeout, setTimeout, crypto: { getRandomValues: bytes => bytes.fill(17) } };
+let quoteSessionDraftSaveTimer = null;
+let quoteSessionInitialSavePromise = null;
+let quoteSessionDraftSavePromise = null;
+let quoteSessionConfirmedDraftSessionId = "";
+let quoteSessionConfirmedDraftKey = "";
+let quoteSessionConfirmedDraftFileKey = "";
+let version = 1;
+let fileVersion = 1;
+let sequence = 0;
+let releaseResponse = null;
+let snapshots = [];
+const calls = [];
+const responseReleases = [];
+let persisted = null;
+let dashboardShown = false;
+const listeners = new Map();
+const effects = { anchor_clicks: 0, location_fallbacks: 0, artifact_requests: 0, modal_hides: 0 };
+function element() { return { hidden: false, dataset: {}, classList: { add() {}, remove() {} },
+  addEventListener: (type, callback) => listeners.set(type, callback), getAttribute: () => "false" }; }
+const elements = {};
+const document = { body: { appendChild() {}, classList: { remove() {} } }, createElement: () => ({
+  click() { effects.anchor_clicks += 1; effects.artifact_requests += 1; if (scenario.anchorThrows) throw Error("Synthetic anchor failure"); }, remove() {} }) };
+window.location = { set href(value) { effects.location_fallbacks += 1; effects.artifact_requests += 1; } };
+const outputRowsValid = () => ({ valid: true, errors: [] });
+const outputRowsToLineItems = () => [{ description: "Synthetic current row", quantity: state.outputRows[0].quantity, unit: "sqm" }];
+const renderOutputValidationMessages = items => messages.push(...items);
+const commitActiveOutputEditor = () => {};
+const showExcelGeneratingModal = () => {};
+const hideExcelGeneratingModal = () => { effects.modal_hides += 1; };
+const generationLoadingModalOptions = () => ({});
+const waitForUiPaint = async () => {};
+const logs = [];
+const messages = [];
+const state = {
+  quoteSessionId: scenario.path === "initial" ? "" : "quote-synthetic-a",
+  quoteSessionRestoredSessionId: scenario.path === "restored" ? "quote-synthetic-a" : "",
+  quoteSessionDraftSaveStarted: true, quoteSessionLoadError: "OLD-REFERENCE-CANARY",
+  quoteCommercialLifecycle: "EXISTING", quoteCommercialReview: null,
+  outputRows: [], originalOutputRows: [], basisConfirmed: true, lineItems: [{}],
+  isAnalysisRunning: false, isGenerating: false, isPageUnloading: scenario.originalBoundary ? false : Boolean(scenario.unloading),
+  isRecoveryScopeTransitioning: false, images: [{ synthetic: true }],
+  boothDimensions: { dimension_source: "default" }, pendingFeedback: "",
+  activeSidePanel: "basis", csrfToken: "synthetic-csrf", csrfHeaderName: "X-Synthetic-CSRF",
+};
+const CANARY = "PRIVATE-BACKEND-FILENAME-PRICING-CANARY";
+const review = {
+  schema: "swooshz.quote-commercial-review.v1", version: 1, status: "REVIEW_REQUIRED",
+  reason_code: "pricing_reference_digest_mismatch", blocked_identity: { id: "synthetic-price", source: "company" },
+};
+const syntheticNormalizedContentFingerprint = value => String(value || "");
+let restoredDetails = { client: { name: "Synthetic" }, project: { title: "Synthetic" } };
+const collectQuoteDetails = () => restoredDetails;
+const selectedPreset = () => ({ name: "Synthetic" });
+const currentProfile = () => ({ label: "Synthetic" });
+const currentPricingReference = () => ({ id: "synthetic-price", source: "company", label: "Synthetic",
+  currency: "SGD", digest_sha256: "sha256:" + "b".repeat(64) });
+const generationProfileIdForPayload = () => "synthetic-profile";
+const dashboardCommercialsFromState = () => ({ currency: "SGD" });
+const syntheticQuoteSessionHasFreshOutputExports = () => false;
+const currentGenerationContext = () => ({ session_id: state.quoteSessionId, run_id: "" });
+const transitionGenerationContext = sessionId => { state.quoteSessionId = sessionId; };
+const syntheticBuildSessionSnapshot = () => ({ version, quoteSessionDraftSaveStarted: true,
+  quoteCommercialLifecycle: state.quoteCommercialLifecycle, quoteCommercialReview: state.quoteCommercialReview,
+  images: state.images, quoteDetails: { currency: "SGD" }, outputRows: [], lineItems: [{}],
+  draftSource: state.draftSource, workflowStage: state.workflowStage });
+const furthestQuoteSessionSidePanel = () => "basis";
+const syntheticSessionFileRecordsFromDraft = () => [{ session_file_key: `synthetic-${fileVersion}`,
+  file_role: "reference", name: "synthetic.png", type: "image/png", size: fileVersion,
+  content_fingerprint: `sha256:${fileVersion}`, data_url: "data:image/png;base64,c3ludGhldGlj" }];
+const syntheticSaveSessionState = () => snapshots.push(JSON.parse(JSON.stringify({
+  review: state.quoteCommercialReview, files: syntheticSessionFileRecordsFromDraft(), version,
+})));
+const syncControlStates = () => {};
+const renderMessages = items => messages.push(...items);
+const resultStatuses = [];
+const setResultStatus = (label, tone) => resultStatuses.push({ label, tone });
+const renderQuoteCommercialReviewState = () => {};
+const fetchFailureLogDetails = (url, details) => ({ url, ...details });
+const syntheticGetJson = async url => {
+  assert.strictEqual(url, "/api/session");
+  calls.push({ url, method: "GET" });
+  return { ok: scenario.refresh !== "fail", data: { csrf_token: "refreshed" } };
+};
+const syntheticApplySessionData = async data => { state.csrfToken = data.csrf_token; return true; };
+const responseFor = (status, data) => ({ ok: status >= 200 && status < 300, status,
+  json: async () => { if (scenario.malformed) throw new SyntaxError(CANARY); if (scenario.bodyAbort) throw new DOMException(CANARY, "AbortError"); return data; } });
+async function fetch(url, options) {
+  assert(["/api/quote-sessions", "/api/jobs", "/api/log", "/api/session", "/api/jobs/job-synthetic-stable"].includes(url), "Non-synthetic transport denied");
+  if (url === "/api/quote-sessions" && !options) { calls.push({ url, method: "GET" }); return responseFor(200, { quote_sessions: persisted ? [persisted] : [] }); }
+  if (url === "/api/jobs/job-synthetic-stable") {
+    calls.push({ url, method: "GET" });
+    return responseFor(200, scenario.excelFault === "poll" ? { status: "failed", result: { status: "failed", error_reference: "ERR-1234ABCD" } } :
+      { status: "completed", result: { status: "completed", files: [{ name: "quotation.xlsx", url: "/api/synthetic-current.xlsx" }] } });
+  }
+  if (url === "/api/session") {
+    calls.push({ url, method: "GET" });
+    if (scenario.refreshBoundary && scenario.gated && scenario.refreshFault !== "body") await new Promise(resolve => { releaseResponse = resolve; });
+    if (scenario.refreshFault === "body") return { ok: true, status: 200, json: async () => {
+      if (scenario.gated) await new Promise(resolve => { releaseResponse = resolve; });
+      throw new DOMException(CANARY, "AbortError"); } };
+    if (scenario.refreshFault === "fetch") throw new TypeError(CANARY);
+    if (scenario.refreshFault === "malformed") return { ok: false, status: 500, json: async () => { throw new SyntaxError(CANARY); } };
+    if (scenario.refreshFault) return responseFor(scenario.refreshStatus || 500, { errors: [CANARY], error_reference: scenario.invalidRefreshReference ? CANARY : "ERR-87654321" });
+    return responseFor(200, { csrf_token: "refreshed", browser_recovery_scope: "a".repeat(64) });
+  }
+  const payload = JSON.parse(options.body);
+  if (url === "/api/log") { logs.push(payload); return responseFor(204, {}); }
+  if (scenario.path === "duplicate") assert.strictEqual(state.quoteSessionLoadError, "", "Duplicate save did not reset its attempt error");
+  calls.push({ url, payload });
+  if (url === "/api/jobs") return scenario.kind === "excel" && scenario.excelFault !== "start"
+    ? responseFor(202, { job_id: payload.job_id, status: "queued" }) : responseFor(500, { errors: ["Synthetic job stop"] });
+  sequence += 1;
+  if (scenario.kind === "dashboard-order") {
+    persisted = structuredClone(payload);
+    await new Promise(resolve => responseReleases.push(resolve));
+  } else if (scenario.gated) await new Promise(resolve => { releaseResponse = resolve; });
+  if (scenario.fetchFailure) throw Error(CANARY);
+  const status = (scenario.refresh === "success" || scenario.realRefresh) && !scenario.refreshFault && sequence === 2 ? 200 : (scenario.status ?? 400);
+  let data = status >= 200 && status < 300 ? { status: "saved", quote_session: { session_id: payload.session_id } } : {
+    status: "blocked", error_reference: scenario.reference ?? "ERR-1234ABCD",
+    errors: [CANARY], message: CANARY,
+    ...(scenario.review ? { quoteCommercialReview: scenario.invalidReview ? { ...review, version: 99 } : review } : {}),
+  };
+  if (scenario.invalidAck === "null") data = null;
+  if (scenario.invalidAck === "missing") data = { status: "saved" };
+  if (scenario.invalidAck === "mismatch") data = { status: "saved", quote_session: { session_id: "quote-different-identity" } };
+  if (scenario.invalidAck === "status") data = { status: "failed", quote_session: { session_id: payload.session_id } };
+  if (status === 200 && !scenario.invalidAck) persisted = structuredClone(payload);
+  return responseFor(status, data);
+}
+const normalizeAnalysisMode = value => value || "standard";
+const analysisRunningMessage = () => "Synthetic analysis";
+const currentGenerator = () => ({ imageNoun: "image" });
+const missingDetailFields = () => [];
+const newClientJobId = () => "job-synthetic-stable";
+const quoteCommercialOverrideSnapshot = () => ({ owner: "quote", currency: "SGD" });
+let restoredOverrides = 0;
+const restoreQuoteCommercialOverrideSnapshot = snapshot => {
+  assert.strictEqual(snapshot.owner, "quote"); restoredOverrides += 1;
+};
+const syntheticClearActiveJob = () => { state.activeJob = null; };
+const setWorkflowStage = value => { state.workflowStage = value; };
+const clearAiFailureBanner = () => {};
+const showAiRunningBanner = () => {};
+const clearBasisReviewSurface = () => {};
+const setSidePanel = value => { state.activeSidePanel = value; };
+const showAiFailureBanner = value => messages.push(value);
+const showAiBlockedBanner = value => messages.push(value);
+const showBlockedAction = value => messages.push(value);
+const buildPayload = () => ({ synthetic: true });
+const applyDraftPricingReferenceReview = () => {};
+const safeGenerationRunId = value => String(value || "");
+const clearPricingReviewMessages = () => {};
+// Duplicate inputs have already passed the real backend tests; retain its real control/finally path.
+const syntheticAppIsBusy = () => state.isGenerating || state.isAnalysisRunning;
+const newClientQuoteSessionId = () => "quote-synthetic-new";
+const normalizeDashboardOperation = value => value;
+const saveDashboardOperation = value => value;
+const syntheticSetDashboardLoadingState = () => {};
+const syntheticShowDashboard = () => { dashboardShown = true; };
+const markQuoteSessionDraftSaveStartedAfterCustomerStep = () => {};
+const quoteDraftShouldPersistToDashboard = () => true;
+const discardCurrentQuoteDraftSession = async () => { throw Error("Unexpected discard"); };
+const dashboardOperationLoadingOptions = () => ({});
+// Backend inputs only: the actual duplicate path must persist and restore these records.
+const duplicateFile = { session_file_key: "synthetic-duplicate-file", file_role: "reference",
+  name: "synthetic.png", type: "image/png", size: 9,
+  content_fingerprint: "sha256:" + require("node:crypto").createHash("sha256").update("synthetic").digest("hex"),
+  data_url: "data:image/png;base64,c3ludGhldGlj" };
+// Construct synthetic backend inputs inside the extracted production lexical scope.
+const duplicateLoaderSource = String.raw`
+const loadQuoteSessionDetail = async () => {
+  const { data_url, file_role, ...metadata } = duplicateFile;
+  const details = { currency: "SGD", client: { name: "Synthetic" }, project: { title: "Synthetic" },
+    company: {}, tax: {}, quote_text: {}, signature: {}, rich_text: {} };
+  details.commercial_snapshot = {
+    schema: "swooshz.quote-commercial-snapshot.v2", version: 2, owner: "quote", lifecycle: "EXISTING",
+    origin: "captured", presence: Object.fromEntries(QUOTE_COMMERCIAL_SNAPSHOT_PRESENCE_KEYS.map(
+      key => [key, key === "currency" ? "captured" : "intentional_empty"])),
+    pricing_basis: { currency: "SGD", id: "synthetic-price", source: "company", digest: "sha256:" + "b".repeat(64) },
+  };
+  return { draft_state: { version: QUOTE_SESSION_STATE_VERSION, quoteCommercialLifecycle: "EXISTING",
+    pricingReferenceId: "synthetic-price", pricingReferenceSource: "company", quoteDetails: details,
+    images: [metadata], quoteBasis: { surfaces: "Synthetic unchanged basis" }, quoteBasisSections: [],
+    lineItems: [{ description: "Synthetic item", quantity: 1, unit: "sqm", pricing_authority: null }],
+    outputRows: [], originalOutputRows: [], basisConfirmed: true, draftSource: "ai", workflowStage: "basis" },
+    draft_files: [structuredClone(duplicateFile)] };
+};
+`;
+const mergeDashboardDraftSummaryDetails = draft => draft;
+const hydrateDashboardDraftImagePayloads = draft => draft;
+// Only DOM/detail adapters remain; restoration, commercial validation and file I/O
+// orchestration are the production functions below.
+const invalidateAuthorityProfileRequests = () => {};
+const presetValueFromQuoteDetails = () => "";
+const normalizePricingReferenceSettingsMode = value => value;
+const quoteDetailsCommercialTouched = () => ({});
+const syncSelectedPricingReference = () => {};
+const renderProfileOptions = () => {};
+const renderPresetOptions = () => {};
+const quoteDetailsWithFallbackDefaults = (defaults, details) => details;
+const restoreQuoteDetailsLogo = async details => details;
+const applyQuoteDetails = details => { restoredDetails = structuredClone(details); };
+const cloneQuoteBasis = value => structuredClone(value);
+const normalizeQuoteBasisSections = value => structuredClone(value);
+const normalizeLineItem = value => structuredClone(value);
+const normalizeOutputRow = value => structuredClone(value);
+const normalizeBoothDimensions = value => structuredClone(value);
+const syntheticRevisionNumber = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+const renderFiles = () => {};
+const renderPricingMatches = () => {};
+const renderMatchSummary = () => {};
+const clearAiFailedDraftState = () => {};
+const renderBasisFailureState = () => {};
+const updateQuoteBasisCard = () => {};
+const renderBasisEmptyState = () => {};
+const updateDownloadButton = () => {};
+const restoredWorkflowStage = saved => saved.workflowStage || "basis";
+const restoredQuoteSessionSidePanel = () => "basis";
+const dashboardRestoreError = message => messages.push(message);
+const clearDashboardOperation = () => { state.dashboardOperation = null; };
+const renderQuoteDashboard = () => {};
+const scrollDashboardSessionIntoView = () => {};
+const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "quoteCommercialReviewIdentity",
+  "normalizeQuoteCommercialReview", "quoteCommercialReviewRequired", "serverQuoteCommercialReviewFromResponse",
+  "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
+  "newClientErrorReference", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
+  "refreshSessionToken", "postJson", "logClientEvent", "ensureClientQuoteSessionId", "mergeDashboardQuoteSession",
+  "currentQuoteSessionPayload", "currentQuoteSessionDraftState", "quoteSessionDraftComparisonKey",
+  "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
+  "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
+  "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
+  "quoteSessionDraftSynchronizationFailureMessage", "handleDraftBasis", "handleGenerate",
+  "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote"];
+if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
+if (scenario.refreshBoundary) required.push("markPageUnloading");
+if (scenario.kind === "dashboard-failure") required.push("returnToDashboard", "restoredQuoteSessionHasChanged", "handleTopbarBrandClick", "setDashboardLoadingState", "showDashboard", "loadQuoteDashboard", "appIsBusy");
+if (scenario.kind === "excel") { constantNames.push(); required.push("downloadCurrentExcelFile", "downloadFileIsFresh", "pdfFileIsFresh", "quoteSessionHasFreshOutputExports", "markOutputRowsDirty", "revisionNumber", "setDownloadFiles", "pollJob", "isInterruptedJobPoll", "handleInterruptedJobPoll", "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage", "handleGeneratedExportReadyAction"); }
+if (scenario.kind === "dashboard-order") required.push("returnToDashboard", "restoredQuoteSessionHasChanged");
+// Optional only so the SAME regression executes against the unchanged baseline.
+for (const name of ["quoteSessionSaveFailureFrom", "safeQuoteSessionErrorReference"]) {
+  if (source.includes(`function ${name}(`)) required.push(name);
+}
+// These adapters supply only synthetic projection inputs and DOM/file effects.
+const recoveryStore = new Map();
+window.localStorage = {
+  setItem: (key, value) => { recoveryStore.set(key, value); snapshots.push({ ...JSON.parse(value), review: JSON.parse(value).quoteCommercialReview, files: scenario.path === "duplicate" ? [...persistedFiles.values()] : syntheticSessionFileRecordsFromDraft() }); },
+  getItem: key => recoveryStore.get(key) || null,
+  removeItem: key => recoveryStore.delete(key),
+};
+const currentBrowserRecoveryScope = () => "a".repeat(64);
+const saveWorkspaceViewState = () => {};
+const syntheticPersistSessionFiles = async files => { assert(files.every(file => file.data_url.startsWith("data:"))); };
+// Instrument the IndexedDB boundary, retaining actual persist/load filtering and scope.
+const persistedFiles = new Map();
+const fileEffects = [];
+const openSessionFileDb = async () => ({
+  transaction(storeName, mode) {
+    assert.strictEqual(storeName, "reference_files");
+    const transaction = {
+      objectStore() { return {
+        put(record) {
+          fileEffects.push({ mode, key: record.session_file_key });
+          persistedFiles.set(record.session_file_key, structuredClone(record));
+        },
+        get(key) {
+          const request = { result: structuredClone(persistedFiles.get(key)) };
+          queueMicrotask(() => { if (request.onsuccess) request.onsuccess(); });
+          return request;
+        },
+      }; },
+    };
+    setImmediate(() => { if (transaction.oncomplete) transaction.oncomplete(); });
+    return transaction;
+  },
+});
+const quoteBasisPersistenceProjection = () => ({
+  quote_basis: scenario.path === "duplicate" ? state.quoteBasis : "Synthetic unchanged basis",
+  quote_basis_sections: scenario.path === "duplicate" ? state.quoteBasisSections : [] });
+const normalizeRestorableOverlay = value => value || "";
+const normalizeQuoteCommercialTouched = value => value;
+const syntheticSessionImageMetadata = value => ({ ...value });
+const quoteDetailsWithSessionLogoMetadata = value => value;
+const basisChatBrowserSnapshot = () => null;
+// All exercised jobs are draft/generation jobs; recovery scope is a synthetic browser input.
+// Retain production validation and null handling rather than an identity adapter.
+required.push("normalizeActiveJob", "activeJobMaxAgeMs");
+if (scenario.originalBoundary) required.push("clearActiveJob", "activeJobBrowserSnapshot");
+if (scenario.originalBoundary || scenario.path === "duplicate") required.push("saveSessionState", "buildSessionSnapshot");
+if (scenario.path === "duplicate") required.push(
+  "applyQuoteSessionSnapshot", "activeJobBrowserSnapshot", "mergeDashboardDraftImagesWithAvailablePayloads",
+  "dashboardDraftPayloadIsReferenceFile", "dashboardDraftLogoSessionFileKey",
+  "dashboardDraftImagePayloadMatches", "dashboardDraftImageFileFieldsMatch", "quoteCommercialSnapshotRawValues", "normalizeQuoteCommercialSnapshot",
+  "quoteCommercialSnapshotPricingBasis", "quoteCommercialStrictDataEqual", "quoteCommercialRestorationReviewReason",
+  "hasMeaningfulQuoteDetailValue", "setQuoteCommercialReview", "normalizeRestoredPricingRow", "normalizeCurrencyLabel",
+  "sessionFileKeyForImage", "sessionFileKeyForLogo", "sessionImageMetadata", "sessionFileRecordsFromImages",
+  "sessionFileRecordFromHeaderLogo", "sessionFileRecordsFromDraft", "persistSessionFiles", "loadSessionFileMap",
+  "restoreSessionImages", "referenceFileType", "referenceFileHasPayload", "normalizedContentFingerprint",
+  "ensureContentFingerprint", "contentFingerprintFromDataUrl", "dataUrlBytes", "sha256ContentFingerprint");
+const adapterSource = (scenario.originalBoundary ? "" :
+  "const clearActiveJob = syntheticClearActiveJob;")
+  + (scenario.originalBoundary || scenario.path === "duplicate" ? "" :
+    "const saveSessionState = syntheticSaveSessionState; const buildSessionSnapshot = syntheticBuildSessionSnapshot;")
+  + (scenario.path === "duplicate" ? "" :
+    "const normalizedContentFingerprint = syntheticNormalizedContentFingerprint; const sessionImageMetadata = syntheticSessionImageMetadata; const sessionFileRecordsFromDraft = syntheticSessionFileRecordsFromDraft; const persistSessionFiles = syntheticPersistSessionFiles;");
+const refreshAdapters = scenario.realRefresh || ["excel", "dashboard-failure"].includes(scenario.kind) ? "" : "const getJson = syntheticGetJson; const applySessionData = syntheticApplySessionData;";
+const boundaryAdapters = (scenario.kind === "excel" ? "" : "const quoteSessionHasFreshOutputExports = syntheticQuoteSessionHasFreshOutputExports; const revisionNumber = syntheticRevisionNumber;")
+  + (scenario.kind === "dashboard-failure" ? "" : "const appIsBusy = syntheticAppIsBusy; const showDashboard = syntheticShowDashboard; const setDashboardLoadingState = syntheticSetDashboardLoadingState;");
+const program = constantSource + "\n" + adapterSource + "\n" + refreshAdapters + "\n" + boundaryAdapters + "\n"
+  + (scenario.path === "duplicate" ? duplicateLoaderSource + "\n" : "") + required.map(extractFunction).join("\n");
+eval(program + String.raw`
+assert.strictEqual(normalizeActiveJob(null), null, "Missing active job must remain null");
+assert.strictEqual(normalizeActiveJob({}), null, "Empty active job must not acquire authority");
+async function settle(promise) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Error("Production save promise did not settle: conditional cycle")), 250);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+async function tick() { await new Promise(resolve => setImmediate(resolve)); }
+function assertNoLeaks() {
+  assert(!JSON.stringify({ messages, logs }).includes(CANARY), "Backend canary leaked to display/log");
+}
+async function act() {
+  if (scenario.path === "duplicate") return duplicateDashboardQuote("quote-synthetic-original", { targetSessionId: "quote-synthetic-duplicate" });
+  if (scenario.consumer === "generate") return handleGenerate();
+  if (scenario.consumer === "resume") return ensureSavedServerJobStarted({ phase: "starting", type: "draft", id: "job-synthetic-stable" });
+  return handleDraftBasis();
+}
+(async () => {
+  if (scenario.kind === "excel") {
+    state.activeSidePanel = "output";
+    state.outputRows = [{ quantity: 1, unit: "sqm", unit_price: 100 }];
+    state.outputRevision = 1; state.downloadFileRevision = 1;
+    state.downloadFile = { name: "quotation.xlsx", url: "/api/synthetic-prior.xlsx", output_revision: 1 };
+    state.outputRows[0].quantity = 2; markOutputRowsDirty();
+    assert.strictEqual(downloadFileIsFresh(), false);
+    elements.sideDownloadButton = element(); elements.excelGeneratingActionButton = element();
+    elements.excelGeneratingActionButton.dataset.exportAction = "excel";
+    const wiringStart = source.indexOf('  elements.sideDownloadButton.addEventListener("click",');
+    const wiringEnd = source.indexOf('  elements.sideViewPdfButton.addEventListener("click",', wiringStart);
+    assert(wiringStart > 0 && wiringEnd > wiringStart); eval(source.slice(wiringStart, wiringEnd));
+    const click = listeners.get("click"); assert.strictEqual(typeof click, "function");
+    if (scenario.readyOnly) {
+      handleGeneratedExportReadyAction();
+      assert.deepStrictEqual(effects, { anchor_clicks: 0, location_fallbacks: 0, artifact_requests: 0, modal_hides: 0 }, "Ready action downloaded an obsolete workbook");
+    } else {
+      const pending = click({ preventDefault() {} }); await tick();
+      if (scenario.gated) {
+        await settle(click({ preventDefault() {} }));
+        assert.strictEqual(calls.filter(c => c.url === "/api/quote-sessions").length, 1);
+        releaseResponse(); scenario.gated = false;
+      }
+      await settle(pending); await tick();
+      const success = scenario.status === 200 && !scenario.invalidAck && !scenario.excelFault;
+      assert.strictEqual(effects.anchor_clicks, success ? 1 : 0, "Actual Excel click downloaded after unsuccessful generation");
+      assert.strictEqual(effects.artifact_requests, success ? 1 : 0, "Stale artifact requested");
+      assert.strictEqual(effects.location_fallbacks, 0, "Stale location fallback");
+      assert.strictEqual(calls.filter(c => c.url === "/api/jobs").length, scenario.status === 200 && !scenario.invalidAck ? 1 : 0);
+      assert.strictEqual(Boolean(state.isGenerating), false);
+      if (success) {
+        assert(downloadFileIsFresh()); assert.strictEqual(state.downloadFile.url, "/api/synthetic-current.xlsx");
+        assert.strictEqual(downloadCurrentExcelFile(), true, "Legitimate fresh explicit retrieval denied");
+        assert.strictEqual(effects.anchor_clicks, 2);
+      } else if (!scenario.excelFault) assert(messages.join(" ").includes("Quote could not be saved"));
+    }
+    console.log(JSON.stringify({ scenario, effects, calls, outputRevision: state.outputRevision, fileRevision: state.downloadFileRevision }));
+  } else if (scenario.kind === "dashboard-failure") {
+    state.activeAppView = "quote";
+    for (const key of ["quoteDashboardPanel", "quoteFlowPanel", "dashboardLoadingModal", "backToDashboardButton", "topbarBrandButton", "newQuoteButton"]) elements[key] = element();
+    await settle(saveQuoteSessionDraftState());
+    const a = structuredClone(persisted); const aFiles = structuredClone(sessionFileRecordsFromDraft());
+    state.quoteSessionRestoredSessionId = state.quoteSessionId;
+    state.quoteSessionRestoredDraftKey = quoteSessionDraftComparisonKey();
+    version = 2; fileVersion = 2; scenario.status = scenario.rejectStatus; scenario.invalidAck = scenario.rejectAck;
+    const before = currentQuoteSessionDraftState(); const files = sessionFileRecordsFromDraft();
+    const wireLine = source.split("\n").find(l => l.includes(scenario.entry === "topbar" ? 'topbarBrandButton?.addEventListener("click"' : 'backToDashboardButton?.addEventListener("click"'));
+    assert(wireLine); eval(wireLine); const button = elements[scenario.entry === "topbar" ? "topbarBrandButton" : "backToDashboardButton"];
+    await settle(listeners.get("click")()); await tick();
+    assert.strictEqual(state.activeAppView, "quote", "Failed save navigated to dashboard");
+    assert.strictEqual(calls.filter(c => c.method === "GET" && c.url === "/api/quote-sessions").length, 0, "Failed save started list chain");
+    assert(messages.join(" ").includes("Quote could not be saved"), "Persistence failure hidden");
+    assert(state.quoteSessionLoadError.includes("ERR-")); assert.strictEqual(state.quoteSessionDashboardBusy, false);
+    assert.deepStrictEqual(currentQuoteSessionDraftState(), before); assert.deepStrictEqual(sessionFileRecordsFromDraft(), files);
+    assert(!quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));
+    scenario.status = 200; scenario.invalidAck = false;
+    await settle(listeners.get("click")()); await tick();
+    assert.strictEqual(state.activeAppView, "dashboard");
+    assert.deepStrictEqual(persisted.draft_state, JSON.parse(JSON.stringify(before))); assert.deepStrictEqual(persisted.draft_files, files);
+    assert.notDeepStrictEqual(persisted.draft_state, a.draft_state); assert.notDeepStrictEqual(files, aFiles);
+    const posts = calls.filter(c => c.url === "/api/quote-sessions" && c.method !== "GET").length;
+    state.activeAppView = "quote"; await settle(listeners.get("click")()); await tick();
+    assert.strictEqual(calls.filter(c => c.url === "/api/quote-sessions" && c.method !== "GET").length, posts, "Unchanged restored fast path wrote again");
+    console.log(JSON.stringify({ scenario, persisted, calls, messages, files_retained: true }));
+  } else if (scenario.kind === "dashboard-order") {
+    const a = saveQuoteSessionDraftState(); await tick();
+    version = 2; if (scenario.changedFiles) fileVersion = 2;
+    const b = saveQuoteSessionDraftState(); await tick();
+    version = 3; if (scenario.changedFiles) fileVersion = 3;
+    const c = returnToDashboard(); await tick();
+    // A correct implementation waits behind A/B. The failing one sends C immediately.
+    const overtook = calls.filter(call => call.url === "/api/quote-sessions").length > 1;
+    if (overtook) { responseReleases[1](); await settle(c); }
+    responseReleases[0](); await settle(a); await tick();
+    const next = overtook ? 2 : 1;
+    responseReleases[next](); await settle(b); await tick();
+    if (!overtook) { responseReleases[2](); await settle(c); }
+    assert.strictEqual(persisted.draft_state.version, 3, "Older queued save overwrote Dashboard draft");
+    if (scenario.changedFiles) assert.strictEqual(persisted.draft_files[0].size, 3, "Latest acknowledged file overwritten");
+    assert(dashboardShown);
+    assert(quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));
+    assert.strictEqual(calls.filter(call => call.url === "/api/jobs").length, 0);
+    console.log(JSON.stringify({ scenario, persisted, overtook, actual_functions: required }));
+  } else if (scenario.kind === "empty-context") {
+    state.quoteSessionId = "";
+    const a = saveQuoteSessionDraftState(); await tick();
+    state.quoteSessionId = ""; version = 2;
+    const b = saveQuoteSessionDraftState(); await tick();
+    state.quoteSessionId = "quote-replacement";
+    releaseResponse(); await settle(a); await tick();
+    if (calls.length > 1) { releaseResponse(); await settle(b); } else await settle(b);
+    assert.strictEqual(calls.filter(call => call.url === "/api/quote-sessions").length, 1, "Empty-origin queued draft wrote into replacement context");
+    assert.strictEqual(state.quoteSessionId, "quote-replacement");
+    assert.strictEqual(quoteSessionConfirmedDraftSessionId, "");
+  } else if (scenario.originalBoundary) {
+    const pending = act();
+    await tick();
+    assert.strictEqual(calls.filter(call => call.url === "/api/quote-sessions").length, 1);
+    const startingLive = structuredClone(state.activeJob);
+    const starting = JSON.parse(JSON.stringify(state.activeJob));
+    assert(starting && starting.phase === "starting" && starting.id === "job-synthetic-stable");
+    assert.deepStrictEqual(normalizeActiveJob(starting, { restoring: true }), starting);
+    const savedBefore = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY));
+    assert.deepStrictEqual(savedBefore.activeJob, starting, "Starting operation was not really serialized");
+    const authority = value => JSON.stringify({
+      reference: value.pricingReferenceId, source: value.pricingReferenceSource,
+      lifecycle: value.quoteCommercialLifecycle, review: value.quoteCommercialReview,
+      basis: value.quoteBasis, items: value.lineItems, output: value.outputRows, images: value.images,
+    });
+    const authorityBefore = authority(savedBefore);
+    const filesBefore = JSON.stringify(sessionFileRecordsFromDraft());
+    if (scenario.refreshBoundary) {
+      releaseResponse(); await tick();
+      assert.strictEqual(calls.filter(c => c.url === "/api/session").length, 1, "Did not reach actual refresh leg");
+      if (scenario.unloading) markPageUnloading();
+    } else state.isPageUnloading = Boolean(scenario.unloading);
+    releaseResponse();
+    await settle(pending);
+    const savedAfter = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY));
+    assert.strictEqual(authority(savedAfter), authorityBefore, "Commercial/output authority changed on save failure");
+    assert.strictEqual(JSON.stringify(sessionFileRecordsFromDraft()), filesBefore);
+    assert.strictEqual(calls.filter(call => call.url === "/api/jobs").length, 0);
+    const preserve = scenario.unloading && (!scenario.refreshBoundary || ["fetch", "body"].includes(scenario.refreshFault));
+    if (preserve) {
+      assert.deepStrictEqual(state.activeJob, startingLive, "Unload destroyed the starting operation");
+      assert.deepStrictEqual(savedAfter.activeJob, starting, "Unload erased durable recovery identity");
+      assert.deepStrictEqual(normalizeActiveJob(savedAfter.activeJob, { restoring: true }), starting);
+      assert.strictEqual(scenario.consumer === "generate" ? state.isGenerating : state.isAnalysisRunning, true);
+      // A replacement document restores the serialized identity. Its real resume consumer must
+      // report an ordinary failed save with that identity and without a job or automatic retry.
+      state.activeJob = normalizeActiveJob(savedAfter.activeJob, { restoring: true });
+      state.isPageUnloading = false;
+      state.isGenerating = false; state.isAnalysisRunning = false;
+      scenario.gated = false; scenario.fetchFailure = false; scenario.bodyAbort = false; scenario.status = 503; scenario.realRefresh = false; scenario.refreshBoundary = false; scenario.refreshFault = null;
+      const resumed = await settle(ensureSavedServerJobStarted(state.activeJob));
+      assert.strictEqual(resumed.ok, false);
+      assert.strictEqual(resumed.data.page_unloading, false);
+      assert.strictEqual(resumed.data.quote_session_save_failure.status, 503);
+      assert(resumed.data.errors.some(value => value.includes("ERR-1234ABCD")));
+      assert.deepStrictEqual(state.activeJob, starting);
+      assert.strictEqual(calls.filter(call => call.url === "/api/quote-sessions").length, 2,
+        "The only second save must be the deliberately invoked resume");
+      assert.strictEqual(normalizeActiveJob({ ...starting, browserRecoveryScope: "b".repeat(64) }, { restoring: true }), null);
+      assert.strictEqual(normalizeActiveJob({ ...starting, startedAt: "2020-01-01T00:00:00Z" }, { restoring: true }), null);
+    } else {
+      assert.strictEqual(state.activeJob, null);
+      assert.strictEqual(savedAfter.activeJob, null, "Ordinary failure did not persist cleanup");
+      assert.strictEqual(state.isGenerating, false); assert.strictEqual(state.isAnalysisRunning, false);
+      assert.strictEqual(appIsBusy(), false);
+      assert(messages.join(" ").includes("ERR-"));
+      if (scenario.consumer === "draft") assert(restoredOverrides > 0);
+      assert.strictEqual(calls.filter(call => call.url === "/api/quote-sessions").length, 1);
+    }
+    assert.strictEqual(calls.filter(call => call.url === "/api/jobs").length, 0);
+    assertNoLeaks();
+    console.log(JSON.stringify({ originalBoundary: scenario.consumer, unloading: scenario.unloading,
+      same_identity: preserve ? state.activeJob.id === starting.id : state.activeJob === null,
+      session_posts: calls.filter(call => call.url === "/api/quote-sessions").length,
+      job_posts: 0, provider_calls: 0, exports: 0, production_boundary: required }));
+  } else if (scenario.kind === "queue") {
+    const autosave = saveQuoteSessionDraftState();
+    await tick(); assert.strictEqual(calls.length, 1);
+    version = 2; fileVersion = 2;
+    const latest = ensureQuoteSession({ synchronizeDraft: true });
+    await tick(); assert.strictEqual(calls.length, 1);
+    releaseResponse(); await settle(autosave); await tick();
+    assert.strictEqual(calls.length, 2);
+    releaseResponse(); assert.strictEqual(await settle(latest), "quote-synthetic-a");
+    assert(quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));
+    version = 3;
+    const metadata = ensureQuoteSession({ synchronizeDraft: true }); await tick();
+    assert(!Object.hasOwn(calls[2].payload, "draft_files"));
+    releaseResponse(); await settle(metadata);
+    fileVersion = 3; version = 4;
+    const files = ensureQuoteSession({ synchronizeDraft: true }); await tick();
+    assert(Object.hasOwn(calls[3].payload, "draft_files"));
+    releaseResponse(); await settle(files);
+  } else if (scenario.kind === "stale") {
+    const failure = {};
+    const save = ensureQuoteSession({ synchronizeDraft: true, saveFailure: failure }); await tick();
+    state.quoteSessionId = "quote-synthetic-b";
+    state.quoteSessionLoadError = "";
+    state.quoteCommercialReview = null;
+    releaseResponse(); assert.strictEqual(await settle(save), "");
+    assert.strictEqual(state.quoteSessionId, "quote-synthetic-b");
+    assert.strictEqual(state.quoteSessionLoadError, "");
+    assert.strictEqual(state.quoteCommercialReview, null);
+    assert.strictEqual(quoteSessionConfirmedDraftSessionId, "");
+  } else if (scenario.kind === "recovery") {
+    const failure = {};
+    assert.strictEqual(await settle(ensureQuoteSession({ synchronizeDraft: true, saveFailure: failure })), "");
+    assert(failure.failure && failure.failure.error_reference === "ERR-1234ABCD");
+    assert.strictEqual(quoteSessionConfirmedDraftSessionId, "");
+    scenario.status = 200;
+    assert.strictEqual(await settle(ensureQuoteSession({ synchronizeDraft: true, saveFailure: failure })), "quote-synthetic-a");
+    assert.strictEqual(failure.failure, null);
+    assert.strictEqual(state.quoteSessionLoadError, "");
+    assert(quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));
+  } else if (scenario.kind === "other-consumer") {
+    await settle(adoptServerQuoteCommercialReview({ quoteCommercialReview: review }));
+    assert.strictEqual(calls.filter(call => call.url === "/api/quote-sessions").length, 1);
+    assert.deepStrictEqual(calls[0].payload.draft_state.quoteCommercialReview, review);
+  } else {
+    const preserveStarting = scenario.kind === "failure" && Boolean(scenario.fetchFailure && scenario.unloading)
+      && ["analyse", "generate"].includes(scenario.consumer);
+    const pending = act();
+    // Capture the independent live operation/activity before any awaited failure continuation.
+    const startingLive = preserveStarting ? structuredClone(state.activeJob) : null;
+    const startingActivity = preserveStarting ? {
+      analysis: state.isAnalysisRunning, generation: state.isGenerating,
+    } : null;
+    const startingCommercial = preserveStarting ? structuredClone({
+      lifecycle: state.quoteCommercialLifecycle, review: state.quoteCommercialReview,
+      images: state.images, items: state.lineItems, output: state.outputRows,
+      basisConfirmed: state.basisConfirmed, pricingIdentity: currentPricingReference(),
+    }) : null;
+    if (preserveStarting) {
+      assert(startingLive && startingLive.phase === "starting" && startingLive.id === "job-synthetic-stable");
+      assert.strictEqual(startingActivity.analysis, scenario.consumer === "analyse");
+      assert.strictEqual(startingActivity.generation, scenario.consumer === "generate");
+    }
+    if (scenario.kind === "failure" && scenario.path !== "duplicate") {
+      assert.strictEqual(state.quoteSessionLoadError, "", "Attempt did not reset prior save failure");
+    }
+    if (scenario.gated) {
+      await tick();
+      assert.strictEqual(await handleDraftBasis(), undefined);
+      assert.strictEqual(calls.filter(call => call.url === "/api/quote-sessions").length, 1);
+      releaseResponse();
+    }
+    const result = await settle(pending);
+    const successfulSave = !scenario.invalidAck && !scenario.malformed && !scenario.bodyAbort && (scenario.status === 200 || scenario.refresh === "success");
+    const sessionCalls = calls.filter(call => call.url === "/api/quote-sessions");
+    assert.strictEqual(sessionCalls.length, (scenario.refresh === "success" || (scenario.realRefresh && !scenario.refreshFault)) ? 2 : 1, "Unexpected nested save/replay");
+    const jobCalls = calls.filter(call => call.url === "/api/jobs");
+    assert.strictEqual(jobCalls.length, successfulSave && scenario.path !== "duplicate" ? 1 : 0);
+    if (jobCalls.length) {
+      assert.strictEqual(jobCalls[0].payload.job_id, "job-synthetic-stable");
+      assert.strictEqual(quoteSessionConfirmedDraftSessionId, state.quoteSessionId);
+      assert.strictEqual(quoteSessionConfirmedDraftFileKey, quoteSessionDraftFileComparisonKey());
+    }
+    if (preserveStarting) {
+      assert.deepStrictEqual(state.activeJob, startingLive, "Departing document changed starting identity");
+      assert.strictEqual(state.isAnalysisRunning, startingActivity.analysis);
+      assert.strictEqual(state.isGenerating, startingActivity.generation);
+      assert.deepStrictEqual({
+        lifecycle: state.quoteCommercialLifecycle, review: state.quoteCommercialReview,
+        images: state.images, items: state.lineItems, output: state.outputRows,
+        basisConfirmed: state.basisConfirmed, pricingIdentity: currentPricingReference(),
+      }, startingCommercial, "Unloading changed commercial/files authority");
+      assert.strictEqual(messages.length, 0, "Departing document rendered a terminal failure");
+      assert.strictEqual(result, undefined);
+    } else {
+      assert.strictEqual(state.isAnalysisRunning, false);
+      assert.strictEqual(state.isGenerating, false);
+    }
+    assert.strictEqual(Boolean(state.quoteSessionRestoreBusy), false);
+    assert(state.images.length && snapshots.some(snapshot => snapshot.files.length), "Recoverable files lost");
+    if (scenario.path === "duplicate") {
+      await tick();
+      assert.strictEqual(result, successfulSave, "Duplicate terminal result mismatch");
+      assert.strictEqual(state.dashboardOperation, null, "Duplicate operation not cleaned up");
+      const saved = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY));
+      assert.strictEqual(saved.quoteSessionId, "quote-synthetic-duplicate");
+      assert.deepStrictEqual(saved.images, [{ name: duplicateFile.name, type: duplicateFile.type,
+        size: duplicateFile.size, content_fingerprint: duplicateFile.content_fingerprint,
+        session_file_key: duplicateFile.session_file_key }]);
+      assert(!Object.hasOwn(saved.images[0], "data_url"), "Snapshot bypasses real file restoration");
+      const stored = persistedFiles.get(duplicateFile.session_file_key);
+      assert.deepStrictEqual(stored, { ...duplicateFile, browserRecoveryScope: currentBrowserRecoveryScope() });
+      assert(fileEffects.some(effect => effect.mode === "readwrite" && effect.key === duplicateFile.session_file_key));
+      const restoredImages = await restoreSessionImages(saved.images);
+      assert.deepStrictEqual(restoredImages, [{ ...duplicateFile, browserRecoveryScope: currentBrowserRecoveryScope() }]);
+      assert.deepStrictEqual(sessionFileRecordsFromImages(state.images), [duplicateFile],
+        "Restored live file differs from persisted identity");
+      assert.deepStrictEqual(sessionCalls[0].payload.draft_files, [duplicateFile]);
+      assert.strictEqual(saved.activeJob, null);
+      assert.deepStrictEqual(saved.lineItems, state.lineItems);
+      assert.deepStrictEqual(saved.quoteBasis, state.quoteBasis);
+    }
+    if (scenario.review && !scenario.invalidReview) {
+      assert.deepStrictEqual(state.quoteCommercialReview, review);
+      assert(snapshots.some(snapshot => snapshot.review?.reason_code === review.reason_code));
+      assert([...messages, ...(result?.data?.errors || [])].some(message => message.includes(QUOTE_COMMERCIAL_REVIEW_MESSAGE)));
+    }
+    if (scenario.kind === "failure") {
+      const display = messages.join(" ") + (result?.data?.errors || []).join(" ");
+      if (!scenario.invalidAck && !scenario.malformed && !scenario.bodyAbort && !scenario.fetchFailure && /^ERR-[A-F0-9]{8}$/.test(scenario.reference ?? "ERR-1234ABCD")) {
+        assert(display.includes(scenario.reference ?? "ERR-1234ABCD"), "Attempt support reference lost");
+      }
+      const currentAttemptFailure = state.quoteSessionLoadError;
+      assert(!display.includes("OLD-REFERENCE-CANARY"), "Prior failure labels this attempt");
+      assert(!currentAttemptFailure.includes("OLD-REFERENCE-CANARY"), "Prior save reference labels this attempt");
+      assert(!currentAttemptFailure.includes(CANARY), "Backend canary leaked to current save failure");
+      if (preserveStarting) {
+        assert(/ERR-[A-F0-9]{8}/.test(currentAttemptFailure), "Safe current-attempt support reference lost");
+      }
+      if (scenario.word) {
+        assert((preserveStarting ? currentAttemptFailure : display).includes(scenario.word), "Failure classification lost");
+      }
+      if (scenario.consumer === "resume") {
+        assert.strictEqual(result.data.quote_session_save_failure.status, scenario.fetchFailure ? 0 : scenario.status);
+        const expectedTransportFailure = Boolean(scenario.fetchFailure || (scenario.realRefresh && ["fetch", "body"].includes(scenario.refreshFault)));
+        assert.strictEqual(result.data.quote_session_save_failure.fetch_failed, expectedTransportFailure);
+        assert.strictEqual(result.data.quote_session_save_failure.page_unloading, Boolean(expectedTransportFailure && scenario.unloading));
+      }
+    }
+    if (scenario.realRefresh) assert.strictEqual(calls.filter(call => call.url === "/api/session").length, 1, "Expected exactly one actual refresh");
+    if (!successfulSave) assert.strictEqual(quoteSessionConfirmedDraftSessionId, "");
+    if (!scenario.consumer && scenario.path !== "duplicate") assert(restoredOverrides > 0);
+  }
+  assertNoLeaks();
+  console.log(JSON.stringify({ scenario, counts: { session_posts: calls.filter(call => call.url === "/api/quote-sessions").length,
+    job_posts: calls.filter(call => call.url === "/api/jobs").length, log_posts: logs.length,
+    local_snapshots: snapshots.length, provider_calls: 0, exports: 0 }, boundary: required }));
+})().catch(error => {
+  console.error(JSON.stringify({ scenario, counts: { session_posts: calls.filter(call => call.url === "/api/quote-sessions").length,
+    job_posts: calls.filter(call => call.url === "/api/jobs").length, provider_calls: 0, exports: 0 } }));
+  console.error(error.stack); process.exitCode = 1;
+});
+`);
+"""
+        completed = subprocess.run(
+            [require_node(self), "-e", script, json.dumps(scenario)],
+            cwd=str(ROOT), text=True, capture_output=True, check=False, timeout=15,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        print(completed.stdout.strip())
+
+    def test_sqag212_generate_unloading_save_preserves_starting_operation(self):
+        self.run_sqag212_production_save_chain({"originalBoundary": True, "consumer": "generate", "unloading": True, "fetchFailure": True, "gated": True})
+
+    def test_sqag212_draft_unloading_save_preserves_starting_operation(self):
+        self.run_sqag212_production_save_chain({"originalBoundary": True, "consumer": "draft", "unloading": True, "fetchFailure": True, "gated": True})
+
+    def test_sqag212_generate_nonunloading_save_failure_stays_terminal(self):
+        self.run_sqag212_production_save_chain({"originalBoundary": True, "consumer": "generate", "unloading": False, "fetchFailure": True, "gated": True})
+
+    def test_sqag212_draft_nonunloading_save_failure_stays_terminal(self):
+        self.run_sqag212_production_save_chain({"originalBoundary": True, "consumer": "draft", "unloading": False, "fetchFailure": True, "gated": True})
+
+    def test_sqag212_production_queued_review_save_settles_without_retry(self):
+        self.run_sqag212_production_save_chain({"path": "queued", "review": True})
+
+    def test_sqag212_production_initial_review_save_settles_without_retry(self):
+        self.run_sqag212_production_save_chain({"path": "initial", "review": True})
+
+    def test_sqag212_production_restored_review_save_settles_without_retry(self):
+        self.run_sqag212_production_save_chain({"path": "restored", "review": True})
+
+    def test_sqag212_production_duplicate_review_save_settles_without_retry(self):
+        self.run_sqag212_production_save_chain({"path": "duplicate", "review": True})
+
+    def test_sqag212_production_save_failure_is_attempt_bound_and_safe(self):
+        cases = [
+            {"status": 400, "review": True, "word": "Pricing review required"},
+            {"status": 400, "word": "details"},
+            {"status": 401, "word": "sign in"},
+            {"status": 403, "refresh": "fail", "word": "permission"},
+            {"status": 413, "word": "too large"},
+            {"status": 429, "word": "requests"},
+            {"status": 503, "word": "try again"},
+            {"status": 503, "unloading": True, "word": "try again"},
+            {"status": 500, "malformed": True, "word": "try again"},
+            {"status": 0, "fetchFailure": True, "word": "connection"},
+            {"status": 0, "fetchFailure": True, "unloading": True, "word": "connection"},
+            {"status": 400, "invalidReview": True, "review": True, "word": "details"},
+            {"status": 500, "reference": "PRIVATE-BACKEND-FILENAME-PRICING-CANARY"},
+        ]
+        for consumer in ("analyse", "generate", "resume"):
+            for case in cases:
+                with self.subTest(consumer=consumer, **case):
+                    self.run_sqag212_production_save_chain({"kind": "failure", "consumer": consumer, **case})
+
+    def test_sqag212_production_save_success_auth_replay_and_pending_click(self):
+        for case in ({"status": 200}, {"status": 403, "refresh": "success"}, {"status": 200, "gated": True}):
+            with self.subTest(**case):
+                self.run_sqag212_production_save_chain(case)
+
+    def test_sqag212_production_save_queue_confirms_latest_state_and_files(self):
+        self.run_sqag212_production_save_chain({"kind": "queue", "status": 200, "gated": True})
+
+    def test_sqag212_production_save_failure_then_success_clears_reference(self):
+        self.run_sqag212_production_save_chain({"kind": "recovery", "status": 500})
+
+    def test_sqag212_production_save_response_cannot_overwrite_new_session(self):
+        for status in (200, 400):
+            with self.subTest(status=status):
+                self.run_sqag212_production_save_chain({"kind": "stale", "status": status, "review": True, "gated": True})
+
+    def test_sqag212_other_response_consumer_still_persists_review(self):
+        self.run_sqag212_production_save_chain({"kind": "other-consumer", "status": 200})
+
+    def test_sqag212_quote_session_request_boundary_exact_bytes(self):
+        # Exercise the actual HTTP handler/read_json with a scaled ceiling, not a size calculator.
+        limit = 256
+        with LocalRunnerServer() as runner:
+            session = self.http_json(runner, "GET", "/api/session")["body"]
+            headers = {
+                "Content-Type": "application/json",
+                "Origin": runner.base_url,
+                session["csrf_header"]: session["csrf_token"],
+            }
+            with (
+                mock.patch.object(webapp, "MAX_REQUEST_BYTES", limit),
+                mock.patch.object(webapp, "quote_session_storage_for_auth_session") as writer,
+                mock.patch.object(webapp, "request_openai_quote_basis", side_effect=AssertionError("provider called")),
+                mock.patch.object(webapp, "run_job_worker", side_effect=AssertionError("job called")),
+            ):
+                writer.return_value.create_or_update_quote_session.return_value = {"session_id": "quote-synthetic-boundary"}
+                for size in (limit - 1, limit, limit + 1):
+                    body = b'{"synthetic":"' + b'x' * (size - len(b'{"synthetic":""}')) + b'"}'
+                    self.assertEqual(len(body), size)
+                    before = writer.return_value.create_or_update_quote_session.call_count
+                    connection = http.client.HTTPConnection(*runner.server.server_address, timeout=5)
+                    try:
+                        connection.request("POST", "/api/quote-sessions", body=body, headers=headers)
+                        response = connection.getresponse()
+                        response.read()
+                        self.assertEqual(response.status, 200 if size <= limit else 413)
+                    finally:
+                        connection.close()
+                    self.assertEqual(writer.return_value.create_or_update_quote_session.call_count - before, 1 if size <= limit else 0)
+
+    def test_sqag212_invalid_success_acknowledgement_blocks_actual_consumers(self):
+        for consumer in ("analyse", "generate", "resume", "duplicate"):
+            for fault in ({"status": 200, "malformed": True}, {"status": 204, "malformed": True},
+                          *({"status": 200, "invalidAck": value} for value in ("null", "missing", "mismatch", "status"))):
+                with self.subTest(consumer=consumer, **fault):
+                    self.run_sqag212_production_save_chain({"kind": "failure", "consumer": consumer,
+                        "path": "duplicate" if consumer == "duplicate" else "queued", **fault})
+
+    def test_sqag212_dashboard_write_orders_after_actual_queue(self):
+        for changed in (False, True):
+            with self.subTest(changedFiles=changed):
+                self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200, "changedFiles": changed})
+
+    def test_sqag212_empty_origin_queued_save_cannot_write_replacement(self):
+        self.run_sqag212_production_save_chain({"kind": "empty-context", "status": 200, "gated": True})
+
+    def test_sqag212_actual_auth_refresh_logging_is_save_safe(self):
+        for consumer in ("analyse", "generate", "resume"):
+            for fault in ("http", "fetch", "malformed"):
+                for invalid in (False, True) if fault == "http" else (False,):
+                    with self.subTest(consumer=consumer, refreshFault=fault, invalidReference=invalid):
+                        self.run_sqag212_production_save_chain({"kind": "failure", "consumer": consumer,
+                            "status": 403, "realRefresh": True, "refreshFault": fault, "invalidRefreshReference": invalid})
+
+    def test_sqag212_actual_auth_refresh_replays_once_with_valid_acknowledgement(self):
+        self.run_sqag212_production_save_chain({"status": 403, "refresh": "success", "realRefresh": True})
+
+    def test_sqag212_response_body_abort_preserves_only_original_unload(self):
+        for consumer in ("generate", "draft"):
+            for unloading in (False, True):
+                with self.subTest(consumer=consumer, unloading=unloading):
+                    self.run_sqag212_production_save_chain({"originalBoundary": True, "consumer": consumer,
+                        "unloading": unloading, "bodyAbort": True, "status": 200, "gated": True})
+
+    def test_sqag212_refresh_interruption_preserves_attempt_bound_recovery(self):
+        for consumer in ("draft", "generate"):
+            for fault in ("fetch", "body", "http", "malformed"):
+                for unloading in (False, True):
+                    for status in ((500, 403, 503) if fault == "http" else (500,)):
+                        with self.subTest(consumer=consumer, fault=fault, unloading=unloading, status=status):
+                            self.run_sqag212_production_save_chain({"originalBoundary": True,
+                                "refreshBoundary": True, "realRefresh": True, "refreshFault": fault,
+                                "refreshStatus": status, "consumer": consumer, "unloading": unloading,
+                                "status": 403, "gated": True})
+        self.run_sqag212_production_save_chain({"status": 403, "refresh": "success", "realRefresh": True})
+
+    def test_sqag212_dashboard_failed_save_preserves_current_draft(self):
+        for entry in ("back", "topbar"):
+            for fault in ({"rejectStatus": 503}, {"rejectStatus": 200, "rejectAck": "mismatch"}):
+                with self.subTest(entry=entry, **fault):
+                    self.run_sqag212_production_save_chain({"kind": "dashboard-failure", "path": "restored",
+                        "status": 200, "entry": entry, **fault})
+        for changed in (False, True):
+            self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200, "changedFiles": changed})
+
+    def test_sqag212_excel_click_requires_successful_current_artifact(self):
+        for fault in ({"status": 503}, {"status": 200, "invalidAck": "mismatch"},
+                      {"status": 200, "excelFault": "start"}, {"status": 200, "excelFault": "poll"},
+                      {"status": 503, "readyOnly": True}, {"status": 200, "gated": True}):
+            with self.subTest(**fault):
+                self.run_sqag212_production_save_chain({"kind": "excel", **fault})
+
     def test_browser_generation_serializes_and_confirms_latest_draft_save(self):
         node = require_node(self)
         script = r"""
@@ -28511,7 +29372,6 @@ const state = {
 const window = { clearTimeout() {} };
 const calls = [];
 const gates = [];
-const safeQuoteSessionId = (value) => String(value || "");
 const normalizedContentFingerprint = (value) => String(value || "");
 const quoteSessionDraftStateCanSave = () => true;
 const saveSessionState = () => {};
@@ -28549,6 +29409,8 @@ async function saveCurrentQuoteSession(options) {
 }
 
 eval([
+  "safeQuoteSessionId",
+  "ensureClientQuoteSessionId",
   "quoteSessionDraftComparisonKey",
   "quoteSessionDraftFileComparisonKey",
   "rememberConfirmedQuoteSessionDraft",

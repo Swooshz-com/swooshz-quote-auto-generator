@@ -3017,7 +3017,8 @@ function serverQuoteCommercialReviewFromResponse(data = {}) {
   return null;
 }
 
-async function adoptServerQuoteCommercialReview(data = {}) {
+async function adoptServerQuoteCommercialReview(data = {}, options = {}) {
+  if (options.sessionId && safeQuoteSessionId(state.quoteSessionId) !== options.sessionId) return false;
   const review = serverQuoteCommercialReviewFromResponse(data);
   if (!review) return false;
   state.quoteCommercialReview = review;
@@ -3025,7 +3026,7 @@ async function adoptServerQuoteCommercialReview(data = {}) {
   renderQuoteCommercialReviewState();
   syncControlStates();
   saveSessionState();
-  if (quoteSessionDraftStateCanSave()) {
+  if (options.persistSession !== false && quoteSessionDraftStateCanSave()) {
     try {
       await saveQuoteSessionDraftState({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
     } catch {
@@ -9420,7 +9421,7 @@ function discardInvalidRestoredActiveJob() {
 
 
 function downloadCurrentExcelFile(file = state.downloadFile) {
-  if (!file?.url) return false;
+  if (!downloadFileIsFresh(file)) return false;
   try {
     const link = document.createElement("a");
     link.href = file.url;
@@ -13034,14 +13035,23 @@ function hideFeedbackModal() {
 }
 
 
-async function jsonFromResponse(response) {
+async function jsonFromResponse(response, options = {}) {
   try {
     return await response.json();
-  } catch {
-    return {
-      status: "failed",
-      errors: genericFailureMessages(),
-    };
+  } catch (error) {
+    if (options.persistSession === false) {
+      const errorReference = newClientErrorReference();
+      const bodyInterrupted = error?.name === "AbortError" || error?.name === "TypeError";
+      return {
+        status: "failed",
+        response_parse_failed: true,
+        fetch_failed: bodyInterrupted,
+        page_unloading: bodyInterrupted && state.isPageUnloading,
+        error_reference: errorReference,
+        errors: genericFailureMessages({ error_reference: errorReference }),
+      };
+    }
+    return { status: "failed", errors: genericFailureMessages() };
   }
 }
 
@@ -13094,12 +13104,13 @@ function renderAuthState() {
   if (elements.topbarLogoutLink) elements.topbarLogoutLink.hidden = !state.authenticated;
 }
 
-async function refreshSessionToken() {
-  const { ok, data } = await getJson("/api/session", { logFetchFailure: false });
-  return ok && await applySessionData(data);
+async function refreshSessionToken(options = {}) {
+  const { ok, data } = await getJson("/api/session", { ...options, logFetchFailure: false });
+  if (options.refreshFailure && data?.fetch_failed === true) options.refreshFailure.failure = data;
+  return ok && isPlainObject(data) && data.response_parse_failed !== true && await applySessionData(data);
 }
 
-async function postJson(url, payload) {
+async function postJson(url, payload, options = {}) {
   let response;
   try {
     response = await fetchPostJsonResponse(url, payload);
@@ -13107,18 +13118,31 @@ async function postJson(url, payload) {
     return postJsonFetchFailure(url, error);
   }
 
-  let data = await jsonFromResponse(response);
-  if (response.status === 403 && await refreshSessionToken()) {
+  let data = await jsonFromResponse(response, options);
+  const refreshFailure = {};
+  if (response.status === 403 && await refreshSessionToken({ ...options, refreshFailure })) {
     try {
       response = await fetchPostJsonResponse(url, payload);
-      data = await jsonFromResponse(response);
+      data = await jsonFromResponse(response, options);
     } catch (error) {
       return postJsonFetchFailure(url, error);
     }
   }
-  await adoptServerQuoteCommercialReview(data);
+  // Keep the original safe status/reference while carrying this save's actual refresh interruption.
+  if (options.persistSession === false && refreshFailure.failure?.fetch_failed === true) {
+    data = { ...data, fetch_failed: true, page_unloading: refreshFailure.failure.page_unloading === true };
+  }
+  await adoptServerQuoteCommercialReview(data, options);
   if (!response.ok) {
-    logClientEvent("server_error", { url, status: response.status, errors: data.errors || [] });
+    const failure = options.persistSession === false
+      ? quoteSessionSaveFailureFrom({ data, status: response.status }) : null;
+    logClientEvent("server_error", {
+      url,
+      status: response.status,
+      ...(failure
+        ? { error_reference: failure.error_reference, errors: [quoteSessionDraftSynchronizationFailureMessage(failure)] }
+        : { errors: data.errors || [] }),
+    });
   }
   return { ok: response.ok, data, status: response.status };
 }
@@ -13145,22 +13169,17 @@ async function getJson(url, options = {}) {
     };
   }
 
-  let data;
-  try {
-    data = await response.json();
-  } catch {
-    data = {
-      status: "failed",
-      errors: genericFailureMessages(),
-    };
-  }
-  await adoptServerQuoteCommercialReview(data);
+  const data = await jsonFromResponse(response, options);
+  await adoptServerQuoteCommercialReview(data, options);
   if (!response.ok) {
+    const failure = options.persistSession === false
+      ? quoteSessionSaveFailureFrom({ data, status: response.status }) : null;
     logClientEvent("server_error", {
       url,
       status: response.status,
-      error_reference: errorReferenceFrom(data),
-      errors: data.errors || [],
+      ...(failure
+        ? { error_reference: failure.error_reference, errors: [quoteSessionDraftSynchronizationFailureMessage(failure)] }
+        : { error_reference: errorReferenceFrom(data), errors: data.errors || [] }),
     });
   }
   return { ok: response.ok, data, status: response.status };
@@ -13460,6 +13479,7 @@ function currentQuoteSessionPayload(options = {}) {
 }
 
 async function saveCurrentQuoteSession(options = {}) {
+  if (options.saveFailure) options.saveFailure.failure = null;
   let requestedSessionId = safeQuoteSessionId(options.sessionId || state.quoteSessionId || "");
   if (!requestedSessionId && quoteSessionInitialSavePromise) {
     await quoteSessionInitialSavePromise.catch(() => null);
@@ -13470,6 +13490,8 @@ async function saveCurrentQuoteSession(options = {}) {
     requestedSessionId = ensureClientQuoteSessionId();
   }
   const payload = currentQuoteSessionPayload({ ...options, sessionId: requestedSessionId });
+  const requestedContextSessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  state.quoteSessionLoadError = "";
   const payloadDraftKey = payload.draft_state
     ? quoteSessionDraftComparisonKey(payload.draft_state)
     : "";
@@ -13477,13 +13499,31 @@ async function saveCurrentQuoteSession(options = {}) {
     ? quoteSessionDraftFileComparisonKey(payload.draft_files)
     : null;
   const savePromise = (async () => {
-    const { ok, data } = await postJson("/api/quote-sessions", payload);
-    if (!ok) {
-      state.quoteSessionLoadError = genericFailureMessage(data);
+    const result = await postJson("/api/quote-sessions", payload, {
+      persistSession: false,
+      sessionId: requestedContextSessionId,
+    });
+    const { ok, data } = result;
+    // A response for an abandoned session must not adopt, confirm or relabel its replacement.
+    if (safeQuoteSessionId(state.quoteSessionId || "") !== requestedContextSessionId) return null;
+    const session = isPlainObject(data) && isPlainObject(data.quote_session) ? data.quote_session : null;
+    const validAcknowledgement = Boolean(ok && data?.status === "saved" && session
+      && session.session_id === payload.session_id && safeQuoteSessionId(session.session_id));
+    if (!validAcknowledgement) {
+      const failure = quoteSessionSaveFailureFrom(result);
+      if (ok) {
+        failure.error_reference ||= newClientErrorReference();
+        if (!state.isPageUnloading) logClientEvent("server_error", {
+          url: "/api/quote-sessions", status: failure.status,
+          error_reference: failure.error_reference, errors: [quoteSessionDraftSynchronizationFailureMessage(failure)],
+        });
+      }
+      if (options.saveFailure) options.saveFailure.failure = failure;
+      state.quoteSessionLoadError = quoteSessionDraftSynchronizationFailureMessage(failure);
       return null;
     }
-    const session = data.quote_session || {};
-    const savedSessionId = safeQuoteSessionId(session.session_id || payload.session_id);
+    state.quoteSessionLoadError = "";
+    const savedSessionId = safeQuoteSessionId(session.session_id);
     const currentContext = currentGenerationContext();
     transitionGenerationContext(
       savedSessionId, currentContext.session_id === savedSessionId ? currentContext.run_id : ""
@@ -13507,6 +13547,7 @@ async function saveCurrentQuoteSession(options = {}) {
 }
 
 async function ensureQuoteSession(options = {}) {
+  if (options.saveFailure) options.saveFailure.failure = null;
   if (options.synchronizeDraft === true && quoteSessionDraftStateCanSave()) {
     clearQuoteSessionDraftSaveTimer();
     while (true) {
@@ -13516,22 +13557,25 @@ async function ensureQuoteSession(options = {}) {
       const draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
       const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
       if (quoteSessionDraftIsConfirmed(currentSessionId, draftKey, draftFileKey)) {
+        state.quoteSessionLoadError = "";
         return currentSessionId;
       }
       const session = await saveQuoteSessionDraftState({
         quoteGenerated: options.quoteGenerated,
         draftState,
         draftFiles,
+        saveFailure: options.saveFailure,
       });
       if (!session || !safeQuoteSessionId(session.session_id || state.quoteSessionId)) return "";
     }
   }
   if (safeQuoteSessionId(state.quoteSessionId)) return state.quoteSessionId;
   const session = await saveCurrentQuoteSession(options);
-  return safeQuoteSessionId(session?.session_id || state.quoteSessionId);
+  return session ? safeQuoteSessionId(session.session_id) : "";
 }
 
 async function saveQuoteSessionDraftState(options = {}) {
+  if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
   saveSessionState();
   const draftState = options.draftState || currentQuoteSessionDraftState();
@@ -13541,9 +13585,11 @@ async function saveQuoteSessionDraftState(options = {}) {
   const draftKey = quoteSessionDraftComparisonKey(draftState);
   const draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
   const priorSave = quoteSessionDraftSavePromise;
+  const queuedSessionId = ensureClientQuoteSessionId();
   const savePromise = (async () => {
     if (priorSave) await priorSave.catch(() => null);
     const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
+    if (currentSessionId !== queuedSessionId) return null;
     if (quoteSessionDraftIsConfirmed(currentSessionId, draftKey, draftFileKey)) {
       return { session_id: currentSessionId };
     }
@@ -13553,6 +13599,7 @@ async function saveQuoteSessionDraftState(options = {}) {
       includeDraftFiles: !quoteSessionDraftFilesAreConfirmed(currentSessionId, draftFileKey),
       draftState,
       draftFiles,
+      saveFailure: options.saveFailure,
     });
     if (session) saveSessionState();
     return session;
@@ -13565,8 +13612,42 @@ async function saveQuoteSessionDraftState(options = {}) {
   }
 }
 
-function quoteSessionDraftSynchronizationFailureMessage() {
-  return "Reference files could not be saved. Please try again before generating the quote.";
+function safeQuoteSessionErrorReference(data = {}) {
+  const reference = errorReferenceFrom(data);
+  return /^ERR-[A-Fa-f0-9]{8}$/.test(reference) ? reference : "";
+}
+
+function quoteSessionSaveFailureFrom(result = {}) {
+  const data = result.data || {};
+  const review = serverQuoteCommercialReviewFromResponse(data);
+  return {
+    status: Number.isInteger(result.status) ? result.status : 0,
+    error_reference: safeQuoteSessionErrorReference(data),
+    fetch_failed: data.fetch_failed === true,
+    page_unloading: data.page_unloading === true,
+    review_reason: review?.reason_code || "",
+  };
+}
+
+function quoteSessionDraftSynchronizationFailureMessage(failure = null) {
+  let message = "Quote could not be saved. Please try again before generating the quote.";
+  if (QUOTE_COMMERCIAL_REVIEW_REASONS.has(failure?.review_reason)) {
+    message = QUOTE_COMMERCIAL_REVIEW_MESSAGE;
+  } else if (failure?.fetch_failed) {
+    message = "Quote could not be saved because the connection was interrupted. Please try again.";
+  } else if (failure?.status === 400) {
+    message = "Quote could not be saved. Check the quote details and try again.";
+  } else if (failure?.status === 401) {
+    message = "Quote could not be saved. Please sign in again and try again.";
+  } else if (failure?.status === 403) {
+    message = "Quote could not be saved. Check your permission to save quotes and try again.";
+  } else if (failure?.status === 413) {
+    message = "Quote could not be saved because the request is too large. Reduce reference files and try again.";
+  } else if (failure?.status === 429) {
+    message = "Quote could not be saved because there were too many requests. Wait a moment and try again.";
+  }
+  const reference = safeQuoteSessionErrorReference(failure);
+  return reference ? `${message} Reference: ${reference}.` : message;
 }
 
 function clearQuoteSessionDraftSaveTimer() {
@@ -13737,10 +13818,16 @@ async function returnToDashboard() {
       showDashboard();
       return;
     }
-    await saveCurrentQuoteSession({
+    const saveFailure = {};
+    const saved = await saveQuoteSessionDraftState({
       quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
-      includeDraftState: true,
+      saveFailure,
     });
+    if (!saved) {
+      renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "error");
+      syncControlStates();
+      return;
+    }
     dashboardLoadStarted = true;
     showDashboard();
   } finally {
@@ -15369,15 +15456,18 @@ async function handleDraftBasis(options = {}) {
   clearBasisReviewSurface();
   setSidePanel("basis", { force: true });
   syncControlStates();
+  const saveFailure = {};
   const synchronizedSessionId = await ensureQuoteSession({
     quoteGenerated: false,
     synchronizeDraft: true,
+    saveFailure,
   });
   if (!synchronizedSessionId) {
+    if (saveFailure.failure?.page_unloading) return;
     state.isAnalysisRunning = false;
     clearActiveJob();
     setWorkflowStage("ready_to_analyze");
-    showAiFailureBanner(quoteSessionDraftSynchronizationFailureMessage());
+    showAiFailureBanner(quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure));
     restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_reference_save_failed" });
     syncControlStates();
     return;
@@ -15657,16 +15747,19 @@ async function handleGenerate(options = {}) {
   renderMessages([]);
   clearPricingReviewMessages();
   syncControlStates();
+  const saveFailure = {};
   const synchronizedSessionId = await ensureQuoteSession({
     quoteGenerated: true,
     synchronizeDraft: true,
+    saveFailure,
   });
   if (!synchronizedSessionId) {
+    if (saveFailure.failure?.page_unloading) return;
     state.isGenerating = false;
     clearActiveJob();
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
     setResultStatus("Reference save failed", "is-bad");
-    renderMessages([quoteSessionDraftSynchronizationFailureMessage()], "error");
+    renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "error");
     syncControlStates();
     return;
   }
@@ -15771,16 +15864,23 @@ async function ensureSavedServerJobStarted(activeJob) {
   if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
   const isDraft = activeJob.type === "draft";
   const viewPdf = activeJob.type === "generate_pdf" || activeJob.viewPdf === true;
+  const saveFailure = {};
   const synchronizedSessionId = await ensureQuoteSession({
     quoteGenerated: !isDraft,
     synchronizeDraft: true,
+    saveFailure,
   });
   if (!synchronizedSessionId) {
     return {
       ok: false,
+      status: saveFailure.failure?.status ?? 0,
       data: {
         status: "failed",
-        errors: [quoteSessionDraftSynchronizationFailureMessage()],
+        error_reference: saveFailure.failure?.error_reference || "",
+        fetch_failed: saveFailure.failure?.fetch_failed === true,
+        page_unloading: saveFailure.failure?.page_unloading === true,
+        quote_session_save_failure: saveFailure.failure,
+        errors: [quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)],
       },
     };
   }
@@ -15855,7 +15955,9 @@ async function resumeSavedJob() {
       state.isAnalysisRunning = false;
       clearActiveJob();
       setWorkflowStage("ready_to_analyze");
-      showAiFailureBanner(genericFailureMessage(restarted.data));
+      showAiFailureBanner(restarted.data.quote_session_save_failure
+        ? quoteSessionDraftSynchronizationFailureMessage(restarted.data.quote_session_save_failure)
+        : genericFailureMessage(restarted.data));
       restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "resume_draft_start_failed" });
       syncControlStates();
       return;
@@ -15930,7 +16032,9 @@ async function resumeSavedJob() {
       hideExcelGeneratingModal();
       setWorkflowStage("completed");
       setResultStatus(restarted.data.status || "Failed", "is-bad");
-      renderMessages(genericFailureMessages(restarted.data), "error");
+      renderMessages(restarted.data.quote_session_save_failure
+        ? [quoteSessionDraftSynchronizationFailureMessage(restarted.data.quote_session_save_failure)]
+        : genericFailureMessages(restarted.data), "error");
       syncControlStates();
       return;
     }
@@ -16483,8 +16587,8 @@ function wireEvents() {
     showExcelGeneratingModal(generationLoadingModalOptions(false));
     await waitForUiPaint();
     try {
-      await handleGenerate();
-      downloadCurrentExcelFile();
+      const generated = await handleGenerate();
+      if (generated) downloadCurrentExcelFile();
     } finally {
       hideExcelGeneratingModal();
     }
