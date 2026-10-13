@@ -24687,9 +24687,12 @@ function extractFunction(name) {
 }
 
 const SIDE_PANEL_SEQUENCE = ["images", "customer", "quote_company", "basis", "output"];
+let checkpointValid = true;
+function customerStepCheckpointIsCurrent() { return checkpointValid; }
 eval([
   "furthestQuoteSessionSidePanel",
   "restoredQuoteSessionSidePanel",
+  "checkpointGatedSidePanel",
 ].map(extractFunction).join("\n"));
 
 const completedQuoteViewedFromCustomer = {
@@ -24703,6 +24706,9 @@ assert.strictEqual(
   "output",
 );
 assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "quote_company");
+checkpointValid = false;
+assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "customer");
+assert.strictEqual(restoredQuoteSessionSidePanel(completedQuoteViewedFromCustomer, { restoreFurthestPanel: true }), "customer");
 
 const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
 const state = { dashboardOperation: null, quoteSessions: [], dashboardActiveSessionId: "" };
