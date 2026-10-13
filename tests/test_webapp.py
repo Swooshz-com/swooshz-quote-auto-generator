@@ -34047,24 +34047,33 @@ async function main() {
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
     await page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`).click();
     await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
-    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
     await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
     const blockedRestored = await page.evaluate(() => ({
+      panel: state.activeSidePanel,
+      forwardLocked: ["quote_company", "basis", "output"].every((panel) => document.querySelector(`[data-side-panel="${panel}"]`).disabled),
       review: state.quoteCommercialReview,
       lifecycle: state.quoteCommercialLifecycle,
       output: JSON.stringify(state.outputRows),
       selected: elements.profileSelect.value,
     }));
+    assert.strictEqual(blockedRestored.panel, "customer");
+    assert.strictEqual(blockedRestored.forwardLocked, true);
     assert.deepStrictEqual(blockedRestored.review, mismatchReview);
     assert.strictEqual(blockedRestored.output, unchangedBefore.output);
     assert.strictEqual(blockedRestored.selected, referenceValue);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
     const blockedReloaded = await page.evaluate(() => ({
+      panel: state.activeSidePanel,
+      forwardLocked: ["quote_company", "basis", "output"].every((panel) => document.querySelector(`[data-side-panel="${panel}"]`).disabled),
       review: state.quoteCommercialReview,
       output: JSON.stringify(state.outputRows),
       snapshot: state.quoteCommercialSnapshot,
     }));
+    assert.strictEqual(blockedReloaded.panel, "customer");
+    assert.strictEqual(blockedReloaded.forwardLocked, true);
     assert.deepStrictEqual(blockedReloaded.review, mismatchReview);
     assert.strictEqual(blockedReloaded.output, unchangedBefore.output);
     assert.strictEqual(blockedReloaded.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);

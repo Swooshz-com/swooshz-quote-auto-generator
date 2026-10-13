@@ -3,6 +3,9 @@
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
+const digestValidatorSource = source.match(/^const PRICING_REFERENCE_DIGEST_RE = (.+);$/m);
+assert.ok(digestValidatorSource, "Missing production pricing digest validator");
+const PRICING_REFERENCE_DIGEST_RE = eval(digestValidatorSource[1]);
 function extract(name) {
   const match = new RegExp(`(?:async )?function ${name}\\(`).exec(source);
   assert.ok(match, `Missing production function ${name}`);
@@ -157,7 +160,7 @@ function fresh() {
     quoteSessionDraftSaveStarted: true, customerStepCheckpoint: null, customerStepCheckpointSaveBusy: false,
     pricingReferenceId: "reference-a", pricingReferenceSource: "company", quoteCommercialLifecycle: "NEW_UNINITIALISED",
     pricingReferenceSelectionIntent: null, quoteCommercialSnapshot: null, quoteCommercialReview: null,
-    pricingReferences: ["a", "b"].map(id => ({id: `reference-${id}`, source: "company", digest_sha256: id.repeat(64)})),
+    pricingReferences: ["a", "b"].map(id => ({id: `reference-${id}`, source: "company", digest_sha256: `sha256:${id.repeat(64)}`})),
     images: [{name: "synthetic.png", type: "image/png", size: 1, content_fingerprint: `sha256:${"c".repeat(64)}`}],
     quoteBasis: {}, quoteBasisSections: [], lineItems: [], outputRows: [], originalOutputRows: [],
     analysisFindings: [], blockingClarificationQuestions: [], pendingQuoteDependencyChanges: [],
@@ -177,6 +180,21 @@ function selectB() {elements.profileSelect.value = "company::reference-b"; handl
 function committedCheckpoint() {return clone(state.customerStepCheckpoint);}
 function control(name, action) {action(); controls.push(name);}
 (async () => {
+  for (const [name, digest] of [
+    ["bare hex", "a".repeat(64)],
+    ["malformed", "sha256:invalid"],
+    ["truncated", `sha256:${"a".repeat(63)}`],
+  ]) {
+    fresh(); state.pricingReferences[0].digest_sha256 = digest;
+    await goToNextSidePanel();
+    control(`${name} pricing digest cannot save or unlock Customer`, () => {
+      assert.strictEqual(customerStepCheckpointForCurrent(), null);
+      assert.strictEqual(state.customerStepCheckpoint, null);
+      assert.strictEqual(savedDraft, null);
+      assert.strictEqual(state.activeSidePanel, "customer");
+      assert.strictEqual(setSidePanel("quote_company"), false);
+    });
+  }
   fresh(); state.pricingReferences = [];
   control("missing pricing reference keeps Next disabled", () => {
     updateSidePanelNav();
@@ -196,9 +214,12 @@ function control(name, action) {action(); controls.push(name);}
     assert.strictEqual(state.activeSidePanel, "quote_company");
     assert.strictEqual(rail.find(n => n.dataset.sidePanel === "quote_company").disabled, false);
     assert.strictEqual(savedDraft.customerStepCheckpoint.pricingReferenceId, "reference-b");
+    assert.strictEqual(savedDraft.customerStepCheckpoint.pricingReferenceDigest, `sha256:${"b".repeat(64)}`);
     assert.strictEqual(savedDraft.activeSidePanel, "quote_company");
     assert.strictEqual(buildPayload().pricing_reference_id, "reference-b");
     assert.strictEqual(buildPayload().pricing_reference_source, "company");
+    assert.strictEqual(buildPayload().pricing_reference.digest_sha256, `sha256:${"b".repeat(64)}`);
+    assert.strictEqual(buildPayload().quote_session.draft_state.customerStepCheckpoint.pricingReferenceDigest, `sha256:${"b".repeat(64)}`);
     assert.deepStrictEqual(buildSessionSnapshot().customerStepCheckpoint, committedCheckpoint());
     assert.deepStrictEqual(currentQuoteSessionDraftState().customerStepCheckpoint, committedCheckpoint());
     assert.strictEqual(buildPayload().client.name, "Synthetic Customer");
@@ -215,7 +236,7 @@ function control(name, action) {action(); controls.push(name);}
     ["malformed", () => {state.customerStepCheckpoint = {version: 1};}],
     ["wrong session", () => {state.quoteSessionId = "quote-replacement";}],
     ["wrong recovery scope", () => {scope = "other-scope";}],
-    ["stale digest", () => {state.pricingReferences[1].digest_sha256 = "d".repeat(64);}],
+    ["stale digest", () => {state.pricingReferences[1].digest_sha256 = `sha256:${"d".repeat(64)}`;}],
     ["changed Customer", () => {elements.clientName.value = "Changed Synthetic Customer";}],
     ["commercial review", () => {state.quoteCommercialReview = {status: QUOTE_COMMERCIAL_REVIEW_STATUS};}],
   ]) {

@@ -30,7 +30,7 @@ class CustomerCheckpointTests(unittest.TestCase):
             "version": 1, "sessionId": "quote-synthetic-checkpoint",
             "recoveryScope": "synthetic-scope",
             "pricingReferenceId": "synthetic-reference", "pricingReferenceSource": "company",
-            "pricingReferenceDigest": "a" * 64,
+            "pricingReferenceDigest": "sha256:" + "a" * 64,
             "customer": {"client": {"name": "Synthetic Customer", "address": "A" * 4000},
                          "project": {"title": "Synthetic Exhibition", "show_name": "Synthetic Show"},
                          "quote_date": "2026-10-13", "project_number": "Synthetic-01"},

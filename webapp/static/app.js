@@ -16189,7 +16189,7 @@ function customerStepCheckpointForCurrent() {
   const sessionId = safeQuoteSessionId(state.quoteSessionId);
   const recoveryScope = currentBrowserRecoveryScope();
   const digest = String(reference?.digest_sha256 || "");
-  if (!sessionId || !recoveryScope || !reference || !/^[0-9a-f]{64}$/.test(digest)
+  if (!sessionId || !recoveryScope || !reference || !PRICING_REFERENCE_DIGEST_RE.test(digest)
     || customerDetailsBlockReason() || quoteCommercialReviewRequired()) return null;
   const details = collectQuoteDetails();
   return {
