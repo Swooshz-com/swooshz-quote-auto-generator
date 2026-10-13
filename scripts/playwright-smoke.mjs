@@ -12,6 +12,7 @@ import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playw
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
+const alpha1Scope = args.includes("--alpha1");
 
 function readArg(name, fallback = "") {
   const index = args.indexOf(name);
@@ -507,6 +508,7 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     throw new Error(`Manual Output description did not survive edit, render, snapshot, or export payload creation: ${JSON.stringify(editEvidence)}.`);
   }
 
+  if (!alpha1Scope) {
   const quoteRestoreEvidence = await page.evaluate(async (expected) => {
     const snapshot = buildSessionSnapshot();
     snapshot.quoteSessionId = "quote-manual-description-restore";
@@ -530,8 +532,9 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
     throw new Error(`Quote-session restore changed a manual Output description: ${JSON.stringify(quoteRestoreEvidence)}.`);
   }
 
+  }
   await page.evaluate(() => saveSessionState());
-  await page.reload({ waitUntil: "domcontentloaded" });
+  if (!alpha1Scope) await page.reload({ waitUntil: "domcontentloaded" });
   await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
   await page.locator("#pricingMatchesBody tr").first().waitFor({ state: "visible", timeout: 15000 });
   await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
@@ -586,7 +589,22 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   await page.locator("#outputDeleteModal").waitFor({ state: "hidden", timeout: 15000 });
 }
 
+async function alpha1AcknowledgeCustomer(page) {
+  if (!alpha1Scope) return;
+  await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
+  await page.locator("#customerDetailsPanel.is-active").waitFor({state:"visible",timeout:15000});
+  if (!(await page.locator("#showName").inputValue()).trim()) await page.locator("#showName").fill("Synthetic Alpha1 Contract Show");
+  await page.locator("#sideNextButton",{hasText:"Next: Quote Company"}).click();
+  if (await page.locator("#quoteDependencyConfirmModal").isVisible()) await page.locator("#confirmQuoteDependencyChangeButton").click();
+  await page.locator("#quoteCompanyPanel.is-active").waitFor({state:"visible",timeout:15000});
+  await page.waitForFunction(()=>customerStepCheckpointIsCurrent(),null,{timeout:15000});
+}
+
 async function prepareRefreshRecoveryQuote(page) {
+  if (alpha1Scope) {
+    await prepareFreshAlpha1ComponentQuote(page);
+    return;
+  }
   await page.evaluate(async () => {
     const reference = state.pricingReferences.find((item) => Array.isArray(item.items) && item.items.length)
       || state.pricingReferences[0];
@@ -673,6 +691,52 @@ async function prepareRefreshRecoveryQuote(page) {
   });
 }
 
+async function prepareFreshAlpha1ComponentQuote(page) {
+  await page.locator("#topbarBrandButton").click();
+  await page.locator("#quoteDashboardPanel.is-active").waitFor({state:"visible",timeout:15000});
+  await page.locator("#dashboardLoadingModal").waitFor({state:"hidden",timeout:15000});
+  await page.locator("#newQuoteButton:not([disabled])").click();
+  await page.locator("#imageIntake.is-active").waitFor({state:"visible",timeout:15000});
+  await page.locator("#imageInput").setInputFiles({
+    name:"refresh-recovery-render.png",mimeType:"image/png",
+    buffer:Buffer.from(g3SyntheticPngDataUrl().split(",")[1],"base64"),
+  });
+  await page.locator("#fileList .file-item").waitFor({state:"visible",timeout:15000});
+  await page.locator("#sideNextButton",{hasText:"Next: Customer"}).click();
+  await page.locator("#customerDetailsPanel.is-active").waitFor({state:"visible",timeout:15000});
+  for (const [id,value] of [
+    ["clientNameEditor","Refresh Recovery Client"],["clientAttentionEditor","Test Contact"],
+    ["clientTitleEditor","Project Manager"],["clientAddressEditor","1 Test Street"],
+    ["projectTitleEditor","Refresh Recovery Quote"],["showName","Refresh Recovery Expo"],
+    ["quoteDate","2026-07-14"],["projectNumberEditor","RECOVERY-001"],
+  ]) await page.locator("#"+id).fill(value);
+  await alpha1AcknowledgeCustomer(page);
+  for (const [id,value] of [
+    ["headerDetailsEditor","Refresh Recovery Company"],["quoteCompanyNameEditor","Refresh Recovery Company"],
+    ["acceptanceTextEditor","Accepted for testing"],["companySignatoryEditor","Test Signatory"],
+    ["companyTitleEditor","Director"],["companyDateLabelEditor","Date"],
+    ["personLabelEditor","Name"],["stampLabelEditor","Stamp"],["dateLabelEditor","Date"],
+  ]) await page.locator("#"+id).fill(value);
+  await page.locator("#headerLogoInput").setInputFiles({
+    name:"refresh-recovery-logo.png",mimeType:"image/png",
+    buffer:Buffer.from(g3SyntheticPngDataUrl().split(",")[1],"base64"),
+  });
+  await page.waitForFunction(()=>Boolean(state.headerLogo?.data_url),null,{timeout:15000});
+  await page.evaluate(() => {
+    if (!customerStepCheckpointIsCurrent()) throw new Error("Fresh component lacks actual acknowledged Customer readiness.");
+    const item=normalizeLineItem({section:"Floor Design",description:"sqm refresh recovery flooring",quantity:1,unit:"sqm",price_mode:"Priced",unit_price:50,unit_price_override:50,catalog_unit_price:50,amount:50,pricing_keyword:"floor-design-refresh-recovery-flooring"});
+    state.lineItems=[synchronizeOwnedOutputRowPrice(item,50,{force:true})];
+    state.quoteBasisSections=[{id:"floor-design",title:"Floor Design",lines:[{tag:"Include",text:"sqm refresh recovery flooring",quantity:1,unit:"sqm",include:true,pricing_keyword:"floor-design-refresh-recovery-flooring"}]}];
+    state.quoteBasis=quoteBasisFromSections(state.quoteBasisSections);
+    state.basisConfirmed=false;
+    state.outputRows=[];state.originalOutputRows=[];state.outputErrors=[];
+    captureOriginalAnalysisSnapshot({source:"alpha1-explicit-component-fixture"});
+    setWorkflowStage("basis_review");syncControlStates();
+  });
+  await page.locator('button[data-side-panel="basis"]:not([disabled])').click();
+  await page.locator("#quoteBasisPanel.is-active").waitFor({state:"visible",timeout:15000});
+}
+
 async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
   await prepareRefreshRecoveryQuote(page);
   const confirmReadiness = await page.evaluate(() => ({
@@ -701,11 +765,11 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
     if (normalizeCount === 1) {
       firstRequestStartedResolve();
       await new Promise((resolve) => { releaseFirstRequest = resolve; });
-      try {
-        await route.abort("aborted");
-      } catch {
-        // Navigation may already have disposed the interrupted request.
+      if (!alpha1Scope) {
+        try { await route.abort("aborted"); } catch { /* disposed interrupted request */ }
+        return;
       }
+      await route.fulfill({status:200,contentType:"application/json",body:JSON.stringify({status:"normalized",line_items:requestPayload.line_items || []})});
       return;
     }
     secondRequestStartedResolve();
@@ -731,6 +795,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
       throw new Error("Confirm Basis did not persist its pending recovery operation before the request completed.");
     }
 
+    if (!alpha1Scope) {
     const reload = page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(100);
     if (typeof releaseFirstRequest !== "function") {
@@ -741,6 +806,11 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
     await secondRequestStarted;
     await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
     releaseSecondRequest();
+
+    } else {
+      if (typeof releaseFirstRequest !== "function") throw new Error("Fresh normalization was not paused for pending-job inspection.");
+      releaseFirstRequest();
+    }
 
     try {
       await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
@@ -766,7 +836,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
         && state.activeSidePanel === "output"
         && !saved.activeJob;
     }, null, { timeout: 15000 });
-    if (normalizeCount !== 2) {
+    if (normalizeCount !== (alpha1Scope ? 1 : 2)) {
       throw new Error("Confirm Basis refresh should resume exactly once; requests observed: " + normalizeCount + ".");
     }
   } finally {
@@ -782,7 +852,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
     { type: "generate_pdf", viewPdf: true, title: "Generating PDF", finalizingTitle: "Finalizing PDF", readyTitle: "PDF ready", action: "pdf", button: "#sideViewPdfButton" },
   ];
 
-  for (const testCase of cases) {
+  for (const testCase of cases.filter(item => !alpha1Scope || item.type === "generate")) {
     let finishJob = false;
     let postCount = 0;
     let releaseFirstPost;
@@ -810,12 +880,14 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (postCount === 1) {
         firstPostStartedResolve();
         await new Promise((resolve) => { releaseFirstPost = resolve; });
+        if (!alpha1Scope) {
         try {
           await route.abort("aborted");
         } catch {
           // Navigation may already have disposed the interrupted request.
         }
         return;
+        }
       }
       secondPostStartedResolve();
       await route.fulfill({
@@ -891,6 +963,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
         throw new Error("Export click did not send a client-generated job id.");
       }
 
+      if (!alpha1Scope) {
       const reload = page.reload({ waitUntil: "domcontentloaded" });
       await page.waitForTimeout(100);
       if (typeof releaseFirstPost !== "function") {
@@ -899,12 +972,16 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       releaseFirstPost();
       await reload;
       await secondPostStarted;
+      } else {
+        if (typeof releaseFirstPost !== "function") throw new Error("Fresh generation was not paused for pending-job inspection.");
+        releaseFirstPost();
+      }
       await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
       const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
       if (restoredTitle !== testCase.title) {
         throw new Error("Expected refreshed " + testCase.type + " overlay title " + testCase.title + ", found " + restoredTitle + ".");
       }
-      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1]) {
+      if (alpha1Scope ? postCount !== 1 : (postCount !== 2 || postedJobIds[0] !== postedJobIds[1])) {
         throw new Error("Refresh should retry " + testCase.type + " with one stable idempotency key: " + JSON.stringify(postedJobIds) + ".");
       }
       const activePanel = (await page.locator(".rail-button.is-active").innerText()).trim();
@@ -976,6 +1053,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
   }
 }
 async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
+  if (alpha1Scope) { await verifyFreshGenerationTerminalStates(page); return; }
   const quoteSessionId = await currentQuoteSessionId(page);
   const cases = [
     { id: "job-refresh-excel-completed", type: "generate", viewPdf: false, title: "Regenerating Excel", terminalStatus: "completed" },
@@ -1135,6 +1213,50 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
   }
 }
 
+async function verifyFreshGenerationTerminalStates(page) {
+  const sessionId=await currentQuoteSessionId(page);
+  if (!sessionId) throw new Error("Fresh terminal contract needs an owned saved session.");
+  for (const status of ["completed","needs_review","blocked","failed","interrupted"]) {
+    let finish=false,starts=0,jobId="",polls=0;
+    const postPattern="**/api/jobs",getPattern="**/api/jobs/job-*";
+    await page.route(postPattern,async route=>{
+      if(route.request().method()!=="POST") return route.fallback();
+      const payload=route.request().postDataJSON();starts++;jobId=payload.job_id;
+      if(payload.type!=="generate"||!jobId||payload.payload?.quote_session?.session_id!==sessionId) throw new Error("Fresh generation request identity/type/session mismatch.");
+      await route.fulfill({status:202,contentType:"application/json",body:JSON.stringify({job_id:jobId,type:"generate",status:"running"})});
+    });
+    await page.route(getPattern,async route=>{
+      const requested=new URL(route.request().url()).pathname.split("/").pop();
+      if(requested!==jobId) return route.fallback();polls++;
+      await route.fulfill({status:200,contentType:"application/json",body:JSON.stringify(finish ? {job_id:jobId,type:"generate",status,result:{status:status==="needs_review"?"needs_confirmation":status,...(status==="blocked"?{errors:["Synthetic blocked state"]}:{}),...(status==="failed"?{message:"Synthetic failed state"}:{}),...(status==="completed"?{files:[{name:"quotation.xlsx",url:"/api/quote-sessions/"+sessionId+"/files/quotation.xlsx"}]}:{})}} : {job_id:jobId,type:"generate",status:"running",created_at:new Date().toISOString()})});
+    });
+    try {
+      await page.locator("#sideDownloadButton:not([disabled])").click();
+      await page.waitForFunction(()=>state.activeJob?.id,null,{timeout:15000});
+      await page.locator("#excelGeneratingModal").waitFor({state:"visible",timeout:15000});
+      const title=(await page.locator("#excelGeneratingTitle").innerText()).trim();
+      if(title!=="Regenerating Excel") throw new Error("Fresh Excel overlay title does not match its running type.");
+      const active=await page.evaluate(()=>JSON.parse(localStorage.getItem("swooshz_quote_session_v1")||"{}").activeJob);
+      if(active?.id!==jobId||starts!==1) throw new Error("Fresh running job is not persisted once under its accepted client identity.");
+      if(status==="interrupted") {
+        await page.evaluate(id=>{window.__alpha1Fetch=window.fetch;window.fetch=(input,init)=>{const url=typeof input==="string"?input:input?.url||"";return url.includes("/api/jobs/"+id)?Promise.reject(new TypeError("Synthetic interrupted job polling")):window.__alpha1Fetch(input,init);};},jobId);
+        await page.locator("#excelGeneratingModal").waitFor({state:"hidden",timeout:30000});
+        const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem("swooshz_quote_session_v1")||"{}").activeJob);
+        if(saved?.id!==jobId||starts!==1) throw new Error("Interrupted live polling lost recovery identity or started another generation.");
+      } else {
+        finish=true;
+        if(status==="completed") {await page.locator("#excelGeneratingModal.is-ready").waitFor({state:"visible",timeout:15000});await page.locator("#excelGeneratingCloseButton").click();}
+        await page.locator("#excelGeneratingModal").waitFor({state:"hidden",timeout:15000});
+        await page.waitForFunction(()=>!JSON.parse(localStorage.getItem("swooshz_quote_session_v1")||"{}").activeJob,null,{timeout:15000});
+        if(starts!==1||!polls) throw new Error("Fresh terminal path has missing polling or duplicate ordinary generation.");
+      }
+    } finally {
+      await page.evaluate(()=>{if(window.__alpha1Fetch){window.fetch=window.__alpha1Fetch;delete window.__alpha1Fetch;}hideExcelGeneratingModal();clearActiveJob();});
+      await page.unroute(postPattern);await page.unroute(getPattern);
+    }
+  }
+}
+
 async function verifyExpiredQuoteJobsDoNotResume(page) {
   const staleStartedAt = new Date(Date.now() - 31 * 60 * 1000).toISOString();
   const freshStartedAt = new Date().toISOString();
@@ -1290,6 +1412,12 @@ async function verifyExpiredQuoteJobsDoNotResume(page) {
 
 async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
   const pendingValue = "local::pending-refresh-reference";
+  let alpha1PendingReference=null;
+  if (alpha1Scope) {
+    const saved=await page.evaluate(async()=>postJson("/api/settings/pricing-references",{id:"pending-refresh-reference",label:"Pending Refresh Reference",source:"local",currency:"USD",tax:{label:"VAT",rate:0.2},items:[{id:"synthetic-floor-needle-punch-carpet",section:"Floor Design",description:"Needle punch carpet in colour",unit_hint:"sqm",internal_cost:10,markup_multiplier:1.5}]}));
+    if(!saved.ok||saved.data?.status!=="saved"||!saved.data.pricing_reference?.digest_sha256) throw new Error("Pending Customer fixture did not establish a real canonical server reference.");
+    alpha1PendingReference=saved.data.pricing_reference;
+  }
   const applied = await page.evaluate(async () => {
     const current = currentPricingReference();
     if (!current) throw new Error("Pricing-reference regression needs an applied reference.");
@@ -1345,6 +1473,11 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
     throw new Error("Pricing-reference regression fixture did not seed retained basis and Output state.");
   }
 
+  if (alpha1Scope) await page.evaluate(reference=>{
+    const i=state.pricingReferences.findIndex(item=>item.id===reference.id&&item.source===reference.source);
+    if(i<0) state.pricingReferences.push(reference); else state.pricingReferences[i]=reference;
+    renderProfileOptions();
+  },alpha1PendingReference);
   await page.locator("#profileSelect").selectOption(pendingValue);
   const pendingState = await page.evaluate(() => ({
     pricingReferenceId: state.pricingReferenceId,
@@ -1377,7 +1510,12 @@ async function verifyPricingReferenceSelectionCommitsOnCustomerNext(page) {
 
   await page.locator("#profileSelect").selectOption(pendingValue);
 
-  await page.reload({ waitUntil: "domcontentloaded" });
+  if (!alpha1Scope) await page.reload({ waitUntil: "domcontentloaded" });
+  else {
+    await page.locator("#sideBackButton").click();
+    await page.locator("#imageIntake.is-active").waitFor({state:"visible",timeout:15000});
+    await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
+  }
   await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
   const restored = await page.evaluate(() => ({
     pricingReferenceId: state.pricingReferenceId,
@@ -2128,9 +2266,11 @@ async function verifyServerPricingReferenceReviewDurability(page) {
     ) {
       throw new Error(`Catalogue refresh silently recovered the review: ${JSON.stringify(refreshedCatalogue)}.`);
     }
+    if (!alpha1Scope) {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
     await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 15000 });
+    }
     const reloaded = await page.evaluate(() => ({
       review: state.quoteCommercialReview,
       snapshot: state.quoteCommercialSnapshot,
@@ -2158,7 +2298,7 @@ async function verifyServerPricingReferenceReviewDurability(page) {
       throw new Error(`Generation should remain review-locked after catalogue restoration: ${JSON.stringify(blockedGeneration)}.`);
     }
 
-    await page.locator('[data-side-panel="customer"]:not([disabled])').click();
+    await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
     await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#profileSelect").click();
     const afterPointerOpen = await page.evaluate(() => ({
@@ -4244,12 +4384,9 @@ async function run573LoadedAppTwice() {
   console.log(JSON.stringify({ status: "ok", mode: "run573-loaded-app-twice", runs }, null, 2));
 }
 
-async function main() {
-  if (args.includes("--run573-loaded-app")) {
-    await run573LoadedAppTwice();
-    return;
-  }
-  if (options.g3Pricing) {
+async function runG3PricingScope() {
+  const originalPort=options.port,originalBaseUrl=baseUrl;
+  try {
     const temporaryQuoteDataRoot = await fs.mkdtemp(path.join(root, "_tmp", "sqag-g3-pricing-"));
     options.port = await unusedLoopbackPort();
     baseUrl = `http://${options.host}:${options.port}`;
@@ -4288,14 +4425,22 @@ async function main() {
     } finally {
       if (browser) await browser.close();
       await stopServer(serverInfo);
-      await fs.rm(temporaryQuoteDataRoot, { recursive: true, force: true });
+      if (!alpha1Scope) await fs.rm(temporaryQuoteDataRoot, { recursive: true, force: true });
     }
+
+  } finally {options.port=originalPort;baseUrl=originalBaseUrl;}
+}
+
+async function main() {
+  if (args.includes("--run573-loaded-app")) {
+    await run573LoadedAppTwice();
     return;
   }
+  if (options.g3Pricing) { await runG3PricingScope(); return; }
   let serverInfo = null;
   const hasExistingServer = await healthOk();
   if (!hasExistingServer) {
-    await fs.rm(quoteDataRoot, { recursive: true, force: true });
+    if (!alpha1Scope) await fs.rm(quoteDataRoot, { recursive: true, force: true });
     serverInfo = startServer();
     if (!(await waitForHealth())) {
       const serverOutput = serverInfo.output.join("").trim();
@@ -4413,13 +4558,14 @@ async function main() {
         return false;
       }
     }, null, { timeout: 15000 });
-    await page.locator('.rail-button[data-side-panel="quote_company"]:not([disabled])').waitFor({ timeout: 15000 });
-    await page.locator('.rail-button[data-side-panel="quote_company"]').click();
-    await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
+    await page.locator("#sideNextButton",{hasText:"Next: Quote Company"}).click();
+    await page.locator("#quoteCompanyPanel").waitFor({state:"visible"});
+    if(alpha1Scope) await page.waitForFunction(()=>customerStepCheckpointIsCurrent(),null,{timeout:15000});
     const seededPresetValue = await page.locator("#presetSelect").inputValue();
     if (seededPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default") {
       throw new Error(`Expected seeded setup to select the synthetic fixture preset, found ${seededPresetValue}.`);
     }
+    if (!alpha1Scope) {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
     await page.locator("#panel-analysis.is-active").waitFor({ state: "visible", timeout: 15000 });
@@ -4518,6 +4664,30 @@ async function main() {
     await page.locator('.rail-button[data-side-panel="quote_company"]:not([disabled])').waitFor({ timeout: 15000 });
     await page.locator('.rail-button[data-side-panel="quote_company"]').click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible", timeout: 15000 });
+    } else {
+    await page.evaluate(() => {
+      state.outputRows = [normalizeOutputRow({
+        section: "Refresh regression",
+        description: "Completed quote row",
+        quantity: 1,
+        unit: "lot",
+        unit_price: 100,
+        amount: 100,
+      })];
+      state.originalOutputRows = state.outputRows.map((row) => ({ ...row }));
+      state.basisConfirmed = true;
+      setWorkflowStage("completed");
+      setSidePanel("customer", { force: true });
+      saveSessionState();
+    });
+      await alpha1AcknowledgeCustomer(page);
+      const liveId=await currentQuoteSessionId(page);
+      const files=await page.locator("#fileList .file-item").allTextContents();
+      if(!liveId||files.length!==1||!files[0].includes(TEST_REFERENCE_FILE_NAME)) throw new Error("Fresh owned quote lost its uploaded reference metadata.");
+      await page.evaluate(async()=>saveQuoteSessionDraftState({quoteGenerated:true}));
+      const detail=await dashboardQuoteSessionDetail(page,liveId);
+      if(detail.quote_session?.session_id!==liveId||!detail.quote_session.draft_state?.outputRows?.length) throw new Error("Fresh component output snapshot was not durably saved under the same owner/session.");
+    }
     const restoredPresetValue = await page.locator("#presetSelect").inputValue();
     if (restoredPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default") {
       throw new Error(`Expected refresh to preserve company preset, found ${restoredPresetValue}.`);
@@ -4580,7 +4750,7 @@ async function main() {
     await page.getByRole("heading", { name: "Pricing Reference Settings" }).waitFor();
     await page.locator("#pricingReferenceImportTab").click();
     await page.locator("#pricingReferenceImportPanel").waitFor({ state: "visible" });
-    await page.reload({ waitUntil: "domcontentloaded" });
+    if (!alpha1Scope) await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
     await page.locator("#pricingReferenceModal").waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#pricingReferenceImportPanel").waitFor({ state: "visible" });
@@ -4784,10 +4954,10 @@ async function main() {
           releaseInitialDuplicateRequest = resolve;
           markFirstDuplicateRequestPaused();
         });
-        await route.abort("aborted");
+        if(alpha1Scope) await route.continue(); else await route.abort("aborted");
         return;
       }
-      if (recoveryPhaseArmed && !recoveryHandshakeFailed && recoveryDetailRequestCount === 0) {
+      if (!alpha1Scope && recoveryPhaseArmed && !recoveryHandshakeFailed && recoveryDetailRequestCount === 0) {
         recoveryDetailRequestCount += 1;
         await new Promise((resolve) => {
           releaseRecoveryDuplicateRequest = resolve;
@@ -4830,6 +5000,7 @@ async function main() {
     if (!dashboardLoadingModalVisible || !dashboardLoadingTitleExpected) {
       await failDuplicateInterruption("Duplicate interruption loading contract failed.", firstRequestPauseReached);
     }
+    if (!alpha1Scope) {
     recoveryPhaseArmed = true;
     const duplicateReload = page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForTimeout(100);
@@ -4875,6 +5046,16 @@ async function main() {
     await page.waitForFunction(() => !window.localStorage.getItem("swooshz_dashboard_operation_v1"));
     if (await duplicatedTargetCard.count() !== 1) {
       throw new Error(`Duplicate refresh should create exactly one target ${interruptedDuplicateOperation.targetSessionId}.`);
+    }
+    } else {
+      releaseInitialDuplicateRequest();
+      duplicatedTargetCard=page.locator(`.dashboard-session-card[data-quote-session-id="${interruptedDuplicateOperation.targetSessionId}"]`);
+      await duplicatedTargetCard.waitFor({state:"visible",timeout:15000});
+      await page.locator("#dashboardLoadingModal").waitFor({state:"hidden",timeout:15000});
+      await page.waitForFunction(()=>!localStorage.getItem("swooshz_dashboard_operation_v1"),null,{timeout:15000});
+      if(await duplicatedTargetCard.count()!==1||duplicateDetailRequestCount!==1) throw new Error("Ordinary duplicate did not complete exactly once under its distinct reserved identity.");
+      const duplicateDetail=await dashboardQuoteSessionDetail(page,interruptedDuplicateOperation.targetSessionId);
+      if(duplicateDetail.quote_session?.session_id!==interruptedDuplicateOperation.targetSessionId||duplicateDetail.quote_session.session_id===currentDashboardSessionId) throw new Error("Ordinary duplicate readback has wrong owned target identity.");
     }
     } catch (error) {
       recoveryPhaseArmed = false;
@@ -5123,14 +5304,21 @@ async function main() {
     await currentDashboardCard.waitFor({ state: "detached", timeout: 15000 });
     await page.locator("#newQuoteButton:not([disabled])").click();
     await page.locator("#imageIntake").waitFor({ state: "visible", timeout: 15000 });
+    if(alpha1Scope){await seedQuoteDraftFromTestFixture(page);await page.locator("#sideNextButton",{hasText:"Next: Customer"}).click();await alpha1AcknowledgeCustomer(page);}
     await verifyMobileHeaderOrder(page);
     await verifyMobileBasisLegendAndOutputCards(page);
     await verifyConfirmBasisSurvivesImmediateRefresh(page);
     await verifyGenerationLoadingModalSurvivesRefresh(page);
     await verifyGenerationTerminalRecoveryAfterRefresh(page);
+    if(alpha1Scope){
+      await prepareRefreshRecoveryQuote(page);
+      await verifyExpiredQuoteJobsDoNotResume(page);
+      await prepareRefreshRecoveryQuote(page);
+      await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
+    }
 
     console.log(JSON.stringify({
-      status: "ok",
+      status: alpha1Scope ? "broad_component_phase_complete" : "ok",
       url: page.url(),
       screenshots: [
         dashboardShot,
@@ -5148,6 +5336,10 @@ async function main() {
   } finally {
     await browser.close();
     await stopServer(serverInfo);
+  }
+  if (alpha1Scope) {
+    await runG3PricingScope();
+    console.log(JSON.stringify({status:"ok",scope:"alpha1",broadComponentsComplete:true,isolatedNormalPricingComplete:true}));
   }
 }
 

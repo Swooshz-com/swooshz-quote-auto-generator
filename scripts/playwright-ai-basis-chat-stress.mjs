@@ -515,8 +515,9 @@ async function main() {
       await page.locator("#showName").fill("Synthetic Expo");
     }
 
-    await page.locator('[data-side-panel="quote_company"]:not([disabled])').waitFor({ timeout: 15000 });
-    await page.locator('[data-side-panel="quote_company"]').click();
+    await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+    await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => customerStepCheckpointIsCurrent(), null, { timeout: 15000 });
     await page.locator("#sideNextButton").click();
     await page.locator("#analysisConfirmModal:not([hidden])").waitFor({ timeout: 15000 });
     await page.locator("#analysisConfirmStartButton").click();

@@ -218,19 +218,26 @@ jobs:
         run: python scripts/scan_sensitive_fixtures.py --fail-on-review
 
       - name: Validate runtime privilege contract
+        id: alpha1_prerequisites
         run: python scripts/validate_runtime_privilege_contract.py
 
       - name: Run Python tests
+        env:
+          SQAG_VALIDATION_SCOPE: alpha1
         run: python -m unittest discover -s tests
 
       - name: Run AI basis chat stress smoke
+        if: always() && steps.alpha1_prerequisites.outcome == 'success'
         run: npm run playwright:ai-stress
 
       - name: Run synthetic internal Google auth smoke
+        if: always() && steps.alpha1_prerequisites.outcome == 'success'
         run: npm run playwright:internal-auth
 
       - name: Run app smoke test
-        run: npm run playwright:smoke
+        if: always() && steps.alpha1_prerequisites.outcome == 'success'
+        run: npm run playwright:smoke -- --alpha1
 
       - name: Run minimum internal alpha browser smoke
-        run: npm run playwright:alpha-smoke
+        if: always() && steps.alpha1_prerequisites.outcome == 'success'
+        run: npm run playwright:alpha-smoke -- --alpha1

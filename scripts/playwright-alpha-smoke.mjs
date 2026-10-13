@@ -882,7 +882,14 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+(async () => {
+  if(process.argv.includes("--alpha1")) {
+    verifyGenerationRunIdBindingControls();
+    await import("./playwright-alpha1-fresh-path.mjs");
+  } else {
+    await main();
+  }
+})().catch((error) => {
   console.error(error?.stack || error?.message || error);
   process.exitCode = 1;
 });

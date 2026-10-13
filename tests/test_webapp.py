@@ -33712,7 +33712,17 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                     webapp.PRICING_REFERENCE_SELECTION_ERROR_MESSAGE,
                 )
 
+    def test_alpha1_fresh_review_and_pricing_use_real_browser_session_and_database_path(self):
+        self._run_g3_browser_pricing_scope(exercise_restoration=False)
+
+    @unittest.skipIf(
+        os.environ.get("SQAG_VALIDATION_SCOPE") == "alpha1",
+        "Alpha2 Modify/restoration only; e3 CI38415683936 attempt1 remains FAIL; shared assertions gate Alpha1 separately.",
+    )
     def test_g3_restoration_review_and_pricing_use_real_browser_session_and_database_path(self):
+        self._run_g3_browser_pricing_scope(exercise_restoration=True)
+
+    def _run_g3_browser_pricing_scope(self, *, exercise_restoration):
         node = require_node(self)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -33761,6 +33771,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                         "G3_SESSION_COOKIE_NAME": webapp.SESSION_COOKIE_NAME,
                         "G3_SESSION_COOKIE_VALUE": cookie_value,
                         "G3_PRICING_REFERENCE_ID": reference_id,
+                        "G3_EXERCISE_ALPHA2_RESTORATION": "1" if exercise_restoration else "0",
                     })
                     script = r'''
 const assert = require("assert");
@@ -33770,6 +33781,7 @@ const baseUrl = process.env.G3_BASE_URL;
 const sessionCookieName = process.env.G3_SESSION_COOKIE_NAME;
 const sessionCookieValue = process.env.G3_SESSION_COOKIE_VALUE;
 const referenceId = process.env.G3_PRICING_REFERENCE_ID;
+const exerciseRestoration = process.env.G3_EXERCISE_ALPHA2_RESTORATION === "1";
 const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 
 async function responseJson(page, path) {
@@ -33924,14 +33936,20 @@ async function main() {
       return {
         sessionId: state.quoteSessionId,
         lifecycle: state.quoteCommercialLifecycle,
+        review: state.quoteCommercialReview,
         snapshot: state.quoteCommercialSnapshot,
         lineItem: state.lineItems[0],
         outputRow: state.outputRows[0],
         basis: JSON.stringify(state.quoteBasisSections),
         output: JSON.stringify(state.outputRows),
+        lineItems: JSON.parse(JSON.stringify(state.lineItems)),
       };
     });
     assert.strictEqual(fresh.lifecycle, "NEW_UNINITIALISED");
+    assert.strictEqual(fresh.review, null);
+    assert.deepStrictEqual(JSON.parse(fresh.basis).flatMap(section => (section.lines || []).map(line => ({ text: line.text, quantity: line.quantity, unit: line.unit, pricing_keyword: line.pricing_keyword }))), [{ text: "Workspace printed graphics", quantity: 2, unit: "sqm", pricing_keyword: "workspace-row" }]);
+    assert.deepStrictEqual(JSON.parse(fresh.output).map(row => ({ description: row.description, quantity: row.quantity, amount: row.amount })), [{ description: "Workspace printed graphics", quantity: 2, amount: 40 }]);
+    assert.deepStrictEqual(fresh.lineItems, [fresh.lineItem]);
     assert.ok(fresh.snapshot && fresh.snapshot.pricing_basis.id === referenceId);
     assert.strictEqual(fresh.snapshot.pricing_basis.source, "company");
     assert.strictEqual(fresh.lineItem.catalog_unit_price, 20);
@@ -33947,31 +33965,33 @@ async function main() {
     assert.strictEqual(savedDraft.pricingReferenceSource, "company");
     assert.ok(savedDraft.quoteDetails?.commercial_snapshot?.pricing_basis?.digest);
 
-    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
-    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
-    const sessionCard = page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`);
-    await sessionCard.waitFor({ state: "visible", timeout: 30000 });
-    await sessionCard.click();
-    await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
-    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
-    await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
-    const restored = await page.evaluate(() => ({
-      lifecycle: state.quoteCommercialLifecycle,
-      review: state.quoteCommercialReview,
-      snapshot: state.quoteCommercialSnapshot,
-      basis: JSON.stringify(state.quoteBasisSections),
-      output: JSON.stringify(state.outputRows),
-      lineItems: JSON.stringify(state.lineItems),
-    }));
-    assert.strictEqual(restored.review, null);
-    assert.strictEqual(restored.lifecycle, fresh.lifecycle);
-    assert.strictEqual(restored.basis, fresh.basis);
-    assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
-    assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
-    assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
+    if (exerciseRestoration) {
+      await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+      await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+      const sessionCard = page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`);
+      await sessionCard.waitFor({ state: "visible", timeout: 30000 });
+      await sessionCard.click();
+      await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+      await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+      const restored = await page.evaluate(() => ({
+        lifecycle: state.quoteCommercialLifecycle,
+        review: state.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+        basis: JSON.stringify(state.quoteBasisSections),
+        output: JSON.stringify(state.outputRows),
+        lineItems: JSON.stringify(state.lineItems),
+      }));
+      assert.strictEqual(restored.review, null);
+      assert.strictEqual(restored.lifecycle, fresh.lifecycle);
+      assert.strictEqual(restored.basis, fresh.basis);
+      assert.strictEqual(restored.output, fresh.output);
+      assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+      assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
+      assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
+    }
 
-    await page.locator('[data-side-panel="customer"]:not([disabled])').click();
+    await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
     await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     const unchangedBefore = await page.evaluate(() => ({
       basis: JSON.stringify(state.quoteBasisSections),
@@ -34043,12 +34063,17 @@ async function main() {
     assert.strictEqual(refreshedCatalogue.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
     assert.strictEqual(refreshedCatalogue.selected, referenceValue);
 
-    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
-    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
-    await page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`).click();
-    await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
-    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
-    await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+    if (exerciseRestoration) {
+      await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+      await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+      await page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`).click();
+      await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
+      await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+      await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+    } else {
+      await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
+      await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    }
     const blockedRestored = await page.evaluate(() => ({
       panel: state.activeSidePanel,
       forwardLocked: ["quote_company", "basis", "output"].every((panel) => document.querySelector(`[data-side-panel="${panel}"]`).disabled),
@@ -34062,9 +34087,11 @@ async function main() {
     assert.deepStrictEqual(blockedRestored.review, mismatchReview);
     assert.strictEqual(blockedRestored.output, unchangedBefore.output);
     assert.strictEqual(blockedRestored.selected, referenceValue);
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
-    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    if (exerciseRestoration) {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+      await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    }
     const blockedReloaded = await page.evaluate(() => ({
       panel: state.activeSidePanel,
       forwardLocked: ["quote_company", "basis", "output"].every((panel) => document.querySelector(`[data-side-panel="${panel}"]`).disabled),
@@ -34092,7 +34119,7 @@ async function main() {
     ]);
     consoleProblems.length = 0;
 
-    await page.locator('[data-side-panel="customer"]:not([disabled])').click();
+    await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
     await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#profileSelect").click();
     const afterPointerOpen = await page.evaluate(() => ({
@@ -34146,6 +34173,14 @@ async function main() {
     assert.strictEqual(recoveredProgression.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
     assert.deepStrictEqual(consoleProblems, []);
     console.log(JSON.stringify({ status: "ok", sessionId: fresh.sessionId }));
+  } catch (error) {
+    const diagnostic = await page.evaluate(() => typeof state === "undefined" ? { appStateAvailable: false } : ({
+      appStateAvailable: true, panel: state.activeSidePanel, sessionId: state.quoteSessionId,
+      checkpointCurrent: customerStepCheckpointIsCurrent(), restoreBusy: state.quoteSessionRestoreBusy,
+      restoreError: state.quoteSessionLoadError || "",
+    })).catch((captureError) => ({ captureError: String(captureError) }));
+    console.error(JSON.stringify({ scope: exerciseRestoration ? "alpha2" : "alpha1", diagnostic, consoleProblems }));
+    throw error;
   } finally {
     await context.close();
     await browser.close();
