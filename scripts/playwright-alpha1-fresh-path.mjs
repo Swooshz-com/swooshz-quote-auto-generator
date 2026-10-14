@@ -188,7 +188,7 @@ function verifySharedCoverageAssertionControls(logoFileKey) {
       const invalid = structuredClone(valid);
       if (variant === "missing") delete invalid[group][key]; else invalid[group][key] = "   ";
       // Matching captured/persisted omissions must never satisfy independent company completeness.
-      completeDurableDraftProof({ quoteDetails: structuredClone(invalid) }, { quoteDetails: structuredClone(invalid) });
+      completeDurableDraftProof({ lineItems: [], quoteDetails: structuredClone(invalid) }, { lineItems: [], quoteDetails: structuredClone(invalid) });
       requireControlRejection(() => requirePersistedQuoteCompany(invalid, logoFileKey), group + "." + key + ":" + variant);
     }
   }
@@ -201,6 +201,7 @@ function verifySharedCoverageAssertionControls(logoFileKey) {
   return { companyPositive: 1, companyMatchingOmissionNegatives: 10, durableAuthorityPositive: 1, durableAuthorityNegatives: 4, visibleQuantityPositive: 1, visibleQuantityNegatives: 2 };
 }
 function completeDurableDraftProof(targetDraft, persistedDraft) {
+  assert(targetDraft && typeof targetDraft === "object" && !Array.isArray(targetDraft), "Captured target lacks a complete draft.");
   assert(persistedDraft && typeof persistedDraft === "object" && !Array.isArray(persistedDraft), "Protected readback lacks a complete persisted draft.");
   const expected = JSON.parse(JSON.stringify(targetDraft));
   const actual = JSON.parse(JSON.stringify(persistedDraft));
@@ -210,6 +211,18 @@ function completeDurableDraftProof(targetDraft, persistedDraft) {
     delete expected.quoteCommercialReview;
   } else if (!hasOwn(expected, "quoteCommercialReview")) {
     assert(!hasOwn(actual, "quoteCommercialReview"), "Absent target review acquired a persisted review value.");
+  }
+  const topLevelEmptyOrderPaths = [];
+  assert(Array.isArray(expected.lineItems) && Array.isArray(actual.lineItems) && actual.lineItems.length === expected.lineItems.length, "Protected top-level lineItems array shape differs from the captured target.");
+  for (let index = 0; index < expected.lineItems.length; index++) {
+    const expectedRow = expected.lineItems[index];
+    const actualRow = actual.lineItems[index];
+    assert(expectedRow && typeof expectedRow === "object" && !Array.isArray(expectedRow) && actualRow && typeof actualRow === "object" && !Array.isArray(actualRow), "Protected top-level lineItems row shape differs from the captured target.");
+    if (hasOwn(expectedRow, "basis_order") && expectedRow.basis_order === "") {
+      assert(!hasOwn(actualRow, "basis_order"), "Empty top-level basis_order target requires actual persisted absence.");
+      delete expectedRow.basis_order;
+      topLevelEmptyOrderPaths.push("lineItems[" + index + "].basis_order");
+    }
   }
   const snapshotEmptyOrderPaths = [];
   const expectedSnapshot = expected.originalAnalysisSnapshot;
@@ -228,7 +241,84 @@ function completeDurableDraftProof(targetDraft, persistedDraft) {
     }
   }
   assert(JSON.stringify(sortedValue(actual)) === JSON.stringify(sortedValue(expected)), "Protected complete persisted draft differs from the captured final target.");
-  return { completeDraftMatch: true, objectKeysDeepSorted: true, arrayOrderPreserved: true, snapshotEmptyOrderPaths, snapshotOrderCanonicalization: "target-own-empty-string-to-actual-absence-only", excludedEphemera: ["savedAt", "activeAppView", "activeSidePanel"], reviewCanonicalization: hasOwn(targetDraft, "quoteCommercialReview") && targetDraft.quoteCommercialReview === null ? "target-null-to-persisted-absent" : "exact" };
+  return { completeDraftMatch: true, objectKeysDeepSorted: true, arrayOrderPreserved: true, topLevelEmptyOrderPaths, topLevelOrderCanonicalization: "target-own-empty-string-to-actual-absence-only", snapshotEmptyOrderPaths, snapshotOrderCanonicalization: "target-own-empty-string-to-actual-absence-only", excludedEphemera: ["savedAt", "activeAppView", "activeSidePanel"], reviewCanonicalization: hasOwn(targetDraft, "quoteCommercialReview") && targetDraft.quoteCommercialReview === null ? "target-null-to-persisted-absent" : "exact" };
+}
+function verifyCompleteDurableDraftComparatorControls() {
+  const draft = {
+    lineItems: [
+      { description: "First synthetic row", quantity: 2, pricing_keyword: "first", category_order: 1, item_order: 1, source_basis_line_id: "first", pricing_authority: { id: "synthetic", source: "local" } },
+      { description: "Second synthetic row", quantity: 3, pricing_keyword: "second", category_order: 2, item_order: 2, source_basis_line_id: "second", pricing_authority: { id: "synthetic", source: "local" } },
+    ],
+    quoteDetails: { unrelatedRequiredField: "preserve" },
+    originalAnalysisSnapshot: { line_items: [{ description: "Original first", basis_order: "" }, { description: "Original second", basis_order: 2 }] },
+    quoteCommercialReview: null,
+  };
+  const baseline = () => {
+    const target = structuredClone(draft), actual = structuredClone(draft);
+    delete actual.originalAnalysisSnapshot.line_items[0].basis_order;
+    delete actual.quoteCommercialReview;
+    return { target, actual };
+  };
+  const positives = [], negatives = [];
+  const unchangedProof = (target, actual) => {
+    const before = JSON.stringify([target, actual]);
+    const proof = completeDurableDraftProof(target, actual);
+    assert(JSON.stringify([target, actual]) === before, "Comparator mutated its input drafts.");
+    return proof;
+  };
+  const positive = (label, mutate, mappedPaths) => {
+    const { target, actual } = baseline(); mutate(target, actual);
+    const proof = unchangedProof(target, actual);
+    assert(JSON.stringify(proof.topLevelEmptyOrderPaths) === JSON.stringify(mappedPaths), "Comparator mapped unexpected top-level paths: " + label);
+    positives.push({ label, proof });
+  };
+  positive("exact unchanged draft", (target, actual) => {
+    actual.originalAnalysisSnapshot = structuredClone(target.originalAnalysisSnapshot);
+    delete target.originalAnalysisSnapshot.line_items[0].basis_order;
+    delete actual.originalAnalysisSnapshot.line_items[0].basis_order;
+    delete target.quoteCommercialReview;
+  }, []);
+  positive("retained two-row empty-to-absent", (target) => { target.lineItems.forEach((row) => { row.basis_order = ""; }); }, ["lineItems[0].basis_order", "lineItems[1].basis_order"]);
+  positive("absent/absent", () => {}, []);
+  positive("positive integer unchanged", (target, actual) => { target.lineItems[0].basis_order = 1; actual.lineItems[0].basis_order = 1; }, []);
+  const mismatch = "Protected complete persisted draft differs";
+  const arrayShape = "Protected top-level lineItems array shape differs";
+  const rowShape = "Protected top-level lineItems row shape differs";
+  const emptyRequiresAbsence = "Empty top-level basis_order target requires actual persisted absence";
+  const negative = (label, mutate, reason = mismatch) => {
+    const { target, actual } = baseline(); unchangedProof(target, actual);
+    mutate(target, actual);
+    const before = JSON.stringify([target, actual]); let message = "";
+    try { completeDurableDraftProof(target, actual); } catch (error) { message = String(error.message); }
+    assert(message.includes(reason), "Comparator failed to causally reject " + label + ": " + message);
+    assert(JSON.stringify([target, actual]) === before, "Comparator mutated negative inputs: " + label);
+    negatives.push({ label, rejectedBy: message });
+  };
+  for (const [label, value] of [["integer1", 1], ["string1", "1"], ["zero", 0], ["null", null], ["false", false], ["array", []], ["object", {}], ["whitespace", " "]]) {
+    negative("target " + label + " versus actual absence", (target) => { target.lineItems[0].basis_order = value; });
+  }
+  for (const [label, value] of [["empty", ""], ["null", null], ["integer1", 1]]) {
+    negative("target empty versus actual " + label, (target, actual) => { target.lineItems[0].basis_order = ""; actual.lineItems[0].basis_order = value; }, emptyRequiresAbsence);
+  }
+  negative("integer1 to integer2", (target, actual) => { target.lineItems[0].basis_order = 1; actual.lineItems[0].basis_order = 2; });
+  negative("target absent actual integer1", (_target, actual) => { actual.lineItems[0].basis_order = 1; });
+  negative("dropped row", (_target, actual) => { actual.lineItems.pop(); }, arrayShape);
+  negative("extra row", (_target, actual) => { actual.lineItems.push(structuredClone(actual.lineItems[0])); }, arrayShape);
+  negative("reversed rows", (_target, actual) => { actual.lineItems.reverse(); });
+  negative("duplicated row", (_target, actual) => { actual.lineItems[1] = structuredClone(actual.lineItems[0]); });
+  for (const [label, value] of [["null", null], ["array", []], ["scalar", 1]]) {
+    negative("matching invalid " + label + " rows", (target, actual) => { target.lineItems[0] = value; actual.lineItems[0] = structuredClone(value); }, rowShape);
+  }
+  negative("missing actual lineItems", (_target, actual) => { delete actual.lineItems; }, arrayShape);
+  negative("nonarray actual lineItems", (_target, actual) => { actual.lineItems = {}; }, arrayShape);
+  for (const [key, value] of [["quantity", 9], ["description", "Changed"], ["pricing_keyword", "changed"], ["category_order", 9], ["item_order", 9], ["source_basis_line_id", "changed"], ["pricing_authority", { id: "changed", source: "local" }]]) {
+    negative("changed " + key, (_target, actual) => { actual.lineItems[0][key] = value; });
+  }
+  negative("unrelated dropped field", (_target, actual) => { delete actual.quoteDetails.unrelatedRequiredField; });
+  negative("snapshot empty-order rule retained", (_target, actual) => { actual.originalAnalysisSnapshot.line_items[0].basis_order = ""; }, "Empty snapshot basis_order target requires actual persisted absence");
+  negative("review clear rule retained", (_target, actual) => { actual.quoteCommercialReview = null; }, "Explicit clear-review target must correspond to an absent persisted review key");
+  assert(positives.length === 4 && negatives.length === 32, "Incomplete comparator control coverage.");
+  return { status: "PURE_COMPARATOR_CONTROLS_PASS", positives, negatives, inputsUnchanged: true };
 }
 async function captureConfirmedSaveTarget(originalUploads, stage) {
   const target = await page.evaluate(() => {
@@ -443,6 +533,7 @@ try {
   const logoFileKey=creationTarget.files.find(file=>file.file_role==="quote_company_logo")?.session_file_key;
   assert(typeof logoFileKey==="string"&&logoFileKey.trim(),"Creation target lacks the original logo file key.");
   requirePersistedQuoteCompany(creationDetail.draft_state?.quoteDetails,logoFileKey);
+  await writeJson("durable-draft-comparator-controls.json", verifyCompleteDurableDraftComparatorControls());
   const sharedCoverageControls=verifySharedCoverageAssertionControls(logoFileKey);
   await writeJson("shared-coverage-assertion-controls.json",sharedCoverageControls);
   const referenceSignature=await page.evaluate(()=>referenceFilesDependencySignature());
