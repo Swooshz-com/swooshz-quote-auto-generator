@@ -511,6 +511,7 @@ try {
   await page.locator("#confirmProfileLoadButton").click();
   assert(await page.evaluate(() => generationProfileIdForPayload()) === ("profile:"+profileId), "Visible saved-profile loading did not bind the selected layout.");
   await page.locator("#headerLogoInput").setInputFiles({ name: "alpha1-synthetic-logo.png", mimeType: "image/png", buffer: logoPng });
+  const creationPreEditSaveSequence = saveSequence;
   const company = [["#headerDetailsEditor",expectedCompany.header_details],["#quoteCompanyNameEditor",expectedCompany.name],["#acceptanceTextEditor","Synthetic approval for local acceptance testing"],["#companySignatoryEditor",expectedCompany.company_signatory],["#companyTitleEditor",expectedCompany.company_title],["#companyDateLabelEditor","Date:"],["#personLabelEditor","Name:"],["#stampLabelEditor","Company stamp"],["#dateLabelEditor","Date:"]];
   for (const [selector,value] of company) await page.locator(selector).fill(value);
   const projectNumber = customers.at(-1)[1];
@@ -527,7 +528,28 @@ try {
   const checkpointDetail = await readSession(sessionId, baseUrl);
   assert(checkpointDetail.draft_state.customerStepCheckpoint?.sessionId === sessionId && checkpointDetail.draft_state.customerStepCheckpoint.pricingReferenceDigest === checkpoint.reference.digest_sha256, 'Acknowledged Customer checkpoint absent from protected same-session GET.');
   const creationTarget=await captureConfirmedSaveTarget(originalUploads,"creation");
-  const creationReceipt=await waitForConfirmedQuoteSave(creationTarget,"creation",baseUrl);
+  const creationSaveTriggerBefore = await page.evaluate(() => ({
+    sessionId: state.quoteSessionId, panel: state.activeSidePanel,
+    current: customerStepCheckpointIsCurrent(), checkpoint: state.customerStepCheckpoint,
+    profile: generationProfileIdForPayload(), reference: currentPricingReference(),
+    files: sessionFileRecordsFromDraft().map((file) => ({
+      session_file_key: file.session_file_key, file_role: file.file_role, name: file.name,
+      type: file.type, size: file.size, content_fingerprint: normalizedContentFingerprint(file.content_fingerprint),
+    })),
+  }));
+  assert(creationTarget.sessionId === sessionId && creationSaveTriggerBefore.sessionId === sessionId && creationSaveTriggerBefore.panel === "quote_company" && creationSaveTriggerBefore.current && creationSaveTriggerBefore.checkpoint?.sessionId === sessionId, "Creation save trigger lost its same-session current Customer checkpoint or Quote Company panel.");
+  assert(creationSaveTriggerBefore.profile === checkpoint.profile && JSON.stringify(sortedValue(creationSaveTriggerBefore.reference)) === JSON.stringify(sortedValue(checkpoint.reference)), "Creation save trigger changed the committed selected profile or pricing reference.");
+  assert(creationSaveTriggerBefore.files.length === 2 && JSON.stringify(sortedValue(creationSaveTriggerBefore.files)) === JSON.stringify(sortedValue(creationTarget.files)), "Creation save trigger changed either original upload tuple.");
+  const creationSaveButton = page.locator('button[data-side-panel="quote_company"]:not([disabled])');
+  assert(await creationSaveButton.isVisible() && await creationSaveButton.isEnabled(), "Creation save requires the real visible enabled Quote Company navigation button.");
+  const creationPreClickSaveSequence = saveSequence;
+  await writeJson("creation-save-trigger-before.json", { target: creationTarget, preEditSaveSequence: creationPreEditSaveSequence, preClickSaveSequence: creationPreClickSaveSequence, before: creationSaveTriggerBefore, selector: 'button[data-side-panel="quote_company"]:not([disabled])', forced: false, extraPostRequired: false });
+  await creationSaveButton.click();
+  const creationReceipt=await waitForConfirmedQuoteSave(creationTarget,"creation",baseUrl,(entry)=>entry.sequence>creationPreEditSaveSequence);
+  assert(creationReceipt.sequence > creationPreEditSaveSequence, "Creation save receipt must be newer than the pre-final-company-edit watermark.");
+  const creationSaveTriggerAfter = await page.evaluate(() => ({ sessionId: state.quoteSessionId, panel: state.activeSidePanel, current: customerStepCheckpointIsCurrent(), checkpoint: state.customerStepCheckpoint, profile: generationProfileIdForPayload(), reference: currentPricingReference() }));
+  assert(creationSaveTriggerAfter.sessionId === sessionId && creationSaveTriggerAfter.panel === "quote_company" && creationSaveTriggerAfter.current && creationSaveTriggerAfter.checkpoint?.sessionId === sessionId && creationSaveTriggerAfter.profile === checkpoint.profile && JSON.stringify(sortedValue(creationSaveTriggerAfter.reference)) === JSON.stringify(sortedValue(checkpoint.reference)), "Creation save trigger changed the same-session checkpoint, panel, selected profile or pricing reference.");
+  await writeJson("creation-save-trigger-proof.json", { target: creationTarget, preEditSaveSequence: creationPreEditSaveSequence, preClickSaveSequence: creationPreClickSaveSequence, acceptedReceiptSequence: creationReceipt.sequence, newerThanPreEditWatermark: true, receiptRequestedBeforeClick: creationReceipt.sequence <= creationPreClickSaveSequence, extraPostRequired: false, before: creationSaveTriggerBefore, after: creationSaveTriggerAfter, selector: 'button[data-side-panel="quote_company"]:not([disabled])', realVisibleEnabledClick: true, forced: false, completePreClickTargetRetained: true });
   assert(creationReceipt.payload?.pricing_reference?.id===fixtureId&&creationReceipt.payload.pricing_reference.source==="local","Fresh UI creation save lost selected pricing authority.");
   const creationDetail=await readSession(sessionId,baseUrl);
   const logoFileKey=creationTarget.files.find(file=>file.file_role==="quote_company_logo")?.session_file_key;
