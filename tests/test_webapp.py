@@ -41211,6 +41211,94 @@ main().catch((error) => {
                         self.assertEqual(error.exception.code, 403)
                         self.assertIn("You do not have permission to perform this action.", body_text)
 
+    def _owner_selected_suggestion_payload(self, owned=False):
+        payload = valid_payload()
+        payload.update(pricing_reference_source="local", pricing_reference={
+            "id": payload["pricing_reference_id"], "source": "local", "currency": "SGD",
+        })
+        lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload, payload["profile_id"])
+        catalog = next(item for item in lookup.values() if item.get("unit_hint") == "sqm")
+        row = {"section": catalog["section"], "description": "Operator selected " + catalog["description"],
+               "quantity": 2, "unit": "sqm", "pricing_keyword": "", "source_basis_line_id": "selected-row"}
+        row["pricing_authority"] = webapp.build_pricing_authority("none", row)
+        line = {"id": "selected-row", "tag": "Include", "text": "[ " + catalog["description"] + " ] - Operator selected " + catalog["description"],
+                "quantity": 2, "unit": "sqm", "pricing_keyword": catalog["id"], "catalog_unit_price": 999999}
+        payload["line_items"] = [row]
+        payload["quote_basis_sections"] = [{"id": "selected", "title": catalog["section"], "lines": [line]}]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        if owned:
+            details = {"currency": "SGD", "exchange_rate": 1, "tax": {"label": "GST", "rate": 0.09},
+                       "company": {"name": "Synthetic Company", "header_details": "Synthetic header"},
+                       "quote_text": {"terms_heading": "Terms", "payment_terms": [], "notes_heading": "Notes", "standard_notes": []},
+                       "signature": {}, "rich_text": {}}
+            details["commercial_snapshot"] = {
+                "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA, "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+                "owner": "quote", "lifecycle": "RECOVERED", "origin": "session_recovery",
+                "presence": {key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                             for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()},
+                "pricing_basis": {"currency": "SGD", "source": "local", "id": payload["pricing_reference_id"],
+                                  "digest": webapp.pricing_reference_catalog_digest(json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8")))},
+            }
+            payload["quote_session"] = {"session_id": "quote-selected-suggestion", "commercials": {"currency": "SGD", "exchange_rate": 1},
+                "draft_state": {"quoteCommercialLifecycle": "RECOVERED", "quoteDetails": details, "lineItems": copy.deepcopy(payload["line_items"])}}
+            self.assertTrue(webapp.quote_commercial_state(payload)["owned"])
+            self.assertFalse(webapp.quote_commercial_state(payload)["review_required"])
+        return payload, catalog
+
+    def test_owner_specific_selection_binds_current_catalogue_in_fresh_and_owned_quotes(self):
+        for owned in (False, True):
+            with self.subTest(owned=owned):
+                payload, catalog = self._owner_selected_suggestion_payload(owned)
+                before = copy.deepcopy(payload)
+                rows = webapp.normalize_line_items_for_quote_basis_review(payload)
+                self.assertEqual(payload, before)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                price = webapp.pricing_reference_sale_unit_price(catalog)
+                self.assertEqual(row["pricing_authority"]["variant"], "catalog")
+                self.assertEqual(row["pricing_authority"]["catalog_item_id"], catalog["id"])
+                self.assertEqual(row["pricing_authority"]["price"], price)
+                self.assertNotEqual(price, 999999)
+                self.assertEqual(row["pricing_basis_amount"], webapp.round_commercial_cents(2 * price))
+                self.assertEqual(row["approved_quote_amount"], row["pricing_basis_amount"])
+                repeated = {**payload, "line_items": rows}
+                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), rows)
+
+    def test_owner_specific_selection_rejects_unbound_ambiguous_and_nonapproved_rows(self):
+        for owned in (False, True):
+            for variant in ("missing-id", "wrong-id", "duplicate-row", "duplicate-basis", "different-quantity", "different-unit", "unknown-catalogue", "custom", "confirm", "exclude", "invalid-authority", "historical"):
+                with self.subTest(owned=owned, variant=variant):
+                    payload, catalog = self._owner_selected_suggestion_payload(owned)
+                    row=payload["line_items"][0];line=payload["quote_basis_sections"][0]["lines"][0]
+                    if variant == "missing-id": row.pop("source_basis_line_id")
+                    elif variant == "wrong-id": row["source_basis_line_id"] = "another-row"
+                    elif variant == "duplicate-row": payload["line_items"].append(copy.deepcopy(row))
+                    elif variant == "duplicate-basis": payload["quote_basis_sections"][0]["lines"].append(copy.deepcopy(line))
+                    elif variant == "different-quantity": line["quantity"] = 3
+                    elif variant == "different-unit": line["unit"] = "nos"
+                    elif variant == "unknown-catalogue": line["pricing_keyword"] = "unknown-catalogue"
+                    elif variant in ("custom", "confirm", "exclude"): line["tag"] = variant.title()
+                    elif variant == "invalid-authority": row["pricing_authority"]["context"]["source_basis_line_id"] = "another-row"
+                    elif variant == "historical": row["pricing_authority"] = webapp.build_pricing_authority("historical", row)
+                    payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+                    rows=webapp.normalize_line_items_for_quote_basis_review(payload)
+                    self.assertFalse(any(item.get("pricing_authority", {}).get("variant") == "catalog" for item in rows))
+
+    def test_owner_specific_selection_preserves_manual_included_and_reference_guards(self):
+        for variant in ("manual", "included"):
+            for owned in (False, True):
+                payload, _ = self._owner_selected_suggestion_payload(owned)
+                row=payload["line_items"][0]
+                row["pricing_authority"] = webapp.build_pricing_authority(variant,row,price=17,
+                    reference_authority=webapp.exact_pricing_reference_authority(payload))
+                rows=webapp.normalize_line_items_for_quote_basis_review(payload)
+                self.assertEqual(rows[0]["pricing_authority"]["variant"], variant)
+                self.assertEqual(rows[0]["pricing_authority"]["price"], 0 if variant=="included" else 17)
+        for field,value in (("digest", "sha256:"+"0"*64), ("currency", "USD"), ("id", "wrong-reference"), ("source", "company")):
+            payload,_=self._owner_selected_suggestion_payload(True)
+            payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"][field]=value
+            self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(payload), [])
+
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {
             "profile_id": "synthetic-exhibition-fixture-template",

@@ -629,8 +629,8 @@ def optional_text_capacity_case(entry_kind, row_count):
     lines = lines[:14]
     for line in lines:
         line.section = "Capacity Boundary"
-    row_texts = ["BOLDITALICUNDERLINE" + "x" * 45]
-    row_texts.extend(f"R{index:03d}" + "x" * 60 for index in range(1, row_count))
+    row_texts = ["BOLDITALICUNDERLINE" + "x" * (quote.OPTIONAL_TEXT_LINE_MAX_WIDTH_EM - 19)]
+    row_texts.extend(f"R{index:03d}" + "x" * (quote.OPTIONAL_TEXT_LINE_MAX_WIDTH_EM - 4) for index in range(1, row_count))
     full_text = "".join(row_texts)
     rich_html = (
         "<div><strong>"
@@ -4467,6 +4467,51 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             1,
         )
 
+    def test_owner_multiline_footer_preserves_numbered_items_text_and_emphasis(self):
+        brief, lines = long_optional_text_pagination_case()
+        continuation = "Explicit second line: caf\u00e9, fa\u00e7ade, r\u00e9sum\u00e9, \u6761\u6b3e\u4fdd\u7559 and \u0395\u03bb\u03bb\u03b7\u03bd\u03b9\u03ba\u03ac remain unchanged."
+        brief["payment_terms"][0] += "\n" + continuation
+        brief["rich_text"]["paymentTerms"] = brief["rich_text"]["paymentTerms"].replace("</div>","<br>"+continuation+"</div>",1)
+        brief["standard_notes"][0] += "\nExplicit note continuation."
+        brief["rich_text"]["standardNotes"] = brief["rich_text"]["standardNotes"].replace("</div>","<br><em>Explicit note continuation.</em></div>",1)
+        for field,key in (("payment_terms","paymentTerms"),("standard_notes","standardNotes")):
+            grouped = quote.brief_rich_text_items(brief,key,brief[field])
+            self.assertEqual(len(grouped),len(brief[field]))
+            self.assertEqual(["".join(run.text for run in item) for item in grouped],brief[field])
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/"quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT,output,brief,lines)
+            with zipfile.ZipFile(output) as z:
+                sheet=ET.fromstring(z.read("xl/worksheets/sheet1.xml"));workbook=ET.fromstring(z.read("xl/workbook.xml"))
+        begin=quote.parse_cell_ref(find_cell_ref(sheet,brief["terms_heading"]))[0]
+        notes=quote.parse_cell_ref(find_cell_ref(sheet,brief["notes_heading"]))[0]
+        finish=quote.parse_cell_ref(find_cell_ref(sheet,brief["acceptance"]["text"]))[0]
+        for start,end,field in ((begin,notes,"payment_terms"),(notes,finish,"standard_notes")):
+            rows=[row for row in range(start+1,end) if cell_value(sheet,f"B{row}")]
+            text="".join(cell_value(sheet,f"B{row}") for row in rows)
+            self.assertEqual(re.sub(r"\s+","",text),re.sub(r"\s+","","".join(brief[field])))
+            numbers=[cell_value(sheet,f"A{row}") for row in rows if cell_value(sheet,f"A{row}")]
+            self.assertEqual(numbers,[f"{n:.2f}" for n in range(1,len(brief[field])+1)])
+            self.assertTrue(all(f"B{row}:I{row}" in merge_refs(sheet) for row in rows))
+        all_runs=[run for node in sheet.iter(f"{NS_MAIN}c")
+                  if node.get("r", "").startswith("B") and begin < quote.parse_cell_ref(node.attrib["r"])[0] < finish
+                  for run in cell_inline_runs(sheet,node.attrib["r"])]
+        self.assertIn("50% deposit","".join(text for text,bold,_,_ in all_runs if bold))
+        self.assertIn("Remaining 50%","".join(text for text,_,italic,_ in all_runs if italic))
+        self.assertIn("site access","".join(text for text,_,_,underline in all_runs if underline))
+        self.assertTrue(no_trailing_blank_print_page(sheet,workbook))
+        self.assertGreater(quote.OPTIONAL_TEXT_LINE_MAX_WIDTH_EM, 64)
+
+    def test_owner_footer_keeps_all_rich_lines_and_plain_multiline_without_global_parser_changes(self):
+        brief={"rich_text":{"paymentTerms":"<div><b>First</b><br>Continuation</div><p><u>Last</u></p>"}}
+        items=quote.brief_rich_text_items(brief,"paymentTerms",["First\nContinuation","Last"])
+        self.assertEqual(["".join(run.text for run in item) for item in items],["First\nContinuation","Last"])
+        self.assertTrue(items[0][0].bold);self.assertTrue(items[1][0].underline)
+        self.assertEqual(len(quote.parse_rich_text_html(brief["rich_text"]["paymentTerms"])),3)
+        items=quote.brief_rich_text_items(brief,"paymentTerms",["A stale fallback"])
+        self.assertEqual(["".join(run.text for run in item) for item in items],["First","Continuation","Last"])
+        self.assertEqual("".join(run.text for run in quote.brief_rich_text_items({},"paymentTerms",["First\nLast"])[0]),"First\nLast")
+
     def test_quote_detail_rich_text_runs_are_written_to_layout_output(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -4932,6 +4977,62 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(invalid.match_status, "unmatched")
         self.assertIsNone(invalid.unit_price_override)
         self.assertIsNone(invalid.amount)
+
+    def test_owner_footer_reflows_original_106_character_mixed_emphasis_without_loss(self):
+        brief, lines, _, _ = optional_text_capacity_case("standard_notes", 1)
+        original = "BOLDITALICUNDERLINE" + "x" * 87
+        brief["standard_notes"] = [original, "FOLLOWING NOTE SENTINEL"]
+        brief["rich_text"]["standardNotes"] = "<div><strong>BOLD</strong><em>ITALIC</em><u>UNDERLINE</u>" + "x" * 87 + "</div><div>FOLLOWING NOTE SENTINEL</div>"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "quote.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, out, brief, lines)
+            with zipfile.ZipFile(out) as zf:
+                sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+            rows = [(int(c.attrib["r"][1:]), cell_value(sheet, c.attrib["r"])) for c in sheet.iter(f"{NS_MAIN}c") if re.fullmatch(r"B\d+", c.attrib.get("r", "")) and ("BOLDITALICUNDERLINE" in cell_value(sheet, c.attrib["r"]) or cell_value(sheet, c.attrib["r"]) == "xx" or cell_value(sheet, c.attrib["r"]) == "FOLLOWING NOTE SENTINEL")]
+            self.assertEqual([text for _, text in rows], [original[:104], original[104:], "FOLLOWING NOTE SENTINEL"])
+            self.assertEqual("".join(text for _, text in rows[:2]), original)
+            self.assertEqual([cell_value(sheet, f"A{row}") for row, _ in rows], ["1.00", "", "2.00"])
+            self.assertEqual([row for row, _ in rows], list(range(rows[0][0], rows[0][0] + 3)))
+
+    def test_real_libreoffice_original_106_character_footer_reflow_proof(self):
+        import pypdfium2 as pdfium
+        brief, lines, _, _ = optional_text_capacity_case("standard_notes", 1)
+        original = "BOLDITALICUNDERLINE" + "x" * 87
+        brief["standard_notes"] = [original, "FOLLOWING NOTE SENTINEL"]
+        brief["rich_text"]["standardNotes"] = "<div><strong>BOLD</strong><em>ITALIC</em><u>UNDERLINE</u>" + "x" * 87 + "</div><div>FOLLOWING NOTE SENTINEL</div>"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "quote.xlsx"
+            pdf = Path(tmp) / "proof.pdf"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, out, brief, lines)
+            self.assertEqual(quote.libreoffice_pdf_export(out, pdf), "libreoffice_exported")
+            doc = pdfium.PdfDocument(str(pdf))
+            try:
+                expected = [original[:104], original[104:], "FOLLOWING NOTE SENTINEL"]
+                matches = {text: [] for text in expected}
+                for page_index, page in enumerate(doc):
+                    textpage = page.get_textpage()
+                    raw = textpage.get_text_range() or ""
+                    raw_lines = raw.splitlines(keepends=True)
+                    for text in expected:
+                        # Match a complete physical line, preserving every character.
+                        offset = 0
+                        for line in raw_lines:
+                            if line.strip() in (text, "1.00 " + text, "2.00 " + text):
+                                start = offset + line.index(text)
+                                boxes = [textpage.get_charbox(i) for i in range(start, start + len(text)) if not raw[i].isspace()]
+                                bbox = (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+                                matches[text].append((page_index, bbox))
+                            offset += len(line)
+                for text in expected:
+                    self.assertEqual(len(matches[text]), 1, text)
+                boxes = [matches[text][0] for text in expected]
+                self.assertEqual(len({page for page, _ in boxes}), 1)
+                for (_, upper), (_, lower) in zip(boxes, boxes[1:]):
+                    self.assertGreaterEqual(upper[1], lower[3], "footer rows overlap")
+                self.assertEqual("".join(expected[:2]), original)
+                print("SQAG original106 reflow proof: " + json.dumps({"all106_characters_retained": True, "complete_physical_lines": True, "neighbor_rows_do_not_overlap": True, "numbering_preserved_by_xml_control": True}))
+            finally:
+                doc.close()
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { deflateSync } from "node:zlib";
 import { chromium } from "playwright";
 import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playwright-test-seeded-setup.mjs";
@@ -34,6 +35,7 @@ const options = {
 let baseUrl = `http://${options.host}:${options.port}`;
 const outputDir = path.join(root, "_logs", "browser", "playwright-smoke");
 const quoteDataRoot = path.join(root, "_tmp", "playwright-quote-data");
+let alpha1OwnedProtectedHTTP = null;
 
 function g3SyntheticPngDataUrl() {
   const crc32 = (bytes) => {
@@ -221,6 +223,27 @@ function startServer({ mockProvider = false, dataRoot = quoteDataRoot } = {}) {
   };
   server.stdout.on("data", collect);
   server.stderr.on("data", collect);
+
+  if (alpha1Scope && !mockProvider) {
+    const receiptSource = { server, origin: new URL(baseUrl).origin, sequence: 0, receipts: [], overflow: false };
+    alpha1OwnedProtectedHTTP = receiptSource;
+    let pendingAccessLine = "";
+    server.stderr.on("data", (chunk) => {
+      pendingAccessLine += String(chunk);
+      if (pendingAccessLine.length > 32768) { receiptSource.overflow = true; return; }
+      const lines = pendingAccessLine.split("\n");
+      pendingAccessLine = lines.pop();
+      for (const line of lines) {
+        const match = line.match(/"([A-Z]+) (\S+) HTTP\/[0-9.]+" ([0-9]{3}) /);
+        if (!match) continue;
+        const actualURL = new URL(match[2], receiptSource.origin);
+        if (actualURL.origin !== receiptSource.origin || !/^\/api\/quote-sessions\/[^/]+\/download\/xlsx$/.test(actualURL.pathname)) continue;
+        if (receiptSource.receipts.length >= 32) { receiptSource.overflow = true; continue; }
+        receiptSource.receipts.push({ sequence: ++receiptSource.sequence, method: match[1], url: actualURL.href, status: Number(match[3]), serverPid: server.pid });
+      }
+    });
+  }
+
   return { server, output };
 }
 
@@ -847,6 +870,8 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
 }
 
 async function verifyGenerationLoadingModalSurvivesRefresh(page) {
+  // Let the unchanged local-runner write window drain after the preceding CRUD controls.
+  if (alpha1Scope) await page.waitForTimeout(60000);
   const cases = [
     { type: "generate", viewPdf: false, title: "Regenerating Excel", finalizingTitle: "Finalizing Excel", readyTitle: "Excel ready", action: "excel", button: "#sideDownloadButton" },
     { type: "generate_pdf", viewPdf: true, title: "Generating PDF", finalizingTitle: "Finalizing PDF", readyTitle: "PDF ready", action: "pdf", button: "#sideViewPdfButton" },
@@ -880,14 +905,12 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (postCount === 1) {
         firstPostStartedResolve();
         await new Promise((resolve) => { releaseFirstPost = resolve; });
-        if (!alpha1Scope) {
         try {
           await route.abort("aborted");
         } catch {
           // Navigation may already have disposed the interrupted request.
         }
         return;
-        }
       }
       secondPostStartedResolve();
       await route.fulfill({
@@ -963,7 +986,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
         throw new Error("Export click did not send a client-generated job id.");
       }
 
-      if (!alpha1Scope) {
+      // Both scopes exercise the actual resume path for these refresh assertions.
       const reload = page.reload({ waitUntil: "domcontentloaded" });
       await page.waitForTimeout(100);
       if (typeof releaseFirstPost !== "function") {
@@ -972,16 +995,12 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       releaseFirstPost();
       await reload;
       await secondPostStarted;
-      } else {
-        if (typeof releaseFirstPost !== "function") throw new Error("Fresh generation was not paused for pending-job inspection.");
-        releaseFirstPost();
-      }
       await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
       const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
       if (restoredTitle !== testCase.title) {
         throw new Error("Expected refreshed " + testCase.type + " overlay title " + testCase.title + ", found " + restoredTitle + ".");
       }
-      if (alpha1Scope ? postCount !== 1 : (postCount !== 2 || postedJobIds[0] !== postedJobIds[1])) {
+      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1]) {
         throw new Error("Refresh should retry " + testCase.type + " with one stable idempotency key: " + JSON.stringify(postedJobIds) + ".");
       }
       const activePanel = (await page.locator(".rail-button.is-active").innerText()).trim();
@@ -1026,7 +1045,12 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (activeDuringFinalization?.type !== testCase.type) {
         throw new Error("Recovered " + testCase.type + " cleared its active job before finalization completed.");
       }
+      const finalSaveResponse = alpha1Scope ? page.waitForResponse(response => new URL(response.url()).pathname === "/api/quote-sessions" && response.request().method() === "POST", { timeout: 15000 }) : null;
       releaseFinalSave();
+      if (finalSaveResponse) {
+        const response = await finalSaveResponse;
+        if (response.status() !== 200) throw new Error("Actual resumed final save returned HTTP " + response.status());
+      }
       await page.waitForFunction(() => {
         const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
         return !saved.activeJob;
@@ -1216,18 +1240,96 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
 async function verifyFreshGenerationTerminalStates(page) {
   const sessionId=await currentQuoteSessionId(page);
   if (!sessionId) throw new Error("Fresh terminal contract needs an owned saved session.");
+
+  // This alias is profile-metadata presentation only. Real server generation remains authoritative.
+  const profilePattern="**/api/profiles", aliasPresetId="alpha1-fresh-real-default";
+  const aliasValue="profile:default:"+aliasPresetId;
+  const templateBytes=await fs.readFile(path.join(root,"templates/profile/default/profile.json"));
+  const templateSha256=createHash("sha256").update(templateBytes).digest("hex");
+  if(templateSha256!=="88e24cd934fc9d04dbbbe0a53c2c61fccda5305b6803c60cbf89e14af00cb683") throw new Error("Real default template identity changed.");
+  const actualProfilesResponse=await page.request.get(baseUrl+"/api/profiles");
+  if(actualProfilesResponse.status()!==200) throw new Error("Real server profile metadata was not available.");
+  const actualProfiles=await actualProfilesResponse.json();
+  const actualDefault=actualProfiles.profiles?.find(profile=>profile.id==="default");
+  const actualPreset=actualDefault?.quote_detail_presets?.find(preset=>preset.id==="default");
+  if(!actualDefault||!actualPreset) throw new Error("Real server default profile/preset is absent.");
+  const serverProfileSummarySha256=createHash("sha256").update(JSON.stringify(stableJson(actualDefault))).digest("hex");
+  const originalFixture=await page.evaluate(async()=>{
+    const response=await fetch("/api/profiles");
+    if(!response.ok) throw new Error("Existing fixture profile metadata was not available.");
+    return response.json();
+  });
+  if(!Array.isArray(originalFixture.profiles)||originalFixture.profiles.some(profile=>profile.id==="default")) throw new Error("Existing fixture metadata changed or collides with real default.");
+  const scopedFixture={...originalFixture,profiles:[...originalFixture.profiles,{
+    ...actualDefault,quote_detail_presets:[...actualDefault.quote_detail_presets,{
+      ...actualPreset,id:aliasPresetId,name:"Alpha1 real server default fixture",
+    }],
+  }]};
+  const scopedProfileHandler=async route=>{
+    if(route.request().method()!=="GET") return route.fallback();
+    await route.fulfill({status:200,contentType:"application/json",body:JSON.stringify(scopedFixture)});
+  };
+  await page.route(profilePattern,scopedProfileHandler);
+  try {
+    await page.reload({waitUntil:"domcontentloaded"});
+    await page.waitForFunction(()=>state.isBooting===false,null,{timeout:15000});
+    if(await currentQuoteSessionId(page)!==sessionId) throw new Error("Profile fixture reload replaced its owned session.");
+    await alpha1AcknowledgeCustomer(page);
+    await page.locator("#presetSelect").selectOption(aliasValue);
+    await page.locator("#loadPresetButton:not([disabled])").click();
+    await page.locator("#profileLoadModal").waitFor({state:"visible",timeout:15000});
+    await page.locator("#confirmProfileLoadButton").click();
+    await page.locator("#profileLoadModal").waitFor({state:"hidden",timeout:15000});
+    await page.waitForFunction(value=>state.selectedPresetValue===value && generationProfileIdForPayload()==="profile:default" && elements.presetStatus.textContent==='Loaded "Alpha1 real server default fixture".',aliasValue,{timeout:15000});
+    const saveResponse=page.waitForResponse(response=>new URL(response.url()).pathname==="/api/quote-sessions" && response.request().method()==="POST",{timeout:15000});
+    const profileSaved=await page.evaluate(async()=>saveQuoteSessionDraftState({quoteGenerated:true}));
+    const acknowledgedResponse=await saveResponse;
+    if(acknowledgedResponse.status()!==200||profileSaved?.session_id!==sessionId) throw new Error("Real default fixture save was not acknowledged under its owned session.");
+    const persisted=await dashboardQuoteSessionDetail(page,sessionId);
+    if(persisted.status!=="ok"||persisted.quote_session?.session_id!==sessionId||persisted.quote_session.quote_company_profile?.id!=="profile:default"||persisted.quote_session.draft_state?.selectedPresetValue!==aliasValue) throw new Error("Real default profile identity was not durably read back.");
+    console.log(JSON.stringify({status:"alpha1_real_default_profile_fixture_ready",sessionId,serverProfileId:actualDefault.id,serverProfileSummarySha256,templateSha256,selectedPresetValue:aliasValue,persistedProfileId:persisted.quote_session.quote_company_profile.id,saveHttp:acknowledgedResponse.status()}));
+    await page.locator('button[data-side-panel="output"]:not([disabled])').click();
+    await page.locator("#outputSidePanel.is-active").waitFor({state:"visible",timeout:15000});
+
   for (const status of ["completed","needs_review","blocked","failed","interrupted"]) {
-    let finish=false,starts=0,jobId="",polls=0;
+    let finish=false,starts=0,jobId="",polls=0,actualCompletedFile=null;
+    let acceptedStartResolve;
+    const acceptedStart=new Promise(resolve=>{acceptedStartResolve=resolve;});
     const postPattern="**/api/jobs",getPattern="**/api/jobs/job-*";
     await page.route(postPattern,async route=>{
       if(route.request().method()!=="POST") return route.fallback();
       const payload=route.request().postDataJSON();starts++;jobId=payload.job_id;
       if(payload.type!=="generate"||!jobId||payload.payload?.quote_session?.session_id!==sessionId) throw new Error("Fresh generation request identity/type/session mismatch.");
-      await route.fulfill({status:202,contentType:"application/json",body:JSON.stringify({job_id:jobId,type:"generate",status:"running"})});
+      if(status==="completed") {
+        if(payload.payload?.profile_id!=="profile:default") throw new Error("Actual completed-fixture request did not use the real default profile.");
+        console.log(JSON.stringify({status:"alpha1_actual_default_profile_request",sessionId,jobId,profileId:payload.payload.profile_id}));
+        const actual=await route.fetch({maxRetries:0});
+        if(actual.status()!==202) throw new Error("Actual completed-fixture generation start returned HTTP "+actual.status());
+        const data=await actual.json();
+        if(data.job_id!==jobId || data.type!=="generate") throw new Error("Actual completed-fixture start identity/type mismatch.");
+        await route.fulfill({response:actual});
+      } else {
+        await route.fulfill({status:202,contentType:"application/json",body:JSON.stringify({job_id:jobId,type:"generate",status:"running"})});
+      }
+      acceptedStartResolve(jobId);
     });
     await page.route(getPattern,async route=>{
       const requested=new URL(route.request().url()).pathname.split("/").pop();
       if(requested!==jobId) return route.fallback();polls++;
+      if(status==="completed" && finish) {
+        const actual=await route.fetch({maxRetries:0});
+        if(actual.status()!==200) throw new Error("Actual completed-fixture poll returned HTTP "+actual.status());
+        const data=await actual.json();
+        if(data.job_id!==jobId || data.type!=="generate") throw new Error("Actual completed-fixture poll identity/type mismatch.");
+        if(data.status==="completed") {
+          const owned=data.result?.quote_session, file=owned?.exports?.xlsx;
+          actualCompletedFile=file;
+          if(owned?.session_id!==sessionId || file?.filename!=="quotation.xlsx" || file?.url!=="/api/quote-sessions/"+sessionId+"/download/xlsx") throw new Error("Actual completed-fixture export is not bound to its owned session/file.");
+          console.log(JSON.stringify({status:"alpha1_actual_completed_fixture",jobId,sessionId,http:actual.status(),fileUrl:file.url,filename:file.filename,bytes:file.size_bytes,sha256:file.sha256}));
+        }
+        await route.fulfill({response:actual});
+        return;
+      }
       await route.fulfill({status:200,contentType:"application/json",body:JSON.stringify(finish ? {job_id:jobId,type:"generate",status,result:{status:status==="needs_review"?"needs_confirmation":status,...(status==="blocked"?{errors:["Synthetic blocked state"]}:{}),...(status==="failed"?{message:"Synthetic failed state"}:{}),...(status==="completed"?{files:[{name:"quotation.xlsx",url:"/api/quote-sessions/"+sessionId+"/files/quotation.xlsx"}]}:{})}} : {job_id:jobId,type:"generate",status:"running",created_at:new Date().toISOString()})});
     });
     try {
@@ -1236,6 +1338,7 @@ async function verifyFreshGenerationTerminalStates(page) {
       await page.locator("#excelGeneratingModal").waitFor({state:"visible",timeout:15000});
       const title=(await page.locator("#excelGeneratingTitle").innerText()).trim();
       if(title!=="Regenerating Excel") throw new Error("Fresh Excel overlay title does not match its running type.");
+      await Promise.race([acceptedStart,page.waitForTimeout(15000).then(()=>{throw new Error("Fresh generation did not reach its actual POST acceptance.");})]);
       const active=await page.evaluate(()=>JSON.parse(localStorage.getItem("swooshz_quote_session_v1")||"{}").activeJob);
       if(active?.id!==jobId||starts!==1) throw new Error("Fresh running job is not persisted once under its accepted client identity.");
       if(status==="interrupted") {
@@ -1244,16 +1347,59 @@ async function verifyFreshGenerationTerminalStates(page) {
         const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem("swooshz_quote_session_v1")||"{}").activeJob);
         if(saved?.id!==jobId||starts!==1) throw new Error("Interrupted live polling lost recovery identity or started another generation.");
       } else {
-        finish=true;
-        if(status==="completed") {await page.locator("#excelGeneratingModal.is-ready").waitFor({state:"visible",timeout:15000});await page.locator("#excelGeneratingCloseButton").click();}
+        if(status==="completed"){
+          const ownedFileUrl=new URL("/api/quote-sessions/"+sessionId+"/download/xlsx",page.url()).href;
+          const receiptSource=alpha1OwnedProtectedHTTP;
+          if(!receiptSource||receiptSource.origin!==new URL(ownedFileUrl).origin||receiptSource.server.exitCode!==null||receiptSource.overflow) throw new Error("Protected workbook needs an intact original owning-server receipt source.");
+          const receiptStartSequence=receiptSource.sequence, receiptDeadline=Date.now()+15000;
+          const protectedFileResponse=new Promise((resolve,reject)=>{
+            const inspect=()=>{
+              if(receiptSource.overflow) return reject(new Error("Original protected HTTP receipt capture overflowed."));
+              const actual=receiptSource.receipts.find(receipt=>receipt.sequence>receiptStartSequence&&receipt.method==="GET"&&receipt.url===ownedFileUrl);
+              if(actual) return resolve(actual);
+              const remaining=receiptDeadline-Date.now();
+              if(remaining<=0) return reject(new Error("Actual owning-server protected HTTP response was not observed within 15000ms."));
+              setTimeout(inspect,Math.min(25,remaining));
+            };
+            inspect();
+          }).then(receipt=>{
+            console.log(JSON.stringify({...receipt,status:"alpha1_original_server_protected_http",http:receipt.status,sessionId,jobId}));
+            if(receipt.status!==200) throw new Error("Actual protected workbook HTTP status was "+receipt.status);
+            return receipt;
+          });
+          const freshDownload=page.waitForEvent("download",{timeout:15000}).then(async download=>{
+            if(download.suggestedFilename()!=="quotation.xlsx"||download.url()!==ownedFileUrl) throw new Error("Fresh completed generation did not download its exact owned workbook.");
+            const downloadFailure=await Promise.race([download.failure(),page.waitForTimeout(15000).then(()=>{throw new Error("Fresh protected workbook download did not complete.");})]);
+            if(downloadFailure) throw new Error("Fresh protected workbook download failed: "+downloadFailure);
+            const actualDownloadPath=await download.path();
+            if(!actualDownloadPath||!actualCompletedFile) throw new Error("Actual completed fixture has no browser bytes or real server export metadata.");
+            const actualDownloadBytes=await fs.readFile(actualDownloadPath);
+            const actualDownloadSha256=createHash("sha256").update(actualDownloadBytes).digest("hex");
+            if(!actualDownloadBytes.length||actualDownloadBytes.length!==actualCompletedFile.size_bytes||actualDownloadSha256!==actualCompletedFile.sha256) throw new Error("Actual browser workbook bytes do not match the current server export metadata.");
+            await fs.mkdir(outputDir,{recursive:true});
+            const retainedWorkbook=path.join(outputDir,"alpha1-fresh-terminal-protected.xlsx");
+            await fs.writeFile(retainedWorkbook,actualDownloadBytes,{flag:"wx"});
+            console.log(JSON.stringify({status:"alpha1_browser_workbook_bytes_observed",sessionId,jobId,url:download.url(),filename:download.suggestedFilename(),bytes:actualDownloadBytes.length,sha256:actualDownloadSha256,retainedWorkbook}));
+            return {download,bytes:actualDownloadBytes.length,sha256:actualDownloadSha256,retainedWorkbook};
+          });
+          finish=true;
+          const [received,response]=await Promise.all([freshDownload,protectedFileResponse]);
+          console.log(JSON.stringify({status:"alpha1_actual_protected_download",sessionId,jobId,filename:received.download.suggestedFilename(),url:received.download.url(),http:response.status,bytes:received.bytes,sha256:received.sha256,retainedWorkbook:received.retainedWorkbook,httpObservation:"original-owning-server-response",serverPid:response.serverPid,serverReceiptSequence:response.sequence}));
+        }else{
+          finish=true;
+        }
         await page.locator("#excelGeneratingModal").waitFor({state:"hidden",timeout:15000});
         await page.waitForFunction(()=>!JSON.parse(localStorage.getItem("swooshz_quote_session_v1")||"{}").activeJob,null,{timeout:15000});
         if(starts!==1||!polls) throw new Error("Fresh terminal path has missing polling or duplicate ordinary generation.");
       }
+      console.log(JSON.stringify({status:"alpha1_fresh_terminal_case_complete",terminal:status,jobId,sessionId,starts,polls}));
     } finally {
       await page.evaluate(()=>{if(window.__alpha1Fetch){window.fetch=window.__alpha1Fetch;delete window.__alpha1Fetch;}hideExcelGeneratingModal();clearActiveJob();});
       await page.unroute(postPattern);await page.unroute(getPattern);
     }
+  }
+  } finally {
+    await page.unroute(profilePattern,scopedProfileHandler);
   }
 }
 
@@ -1400,7 +1546,7 @@ async function verifyExpiredQuoteJobsDoNotResume(page) {
       if (["analyzing", "generating"].includes(after.workflowStage)) {
         throw new Error(`${testCase.label} restored an unsafe running stage ${after.workflowStage}.`);
       }
-      if (after.quoteState !== before.quoteState) {
+      if (!isDeepStrictEqual(JSON.parse(after.quoteState), JSON.parse(before.quoteState))) {
         throw new Error(`${testCase.label} mutated saved quote data during stale cleanup.`);
       }
     }
@@ -4665,6 +4811,8 @@ async function main() {
     await page.locator('.rail-button[data-side-panel="quote_company"]').click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible", timeout: 15000 });
     } else {
+      // Confirm changed reference files before constructing completed output.
+      await alpha1AcknowledgeCustomer(page);
     await page.evaluate(() => {
       state.outputRows = [normalizeOutputRow({
         section: "Refresh regression",
@@ -4677,16 +4825,15 @@ async function main() {
       state.originalOutputRows = state.outputRows.map((row) => ({ ...row }));
       state.basisConfirmed = true;
       setWorkflowStage("completed");
-      setSidePanel("customer", { force: true });
       saveSessionState();
     });
-      await alpha1AcknowledgeCustomer(page);
       const liveId=await currentQuoteSessionId(page);
       const files=await page.locator("#fileList .file-item").allTextContents();
       if(!liveId||files.length!==1||!files[0].includes(TEST_REFERENCE_FILE_NAME)) throw new Error("Fresh owned quote lost its uploaded reference metadata.");
-      await page.evaluate(async()=>saveQuoteSessionDraftState({quoteGenerated:true}));
+      const saved=await page.evaluate(async()=>saveQuoteSessionDraftState({quoteGenerated:true}));
+      if(!saved||saved.session_id!==liveId) throw new Error("Fresh component save was not acknowledged under the same owner/session.");
       const detail=await dashboardQuoteSessionDetail(page,liveId);
-      if(detail.quote_session?.session_id!==liveId||!detail.quote_session.draft_state?.outputRows?.length) throw new Error("Fresh component output snapshot was not durably saved under the same owner/session.");
+      if(detail.status!=="ok"||detail.quote_session?.session_id!==liveId||!detail.quote_session.draft_state?.outputRows?.length) throw new Error("Fresh component output snapshot was not durably saved under the same owner/session.");
     }
     const restoredPresetValue = await page.locator("#presetSelect").inputValue();
     if (restoredPresetValue !== "profile:synthetic-exhibition-fixture-template:synthetic-fixture-default") {

@@ -13590,18 +13590,32 @@ async function saveQuoteSessionDraftState(options = {}) {
   if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
   saveSessionState();
-  const draftState = options.draftState || currentQuoteSessionDraftState();
-  const draftFiles = Array.isArray(options.draftFiles)
+  // Caller snapshots stay immutable while an earlier save is pending.
+  let draftState = JSON.parse(JSON.stringify(options.draftState || currentQuoteSessionDraftState()));
+  let draftFiles = JSON.parse(JSON.stringify(Array.isArray(options.draftFiles)
     ? options.draftFiles
-    : sessionFileRecordsFromDraft();
-  const draftKey = quoteSessionDraftComparisonKey(draftState);
-  const draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
+    : sessionFileRecordsFromDraft()));
+  let draftKey = quoteSessionDraftComparisonKey(draftState);
+  let draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
   const priorSave = quoteSessionDraftSavePromise;
   const queuedSessionId = ensureClientQuoteSessionId();
   const savePromise = (async () => {
-    if (priorSave) await priorSave.catch(() => null);
+    if (priorSave) {
+      await priorSave.catch(() => null);
+      // Let the acknowledged caller apply its checkpoint before an ordinary
+      // queued save captures the current draft. No waiter depends on this save.
+      await Promise.resolve();
+    }
     const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
     if (currentSessionId !== queuedSessionId) return null;
+    if (priorSave && !options.draftState) {
+      draftState = JSON.parse(JSON.stringify(currentQuoteSessionDraftState()));
+      if (!Array.isArray(options.draftFiles)) {
+        draftFiles = JSON.parse(JSON.stringify(sessionFileRecordsFromDraft()));
+      }
+      draftKey = quoteSessionDraftComparisonKey(draftState);
+      draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
+    }
     if (quoteSessionDraftIsConfirmed(currentSessionId, draftKey, draftFileKey)) {
       return { session_id: currentSessionId };
     }

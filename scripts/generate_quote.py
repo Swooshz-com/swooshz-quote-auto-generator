@@ -128,7 +128,8 @@ TOTAL_BLOCK_HEIGHT = 3
 SIGNATURE_CONTENT_HEIGHT = 8
 SIGNATURE_BLOCK_PAGE_GUARD_ROWS = 0
 SIGNATURE_BLOCK_HEIGHT = SIGNATURE_CONTENT_HEIGHT + SIGNATURE_BLOCK_PAGE_GUARD_ROWS
-OPTIONAL_TEXT_LINE_MAX_WIDTH_EM = 64
+# The visible B:I body columns span 123.875 width units; allow padding and rich emphasis.
+OPTIONAL_TEXT_LINE_MAX_WIDTH_EM = 104
 # LibreOffice advances past three bottom rows before the declared continuation break.
 OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS = 3
 QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT = "18.7"
@@ -1224,6 +1225,35 @@ def brief_rich_text_lines(
     rich_text = brief.get("rich_text") if isinstance(brief.get("rich_text"), dict) else {}
     parsed = parse_rich_text_html(rich_text.get(key)) if isinstance(rich_text, dict) else []
     return parsed if parsed else plain_rich_text_lines(fallback_lines, bold=fallback_bold)
+
+
+def brief_rich_text_items(
+    brief: dict[str, Any], key: str, fallback_items: list[Any],
+) -> list[list[RichTextRun]]:
+    """Keep explicit lines within their supplied numbered item, without truncating rich text."""
+    rich_text = brief.get("rich_text") if isinstance(brief.get("rich_text"), dict) else {}
+    parsed = parse_rich_text_html(rich_text.get(key))
+    if not parsed:
+        return plain_rich_text_lines(fallback_items)
+    grouped: list[list[RichTextRun]] = []
+    cursor = 0
+    for item in fallback_items:
+        parts = str(item).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        lines = parsed[cursor:cursor + len(parts)]
+        if len(lines) != len(parts) or any(
+            clean_text("".join(run.text for run in runs)) != clean_text(text)
+            for runs, text in zip(lines, parts)
+        ):
+            # Rich text remains authoritative; preserve every parsed line if grouping cannot be proved.
+            return parsed
+        runs: list[RichTextRun] = []
+        for index, line in enumerate(lines):
+            if index:
+                runs.append(RichTextRun("\n"))
+            runs.extend(line)
+        grouped.append(runs)
+        cursor += len(parts)
+    return grouped + parsed[cursor:]
 
 
 def brief_rich_text_cell_runs(
@@ -3314,11 +3344,11 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
 
     terms_heading = clean_text(brief.get("terms_heading"))
     payment_terms = brief.get("payment_terms") or []
-    payment_term_runs = brief_rich_text_lines(brief, "paymentTerms", payment_terms)
-    if terms_heading or payment_terms:
+    payment_term_runs = brief_rich_text_items(brief, "paymentTerms", payment_terms)
+    if terms_heading or payment_term_runs:
         heading_runs = brief_rich_text_cell_runs(brief, "termsHeading", terms_heading)
         heading_admission_height = len(wrap_rich_text_runs(heading_runs))
-        if terms_heading and payment_terms:
+        if terms_heading and payment_term_runs:
             first_term_runs = (
                 payment_term_runs[0]
                 if payment_term_runs
@@ -3338,8 +3368,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 admission_height=heading_admission_height,
             )
             optional_text_moved = optional_text_moved or moved
-        for index, term in enumerate(payment_terms, start=1):
-            runs = payment_term_runs[index - 1] if index - 1 < len(payment_term_runs) else [RichTextRun(clean_text(term))]
+        for index, runs in enumerate(payment_term_runs, start=1):
             next_text_row, last_optional_row, moved = write_optional_text_block(
                 root,
                 next_text_row,
@@ -3356,11 +3385,11 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
 
     notes_heading = clean_text(brief.get("notes_heading"))
     standard_notes = brief.get("standard_notes") or []
-    standard_note_runs = brief_rich_text_lines(brief, "standardNotes", standard_notes)
-    if notes_heading or standard_notes:
+    standard_note_runs = brief_rich_text_items(brief, "standardNotes", standard_notes)
+    if notes_heading or standard_note_runs:
         heading_runs = brief_rich_text_cell_runs(brief, "notesHeading", notes_heading)
         heading_admission_height = len(wrap_rich_text_runs(heading_runs))
-        if notes_heading and standard_notes:
+        if notes_heading and standard_note_runs:
             first_note_runs = (
                 standard_note_runs[0]
                 if standard_note_runs
@@ -3380,8 +3409,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 admission_height=heading_admission_height,
             )
             optional_text_moved = optional_text_moved or moved
-        for index, note in enumerate(standard_notes, start=1):
-            runs = standard_note_runs[index - 1] if index - 1 < len(standard_note_runs) else [RichTextRun(clean_text(note))]
+        for index, runs in enumerate(standard_note_runs, start=1):
             next_text_row, last_optional_row, moved = write_optional_text_block(
                 root,
                 next_text_row,
