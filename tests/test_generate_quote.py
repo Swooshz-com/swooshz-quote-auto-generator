@@ -3125,6 +3125,55 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         ):
             self.assertTrue(find_cell_ref(sheet, expected), expected)
 
+    def test_optional_text_runs_preserve_active_template_font(self):
+        for alternate_font in (False, True):
+            for kind in ("payment_terms", "standard_notes"):
+                with self.subTest(alternate_font=alternate_font, kind=kind), tempfile.TemporaryDirectory() as tmp:
+                    directory = Path(tmp)
+                    template = KONCEPT_LAYOUT
+                    if alternate_font:
+                        with zipfile.ZipFile(template) as archive:
+                            parts = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+                        styles = ET.fromstring(parts["xl/styles.xml"])
+                        fonts = styles.find(f"{NS_MAIN}fonts")
+                        xfs = styles.find(f"{NS_MAIN}cellXfs")
+                        for style_id in (37, 41):
+                            font = fonts[int(xfs[style_id].attrib["fontId"])]
+                            font.find(f"{NS_MAIN}name").attrib["val"] = "Liberation Serif"
+                            font.find(f"{NS_MAIN}sz").attrib["val"] = "9.5"
+                        parts["xl/styles.xml"] = ET.tostring(styles)
+                        template = directory / "selected-layout.xlsx"
+                        with zipfile.ZipFile(template, "w") as archive:
+                            for name, content in parts.items():
+                                archive.writestr(name, content)
+                    brief, lines, expected_text, _ = optional_text_capacity_case(kind, 54)
+                    heading_key = "terms_heading" if kind == "payment_terms" else "notes_heading"
+                    brief[heading_key] = "Selected font heading"
+                    output = directory / "quotation.xlsx"
+                    quote.write_quote_layout_xlsx(template, output, brief, lines)
+                    with zipfile.ZipFile(output) as archive:
+                        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                        styles = ET.fromstring(archive.read("xl/styles.xml"))
+                    fonts = styles.find(f"{NS_MAIN}fonts")
+                    xfs = styles.find(f"{NS_MAIN}cellXfs")
+                    heading_ref = find_cell_ref(sheet, brief[heading_key])
+                    self.assertTrue(heading_ref)
+                    content_refs = [
+                        node.attrib["r"] for node in sheet.iter(f"{NS_MAIN}c")
+                        if node.attrib["r"].startswith("B") and cell_value(sheet, node.attrib["r"]) in expected_text
+                        and len(cell_value(sheet, node.attrib["r"])) == quote.OPTIONAL_TEXT_LINE_MAX_WIDTH_EM
+                    ]
+                    self.assertEqual(len(content_refs), 54)
+                    for ref in [heading_ref] + content_refs:
+                        node = cell(sheet, ref)
+                        font = fonts[int(xfs[int(node.attrib["s"])].attrib["fontId"])]
+                        for run in node.findall(f"{NS_MAIN}is/{NS_MAIN}r"):
+                            properties = run.find(f"{NS_MAIN}rPr")
+                            for tag, font_tag in (("rFont", "name"), ("sz", "sz")):
+                                explicit = properties.find(f"{NS_MAIN}{tag}")
+                                self.assertIsNotNone(explicit, f"{ref} must not fall back to renderer defaults")
+                                self.assertEqual(explicit.attrib["val"], font.find(f"{NS_MAIN}{font_tag}").attrib["val"])
+
     def test_payment_terms_capacity_boundaries_are_split_without_skipping(self):
         for row_count in (53, 54, 55, 56, 57, 106):
             with self.subTest(row_count=row_count):
@@ -4473,8 +4522,12 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual(font_size(font), "10", expected_text)
             for text, run_font_name, run_font_size in cell_inline_run_fonts(sheet, ref):
                 if text:
-                    self.assertEqual(run_font_name, "", expected_text)
-                    self.assertEqual(run_font_size, "", expected_text)
+                    optional_style = cell_style(sheet, ref) in {
+                        cell_style(sheet, find_cell_ref(sheet, "Commercial Terms")),
+                        cell_style(sheet, find_cell_ref(sheet, "50% deposit")),
+                    }
+                    self.assertEqual(run_font_name, font_name(font) if optional_style else "", expected_text)
+                    self.assertEqual(run_font_size, font_size(font) if optional_style else "", expected_text)
 
         paragraphs = [
             "".join(text_node.text or "" for text_node in paragraph.findall(f".//{NS_A}t"))

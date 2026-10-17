@@ -2023,6 +2023,19 @@ def add_quote_layout_styles(parts: dict[str, bytes]) -> dict[str, str]:
     return style_ids
 
 
+def ooxml_style_text_font(parts: dict[str, bytes], style: str) -> dict[str, str | None]:
+    """Make rich runs use the selected cell font across spreadsheet readers."""
+    styles = ET.fromstring(parts["xl/styles.xml"])
+    cell_style = styles.find(f"{NS_MAIN}cellXfs")[int(style)]
+    font = styles.find(f"{NS_MAIN}fonts")[int(cell_style.attrib.get("fontId", "0"))]
+    name = font.find(f"{NS_MAIN}name")
+    size = font.find(f"{NS_MAIN}sz")
+    return {
+        "font_name": name.attrib["val"] if name is not None else None,
+        "font_size": size.attrib["val"] if size is not None else None,
+    }
+
+
 def update_drawing_project_number(xml: bytes, project_number: str) -> bytes:
     project_number = clean_text(project_number)
     if not project_number:
@@ -2944,6 +2957,8 @@ def write_optional_text_block(
     number: int | None = None,
     number_style: str | None = None,
     admission_height: int | None = None,
+    font_name: str | None = None,
+    font_size: str | None = None,
 ) -> tuple[int, int, bool]:
     lines = wrap_rich_text_runs(runs)
     if not lines:
@@ -2964,7 +2979,10 @@ def write_optional_text_block(
         moved = moved or line_moved
         if number is not None and line_index == 0:
             set_ooxml_cell(root, row_number, 1, f"{number:.2f}", number_style)
-        set_ooxml_rich_text_cell(root, row_number, text_column, line_runs, style)
+        set_ooxml_rich_text_cell(
+            root, row_number, text_column, line_runs, style,
+            font_name=font_name, font_size=font_size,
+        )
         ensure_merge_ref(root, f"{merge_start_column}{row_number}:I{row_number}")
         last_row = row_number
         row_number += 1
@@ -3372,6 +3390,10 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
 
     acceptance = brief.get("acceptance") if isinstance(brief.get("acceptance"), dict) else {}
     signature = brief.get("signature") if isinstance(brief.get("signature"), dict) else {}
+    optional_text_fonts = {
+        name: ooxml_style_text_font(parts, layout_styles[name])
+        for name in ("terms_heading", "terms_body")
+    }
     next_text_row = grand_row + 3
     last_optional_row = 0
     optional_text_moved = False
@@ -3400,6 +3422,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 text_column=1,
                 style=layout_styles["terms_heading"],
                 admission_height=heading_admission_height,
+                **optional_text_fonts["terms_heading"],
             )
             optional_text_moved = optional_text_moved or moved
         for index, runs in enumerate(payment_term_runs, start=1):
@@ -3412,6 +3435,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 style=layout_styles["terms_body"],
                 number=index,
                 number_style=layout_styles["terms_number"],
+                **optional_text_fonts["terms_body"],
             )
             optional_text_moved = optional_text_moved or moved
         if last_optional_row:
@@ -3441,6 +3465,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 text_column=1,
                 style=layout_styles["terms_heading"],
                 admission_height=heading_admission_height,
+                **optional_text_fonts["terms_heading"],
             )
             optional_text_moved = optional_text_moved or moved
         for index, runs in enumerate(standard_note_runs, start=1):
@@ -3453,6 +3478,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 style=layout_styles["terms_body"],
                 number=index,
                 number_style=layout_styles["terms_number"],
+                **optional_text_fonts["terms_body"],
             )
             optional_text_moved = optional_text_moved or moved
 
