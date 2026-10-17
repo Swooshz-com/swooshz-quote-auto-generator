@@ -3135,6 +3135,81 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             with self.subTest(row_count=row_count):
                 self._assert_optional_text_capacity_boundary("standard_notes", row_count)
 
+    def test_optional_text_pages_fit_the_saved_physical_print_height(self):
+        for entry_kind in ("payment_terms", "standard_notes"):
+            for row_count in (53, 54, 55, 56, 57, 106):
+                with self.subTest(entry_kind=entry_kind, row_count=row_count):
+                    brief, lines, _, _ = optional_text_capacity_case(entry_kind, row_count)
+                    with tempfile.TemporaryDirectory() as tmp:
+                        output = Path(tmp) / "quotation.xlsx"
+                        quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, output, brief, lines)
+                        with zipfile.ZipFile(output) as archive:
+                            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                    setup = sheet.find(f"{NS_MAIN}pageSetup")
+                    margins = sheet.find(f"{NS_MAIN}pageMargins")
+                    self.assertEqual(setup.attrib["paperSize"], "9")
+                    self.assertEqual(setup.attrib["orientation"], "portrait")
+                    # A4 height in points, less the saved top and bottom margins.
+                    printable_height = 297 / 25.4 * 72 - sum(
+                        float(margins.attrib[name]) * 72 for name in ("top", "bottom")
+                    )
+                    scale = float(setup.attrib["scale"]) / 100
+                    default_height = float(sheet.find(f"{NS_MAIN}sheetFormatPr").attrib["defaultRowHeight"])
+                    rows = {
+                        int(row.attrib["r"]): row
+                        for row in sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row")
+                    }
+                    breaks = row_break_ids(sheet)
+                    for page_start, page_end in zip(
+                        [break_id + 1 for break_id in breaks], breaks[1:]
+                    ):
+                        visible_height = sum(
+                            float(rows[row].attrib.get("ht", default_height))
+                            for row in range(page_start, page_end + 1)
+                            if rows[row].attrib.get("hidden") != "1"
+                        ) * scale
+                        self.assertLessEqual(visible_height, printable_height)
+                    for row_number, row in rows.items():
+                        if any(quote.ooxml_cell_has_payload(cell) for cell in row):
+                            self.assertNotEqual(row.attrib.get("hidden"), "1", row_number)
+
+    def test_continuation_guard_padding_keeps_values_formulas_and_occupied_merges(self):
+        cases = (
+            ("empty", {114, 115, 116}),
+            ("value", {116}),
+            ("zero", set()),
+            ("formula", set()),
+            ("vertical_merge", set()),
+        )
+        for kind, expected_hidden in cases:
+            with self.subTest(kind=kind):
+                sheet = ET.Element(f"{NS_MAIN}worksheet")
+                data = ET.SubElement(sheet, f"{NS_MAIN}sheetData")
+                for number in range(1, 134):
+                    ET.SubElement(data, f"{NS_MAIN}row", {
+                        "r": str(number), "ht": "17", "customHeight": "1",
+                    })
+                if kind == "value":
+                    quote.set_ooxml_cell(sheet, 115, 2, "Keep this text")
+                elif kind == "zero":
+                    quote.set_ooxml_cell(sheet, 116, 2, 0)
+                elif kind == "formula":
+                    row = next(row for row in data if row.attrib["r"] == "116")
+                    cell = ET.SubElement(row, f"{NS_MAIN}c", {"r": "B116", "t": "str"})
+                    ET.SubElement(cell, f"{NS_MAIN}f").text = 'IF(1=1,"",0)'
+                    ET.SubElement(cell, f"{NS_MAIN}v")
+                elif kind == "vertical_merge":
+                    quote.set_ooxml_cell(sheet, 113, 2, "Keep the complete merged area")
+                    quote.ensure_merge_ref(sheet, "B113:B116")
+                quote.hide_empty_continuation_guard_rows(sheet, 133)
+                rows = {int(row.attrib["r"]): row for row in data}
+                self.assertEqual(
+                    {number for number, row in rows.items() if row.attrib.get("hidden") == "1"},
+                    expected_hidden,
+                )
+                self.assertTrue(all(row.attrib["ht"] == "17" for row in rows.values()))
+                self.assertTrue(all(row.attrib["customHeight"] == "1" for row in rows.values()))
+
     def test_regular_carlito_font_name_accepts_exact_regular_aliases(self):
         for name in ("Carlito", "Carlito-Regular"):
             with self.subTest(name=name):

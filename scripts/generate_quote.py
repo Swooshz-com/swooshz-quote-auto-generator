@@ -3005,6 +3005,40 @@ def last_payload_row(root: ET.Element, max_row: int) -> int:
     return result
 
 
+def hide_empty_continuation_guard_rows(root: ET.Element, last_row: int) -> None:
+    """Keep reserved blank padding from forcing an automatic print page."""
+    sheet_data = root.find(f"{NS_MAIN}sheetData")
+    if sheet_data is None:
+        return
+    payload_cells = [
+        parse_cell_ref(cell.attrib["r"])
+        for cell in sheet_data.iter(f"{NS_MAIN}c")
+        if ooxml_cell_has_payload(cell)
+    ]
+    payload_rows = {row for row, _ in payload_cells}
+    occupied_merges = []
+    for merge in root.findall(f"{NS_MAIN}mergeCells/{NS_MAIN}mergeCell"):
+        start, end = merge.attrib["ref"].split(":")
+        first_row, first_col = parse_cell_ref(start)
+        final_row, final_col = parse_cell_ref(end)
+        if final_row > first_row and any(
+            first_row <= row <= final_row and first_col <= col <= final_col
+            for row, col in payload_cells
+        ):
+            occupied_merges.append((first_row, final_row))
+    rows = {int(row.attrib["r"]): row for row in sheet_data}
+    for page_end in manual_page_break_ids(last_row)[1:]:
+        for row_number in range(
+            page_end, page_end - OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS, -1
+        ):
+            if row_number in payload_rows or any(
+                start <= row_number <= end for start, end in occupied_merges
+            ):
+                break
+            if row_number in rows:
+                rows[row_number].attrib["hidden"] = "1"
+
+
 def printable_last_row(root: ET.Element, last_row: int, manual_pagination_enabled: bool) -> int:
     if not manual_pagination_enabled:
         return last_row
@@ -3445,6 +3479,8 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     last_print_row = printable_last_row(root, last_content_row, manual_pagination_enabled)
     trim_layout_worksheet(root, last_print_row)
     complete_quote_layout_worksheet(root, last_print_row, existing_row_numbers)
+    if manual_pagination_enabled and last_optional_row:
+        hide_empty_continuation_guard_rows(root, last_print_row)
     set_manual_page_breaks(root, last_print_row, manual_pagination_enabled)
     parts["xl/worksheets/sheet1.xml"] = serialize_excel_worksheet(root)
     if "xl/drawings/drawing1.xml" in parts:
