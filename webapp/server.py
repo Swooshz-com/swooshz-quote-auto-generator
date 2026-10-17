@@ -24011,6 +24011,101 @@ def line_items_aligned_to_quote_basis(
     return aligned if approved_only else (aligned or line_items)
 
 
+def line_items_with_confirmed_basis_selections(
+    payload: dict[str, Any],
+    line_items: list[dict[str, Any]],
+    auth_session: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Admit an explicit, uniquely identified selection for an unresolved row."""
+    raw_items = payload.get("line_items")
+    if not isinstance(raw_items, list):
+        return line_items
+    if not any(isinstance(item.get("pricing_authority"), dict)
+               and item["pricing_authority"].get("variant") == "none" for item in line_items):
+        return line_items
+    raw_sections = payload.get("quote_basis_sections")
+    if not isinstance(raw_sections, list) or not any(
+        isinstance(section, dict) and any(isinstance(line, dict)
+            and normalize_basis_tag(line.get("tag")) == "Include" and clean_text(line.get("pricing_keyword"))
+            for line in section.get("lines") or []) for section in raw_sections
+    ):
+        return line_items
+    authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
+    if not authority.get("ok") or pricing_reference_authority_error(payload, auth_session=auth_session):
+        return line_items
+    lookup = pricing_catalog_runtime_lookup_for_payload(
+        payload, profile_id_from_payload(payload), auth_session=auth_session,
+    )
+    sections = normalize_quote_basis_sections(
+        payload, pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
+    )
+    basis_lines = [line for section in sections for line in section.get("lines") or [] if isinstance(line, dict)]
+    result = []
+    for item in line_items:
+        source_id = safe_resource_id(item.get("source_basis_line_id"), "")
+        originals = [raw for raw in raw_items if isinstance(raw, dict) and source_id
+                     and safe_resource_id(raw.get("source_basis_line_id"), "") == source_id]
+        selected = [line for line in basis_lines if source_id
+                    and source_id in {safe_resource_id(line.get("id"), ""), safe_resource_id(line.get("source_line_item_id"), "")}]
+        current = item.get("pricing_authority") or {}
+        if len(originals) != 1 or len(selected) != 1 or current.get("variant") != "none":
+            result.append(item)
+            continue
+        original, line = originals[0], selected[0]
+        # Persisted prices, changed catalogue selectors and invalid authorities are not a new selection.
+        if clean_text(original.get("pricing_keyword")) or normalize_basis_tag(line.get("tag")) != "Include" or line.get("custom_pricing"):
+            result.append(item)
+            continue
+        supplied = original.get("pricing_authority")
+        if supplied is not None and (not isinstance(supplied, dict) or supplied.get("variant") != "none"
+                                    or normalize_pricing_authority(supplied, original) is None):
+            result.append(item)
+            continue
+        keyword = clean_text(line.get("pricing_keyword"))
+        catalog_item = lookup.get(keyword)
+        quantity = parse_float_or_none(item.get("quantity"))
+        selected_quantity = parse_float_or_none(line.get("quantity"))
+        unit = normalize_pricing_unit(item.get("unit"))
+        if (not catalog_item or clean_text(catalog_item.get("id")) != keyword
+                or quantity is None or quantity <= 0 or selected_quantity != quantity
+                or parse_float_or_none(original.get("quantity")) != selected_quantity
+                or not unit or normalize_pricing_unit(line.get("unit")) != unit
+                or normalize_pricing_unit(catalog_item_unit_hint(catalog_item)) != unit
+                or any(catalog_line_contradicts_item(text, catalog_item, catalog_items=list(lookup.values()))
+                       for text in (original.get("description"), line.get("text")) if clean_text(text))):
+            result.append(item)
+            continue
+        price = pricing_reference_sale_unit_price(catalog_item)
+        if price is None:
+            result.append(item)
+            continue
+        next_item = dict(item)
+        next_item.update({
+            "section": normalize_catalog_section(catalog_item.get("section")),
+            "description": clean_customer_quote_line_text(catalog_item.get("description")),
+            "pricing_keyword": keyword, "catalog_description": clean_customer_quote_line_text(catalog_item.get("description")),
+            "pricing_reference_description": clean_text(catalog_item.get("description")),
+            "status": "matched", "price_mode": "Priced", "catalog_unit_price": price,
+            "effective_unit_price": price, "unit_price_override": price,
+        })
+        source, reference_id, digest, currency = pricing_authority_reference_identity(authority)
+        next_item.update(pricing_reference_source=source, pricing_reference_id=reference_id,
+                         pricing_basis_digest=digest, pricing_basis_currency=currency)
+        next_item["pricing_authority"] = build_pricing_authority(
+            "catalog", next_item, price=price, reference_authority=authority, catalog_item=catalog_item,
+        )
+        next_item["pricing_basis_amount"] = round_commercial_cents(quantity * price)
+        next_item["approved_quote_amount"] = round_commercial_cents(
+            next_item["pricing_basis_amount"] * (quote_exchange_rate_from_payload(payload) or 1),
+        )
+        for key in ("category_order", "item_order"):
+            value = pricing_reference_order_number(catalog_item.get(key))
+            if value is not None:
+                next_item[key] = value
+        result.append(next_item)
+    return result
+
+
 def normalize_line_items_for_quote_basis_review(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
@@ -24022,6 +24117,7 @@ def normalize_line_items_for_quote_basis_review(
         return []
     if commercial_state.get("owned"):
         line_items = normalize_line_items(payload, auth_session=auth_session)
+        line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
     trusted_input_authorities: dict[str, dict[str, Any]] = {}
     trusted_input_items = normalize_line_items(payload, auth_session=auth_session)
@@ -24064,6 +24160,7 @@ def normalize_line_items_for_quote_basis_review(
         provider_result=True,
         exchange_rate=quote_exchange_rate_from_payload(payload),
     )
+    line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session)
     return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
 

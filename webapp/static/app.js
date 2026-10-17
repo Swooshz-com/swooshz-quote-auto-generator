@@ -257,6 +257,8 @@ const state = {
   quoteSessionRestoreError: "",
   quoteSessionRestoreBusy: false,
   quoteSessionDraftSaveStarted: false,
+  customerStepCheckpoint: null,
+  customerStepCheckpointSaveBusy: false,
   quoteSessionRestoredSessionId: "",
   quoteSessionRestoredDraftKey: "",
   quoteCommercialLifecycle: "NEW_UNINITIALISED",
@@ -4003,7 +4005,7 @@ function applyWorkspaceViewState(saved = {}, options = {}) {
   const quoteRestored = options.quoteRestored === true;
   state.activeAppView = saved.activeAppView === "quote" && quoteRestored ? "quote" : "dashboard";
   if (state.activeAppView === "quote" && SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)) {
-    setSidePanel(saved.activeSidePanel, { force: true });
+    setSidePanel(checkpointGatedSidePanel(saved.activeSidePanel), { force: true });
   }
   const overlay = normalizeRestorableOverlay(saved.restorableOverlay);
   state.restorableOverlay = quoteRestored || overlay === "pricing_reference_settings" ? overlay : "";
@@ -4304,6 +4306,7 @@ function buildSessionSnapshot() {
     quoteSessionId: state.quoteSessionId,
     generationContext: currentGenerationContext(),
     quoteSessionDraftSaveStarted: state.quoteSessionDraftSaveStarted,
+    customerStepCheckpoint: state.customerStepCheckpoint,
     quoteSessionRestoredSessionId: state.quoteSessionRestoredSessionId,
     quoteSessionRestoredDraftKey: state.quoteSessionRestoredDraftKey,
     quoteCommercialLifecycle: state.quoteCommercialLifecycle,
@@ -4543,10 +4546,11 @@ function furthestQuoteSessionSidePanel(saved = {}) {
 }
 
 function restoredQuoteSessionSidePanel(saved = {}, options = {}) {
-  if (options.restoreFurthestPanel === true) return furthestQuoteSessionSidePanel(saved);
-  return SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)
+  const panel = options.restoreFurthestPanel === true ? furthestQuoteSessionSidePanel(saved)
+    : SIDE_PANEL_SEQUENCE.includes(saved.activeSidePanel)
     ? saved.activeSidePanel
     : furthestQuoteSessionSidePanel(saved);
+  return checkpointGatedSidePanel(panel);
 }
 
 function quoteCommercialStrictDataEqual(left, right, depth = 0) {
@@ -4781,6 +4785,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   const savedRunMatchesSession = safeQuoteSessionId(savedGenerationContext.session_id || "") === targetSessionId;
   transitionGenerationContext(targetSessionId, savedRunMatchesSession ? savedGenerationContext.run_id : "");
   state.quoteSessionDraftSaveStarted = Boolean(restoredState.quoteSessionDraftSaveStarted || options.sessionId);
+  state.customerStepCheckpoint = isPlainObject(restoredState.customerStepCheckpoint)
+    ? { ...restoredState.customerStepCheckpoint } : null;
   const restoredSessionId = safeQuoteSessionId(restoredState.quoteSessionRestoredSessionId || "");
   state.quoteSessionRestoredSessionId = restoredSessionId && restoredSessionId === state.quoteSessionId ? restoredSessionId : "";
   state.quoteSessionRestoredDraftKey = state.quoteSessionRestoredSessionId ? String(restoredState.quoteSessionRestoredDraftKey || "") : "";
@@ -5938,6 +5944,7 @@ function resetCurrentQuoteDraftState() {
   clearQuoteSessionDraftSaveTimer();
   transitionGenerationContext("", "");
   state.quoteSessionDraftSaveStarted = false;
+  state.customerStepCheckpoint = null;
   clearRestoredQuoteSessionBaseline();
   state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
   state.quoteCommercialSnapshot = null;
@@ -8889,6 +8896,10 @@ async function confirmQuoteDependencyChange() {
     return;
   }
   const targetPanel = originPanel === "images" ? "customer" : "quote_company";
+  if (originPanel === "customer") {
+    await advanceCustomerStep();
+    return;
+  }
   const moved = setSidePanel(targetPanel, { notify: true });
   if (!moved) updateSidePanelNav();
   if (generatedStateCleared || moved) {
@@ -13319,6 +13330,7 @@ function currentQuoteSessionDraftState() {
     savedAt: snapshot.savedAt,
     activeAppView: "quote",
     quoteSessionDraftSaveStarted: snapshot.quoteSessionDraftSaveStarted,
+    customerStepCheckpoint: snapshot.customerStepCheckpoint,
     profileId: snapshot.profileId,
     pricingReferenceId: snapshot.pricingReferenceId,
     pricingReferenceSource: snapshot.pricingReferenceSource,
@@ -13578,18 +13590,32 @@ async function saveQuoteSessionDraftState(options = {}) {
   if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
   saveSessionState();
-  const draftState = options.draftState || currentQuoteSessionDraftState();
-  const draftFiles = Array.isArray(options.draftFiles)
+  // Caller snapshots stay immutable while an earlier save is pending.
+  let draftState = JSON.parse(JSON.stringify(options.draftState || currentQuoteSessionDraftState()));
+  let draftFiles = JSON.parse(JSON.stringify(Array.isArray(options.draftFiles)
     ? options.draftFiles
-    : sessionFileRecordsFromDraft();
-  const draftKey = quoteSessionDraftComparisonKey(draftState);
-  const draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
+    : sessionFileRecordsFromDraft()));
+  let draftKey = quoteSessionDraftComparisonKey(draftState);
+  let draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
   const priorSave = quoteSessionDraftSavePromise;
   const queuedSessionId = ensureClientQuoteSessionId();
   const savePromise = (async () => {
-    if (priorSave) await priorSave.catch(() => null);
+    if (priorSave) {
+      await priorSave.catch(() => null);
+      // Let the acknowledged caller apply its checkpoint before an ordinary
+      // queued save captures the current draft. No waiter depends on this save.
+      await Promise.resolve();
+    }
     const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
     if (currentSessionId !== queuedSessionId) return null;
+    if (priorSave && !options.draftState) {
+      draftState = JSON.parse(JSON.stringify(currentQuoteSessionDraftState()));
+      if (!Array.isArray(options.draftFiles)) {
+        draftFiles = JSON.parse(JSON.stringify(sessionFileRecordsFromDraft()));
+      }
+      draftKey = quoteSessionDraftComparisonKey(draftState);
+      draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
+    }
     if (quoteSessionDraftIsConfirmed(currentSessionId, draftKey, draftFileKey)) {
       return { session_id: currentSessionId };
     }
@@ -16172,9 +16198,98 @@ function isSensitiveChatRequest(normalizedText) {
   ].some((term) => normalizedText.includes(term));
 }
 
+function customerStepCheckpointForCurrent() {
+  const reference = currentPricingReference();
+  const sessionId = safeQuoteSessionId(state.quoteSessionId);
+  const recoveryScope = currentBrowserRecoveryScope();
+  const digest = String(reference?.digest_sha256 || "");
+  if (!sessionId || !recoveryScope || !reference || !PRICING_REFERENCE_DIGEST_RE.test(digest)
+    || customerDetailsBlockReason() || quoteCommercialReviewRequired()) return null;
+  const details = collectQuoteDetails();
+  return {
+    version: 1,
+    sessionId,
+    recoveryScope,
+    pricingReferenceId: state.pricingReferenceId,
+    pricingReferenceSource: state.pricingReferenceSource,
+    pricingReferenceDigest: digest,
+    customer: {
+      client: details.client,
+      project: details.project,
+      quote_date: details.quote_date,
+      project_number: details.project_number,
+    },
+  };
+}
+
+function customerStepCheckpointIsCurrent() {
+  const checkpoint = state.customerStepCheckpoint;
+  const current = customerStepCheckpointForCurrent();
+  return Boolean(!state.customerStepCheckpointSaveBusy
+    && !pendingPricingReferenceSelectionChanged()
+    && isPlainObject(checkpoint) && current
+    && quoteCommercialStrictDataEqual(checkpoint, current));
+}
+
+function customerNextBlockReason() {
+  if (!hasReferenceFilesForNavigation()) return "Add reference files before opening this step.";
+  if (!pendingPricingReference() && !currentPricingReference()) return MISSING_PRICING_REFERENCES_MESSAGE;
+  return customerDetailsBlockReason();
+}
+
+function checkpointGatedSidePanel(panelName) {
+  return SIDE_PANEL_SEQUENCE.indexOf(panelName) >= SIDE_PANEL_SEQUENCE.indexOf("quote_company")
+    && !customerStepCheckpointIsCurrent() ? "customer" : panelName;
+}
+
+async function advanceCustomerStep() {
+  if (state.customerStepCheckpointSaveBusy) return false;
+  ensureClientQuoteSessionId();
+  const checkpoint = customerStepCheckpointForCurrent();
+  if (!checkpoint || !hasReferenceFilesForNavigation()) return false;
+  if (!state.quoteSessionDraftSaveStarted) markQuoteSessionDraftSaveStartedAfterCustomerStep();
+  const draftState = currentQuoteSessionDraftState();
+  draftState.customerStepCheckpoint = checkpoint;
+  draftState.activeSidePanel = "quote_company";
+  const saveFailure = {};
+  state.customerStepCheckpointSaveBusy = true;
+  updateSidePanelNav();
+  try {
+    const saved = await saveQuoteSessionDraftState({
+      quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length),
+      draftState,
+      saveFailure,
+    });
+    if (!saved || safeQuoteSessionId(saved.session_id) !== checkpoint.sessionId) {
+      if (saveFailure.failure) {
+        renderMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)], "warn");
+      }
+      return false;
+    }
+    // An acknowledgement for old Customer inputs must not unlock their replacement.
+    if (!quoteCommercialStrictDataEqual(checkpoint, customerStepCheckpointForCurrent())
+      || pendingPricingReferenceSelectionChanged()) return false;
+    state.customerStepCheckpoint = checkpoint;
+  } finally {
+    state.customerStepCheckpointSaveBusy = false;
+    updateSidePanelNav();
+  }
+  const moved = setSidePanel("quote_company", { notify: true });
+  saveSessionState();
+  return moved;
+}
+
 function sidePanelBlockReason(panelName) {
   if (panelName === "images") return "";
   if (!hasReferenceFilesForNavigation()) return "Add reference files before opening this step.";
+  if (["quote_company", "basis", "output"].includes(panelName)
+    && !customerStepCheckpointIsCurrent()) {
+    if (panelName === "quote_company") {
+      const reason = customerDetailsBlockReason("Complete Customer details before opening Quote Company");
+      if (reason) return reason;
+    }
+    return "Click Next in Customer to save this step before continuing.";
+  }
   if (quoteOutputProgressForNavigation()) return "";
   if (panelName === "quote_company") {
     return customerDetailsBlockReason("Complete Customer details before opening Quote Company");
@@ -16262,7 +16377,7 @@ function updateSidePanelNav() {
   const isQuoteCompanyStep = state.activeSidePanel === "quote_company";
   const isBasisStep = state.activeSidePanel === "basis";
   const isOutputStep = state.activeSidePanel === "output";
-  const busy = appIsBusy();
+  const busy = appIsBusy() || state.customerStepCheckpointSaveBusy;
   elements.resetImagesButton.hidden = state.activeSidePanel !== "images";
   elements.clearCustomerButton.hidden = state.activeSidePanel !== "customer";
   elements.clearQuoteCompanyButton.hidden = state.activeSidePanel !== "quote_company";
@@ -16320,6 +16435,8 @@ function updateSidePanelNav() {
     nextBlockReason = startAnalysisBlockReason();
   } else if (isBasisStep) {
     nextBlockReason = basisBlockReason;
+  } else if (state.activeSidePanel === "customer") {
+    nextBlockReason = customerNextBlockReason();
   } else {
     nextBlockReason = sidePanelBlockReason(nextPanel);
   }
@@ -16368,7 +16485,11 @@ async function goToNextSidePanel(options = {}) {
     return;
   }
   if (state.activeSidePanel === "output") return;
-  if (state.activeSidePanel === "customer") applyPendingPricingReferenceSelection();
+  if (state.activeSidePanel === "customer") {
+    applyPendingPricingReferenceSelection();
+    await advanceCustomerStep();
+    return;
+  }
   const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
   const moved = setSidePanel(nextPanel, { notify: true });
   if (moved && nextPanel === "customer") {

@@ -128,7 +128,8 @@ TOTAL_BLOCK_HEIGHT = 3
 SIGNATURE_CONTENT_HEIGHT = 8
 SIGNATURE_BLOCK_PAGE_GUARD_ROWS = 0
 SIGNATURE_BLOCK_HEIGHT = SIGNATURE_CONTENT_HEIGHT + SIGNATURE_BLOCK_PAGE_GUARD_ROWS
-OPTIONAL_TEXT_LINE_MAX_WIDTH_EM = 64
+# The visible B:I body columns span 123.875 width units; allow padding and rich emphasis.
+OPTIONAL_TEXT_LINE_MAX_WIDTH_EM = 104
 # LibreOffice advances past three bottom rows before the declared continuation break.
 OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS = 3
 QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT = "18.7"
@@ -1226,6 +1227,35 @@ def brief_rich_text_lines(
     return parsed if parsed else plain_rich_text_lines(fallback_lines, bold=fallback_bold)
 
 
+def brief_rich_text_items(
+    brief: dict[str, Any], key: str, fallback_items: list[Any],
+) -> list[list[RichTextRun]]:
+    """Keep explicit lines within their supplied numbered item, without truncating rich text."""
+    rich_text = brief.get("rich_text") if isinstance(brief.get("rich_text"), dict) else {}
+    parsed = parse_rich_text_html(rich_text.get(key))
+    if not parsed:
+        return plain_rich_text_lines(fallback_items)
+    grouped: list[list[RichTextRun]] = []
+    cursor = 0
+    for item in fallback_items:
+        parts = str(item).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        lines = parsed[cursor:cursor + len(parts)]
+        if len(lines) != len(parts) or any(
+            clean_text("".join(run.text for run in runs)) != clean_text(text)
+            for runs, text in zip(lines, parts)
+        ):
+            # Rich text remains authoritative; preserve every parsed line if grouping cannot be proved.
+            return parsed
+        runs: list[RichTextRun] = []
+        for index, line in enumerate(lines):
+            if index:
+                runs.append(RichTextRun("\n"))
+            runs.extend(line)
+        grouped.append(runs)
+        cursor += len(parts)
+    return grouped + parsed[cursor:]
+
+
 def brief_rich_text_cell_runs(
     brief: dict[str, Any],
     key: str,
@@ -1991,6 +2021,19 @@ def add_quote_layout_styles(parts: dict[str, bytes]) -> dict[str, str]:
     }
     parts["xl/styles.xml"] = serialize_excel_styles(styles_root)
     return style_ids
+
+
+def ooxml_style_text_font(parts: dict[str, bytes], style: str) -> dict[str, str | None]:
+    """Make rich runs use the selected cell font across spreadsheet readers."""
+    styles = ET.fromstring(parts["xl/styles.xml"])
+    cell_style = styles.find(f"{NS_MAIN}cellXfs")[int(style)]
+    font = styles.find(f"{NS_MAIN}fonts")[int(cell_style.attrib.get("fontId", "0"))]
+    name = font.find(f"{NS_MAIN}name")
+    size = font.find(f"{NS_MAIN}sz")
+    return {
+        "font_name": name.attrib["val"] if name is not None else None,
+        "font_size": size.attrib["val"] if size is not None else None,
+    }
 
 
 def update_drawing_project_number(xml: bytes, project_number: str) -> bytes:
@@ -2914,6 +2957,8 @@ def write_optional_text_block(
     number: int | None = None,
     number_style: str | None = None,
     admission_height: int | None = None,
+    font_name: str | None = None,
+    font_size: str | None = None,
 ) -> tuple[int, int, bool]:
     lines = wrap_rich_text_runs(runs)
     if not lines:
@@ -2934,7 +2979,10 @@ def write_optional_text_block(
         moved = moved or line_moved
         if number is not None and line_index == 0:
             set_ooxml_cell(root, row_number, 1, f"{number:.2f}", number_style)
-        set_ooxml_rich_text_cell(root, row_number, text_column, line_runs, style)
+        set_ooxml_rich_text_cell(
+            root, row_number, text_column, line_runs, style,
+            font_name=font_name, font_size=font_size,
+        )
         ensure_merge_ref(root, f"{merge_start_column}{row_number}:I{row_number}")
         last_row = row_number
         row_number += 1
@@ -2973,6 +3021,40 @@ def last_payload_row(root: ET.Element, max_row: int) -> int:
         if row_number <= max_row:
             result = max(result, row_number)
     return result
+
+
+def hide_empty_continuation_guard_rows(root: ET.Element, last_row: int) -> None:
+    """Keep reserved blank padding from forcing an automatic print page."""
+    sheet_data = root.find(f"{NS_MAIN}sheetData")
+    if sheet_data is None:
+        return
+    payload_cells = [
+        parse_cell_ref(cell.attrib["r"])
+        for cell in sheet_data.iter(f"{NS_MAIN}c")
+        if ooxml_cell_has_payload(cell)
+    ]
+    payload_rows = {row for row, _ in payload_cells}
+    occupied_merges = []
+    for merge in root.findall(f"{NS_MAIN}mergeCells/{NS_MAIN}mergeCell"):
+        start, end = merge.attrib["ref"].split(":")
+        first_row, first_col = parse_cell_ref(start)
+        final_row, final_col = parse_cell_ref(end)
+        if final_row > first_row and any(
+            first_row <= row <= final_row and first_col <= col <= final_col
+            for row, col in payload_cells
+        ):
+            occupied_merges.append((first_row, final_row))
+    rows = {int(row.attrib["r"]): row for row in sheet_data}
+    for page_end in manual_page_break_ids(last_row)[1:]:
+        for row_number in range(
+            page_end, page_end - OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS, -1
+        ):
+            if row_number in payload_rows or any(
+                start <= row_number <= end for start, end in occupied_merges
+            ):
+                break
+            if row_number in rows:
+                rows[row_number].attrib["hidden"] = "1"
 
 
 def printable_last_row(root: ET.Element, last_row: int, manual_pagination_enabled: bool) -> int:
@@ -3308,17 +3390,21 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
 
     acceptance = brief.get("acceptance") if isinstance(brief.get("acceptance"), dict) else {}
     signature = brief.get("signature") if isinstance(brief.get("signature"), dict) else {}
+    optional_text_fonts = {
+        name: ooxml_style_text_font(parts, layout_styles[name])
+        for name in ("terms_heading", "terms_body")
+    }
     next_text_row = grand_row + 3
     last_optional_row = 0
     optional_text_moved = False
 
     terms_heading = clean_text(brief.get("terms_heading"))
     payment_terms = brief.get("payment_terms") or []
-    payment_term_runs = brief_rich_text_lines(brief, "paymentTerms", payment_terms)
-    if terms_heading or payment_terms:
+    payment_term_runs = brief_rich_text_items(brief, "paymentTerms", payment_terms)
+    if terms_heading or payment_term_runs:
         heading_runs = brief_rich_text_cell_runs(brief, "termsHeading", terms_heading)
         heading_admission_height = len(wrap_rich_text_runs(heading_runs))
-        if terms_heading and payment_terms:
+        if terms_heading and payment_term_runs:
             first_term_runs = (
                 payment_term_runs[0]
                 if payment_term_runs
@@ -3336,10 +3422,10 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 text_column=1,
                 style=layout_styles["terms_heading"],
                 admission_height=heading_admission_height,
+                **optional_text_fonts["terms_heading"],
             )
             optional_text_moved = optional_text_moved or moved
-        for index, term in enumerate(payment_terms, start=1):
-            runs = payment_term_runs[index - 1] if index - 1 < len(payment_term_runs) else [RichTextRun(clean_text(term))]
+        for index, runs in enumerate(payment_term_runs, start=1):
             next_text_row, last_optional_row, moved = write_optional_text_block(
                 root,
                 next_text_row,
@@ -3349,6 +3435,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 style=layout_styles["terms_body"],
                 number=index,
                 number_style=layout_styles["terms_number"],
+                **optional_text_fonts["terms_body"],
             )
             optional_text_moved = optional_text_moved or moved
         if last_optional_row:
@@ -3356,11 +3443,11 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
 
     notes_heading = clean_text(brief.get("notes_heading"))
     standard_notes = brief.get("standard_notes") or []
-    standard_note_runs = brief_rich_text_lines(brief, "standardNotes", standard_notes)
-    if notes_heading or standard_notes:
+    standard_note_runs = brief_rich_text_items(brief, "standardNotes", standard_notes)
+    if notes_heading or standard_note_runs:
         heading_runs = brief_rich_text_cell_runs(brief, "notesHeading", notes_heading)
         heading_admission_height = len(wrap_rich_text_runs(heading_runs))
-        if notes_heading and standard_notes:
+        if notes_heading and standard_note_runs:
             first_note_runs = (
                 standard_note_runs[0]
                 if standard_note_runs
@@ -3378,10 +3465,10 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 text_column=1,
                 style=layout_styles["terms_heading"],
                 admission_height=heading_admission_height,
+                **optional_text_fonts["terms_heading"],
             )
             optional_text_moved = optional_text_moved or moved
-        for index, note in enumerate(standard_notes, start=1):
-            runs = standard_note_runs[index - 1] if index - 1 < len(standard_note_runs) else [RichTextRun(clean_text(note))]
+        for index, runs in enumerate(standard_note_runs, start=1):
             next_text_row, last_optional_row, moved = write_optional_text_block(
                 root,
                 next_text_row,
@@ -3391,6 +3478,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
                 style=layout_styles["terms_body"],
                 number=index,
                 number_style=layout_styles["terms_number"],
+                **optional_text_fonts["terms_body"],
             )
             optional_text_moved = optional_text_moved or moved
 
@@ -3417,6 +3505,8 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     last_print_row = printable_last_row(root, last_content_row, manual_pagination_enabled)
     trim_layout_worksheet(root, last_print_row)
     complete_quote_layout_worksheet(root, last_print_row, existing_row_numbers)
+    if manual_pagination_enabled and last_optional_row:
+        hide_empty_continuation_guard_rows(root, last_print_row)
     set_manual_page_breaks(root, last_print_row, manual_pagination_enabled)
     parts["xl/worksheets/sheet1.xml"] = serialize_excel_worksheet(root)
     if "xl/drawings/drawing1.xml" in parts:

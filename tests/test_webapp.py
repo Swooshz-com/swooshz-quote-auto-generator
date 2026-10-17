@@ -20580,6 +20580,10 @@ const elements = {
   dateLabel: field("Date"),
 };
 
+// This component checks existing detail blockers after a verified saved checkpoint.
+let checkpointVerified = true;
+function customerStepCheckpointIsCurrent() { return checkpointVerified; }
+
 eval([
   "normalizeTextNewlines",
   "splitLines",
@@ -20677,6 +20681,9 @@ elements.acceptanceText.value = "Accepted by customer";
 assert.strictEqual(startAnalysisBlockReason(), "");
 assert.strictEqual(sidePanelBlockReason("quote_company"), "");
 assert.strictEqual(canStartAnalysis(), true);
+checkpointVerified = false;
+assert.ok(sidePanelBlockReason("quote_company").includes("Click Next in Customer"));
+checkpointVerified = true;
 state.workflowStage = "pricing_review";
 state.outputRows = [{ description: "Restored output row", quantity: 1 }];
 state.quoteBasisSections = [];
@@ -23540,6 +23547,7 @@ function currentGenerator() { return { analyzeLabel: "Start Analysis" }; }
 function sidePanelBlockReason(panelName) { return panelName === "quote_company" && !currentPricingReference() ? "Complete Customer details before opening Quote Company: Quote Pricing Reference." : ""; }
 function basisConfirmBlockReason() { return ""; }
 function startAnalysisBlockReason() { return ""; }
+function customerDetailsBlockReason() { return ""; }
 function updateDownloadButton() {}
 function activeSidePanelIndex() { return Math.max(0, SIDE_PANEL_SEQUENCE.indexOf(state.activeSidePanel)); }
 function hasReferenceFilesForNavigation() { return state.images.some((image) => image?.data_url || image?.session_file_key || image?.name); }
@@ -23571,6 +23579,11 @@ eval([
   "quoteCommercialSnapshotPricingBasis",
   "renderProfileOptions",
   "updateSidePanelNav",
+  "customerNextBlockReason",
+  "pendingPricingReference",
+  "pendingPricingReferenceSelection",
+  "pricingReferenceFromSelectionValue",
+  "isPlainObject",
 ].map(extractFunction).join("\n"));
 
 renderProfileOptions();
@@ -24687,9 +24700,12 @@ function extractFunction(name) {
 }
 
 const SIDE_PANEL_SEQUENCE = ["images", "customer", "quote_company", "basis", "output"];
+let checkpointValid = true;
+function customerStepCheckpointIsCurrent() { return checkpointValid; }
 eval([
   "furthestQuoteSessionSidePanel",
   "restoredQuoteSessionSidePanel",
+  "checkpointGatedSidePanel",
 ].map(extractFunction).join("\n"));
 
 const completedQuoteViewedFromCustomer = {
@@ -24703,6 +24719,9 @@ assert.strictEqual(
   "output",
 );
 assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "quote_company");
+checkpointValid = false;
+assert.strictEqual(restoredQuoteSessionSidePanel({ activeSidePanel: "quote_company" }), "customer");
+assert.strictEqual(restoredQuoteSessionSidePanel(completedQuoteViewedFromCustomer, { restoreFurthestPanel: true }), "customer");
 
 const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
 const state = { dashboardOperation: null, quoteSessions: [], dashboardActiveSessionId: "" };
@@ -28474,7 +28493,7 @@ assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReferenc
         self.assertIn("quoteCommercialTouched: snapshot.quoteCommercialTouched", draft_state_body)
         self.assertIn("quoteDetailsCommercialTouched(savedQuoteDetails)", restore_body)
 
-    def run_sqag212_production_save_chain(self, scenario):
+    def run_sqag212_production_save_chain(self, scenario, *, expected_failure=None):
         # Only transport, DOM effects and synthetic snapshot inputs are mocked.
         # The save/queue/confirmation/postJson/adopter/start consumers are source-extracted.
         script = r"""
@@ -28823,7 +28842,22 @@ const refreshAdapters = scenario.realRefresh || ["excel", "dashboard-failure"].i
 const boundaryAdapters = (scenario.kind === "excel" ? "" : "const quoteSessionHasFreshOutputExports = syntheticQuoteSessionHasFreshOutputExports; const revisionNumber = syntheticRevisionNumber;")
   + (scenario.kind === "dashboard-failure" ? "" : "const appIsBusy = syntheticAppIsBusy; const showDashboard = syntheticShowDashboard; const setDashboardLoadingState = syntheticSetDashboardLoadingState;");
 const program = constantSource + "\n" + adapterSource + "\n" + refreshAdapters + "\n" + boundaryAdapters + "\n"
-  + (scenario.path === "duplicate" ? duplicateLoaderSource + "\n" : "") + required.map(extractFunction).join("\n");
+  + (scenario.path === "duplicate" ? duplicateLoaderSource + "\n" : "") + required.map(name => {
+    let fn = extractFunction(name);
+    // Deliberate in-memory negative controls; production source is never changed.
+    if (name === "returnToDashboard" && ["bypass", "premature"].includes(scenario.queueFault)) {
+      const marker = "const saved = await saveQuoteSessionDraftState({";
+      assert(fn.includes(marker));
+      fn = fn.replace(marker, scenario.queueFault === "bypass"
+        ? "const saved = await saveCurrentQuoteSession({ includeDraftState: true, includeDraftFiles: true,"
+        : "const saved = saveQuoteSessionDraftState({");
+    }
+    if (name === "saveQuoteSessionDraftState" && scenario.queueFault === "stale") {
+      const marker = "if (priorSave && !options.draftState)";
+      assert(fn.includes(marker)); fn = fn.replace(marker, "if (false)");
+    }
+    return fn;
+  }).join("\n");
 eval(program + String.raw`
 assert.strictEqual(normalizeActiveJob(null), null, "Missing active job must remain null");
 assert.strictEqual(normalizeActiveJob({}), null, "Empty active job must not acquire authority");
@@ -28913,16 +28947,36 @@ async function act() {
   } else if (scenario.kind === "dashboard-order") {
     const a = saveQuoteSessionDraftState(); await tick();
     version = 2; if (scenario.changedFiles) fileVersion = 2;
-    const b = saveQuoteSessionDraftState(); await tick();
+    const b = saveQuoteSessionDraftState(scenario.explicitSnapshot ? {
+      draftState: currentQuoteSessionDraftState(), draftFiles: sessionFileRecordsFromDraft(),
+    } : {}); await tick();
     version = 3; if (scenario.changedFiles) fileVersion = 3;
     const c = returnToDashboard(); await tick();
-    // A correct implementation waits behind A/B. The failing one sends C immediately.
+    // Dashboard waits for the real queue; ordinary queued saves capture the latest
+    // draft when they run, while explicitly supplied snapshots remain immutable.
     const overtook = calls.filter(call => call.url === "/api/quote-sessions").length > 1;
-    if (overtook) { responseReleases[1](); await settle(c); }
+    assert.strictEqual(overtook, false, "Dashboard save bypassed pending queue");
+    assert.strictEqual(dashboardShown, false, "Dashboard shown before latest save acknowledgement");
     responseReleases[0](); await settle(a); await tick();
-    const next = overtook ? 2 : 1;
-    responseReleases[next](); await settle(b); await tick();
-    if (!overtook) { responseReleases[2](); await settle(c); }
+    const posts = () => calls.filter(call => call.url === "/api/quote-sessions");
+    assert.strictEqual(posts().length, 2);
+    assert.strictEqual(posts()[1].payload.draft_state.version, scenario.explicitSnapshot ? 2 : 3,
+      "Queued save did not capture the latest draft");
+    if (scenario.changedFiles) assert.strictEqual(posts()[1].payload.draft_files[0].size,
+      scenario.explicitSnapshot ? 2 : 3, "Queued save lost its file snapshot");
+    assert.strictEqual(dashboardShown, false, "Dashboard shown before latest save acknowledgement");
+    assert.strictEqual(quoteSessionDraftIsConfirmed(state.quoteSessionId,
+      quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()), false);
+    responseReleases[1](); await settle(b); await tick();
+    if (scenario.explicitSnapshot) {
+      assert.strictEqual(posts().length, 3);
+      assert.strictEqual(posts()[2].payload.draft_state.version, 3);
+      assert.strictEqual(dashboardShown, false, "Dashboard shown before latest save acknowledgement");
+      responseReleases[2]();
+    }
+    await settle(c); await tick();
+    assert.strictEqual(posts().length, scenario.explicitSnapshot ? 3 : 2,
+      "Acknowledged current draft was saved again");
     assert.strictEqual(persisted.draft_state.version, 3, "Older queued save overwrote Dashboard draft");
     if (scenario.changedFiles) assert.strictEqual(persisted.draft_files[0].size, 3, "Latest acknowledged file overwritten");
     assert(dashboardShown);
@@ -29169,9 +29223,16 @@ async function act() {
 `);
 """
         completed = subprocess.run(
-            [require_node(self), "-e", script, json.dumps(scenario)],
-            cwd=str(ROOT), text=True, capture_output=True, check=False, timeout=15,
+            # Stdin avoids the Windows command-line size limit for this full
+            # production-boundary harness, preserving the same scenario argv.
+            [require_node(self), "-e", "eval(require('fs').readFileSync(0, 'utf8'))", json.dumps(scenario)],
+            input=script, cwd=str(ROOT), text=True, capture_output=True, check=False, timeout=15,
         )
+        if expected_failure is not None:
+            self.assertNotEqual(completed.returncode, 0, "Negative control unexpectedly passed")
+            self.assertIn(expected_failure, completed.stderr)
+            self.assertNotIn("TypeError", completed.stderr)
+            return
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
         print(completed.stdout.strip())
 
@@ -29282,6 +29343,21 @@ async function act() {
         for changed in (False, True):
             with self.subTest(changedFiles=changed):
                 self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200, "changedFiles": changed})
+
+    def test_sqag212_dashboard_queue_retains_explicit_snapshots(self):
+        for changed in (False, True):
+            with self.subTest(changedFiles=changed):
+                self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200,
+                    "changedFiles": changed, "explicitSnapshot": True})
+
+    def test_sqag212_dashboard_queue_oracle_rejects_regressions(self):
+        for fault, failure in (("bypass", "Dashboard save bypassed pending queue"),
+                               ("premature", "Dashboard shown before latest save acknowledgement"),
+                               ("stale", "Queued save did not capture the latest draft")):
+            for changed in (False, True):
+                with self.subTest(queueFault=fault, changedFiles=changed):
+                    self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200,
+                        "changedFiles": changed, "queueFault": fault}, expected_failure=failure)
 
     def test_sqag212_empty_origin_queued_save_cannot_write_replacement(self):
         self.run_sqag212_production_save_chain({"kind": "empty-context", "status": 200, "gated": True})
@@ -33693,7 +33769,17 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                     webapp.PRICING_REFERENCE_SELECTION_ERROR_MESSAGE,
                 )
 
+    def test_alpha1_fresh_review_and_pricing_use_real_browser_session_and_database_path(self):
+        self._run_g3_browser_pricing_scope(exercise_restoration=False)
+
+    @unittest.skipIf(
+        os.environ.get("SQAG_VALIDATION_SCOPE") == "alpha1",
+        "Alpha2 Modify/restoration only; e3 CI38415683936 attempt1 remains FAIL; shared assertions gate Alpha1 separately.",
+    )
     def test_g3_restoration_review_and_pricing_use_real_browser_session_and_database_path(self):
+        self._run_g3_browser_pricing_scope(exercise_restoration=True)
+
+    def _run_g3_browser_pricing_scope(self, *, exercise_restoration):
         node = require_node(self)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -33742,6 +33828,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                         "G3_SESSION_COOKIE_NAME": webapp.SESSION_COOKIE_NAME,
                         "G3_SESSION_COOKIE_VALUE": cookie_value,
                         "G3_PRICING_REFERENCE_ID": reference_id,
+                        "G3_EXERCISE_ALPHA2_RESTORATION": "1" if exercise_restoration else "0",
                     })
                     script = r'''
 const assert = require("assert");
@@ -33751,6 +33838,7 @@ const baseUrl = process.env.G3_BASE_URL;
 const sessionCookieName = process.env.G3_SESSION_COOKIE_NAME;
 const sessionCookieValue = process.env.G3_SESSION_COOKIE_VALUE;
 const referenceId = process.env.G3_PRICING_REFERENCE_ID;
+const exerciseRestoration = process.env.G3_EXERCISE_ALPHA2_RESTORATION === "1";
 const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 
 async function responseJson(page, path) {
@@ -33905,14 +33993,20 @@ async function main() {
       return {
         sessionId: state.quoteSessionId,
         lifecycle: state.quoteCommercialLifecycle,
+        review: state.quoteCommercialReview,
         snapshot: state.quoteCommercialSnapshot,
         lineItem: state.lineItems[0],
         outputRow: state.outputRows[0],
         basis: JSON.stringify(state.quoteBasisSections),
         output: JSON.stringify(state.outputRows),
+        lineItems: JSON.parse(JSON.stringify(state.lineItems)),
       };
     });
     assert.strictEqual(fresh.lifecycle, "NEW_UNINITIALISED");
+    assert.strictEqual(fresh.review, null);
+    assert.deepStrictEqual(JSON.parse(fresh.basis).flatMap(section => (section.lines || []).map(line => ({ text: line.text, quantity: line.quantity, unit: line.unit, pricing_keyword: line.pricing_keyword }))), [{ text: "Workspace printed graphics", quantity: 2, unit: "sqm", pricing_keyword: "workspace-row" }]);
+    assert.deepStrictEqual(JSON.parse(fresh.output).map(row => ({ description: row.description, quantity: row.quantity, amount: row.amount })), [{ description: "Workspace printed graphics", quantity: 2, amount: 40 }]);
+    assert.deepStrictEqual(fresh.lineItems, [fresh.lineItem]);
     assert.ok(fresh.snapshot && fresh.snapshot.pricing_basis.id === referenceId);
     assert.strictEqual(fresh.snapshot.pricing_basis.source, "company");
     assert.strictEqual(fresh.lineItem.catalog_unit_price, 20);
@@ -33928,31 +34022,33 @@ async function main() {
     assert.strictEqual(savedDraft.pricingReferenceSource, "company");
     assert.ok(savedDraft.quoteDetails?.commercial_snapshot?.pricing_basis?.digest);
 
-    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
-    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
-    const sessionCard = page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`);
-    await sessionCard.waitFor({ state: "visible", timeout: 30000 });
-    await sessionCard.click();
-    await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
-    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
-    await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
-    const restored = await page.evaluate(() => ({
-      lifecycle: state.quoteCommercialLifecycle,
-      review: state.quoteCommercialReview,
-      snapshot: state.quoteCommercialSnapshot,
-      basis: JSON.stringify(state.quoteBasisSections),
-      output: JSON.stringify(state.outputRows),
-      lineItems: JSON.stringify(state.lineItems),
-    }));
-    assert.strictEqual(restored.review, null);
-    assert.strictEqual(restored.lifecycle, fresh.lifecycle);
-    assert.strictEqual(restored.basis, fresh.basis);
-    assert.strictEqual(restored.output, fresh.output);
-    assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
-    assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
-    assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
+    if (exerciseRestoration) {
+      await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+      await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+      const sessionCard = page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`);
+      await sessionCard.waitFor({ state: "visible", timeout: 30000 });
+      await sessionCard.click();
+      await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+      await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+      const restored = await page.evaluate(() => ({
+        lifecycle: state.quoteCommercialLifecycle,
+        review: state.quoteCommercialReview,
+        snapshot: state.quoteCommercialSnapshot,
+        basis: JSON.stringify(state.quoteBasisSections),
+        output: JSON.stringify(state.outputRows),
+        lineItems: JSON.stringify(state.lineItems),
+      }));
+      assert.strictEqual(restored.review, null);
+      assert.strictEqual(restored.lifecycle, fresh.lifecycle);
+      assert.strictEqual(restored.basis, fresh.basis);
+      assert.strictEqual(restored.output, fresh.output);
+      assert.strictEqual(restored.lineItems, JSON.stringify([fresh.lineItem]));
+      assert.strictEqual(restored.snapshot.pricing_basis.id, referenceId);
+      assert.strictEqual(restored.snapshot.pricing_basis.source, "company");
+    }
 
-    await page.locator('[data-side-panel="customer"]:not([disabled])').click();
+    await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
     await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     const unchangedBefore = await page.evaluate(() => ({
       basis: JSON.stringify(state.quoteBasisSections),
@@ -34024,28 +34120,44 @@ async function main() {
     assert.strictEqual(refreshedCatalogue.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
     assert.strictEqual(refreshedCatalogue.selected, referenceValue);
 
-    await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
-    await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
-    await page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`).click();
-    await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
-    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
-    await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+    if (exerciseRestoration) {
+      await page.locator("#backToDashboardButton", { hasText: "Dashboard" }).click();
+      await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 30000 });
+      await page.locator(`.dashboard-session-card[data-quote-session-id="${fresh.sessionId}"]`).click();
+      await page.locator(`[data-dashboard-panel-action="modify-session"][data-quote-session-id="${fresh.sessionId}"]`).click();
+      await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+      await page.waitForFunction(() => state.quoteSessionRestoreBusy === false, null, { timeout: 30000 });
+    } else {
+      await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
+      await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    }
     const blockedRestored = await page.evaluate(() => ({
+      panel: state.activeSidePanel,
+      forwardLocked: ["quote_company", "basis", "output"].every((panel) => document.querySelector(`[data-side-panel="${panel}"]`).disabled),
       review: state.quoteCommercialReview,
       lifecycle: state.quoteCommercialLifecycle,
       output: JSON.stringify(state.outputRows),
       selected: elements.profileSelect.value,
     }));
+    assert.strictEqual(blockedRestored.panel, "customer");
+    assert.strictEqual(blockedRestored.forwardLocked, true);
     assert.deepStrictEqual(blockedRestored.review, mismatchReview);
     assert.strictEqual(blockedRestored.output, unchangedBefore.output);
     assert.strictEqual(blockedRestored.selected, referenceValue);
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+    if (exerciseRestoration) {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => state.isBooting === false, null, { timeout: 30000 });
+      await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+    }
     const blockedReloaded = await page.evaluate(() => ({
+      panel: state.activeSidePanel,
+      forwardLocked: ["quote_company", "basis", "output"].every((panel) => document.querySelector(`[data-side-panel="${panel}"]`).disabled),
       review: state.quoteCommercialReview,
       output: JSON.stringify(state.outputRows),
       snapshot: state.quoteCommercialSnapshot,
     }));
+    assert.strictEqual(blockedReloaded.panel, "customer");
+    assert.strictEqual(blockedReloaded.forwardLocked, true);
     assert.deepStrictEqual(blockedReloaded.review, mismatchReview);
     assert.strictEqual(blockedReloaded.output, unchangedBefore.output);
     assert.strictEqual(blockedReloaded.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
@@ -34064,7 +34176,7 @@ async function main() {
     ]);
     consoleProblems.length = 0;
 
-    await page.locator('[data-side-panel="customer"]:not([disabled])').click();
+    await page.locator('button[data-side-panel="customer"]:not([disabled])').click();
     await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#profileSelect").click();
     const afterPointerOpen = await page.evaluate(() => ({
@@ -34118,6 +34230,14 @@ async function main() {
     assert.strictEqual(recoveredProgression.snapshot.pricing_basis.digest, fresh.snapshot.pricing_basis.digest);
     assert.deepStrictEqual(consoleProblems, []);
     console.log(JSON.stringify({ status: "ok", sessionId: fresh.sessionId }));
+  } catch (error) {
+    const diagnostic = await page.evaluate(() => typeof state === "undefined" ? { appStateAvailable: false } : ({
+      appStateAvailable: true, panel: state.activeSidePanel, sessionId: state.quoteSessionId,
+      checkpointCurrent: customerStepCheckpointIsCurrent(), restoreBusy: state.quoteSessionRestoreBusy,
+      restoreError: state.quoteSessionLoadError || "",
+    })).catch((captureError) => ({ captureError: String(captureError) }));
+    console.error(JSON.stringify({ scope: exerciseRestoration ? "alpha2" : "alpha1", diagnostic, consoleProblems }));
+    throw error;
   } finally {
     await context.close();
     await browser.close();
@@ -41147,6 +41267,94 @@ main().catch((error) => {
 
                         self.assertEqual(error.exception.code, 403)
                         self.assertIn("You do not have permission to perform this action.", body_text)
+
+    def _owner_selected_suggestion_payload(self, owned=False):
+        payload = valid_payload()
+        payload.update(pricing_reference_source="local", pricing_reference={
+            "id": payload["pricing_reference_id"], "source": "local", "currency": "SGD",
+        })
+        lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload, payload["profile_id"])
+        catalog = next(item for item in lookup.values() if item.get("unit_hint") == "sqm")
+        row = {"section": catalog["section"], "description": "Operator selected " + catalog["description"],
+               "quantity": 2, "unit": "sqm", "pricing_keyword": "", "source_basis_line_id": "selected-row"}
+        row["pricing_authority"] = webapp.build_pricing_authority("none", row)
+        line = {"id": "selected-row", "tag": "Include", "text": "[ " + catalog["description"] + " ] - Operator selected " + catalog["description"],
+                "quantity": 2, "unit": "sqm", "pricing_keyword": catalog["id"], "catalog_unit_price": 999999}
+        payload["line_items"] = [row]
+        payload["quote_basis_sections"] = [{"id": "selected", "title": catalog["section"], "lines": [line]}]
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        if owned:
+            details = {"currency": "SGD", "exchange_rate": 1, "tax": {"label": "GST", "rate": 0.09},
+                       "company": {"name": "Synthetic Company", "header_details": "Synthetic header"},
+                       "quote_text": {"terms_heading": "Terms", "payment_terms": [], "notes_heading": "Notes", "standard_notes": []},
+                       "signature": {}, "rich_text": {}}
+            details["commercial_snapshot"] = {
+                "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA, "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+                "owner": "quote", "lifecycle": "RECOVERED", "origin": "session_recovery",
+                "presence": {key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                             for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()},
+                "pricing_basis": {"currency": "SGD", "source": "local", "id": payload["pricing_reference_id"],
+                                  "digest": webapp.pricing_reference_catalog_digest(json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8")))},
+            }
+            payload["quote_session"] = {"session_id": "quote-selected-suggestion", "commercials": {"currency": "SGD", "exchange_rate": 1},
+                "draft_state": {"quoteCommercialLifecycle": "RECOVERED", "quoteDetails": details, "lineItems": copy.deepcopy(payload["line_items"])}}
+            self.assertTrue(webapp.quote_commercial_state(payload)["owned"])
+            self.assertFalse(webapp.quote_commercial_state(payload)["review_required"])
+        return payload, catalog
+
+    def test_owner_specific_selection_binds_current_catalogue_in_fresh_and_owned_quotes(self):
+        for owned in (False, True):
+            with self.subTest(owned=owned):
+                payload, catalog = self._owner_selected_suggestion_payload(owned)
+                before = copy.deepcopy(payload)
+                rows = webapp.normalize_line_items_for_quote_basis_review(payload)
+                self.assertEqual(payload, before)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                price = webapp.pricing_reference_sale_unit_price(catalog)
+                self.assertEqual(row["pricing_authority"]["variant"], "catalog")
+                self.assertEqual(row["pricing_authority"]["catalog_item_id"], catalog["id"])
+                self.assertEqual(row["pricing_authority"]["price"], price)
+                self.assertNotEqual(price, 999999)
+                self.assertEqual(row["pricing_basis_amount"], webapp.round_commercial_cents(2 * price))
+                self.assertEqual(row["approved_quote_amount"], row["pricing_basis_amount"])
+                repeated = {**payload, "line_items": rows}
+                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), rows)
+
+    def test_owner_specific_selection_rejects_unbound_ambiguous_and_nonapproved_rows(self):
+        for owned in (False, True):
+            for variant in ("missing-id", "wrong-id", "duplicate-row", "duplicate-basis", "different-quantity", "different-unit", "unknown-catalogue", "custom", "confirm", "exclude", "invalid-authority", "historical"):
+                with self.subTest(owned=owned, variant=variant):
+                    payload, catalog = self._owner_selected_suggestion_payload(owned)
+                    row=payload["line_items"][0];line=payload["quote_basis_sections"][0]["lines"][0]
+                    if variant == "missing-id": row.pop("source_basis_line_id")
+                    elif variant == "wrong-id": row["source_basis_line_id"] = "another-row"
+                    elif variant == "duplicate-row": payload["line_items"].append(copy.deepcopy(row))
+                    elif variant == "duplicate-basis": payload["quote_basis_sections"][0]["lines"].append(copy.deepcopy(line))
+                    elif variant == "different-quantity": line["quantity"] = 3
+                    elif variant == "different-unit": line["unit"] = "nos"
+                    elif variant == "unknown-catalogue": line["pricing_keyword"] = "unknown-catalogue"
+                    elif variant in ("custom", "confirm", "exclude"): line["tag"] = variant.title()
+                    elif variant == "invalid-authority": row["pricing_authority"]["context"]["source_basis_line_id"] = "another-row"
+                    elif variant == "historical": row["pricing_authority"] = webapp.build_pricing_authority("historical", row)
+                    payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+                    rows=webapp.normalize_line_items_for_quote_basis_review(payload)
+                    self.assertFalse(any(item.get("pricing_authority", {}).get("variant") == "catalog" for item in rows))
+
+    def test_owner_specific_selection_preserves_manual_included_and_reference_guards(self):
+        for variant in ("manual", "included"):
+            for owned in (False, True):
+                payload, _ = self._owner_selected_suggestion_payload(owned)
+                row=payload["line_items"][0]
+                row["pricing_authority"] = webapp.build_pricing_authority(variant,row,price=17,
+                    reference_authority=webapp.exact_pricing_reference_authority(payload))
+                rows=webapp.normalize_line_items_for_quote_basis_review(payload)
+                self.assertEqual(rows[0]["pricing_authority"]["variant"], variant)
+                self.assertEqual(rows[0]["pricing_authority"]["price"], 0 if variant=="included" else 17)
+        for field,value in (("digest", "sha256:"+"0"*64), ("currency", "USD"), ("id", "wrong-reference"), ("source", "company")):
+            payload,_=self._owner_selected_suggestion_payload(True)
+            payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"][field]=value
+            self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(payload), [])
 
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {
