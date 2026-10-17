@@ -482,6 +482,7 @@ def normalize_pricing_authority(
     row: dict[str, Any],
     price_rows: list[PriceRow],
     trusted_reference: dict[str, Any] | None = None,
+    quote_currency: str | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -505,6 +506,8 @@ def normalize_pricing_authority(
             }
         )
     )
+    if variant == "manual" and "price_currency" in raw:
+        allowed_keys.add("price_currency")
     if set(raw) != allowed_keys:
         return None
     supplied_context = raw.get("context")
@@ -545,6 +548,10 @@ def normalize_pricing_authority(
         "price": 0.0 if variant == "included" else price,
         "currency": raw["currency"],
     }
+    if variant == "manual" and "price_currency" in raw:
+        if not isinstance(raw["price_currency"], str) or not quote_currency or raw["price_currency"] != quote_currency:
+            return None
+        normalized["price_currency"] = quote_currency
     if variant == "catalog":
         if any(not isinstance(raw.get(key), str) for key in (
             "catalog_source", "catalog_item_id", "catalog_digest",
@@ -884,7 +891,8 @@ def prepare_lines(
                 "description": clean_text(item.get("description")),
                 "unit": normalized_unit,
                 "pricing_keyword": pricing_keyword,
-            }, price_rows, trusted_reference=trusted_pricing_reference)
+            }, price_rows, trusted_reference=trusted_pricing_reference,
+                quote_currency=clean_text(brief.get("currency")))
             variant = clean_text(authority.get("variant") if authority else "").lower()
             if authority is None or variant not in {"manual", "catalog", "included"}:
                 status = "unmatched"
@@ -2720,7 +2728,13 @@ def customer_quote_description(description: str) -> str:
     return reference or text
 
 
+def line_quote_exchange_rate(line: QuoteLine, exchange_rate: float) -> float:
+    authority = line.pricing_authority
+    return 1.0 if isinstance(authority, dict) and authority.get("variant") == "manual" and authority.get("price_currency") else exchange_rate
+
+
 def amount_value(line: QuoteLine, exchange_rate: float = 1.0) -> str | float | None:
+    exchange_rate = line_quote_exchange_rate(line, exchange_rate)
     if line.price_mode == "Included":
         return 0.0
     if line.display_price:
@@ -2730,6 +2744,7 @@ def amount_value(line: QuoteLine, exchange_rate: float = 1.0) -> str | float | N
 
 
 def line_amount_value(line: QuoteLine, exchange_rate: float = 1.0) -> float | None:
+    exchange_rate = line_quote_exchange_rate(line, exchange_rate)
     if line.price_mode == "Included":
         return 0.0
     if line.amount is not None:
