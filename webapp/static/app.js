@@ -2695,6 +2695,10 @@ function buildPricingAuthority(variant = "none", row = {}, options = {}) {
     if (price === null && normalizedVariant !== "included") return null;
     authority.price = normalizedVariant === "included" ? 0 : price;
     authority.currency = basis?.currency || normalizeCurrencyLabel(options.currency || DEFAULT_CURRENCY_LABEL);
+    if (normalizedVariant === "manual" && options.priceCurrency !== undefined) {
+      if (options.priceCurrency !== collectQuoteCurrency()) return null;
+      authority.price_currency = options.priceCurrency;
+    }
     if (normalizedVariant === "catalog") {
       const item = options.catalogItem || row;
       authority.catalog_source = basis?.source || "";
@@ -2721,6 +2725,7 @@ function normalizePricingAuthority(raw, row = {}, options = {}) {
     : PRICING_AUTHORITY_TRUSTED_VARIANTS.has(variant)
       ? ["context", "currency", "price", "schema", "variant", "version"]
       : ["context", "schema", "variant", "version"];
+  if (variant === "manual" && Object.prototype.hasOwnProperty.call(raw, "price_currency")) allowedKeys.push("price_currency");
   if (Object.keys(raw).sort().join("|") !== allowedKeys.sort().join("|")) return null;
   if (variant === "catalog" && [
     "catalog_source",
@@ -2744,6 +2749,10 @@ function normalizePricingAuthority(raw, row = {}, options = {}) {
   const currency = raw.currency;
   normalized.price = variant === "included" ? 0 : price;
   normalized.currency = currency;
+  if (variant === "manual" && Object.prototype.hasOwnProperty.call(raw, "price_currency")) {
+    if (typeof raw.price_currency !== "string" || raw.price_currency !== collectQuoteCurrency()) return null;
+    normalized.price_currency = raw.price_currency;
+  }
   if (variant !== "catalog") return normalized;
   const itemId = raw.catalog_item_id;
   const source = raw.catalog_source;
@@ -2825,7 +2834,7 @@ function applyPricingAuthorityProjection(row = {}, authority = null) {
   const quantity = numberOrNull(row.quantity);
   if (quantity !== null && quantity > 0) {
     row.pricing_basis_amount = roundCommercialCents(quantity * price);
-    row.approved_quote_amount = quoteAmountValue(row.pricing_basis_amount);
+    row.approved_quote_amount = quoteAmountValue(row.pricing_basis_amount, outputRowFxMultiplier(row));
   }
   return row;
 }
@@ -9606,6 +9615,14 @@ function roundCommercialCents(value) {
   return (negative ? -1 : 1) * Number(cents) / 100;
 }
 
+// Manual quote-currency edits are explicit; untagged saved prices retain their
+// reference-currency semantics and catalog prices continue to use quote FX.
+function outputRowFxMultiplier(row = {}) {
+  const authority = row.pricing_authority;
+  return authority?.variant === "manual" && authority.price_currency === collectQuoteCurrency()
+    ? 1 : quoteFxMultiplier();
+}
+
 function quoteAmountValue(value, multiplier = quoteFxMultiplier()) {
   const numeric = numberOrNull(value);
   if (numeric === null) return null;
@@ -9636,14 +9653,16 @@ function synchronizeOwnedOutputRowPrice(row = {}, value = row.unit_price_overrid
     effective_unit_price: unitPrice,
   };
   if (typeof buildPricingAuthority === "function") {
-    next.pricing_authority = buildPricingAuthority("manual", next, { price: unitPrice })
+    next.pricing_authority = buildPricingAuthority("manual", next, { price: unitPrice,
+        ...(options.quoteCurrencyPrice ? { priceCurrency: collectQuoteCurrency() } : {}),
+      })
       || buildPricingAuthority("historical", next);
   } else {
     delete next.pricing_authority;
   }
   if (quantity !== null && quantity > 0) {
     next.pricing_basis_amount = roundCommercialCents(quantity * unitPrice);
-    next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount);
+    next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount, outputRowFxMultiplier(next));
   } else {
     next.pricing_basis_amount = null;
     next.approved_quote_amount = null;
@@ -10114,15 +10133,15 @@ function outputCellDisplayValue(row = {}, field = "") {
     const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
     if (ownedCommercial) {
       const effective = effectiveOutputUnitPrice(row);
-      return effective === null ? "???" : formatAmount(quoteAmountValue(effective));
+      return effective === null ? "???" : formatAmount(quoteAmountValue(effective, outputRowFxMultiplier(row)));
     }
-    if (numberOrNull(row.unit_price_override) !== null) return formatAmount(quoteAmountValue(row.unit_price_override));
+    if (numberOrNull(row.unit_price_override) !== null) return formatAmount(quoteAmountValue(row.unit_price_override, outputRowFxMultiplier(row)));
     if (numberOrNull(row.catalog_unit_price) !== null) return formatAmount(quoteAmountValue(row.catalog_unit_price));
     return "???";
   }
   if (field === "amount") {
     if (row.price_mode === "Included") return "0.00";
-    return formatAmount(quoteAmountValue(row.amount)) || "???";
+    return formatAmount(quoteAmountValue(row.amount, outputRowFxMultiplier(row))) || "???";
   }
   return String(row[field] ?? "").trim() || "???";
 }
@@ -10150,7 +10169,7 @@ function outputEditorHtml(row = {}, index = 0, field = "") {
   const value = field === "unit_price_override"
     ? row.price_mode === "Included"
       ? "Included"
-      : String(unitPriceValue ?? "")
+      : String(unitPriceValue === null || unitPriceValue === "" ? "" : quoteAmountValue(unitPriceValue, outputRowFxMultiplier(row)))
     : String(row[field] ?? "");
   if (field === "description") {
     return `<textarea class="output-cell-input output-description-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" rows="3" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">${escapeHtml(value)}</textarea>`;
@@ -10276,7 +10295,7 @@ function outputRowsToLineItems(rows = state.outputRows) {
         next.pricing_basis_amount = roundCommercialCents(quantity * historicalEffectivePrice);
       }
       if (next.approved_quote_amount == null && next.pricing_basis_amount != null) {
-        next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount);
+        next.approved_quote_amount = quoteAmountValue(next.pricing_basis_amount, outputRowFxMultiplier(next));
       }
     }
     if (next.price_mode === "Included") {
@@ -10421,7 +10440,7 @@ function matchSummaryStats(rows = []) {
   );
   const totalPending = needsManualInput > 0 || commercialIncomplete;
   const total = safeRows.reduce((sum, row) => {
-    const amount = quoteAmountValue(row.amount);
+    const amount = quoteAmountValue(row.amount, outputRowFxMultiplier(row));
     return Number.isFinite(amount) ? sum + amount : sum;
   }, 0);
   return { sections, pricedRows, needsManualInput, total: roundCommercialCents(total), totalPending };
@@ -10580,7 +10599,7 @@ function handleOutputRowEdit(event) {
     if (typeof buildPricingAuthority === "function") nextRow.pricing_authority = buildPricingAuthority("historical", nextRow);
     else delete nextRow.pricing_authority;
   }
-  if (field === "unit_price_override") nextRow = synchronizeOwnedOutputRowPrice(nextRow, input.value, { force: true });
+  if (field === "unit_price_override") nextRow = synchronizeOwnedOutputRowPrice(nextRow, input.value, { force: true, quoteCurrencyPrice: true });
   state.outputRows[index] = recalculateOutputRow(nextRow);
   state.lineItems = outputRowsToLineItems();
   markOutputRowsDirty();
@@ -10614,7 +10633,7 @@ function commitOutputEditor(editor) {
       }
     } else {
       nextRow = { ...currentRow, price_mode: "Priced", display_price: "", unit_price_override: value };
-      nextRow = synchronizeOwnedOutputRowPrice(nextRow, value, { force: true });
+      nextRow = synchronizeOwnedOutputRowPrice(nextRow, value, { force: true, quoteCurrencyPrice: true });
     }
   }
   state.outputRows[index] = recalculateOutputRow(nextRow);
@@ -11181,16 +11200,12 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
   state.quoteBasisSections = sections;
   state.quoteBasis = quoteBasisFromSections(sections);
   state.basisConfirmed = false;
-  if (Array.isArray(state.outputRows) && state.outputRows.length && Array.isArray(state.lineItems)) {
-    refreshOutputRowsFromLineItems();
-    state.lineItems = outputRowsToLineItems();
-    markOutputRowsDirty();
-    if (typeof renderPricingMatches === "function") renderPricingMatches(state.outputRows);
-    if (typeof renderMatchSummary === "function") renderMatchSummary({ pricing_matches: state.outputRows });
-    if (typeof renderOutputValidationMessages === "function") renderOutputValidationMessages(outputRowsValid().errors);
-  } else {
-    setDownloadFiles([]);
-  }
+  // Preserve the unpriced input until the server admits this explicit selection.
+  // Projecting through old output first invalidates its pricing authority.
+  state.outputRows = [];
+  state.originalOutputRows = [];
+  setDownloadFiles([]);
+  markOutputRowsDirty();
   updateQuoteBasisCard("edited");
   syncControlStates();
 }
@@ -15269,6 +15284,7 @@ function dashboardDateFilterSummaryText(filteredCount = 0, totalCount = 0) {
 }
 
 function renderQuoteDashboard() {
+  if (elements.dashboardSearchInput) elements.dashboardSearchInput.value = state.dashboardSearch || "";
   updateDashboardSummary();
   if (elements.dashboardDateFilter) elements.dashboardDateFilter.value = state.dashboardDateFilter || "all";
   ensureDashboardCustomDateDefaults();

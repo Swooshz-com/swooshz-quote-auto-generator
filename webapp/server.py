@@ -6466,6 +6466,7 @@ def normalize_pricing_authority(
     row: dict[str, Any],
     *,
     reference_authority: dict[str, Any] | None = None,
+    quote_currency: str | None = None,
     catalog_item: dict[str, Any] | None = None,
     catalog_items: list[dict[str, Any]] | None = None,
     catalog_evidence_descriptions: tuple[Any, ...] | list[Any] | None = None,
@@ -6493,6 +6494,8 @@ def normalize_pricing_authority(
             }
         )
     )
+    if variant == "manual" and "price_currency" in raw:
+        allowed_keys.add("price_currency")
     if set(raw) != allowed_keys:
         return None
     context = pricing_authority_context(row)
@@ -6518,6 +6521,10 @@ def normalize_pricing_authority(
         "price": 0.0 if variant == "included" else price,
         "currency": supplied_currency,
     }
+    if variant == "manual" and "price_currency" in raw:
+        if not isinstance(raw["price_currency"], str) or not quote_currency or raw["price_currency"] != quote_currency:
+            return None
+        normalized["price_currency"] = quote_currency
     if variant == "catalog":
         evidence_descriptions = (
             list(catalog_evidence_descriptions)
@@ -6592,10 +6599,18 @@ def pricing_authority_price(authority: Any) -> float | None:
     return pricing_authority_number(authority.get("price"))
 
 
+def pricing_authority_exchange_rate(authority: Any, exchange_rate: float | None) -> float | None:
+    """A validated tagged manual price is already in the current quote currency."""
+    if isinstance(authority, dict) and authority.get("variant") == "manual" and authority.get("price_currency"):
+        return 1.0
+    return exchange_rate
+
+
 def rebind_pricing_authority_context(
     row: dict[str, Any],
     *,
     reference_authority: dict[str, Any] | None = None,
+    quote_currency: str | None = None,
     catalog_lookup: dict[str, dict[str, Any]] | None = None,
     catalog_evidence_descriptions: tuple[Any, ...] | list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -6623,6 +6638,7 @@ def rebind_pricing_authority_context(
         candidate,
         row,
         reference_authority=authority,
+        quote_currency=quote_currency,
         catalog_item=catalog_item,
         catalog_items=list(lookup.values()),
         catalog_evidence_descriptions=catalog_evidence_descriptions,
@@ -20188,6 +20204,7 @@ def normalize_owned_line_item(
     raw: dict[str, Any],
     *,
     exchange_rate: float | None = None,
+    quote_currency: str | None = None,
     reference_authority: dict[str, Any] | None = None,
     catalog_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
@@ -20254,6 +20271,7 @@ def normalize_owned_line_item(
         raw_authority,
         item,
         reference_authority=reference_authority,
+        quote_currency=quote_currency,
         catalog_item=catalog_item,
         catalog_items=catalog_items,
         catalog_evidence_descriptions=(original_description,),
@@ -20345,6 +20363,7 @@ def normalize_owned_line_item(
     normalized_exchange_rate = parse_float_or_none(exchange_rate)
     if normalized_exchange_rate is not None and normalized_exchange_rate <= 0:
         normalized_exchange_rate = None
+    normalized_exchange_rate = pricing_authority_exchange_rate(authority, normalized_exchange_rate)
     if effective is not None and effective >= 0 and quantity is not None and quantity > 0:
         item["pricing_basis_amount"] = round_commercial_cents(quantity * effective)
         if normalized_exchange_rate is not None:
@@ -20414,6 +20433,7 @@ def normalize_line_items(
                     exchange_rate=exchange_rate,
                     reference_authority=authority,
                     catalog_lookup=owned_catalog_lookup,
+                    quote_currency=quote_currency_from_payload(payload),
                 )
             ]
             if item
@@ -20551,6 +20571,7 @@ def normalize_line_items(
                 catalog_item=catalog_item,
                 catalog_items=catalog_items,
                 catalog_evidence_descriptions=(original_description,),
+                quote_currency=quote_currency_from_payload(payload),
             )
             if incoming_authority is None:
                 catalog_item = None
@@ -20744,6 +20765,7 @@ def normalize_line_items(
                 catalog_item=catalog_item,
                 catalog_items=catalog_items,
                 catalog_evidence_descriptions=(original_description,),
+                quote_currency=quote_currency_from_payload(payload),
             )
             if (
                 normalized_authority is None
@@ -20756,6 +20778,7 @@ def normalize_line_items(
                     reference_authority=authority,
                     catalog_lookup=catalog_lookup,
                     catalog_evidence_descriptions=(original_description,),
+                    quote_currency=quote_currency_from_payload(payload),
                 )
                 normalized_authority = rebound.get("pricing_authority")
         elif price_mode == "Included":
@@ -20836,7 +20859,8 @@ def normalize_line_items(
             if quantity is not None and quantity > 0:
                 item["pricing_basis_amount"] = round_commercial_cents(quantity * trusted_price)
                 item["approved_quote_amount"] = round_commercial_cents(
-                    item["pricing_basis_amount"] * (quote_exchange_rate_from_payload(payload) or 1)
+                    item["pricing_basis_amount"] * pricing_authority_exchange_rate(
+                        normalized_authority, quote_exchange_rate_from_payload(payload) or 1)
                 )
         elif authority_supplied:
             item["status"] = "unmatched"
@@ -23663,6 +23687,7 @@ def line_items_aligned_to_quote_basis(
     approved_only: bool = False,
     provider_result: bool = False,
     exchange_rate: float | None = None,
+    quote_currency: str | None = None,
 ) -> list[dict[str, Any]]:
     if not sections:
         return line_items
@@ -23988,6 +24013,7 @@ def line_items_aligned_to_quote_basis(
             next_item = rebind_pricing_authority_context(
                 next_item,
                 catalog_lookup=catalog_lookup,
+                quote_currency=quote_currency,
                 catalog_evidence_descriptions=(line.get("text"), existing.get("description")),
             )
             trusted_price = pricing_authority_price(next_item.get("pricing_authority"))
@@ -23996,7 +24022,8 @@ def line_items_aligned_to_quote_basis(
                 if current_quantity is not None and current_quantity > 0:
                     next_item["pricing_basis_amount"] = round_commercial_cents(current_quantity * trusted_price)
                     next_item["approved_quote_amount"] = round_commercial_cents(
-                        next_item["pricing_basis_amount"] * (exchange_rate or 1)
+                        next_item["pricing_basis_amount"] * pricing_authority_exchange_rate(
+                            next_item.get("pricing_authority"), exchange_rate or 1)
                     )
                 else:
                     next_item.pop("pricing_basis_amount", None)
@@ -24159,6 +24186,7 @@ def normalize_line_items_for_quote_basis_review(
         approved_only=True,
         provider_result=True,
         exchange_rate=quote_exchange_rate_from_payload(payload),
+        quote_currency=quote_currency_from_payload(payload),
     )
     line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session)
     return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
@@ -24498,6 +24526,7 @@ def normalize_ai_draft(
         catalog_lookup,
         provider_result=has_payload_context,
         exchange_rate=quote_exchange_rate_from_payload(payload),
+        quote_currency=quote_currency_from_payload(payload),
     )
     legacy_basis = quote_basis_from_sections(sections)
     blockers = normalize_blocking_clarification_questions(parsed.get("blocking_clarification_questions"))
@@ -25262,6 +25291,7 @@ def unpack_ai_draft(
         catalog_lookup,
         provider_result=provider_result,
         exchange_rate=quote_exchange_rate_from_payload(payload),
+        quote_currency=quote_currency_from_payload(payload),
     )
     require_basis_confidence(sections, provider=clean_text(ai_draft.get("source")) or "AI")
     raw_basis = quote_basis_from_sections(sections)
@@ -25367,6 +25397,7 @@ def finalized_remote_draft_result(
         catalog_lookup,
         provider_result=source.strip().lower() != "local",
         exchange_rate=quote_exchange_rate_from_payload(payload),
+        quote_currency=quote_currency_from_payload(payload),
     )
     for section in adjusted_sections:
         for line in section.get("lines") or []:

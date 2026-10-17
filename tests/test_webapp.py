@@ -3698,7 +3698,7 @@ eval([
   "quoteCommercialReviewRequired",
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
-  "quoteFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
+  "quoteFxMultiplier", "outputRowFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
   "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
   "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
@@ -21071,6 +21071,7 @@ assert.strictEqual(
         self.assertIn("formatSubtotalValue", js)
         self.assertIn("formatOutputTotalValue", js)
         self.assertIn("quoteFxMultiplier", js)
+        self.assertIn("outputRowFxMultiplier", js)
         self.assertIn("quoteAmountValue", js)
         self.assertIn("+ ???", js)
         self.assertNotIn('? "???"', summary_body)
@@ -21078,7 +21079,7 @@ assert.strictEqual(
         self.assertIn('renderOutputEditCell(row, index, "unit_price_override")', table_body)
         self.assertIn("catalog_unit_price", js)
         self.assertIn("effectiveOutputUnitPrice", js)
-        self.assertIn("quoteAmountValue(row.amount)", js)
+        self.assertIn("quoteAmountValue(row.amount, outputRowFxMultiplier(row))", js)
         self.assertIn("quoteAmountValue(row.catalog_unit_price)", js)
         self.assertIn("Unit price must be a number or Included.", js)
         self.assertNotIn('renderOutputEditCell(row, index, "price_mode")', table_body)
@@ -21156,6 +21157,7 @@ function collectQuoteExchangeRate() {
   return fxRate;
 }
 eval(extractFunction("quoteFxMultiplier"));
+eval(extractFunction("outputRowFxMultiplier"));
 eval(extractFunction("quoteAmountValue"));
 eval(extractFunction("formatSubtotalValue"));
 let taxLabel = "GST";
@@ -26293,7 +26295,7 @@ eval([
   "roundCommercialCents",
   "synchronizeOwnedOutputRowPrice",
   "formatAmount",
-  "quoteFxMultiplier",
+  "quoteFxMultiplier", "outputRowFxMultiplier",
   "roundCommercialCents",
   "quoteAmountValue",
   "recalculateOutputRow",
@@ -32393,7 +32395,7 @@ eval([
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
   "formatAmount",
-  "quoteFxMultiplier",
+  "quoteFxMultiplier", "outputRowFxMultiplier",
   "roundCommercialCents",
   "quoteAmountValue",
   "synchronizeOwnedOutputRowPrice",
@@ -32603,7 +32605,7 @@ eval([
   "unitPriceEditKind",
   "effectiveOutputUnitPrice",
   "formatAmount",
-  "quoteFxMultiplier",
+  "quoteFxMultiplier", "outputRowFxMultiplier",
   "roundCommercialCents",
   "quoteAmountValue",
   "synchronizeOwnedOutputRowPrice",
@@ -43919,6 +43921,8 @@ function normalizeCurrencyLabel(value = "") { return String(value || "").trim().
 function roundCommercialCents(value) { return Math.round(Number(value) * 100) / 100; }
 function numberOrNull(value) { const number = Number(value); return Number.isFinite(number) ? number : null; }
 function quoteAmountValue(value) { return roundCommercialCents(value); }
+function quoteFxMultiplier() { return 1; }
+function collectQuoteCurrency() { return "SGD"; }
 eval([
   "cleanCustomerQuoteLineText",
   "bracketedCatalogReferenceParts",
@@ -43935,6 +43939,7 @@ eval([
   "pricingAuthorityPresentationRow",
   "normalizeOutputPricingAuthority",
   "pricingAuthorityPrice",
+  "outputRowFxMultiplier",
   "applyPricingAuthorityProjection",
 ].map(extractFunction).join("\n"));
 

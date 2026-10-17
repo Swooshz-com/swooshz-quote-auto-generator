@@ -79,6 +79,23 @@ npm run playwright:smoke
   selector to another row; alignment must recalculate trusted amounts and
   repeated normalization must preserve the result.
 
+## Manual price and restored search contract
+
+Output unit-price edits are entered in the quote currency shown on Output.
+A new manual authority records `price_currency` only when it matches that quote
+currency. Its value is not multiplied by FX again. Catalog prices and legacy
+manual authorities without that field retain reference-currency conversion.
+The server and XLSX generator reject mismatched tags and extra catalog fields.
+
+Run `python -m unittest tests.test_owner_uat_contract` for the cross-boundary
+regressions. Its rendered G3 fixture uses the native temporary directory to keep
+Windows publication paths bounded; evidence stays under `_logs/browser/`.
+It checks suggestion selection after Output, a distinct catalog positive
+control, forged suggestion prices, FX editing and reopening, persisted visible
+Dashboard search, protected download identity, and actual XLSX row amounts.
+No live provider is used. Retain existing authority, generator and commercial
+regressions and require complete exact-head CI, including native output.
+
 ## Regression Standard
 
 ### Full-draft Responses contract

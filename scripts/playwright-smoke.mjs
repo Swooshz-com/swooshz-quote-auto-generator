@@ -10,6 +10,7 @@ import { isDeepStrictEqual } from "node:util";
 import { deflateSync } from "node:zlib";
 import { chromium } from "playwright";
 import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playwright-test-seeded-setup.mjs";
+import { verifyOwnerUatChecks } from "./playwright-owner-uat-checks.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
@@ -2266,9 +2267,10 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot) {
   ) {
     throw new Error(`Analyse forensic linkage or safe count evidence is incomplete: ${JSON.stringify({ run: forensic.run, request, counts })}.`);
   }
+  const ownerUat = await verifyOwnerUatChecks(page, browserResult.quoteSessionId, outputDir);
   await page.evaluate(async (sessionId) => deleteQuoteSessionRecord(sessionId), browserResult.quoteSessionId);
   await page.evaluate(() => clearSessionState());
-  return { jobId: accepted.job_id, runId: accepted.generation_run_id, rows: browserResult.rows.length, digest: browserResult.commercialBasis.digest };
+  return { jobId: accepted.job_id, runId: accepted.generation_run_id, rows: browserResult.rows.length, digest: browserResult.commercialBasis.digest, ownerUat };
 }
 
 async function verifyServerPricingReferenceReviewDurability(page) {
@@ -4533,7 +4535,7 @@ async function run573LoadedAppTwice() {
 async function runG3PricingScope() {
   const originalPort=options.port,originalBaseUrl=baseUrl;
   try {
-    const temporaryQuoteDataRoot = await fs.mkdtemp(path.join(root, "_tmp", "sqag-g3-pricing-"));
+    const temporaryQuoteDataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-g3-pricing-"));
     options.port = await unusedLoopbackPort();
     baseUrl = `http://${options.host}:${options.port}`;
     let serverInfo = null;
