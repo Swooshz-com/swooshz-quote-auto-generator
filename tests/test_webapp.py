@@ -28493,7 +28493,7 @@ assert.ok(!saveBody.includes("persistLastPricingReferenceSelection(savedReferenc
         self.assertIn("quoteCommercialTouched: snapshot.quoteCommercialTouched", draft_state_body)
         self.assertIn("quoteDetailsCommercialTouched(savedQuoteDetails)", restore_body)
 
-    def run_sqag212_production_save_chain(self, scenario):
+    def run_sqag212_production_save_chain(self, scenario, *, expected_failure=None):
         # Only transport, DOM effects and synthetic snapshot inputs are mocked.
         # The save/queue/confirmation/postJson/adopter/start consumers are source-extracted.
         script = r"""
@@ -28842,7 +28842,22 @@ const refreshAdapters = scenario.realRefresh || ["excel", "dashboard-failure"].i
 const boundaryAdapters = (scenario.kind === "excel" ? "" : "const quoteSessionHasFreshOutputExports = syntheticQuoteSessionHasFreshOutputExports; const revisionNumber = syntheticRevisionNumber;")
   + (scenario.kind === "dashboard-failure" ? "" : "const appIsBusy = syntheticAppIsBusy; const showDashboard = syntheticShowDashboard; const setDashboardLoadingState = syntheticSetDashboardLoadingState;");
 const program = constantSource + "\n" + adapterSource + "\n" + refreshAdapters + "\n" + boundaryAdapters + "\n"
-  + (scenario.path === "duplicate" ? duplicateLoaderSource + "\n" : "") + required.map(extractFunction).join("\n");
+  + (scenario.path === "duplicate" ? duplicateLoaderSource + "\n" : "") + required.map(name => {
+    let fn = extractFunction(name);
+    // Deliberate in-memory negative controls; production source is never changed.
+    if (name === "returnToDashboard" && ["bypass", "premature"].includes(scenario.queueFault)) {
+      const marker = "const saved = await saveQuoteSessionDraftState({";
+      assert(fn.includes(marker));
+      fn = fn.replace(marker, scenario.queueFault === "bypass"
+        ? "const saved = await saveCurrentQuoteSession({ includeDraftState: true, includeDraftFiles: true,"
+        : "const saved = saveQuoteSessionDraftState({");
+    }
+    if (name === "saveQuoteSessionDraftState" && scenario.queueFault === "stale") {
+      const marker = "if (priorSave && !options.draftState)";
+      assert(fn.includes(marker)); fn = fn.replace(marker, "if (false)");
+    }
+    return fn;
+  }).join("\n");
 eval(program + String.raw`
 assert.strictEqual(normalizeActiveJob(null), null, "Missing active job must remain null");
 assert.strictEqual(normalizeActiveJob({}), null, "Empty active job must not acquire authority");
@@ -28932,16 +28947,36 @@ async function act() {
   } else if (scenario.kind === "dashboard-order") {
     const a = saveQuoteSessionDraftState(); await tick();
     version = 2; if (scenario.changedFiles) fileVersion = 2;
-    const b = saveQuoteSessionDraftState(); await tick();
+    const b = saveQuoteSessionDraftState(scenario.explicitSnapshot ? {
+      draftState: currentQuoteSessionDraftState(), draftFiles: sessionFileRecordsFromDraft(),
+    } : {}); await tick();
     version = 3; if (scenario.changedFiles) fileVersion = 3;
     const c = returnToDashboard(); await tick();
-    // A correct implementation waits behind A/B. The failing one sends C immediately.
+    // Dashboard waits for the real queue; ordinary queued saves capture the latest
+    // draft when they run, while explicitly supplied snapshots remain immutable.
     const overtook = calls.filter(call => call.url === "/api/quote-sessions").length > 1;
-    if (overtook) { responseReleases[1](); await settle(c); }
+    assert.strictEqual(overtook, false, "Dashboard save bypassed pending queue");
+    assert.strictEqual(dashboardShown, false, "Dashboard shown before latest save acknowledgement");
     responseReleases[0](); await settle(a); await tick();
-    const next = overtook ? 2 : 1;
-    responseReleases[next](); await settle(b); await tick();
-    if (!overtook) { responseReleases[2](); await settle(c); }
+    const posts = () => calls.filter(call => call.url === "/api/quote-sessions");
+    assert.strictEqual(posts().length, 2);
+    assert.strictEqual(posts()[1].payload.draft_state.version, scenario.explicitSnapshot ? 2 : 3,
+      "Queued save did not capture the latest draft");
+    if (scenario.changedFiles) assert.strictEqual(posts()[1].payload.draft_files[0].size,
+      scenario.explicitSnapshot ? 2 : 3, "Queued save lost its file snapshot");
+    assert.strictEqual(dashboardShown, false, "Dashboard shown before latest save acknowledgement");
+    assert.strictEqual(quoteSessionDraftIsConfirmed(state.quoteSessionId,
+      quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()), false);
+    responseReleases[1](); await settle(b); await tick();
+    if (scenario.explicitSnapshot) {
+      assert.strictEqual(posts().length, 3);
+      assert.strictEqual(posts()[2].payload.draft_state.version, 3);
+      assert.strictEqual(dashboardShown, false, "Dashboard shown before latest save acknowledgement");
+      responseReleases[2]();
+    }
+    await settle(c); await tick();
+    assert.strictEqual(posts().length, scenario.explicitSnapshot ? 3 : 2,
+      "Acknowledged current draft was saved again");
     assert.strictEqual(persisted.draft_state.version, 3, "Older queued save overwrote Dashboard draft");
     if (scenario.changedFiles) assert.strictEqual(persisted.draft_files[0].size, 3, "Latest acknowledged file overwritten");
     assert(dashboardShown);
@@ -29188,9 +29223,16 @@ async function act() {
 `);
 """
         completed = subprocess.run(
-            [require_node(self), "-e", script, json.dumps(scenario)],
-            cwd=str(ROOT), text=True, capture_output=True, check=False, timeout=15,
+            # Stdin avoids the Windows command-line size limit for this full
+            # production-boundary harness, preserving the same scenario argv.
+            [require_node(self), "-e", "eval(require('fs').readFileSync(0, 'utf8'))", json.dumps(scenario)],
+            input=script, cwd=str(ROOT), text=True, capture_output=True, check=False, timeout=15,
         )
+        if expected_failure is not None:
+            self.assertNotEqual(completed.returncode, 0, "Negative control unexpectedly passed")
+            self.assertIn(expected_failure, completed.stderr)
+            self.assertNotIn("TypeError", completed.stderr)
+            return
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
         print(completed.stdout.strip())
 
@@ -29301,6 +29343,21 @@ async function act() {
         for changed in (False, True):
             with self.subTest(changedFiles=changed):
                 self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200, "changedFiles": changed})
+
+    def test_sqag212_dashboard_queue_retains_explicit_snapshots(self):
+        for changed in (False, True):
+            with self.subTest(changedFiles=changed):
+                self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200,
+                    "changedFiles": changed, "explicitSnapshot": True})
+
+    def test_sqag212_dashboard_queue_oracle_rejects_regressions(self):
+        for fault, failure in (("bypass", "Dashboard save bypassed pending queue"),
+                               ("premature", "Dashboard shown before latest save acknowledgement"),
+                               ("stale", "Queued save did not capture the latest draft")):
+            for changed in (False, True):
+                with self.subTest(queueFault=fault, changedFiles=changed):
+                    self.run_sqag212_production_save_chain({"kind": "dashboard-order", "status": 200,
+                        "changedFiles": changed, "queueFault": fault}, expected_failure=failure)
 
     def test_sqag212_empty_origin_queued_save_cannot_write_replacement(self):
         self.run_sqag212_production_save_chain({"kind": "empty-context", "status": 200, "gated": True})
