@@ -707,7 +707,7 @@ async function main() {
     await page.locator("#sideNextButton:not(.is-disabled)").waitFor({ timeout: 15000 });
     await page.locator("#sideNextButton").click();
     await page.locator("#outputSidePanel.is-active").waitFor({ timeout: 15000 });
-    const pendingUnitPriceCells = page.locator(".output-unit-price-cell", { hasText: "???" });
+    const pendingUnitPriceCells = page.locator('#pricingMatchesBody .output-unit-price-cell[data-output-edit-field="unit_price_override"][data-output-denomination]', { hasText: "???" });
     await pendingUnitPriceCells.first().waitFor({ timeout: 15000 });
     const outputIncludedRows = await pendingUnitPriceCells.evaluateAll((cells) => (
       cells.slice(0, 2).map((cell) => cell.getAttribute("data-output-row")).filter(Boolean)
@@ -716,7 +716,18 @@ async function main() {
       throw new Error("Expected at least one pending output unit price cell.");
     }
     for (const row of outputIncludedRows) {
-      const unitPriceCell = page.locator(`.output-unit-price-cell[data-output-row="${row}"]`);
+      const rowPrices = page.locator(`#pricingMatchesBody .output-unit-price-cell[data-output-row="${row}"]`);
+      const unitPriceCell = rowPrices.locator('xpath=self::*[@data-output-edit-field="unit_price_override"][@data-output-denomination]');
+      if (await rowPrices.count() !== 2 || await unitPriceCell.count() !== 1) throw new Error("Expected two prices with exactly one active denomination.");
+      const denomination = await unitPriceCell.getAttribute("data-output-denomination");
+      if (!["reference", "quote"].includes(denomination)) throw new Error("Active price has no explicit denomination.");
+      const inactivePrice = rowPrices.locator('xpath=self::*[not(@data-output-edit-field)]');
+      const beforeInactiveClick = await page.evaluate(() => state.outputRevision);
+      await inactivePrice.locator(".output-cell-text").click();
+      if (await page.locator('[data-output-editor-field="unit_price_override"]').count() !== 0
+        || await page.evaluate(() => state.outputRevision) !== beforeInactiveClick) {
+        throw new Error("Inactive price incorrectly opened an editor or changed the row.");
+      }
       await unitPriceCell.locator(".output-cell-text").click();
       const includedButton = unitPriceCell.locator(".output-unit-price-editor .output-included-button");
       await includedButton.waitFor({ timeout: 15000 });

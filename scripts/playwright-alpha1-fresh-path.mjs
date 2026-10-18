@@ -665,8 +665,41 @@ try {
   const includedEvents=await page.evaluate(()=>window.__alpha1IncludedEvents);
   assert(includedEvents.some(e=>e.type==="click"&&e.phase==="capture"),"Included action click did not reach the live pricing table.");
   assert(includedEvents.some(e=>e.type==="click"&&e.phase==="bubble"),"Included action click did not bubble through the live pricing table.");
-  await includedRow.locator("[data-output-edit-field='unit_price_override']").filter({hasText:"Included"}).waitFor({state:"visible"});
-  assert(Math.abs(Number((await includedRow.locator(".amount-cell").innerText()).replace(/[^0-9.-]/g,"")))<0.005,"Included row amount is not zero.");
+  const requireIncludedAmountZero = async () => {
+    const amountText = (await includedRow.locator(".amount-cell").innerText()).trim();
+    assert(/^-?\d+(?:\.\d+)?$/.test(amountText) && Number(amountText) === 0, "Included row amount must be a rendered numeric zero.");
+  };
+  const requireVisibleIncluded = async () => {
+    const prices = includedRow.locator(".output-unit-price-cell");
+    assert(await prices.count() === 2, "Included row must retain reference and quoted price cells.");
+    for (const cell of await prices.all()) {
+      assert(await cell.isVisible() && (await cell.locator(".output-cell-text").innerText()).trim() === "Included", "Included price must remain visible in both denominations.");
+      assert(await cell.getAttribute("data-output-edit-field") === null && await cell.locator("[data-output-editor-field]").count() === 0, "Included price must not expose a numeric editor.");
+    }
+    const authority = await includedRow.evaluate((element, description) => {
+      const row = state.outputRows.find(row => row.description === description);
+      return {raw: row?.pricing_authority, trusted: row && outputPriceAuthority(row)};
+    }, included.description);
+    assert(authority.raw?.variant === "included" && authority.trusted?.variant === "included", "Included row lost trusted pricing authority.");
+    await requireIncludedAmountZero();
+  };
+  await requireVisibleIncluded();
+  const includedAmountCell = includedRow.locator(".amount-cell");
+  const includedAmountText = await includedAmountCell.innerText();
+  const includedAmountControls = [{text: includedAmountText, accepted: true}];
+  try {
+    for (const text of ["", "???"]) {
+      await includedAmountCell.evaluate((cell, value) => { cell.textContent = value; }, text);
+      let rejected = false;
+      try { await requireIncludedAmountZero(); } catch { rejected = true; }
+      assert(rejected, "Included zero assertion accepted a blank or unresolved amount.");
+      includedAmountControls.push({text, accepted: false});
+    }
+  } finally {
+    await includedAmountCell.evaluate((cell, value) => { cell.textContent = value; }, includedAmountText);
+  }
+  await requireVisibleIncluded();
+  await writeJson("included-amount-dom-controls.json", includedAmountControls);
   expectedNumbers=[Math.round(price*2*100)/100,Math.round(price*2*1.09*100)/100];
   await page.screenshot({path:path.join(dirs.captures,"06-edited-lines.png"),fullPage:true});
   const editSaveTarget=await captureConfirmedSaveTarget(originalUploads, "commercial");
@@ -677,6 +710,11 @@ try {
   requireVisibleEditedQuantity(await pricedRow.locator('[data-output-edit-field="quantity"] .output-cell-text').innerText(),"after editing");
   assert(Number(durable.draft_state?.outputRows?.find((r)=>r.description===priced.description)?.quantity)===2,"Independent readback lost quantity 2.");
   assert(durable.draft_state?.outputRows?.find((r)=>r.description===included.description)?.price_mode==="Included","Independent readback lost Included state.");
+  const requirePersistedIncluded = (detail) => {
+    const row = detail.draft_state?.outputRows?.find(row => row.description === included.description);
+    assert(row?.pricing_authority?.variant === "included" && row.pricing_authority.price === 0 && row.amount === 0, "Saved Included authority and numeric zero amount must persist.");
+  };
+  requirePersistedIncluded(durable);
   const beforeGen=trace.jobs.length;
   assert(await page.locator('#outputSidePanel.is-active').isVisible(), 'Fresh confirmation did not reach Output.');
   assert(await page.locator('#sideDownloadButton').getAttribute('aria-disabled') !== 'true', 'Current XLSX action is disabled.');
@@ -701,8 +739,9 @@ try {
   assert(job.request.payload.pricing_reference_source==="local","XLSX request lost pricing-reference source.");
   assert(Number(xlsxReadback.draft_state.outputRows.find(r=>r.description===priced.description)?.quantity)===2,"Post-generation durable state changed the latest edit.");
   requireVisibleEditedQuantity(await pricedRow.locator('[data-output-edit-field="quantity"] .output-cell-text').innerText(),"after generation");
-  assert((await includedRow.locator('[data-output-edit-field="unit_price_override"]').innerText()).includes("Included"),"Visible Output lost the Included edit after generation.");
+  await requireVisibleIncluded();
   assert(xlsxReadback.draft_state.outputRows.find(r=>r.description===included.description)?.price_mode==="Included","Post-generation durable state lost Included edit.");
+  requirePersistedIncluded(xlsxReadback);
   assert(new URL(await page.locator("#sideDownloadButton").getAttribute("href"),baseUrl).toString()===new URL(exp.url,baseUrl).toString(),"Fresh quote does not point to current XLSX.");
   const downloaded=await fs.readFile(downloadPath);
   const digest=createHash("sha256").update(downloaded).digest("hex");

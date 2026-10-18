@@ -593,11 +593,19 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
       cells,
     };
   });
-  const expectedLabels = ["Section", "Description", "Quantity", "Unit", "Unit price", "Amount", "Delete"];
+  const { sourceCurrency, quoteCurrency } = await page.evaluate(() => ({
+    sourceCurrency: selectedPricingReferenceCurrency(), quoteCurrency: collectQuoteCurrency(),
+  }));
+  const expectedLabels = ["Section", "Description", "Quantity", "Unit",
+    "Reference price " + sourceCurrency, "FX " + quoteCurrency + " per " + sourceCurrency,
+    "Quoted unit price " + quoteCurrency, "Amount", "Delete"];
   if (outputMetrics.rowDisplay !== "grid" || outputMetrics.tableHeadDisplay !== "none") {
     throw new Error(`Mobile output rows should render as cards: ${JSON.stringify(outputMetrics)}.`);
   }
-  if (expectedLabels.some((label) => !outputMetrics.cells.some((cell) => cell.label === label && cell.before.includes(label)))) {
+  if (outputMetrics.cells.length !== expectedLabels.length || expectedLabels.some((label, index) => {
+    const cell = outputMetrics.cells[index];
+    return cell.label !== label || cell.before !== JSON.stringify(label) || cell.display !== "grid" || cell.width <= 0;
+  })) {
     throw new Error(`Mobile output card labels were missing: ${JSON.stringify(outputMetrics)}.`);
   }
   if (outputMetrics.rowWidth > 500 || outputMetrics.cells.some((cell) => cell.width > 500)) {
