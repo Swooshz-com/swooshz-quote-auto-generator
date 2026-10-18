@@ -108,6 +108,7 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   const overridden=await rowSnapshot();assert.equal(overridden.revision,reference.revision+1);
   assert.equal(JSON.parse(overridden.row).pricing_authority.price_currency,'AUD');
   assert.equal(await cell.locator('.output-cell-text').innerText(),'1.00');
+  await verifyCatalogueBaselineDisplay(page,index,fixture,outputDir);
   // A late/background browser checkpoint must not consume valid but uncommitted text.
   await cell.locator('.output-cell-text').click();await editor.fill('2');
   const checkpoint=await page.evaluate(()=>{const before={rows:JSON.stringify(state.outputRows),revision:state.outputRevision};saveSessionState();renderPricingMatches(state.outputRows);return {before,after:{rows:JSON.stringify(state.outputRows),revision:state.outputRevision},pending:activeOutputEditor?.editor.value};});
@@ -232,6 +233,8 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   await page.locator('[data-dashboard-panel-action="modify-session"]').click();
   await page.locator('#outputSidePanel.is-active').waitFor({timeout:30000});
   assert.equal(await cell.locator('.output-cell-text').innerText(),'1.00');
+  assert.equal(await page.locator('tr[data-output-row="'+index+'"] td:nth-child(5) .output-cell-text').innerText(),fixture.catalogPrice.toFixed(2),'Catalogue baseline survives saved/reopened override');
+  assert.equal(await page.locator('tr[data-output-row="'+index+'"] .output-fx-cell').innerText(),'3\nNot applied');
   await fs.mkdir(outputDir,{recursive:true});
   await page.screenshot({path:path.join(outputDir,'owner-uat-c17-output.png'),fullPage:true});
   const downloadPromise=page.waitForEvent('download',{timeout:60000});
@@ -397,4 +400,91 @@ async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
     });
   }
   assert.deepEqual(outcomes,expected,'Both native buttons must select the requested empty denomination for Enter, Space and pointer');
+}
+
+// Render the real production price cells into the live owner table. Only source
+// fixtures change: no price authority, draft, save, revision or export mutation.
+async function verifyCatalogueBaselineDisplay(page,index,fixture,outputDir) {
+  await page.evaluate(()=>{clearQuoteSessionDraftSaveTimer();globalThis.baselineTestPrior={...state};globalThis.baselineTestCurrency=collectQuoteCurrency();});
+  const effects=[],outcomes=[];
+  const observe=request=>{if(request.method()!=='GET')effects.push(request.url());};page.on('request',observe);
+  const cases=['valid','same-currency','zero','missing-item','missing-key','missing-basis','missing-digest','missing-reference','changed-source','missing-currency','ambiguous-item','ambiguous-reference','stale-digest','stale-identity','stale-currency','stale-row-basis','wrong-section','wrong-description','wrong-unit','missing-unit','missing-section','explicit-General','invalid-price','bracketed-description'];
+  try {
+    for(const name of cases) {
+      const result=await page.evaluate(({name,index})=>{
+        Object.assign(state,baselineTestPrior);setQuoteCurrencyControls(baselineTestCurrency);
+        state.pricingReferences=structuredClone(baselineTestPrior.pricingReferences);
+        state.quoteCommercialSnapshot=structuredClone(baselineTestPrior.quoteCommercialSnapshot);
+        state.outputRows=structuredClone(baselineTestPrior.outputRows);
+        const reference=currentPricingReference(),row=state.outputRows[index];
+        const items=reference.authority_items || reference.items;
+        const item=pricingReferenceCatalogItem(reference,row.pricing_keyword);
+        if(!item)throw new Error('Positive catalogue fixture must resolve before mutations');
+        row.catalog_unit_price=999999; // Deliberately untrustworthy cached projection.
+        if(name==='same-currency'){setQuoteCurrencyControls('SGD');row.pricing_authority.price_currency='SGD';}
+        if(name==='zero')item.sale_unit_price=0;
+        if(name==='missing-item')items.splice(items.indexOf(item),1);
+        if(name==='missing-key')row.pricing_keyword='';
+        if(name==='missing-basis')state.quoteCommercialSnapshot=null;
+        if(name==='missing-digest')delete reference.digest_sha256;
+        if(name==='missing-reference')state.pricingReferences=[];
+        if(name==='changed-source')state.pricingReferenceSource='different-source';
+        if(name==='missing-currency')delete reference.currency;
+        if(name==='ambiguous-item')items.push(structuredClone(item));
+        if(name==='ambiguous-reference')state.pricingReferences.push(structuredClone(reference));
+        if(name==='stale-digest')state.quoteCommercialSnapshot.pricing_basis.digest='sha256:'+ 'a'.repeat(64);
+        if(name==='stale-identity')state.quoteCommercialSnapshot.pricing_basis.id='different-synthetic-reference';
+        if(name==='stale-currency')state.quoteCommercialSnapshot.pricing_basis.currency='USD';
+        if(name==='stale-row-basis')row.pricing_basis_digest='sha256:'+ 'b'.repeat(64);
+        if(name==='wrong-section')row.section='Different synthetic section';
+        if(name==='wrong-description')row.description='Different synthetic description';
+        if(name==='wrong-unit')row.unit='Different synthetic unit';
+        if(name==='missing-unit'){row.unit='';item.unit='';item.unit_hint='';}
+        if(name==='missing-section'){row.section='';item.section='';}
+        if(name==='explicit-General'){row.section='General';item.section='General';}
+        if(name==='invalid-price')item.sale_unit_price=null,item.catalog_unit_price=null,item.unit_price=null;
+        if(name==='bracketed-description')row.description='['+item.description+'] - Synthetic detail';
+        row.pricing_authority.context=pricingAuthorityContext(row);
+        const snapshot=()=>JSON.stringify(state);
+        const before=snapshot();
+        const html=renderOutputPriceCells(row,index);
+        const tr=elements.pricingMatchesBody.querySelector('tr[data-output-row="'+index+'"]');
+        const cells=[...tr.children];cells[4].outerHTML=html;cells[5].remove();cells[6].remove();
+        return {before,after:snapshot(),mode:outputPriceDenomination(row),price:row.pricing_authority.price,
+          tag:row.pricing_authority.price_currency,amount:outputCellDisplayValue(row,'amount')};
+      },{name,index});
+      assert.equal(result.after,result.before,name+' display must preserve all commercial state');
+      // Missing reference metadata invalidates existing authority too; preserve those guards.
+      if(!['missing-digest','missing-reference','changed-source','missing-currency'].includes(name))assert.deepEqual({mode:result.mode,price:result.price,tag:result.tag,amount:result.amount},{mode:'quote',price:1,tag:name==='same-currency'?'SGD':'AUD',amount:'2.00'},name+' must not apply FX or replace the quote price');
+      const tr=page.locator('tr[data-output-row="'+index+'"]'),reference=tr.locator('td:nth-child(5)');
+      const expected=['valid','same-currency','bracketed-description','explicit-General'].includes(name)?fixture.catalogPrice.toFixed(2):name==='zero'?'0.00':'Unavailable';
+      assert.equal(await reference.locator('.output-cell-text').innerText(),expected,name);
+      assert.equal(await reference.locator('input,button,[tabindex],[contenteditable]').count(),0,name+' reference must remain read-only during a valid override');
+      {
+        assert.equal(await reference.getAttribute('data-output-edit-field'),null);
+        assert.equal(await reference.getAttribute('tabindex'),null);
+        assert.match(await reference.ariaSnapshot(),/Catalogue reference \(read-only\)/);
+        if(!['missing-digest','missing-reference','changed-source','missing-currency'].includes(name)) {
+          assert.equal(await tr.locator('.output-fx-cell').innerText(),'3\nNot applied');
+          assert.equal(await tr.locator('[data-output-edit-field="unit_price_override"]').count(),1);
+        }
+        await reference.locator('.output-cell-text').click();assert.equal(await page.locator('[data-output-editor-field]').count(),0);
+      }
+      if(['valid','missing-item','stale-digest'].includes(name)) {
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await reference.isVisible(),true);
+        const bounds=await reference.evaluate(e=>({overflow:e.scrollWidth-e.clientWidth,label:e.dataset.outputLabel,text:e.innerText}));
+        assert.equal(bounds.overflow<=1,true,JSON.stringify(bounds));assert.equal(bounds.label,'Reference price SGD');
+        await page.screenshot({path:path.join(outputDir,'catalogue-baseline-'+name+'-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
+      }
+      outcomes.push({name,reference:expected,mode:result.mode,amount:result.amount,commercialStateUnchanged:result.before===result.after});
+    }
+    assert.equal(effects.length,0,'Source display must not send mutable HTTP requests');
+  } finally {
+    page.off('request',observe);
+    await page.setViewportSize({width:1440,height:1000});
+    await page.evaluate(()=>{Object.assign(state,baselineTestPrior);setQuoteCurrencyControls(baselineTestCurrency);delete globalThis.baselineTestCurrency;delete globalThis.baselineTestPrior;renderPricingMatches(state.outputRows);});
+    await fs.writeFile(path.join(outputDir,'catalogue-baseline-display-proof.json'),JSON.stringify({outcomes,effects},null,2));
+  }
 }

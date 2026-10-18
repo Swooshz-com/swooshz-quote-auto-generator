@@ -10278,6 +10278,38 @@ function renderOutputEditCell(row = {}, index = 0, field = "", extraClass = "") 
   `;
 }
 
+// Display-only catalogue lookup: never promote a cached row price or manual authority.
+function outputCatalogueBaseline(row = {}) {
+  const admitted = quoteCommercialSnapshotPricingBasis();
+  const reference = currentPricingReference();
+  const basis = pricingReferenceAuthorityBasis(reference);
+  if (!samePricingReferenceBasis(admitted, basis) || quoteCommercialReviewRequired()) return null;
+  const selected = state.pricingReferences.filter((candidate) => (
+    String(candidate?.id || "").trim() === basis.id
+    && String(candidate?.source || "").trim() === basis.source
+  ));
+  if (selected.length !== 1) return null;
+  const rowBasisFields = {
+    pricing_basis_currency: "currency", pricing_reference_source: "source",
+    pricing_reference_id: "id", pricing_basis_digest: "digest",
+  };
+  if (Object.entries(rowBasisFields).some(([field, key]) => (
+    Object.hasOwn(row, field) && row[field] !== admitted[key]
+  ))) return null;
+  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  if (!item) return null;
+  const context = pricingAuthorityContext(row);
+  const description = pricingAuthorityCatalogDescription(item);
+  const section = canonicalPricingAuthorityText(item.section || "");
+  const unit = canonicalPricingAuthorityUnit(item.unit || item.unit_hint || "");
+  const bracketed = bracketedCatalogReferenceParts(context.description);
+  if (!description || !section || !unit
+    || context.section !== section
+    || context.unit !== unit
+    || canonicalPricingAuthorityText(bracketed?.reference || context.description) !== description) return null;
+  return pricingAuthorityNumber(item.sale_unit_price ?? item.catalog_unit_price ?? item.unit_price);
+}
+
 function renderOutputPriceCells(row, index) {
   const mode = outputPriceDenomination(row);
   const included = outputPriceAuthority(row)?.variant === "included";
@@ -10285,8 +10317,12 @@ function renderOutputPriceCells(row, index) {
   const quote = collectQuoteCurrency();
   const modeButton = '<button type="button" class="output-price-mode" data-output-price-mode="' + (mode === "quote" ? "reference" : "quote") + '" data-output-row="' + index + '">' + (mode === "quote" ? 'Use reference price' : 'Quote-currency override') + '</button>';
   const cell = (label, editable, value, button = "") => '<td class="' + (editable ? 'output-edit-cell ' : '') + 'output-unit-price-cell" data-output-label="' + escapeHtml(label) + '" ' + (editable ? 'data-output-edit-field="unit_price_override" data-output-denomination="' + mode + '" tabindex="0" title="Click to edit" ' : '') + 'data-output-row="' + index + '"><span class="output-price-content"><span class="output-cell-text">' + escapeHtml(value) + '</span>' + button + '</span></td>';
+  const quoteOverride = mode === "quote" || (row.pricing_authority?.variant === "manual"
+    && row.pricing_authority.price_currency === quote);
+  const baseline = mode === "quote" ? outputCatalogueBaseline(row) : null;
+  const referenceDisplay = quoteOverride ? (baseline === null ? "Unavailable" : formatAmount(baseline)) : outputCellDisplayValue(row, "unit_price_override");
   const referenceAction = included ? '<button type="button" class="output-price-mode" data-output-price-mode="reference" data-output-row="' + index + '">Use reference price</button>' : '';
-  return cell('Reference price ' + source, mode === "reference" && !included, outputCellDisplayValue(row, "unit_price_override"), mode === "reference" ? modeButton + referenceAction : "")
+  return cell('Reference price ' + source, !quoteOverride && !included, referenceDisplay, quoteOverride ? '<small>Catalogue reference (read-only)</small>' : modeButton + referenceAction)
     + '<td class="output-fx-cell" data-output-label="FX ' + escapeHtml(quote + ' per ' + source) + '"><span>' + escapeHtml(String(collectQuoteExchangeRate() ?? 'Review required')) + (mode === "quote" ? '<small>Not applied</small>' : '') + '</span></td>'
     + cell('Quoted unit price ' + quote, mode === "quote", outputCellDisplayValue(row, "quoted_unit_price"), mode === "quote" ? modeButton + '<small>Manual override</small>' : "");
 }
