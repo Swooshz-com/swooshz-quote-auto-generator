@@ -10842,6 +10842,8 @@ function handleOutputCellKeydown(event) {
     }
     return;
   }
+  // Nested controls retain their native keyboard activation.
+  if (event.target.closest("button, input, textarea, select, a[href], [contenteditable]")) return;
   const cell = event.target.closest(".output-edit-cell");
   if (!cell) return;
   if (event.key === "Enter" || event.key === "F2") {

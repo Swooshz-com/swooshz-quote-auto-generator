@@ -59,6 +59,7 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   const editor=page.locator('[data-output-editor-field="unit_price_override"]');
   const rowSnapshot=()=>page.evaluate(i=>({row:JSON.stringify(state.outputRows[i]),revision:state.outputRevision}),index);
   await page.evaluate(async()=>{clearQuoteSessionDraftSaveTimer();await saveQuoteSessionDraftState();});
+  await verifyOutputModeKeyboardActivation(page,index,outputDir);
   const catalogueBefore=await rowSnapshot();
   assert.equal(await cell.locator('.output-cell-text').innerText(),fixture.catalogPrice.toFixed(2));
   await cell.locator('.output-cell-text').click();assert.equal(await editor.inputValue(),String(fixture.catalogPrice),JSON.stringify(await page.evaluate(()=>({pending:activeOutputEditor && {field:activeOutputEditor.editor.dataset.outputEditorField,staged:activeOutputEditor.staged,row:activeOutputEditor.row},rows:state.outputRows,html:elements.pricingMatchesBody.innerHTML}))));
@@ -303,4 +304,97 @@ async function verifyDelayedGenerationAdmission(page,cell,editor,index,outputDir
     const evidence={busyOpeningRefused:true,focusTrail,invalidRetained:'1.005',negativeJobs:0,positiveJobs:jobs,revisionPreserved:true};
     await fs.writeFile(path.join(outputDir,'fxui-delayed-generation-proof.json'),JSON.stringify(evidence,null,2));return evidence;
   } finally {releaseSave();await page.unroute('**/api/quote-sessions',pauseSave);page.off('request',observe);}
+}
+
+
+// Native activation and delegated handlers run in the real loaded application.
+// Synthetic row seeding and save-queue counts are isolated here; the surrounding
+// owner flow separately verifies real HTTP persistence and protected XLSX output.
+async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
+  await page.evaluate(i=>{
+    clearQuoteSessionDraftSaveTimer();
+    globalThis.fxModeTest={prior:{...state},fx:elements.quoteExchangeRate.value,
+      queue:queueQuoteSessionDraftStateSave,blocked:blockedOutputDraftSaveOptions,
+      row:structuredClone(state.outputRows[i]),saves:0};
+    queueQuoteSessionDraftStateSave=()=>{fxModeTest.saves++;};
+    blockedOutputDraftSaveOptions=null;
+    globalThis.seedFxModeTest=mode=>{
+      revokeOutputEditor();
+      Object.assign(state,fxModeTest.prior);
+      elements.quoteExchangeRate.value='2';
+      const row={...structuredClone(fxModeTest.row),quantity:3,price_mode:'Priced'};
+      delete row.display_price;
+      const priced=synchronizeOwnedOutputRowPrice(row,'10',{force:true,quoteCurrencyPrice:mode==='quote'});
+      state.outputRows=fxModeTest.prior.outputRows.map((r,j)=>normalizeOutputRow(j===i?priced:structuredClone(r)));
+      fxModeTest.saves=0;blockedOutputDraftSaveOptions=null;
+      renderPricingMatches(state.outputRows);state.lineItems=outputRowsToLineItems();syncControlStates();
+    };
+  },index);
+  const editor=page.locator('[data-output-editor-field="unit_price_override"]');
+  const snapshot=()=>page.evaluate(i=>({rows:JSON.stringify(state.outputRows),lineItems:JSON.stringify(state.lineItems),
+    revision:state.outputRevision,draft:JSON.parse(quoteSessionDraftComparisonKey(currentQuoteSessionDraftState())),
+    file:state.downloadFile,fileRevision:state.downloadFileRevision,pdf:state.pdfFile,pdfRevision:state.pdfFileRevision,saves:fxModeTest.saves}),index);
+  const activate=async(mode,action)=>{
+    const button=page.locator('[data-output-price-mode="'+mode+'"][data-output-row="'+index+'"]');
+    if(action==='pointer')await button.click();
+    else {await button.focus();await page.keyboard.press(action);}
+  };
+  const outcomes=[],expected=[],effects=[];
+  const observe=request=>{if(request.method()!=='GET')effects.push(request.url());};page.on('request',observe);
+  try {
+    assert.equal(await page.evaluate(()=>selectedPricingReferenceCurrency()),'SGD');
+    assert.equal(await page.evaluate(()=>collectQuoteCurrency()),'AUD');
+    for(const mode of ['quote','reference'])for(const action of ['Enter','Space','pointer']) {
+      await page.evaluate(mode=>seedFxModeTest(mode==='quote'?'reference':'quote'),mode);
+      const before=await snapshot();
+      await activate(mode,action);
+      const opened=await page.evaluate(()=>({value:activeOutputEditor?.editor.value,mode:activeOutputEditor?.denomination,staged:activeOutputEditor?.staged}));
+      assert.deepEqual(await snapshot(),before,'Mode selection alone must preserve authority, revision, draft, publication and price');
+      await editor.fill('1.005');await editor.press('Enter');
+      assert.equal(await editor.inputValue(),'1.005');assert.equal(await editor.getAttribute('aria-invalid'),'true');
+      assert.equal(await page.evaluate(()=>commitActiveOutputEditor({commit:false})),'blocked');
+      assert.deepEqual(await snapshot(),before,'Invalid keyboard edit must have zero commercial effects');
+      await editor.press('Escape');assert.deepEqual(await snapshot(),before,'Escape must cancel exact authority');
+      await activate(mode,action);await editor.fill('1');
+      await editor.evaluate(e=>{globalThis.fxModeDetachedEditor=e;});await editor.press('Enter');
+      await page.evaluate(()=>{fxModeDetachedEditor.dispatchEvent(new Event('change',{bubbles:true}));fxModeDetachedEditor.dispatchEvent(new FocusEvent('focusout',{bubbles:true}));});
+      const committed=await page.evaluate(i=>({mode:outputPriceDenomination(state.outputRows[i]),
+        price:outputPriceAuthority(state.outputRows[i])?.price,tag:outputPriceAuthority(state.outputRows[i])?.price_currency??null,
+        amount:outputCellDisplayValue(state.outputRows[i],'amount'),revision:state.outputRevision,saves:fxModeTest.saves}),index);
+      outcomes.push({mode,action,opened,committed});
+      expected.push({mode,action,opened:{value:'',mode,staged:true},committed:{mode,price:1,tag:mode==='quote'?'AUD':null,
+        amount:mode==='quote'?'3.00':'6.00',revision:before.revision+1,saves:1}});
+    }
+    // Ordinary cell shortcuts still open the current denomination and no-op safely.
+    for(const mode of ['reference','quote'])for(const key of ['Enter','F2']) {
+      await page.evaluate(mode=>seedFxModeTest(mode),mode);const before=await snapshot();
+      const cell=page.locator('tr[data-output-row="'+index+'"] [data-output-edit-field="unit_price_override"]');
+      await cell.focus();await page.keyboard.press(key);assert.equal(await editor.inputValue(),'10');
+      assert.equal(await page.evaluate(()=>activeOutputEditor.denomination),mode);
+      await editor.press('Tab');assert.deepEqual(await snapshot(),before);
+    }
+    // Included is a nested native button too; invalid input must not swallow it.
+    for(const action of ['Enter','Space','pointer']) {
+      await page.evaluate(()=>seedFxModeTest('reference'));
+      const cell=page.locator('tr[data-output-row="'+index+'"] [data-output-edit-field="unit_price_override"]');
+      await cell.focus();await page.keyboard.press('F2');await editor.fill('1.005');
+      const included=page.locator('[data-output-included-action][data-output-row="'+index+'"]');
+      if(action==='pointer')await included.click();else {await included.focus();await page.keyboard.press(action);}
+      assert.deepEqual(await page.evaluate(i=>({variant:outputPriceAuthority(state.outputRows[i])?.variant,
+        amount:outputCellDisplayValue(state.outputRows[i],'amount'),saves:fxModeTest.saves}),index),{variant:'included',amount:'0.00',saves:1});
+      assert.equal(await editor.count(),0);
+    }
+    assert.equal(effects.length,0,'Isolated event fixtures must not send mutable HTTP requests');
+  } finally {
+    await fs.writeFile(path.join(outputDir,'fxui-native-mode-activation.json'),JSON.stringify({outcomes,expected,effects},null,2));
+    page.off('request',observe);
+    await page.evaluate(()=>{
+      revokeOutputEditor();clearQuoteSessionDraftSaveTimer();Object.assign(state,fxModeTest.prior);
+      elements.quoteExchangeRate.value=fxModeTest.fx;queueQuoteSessionDraftStateSave=fxModeTest.queue;
+      blockedOutputDraftSaveOptions=fxModeTest.blocked;
+      renderPricingMatches(state.outputRows);renderOutputValidationMessages(state.outputErrors);syncControlStates();
+      delete globalThis.seedFxModeTest;delete globalThis.fxModeTest;delete globalThis.fxModeDetachedEditor;
+    });
+  }
+  assert.deepEqual(outcomes,expected,'Both native buttons must select the requested empty denomination for Enter, Space and pointer');
 }
