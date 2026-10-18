@@ -5846,13 +5846,15 @@ td input {
   line-height: 1.3;
 }
 
-.output-col-section { width: 16%; }
-.output-col-description { width: 32%; }
-.output-col-quantity { width: 8%; }
-.output-col-unit { width: 7%; }
-.output-col-unit-price { width: 13%; }
+.output-col-section { width: 10%; }
+.output-col-description { width: 20%; }
+.output-col-quantity { width: 9%; }
+.output-col-unit { width: 6%; }
+.output-col-unit-price { width: 14%; }
+.output-col-fx { width: 8%; }
+.output-col-quoted-price { width: 14%; }
 .output-col-amount { width: 11%; }
-.output-col-actions { width: 13%; }
+.output-col-actions { width: 8%; }
 
 .output-match-table th:nth-child(3),
 .output-match-table th:nth-child(4),
@@ -8910,3 +8912,15 @@ body.privacy-page {
     grid-template-columns: 1fr;
   }
 }
+
+/* Explicit denomination controls are scoped to the existing Output table. */
+.output-match-table .output-price-mode { display: block; max-width: 100%; margin: 6px auto 0; font: inherit; cursor: pointer; }
+.output-match-table small { display: block; }
+.output-editor-error { display: block; color: #a02121; font-size: 12px; }
+.output-match-table td:nth-child(8), .output-match-table th:nth-child(8), .output-match-table td:nth-child(9), .output-match-table th:nth-child(9) { text-align: center; }
+@media (max-width: 760px) {
+  .output-match-table td:nth-child(8), .output-match-table td:nth-child(9) { text-align: left; }
+  .output-match-table .output-price-mode { margin-left: 0; }
+}
+
+.output-match-table th { white-space: normal; overflow-wrap: anywhere; padding-inline: 4px; }

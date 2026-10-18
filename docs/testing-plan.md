@@ -81,7 +81,13 @@ npm run playwright:smoke
 
 ## Manual price and restored search contract
 
-Output unit-price edits are entered in the quote currency shown on Output.
+Output defaults to editable reference prices, read-only FX and derived quoted unit prices.
+The explicit Quote-currency override action stages an empty transient replacement;
+only a valid cent-exact commit changes authority. Escape cancels. Catalogue no-op
+and cancellation preserve authority and revision. Invalid editors block saves,
+navigation and generation before effects. Resolve tagged overrides through Reference
+price before switching quote currency. Preserve line-first FX rounding (1.01 x 3
+at FX1.37 gives 4.15, while displayed unit is 1.38) and runtime multiply ties.
 A new manual authority records `price_currency` only when it matches that quote
 currency. Its value is not multiplied by FX again. Catalog prices and legacy
 manual authorities without that field retain reference-currency conversion.
@@ -95,6 +101,27 @@ control, forged suggestion prices, FX editing and reopening, persisted visible
 Dashboard search, protected download identity, and actual XLSX row amounts.
 No live provider is used. Retain existing authority, generator and commercial
 regressions and require complete exact-head CI, including native output.
+
+FXUI-R01 through R11 are bound by the owner contract suite: explicit reference and
+quote denominations, catalogue no-op/cancel, immutable C17 predecessor readback,
+transient staging, exact precision, previous-currency admission, unchanged runtime
+line-first rounding, rendered event/sort/mobile behavior, deferred save ordering,
+and authority/current-publication protection. The immutable synthetic predecessor
+in `tests/fixtures/fxui-c17-predecessor.json` was produced by C17 main
+`eda4dd086b8e570632321a0b8e9f595ec6903a5b`, SHA256
+`1db57ff326ad072ecef74f146c5c5c1965fe5d55c1028de0ff30dcf0ea5a0d99`.
+Candidate tests consume those bytes unchanged in browser and server checks.
+The rendered carrier also checks invalid editors before save/job/window effects
+and consumes the protected generated XLSX, its persisted authority and SHA256.
+
+Delayed generation synchronization must refuse keyboard editor opening while busy.
+A transient invalid editor appearing across the await must block actual job
+dispatch; cancel and retry must dispatch exactly one job. The shared dispatch
+admission also covers saved-job retries and XLSX/PDF consumers. Verify desktop
+heading text fits inside cells at 1440px and 1100px, retaining mobile readability.
+Accepted large decimal prices must reopen as plain decimal text in both
+denominations. Enter/Tab without changes must preserve exact authority, revision,
+draft key, save count and artifact identity; precision-changing input still rejects.
 
 ## Regression Standard
 

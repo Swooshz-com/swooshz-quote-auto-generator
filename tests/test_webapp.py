@@ -3541,6 +3541,8 @@ function response(suffix) {
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function queueQuoteSessionDraftStateSave(){}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -3664,11 +3666,11 @@ function buildPricingAuthority(variant = "none", row = {}, options = {}) {
   return authority;
 }
 function normalizeOutputPricingAuthority(raw, row = {}) {
-  if (!raw || raw.variant !== "manual" || raw.schema !== PRICING_AUTHORITY_SCHEMA || raw.version !== PRICING_AUTHORITY_VERSION) return null;
+  if (!raw || !["manual", "included"].includes(raw.variant) || raw.schema !== PRICING_AUTHORITY_SCHEMA || raw.version !== PRICING_AUTHORITY_VERSION) return null;
   return JSON.stringify(raw.context) === JSON.stringify(pricingAuthorityContext(row)) ? raw : null;
 }
 function pricingAuthorityPrice(authority) {
-  return authority?.variant === "manual" && Number.isFinite(Number(authority.price)) ? Number(authority.price) : null;
+  return ["manual", "included"].includes(authority?.variant) && Number.isFinite(Number(authority.price)) ? Number(authority.price) : null;
 }
 function applyPricingAuthorityProjection(row = {}, authority = null) {
   const price = pricingAuthorityPrice(authority);
@@ -3699,7 +3701,7 @@ eval([
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
   "quoteFxMultiplier", "outputRowFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
-  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
+  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
@@ -3708,6 +3710,8 @@ state.outputRows = [
   normalizeOutputRow({ section: "Saved Floors", description: "Captured carpet", quantity: 2, unit: "sqm", price_mode: "Priced", effective_unit_price: 100, catalog_unit_price: 999, pricing_keyword: "captured-row", amount: 200 }),
   normalizeOutputRow({ section: "Saved Services", description: "Included coordination", quantity: 1, unit: "lot", price_mode: "Included", display_price: "Included", amount: 0 }),
 ];
+state.outputRows[0].pricing_authority = buildPricingAuthority("manual", state.outputRows[0], {price:100});
+state.outputRows[1].pricing_authority = buildPricingAuthority("included", state.outputRows[1]);
 const missingHistoricalPrice = normalizeOutputRow({ section: "Saved Review", description: "Missing captured price", quantity: 1, unit: "sqm", price_mode: "Priced", catalog_unit_price: 999 });
 assert.strictEqual(effectiveOutputUnitPrice(missingHistoricalPrice), null);
 assert.strictEqual(missingHistoricalPrice.amount, "");
@@ -20288,7 +20292,7 @@ eval(extractAsyncFunction("confirmQuoteDependencyChange"));
         self.assertIn("PRICING_REFERENCE_PREVIEW_PLACEHOLDERS", js)
         self.assertIn('placeholder="${escapeHtml(PRICING_REFERENCE_PREVIEW_PLACEHOLDERS[field] || "")}"', js)
         self.assertIn("function outputEditorPlaceholder", js)
-        self.assertIn('placeholder="${escapeHtml(outputEditorPlaceholder(field))}"', js)
+        self.assertIn('placeholder="Enter ' , js)
         self.assertIn("function clarificationAnswerPlaceholder", js)
         self.assertIn('placeholder="${escapeHtml(clarificationAnswerPlaceholder(question))}"', js)
 
@@ -20826,7 +20830,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
         self.assertIn("await waitForUiPaint();", download_handler)
-        self.assertIn("commitActiveOutputEditor();", download_handler)
+        self.assertIn('if (commitActiveOutputEditor() === "blocked") return;', download_handler)
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(false));", download_handler)
         self.assertIn('title: "Regenerating Excel"', loading_options_body)
         self.assertIn("await handleGenerate();", download_handler)
@@ -20887,6 +20891,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
 
         node = require_node(self)
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -21076,11 +21081,11 @@ assert.strictEqual(
         self.assertIn("+ ???", js)
         self.assertNotIn('? "???"', summary_body)
         self.assertIn('data-output-edit-field="${field}"', js)
-        self.assertIn('renderOutputEditCell(row, index, "unit_price_override")', table_body)
+        self.assertIn('renderOutputPriceCells(row, index)', table_body)
         self.assertIn("catalog_unit_price", js)
         self.assertIn("effectiveOutputUnitPrice", js)
         self.assertIn("quoteAmountValue(row.amount, outputRowFxMultiplier(row))", js)
-        self.assertIn("quoteAmountValue(row.catalog_unit_price)", js)
+        self.assertIn("outputPriceAuthority(row)", js)
         self.assertIn("Unit price must be a number or Included.", js)
         self.assertNotIn('renderOutputEditCell(row, index, "price_mode")', table_body)
         self.assertNotIn("pricingStatusLabel(row.status)", table_body)
@@ -21088,6 +21093,7 @@ assert.strictEqual(
         node = require_node(self)
 
         script = r"""
+function applyPricingAuthorityProjection(row){return row;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -23446,6 +23452,7 @@ eval([
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -23946,6 +23953,7 @@ eval([
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -24089,6 +24097,7 @@ eval([
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -24796,6 +24805,7 @@ eval([
 
         node = require_node(self)
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -25297,10 +25307,12 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn("unit_price_override", js)
         self.assertIn("catalog_unit_price", js)
         self.assertIn("Included", js)
-        self.assertIn("<th>Unit price</th>", html)
+        self.assertIn("<th>Reference price</th>", html)
+        self.assertIn("<th>FX</th>", html)
+        self.assertIn("<th>Quoted unit price</th>", html)
         self.assertNotIn("<th>Price mode</th>", html)
-        self.assertIn('Click on any field in the table below to change it.', html)
-        self.assertIn('Unit price accepts a number or "Included".', html)
+        self.assertIn('Edit the reference price, or explicitly choose a quote-currency override.', html)
+        self.assertIn('Only one denomination is editable.', html)
         self.assertNotIn("Double click a row value to amend it.", html)
         self.assertNotIn("<datalist", js)
         self.assertNotIn('<option value="Included"></option>', js)
@@ -25638,9 +25650,9 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn(".output-unit-price-editor", css)
         self.assertIn(".output-unit-price-cell", css)
         self.assertIn(".output-unit-price-content", css)
-        self.assertIn(".output-col-description { width: 32%; }", css)
-        self.assertIn(".output-col-unit-price { width: 13%; }", css)
-        self.assertIn(".output-col-actions { width: 13%; }", css)
+        self.assertIn(".output-col-description { width: 20%; }", css)
+        self.assertIn(".output-col-unit-price { width: 14%; }", css)
+        self.assertIn(".output-col-actions { width: 8%; }", css)
         self.assertIn(".output-match-table th:nth-child(3),", css)
         self.assertIn(".output-match-table th:nth-child(6),", css)
         self.assertIn(".output-match-table th:nth-child(7),", css)
@@ -25657,6 +25669,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         node = require_node(self)
 
         script = r"""
+function applyPricingAuthorityProjection(row){return row;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26255,6 +26268,19 @@ assert.ok(source.includes("refreshOutputRowsFromLineItems();"));
         node = require_node(self)
 
         script = r"""
+let blockedOutputDraftSaveOptions=null;
+let committedOutputCurrency="";
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+const outputRowIdentities=new WeakMap();
+let activeOutputEditor=null;
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function selectedPricingReferenceCurrency(){return "SGD";}
+function collectQuoteCurrency(){return "SGD";}
+function queueQuoteSessionDraftStateSave(){}
+function testCommitOutputEditor(editor){editor.setAttribute=()=>{};editor.setCustomValidity=()=>{};editor.closest=()=>null;activeOutputEditor={editor,row:state.outputRows[Number(editor.dataset.outputRow)],revision:state.outputRevision,denomination:"reference",staged:false};return commitOutputEditor(editor);}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26299,12 +26325,12 @@ eval([
   "roundCommercialCents",
   "quoteAmountValue",
   "recalculateOutputRow",
-  "outputCellDisplayValue",
+  "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "outputEditorPlaceholder",
   "outputEditorHtml",
   "renderOutputEditCell",
-  "commitOutputEditor",
-  "applyOutputIncludedAction",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "appIsBusy", "applyOutputIncludedAction",
   "handleOutputEditorCommit",
 ].map(extractFunction).join("\n"));
 
@@ -26344,7 +26370,7 @@ applyOutputIncludedAction({ dataset: { outputRow: "0" } });
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_override"), "Included");
 
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
   value: "",
   isConnected: false,
@@ -26352,7 +26378,7 @@ commitOutputEditor({
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_override"), "Included");
 
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
   value: "",
   isConnected: true,
@@ -26365,11 +26391,12 @@ const replacedEditor = {
   value: "45.50",
   isConnected: true,
 };
+activeOutputEditor={editor:replacedEditor,row:state.outputRows[1],revision:state.outputRevision};
 pendingFocusout = replacedEditor;
 applyOutputIncludedAction({
   dataset: { outputRow: "1" },
   closest: (selector) => selector === ".output-edit-cell"
-    ? { querySelector: () => replacedEditor }
+    ? { contains: () => true, querySelector: () => replacedEditor }
     : null,
 });
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
@@ -26381,6 +26408,7 @@ const normalEditor = {
   value: "3",
   isConnected: true,
 };
+activeOutputEditor={editor:normalEditor,row:state.outputRows[0],revision:state.outputRevision};
 handleOutputEditorCommit({ target: { closest: () => normalEditor }, type: "focusout" });
 assert.strictEqual(state.outputRows[0].quantity, "3");
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
@@ -26464,6 +26492,19 @@ assert.strictEqual(elements.pricingReviewMessages.innerHTML, "");
         node = require_node(self)
 
         script = r"""
+let blockedOutputDraftSaveOptions=null;
+let committedOutputCurrency="";
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+const outputRowIdentities=new WeakMap();
+let activeOutputEditor=null;
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function selectedPricingReferenceCurrency(){return "SGD";}
+function collectQuoteCurrency(){return "SGD";}
+function queueQuoteSessionDraftStateSave(){}
+function testCommitOutputEditor(editor){editor.setAttribute=()=>{};editor.setCustomValidity=()=>{};editor.closest=()=>null;activeOutputEditor={editor,row:state.outputRows[Number(editor.dataset.outputRow)],revision:state.outputRevision,denomination:"reference",staged:false};return commitOutputEditor(editor);}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26507,7 +26548,7 @@ eval([
   "downloadFileIsFresh",
   "pdfFileIsFresh",
   "updateDownloadButton",
-  "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
   "hideOutputDeleteModal",
   "confirmOutputRowDelete",
 ].map(extractFunction).join("\n"));
@@ -26570,20 +26611,21 @@ assert.strictEqual(pdfFileIsFresh(), true);
 assert.strictEqual(elements.sideDownloadButton.href, "/api/quote-sessions/old/download/xlsx");
 assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/old/view/pdf");
 
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
   value: "not-a-price",
   isConnected: true,
 });
-assert.strictEqual(state.outputRevision, 1);
+assert.strictEqual(state.outputRevision, 0);
 assert.strictEqual(state.downloadFile.url, "/api/quote-sessions/old/download/xlsx");
 assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/old/view/pdf");
-assert.strictEqual(state.outputRows[0].unit_price_override, "not-a-price");
-assert.strictEqual(outputRowsValid().valid, false);
-assert.strictEqual(downloadFileIsFresh(), false);
-assert.strictEqual(pdfFileIsFresh(), false);
-assert.strictEqual(elements.sideDownloadButton.href, "#");
-assert.strictEqual(elements.sideDownloadButton.download, "");
+assert.strictEqual(state.outputRows[0].unit_price_override, "10");
+assert.strictEqual(activeOutputEditor.editor.value, "not-a-price");
+assert.strictEqual(commitActiveOutputEditor(), "blocked");
+assert.strictEqual(outputRowsValid().valid, true);
+assert.strictEqual(downloadFileIsFresh(), true);
+assert.strictEqual(pdfFileIsFresh(), true);
+revokeOutputEditor();
 
 setDownloadFiles([
   { url: "/api/jobs/new/files/quotation.xlsx", name: "quotation.xlsx" },
@@ -26595,7 +26637,7 @@ setDownloadFiles([
 assert.strictEqual(downloadFileIsFresh(), true);
 assert.strictEqual(pdfFileIsFresh(), true);
 confirmOutputRowDelete();
-assert.strictEqual(state.outputRevision, 2);
+assert.strictEqual(state.outputRevision, 1);
 assert.strictEqual(state.outputRows.length, 1);
 assert.strictEqual(state.downloadFile.url, "/api/quote-sessions/new/download/xlsx");
 assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/new/view/pdf");
@@ -26617,6 +26659,11 @@ assert.strictEqual(elements.sideDownloadButton.href, "#");
         node = require_node(self)
 
         script = r"""
+function quoteCurrencyControlValue(){return elements.quoteCurrency.value;}
+function collectQuoteCurrency(){return "SGD";}
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
+function outputPriceAuthority(row){return row.pricing_authority || null;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26639,7 +26686,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
-const quoteCurrency = {};
+const quoteCurrency = {value:"USD",setCustomValidity(){}};
 const quoteCurrencyCustom = { value: "" };
 const projectTitle = {};
 const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
@@ -26656,6 +26703,7 @@ const elements = {
   quoteExchangeRate: {},
 };
 const state = {
+  lineItems: [],
   outputRows: [{ description: "Generated row", amount: 100 }],
   outputRevision: 0,
   downloadFile: { url: "/api/jobs/old/files/quotation.xlsx", name: "quotation.xlsx" },
@@ -26717,6 +26765,9 @@ assert.strictEqual(saved, false);
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
+function outputPriceAuthority(row){return row.pricing_authority || null;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26746,7 +26797,7 @@ const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
-  quoteCurrency: { value: "" },
+  quoteCurrency: { value: "", setCustomValidity(){} },
   quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "" },
   quoteExchangeRateField: { hidden: true },
@@ -26759,6 +26810,7 @@ const elements = {
   selectedPricingReferenceTax: { textContent: "" },
 };
 const state = {
+  lineItems: [],
   pricingReferenceId: "sgd-ref",
   pricingReferenceSource: "bundled",
   pricingReferences: [
@@ -26919,6 +26971,7 @@ assert.strictEqual(elements.quoteTaxRate.value, "8");
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27079,6 +27132,8 @@ assert.strictEqual(workflowStage, "ready_to_analyze");
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27270,6 +27325,9 @@ assert.strictEqual(elements.profileSelect.value, "local::missing-saved-reference
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
+function outputPriceAuthority(row){return row.pricing_authority || null;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27307,7 +27365,7 @@ const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
-  quoteCurrency: { value: "" },
+  quoteCurrency: { value: "", setCustomValidity(){} },
   quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "" },
   quoteExchangeRateField: { hidden: true },
@@ -27327,6 +27385,7 @@ const elements = {
   dateLabel: { value: "" },
 };
 const state = {
+  lineItems: [],
   pricingReferenceId: "sgd-ref",
   pricingReferenceSource: "bundled",
   pricingReferences: [
@@ -27501,6 +27560,7 @@ assert.strictEqual(collectQuoteCurrency(), "JPY");
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27739,6 +27799,7 @@ assert.deepStrictEqual(normalizeQuoteCommercialReview(durableReview), durableRev
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -28040,6 +28101,7 @@ const saved = {
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -29413,6 +29475,7 @@ async function act() {
     def test_browser_generation_serializes_and_confirms_latest_draft_save(self):
         node = require_node(self)
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -32287,7 +32350,7 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         self.assertIn(".side-workspace .assistant-output .message-list:empty", css)
         self.assertIn("width: min(100%, var(--workspace-content-width));", css)
         self.assertIn("width: auto;", css)
-        self.assertIn(".output-col-description { width: 32%; }", css)
+        self.assertIn(".output-col-description { width: 20%; }", css)
         self.assertIn("margin: 0 0 12px;", css)
         self.assertIn(".quote-basis-title-row h3", css)
 
@@ -32348,6 +32411,18 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         node = require_node(self)
 
         script = r"""
+let blockedOutputDraftSaveOptions=null;
+let committedOutputCurrency="";
+function applyPricingAuthorityProjection(row){return row;}
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+const outputRowIdentities=new WeakMap();
+let activeOutputEditor=null;
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function queueQuoteSessionDraftStateSave(){}
+function testCommitOutputEditor(editor){editor.setAttribute=()=>{};editor.setCustomValidity=()=>{};editor.closest=()=>null;activeOutputEditor={editor,row:state.outputRows[Number(editor.dataset.outputRow)],revision:state.outputRevision,denomination:"reference",staged:false};return commitOutputEditor(editor);}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -32405,13 +32480,13 @@ eval([
   "pricingReferenceOrder",
   "compareOrderValues",
   "sortOutputRows",
-  "outputCellDisplayValue",
+  "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "renderOutputEditCell",
-  "renderPricingMatches",
+  "renderOutputPriceCells", "renderPricingMatches",
   "snapshotOutputRows",
   "outputRowsToLineItems",
   "outputRowsValid",
-  "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
 ].map(extractFunction).join("\n"));
 
 function selectedPricingReferenceCurrency() { return "SGD"; }
@@ -32494,7 +32569,7 @@ state.outputRows = [normalizeOutputRow({
   ...catalogMetadata,
   description: "nos. standard reception counter",
 })];
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "description", outputRow: "0" },
   value: manualDescription,
   isConnected: true,
@@ -32549,6 +32624,13 @@ assert.strictEqual(outputRowsToLineItems(state.outputRows)[0].description, manua
         node = require_node(self)
 
         script = r"""
+function applyPricingAuthorityProjection(row){return row;}
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function queueQuoteSessionDraftStateSave(){}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -32614,7 +32696,7 @@ eval([
   "bracketedCatalogReferenceParts",
   "outputCatalogDescription",
   "outputRowFromLineItem",
-  "outputCellDisplayValue",
+  "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "outputRowsValid",
   "rowNeedsManualInput",
   "matchSummaryStats",

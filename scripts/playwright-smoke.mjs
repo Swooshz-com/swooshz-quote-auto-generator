@@ -4564,7 +4564,7 @@ async function runG3PricingScope() {
         analysis = await verifyRun030DraftBoundary(page, temporaryQuoteDataRoot);
       } catch (error) {
         const serverOutput = serverInfo.output.join("").slice(-10000);
-        throw new Error(`${error.message}\nIsolated server output:\n${serverOutput}`);
+        throw new Error(`${error.stack || error.message}\nIsolated server output:\n${serverOutput}`);
       }
       if (consoleProblems.length || networkProblems.length) {
         throw new Error(`G3 browser diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);
