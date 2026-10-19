@@ -79,6 +79,20 @@ class OwnerUatContractTest(unittest.TestCase):
                 return shared[int(value.text)]
             return ''.join(cell.itertext()) if cell.get('t') == 'inlineStr' else value.text if value is not None else ''
 
+        cells_by_ref = {cell.get('r'): cell for cell in sheet.findall('.//s:sheetData/s:row/s:c', ns)}
+        values = {ref: cell_value(cell) for ref, cell in cells_by_ref.items()}
+        self.assertEqual(values['E21'], 'AUD')
+        for row_number, label, amount in ((29, 'Total', 302), (30, 'GST 0%', 0), (31, 'Total including GST', 302)):
+            self.assertEqual(values[f'D{row_number}'], label)
+            self.assertEqual(float(values[f'E{row_number}']), amount)
+            self.assertEqual(values[f'F{row_number}'], 'AUD')
+            self.assertIsNotNone(cells_by_ref[f'E{row_number}'].find('s:f', ns))
+        self.assertEqual(evidence['ui'], 'OWNER_ACCEPTED_S3')
+        self.assertEqual(len(evidence['catalogueProof']['outcomes']), 24)
+        self.assertEqual(len(evidence['catalogueProof']['fullTableOutcomes']), 5)
+        self.assertEqual(evidence['catalogueProof']['effects'], [])
+        self.assertEqual(len(evidence['keyboardProof']['outcomes']), 12)
+        self.assertEqual(evidence['keyboardProof']['effects'], [])
         amounts = {}
         for row in sheet.findall('.//s:sheetData/s:row', ns):
             cells = {cell.get('r').rstrip('0123456789'): cell_value(cell) for cell in row}

@@ -10212,7 +10212,7 @@ function blockOutputEditor(editor, message) {
   let error = cell?.querySelector(".output-editor-error");
   if (!error && cell) {
     error = document.createElement("span");
-    error.className = "output-editor-error";
+    error.className = "output-editor-error" + (editor.dataset.outputEditorField === "unit_price_override" ? " sr-only" : "");
     error.setAttribute("role", "alert");
     cell.append(error);
   }
@@ -10246,7 +10246,11 @@ function outputEditorHtml(row = {}, index = 0, field = "", options = {}) {
   const label = priceField ? (denomination === "quote" ? "Quote-currency override " + collectQuoteCurrency() : "Reference price " + selectedPricingReferenceCurrency()) : field;
   const attrs = 'class="output-cell-input is-editing" data-output-editor-field="' + field + '" data-output-row="' + index + '" aria-label="' + escapeHtml(label) + '"';
   if (field === "description") return '<textarea ' + attrs.replace('output-cell-input', 'output-cell-input output-description-input') + ' rows="3" placeholder="' + escapeHtml(outputEditorPlaceholder(field)) + '">' + escapeHtml(value) + '</textarea>';
-  if (priceField) return '<span class="output-unit-price-editor"><input ' + attrs + ' value="' + escapeHtml(value) + '" inputmode="decimal" placeholder="Enter ' + escapeHtml(label) + '"><button class="output-included-button" type="button" data-output-included-action="true" data-output-row="' + index + '">Included</button></span>';
+  if (priceField) {
+    const unavailable = outputCatalogueBaseline(row) === null;
+    const switchLabel = "Use reference price";
+    return '<span class="output-unit-price-editor"><input ' + attrs + ' value="' + escapeHtml(value) + '" inputmode="decimal"><span class="output-price-editor-actions"><button class="output-included-button" type="button" data-output-included-action="true" data-output-row="' + index + '">Included</button><button class="output-price-mode output-price-switch" type="button" data-output-reference-action="true" data-output-row="' + index + '"' + (unavailable ? ' disabled title="Catalogue price unavailable"' : '') + '>' + escapeHtml(switchLabel) + '</button></span></span>';
+  }
   return '<input ' + attrs + ' value="' + escapeHtml(value) + '" inputmode="' + (field === "quantity" ? "decimal" : "text") + '" placeholder="' + escapeHtml(outputEditorPlaceholder(field)) + '">';
 }
 
@@ -10312,19 +10316,18 @@ function outputCatalogueBaseline(row = {}) {
 
 function renderOutputPriceCells(row, index) {
   const mode = outputPriceDenomination(row);
-  const included = outputPriceAuthority(row)?.variant === "included";
+  const authority = outputPriceAuthority(row);
+  const included = authority?.variant === "included";
+  const customReference = mode === "reference" && authority?.variant === "manual";
   const source = selectedPricingReferenceCurrency();
   const quote = collectQuoteCurrency();
-  const modeButton = '<button type="button" class="output-price-mode" data-output-price-mode="' + (mode === "quote" ? "reference" : "quote") + '" data-output-row="' + index + '">' + (mode === "quote" ? 'Use reference price' : 'Quote-currency override') + '</button>';
-  const cell = (label, editable, value, button = "") => '<td class="' + (editable ? 'output-edit-cell ' : '') + 'output-unit-price-cell" data-output-label="' + escapeHtml(label) + '" ' + (editable ? 'data-output-edit-field="unit_price_override" data-output-denomination="' + mode + '" tabindex="0" title="Click to edit" ' : '') + 'data-output-row="' + index + '"><span class="output-price-content"><span class="output-cell-text">' + escapeHtml(value) + '</span>' + button + '</span></td>';
-  const quoteOverride = mode === "quote" || (row.pricing_authority?.variant === "manual"
-    && row.pricing_authority.price_currency === quote);
-  const baseline = mode === "quote" ? outputCatalogueBaseline(row) : null;
-  const referenceDisplay = quoteOverride ? (baseline === null ? "Unavailable" : formatAmount(baseline)) : outputCellDisplayValue(row, "unit_price_override");
-  const referenceAction = included ? '<button type="button" class="output-price-mode" data-output-price-mode="reference" data-output-row="' + index + '">Use reference price</button>' : '';
-  return cell('Reference price ' + source, !quoteOverride && !included, referenceDisplay, quoteOverride ? '<small>Catalogue reference (read-only)</small>' : modeButton + referenceAction)
-    + '<td class="output-fx-cell" data-output-label="FX ' + escapeHtml(quote + ' per ' + source) + '"><span>' + escapeHtml(String(collectQuoteExchangeRate() ?? 'Review required')) + (mode === "quote" ? '<small>Not applied</small>' : '') + '</span></td>'
-    + cell('Quoted unit price ' + quote, mode === "quote", outputCellDisplayValue(row, "quoted_unit_price"), mode === "quote" ? modeButton + '<small>Manual override</small>' : "");
+  const baseline = outputCatalogueBaseline(row);
+  const referenceDisplay = baseline === null ? "Unavailable" : formatAmount(baseline);
+  const cell = (label, denomination, editable, value, note = "") => '<td class="output-unit-price-cell' + (editable ? ' output-edit-cell' : '') + (denomination === "quote" ? ' output-price-entry' : '') + (denomination === "quote" && mode === "quote" ? ' output-custom-price' : '') + '" data-output-label="' + escapeHtml(label) + '" ' + (editable ? 'data-output-edit-field="unit_price_override" data-output-denomination="' + denomination + '" ' : '') + (denomination === "quote" ? 'data-output-price-entry="quote" ' : '') + (editable || denomination === "quote" ? 'tabindex="0" title="Click to edit" ' : '') + 'data-output-row="' + index + '"><span class="output-price-content"><span class="output-cell-text">' + escapeHtml(value) + '</span>' + note + '</span></td>';
+  const rate = escapeHtml(String(collectQuoteExchangeRate() ?? 'Review required'));
+  return cell('Reference price ' + source, "reference", false, referenceDisplay, '<small>Catalogue reference (read-only)</small>')
+    + '<td class="output-fx-cell" data-output-label="FX ' + escapeHtml(quote + ' per ' + source) + '"><span>' + (mode === "quote" || included ? '<strong class="output-fx-unused">Not used</strong><small>Rate: ' + rate + '</small>' : rate + (customReference ? '<small>On custom reference ' + escapeHtml(formatAmount(authority.price) + ' ' + source) + '</small>' : '')) + '</span></td>'
+    + cell('Quoted unit price ' + quote, "quote", true, outputCellDisplayValue(row, "quoted_unit_price"));
 }
 
 function ensureOutputRowsFromLineItems() {
@@ -10790,6 +10793,39 @@ function applyOutputIncludedAction(button) {
   return "committed";
 }
 
+function applyOutputReferencePricing(button) {
+  if (appIsBusy() || !button?.isConnected || !elements.pricingMatchesBody.contains(button)) return "unchanged";
+  const pending = activeOutputEditor;
+  const index = state.outputRows.indexOf(pending?.row);
+  if (!pending || index < 0 || pending.revision !== state.outputRevision
+    || !button.closest(".output-edit-cell")?.contains(pending.editor)) return "unchanged";
+  const row = state.outputRows[index];
+  const price = outputCatalogueBaseline(row);
+  const reference = currentPricingReference();
+  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  if (price === null || !item) return "unchanged";
+  const next = { ...row, price_mode: "Priced" };
+  delete next.display_price;
+  const authority = normalizeOutputPricingAuthority(
+    buildPricingAuthority("catalog", next, { price, reference, catalogItem: item }), next, { reference, catalogItem: item },
+  );
+  if (!authority) return "unchanged";
+  const unchanged = outputPriceAuthority(row)?.variant === "catalog";
+  revokeOutputEditor();
+  if (unchanged) { renderPricingMatches(state.outputRows); resumeBlockedOutputDraftSave(); return "unchanged"; }
+  next.pricing_authority = authority;
+  state.outputRows[index] = preserveOutputRowIdentity(row, recalculateOutputRow(applyPricingAuthorityProjection(next, authority)));
+  state.lineItems = outputRowsToLineItems();
+  markOutputRowsDirty();
+  const validation = outputRowsValid();
+  renderOutputValidationMessages(validation.valid ? [] : validation.errors);
+  renderPricingMatches(state.outputRows);
+  renderMatchSummary({ pricing_matches: state.outputRows });
+  syncControlStates();
+  queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+  return "committed";
+}
+
 function openOutputCellEditor(cell, options = {}) {
   if (appIsBusy()) return;
   if (!cell || cell.querySelector("[data-output-editor-field]")) return;
@@ -10797,13 +10833,15 @@ function openOutputCellEditor(cell, options = {}) {
   if (!state.outputRows[index]) return;
   const identity = outputRowIdentity(state.outputRows[index]);
   const column = cell.cellIndex;
-  const field = options.denomination ? "unit_price_override" : cell.dataset.outputEditField;
+  const entryDenomination = options.denomination || cell.dataset.outputPriceEntry;
+  const field = entryDenomination ? "unit_price_override" : cell.dataset.outputEditField;
   if (commitActiveOutputEditor() === "blocked") return;
   index = state.outputRows.findIndex((row) => outputRowIdentity(row) === identity);
   cell = elements.pricingMatchesBody.querySelector('tr[data-output-row="' + index + '"]')?.children[column];
   const row = state.outputRows[index];
   if (!cell || !row || !field) return;
-  const denomination = options.denomination || outputPriceDenomination(row);
+  const denomination = entryDenomination || outputPriceDenomination(row);
+  const staged = options.staged === true || (field === "unit_price_override" && (denomination !== outputPriceDenomination(row) || outputPriceAuthority(row)?.variant === "included"));
   if (field === "unit_price_override") {
     cell.parentElement.querySelectorAll('[data-output-edit-field="unit_price_override"]').forEach((other) => {
       other.classList.remove("output-edit-cell");
@@ -10815,22 +10853,19 @@ function openOutputCellEditor(cell, options = {}) {
     cell.tabIndex = 0;
   }
   cell.classList.add("output-edit-cell");
-  cell.innerHTML = outputEditorHtml(row, index, field, { ...options, denomination });
+  cell.innerHTML = outputEditorHtml(row, index, field, { ...options, denomination, staged });
   const editor = cell.querySelector("[data-output-editor-field]");
   if (!editor) return;
-  activeOutputEditor = { editor, row, revision: state.outputRevision, denomination, staged: options.staged === true };
+  activeOutputEditor = { editor, row, revision: state.outputRevision, denomination, staged };
   editor.focus();
   editor.select?.();
 }
 
 function handleOutputCellClick(event) {
-  const modeButton = event.target.closest("[data-output-price-mode]");
-  if (modeButton) {
+  const referenceButton = event.target.closest("[data-output-reference-action]");
+  if (referenceButton) {
     event.preventDefault();
-    const index = Number(modeButton.dataset.outputRow);
-    const denomination = modeButton.dataset.outputPriceMode;
-    const rowNode = elements.pricingMatchesBody.querySelector('tr[data-output-row="' + index + '"]');
-    openOutputCellEditor(rowNode?.children[denomination === "quote" ? 6 : 4], { denomination, staged: true });
+    applyOutputReferencePricing(referenceButton);
     return;
   }
   const deleteButton = event.target.closest("[data-output-delete-row]");
@@ -10846,24 +10881,25 @@ function handleOutputCellClick(event) {
     return;
   }
   if (event.target.closest("[data-output-editor-field]")) return;
-  const cell = event.target.closest(".output-edit-cell");
+  const cell = event.target.closest(".output-edit-cell, [data-output-price-entry]");
   if (!cell) return;
   openOutputCellEditor(cell);
 }
 
 function handleOutputIncludedPointerDown(event) {
-  if (!event.target.closest("[data-output-included-action], [data-output-price-mode]")) return;
+  if (!event.target.closest("[data-output-included-action], [data-output-reference-action]")) return;
   event.preventDefault();
 }
 
 function handleOutputCellOpen(event) {
-  const cell = event.target.closest(".output-edit-cell");
+  const cell = event.target.closest(".output-edit-cell, [data-output-price-entry]");
   if (!cell) return;
   openOutputCellEditor(cell);
 }
 
 function handleOutputCellKeydown(event) {
-  const editor = event.target.closest("[data-output-editor-field]");
+  const editor = event.target.closest("[data-output-editor-field]")
+    || (event.key === "Escape" ? event.target.closest(".output-unit-price-editor")?.querySelector("[data-output-editor-field]") : null);
   if (editor) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -10880,7 +10916,7 @@ function handleOutputCellKeydown(event) {
   }
   // Nested controls retain their native keyboard activation.
   if (event.target.closest("button, input, textarea, select, a[href], [contenteditable]")) return;
-  const cell = event.target.closest(".output-edit-cell");
+  const cell = event.target.closest(".output-edit-cell, [data-output-price-entry]");
   if (!cell) return;
   if (event.key === "Enter" || event.key === "F2") {
     event.preventDefault();
@@ -10889,7 +10925,12 @@ function handleOutputCellKeydown(event) {
 }
 
 function handleOutputEditorCommit(event) {
-  const editor = event.target.closest("[data-output-editor-field]");
+  const group = event.target.closest(".output-unit-price-editor");
+  if (event.type === "focusout" && group?.contains(event.relatedTarget)) return;
+  // Price changes commit on Enter or when focus leaves the complete editor.
+  if (event.type === "change" && group) return;
+  const editor = event.target.closest("[data-output-editor-field]")
+    || (event.type === "focusout" ? group?.querySelector("[data-output-editor-field]") : null);
   if (!editor) return;
   if (editor.dataset.outputCommitSuperseded === "true") return;
   commitOutputEditor(editor);

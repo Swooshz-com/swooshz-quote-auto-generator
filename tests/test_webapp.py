@@ -20292,7 +20292,9 @@ eval(extractAsyncFunction("confirmQuoteDependencyChange"));
         self.assertIn("PRICING_REFERENCE_PREVIEW_PLACEHOLDERS", js)
         self.assertIn('placeholder="${escapeHtml(PRICING_REFERENCE_PREVIEW_PLACEHOLDERS[field] || "")}"', js)
         self.assertIn("function outputEditorPlaceholder", js)
-        self.assertIn('placeholder="Enter ' , js)
+        price_editor = js.split('function outputEditorHtml', 1)[1].split('function renderOutputEditCell', 1)[0].split('if (priceField) {', 1)[1].split("return '<input", 1)[0]
+        self.assertNotIn('placeholder=', price_editor)
+        self.assertIn('escapeHtml(outputEditorPlaceholder(field))', js)
         self.assertIn("function clarificationAnswerPlaceholder", js)
         self.assertIn('placeholder="${escapeHtml(clarificationAnswerPlaceholder(question))}"', js)
 
@@ -25311,8 +25313,8 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn("<th>FX</th>", html)
         self.assertIn("<th>Quoted unit price</th>", html)
         self.assertNotIn("<th>Price mode</th>", html)
-        self.assertIn('Edit the reference price, or explicitly choose a quote-currency override.', html)
-        self.assertIn('Only one denomination is editable.', html)
+        self.assertIn('Click the quoted unit price to edit. Custom prices do not use FX.', html)
+        self.assertIn('Use Included or restore reference pricing inside the editor. Press Escape to cancel.', html)
         self.assertNotIn("Double click a row value to amend it.", html)
         self.assertNotIn("<datalist", js)
         self.assertNotIn('<option value="Included"></option>', js)
@@ -26270,6 +26272,8 @@ assert.ok(source.includes("refreshOutputRowsFromLineItems();"));
         script = r"""
 let blockedOutputDraftSaveOptions=null;
 let committedOutputCurrency="";
+// This extracted event carrier has no admitted catalogue; live tests cover trust.
+function outputCatalogueBaseline(){return null;}
 function currentPricingReference(){return {items:[]};}
 function pricingReferenceCatalogItem(){return null;}
 const outputRowIdentities=new WeakMap();
@@ -26360,7 +26364,7 @@ function renderPricingMatches() {
   if (!pendingFocusout) return;
   const editor = pendingFocusout;
   pendingFocusout = null;
-  handleOutputEditorCommit({ target: { closest: () => editor }, type: "focusout" });
+  handleOutputEditorCommit({ target: { closest: (selector) => selector === ".output-unit-price-editor" ? null : editor }, type: "focusout" });
 }
 function renderMatchSummary() {}
 function syncControlStates() {}
@@ -26409,7 +26413,7 @@ const normalEditor = {
   isConnected: true,
 };
 activeOutputEditor={editor:normalEditor,row:state.outputRows[0],revision:state.outputRevision};
-handleOutputEditorCommit({ target: { closest: () => normalEditor }, type: "focusout" });
+handleOutputEditorCommit({ target: { closest: (selector) => selector === ".output-unit-price-editor" ? null : normalEditor }, type: "focusout" });
 assert.strictEqual(state.outputRows[0].quantity, "3");
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 """
@@ -32414,6 +32418,8 @@ assert.strictEqual(state.basisChat.completionNotice, null);
 let blockedOutputDraftSaveOptions=null;
 let committedOutputCurrency="";
 function applyPricingAuthorityProjection(row){return row;}
+// This description-only carrier has no admitted catalogue; real rendered tests cover trust.
+function outputCatalogueBaseline(){return null;}
 function currentPricingReference(){return {items:[]};}
 function pricingReferenceCatalogItem(){return null;}
 const outputRowIdentities=new WeakMap();

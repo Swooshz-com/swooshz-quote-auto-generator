@@ -43,6 +43,8 @@ function quoteBasisFromSections(v){return {selected:v[0].lines[0].text};}
 function catalogBackedPossibleMatchText(line,match){return '[ '+match.description+' ] - '+line.text;}
 function buildPricingAuthority(kind,row,options={}) {return {variant:kind,price:options.price,context:{},...(options.priceCurrency?{price_currency:options.priceCurrency}: {})};}
 function normalizeOutputPricingAuthority(a){return a;}
+// This extracted unit harness has no admitted catalogue; live rendered tests cover trust.
+function outputCatalogueBaseline(){return null;}
 function currentPricingReference(){return {items:[]};}
 function selectedPricingReferenceCurrency(){return 'SGD';}
 function pricingReferenceCatalogItem(){return null;}
