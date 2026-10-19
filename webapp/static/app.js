@@ -7194,7 +7194,7 @@ function authoritativeBasisKeyClass(value = "") {
   return String(value).normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
-function authoritativeBasisKeyIsUnsafe(value = "") {
+function authoritativeBasisKeyIsUnsafeUncached(value = "") {
   if (QUOTE_BASIS_UNSAFE_KEYS.has(String(value))) return true;
   const keyClass = authoritativeBasisKeyClass(value);
   const parts = new Set(keyClass.split("_").filter(Boolean));
@@ -7204,9 +7204,34 @@ function authoritativeBasisKeyIsUnsafe(value = "") {
   return ["_file_handle", "_temp_path", "_temporary_path", "_tmp_path"].some((suffix) => keyClass.endsWith(suffix));
 }
 
+// The key check is pure; basis edits revalidate the same few keys on every interaction.
+const AUTHORITATIVE_BASIS_KEY_SAFETY = new Map();
+function authoritativeBasisKeyIsUnsafe(value = "") {
+  const key = String(value);
+  if (AUTHORITATIVE_BASIS_KEY_SAFETY.has(key)) return AUTHORITATIVE_BASIS_KEY_SAFETY.get(key);
+  const unsafe = authoritativeBasisKeyIsUnsafeUncached(key);
+  if (AUTHORITATIVE_BASIS_KEY_SAFETY.size < 4096) AUTHORITATIVE_BASIS_KEY_SAFETY.set(key, unsafe);
+  return unsafe;
+}
+
+// Exact TextEncoder UTF-8 length (lone surrogates count as U+FFFD) without allocating per string.
+function authoritativeBasisUtf8Length(text) {
+  let length = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) length += 1;
+    else if (code < 0x800) length += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length && (text.charCodeAt(index + 1) & 0xfc00) === 0xdc00) {
+      length += 4;
+      index += 1;
+    } else length += 3;
+  }
+  return length;
+}
+
 function admitAuthoritativeBasisValue(value) {
   const budget = { nodes: 0, bytes: 0 };
-  const byteLength = (text) => new TextEncoder().encode(text).length;
+  const byteLength = authoritativeBasisUtf8Length;
   const admit = (current, depth) => {
     if (depth > AUTHORITATIVE_BASIS_LIMITS.depth) throw new TypeError("Quote basis exceeds the maximum depth.");
     budget.nodes += 1;
@@ -11355,7 +11380,35 @@ function basisFieldLabel(field) {
 }
 
 function updateQuoteBasisCard(source = "edited") {
-  elements.basisReviewSurface.innerHTML = renderQuoteBasisMessage(state.quoteBasis, source);
+  replaceChangedMarkup(elements.basisReviewSurface, renderQuoteBasisMessage(state.quoteBasis, source));
+}
+
+// Same resulting DOM as assigning innerHTML, but unchanged nodes are kept so a one-line
+// basis edit does not rebuild and restyle every other line and possible match.
+function replaceChangedMarkup(container, html) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  replaceChangedChildNodes(container, template.content);
+}
+
+function replaceChangedChildNodes(target, source) {
+  const current = [...target.childNodes];
+  const next = [...source.childNodes];
+  if (current.length !== next.length) {
+    target.replaceChildren(...next);
+    return;
+  }
+  next.forEach((node, index) => {
+    const existing = current[index];
+    if (existing.isEqualNode(node)) return;
+    const sameElementShell = existing.nodeType === Node.ELEMENT_NODE
+      && node.nodeType === Node.ELEMENT_NODE
+      && existing.tagName === node.tagName
+      && existing.attributes.length === node.attributes.length
+      && [...node.attributes].every((attribute) => existing.getAttribute(attribute.name) === attribute.value);
+    if (sameElementShell) replaceChangedChildNodes(existing, node);
+    else existing.replaceWith(node);
+  });
 }
 
 function possibleMatchBasisDetailText(line = {}) {

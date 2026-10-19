@@ -19908,6 +19908,27 @@ def catalog_line_contradicts_item(
     return line_ratio < 0.2 and item_ratio < 0.2
 
 
+def unresolved_detail_contradicts_selected_reference(
+    detail: Any,
+    line_text: Any,
+    item: dict[str, Any],
+    *,
+    catalog_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Judge an unclaimed row's detail under the basis line's exact selected reference.
+
+    An explicit selection is written as "[ reference ] - detail". The unclaimed source
+    row's original wording is that same detail, so it keeps every family and attribute
+    check but not the generic low-overlap rule an established reference already waives.
+    """
+    bracketed = bracketed_catalog_reference_parts(line_text)
+    if bracketed and not bracketed_catalog_reference_parts(detail):
+        _tokens, established, mismatch, _detail = catalog_family_evidence_tokens(line_text, item, catalog_items)
+        if established and not mismatch:
+            detail = f"[ {bracketed[0]} ] - {clean_text(detail)}"
+    return catalog_line_contradicts_item(detail, item, catalog_items=catalog_items)
+
+
 def reject_catalog_line_item_authority(
     row: dict[str, Any],
     *,
@@ -22532,6 +22553,7 @@ def quote_basis_sections_with_catalog_exact_lines(
     mark_unmatched_confirm_custom: bool = False,
     *,
     provider_result: bool = False,
+    reviewed_selection: bool = False,
 ) -> list[dict[str, Any]]:
     invalid_pricing_keyword_flag = "_invalid_pricing_keyword"
     invalid_pricing_keyword_value_flag = "_invalid_pricing_keyword_value"
@@ -22698,8 +22720,7 @@ def quote_basis_sections_with_catalog_exact_lines(
         associated_source_items = matched_source_items or (
             catalog_fallback_items if len(catalog_fallback_items) == 1 else []
         )
-        evidence_descriptions.extend(item.get("description") for item in associated_source_items)
-        return any(
+        if any(
             catalog_line_contradicts_item(
                 evidence,
                 catalog_item,
@@ -22707,6 +22728,23 @@ def quote_basis_sections_with_catalog_exact_lines(
             )
             for evidence in evidence_descriptions
             if clean_text(evidence)
+        ):
+            return True
+        return any(
+            unresolved_detail_contradicts_selected_reference(
+                source_item.get("description"),
+                line.get("text"),
+                catalog_item,
+                catalog_items=exact_catalog_items,
+            )
+            if reviewed_selection and not catalog_item_for_pricing_keyword(source_item.get("pricing_keyword"))
+            else catalog_line_contradicts_item(
+                source_item.get("description"),
+                catalog_item,
+                catalog_items=exact_catalog_items,
+            )
+            for source_item in associated_source_items
+            if clean_text(source_item.get("description"))
         )
 
     catalog_items_by_section: dict[str, list[dict[str, Any]]] = {}
@@ -23499,6 +23537,7 @@ def line_items_with_resolved_basis_catalog(
     catalog_lookup: dict[str, dict[str, Any]],
     *,
     provider_result: bool = False,
+    reviewed_selection: bool = False,
 ) -> list[dict[str, Any]]:
     if not line_items or not sections or not catalog_lookup:
         return line_items
@@ -23648,14 +23687,27 @@ def line_items_with_resolved_basis_catalog(
         if not catalog_item:
             resolved_items.append(item)
             continue
-        if any(
-            catalog_line_contradicts_item(
-                evidence,
+        # A reviewed selection reads this unclaimed row's wording as detail of its exact reference.
+        description_contradicts = (
+            unresolved_detail_contradicts_selected_reference
+            if reviewed_selection
+            else lambda detail, _line_text, selected, **kwargs: catalog_line_contradicts_item(detail, selected, **kwargs)
+        )
+        if (
+            clean_text(basis_line.get("text"))
+            and catalog_line_contradicts_item(
+                basis_line.get("text"),
                 catalog_item,
                 catalog_items=list(catalog_lookup.values()),
             )
-            for evidence in (item.get("description"), basis_line.get("text"))
-            if clean_text(evidence)
+        ) or (
+            clean_text(item.get("description"))
+            and description_contradicts(
+                item.get("description"),
+                basis_line.get("text"),
+                catalog_item,
+                catalog_items=list(catalog_lookup.values()),
+            )
         ):
             resolved_items.append(
                 reject_catalog_line_item_authority(
@@ -24123,14 +24175,18 @@ def line_items_with_confirmed_basis_selections(
         catalog_item = lookup.get(keyword)
         quantity = parse_float_or_none(item.get("quantity"))
         selected_quantity = parse_float_or_none(line.get("quantity"))
-        unit = normalize_pricing_unit(item.get("unit"))
+        # Selecting a match adopts its catalogue unit on the reviewed line; the unpriced row's
+        # proposed unit is superseded, but the confirmed line must still be in catalogue units.
+        unit = normalize_pricing_unit(line.get("unit"))
         if (not catalog_item or clean_text(catalog_item.get("id")) != keyword
                 or quantity is None or quantity <= 0 or selected_quantity != quantity
                 or parse_float_or_none(original.get("quantity")) != selected_quantity
-                or not unit or normalize_pricing_unit(line.get("unit")) != unit
+                or not unit
                 or normalize_pricing_unit(catalog_item_unit_hint(catalog_item)) != unit
-                or any(catalog_line_contradicts_item(text, catalog_item, catalog_items=list(lookup.values()))
-                       for text in (original.get("description"), line.get("text")) if clean_text(text))):
+                or (clean_text(line.get("text")) and catalog_line_contradicts_item(
+                    line.get("text"), catalog_item, catalog_items=list(lookup.values())))
+                or (clean_text(original.get("description")) and unresolved_detail_contradicts_selected_reference(
+                    original.get("description"), line.get("text"), catalog_item, catalog_items=list(lookup.values())))):
             result.append(item)
             continue
         price = pricing_reference_sale_unit_price(catalog_item)
@@ -24143,7 +24199,7 @@ def line_items_with_confirmed_basis_selections(
             "description": clean_customer_quote_line_text(catalog_item.get("description")),
             "pricing_keyword": keyword, "catalog_description": clean_customer_quote_line_text(catalog_item.get("description")),
             "pricing_reference_description": clean_text(catalog_item.get("description")),
-            "status": "matched", "price_mode": "Priced", "catalog_unit_price": price,
+            "unit": unit, "status": "matched", "price_mode": "Priced", "catalog_unit_price": price,
             "effective_unit_price": price, "unit_price_override": price,
         })
         source, reference_id, digest, currency = pricing_authority_reference_identity(authority)
@@ -24203,12 +24259,14 @@ def normalize_line_items_for_quote_basis_review(
         line_items,
         list(catalog_lookup.values()),
         provider_result=True,
+        reviewed_selection=True,
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
         sections,
         catalog_lookup,
         provider_result=True,
+        reviewed_selection=True,
     )
     line_items = line_items_aligned_to_quote_basis(
         line_items,

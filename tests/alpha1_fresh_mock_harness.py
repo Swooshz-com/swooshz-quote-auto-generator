@@ -147,10 +147,17 @@ def main() -> int:
         if host not in ('127.0.0.1','::1','localhost'): raise RuntimeError('external socket connection blocked by Alpha1 local harness')
         return _alpha_real_connect(sock,address)
     _alpha_socket.socket.connect=_alpha_loopback_only
+    scenario_path = Path(sys.argv[8]).resolve() if len(sys.argv) > 8 else None
     def alpha1_mock_provider(payload, api_key, auth_session=None):
         if api_key != 'ordinary-mock-only-no-network': raise RuntimeError('unexpected provider marker')
         authority = _alpha_webapp_server.exact_pricing_reference_authority(payload, auth_session=auth_session)
         if not authority.get('ok'): raise RuntimeError('fixture pricing authority did not resolve')
+        if scenario_path is not None:
+            # Optional caller-written synthetic provider output; normalisation stays production code.
+            raw = json.loads(scenario_path.read_text(encoding='utf-8'))['raw']
+            server.__alpha1_mock_invocations=getattr(server,'__alpha1_mock_invocations',0)+1
+            (Path(sys.argv[2]).parent/'mock-provider-count.json').write_text(json.dumps({'mock_invocations':server.__alpha1_mock_invocations,'real_provider_calls':0})+'\n')
+            return _alpha_webapp_server.normalize_ai_draft(raw,payload,require_confidence=True,auth_session=auth_session)
         lookup = _alpha_webapp_server.pricing_catalog_runtime_lookup_for_payload(payload, _alpha_webapp_server.profile_id_from_payload(payload), auth_session=auth_session)
         items=[]; seen=set()
         for item in lookup.values():

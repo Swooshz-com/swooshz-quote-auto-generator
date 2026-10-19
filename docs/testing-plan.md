@@ -78,6 +78,17 @@ npm run playwright:smoke
   with differing quantities or units. Basis ownership must not transfer a
   selector to another row; alignment must recalculate trusted amounts and
   repeated normalization must preserve the result.
+- Possible Match selection, AI Confirm ticking, quote-basis click responsiveness
+  or Confirm Quotation Basis: run the `test_owner_uat_*` cases in
+  `tests.test_webapp` and `npm run playwright:owner-uat-basis`. The rendered
+  script uses the real server, UI, normalisation, persistence and XLSX path with
+  a deterministic synthetic draft, a saved (`EXISTING`) quote, similar catalogue
+  entries, a non-reference quote currency and injected request latency. It
+  checks trusted catalogue authority, FX-correct quoted price and amount,
+  review-only rows staying `???`, Output edits, reopen and protected XLSX
+  values. For timing evidence add `--measure-only --cpu-throttle=4
+  --catalog-extra=300` (optionally `--cpu-profile`); it reports Event Timing
+  input-to-paint per click and the time until `Preparing Output` paints.
 
 ## Manual price and restored search contract
 

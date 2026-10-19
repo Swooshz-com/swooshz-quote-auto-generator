@@ -25451,7 +25451,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn('startElapsedTimer("basisChatElapsed"', js)
         self.assertIn('stopElapsedTimer("basisChatElapsed")', js)
         self.assertIn("basis-chat-selected-line-${tag.toLowerCase()}", js)
-        self.assertIn("elements.basisReviewSurface.innerHTML = renderQuoteBasisMessage", js)
+        self.assertIn("replaceChangedMarkup(elements.basisReviewSurface, renderQuoteBasisMessage(", js)
         self.assertNotIn("Rows marked Confirm need a decision", js)
         self.assertNotIn("setBasisReviewStatus", js)
         self.assertNotIn("Analyzing reference images now. I will list the basis for confirmation before generating anything.", js)
@@ -41690,6 +41690,88 @@ main().catch((error) => {
             payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"][field]=value
             self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(payload), [])
 
+    def _owner_possible_match_payload(self, owned, detail, row_unit="lot", line_unit="sqm", row_description=None):
+        # Owner UAT U1 shape: an unpriced AI row in its own unit and wording, and an explicit
+        # Possible Match selection written as "[ reference ] - detail" in the catalogue unit.
+        payload, catalog = self._owner_selected_suggestion_payload(owned)
+        row = payload["line_items"][0]
+        line = payload["quote_basis_sections"][0]["lines"][0]
+        row.update(description=row_description or detail, unit=row_unit)
+        row["pricing_authority"] = webapp.build_pricing_authority("none", row)
+        line.update(text="[ " + catalog["description"] + " ] - " + detail, unit=line_unit)
+        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        if owned:
+            payload["quote_session"]["draft_state"]["lineItems"] = copy.deepcopy(payload["line_items"])
+        return payload, catalog
+
+    def test_owner_uat_possible_match_selection_prices_unrelated_wording_and_unit_change(self):
+        detail = "Grey loop pile across reception zone"
+        for owned in (False, True):
+            with self.subTest(owned=owned):
+                payload, catalog = self._owner_possible_match_payload(owned, detail)
+                before = copy.deepcopy(payload)
+                rows = webapp.normalize_line_items_for_quote_basis_review(payload)
+                self.assertEqual(payload, before)
+                [selected] = [row for row in rows if row.get("source_basis_line_id") == "selected-row"]
+                price = webapp.pricing_reference_sale_unit_price(catalog)
+                self.assertEqual(selected["pricing_authority"]["variant"], "catalog")
+                self.assertEqual(selected["pricing_authority"]["catalog_item_id"], catalog["id"])
+                self.assertEqual(selected["pricing_authority"]["price"], price)
+                self.assertEqual(selected["unit"], "sqm")
+                self.assertEqual(selected["pricing_authority"]["context"]["unit"], "sqm")
+                self.assertEqual(selected["pricing_basis_amount"], webapp.round_commercial_cents(2 * price))
+                repeated = {**payload, "line_items": rows}
+                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), rows)
+        payload, catalog = self._owner_possible_match_payload(False, detail)
+        payload["quote_exchange_rate"] = 0.7391
+        [selected] = webapp.normalize_line_items_for_quote_basis_review(payload)
+        basis_amount = webapp.round_commercial_cents(2 * webapp.pricing_reference_sale_unit_price(catalog))
+        self.assertEqual(selected["pricing_basis_amount"], basis_amount)
+        self.assertEqual(selected["approved_quote_amount"], webapp.round_commercial_cents(basis_amount * 0.7391))
+
+    def test_owner_uat_basis_repair_rendered_browser_regression(self):
+        # Rendered U1/U2 path: real server, UI, normalisation, persistence and XLSX; synthetic draft only.
+        node = require_node(self)
+        if not (ROOT / "node_modules" / "playwright" / "package.json").exists():
+            message = "Playwright is required for the rendered owner-UAT basis regression."
+            if os.environ.get("CI"):
+                self.fail(message)
+            self.skipTest(message)
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.run(
+                [node, "scripts/playwright-owner-uat-basis-repair.mjs", "--lines=24", "--latency-ms=800"],
+                cwd=str(ROOT),
+                env={**os.environ, "SQAG_OWNER_UAT_EVIDENCE_ROOT": tmp, "PYTHON": sys.executable},
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+                timeout=600,
+            )
+            self.assertEqual(completed.returncode, 0, (completed.stderr or completed.stdout)[-4000:])
+            [run_dir] = [path for path in Path(tmp).iterdir() if path.is_dir()]
+            result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["xlsx"]["status"], "PASS")
+        self.assertEqual({row["id"] for row in result["u1"] if row.get("expected") is not None},
+                         {"u1-video", "u1-graphic", "u1-carpet", "u1-confirmed"})
+        self.assertEqual([row["quoted"] for row in result["u1"] if row["id"] == "u1-review"], ["???"])
+
+    def test_owner_uat_possible_match_selection_keeps_review_for_unit_and_family_conflicts(self):
+        competing = "synthetic vinyl floor finish"
+        cases = {
+            "line-not-in-catalogue-unit": {"detail": "Grey loop pile across reception zone", "line_unit": "lot"},
+            "detail-names-competing-family": {"detail": competing},
+            "row-wording-names-competing-family": {"detail": "Grey loop pile across reception zone", "row_description": competing},
+        }
+        for owned in (False, True):
+            for label, options in cases.items():
+                with self.subTest(owned=owned, case=label):
+                    payload, _ = self._owner_possible_match_payload(owned, **options)
+                    rows = webapp.normalize_line_items_for_quote_basis_review(payload)
+                    self.assertFalse(any(row.get("pricing_authority", {}).get("variant") == "catalog" for row in rows))
+                    self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows))
+
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {
             "profile_id": "synthetic-exhibition-fixture-template",
@@ -43435,6 +43517,44 @@ assert.throws(() => admitAuthoritativeBasisValue(exactNodes), /node/);
 const exactBytes = Array.from({ length: 4 }, () => "a".repeat(262144));
 assert.strictEqual(admitAuthoritativeBasisValue(exactBytes).length, 4);
 assert.throws(() => admitAuthoritativeBasisValue([...exactBytes, "x"]), /text/);
+process.stdout.write("ok");
+'''
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(ROOT),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(completed.stdout, "ok")
+
+    def test_owner_uat_basis_validator_fast_paths_match_reference_semantics(self):
+        # Owner UAT U2: the allocation-free byte count and key memo must be exact equivalents.
+        node = require_node(self)
+        script = r'''
+const fs = require("fs");
+const assert = require("assert");
+const source = fs.readFileSync("webapp/static/app.js", "utf8");
+const QUOTE_BASIS_UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
+const encoder = new TextEncoder();
+const samples = ["", "a", "\u007f", "\u0080", "߿", "ࠀ", "￿", "é".repeat(128), "😀", "x\ud800y", "\udc00", "\ud83d", "😀\ud83d"];
+let seed = 593;
+const next = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed; };
+for (let index = 0; index < 5000; index += 1) {
+  let text = "";
+  for (let length = next() % 12; length > 0; length -= 1) text += String.fromCharCode(next() % 5 === 0 ? 0xd800 + (next() % 0x800) : next() % 0x10000);
+  samples.push(text);
+}
+for (const text of samples) assert.strictEqual(authoritativeBasisUtf8Length(text), encoder.encode(text).length, JSON.stringify(text));
+const keys = ["text", "tag", "quantity", "pricing_keyword", "possible_pricing_matches", "__proto__", "api-token", "client_secret", "Cookie", "auth-header", "data_url", "artifact_download_url", "temporary_path", "file_handle", "notes", "ｔoken"];
+for (const key of [...keys, ...keys]) assert.strictEqual(authoritativeBasisKeyIsUnsafe(key), authoritativeBasisKeyIsUnsafeUncached(key), key);
+// Past the bounded memo, uncached keys must still be classified exactly.
+for (let index = 0; index < 5000; index += 1) assert.strictEqual(authoritativeBasisKeyIsUnsafe("generated_key_" + index), false);
+assert.strictEqual(authoritativeBasisKeyIsUnsafe("generated_token_9999"), true);
+assert.strictEqual(authoritativeBasisKeyIsUnsafe("generated_note_9999"), false);
 process.stdout.write("ok");
 '''
         completed = subprocess.run(
