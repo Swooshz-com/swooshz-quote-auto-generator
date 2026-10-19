@@ -3055,6 +3055,250 @@ class WebappServerTest(unittest.TestCase):
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(payload))
         self.assertIsNone(webapp.quote_session_commercials(payload, {"commercials": {}})["subtotal"])
 
+    def owned_quote_currency_pricing_payload(
+        self, *, variant="manual", matched=True, price=1, quantity=3,
+        basis=3, approved=3, currency="AUD", exchange_rate=2,
+        tagged=True, override=True,
+    ):
+        payload = recovered_convergence_payload(
+            include_included_row=False, exchange_rate=exchange_rate,
+        )
+        details = payload["quote_session"]["draft_state"]["quoteDetails"]
+        details["currency"] = currency
+        reference = webapp.exact_pricing_reference_authority(payload)
+        self.assertTrue(reference["ok"])
+        catalog_item = webapp.pricing_catalog_runtime_lookup_for_payload(payload)[
+            "synthetic-floors-synthetic-carpet-tile"
+        ]
+        row = {
+            "source_basis_line_id": "saved-currency-control",
+            "section": "Synthetic Floors" if matched else "Custom Controls",
+            "description": catalog_item["description"] if matched else "Unlisted calibration control",
+            "pricing_keyword": catalog_item["id"] if matched else "",
+            "quantity": quantity,
+            "unit": "sqm" if matched else "nos",
+            "price_mode": "Included" if variant == "included" else "Priced",
+            "effective_unit_price": price,
+            "pricing_basis_amount": basis,
+            "approved_quote_amount": approved,
+        }
+        if override:
+            row["unit_price_override"] = price
+        row["pricing_authority"] = webapp.build_pricing_authority(
+            variant, row, price=price, reference_authority=reference,
+            catalog_item=catalog_item if variant == "catalog" else None,
+        )
+        if variant == "manual" and tagged:
+            row["pricing_authority"]["price_currency"] = currency
+        payload["quote_session"]["draft_state"]["outputRows"] = [row]
+        payload["line_items"] = copy.deepcopy([row])
+        return payload
+
+    def test_owned_quote_currency_manual_fx_generation_and_session_totals(self):
+        cases = (
+            ("AUD", 2, 1, 3, 3, 0.27, 3.27),
+            ("SGD", 2, 1, 3, 3, 0.27, 3.27),
+            ("AUD", 1, 1, 3, 3, 0.27, 3.27),
+            ("AUD", 1.37, 1.01, 3, 3.03, 0.27, 3.30),
+            ("AUD", 2, 10.25, 2.5, 25.63, 2.31, 27.94),
+            ("AUD", 2, 0, 2, 0, 0, 0),
+        )
+        for matched in (True, False):
+            for override in (True, False):
+                for currency, rate, price, quantity, amount, tax, total in cases:
+                    with self.subTest(matched=matched, override=override, currency=currency, rate=rate, price=price):
+                        payload = self.owned_quote_currency_pricing_payload(
+                            matched=matched, override=override, currency=currency,
+                            exchange_rate=rate, price=price, quantity=quantity,
+                            basis=amount, approved=amount,
+                        )
+                        original = copy.deepcopy(payload)
+                        for _ in range(2):
+                            canonical = webapp.quote_commercial_payload(payload)
+                            self.assertEqual(canonical["line_items"][0]["approved_quote_amount"], amount)
+                            self.assertEqual(webapp.quote_commercial_state_errors(payload), [])
+                            self.assertEqual(webapp.validate_generation_payload(payload), [])
+                            brief = webapp.payload_to_brief(payload)
+                            self.assertEqual(brief["line_items"][0]["approved_quote_amount"], amount)
+                            self.assertEqual(brief["line_items"][0]["pricing_authority"]["price_currency"], currency)
+                            summary = webapp.quote_session_commercials(payload, payload["quote_session"])
+                            self.assertEqual(summary, {
+                                "currency": currency, "exchange_rate": rate,
+                                "tax_label": "GST", "tax_rate": 0.09,
+                                "subtotal": amount, "tax_amount": tax, "grand_total": total,
+                            })
+                            payload = json.loads(json.dumps(payload))
+                        self.assertEqual(payload, original)
+
+    def test_owned_quote_currency_source_fx_and_included_controls(self):
+        cases = (
+            ("catalog", False, 14.4, 43.2, 86.4, 2),
+            ("catalog", False, 14.4, 43.2, 59.18, 1.37),
+            ("manual", False, 1.01, 3.03, 4.15, 1.37),
+            ("included", False, 0, 0, 0, 2),
+        )
+        for variant, tagged, price, basis, approved, rate in cases:
+            for override in (True, False):
+                with self.subTest(variant=variant, override=override, rate=rate):
+                    payload = self.owned_quote_currency_pricing_payload(
+                        variant=variant, tagged=tagged, override=override,
+                        price=price, basis=basis, approved=approved, exchange_rate=rate,
+                    )
+                    self.assertEqual(webapp.quote_commercial_state_errors(payload), [])
+                    self.assertEqual(webapp.validate_generation_payload(payload), [])
+                    brief = webapp.payload_to_brief(payload)
+                    row = brief["line_items"][0]
+                    self.assertEqual(row["pricing_authority"]["variant"], variant)
+                    self.assertEqual(row["approved_quote_amount"], approved)
+                    self.assertEqual(webapp.quote_session_commercials(payload, payload["quote_session"])["subtotal"], approved)
+
+    def test_owned_quote_currency_saved_payload_reaches_real_xlsx(self):
+        import generate_quote as quote
+        from tests.test_generate_quote import cell_value, find_cell_ref
+
+        for matched in (True, False):
+            payload = self.owned_quote_currency_pricing_payload(matched=matched)
+            payload["quote_session"]["draft_state"]["quoteDetails"]["company"]["logo_data_url"] = SANITIZED_LOGO_DATA_URL
+            # Read the owned snapshot through the same admission used by generation.
+            brief = webapp.payload_to_brief(json.loads(json.dumps(payload)))
+            identity = payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]
+            lines = quote.prepare_lines(
+                brief, [], allow_ambiguous=False, authority_required=True,
+                trusted_pricing_reference=identity,
+            )
+            self.assertEqual(quote.line_amount_value(lines[0], 2), 3)
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "quotation.xlsx"
+                quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, target, brief, lines)
+                with zipfile.ZipFile(target) as archive:
+                    sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+                subtotal_ref = find_cell_ref(sheet, "Total")
+                self.assertTrue(subtotal_ref)
+                subtotal_row = quote.parse_cell_ref(subtotal_ref)[0]
+                self.assertEqual(float(cell_value(sheet, f"E{subtotal_row}")), 3)
+                self.assertEqual(float(cell_value(sheet, f"E{subtotal_row + 1}")), 0.27)
+                self.assertEqual(float(cell_value(sheet, f"E{subtotal_row + 2}")), 3.27)
+                formulas = [node.text for node in sheet.iter(f"{webapp.NS_MAIN}f")]
+                self.assertTrue(any(value.startswith("SUM(") for value in formulas))
+                self.assertIn(f"ROUND(E{subtotal_row}*0.090000,2)", formulas)
+                self.assertTrue(any("AUD" in (node.text or "") for node in sheet.iter(f"{webapp.NS_MAIN}t")))
+                names = [node.text for node in workbook.iter(f"{webapp.NS_MAIN}definedName") if node.get("name") == "_xlnm.Print_Area"]
+                self.assertTrue(names)
+
+    def test_owned_quote_currency_explicit_edit_converges_stale_captures(self):
+        payload = self.owned_quote_currency_pricing_payload(basis=200, approved=274)
+        row = payload["quote_session"]["draft_state"]["outputRows"][0]
+        row["effective_unit_price"] = 100
+        row["catalog_unit_price"] = 999
+        canonical = webapp.quote_commercial_payload(payload)["line_items"][0]
+        self.assertEqual(canonical["pricing_basis_amount"], 3)
+        self.assertEqual(canonical["approved_quote_amount"], 3)
+        self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+    def test_owned_quote_currency_rejects_untrusted_authorities_and_snapshots(self):
+        base = self.owned_quote_currency_pricing_payload()
+        cases = {}
+        for key, value in (
+            ("price_currency", "SGD"), ("price_currency", "aud"),
+            ("price_currency", None), ("price_currency", 1),
+            ("currency", "AUD"), ("schema", "forged"),
+            ("version", True), ("price", "0x10"), ("price", -1),
+            ("extra", "AUD"),
+        ):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["outputRows"][0]["pricing_authority"][key] = value
+            cases[f"authority {key}={value}"] = candidate
+        for variant in ("none", "historical"):
+            candidate = copy.deepcopy(base)
+            row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+            row["pricing_authority"] = webapp.build_pricing_authority(variant, row)
+            cases[variant] = candidate
+        missing = copy.deepcopy(base)
+        missing["quote_session"]["draft_state"]["outputRows"][0].pop("pricing_authority")
+        cases["missing authority"] = missing
+        stale_context = copy.deepcopy(base)
+        stale_context["quote_session"]["draft_state"]["outputRows"][0]["pricing_authority"]["context"]["description"] = "Other row"
+        cases["stale context"] = stale_context
+        for key, value in (("id", "other"), ("source", "company"), ("digest", "sha256:" + "0" * 64)):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"][key] = value
+            cases["stale reference " + key] = candidate
+        for rate in (0, -1, None, "bad", float("inf")):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["quoteDetails"]["exchange_rate"] = rate
+            cases[f"rate {rate}"] = candidate
+        for snapshot in (None, {}, {"schema": "forged"}):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"] = snapshot
+            cases[f"snapshot {snapshot}"] = candidate
+        for label, candidate in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                with self.assertRaises(webapp.QuoteCommercialStateError):
+                    webapp.payload_to_brief(candidate)
+
+    def test_owned_quote_currency_included_rejects_contradictory_captures(self):
+        base = self.owned_quote_currency_pricing_payload(
+            variant="included", price=0, basis=0, approved=0,
+        )
+        self.assertEqual(webapp.validate_generation_payload(base), [])
+        for display_included in (True, False):
+            for field in ("pricing_basis_amount", "approved_quote_amount"):
+                for value in (999, -1, "???", float("inf"), float("nan"), True):
+                    candidate = copy.deepcopy(base)
+                    row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+                    if not display_included:
+                        row["price_mode"] = "Priced"
+                    row[field] = value
+                    with self.subTest(display_included=display_included, field=field, value=value):
+                        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                        with self.assertRaises(webapp.QuoteCommercialStateError):
+                            webapp.payload_to_brief(candidate)
+
+        # An override-only legacy marker is already rejected by the owned
+        # commercial invalid-override guard before normalization can coerce it.
+        for field in ("pricing_basis_amount", "approved_quote_amount"):
+            for value in (999, "???"):
+                candidate = self.owned_quote_currency_pricing_payload()
+                row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+                row["unit_price_override"] = "Included"
+                row[field] = value
+                canonical = webapp.quote_commercial_payload(candidate)
+                self.assertTrue(canonical["line_items"][0]["_commercial_invalid_unit_price_override"])
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                with self.assertRaises(webapp.QuoteCommercialStateError):
+                    webapp.payload_to_brief(candidate)
+
+    def test_owned_quote_currency_rejects_inconsistent_or_malformed_captured_amounts(self):
+        for variant, price, basis, approved in (("catalog", 14.4, 43.2, 86.4), ("manual", 1, 3, 3)):
+            base = self.owned_quote_currency_pricing_payload(
+                variant=variant, override=False, price=price, basis=basis, approved=approved,
+            )
+            for key, value in (("quantity", 4), ("pricing_basis_amount", 999), ("approved_quote_amount", 999)):
+                candidate = copy.deepcopy(base)
+                candidate["quote_session"]["draft_state"]["outputRows"][0][key] = value
+                with self.subTest(variant=variant, key=key):
+                    self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                    self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                    with self.assertRaises(webapp.QuoteCommercialStateError):
+                        webapp.payload_to_brief(candidate)
+            for override in (True, False):
+                for key in ("pricing_basis_amount", "approved_quote_amount"):
+                    for value in ("???", "not-a-number", float("nan"), float("inf"), -1, True):
+                        candidate = copy.deepcopy(base)
+                        row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+                        row[key] = value
+                        if override:
+                            row["unit_price_override"] = price
+                        with self.subTest(variant=variant, override=override, key=key, value=value):
+                            self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                            with self.assertRaises(webapp.QuoteCommercialStateError):
+                                webapp.payload_to_brief(candidate)
+
     def test_recovered_explicit_price_edit_replaces_stale_captured_price_everywhere(self):
         payload = recovered_convergence_payload(unit_price_override=120)
         saved_rows = payload["quote_session"]["draft_state"]["outputRows"]
