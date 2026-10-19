@@ -30,6 +30,15 @@ const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const controls = [];
 let state = {};
 let saveMode = "success";
+let activeOutputEditor = null;
+let committedOutputCurrency = "";
+let blockedEditorCommits = 0;
+function commitOutputEditor(editor) {
+  assert.strictEqual(editor, activeOutputEditor.editor);
+  assert.strictEqual(editor.value, "1.005");
+  blockedEditorCommits++;
+  return "blocked";
+}
 let postCount = 0;
 let releaseSave = null;
 let savedDraft = null;
@@ -153,7 +162,7 @@ const functions = ["safeQuoteSessionId", "isPlainObject", "revisionNumber", "spl
   "customerNextBlockReason",
   "checkpointGatedSidePanel", "advanceCustomerStep", "sidePanelBlockReason", "setSidePanel",
   "activeSidePanelIndex", "updateSidePanelNav", "appIsBusy", "appBusyTitle", "quoteOutputProgressForNavigation",
-  "goToNextSidePanel", "goToPreviousSidePanel", "furthestQuoteSessionSidePanel", "restoredQuoteSessionSidePanel"];
+  "commitActiveOutputEditor", "goToNextSidePanel", "goToPreviousSidePanel", "furthestQuoteSessionSidePanel", "restoredQuoteSessionSidePanel"];
 eval(functions.map(extract).join("\n"));
 function fresh() {
   state = {quoteSessionId: "quote-synthetic-checkpoint", activeSidePanel: "customer",
@@ -167,6 +176,7 @@ function fresh() {
     basisConfirmed: false, outputRevision: 0, downloadFile: null, pdfFile: null, boothDimensions: {},
     activeAppView: "quote", workflowStage: "details_review", isRecoveryScopeTransitioning: false};
   scope = "synthetic-scope"; saveMode = "success"; savedDraft = null;
+  activeOutputEditor = null; blockedEditorCommits = 0;
   quoteSessionInitialSavePromise = null; quoteSessionDraftSavePromise = null;
   quoteSessionConfirmedDraftSessionId = ""; quoteSessionConfirmedDraftKey = ""; quoteSessionConfirmedDraftFileKey = "";
   elements.profileSelect.value = "company::reference-a";
@@ -180,6 +190,26 @@ function selectB() {elements.profileSelect.value = "company::reference-b"; handl
 function committedCheckpoint() {return clone(state.customerStepCheckpoint);}
 function control(name, action) {action(); controls.push(name);}
 (async () => {
+  fresh();
+  const noEditorPosts = postCount;
+  await goToNextSidePanel();
+  control("no Output editor permits acknowledged Customer Next", () => {
+    assert.strictEqual(state.activeSidePanel, "quote_company");
+    assert.strictEqual(postCount, noEditorPosts + 1);
+    assert.strictEqual(customerStepCheckpointIsCurrent(), true);
+  });
+  fresh(); selectB();
+  activeOutputEditor = {editor: {value: "1.005"}};
+  const blockedState = clone(state), blockedPosts = postCount;
+  await goToNextSidePanel();
+  goToPreviousSidePanel();
+  control("blocked Output editor prevents forward/backward navigation and save", () => {
+    assert.strictEqual(blockedEditorCommits, 2);
+    assert.deepStrictEqual(state, blockedState);
+    assert.strictEqual(postCount, blockedPosts);
+    assert.strictEqual(savedDraft, null);
+    assert.strictEqual(activeOutputEditor.editor.value, "1.005");
+  });
   for (const [name, digest] of [
     ["bare hex", "a".repeat(64)],
     ["malformed", "sha256:invalid"],

@@ -2298,8 +2298,14 @@ function customCurrencyInputIsValid(input = elements.pricingReferenceCurrencyCus
   return /^[A-Z]{3}$/.test(normalizedCustomCurrencyInput(input));
 }
 
+let committedOutputCurrency = "";
+let activeOutputEditor = null;
+let blockedOutputDraftSaveOptions = null;
+const outputRowIdentities = new WeakMap();
+
 function setQuoteCurrencyControls(value = DEFAULT_CURRENCY_LABEL) {
   const normalized = normalizeCurrencyLabel(value);
+  committedOutputCurrency = normalized;
   const isSupported = isStandardCurrencyCode(normalized);
   if (elements.quoteCurrency) {
     elements.quoteCurrency.value = isSupported ? normalized : CUSTOM_CURRENCY_VALUE;
@@ -3139,6 +3145,7 @@ function quoteCommercialSnapshotHasUserValues(snapshot = {}) {
 }
 
 function restoreQuoteCommercialOverrideSnapshot(snapshot = {}, options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (!quoteCommercialSnapshotHasUserValues(snapshot)) return false;
   const values = snapshot.values && typeof snapshot.values === "object" ? snapshot.values : {};
   const touched = normalizeQuoteCommercialTouched(snapshot.quoteCommercialTouched || {});
@@ -3153,6 +3160,7 @@ function restoreQuoteCommercialOverrideSnapshot(snapshot = {}, options = {}) {
     elements.quoteCurrencyCustom.value = normalizedCustomCurrencyInput({ value: values.quoteCurrencyCustom });
   }
   syncQuoteCurrencyCustomInput();
+  committedOutputCurrency = quoteCurrencyControlValue();
   syncQuoteExchangeRateField();
   syncQuoteCommercialContextPills();
   updateOutputHeader();
@@ -3183,7 +3191,7 @@ function collectTaxDetails() {
 }
 
 function collectQuoteCurrency() {
-  const value = quoteCurrencyControlValue();
+  const value = committedOutputCurrency || quoteCurrencyControlValue();
   if (["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""))) {
     return value ? normalizeCurrencyLabel(value) : "";
   }
@@ -3880,6 +3888,7 @@ function applyQuoteDetails(details = {}, options = {}) {
     const savedCurrency = String(details.currency ?? "").trim();
     if (ownedCommercial && !savedCurrency) {
       if (elements.quoteCurrency) elements.quoteCurrency.value = "";
+      committedOutputCurrency = "";
       if (elements.quoteCurrencyCustom) {
         elements.quoteCurrencyCustom.value = "";
         elements.quoteCurrencyCustom.hidden = true;
@@ -4375,6 +4384,7 @@ async function purgeBrowserRecoveryState() {
 }
 
 function saveSessionState() {
+  if (commitActiveOutputEditor({ commit: false }) === "blocked") return;
   if (state.isBooting || !currentBrowserRecoveryScope()) return;
   try {
     if (state.activeAppView === "dashboard" && !safeQuoteSessionId(state.quoteSessionId) && !quoteDraftShouldPersistToDashboard()) {
@@ -4720,6 +4730,7 @@ function quoteCommercialRestorationReviewReason(saved = {}, normalizedSnapshot =
 }
 
 async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION) {
     return false;
   }
@@ -5930,6 +5941,7 @@ function clearQuoteCompanyDetails() {
 }
 
 function resetImagesDraft() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (appIsBusy()) return;
   state.images = [];
   if (elements.imageInput) elements.imageInput.value = "";
@@ -5941,6 +5953,7 @@ function resetImagesDraft() {
 }
 
 async function startNewQuote() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (appIsBusy()) return;
   clearSessionState();
   resetCurrentQuoteDraftState();
@@ -5949,6 +5962,7 @@ async function startNewQuote() {
 }
 
 function resetCurrentQuoteDraftState() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   invalidateAuthorityProfileRequests();
   clearQuoteSessionDraftSaveTimer();
   transitionGenerationContext("", "");
@@ -8375,6 +8389,7 @@ function exportSelectedPricingReference(event) {
 }
 
 function openPricingReferenceModal(options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   stopElapsedTimer("pricingReferenceImportElapsed");
   stopElapsedTimer("pricingReferenceSaveElapsed");
   state.pendingPricingReference = null;
@@ -9374,6 +9389,7 @@ function showGeneratedExportReadyModal(viewPdf = false) {
 }
 
 function handleGeneratedExportReadyAction() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const action = elements.excelGeneratingActionButton?.dataset.exportAction || "";
   const handled = action === "pdf" ? viewCurrentPdfFile() : action === "excel" ? downloadCurrentExcelFile() : false;
   if (handled) hideExcelGeneratingModal();
@@ -9441,6 +9457,7 @@ function discardInvalidRestoredActiveJob() {
 
 
 function downloadCurrentExcelFile(file = state.downloadFile) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (!downloadFileIsFresh(file)) return false;
   try {
     const link = document.createElement("a");
@@ -9456,6 +9473,7 @@ function downloadCurrentExcelFile(file = state.downloadFile) {
 }
 
 function viewCurrentPdfFile(file = state.pdfFile, preparedWindow = null) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (!file?.url) {
     if (preparedWindow && !preparedWindow.closed) preparedWindow.close();
     return false;
@@ -10125,25 +10143,81 @@ function resetOutputSortModeToPricingReference() {
   if (typeof elements !== "undefined" && elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
 }
 
+function outputRowIdentity(row) {
+  if (!outputRowIdentities.has(row)) outputRowIdentities.set(row, {});
+  return outputRowIdentities.get(row);
+}
+
+function preserveOutputRowIdentity(source, target) {
+  outputRowIdentities.set(target, outputRowIdentity(source));
+  return target;
+}
+
+function outputPriceAuthority(row = {}) {
+  return normalizeOutputPricingAuthority(row.pricing_authority, row);
+}
+
+function outputPriceDenomination(row = {}) {
+  const authority = outputPriceAuthority(row);
+  return authority?.variant === "manual" && Object.hasOwn(authority, "price_currency") ? "quote" : "reference";
+}
+
 function outputCellDisplayValue(row = {}, field = "") {
-  if (field === "price_mode") return row.price_mode === "Included" ? "Included" : "Priced";
-  if (field === "unit_price_override") {
-    if (row.price_mode === "Included") return "Included";
-    if (unitPriceEditKind(row.unit_price_override) === "invalid") return "???";
-    const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
-    if (ownedCommercial) {
-      const effective = effectiveOutputUnitPrice(row);
-      return effective === null ? "???" : formatAmount(quoteAmountValue(effective, outputRowFxMultiplier(row)));
-    }
-    if (numberOrNull(row.unit_price_override) !== null) return formatAmount(quoteAmountValue(row.unit_price_override, outputRowFxMultiplier(row)));
-    if (numberOrNull(row.catalog_unit_price) !== null) return formatAmount(quoteAmountValue(row.catalog_unit_price));
-    return "???";
-  }
-  if (field === "amount") {
-    if (row.price_mode === "Included") return "0.00";
+  if (field === "price_mode") return outputPriceAuthority(row)?.variant === "included" ? "Included" : "Priced";
+  if (["unit_price_override", "quoted_unit_price", "amount"].includes(field)) {
+    const authority = outputPriceAuthority(row);
+    const price = pricingAuthorityPrice(authority);
+    if (price === null) return "???";
+    if (authority.variant === "included") return field === "amount" ? "0.00" : "Included";
+    if (field === "unit_price_override") return outputPriceDenomination(row) === "quote" ? "Inactive" : formatAmount(price);
+    if (field === "quoted_unit_price") return formatAmount(quoteAmountValue(price, outputRowFxMultiplier(row)));
     return formatAmount(quoteAmountValue(row.amount, outputRowFxMultiplier(row))) || "???";
   }
   return String(row[field] ?? "").trim() || "???";
+}
+
+// Reject precision loss before converting the authored decimal to Number.
+function admittedOutputPrice(text) {
+  const value = String(text).trim();
+  if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(value)) return null;
+  const canonical = (s) => {
+    const [coefficient, exponent = "0"] = s.toLowerCase().split("e");
+    const decimalPlaces = coefficient.includes(".") ? coefficient.length - coefficient.indexOf(".") - 1 : 0;
+    const digits = coefficient.replace(".", "").replace(/^0+/, "");
+    if (!digits) return "0";
+    const significant = digits.replace(/0+$/, "");
+    return significant + "e" + (Number(exponent) - decimalPlaces + digits.length - significant.length);
+  };
+  const normalized = pricingAuthorityNumber(value);
+  return normalized !== null && canonical(value) === canonical(String(normalized)) ? normalized : null;
+}
+
+function resumeBlockedOutputDraftSave() {
+  if (!blockedOutputDraftSaveOptions || commitActiveOutputEditor() === "blocked") return;
+  const options = blockedOutputDraftSaveOptions;
+  blockedOutputDraftSaveOptions = null;
+  queueQuoteSessionDraftStateSave(options);
+}
+
+function revokeOutputEditor() {
+  const pending = activeOutputEditor;
+  activeOutputEditor = null;
+  if (pending?.editor?.dataset) pending.editor.dataset.outputCommitSuperseded = "true";
+}
+
+function blockOutputEditor(editor, message) {
+  editor.setAttribute("aria-invalid", "true");
+  editor.setCustomValidity?.(message);
+  const cell = editor.closest(".output-edit-cell");
+  let error = cell?.querySelector(".output-editor-error");
+  if (!error && cell) {
+    error = document.createElement("span");
+    error.className = "output-editor-error" + (editor.dataset.outputEditorField === "unit_price_override" ? " sr-only" : "");
+    error.setAttribute("role", "alert");
+    cell.append(error);
+  }
+  if (error) error.textContent = message;
+  return "blocked";
 }
 
 function outputEditorPlaceholder(field = "") {
@@ -10161,40 +10235,23 @@ function outputEditorPlaceholder(field = "") {
   return placeholders[field] || "e.g. Returning client adjustment";
 }
 
-function outputEditorHtml(row = {}, index = 0, field = "") {
-  const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
-  const unitPriceValue = ownedCommercial
-    ? effectiveOutputUnitPrice(row)
-    : (row.unit_price_override || row.catalog_unit_price || "");
-  const value = field === "unit_price_override"
-    ? row.price_mode === "Included"
-      ? "Included"
-      : String(unitPriceValue === null || unitPriceValue === "" ? "" : quoteAmountValue(unitPriceValue, outputRowFxMultiplier(row)))
+function outputEditorHtml(row = {}, index = 0, field = "", options = {}) {
+  const priceField = field === "unit_price_override";
+  const authority = outputPriceAuthority(row);
+  const price = pricingAuthorityPrice(authority);
+  const value = options.staged ? "" : priceField
+    ? authority?.variant === "included" || price === null ? "" : price.toLocaleString("en-US", { useGrouping: false, maximumFractionDigits: 2 })
     : String(row[field] ?? "");
-  if (field === "description") {
-    return `<textarea class="output-cell-input output-description-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" rows="3" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">${escapeHtml(value)}</textarea>`;
+  const denomination = options.denomination || outputPriceDenomination(row);
+  const label = priceField ? (denomination === "quote" ? "Quote-currency override " + collectQuoteCurrency() : "Reference price " + selectedPricingReferenceCurrency()) : field;
+  const attrs = 'class="output-cell-input is-editing" data-output-editor-field="' + field + '" data-output-row="' + index + '" aria-label="' + escapeHtml(label) + '"';
+  if (field === "description") return '<textarea ' + attrs.replace('output-cell-input', 'output-cell-input output-description-input') + ' rows="3" placeholder="' + escapeHtml(outputEditorPlaceholder(field)) + '">' + escapeHtml(value) + '</textarea>';
+  if (priceField) {
+    const unavailable = outputCatalogueBaseline(row) === null;
+    const switchLabel = "Use reference price";
+    return '<span class="output-unit-price-editor"><input ' + attrs + ' value="' + escapeHtml(value) + '" inputmode="decimal"><span class="output-price-editor-actions"><button class="output-included-button" type="button" data-output-included-action="true" data-output-row="' + index + '">Included</button><button class="output-price-mode output-price-switch" type="button" data-output-reference-action="true" data-output-row="' + index + '"' + (unavailable ? ' disabled title="Catalogue price unavailable"' : '') + '>' + escapeHtml(switchLabel) + '</button></span></span>';
   }
-  if (field === "price_mode") {
-    return `
-      <select class="output-cell-input is-editing" data-output-editor-field="${field}" data-output-row="${index}">
-        <option value="Priced" ${row.price_mode === "Included" ? "" : "selected"}>Priced</option>
-        <option value="Included" ${row.price_mode === "Included" ? "selected" : ""}>Included</option>
-      </select>
-    `;
-  }
-  if (field === "unit_price_override") {
-    const includedButton = row.price_mode !== "Included"
-      ? `<button class="output-included-button" type="button" data-output-included-action="true" data-output-row="${index}" aria-label="Mark row ${index + 1} unit price as included" title="Mark unit price as Included">Included</button>`
-      : "";
-    return `
-      <span class="output-unit-price-editor">
-        <input class="output-cell-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" value="${escapeHtml(value)}" inputmode="decimal" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">
-        ${includedButton}
-      </span>
-    `;
-  }
-  const inputMode = field === "quantity" ? "decimal" : "text";
-  return `<input class="output-cell-input is-editing" data-output-editor-field="${field}" data-output-row="${index}" value="${escapeHtml(value)}" inputmode="${inputMode}" placeholder="${escapeHtml(outputEditorPlaceholder(field))}">`;
+  return '<input ' + attrs + ' value="' + escapeHtml(value) + '" inputmode="' + (field === "quantity" ? "decimal" : "text") + '" placeholder="' + escapeHtml(outputEditorPlaceholder(field)) + '">';
 }
 
 function renderOutputEditCell(row = {}, index = 0, field = "", extraClass = "") {
@@ -10223,6 +10280,54 @@ function renderOutputEditCell(row = {}, index = 0, field = "", extraClass = "") 
       ${cellBody}
     </td>
   `;
+}
+
+// Display-only catalogue lookup: never promote a cached row price or manual authority.
+function outputCatalogueBaseline(row = {}) {
+  const admitted = quoteCommercialSnapshotPricingBasis();
+  const reference = currentPricingReference();
+  const basis = pricingReferenceAuthorityBasis(reference);
+  if (!samePricingReferenceBasis(admitted, basis) || quoteCommercialReviewRequired()) return null;
+  const selected = state.pricingReferences.filter((candidate) => (
+    String(candidate?.id || "").trim() === basis.id
+    && String(candidate?.source || "").trim() === basis.source
+  ));
+  if (selected.length !== 1) return null;
+  const rowBasisFields = {
+    pricing_basis_currency: "currency", pricing_reference_source: "source",
+    pricing_reference_id: "id", pricing_basis_digest: "digest",
+  };
+  if (Object.entries(rowBasisFields).some(([field, key]) => (
+    Object.hasOwn(row, field) && row[field] !== admitted[key]
+  ))) return null;
+  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  if (!item) return null;
+  const context = pricingAuthorityContext(row);
+  const description = pricingAuthorityCatalogDescription(item);
+  const section = canonicalPricingAuthorityText(item.section || "");
+  const unit = canonicalPricingAuthorityUnit(item.unit || item.unit_hint || "");
+  const bracketed = bracketedCatalogReferenceParts(context.description);
+  if (!description || !section || !unit
+    || context.section !== section
+    || context.unit !== unit
+    || canonicalPricingAuthorityText(bracketed?.reference || context.description) !== description) return null;
+  return pricingAuthorityNumber(item.sale_unit_price ?? item.catalog_unit_price ?? item.unit_price);
+}
+
+function renderOutputPriceCells(row, index) {
+  const mode = outputPriceDenomination(row);
+  const authority = outputPriceAuthority(row);
+  const included = authority?.variant === "included";
+  const customReference = mode === "reference" && authority?.variant === "manual";
+  const source = selectedPricingReferenceCurrency();
+  const quote = collectQuoteCurrency();
+  const baseline = outputCatalogueBaseline(row);
+  const referenceDisplay = baseline === null ? "Unavailable" : formatAmount(baseline);
+  const cell = (label, denomination, editable, value, note = "") => '<td class="output-unit-price-cell' + (editable ? ' output-edit-cell' : '') + (denomination === "quote" ? ' output-price-entry' : '') + (denomination === "quote" && mode === "quote" ? ' output-custom-price' : '') + '" data-output-label="' + escapeHtml(label) + '" ' + (editable ? 'data-output-edit-field="unit_price_override" data-output-denomination="' + denomination + '" ' : '') + (denomination === "quote" ? 'data-output-price-entry="quote" ' : '') + (editable || denomination === "quote" ? 'tabindex="0" title="Click to edit" ' : '') + 'data-output-row="' + index + '"><span class="output-price-content"><span class="output-cell-text">' + escapeHtml(value) + '</span>' + note + '</span></td>';
+  const rate = escapeHtml(String(collectQuoteExchangeRate() ?? 'Review required'));
+  return cell('Reference price ' + source, "reference", false, referenceDisplay, '<small>Catalogue reference (read-only)</small>')
+    + '<td class="output-fx-cell" data-output-label="FX ' + escapeHtml(quote + ' per ' + source) + '"><span>' + (mode === "quote" || included ? '<strong class="output-fx-unused">Not used</strong><small>Rate: ' + rate + '</small>' : rate + (customReference ? '<small>On custom reference ' + escapeHtml(formatAmount(authority.price) + ' ' + source) + '</small>' : '')) + '</span></td>'
+    + cell('Quoted unit price ' + quote, "quote", true, outputCellDisplayValue(row, "quoted_unit_price"));
 }
 
 function ensureOutputRowsFromLineItems() {
@@ -10373,6 +10478,7 @@ function renderOutputDeleteModal() {
 }
 
 function requestOutputRowDelete(index) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (appIsBusy()) return;
   if (!Number.isInteger(index) || index < 0 || !state.outputRows[index]) return;
   state.outputDeleteRowIndex = index;
@@ -10380,6 +10486,7 @@ function requestOutputRowDelete(index) {
 }
 
 function confirmOutputRowDelete() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const index = state.outputDeleteRowIndex;
   if (!Number.isInteger(index) || index < 0 || !state.outputRows[index]) {
     hideOutputDeleteModal();
@@ -10398,6 +10505,7 @@ function confirmOutputRowDelete() {
 }
 
 function deleteOutputRow(index) {
+  if (commitActiveOutputEditor() === "blocked") return;
   requestOutputRowDelete(index);
 }
 
@@ -10485,6 +10593,15 @@ function outputHeaderStatus(rows = state.outputRows) {
 }
 
 function updateOutputHeader(rows = state.outputRows) {
+  const headings = elements.pricingMatchesBody?.closest?.("table")?.querySelectorAll("thead th");
+  if (headings?.length === 9) {
+    const source = selectedPricingReferenceCurrency();
+    const quote = collectQuoteCurrency();
+    headings[4].textContent = "Reference price " + source;
+    headings[5].textContent = "FX " + quote + " per " + source;
+    headings[6].textContent = "Quoted unit price " + quote;
+    headings[7].textContent = "Amount " + quote;
+  }
   const safeRows = Array.isArray(rows) ? rows : [];
   const status = outputHeaderStatus(safeRows);
   if (elements.outputStatusPill) {
@@ -10539,13 +10656,17 @@ function renderMatchSummary(result = {}) {
 }
 
 function renderPricingMatches(rows = [], options = {}) {
+  if (activeOutputEditor) {
+    commitActiveOutputEditor({ commit: false });
+    return false;
+  }
   state.pricingMatches = (Array.isArray(rows) ? rows : []).map((row) => (
-    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row
+    preserveOutputRowIdentity(row, typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(row) : row)
   ));
   if (options.fromPricingMatches) {
     state.outputRows = state.pricingMatches.map(outputRowFromPricingMatch);
   } else if (state.pricingMatches.length && state.pricingMatches[0]?.price_mode) {
-    state.outputRows = state.pricingMatches.map(normalizeOutputRow);
+    state.outputRows = state.pricingMatches.map((row) => preserveOutputRowIdentity(row, normalizeOutputRow(row)));
   }
   state.outputRows = sortOutputRows(state.outputRows);
   if (elements.outputSortMode) elements.outputSortMode.value = state.outputSortMode;
@@ -10554,7 +10675,7 @@ function renderPricingMatches(rows = [], options = {}) {
   elements.pricingTableWrap.hidden = !outputRows.length;
   elements.pricingEmptyState.hidden = Boolean(outputRows.length) || Boolean(elements.pricingReviewMessages.innerHTML.trim());
   if (!outputRows.length) {
-    elements.pricingMatchesBody.innerHTML = `<tr><td colspan="7">No output rows yet.</td></tr>`;
+    elements.pricingMatchesBody.innerHTML = `<tr><td colspan="9">No output rows yet.</td></tr>`;
     updateDownloadButton();
     return;
   }
@@ -10565,7 +10686,7 @@ function renderPricingMatches(rows = [], options = {}) {
         ${renderOutputEditCell(row, index, "description", "output-description-cell")}
         ${renderOutputEditCell(row, index, "quantity")}
         ${renderOutputEditCell(row, index, "unit")}
-        ${renderOutputEditCell(row, index, "unit_price_override")}
+        ${renderOutputPriceCells(row, index)}
         <td class="amount-cell ${outputCellDisplayValue(row, "amount") === "???" ? "is-pending" : ""}" data-output-label="Amount">${escapeHtml(outputCellDisplayValue(row, "amount"))}</td>
         <td class="output-row-actions" data-output-label="Delete">
           <button class="output-delete-button" type="button" data-output-delete-row="${index}" aria-label="Delete row">Del</button>
@@ -10586,57 +10707,57 @@ function clearPricingReviewMessages() {
 }
 
 function handleOutputRowEdit(event) {
+  if (appIsBusy()) return;
   const input = event.target.closest("[data-output-field]");
   if (!input) return;
-  const index = Number(input.dataset.outputRow);
-  const field = input.dataset.outputField;
-  if (!Number.isInteger(index) || index < 0 || !state.outputRows[index] || !field) return;
-  let nextRow = {
-    ...state.outputRows[index],
-    [field]: input.value,
-  };
-  if (["source_basis_line_id", "section", "description", "unit", "pricing_keyword"].includes(field)) {
-    if (typeof buildPricingAuthority === "function") nextRow.pricing_authority = buildPricingAuthority("historical", nextRow);
-    else delete nextRow.pricing_authority;
+  if (!activeOutputEditor || activeOutputEditor.editor !== input) {
+    if (commitActiveOutputEditor() === "blocked") return;
+    const row = state.outputRows[Number(input.dataset.outputRow)];
+    if (!row) return;
+    input.dataset.outputEditorField = input.dataset.outputField;
+    activeOutputEditor = { editor: input, row, revision: state.outputRevision, denomination: outputPriceDenomination(row), staged: false };
   }
-  if (field === "unit_price_override") nextRow = synchronizeOwnedOutputRowPrice(nextRow, input.value, { force: true, quoteCurrencyPrice: true });
-  state.outputRows[index] = recalculateOutputRow(nextRow);
-  state.lineItems = outputRowsToLineItems();
-  markOutputRowsDirty();
-  const validation = outputRowsValid();
-  renderOutputValidationMessages(validation.valid ? [] : validation.errors);
-  renderPricingMatches(state.outputRows);
-  syncControlStates();
-  if (typeof queueQuoteSessionDraftStateSave === "function") queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+  commitOutputEditor(input);
 }
 
 function commitOutputEditor(editor) {
-  if (!editor || !editor.dataset.outputEditorField) return;
-  if (editor.isConnected === false) return;
-  const index = Number(editor.dataset.outputRow);
+  const pending = activeOutputEditor;
+  if (!pending || pending.editor !== editor || editor.dataset.outputCommitSuperseded === "true") return "unchanged";
+  if (editor.isConnected === false || !state.outputRows.includes(pending.row) || pending.revision !== state.outputRevision) {
+    revokeOutputEditor();
+    return "unchanged";
+  }
+  const index = state.outputRows.indexOf(pending.row);
   const field = editor.dataset.outputEditorField;
-  if (!Number.isInteger(index) || index < 0 || !state.outputRows[index] || !field) return;
-  const currentRow = state.outputRows[index];
+  const currentRow = pending.row;
   let nextRow = { ...currentRow, [field]: editor.value };
-  if (["source_basis_line_id", "section", "description", "unit", "pricing_keyword"].includes(field)) {
-    if (typeof buildPricingAuthority === "function") nextRow.pricing_authority = buildPricingAuthority("historical", nextRow);
-    else delete nextRow.pricing_authority;
-  }
   if (field === "unit_price_override") {
-    const value = String(editor.value || "").trim();
-    if (value.toLowerCase() === "included" || (currentRow.price_mode === "Included" && value === "")) {
-      nextRow = { ...currentRow, price_mode: "Included", unit_price_override: "", display_price: "Included" };
-      if (typeof buildPricingAuthority === "function") {
-        nextRow.pricing_authority = buildPricingAuthority("included", nextRow) || buildPricingAuthority("historical", nextRow);
-      } else {
-        delete nextRow.pricing_authority;
-      }
-    } else {
-      nextRow = { ...currentRow, price_mode: "Priced", display_price: "", unit_price_override: value };
-      nextRow = synchronizeOwnedOutputRowPrice(nextRow, value, { force: true, quoteCurrencyPrice: true });
+    const value = String(editor.value).trim();
+    if (value.toLowerCase() === "included") return applyOutputIncludedAction(editor);
+    const price = admittedOutputPrice(value);
+    if (price === null) return blockOutputEditor(editor, "Enter a nonnegative price with exact cent precision, or cancel with Escape.");
+    const authority = outputPriceAuthority(currentRow);
+    if (!pending.staged && authority && authority.variant !== "included" && authority.price === price && outputPriceDenomination(currentRow) === pending.denomination) {
+      revokeOutputEditor();
+      renderPricingMatches(state.outputRows);
+      resumeBlockedOutputDraftSave();
+      return "unchanged";
     }
+    nextRow = { ...currentRow, price_mode: "Priced" };
+    delete nextRow.display_price;
+    nextRow = synchronizeOwnedOutputRowPrice(nextRow, value, { force: true, quoteCurrencyPrice: pending.denomination === "quote" });
+    if (outputPriceAuthority(nextRow)?.variant !== "manual") return blockOutputEditor(editor, "Pricing context needs review before this price can be committed.");
+  } else {
+    if (String(currentRow[field] ?? "") === editor.value) {
+      revokeOutputEditor();
+      renderPricingMatches(state.outputRows);
+      return "unchanged";
+    }
+    if (["source_basis_line_id", "section", "description", "unit", "pricing_keyword"].includes(field)) nextRow.pricing_authority = buildPricingAuthority("historical", nextRow);
   }
-  state.outputRows[index] = recalculateOutputRow(nextRow);
+  // Consume before rerender, so synchronous focusout/change cannot replay.
+  revokeOutputEditor();
+  state.outputRows[index] = preserveOutputRowIdentity(currentRow, recalculateOutputRow(nextRow));
   state.lineItems = outputRowsToLineItems();
   markOutputRowsDirty();
   const validation = outputRowsValid();
@@ -10644,27 +10765,56 @@ function commitOutputEditor(editor) {
   renderPricingMatches(state.outputRows);
   renderMatchSummary({ pricing_matches: state.outputRows });
   syncControlStates();
-  if (typeof queueQuoteSessionDraftStateSave === "function") queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+  queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+  return "committed";
 }
 
 function applyOutputIncludedAction(button) {
-  const index = Number(button?.dataset.outputRow);
-  if (!Number.isInteger(index) || index < 0 || !state.outputRows[index]) return;
-  const unitPriceEditor = button?.closest?.(".output-edit-cell")
-    ?.querySelector?.('[data-output-editor-field="unit_price_override"]');
-  if (unitPriceEditor?.dataset) unitPriceEditor.dataset.outputCommitSuperseded = "true";
-  const nextRow = {
-    ...state.outputRows[index],
-    price_mode: "Included",
-    unit_price_override: "",
-    display_price: "Included",
-  };
-  if (typeof buildPricingAuthority === "function") {
-    nextRow.pricing_authority = buildPricingAuthority("included", nextRow) || buildPricingAuthority("historical", nextRow);
-  } else {
-    delete nextRow.pricing_authority;
-  }
-  state.outputRows[index] = recalculateOutputRow(nextRow);
+  if (appIsBusy()) return "unchanged";
+  const pending = activeOutputEditor;
+  const index = pending && (button === pending.editor || button.closest?.(".output-edit-cell")?.contains(pending.editor))
+    ? state.outputRows.indexOf(pending.row) : Number(button?.dataset.outputRow);
+  if (!Number.isInteger(index) || index < 0 || !state.outputRows[index]) return "unchanged";
+  if (pending && (pending.row !== state.outputRows[index] || pending.revision !== state.outputRevision)) return "unchanged";
+  const row = state.outputRows[index];
+  const unchanged = outputPriceAuthority(row)?.variant === "included";
+  revokeOutputEditor();
+  if (unchanged) { renderPricingMatches(state.outputRows); return "unchanged"; }
+  const next = { ...row, price_mode: "Included", unit_price_override: "" };
+  delete next.display_price;
+  next.pricing_authority = buildPricingAuthority("included", next);
+  state.outputRows[index] = recalculateOutputRow(next);
+  state.lineItems = outputRowsToLineItems();
+  markOutputRowsDirty();
+  renderPricingMatches(state.outputRows);
+  renderMatchSummary({ pricing_matches: state.outputRows });
+  syncControlStates();
+  queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+  return "committed";
+}
+
+function applyOutputReferencePricing(button) {
+  if (appIsBusy() || !button?.isConnected || !elements.pricingMatchesBody.contains(button)) return "unchanged";
+  const pending = activeOutputEditor;
+  const index = state.outputRows.indexOf(pending?.row);
+  if (!pending || index < 0 || pending.revision !== state.outputRevision
+    || !button.closest(".output-edit-cell")?.contains(pending.editor)) return "unchanged";
+  const row = state.outputRows[index];
+  const price = outputCatalogueBaseline(row);
+  const reference = currentPricingReference();
+  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  if (price === null || !item) return "unchanged";
+  const next = { ...row, price_mode: "Priced" };
+  delete next.display_price;
+  const authority = normalizeOutputPricingAuthority(
+    buildPricingAuthority("catalog", next, { price, reference, catalogItem: item }), next, { reference, catalogItem: item },
+  );
+  if (!authority) return "unchanged";
+  const unchanged = outputPriceAuthority(row)?.variant === "catalog";
+  revokeOutputEditor();
+  if (unchanged) { renderPricingMatches(state.outputRows); resumeBlockedOutputDraftSave(); return "unchanged"; }
+  next.pricing_authority = authority;
+  state.outputRows[index] = preserveOutputRowIdentity(row, recalculateOutputRow(applyPricingAuthorityProjection(next, authority)));
   state.lineItems = outputRowsToLineItems();
   markOutputRowsDirty();
   const validation = outputRowsValid();
@@ -10672,22 +10822,52 @@ function applyOutputIncludedAction(button) {
   renderPricingMatches(state.outputRows);
   renderMatchSummary({ pricing_matches: state.outputRows });
   syncControlStates();
-  if (typeof queueQuoteSessionDraftStateSave === "function") queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+  queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+  return "committed";
 }
 
-function openOutputCellEditor(cell) {
+function openOutputCellEditor(cell, options = {}) {
+  if (appIsBusy()) return;
   if (!cell || cell.querySelector("[data-output-editor-field]")) return;
-  const index = Number(cell.dataset.outputRow);
-  const field = cell.dataset.outputEditField;
-  if (!Number.isInteger(index) || index < 0 || !state.outputRows[index] || !field) return;
-  cell.innerHTML = outputEditorHtml(state.outputRows[index], index, field);
+  let index = Number(cell.dataset.outputRow);
+  if (!state.outputRows[index]) return;
+  const identity = outputRowIdentity(state.outputRows[index]);
+  const column = cell.cellIndex;
+  const entryDenomination = options.denomination || cell.dataset.outputPriceEntry;
+  const field = entryDenomination ? "unit_price_override" : cell.dataset.outputEditField;
+  if (commitActiveOutputEditor() === "blocked") return;
+  index = state.outputRows.findIndex((row) => outputRowIdentity(row) === identity);
+  cell = elements.pricingMatchesBody.querySelector('tr[data-output-row="' + index + '"]')?.children[column];
+  const row = state.outputRows[index];
+  if (!cell || !row || !field) return;
+  const denomination = entryDenomination || outputPriceDenomination(row);
+  const staged = options.staged === true || (field === "unit_price_override" && (denomination !== outputPriceDenomination(row) || outputPriceAuthority(row)?.variant === "included"));
+  if (field === "unit_price_override") {
+    cell.parentElement.querySelectorAll('[data-output-edit-field="unit_price_override"]').forEach((other) => {
+      other.classList.remove("output-edit-cell");
+      other.removeAttribute("data-output-edit-field");
+      other.removeAttribute("tabindex");
+    });
+    cell.dataset.outputEditField = field;
+    cell.dataset.outputDenomination = denomination;
+    cell.tabIndex = 0;
+  }
+  cell.classList.add("output-edit-cell");
+  cell.innerHTML = outputEditorHtml(row, index, field, { ...options, denomination, staged });
   const editor = cell.querySelector("[data-output-editor-field]");
   if (!editor) return;
+  activeOutputEditor = { editor, row, revision: state.outputRevision, denomination, staged };
   editor.focus();
-  if (typeof editor.select === "function") editor.select();
+  editor.select?.();
 }
 
 function handleOutputCellClick(event) {
+  const referenceButton = event.target.closest("[data-output-reference-action]");
+  if (referenceButton) {
+    event.preventDefault();
+    applyOutputReferencePricing(referenceButton);
+    return;
+  }
   const deleteButton = event.target.closest("[data-output-delete-row]");
   if (deleteButton) {
     event.preventDefault();
@@ -10701,28 +10881,31 @@ function handleOutputCellClick(event) {
     return;
   }
   if (event.target.closest("[data-output-editor-field]")) return;
-  const cell = event.target.closest(".output-edit-cell");
+  const cell = event.target.closest(".output-edit-cell, [data-output-price-entry]");
   if (!cell) return;
   openOutputCellEditor(cell);
 }
 
 function handleOutputIncludedPointerDown(event) {
-  if (!event.target.closest("[data-output-included-action]")) return;
+  if (!event.target.closest("[data-output-included-action], [data-output-reference-action]")) return;
   event.preventDefault();
 }
 
 function handleOutputCellOpen(event) {
-  const cell = event.target.closest(".output-edit-cell");
+  const cell = event.target.closest(".output-edit-cell, [data-output-price-entry]");
   if (!cell) return;
   openOutputCellEditor(cell);
 }
 
 function handleOutputCellKeydown(event) {
-  const editor = event.target.closest("[data-output-editor-field]");
+  const editor = event.target.closest("[data-output-editor-field]")
+    || (event.key === "Escape" ? event.target.closest(".output-unit-price-editor")?.querySelector("[data-output-editor-field]") : null);
   if (editor) {
     if (event.key === "Escape") {
       event.preventDefault();
+      revokeOutputEditor();
       renderPricingMatches(state.outputRows);
+      resumeBlockedOutputDraftSave();
       return;
     }
     if (event.key === "Enter" && editor.tagName !== "TEXTAREA") {
@@ -10731,7 +10914,9 @@ function handleOutputCellKeydown(event) {
     }
     return;
   }
-  const cell = event.target.closest(".output-edit-cell");
+  // Nested controls retain their native keyboard activation.
+  if (event.target.closest("button, input, textarea, select, a[href], [contenteditable]")) return;
+  const cell = event.target.closest(".output-edit-cell, [data-output-price-entry]");
   if (!cell) return;
   if (event.key === "Enter" || event.key === "F2") {
     event.preventDefault();
@@ -10740,16 +10925,36 @@ function handleOutputCellKeydown(event) {
 }
 
 function handleOutputEditorCommit(event) {
-  const editor = event.target.closest("[data-output-editor-field]");
+  const group = event.target.closest(".output-unit-price-editor");
+  if (event.type === "focusout" && group?.contains(event.relatedTarget)) return;
+  // Price changes commit on Enter or when focus leaves the complete editor.
+  if (event.type === "change" && group) return;
+  const editor = event.target.closest("[data-output-editor-field]")
+    || (event.type === "focusout" ? group?.querySelector("[data-output-editor-field]") : null);
   if (!editor) return;
   if (editor.dataset.outputCommitSuperseded === "true") return;
   commitOutputEditor(editor);
 }
 
-function commitActiveOutputEditor() {
-  const editor = elements.pricingMatchesBody?.querySelector("[data-output-editor-field]");
-  if (!editor) return;
-  commitOutputEditor(editor);
+function commitActiveOutputEditor(options = {}) {
+  let outcome = "unchanged";
+  if (activeOutputEditor && options.commit === false) {
+    const editor = activeOutputEditor.editor;
+    if (editor.dataset.outputEditorField === "unit_price_override"
+      && String(editor.value).trim().toLowerCase() !== "included"
+      && admittedOutputPrice(editor.value) === null) {
+      outcome = blockOutputEditor(editor, "Resolve this price or cancel with Escape before continuing.");
+    }
+  } else if (activeOutputEditor) {
+    outcome = commitOutputEditor(activeOutputEditor.editor);
+  }
+  if (outcome === "blocked") return outcome;
+  if (!options.currencyChange && committedOutputCurrency && quoteCurrencyControlValue() !== committedOutputCurrency) {
+    elements.quoteCurrency?.setCustomValidity("Complete or cancel the prospective quote currency before continuing.");
+    elements.quoteCurrency?.reportValidity();
+    return "blocked";
+  }
+  return outcome;
 }
 
 function renderBasisEmptyState(message = "Load images, complete Customer and Quote Company, then start analysis to review the draft here.") {
@@ -12863,6 +13068,7 @@ function showAiFailedDraftState(data = {}) {
 }
 
 function resetQuoteBasisToOriginal() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const snapshot = state.originalAnalysisSnapshot;
   if (!snapshot) return;
   invalidateBasisChatAuthority();
@@ -12885,6 +13091,7 @@ function resetQuoteBasisToOriginal() {
 }
 
 async function resetOutputDraft() {
+  if (commitActiveOutputEditor() === "blocked") return;
   if (appIsBusy() || !state.originalOutputRows.length) return;
   state.outputRows = snapshotOutputRows(state.originalOutputRows);
   state.lineItems = outputRowsToLineItems();
@@ -13083,6 +13290,7 @@ async function jsonFromResponse(response, options = {}) {
 
 
 async function applySessionData(data = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const nextRecoveryScope = String(data.browser_recovery_scope || "").trim();
   if (!data.csrf_token || !nextRecoveryScope) return false;
   const previousRecoveryScope = currentBrowserRecoveryScope();
@@ -13506,6 +13714,7 @@ function currentQuoteSessionPayload(options = {}) {
 }
 
 async function saveCurrentQuoteSession(options = {}) {
+  if (commitActiveOutputEditor({ commit: options.commitEditor !== false }) === "blocked") return null;
   if (options.saveFailure) options.saveFailure.failure = null;
   let requestedSessionId = safeQuoteSessionId(options.sessionId || state.quoteSessionId || "");
   if (!requestedSessionId && quoteSessionInitialSavePromise) {
@@ -13602,6 +13811,7 @@ async function ensureQuoteSession(options = {}) {
 }
 
 async function saveQuoteSessionDraftState(options = {}) {
+  if (commitActiveOutputEditor({ commit: options.commitEditor !== false }) === "blocked") return null;
   if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
   saveSessionState();
@@ -13637,6 +13847,7 @@ async function saveQuoteSessionDraftState(options = {}) {
     const session = await saveCurrentQuoteSession({
       quoteGenerated: Boolean(options.quoteGenerated ?? (state.basisConfirmed || state.outputRows.length)),
       includeDraftState: true,
+      commitEditor: options.commitEditor !== false,
       includeDraftFiles: !quoteSessionDraftFilesAreConfirmed(currentSessionId, draftFileKey),
       draftState,
       draftFiles,
@@ -13698,13 +13909,19 @@ function clearQuoteSessionDraftSaveTimer() {
 }
 
 function queueQuoteSessionDraftStateSave(options = {}) {
+  if (commitActiveOutputEditor({ commit: false }) === "blocked") return;
+  blockedOutputDraftSaveOptions = null;
   if (!quoteSessionDraftStateCanSave()) return;
   saveSessionState();
   clearQuoteSessionDraftSaveTimer();
   const delay = Number.isFinite(Number(options.delay)) ? Math.max(0, Number(options.delay)) : 650;
   quoteSessionDraftSaveTimer = window.setTimeout(() => {
     quoteSessionDraftSaveTimer = null;
-    saveQuoteSessionDraftState(options).catch(() => {});
+    if (commitActiveOutputEditor({ commit: false }) === "blocked") {
+      blockedOutputDraftSaveOptions = options;
+      return;
+    }
+    saveQuoteSessionDraftState({ ...options, commitEditor: false }).catch(() => {});
   }, delay);
 }
 
@@ -13721,6 +13938,29 @@ function quoteCommercialFieldChanged(target = null) {
 }
 
 function handleQuoteDetailFieldChange(event = {}) {
+  const previousCurrency = collectQuoteCurrency();
+  const currencyControl = event.target === elements.quoteCurrency || event.target === elements.quoteCurrencyCustom;
+  if (commitActiveOutputEditor({ currencyChange: currencyControl }) === "blocked") {
+    if (currencyControl) setQuoteCurrencyControls(previousCurrency);
+    return;
+  }
+  if (currencyControl) {
+    const candidate = quoteCurrencyControlValue();
+    // Keep collectors on PREVIOUS Q until all committed tags have been checked.
+    const hasQuoteOverride = [...state.outputRows, ...state.lineItems].some((row) => {
+      const authority = outputPriceAuthority(row);
+      return authority?.variant === "manual" && authority.price_currency === previousCurrency;
+    });
+    if (candidate !== previousCurrency && hasQuoteOverride) {
+      setQuoteCurrencyControls(previousCurrency);
+      elements.quoteCurrency?.setCustomValidity("Resolve quote-currency overrides through Reference price before changing currency.");
+      elements.quoteCurrency?.reportValidity();
+      return;
+    }
+    if (!candidate) { syncQuoteCurrencyCustomInput(); return; }
+    committedOutputCurrency = candidate;
+    elements.quoteCurrency?.setCustomValidity("");
+  }
   const commercialChanged = quoteCommercialFieldChanged(event.target);
   const quoteCompanyChanged = [
     elements.headerDetails,
@@ -13798,6 +14038,7 @@ async function deleteQuoteSessionRecord(sessionId = "") {
 }
 
 async function discardCurrentQuoteDraftSession() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   await deleteQuoteSessionRecord(state.quoteSessionId);
   clearSessionState();
   resetCurrentQuoteDraftState();
@@ -13812,6 +14053,7 @@ function setDashboardLoadingState(isLoading = false, options = {}) {
 }
 
 function showQuoteFlow() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   state.activeAppView = "quote";
   elements.quoteDashboardPanel?.classList.remove("is-active");
   elements.quoteFlowPanel?.classList.add("is-active");
@@ -13821,6 +14063,7 @@ function showQuoteFlow() {
 }
 
 function showDashboard(options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (state.activeSidePanel === "customer") resetPendingPricingReferenceSelection();
   state.activeAppView = "dashboard";
   elements.quoteFlowPanel?.classList.remove("is-active");
@@ -13834,6 +14077,7 @@ function showDashboard(options = {}) {
 }
 
 async function returnToDashboard() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (appIsBusy()) return;
   let dashboardLoadStarted = false;
   setDashboardLoadingState(true, {
@@ -14485,6 +14729,7 @@ async function resumeDashboardOperation(operation = restoredDashboardOperation()
 }
 
 async function modifyDashboardQuote(sessionId, options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const safeSessionId = safeQuoteSessionId(sessionId || "");
   const isResume = options.resume === true;
   if (!safeSessionId || (!isResume && appIsBusy()) || state.quoteSessionRestoreBusy) return false;
@@ -14532,6 +14777,7 @@ async function modifyDashboardQuote(sessionId, options = {}) {
 }
 
 async function duplicateDashboardQuote(sessionId, options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const sourceSessionId = safeQuoteSessionId(sessionId || "");
   const isResume = options.resume === true;
   if (!sourceSessionId || (!isResume && appIsBusy()) || state.quoteSessionRestoreBusy) return false;
@@ -15340,6 +15586,10 @@ function delay(ms) {
 }
 
 async function startJob(type, payload, options = {}) {
+  // Synchronization may have awaited: admit again at the actual dispatch boundary.
+  if (commitActiveOutputEditor({ commit: false }) === "blocked") {
+    return { ok: false, data: { status: "blocked", errors: ["Resolve the pending output price or cancel it with Escape before continuing."] } };
+  }
   return postJson("/api/jobs", {
     type,
     payload,
@@ -15728,6 +15978,7 @@ async function confirmBasis(options = {}) {
 }
 
 async function handleGenerate(options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   if (state.isGenerating) return;
   if (quoteCommercialReviewRequired()) {
     showBlockedAction(QUOTE_COMMERCIAL_REVIEW_MESSAGE, { details: false });
@@ -16340,6 +16591,7 @@ function resetQuoteFlowScroll() {
 }
 
 function setSidePanel(panelName, options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const panelTitles = {
     images: ["Upload", "Reference Inputs", currentGenerator().intakeSubtitle],
     customer: ["Customer", "Customer Details", "Customer, project, booth size, and customer address for this quotation."],
@@ -16465,12 +16717,14 @@ function updateSidePanelNav() {
 }
 
 function goToPreviousSidePanel() {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const index = activeSidePanelIndex();
   if (index <= 0) return;
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
 
 async function goToNextSidePanel(options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
   const index = activeSidePanelIndex();
   if (elements.sideNextButton?.getAttribute("aria-disabled") === "true") {
     const reason = elements.sideNextButton.title || "This step is not ready yet.";
@@ -16720,7 +16974,7 @@ function wireEvents() {
       if (!validation.valid) renderOutputValidationMessages(validation.errors);
       return;
     }
-    commitActiveOutputEditor();
+    if (commitActiveOutputEditor() === "blocked") return;
     showExcelGeneratingModal(generationLoadingModalOptions(false));
     await waitForUiPaint();
     try {
@@ -16737,7 +16991,7 @@ function wireEvents() {
       if (!validation.valid) renderOutputValidationMessages(validation.errors);
       return;
     }
-    commitActiveOutputEditor();
+    if (commitActiveOutputEditor() === "blocked") return;
     const pdfWindow = window.open("about:blank", "_blank");
     let openedPdf = false;
     showExcelGeneratingModal(generationLoadingModalOptions(true));
@@ -16874,7 +17128,7 @@ function wireEvents() {
   elements.deletePricingReferenceButton?.addEventListener("click", requestSelectedPricingReferenceDelete);
   elements.cancelPricingReferenceDeleteButton?.addEventListener("click", hidePricingReferenceDeleteConfirm);
   elements.confirmPricingReferenceDeleteButton?.addEventListener("click", deleteSelectedPricingReference);
-  elements.outputSortMode?.addEventListener("change", () => { state.outputSortMode = elements.outputSortMode.value; renderPricingMatches(state.outputRows); renderMatchSummary({ pricing_matches: state.outputRows }); syncControlStates(); });
+  elements.outputSortMode?.addEventListener("change", () => { if (commitActiveOutputEditor() === "blocked") { elements.outputSortMode.value = state.outputSortMode; return; } state.outputSortMode = elements.outputSortMode.value; renderPricingMatches(state.outputRows); renderMatchSummary({ pricing_matches: state.outputRows }); syncControlStates(); });
   elements.pricingReferenceForm.addEventListener("submit", savePricingReferenceFromModal);
   elements.exportPricingReferenceButton?.addEventListener("click", exportSelectedPricingReference);
   elements.pricingReferenceTemplateButton.addEventListener("click", downloadPricingReferenceTemplate);

@@ -821,7 +821,7 @@
                         </select>
                       </label>
                     </div>
-                    <p class="output-edit-hint">Click on any field in the table below to change it.<br>Unit price accepts a number or "Included".</p>
+                    <p class="output-edit-hint">Click the quoted unit price to edit. Custom prices do not use FX.<br>Use Included or restore reference pricing inside the editor. Press Escape to cancel.</p>
                     <table class="match-table output-match-table">
                       <colgroup>
                         <col class="output-col-section">
@@ -829,6 +829,8 @@
                         <col class="output-col-quantity">
                         <col class="output-col-unit">
                         <col class="output-col-unit-price">
+                        <col class="output-col-fx">
+                        <col class="output-col-quoted-price">
                         <col class="output-col-amount">
                         <col class="output-col-actions">
                       </colgroup>
@@ -838,7 +840,9 @@
                           <th>Description</th>
                           <th>Quantity</th>
                           <th>Unit</th>
-                          <th>Unit price</th>
+                          <th>Reference price</th>
+                          <th>FX</th>
+                          <th>Quoted unit price</th>
                           <th>Amount</th>
                           <th>Actions</th>
                         </tr>

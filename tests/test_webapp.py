@@ -3055,6 +3055,250 @@ class WebappServerTest(unittest.TestCase):
         self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(payload))
         self.assertIsNone(webapp.quote_session_commercials(payload, {"commercials": {}})["subtotal"])
 
+    def owned_quote_currency_pricing_payload(
+        self, *, variant="manual", matched=True, price=1, quantity=3,
+        basis=3, approved=3, currency="AUD", exchange_rate=2,
+        tagged=True, override=True,
+    ):
+        payload = recovered_convergence_payload(
+            include_included_row=False, exchange_rate=exchange_rate,
+        )
+        details = payload["quote_session"]["draft_state"]["quoteDetails"]
+        details["currency"] = currency
+        reference = webapp.exact_pricing_reference_authority(payload)
+        self.assertTrue(reference["ok"])
+        catalog_item = webapp.pricing_catalog_runtime_lookup_for_payload(payload)[
+            "synthetic-floors-synthetic-carpet-tile"
+        ]
+        row = {
+            "source_basis_line_id": "saved-currency-control",
+            "section": "Synthetic Floors" if matched else "Custom Controls",
+            "description": catalog_item["description"] if matched else "Unlisted calibration control",
+            "pricing_keyword": catalog_item["id"] if matched else "",
+            "quantity": quantity,
+            "unit": "sqm" if matched else "nos",
+            "price_mode": "Included" if variant == "included" else "Priced",
+            "effective_unit_price": price,
+            "pricing_basis_amount": basis,
+            "approved_quote_amount": approved,
+        }
+        if override:
+            row["unit_price_override"] = price
+        row["pricing_authority"] = webapp.build_pricing_authority(
+            variant, row, price=price, reference_authority=reference,
+            catalog_item=catalog_item if variant == "catalog" else None,
+        )
+        if variant == "manual" and tagged:
+            row["pricing_authority"]["price_currency"] = currency
+        payload["quote_session"]["draft_state"]["outputRows"] = [row]
+        payload["line_items"] = copy.deepcopy([row])
+        return payload
+
+    def test_owned_quote_currency_manual_fx_generation_and_session_totals(self):
+        cases = (
+            ("AUD", 2, 1, 3, 3, 0.27, 3.27),
+            ("SGD", 2, 1, 3, 3, 0.27, 3.27),
+            ("AUD", 1, 1, 3, 3, 0.27, 3.27),
+            ("AUD", 1.37, 1.01, 3, 3.03, 0.27, 3.30),
+            ("AUD", 2, 10.25, 2.5, 25.63, 2.31, 27.94),
+            ("AUD", 2, 0, 2, 0, 0, 0),
+        )
+        for matched in (True, False):
+            for override in (True, False):
+                for currency, rate, price, quantity, amount, tax, total in cases:
+                    with self.subTest(matched=matched, override=override, currency=currency, rate=rate, price=price):
+                        payload = self.owned_quote_currency_pricing_payload(
+                            matched=matched, override=override, currency=currency,
+                            exchange_rate=rate, price=price, quantity=quantity,
+                            basis=amount, approved=amount,
+                        )
+                        original = copy.deepcopy(payload)
+                        for _ in range(2):
+                            canonical = webapp.quote_commercial_payload(payload)
+                            self.assertEqual(canonical["line_items"][0]["approved_quote_amount"], amount)
+                            self.assertEqual(webapp.quote_commercial_state_errors(payload), [])
+                            self.assertEqual(webapp.validate_generation_payload(payload), [])
+                            brief = webapp.payload_to_brief(payload)
+                            self.assertEqual(brief["line_items"][0]["approved_quote_amount"], amount)
+                            self.assertEqual(brief["line_items"][0]["pricing_authority"]["price_currency"], currency)
+                            summary = webapp.quote_session_commercials(payload, payload["quote_session"])
+                            self.assertEqual(summary, {
+                                "currency": currency, "exchange_rate": rate,
+                                "tax_label": "GST", "tax_rate": 0.09,
+                                "subtotal": amount, "tax_amount": tax, "grand_total": total,
+                            })
+                            payload = json.loads(json.dumps(payload))
+                        self.assertEqual(payload, original)
+
+    def test_owned_quote_currency_source_fx_and_included_controls(self):
+        cases = (
+            ("catalog", False, 14.4, 43.2, 86.4, 2),
+            ("catalog", False, 14.4, 43.2, 59.18, 1.37),
+            ("manual", False, 1.01, 3.03, 4.15, 1.37),
+            ("included", False, 0, 0, 0, 2),
+        )
+        for variant, tagged, price, basis, approved, rate in cases:
+            for override in (True, False):
+                with self.subTest(variant=variant, override=override, rate=rate):
+                    payload = self.owned_quote_currency_pricing_payload(
+                        variant=variant, tagged=tagged, override=override,
+                        price=price, basis=basis, approved=approved, exchange_rate=rate,
+                    )
+                    self.assertEqual(webapp.quote_commercial_state_errors(payload), [])
+                    self.assertEqual(webapp.validate_generation_payload(payload), [])
+                    brief = webapp.payload_to_brief(payload)
+                    row = brief["line_items"][0]
+                    self.assertEqual(row["pricing_authority"]["variant"], variant)
+                    self.assertEqual(row["approved_quote_amount"], approved)
+                    self.assertEqual(webapp.quote_session_commercials(payload, payload["quote_session"])["subtotal"], approved)
+
+    def test_owned_quote_currency_saved_payload_reaches_real_xlsx(self):
+        import generate_quote as quote
+        from tests.test_generate_quote import cell_value, find_cell_ref
+
+        for matched in (True, False):
+            payload = self.owned_quote_currency_pricing_payload(matched=matched)
+            payload["quote_session"]["draft_state"]["quoteDetails"]["company"]["logo_data_url"] = SANITIZED_LOGO_DATA_URL
+            # Read the owned snapshot through the same admission used by generation.
+            brief = webapp.payload_to_brief(json.loads(json.dumps(payload)))
+            identity = payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"]
+            lines = quote.prepare_lines(
+                brief, [], allow_ambiguous=False, authority_required=True,
+                trusted_pricing_reference=identity,
+            )
+            self.assertEqual(quote.line_amount_value(lines[0], 2), 3)
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "quotation.xlsx"
+                quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, target, brief, lines)
+                with zipfile.ZipFile(target) as archive:
+                    sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+                subtotal_ref = find_cell_ref(sheet, "Total")
+                self.assertTrue(subtotal_ref)
+                subtotal_row = quote.parse_cell_ref(subtotal_ref)[0]
+                self.assertEqual(float(cell_value(sheet, f"E{subtotal_row}")), 3)
+                self.assertEqual(float(cell_value(sheet, f"E{subtotal_row + 1}")), 0.27)
+                self.assertEqual(float(cell_value(sheet, f"E{subtotal_row + 2}")), 3.27)
+                formulas = [node.text for node in sheet.iter(f"{webapp.NS_MAIN}f")]
+                self.assertTrue(any(value.startswith("SUM(") for value in formulas))
+                self.assertIn(f"ROUND(E{subtotal_row}*0.090000,2)", formulas)
+                self.assertTrue(any("AUD" in (node.text or "") for node in sheet.iter(f"{webapp.NS_MAIN}t")))
+                names = [node.text for node in workbook.iter(f"{webapp.NS_MAIN}definedName") if node.get("name") == "_xlnm.Print_Area"]
+                self.assertTrue(names)
+
+    def test_owned_quote_currency_explicit_edit_converges_stale_captures(self):
+        payload = self.owned_quote_currency_pricing_payload(basis=200, approved=274)
+        row = payload["quote_session"]["draft_state"]["outputRows"][0]
+        row["effective_unit_price"] = 100
+        row["catalog_unit_price"] = 999
+        canonical = webapp.quote_commercial_payload(payload)["line_items"][0]
+        self.assertEqual(canonical["pricing_basis_amount"], 3)
+        self.assertEqual(canonical["approved_quote_amount"], 3)
+        self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+    def test_owned_quote_currency_rejects_untrusted_authorities_and_snapshots(self):
+        base = self.owned_quote_currency_pricing_payload()
+        cases = {}
+        for key, value in (
+            ("price_currency", "SGD"), ("price_currency", "aud"),
+            ("price_currency", None), ("price_currency", 1),
+            ("currency", "AUD"), ("schema", "forged"),
+            ("version", True), ("price", "0x10"), ("price", -1),
+            ("extra", "AUD"),
+        ):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["outputRows"][0]["pricing_authority"][key] = value
+            cases[f"authority {key}={value}"] = candidate
+        for variant in ("none", "historical"):
+            candidate = copy.deepcopy(base)
+            row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+            row["pricing_authority"] = webapp.build_pricing_authority(variant, row)
+            cases[variant] = candidate
+        missing = copy.deepcopy(base)
+        missing["quote_session"]["draft_state"]["outputRows"][0].pop("pricing_authority")
+        cases["missing authority"] = missing
+        stale_context = copy.deepcopy(base)
+        stale_context["quote_session"]["draft_state"]["outputRows"][0]["pricing_authority"]["context"]["description"] = "Other row"
+        cases["stale context"] = stale_context
+        for key, value in (("id", "other"), ("source", "company"), ("digest", "sha256:" + "0" * 64)):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"][key] = value
+            cases["stale reference " + key] = candidate
+        for rate in (0, -1, None, "bad", float("inf")):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["quoteDetails"]["exchange_rate"] = rate
+            cases[f"rate {rate}"] = candidate
+        for snapshot in (None, {}, {"schema": "forged"}):
+            candidate = copy.deepcopy(base)
+            candidate["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"] = snapshot
+            cases[f"snapshot {snapshot}"] = candidate
+        for label, candidate in cases.items():
+            with self.subTest(label=label):
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                with self.assertRaises(webapp.QuoteCommercialStateError):
+                    webapp.payload_to_brief(candidate)
+
+    def test_owned_quote_currency_included_rejects_contradictory_captures(self):
+        base = self.owned_quote_currency_pricing_payload(
+            variant="included", price=0, basis=0, approved=0,
+        )
+        self.assertEqual(webapp.validate_generation_payload(base), [])
+        for display_included in (True, False):
+            for field in ("pricing_basis_amount", "approved_quote_amount"):
+                for value in (999, -1, "???", float("inf"), float("nan"), True):
+                    candidate = copy.deepcopy(base)
+                    row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+                    if not display_included:
+                        row["price_mode"] = "Priced"
+                    row[field] = value
+                    with self.subTest(display_included=display_included, field=field, value=value):
+                        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                        self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                        with self.assertRaises(webapp.QuoteCommercialStateError):
+                            webapp.payload_to_brief(candidate)
+
+        # An override-only legacy marker is already rejected by the owned
+        # commercial invalid-override guard before normalization can coerce it.
+        for field in ("pricing_basis_amount", "approved_quote_amount"):
+            for value in (999, "???"):
+                candidate = self.owned_quote_currency_pricing_payload()
+                row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+                row["unit_price_override"] = "Included"
+                row[field] = value
+                canonical = webapp.quote_commercial_payload(candidate)
+                self.assertTrue(canonical["line_items"][0]["_commercial_invalid_unit_price_override"])
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                with self.assertRaises(webapp.QuoteCommercialStateError):
+                    webapp.payload_to_brief(candidate)
+
+    def test_owned_quote_currency_rejects_inconsistent_or_malformed_captured_amounts(self):
+        for variant, price, basis, approved in (("catalog", 14.4, 43.2, 86.4), ("manual", 1, 3, 3)):
+            base = self.owned_quote_currency_pricing_payload(
+                variant=variant, override=False, price=price, basis=basis, approved=approved,
+            )
+            for key, value in (("quantity", 4), ("pricing_basis_amount", 999), ("approved_quote_amount", 999)):
+                candidate = copy.deepcopy(base)
+                candidate["quote_session"]["draft_state"]["outputRows"][0][key] = value
+                with self.subTest(variant=variant, key=key):
+                    self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                    self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.validate_generation_payload(candidate))
+                    with self.assertRaises(webapp.QuoteCommercialStateError):
+                        webapp.payload_to_brief(candidate)
+            for override in (True, False):
+                for key in ("pricing_basis_amount", "approved_quote_amount"):
+                    for value in ("???", "not-a-number", float("nan"), float("inf"), -1, True):
+                        candidate = copy.deepcopy(base)
+                        row = candidate["quote_session"]["draft_state"]["outputRows"][0]
+                        row[key] = value
+                        if override:
+                            row["unit_price_override"] = price
+                        with self.subTest(variant=variant, override=override, key=key, value=value):
+                            self.assertIn(webapp.QUOTE_COMMERCIAL_REVIEW_MESSAGE, webapp.quote_commercial_state_errors(candidate))
+                            with self.assertRaises(webapp.QuoteCommercialStateError):
+                                webapp.payload_to_brief(candidate)
+
     def test_recovered_explicit_price_edit_replaces_stale_captured_price_everywhere(self):
         payload = recovered_convergence_payload(unit_price_override=120)
         saved_rows = payload["quote_session"]["draft_state"]["outputRows"]
@@ -3541,6 +3785,8 @@ function response(suffix) {
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function queueQuoteSessionDraftStateSave(){}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -3664,11 +3910,11 @@ function buildPricingAuthority(variant = "none", row = {}, options = {}) {
   return authority;
 }
 function normalizeOutputPricingAuthority(raw, row = {}) {
-  if (!raw || raw.variant !== "manual" || raw.schema !== PRICING_AUTHORITY_SCHEMA || raw.version !== PRICING_AUTHORITY_VERSION) return null;
+  if (!raw || !["manual", "included"].includes(raw.variant) || raw.schema !== PRICING_AUTHORITY_SCHEMA || raw.version !== PRICING_AUTHORITY_VERSION) return null;
   return JSON.stringify(raw.context) === JSON.stringify(pricingAuthorityContext(row)) ? raw : null;
 }
 function pricingAuthorityPrice(authority) {
-  return authority?.variant === "manual" && Number.isFinite(Number(authority.price)) ? Number(authority.price) : null;
+  return ["manual", "included"].includes(authority?.variant) && Number.isFinite(Number(authority.price)) ? Number(authority.price) : null;
 }
 function applyPricingAuthorityProjection(row = {}, authority = null) {
   const price = pricingAuthorityPrice(authority);
@@ -3699,7 +3945,7 @@ eval([
   "collectRichTextDetails", "collectQuoteDetails", "setInputValue", "collectTaxDetails", "collectQuoteCurrency",
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
   "quoteFxMultiplier", "outputRowFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
-  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputCellDisplayValue",
+  "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
@@ -3708,6 +3954,8 @@ state.outputRows = [
   normalizeOutputRow({ section: "Saved Floors", description: "Captured carpet", quantity: 2, unit: "sqm", price_mode: "Priced", effective_unit_price: 100, catalog_unit_price: 999, pricing_keyword: "captured-row", amount: 200 }),
   normalizeOutputRow({ section: "Saved Services", description: "Included coordination", quantity: 1, unit: "lot", price_mode: "Included", display_price: "Included", amount: 0 }),
 ];
+state.outputRows[0].pricing_authority = buildPricingAuthority("manual", state.outputRows[0], {price:100});
+state.outputRows[1].pricing_authority = buildPricingAuthority("included", state.outputRows[1]);
 const missingHistoricalPrice = normalizeOutputRow({ section: "Saved Review", description: "Missing captured price", quantity: 1, unit: "sqm", price_mode: "Priced", catalog_unit_price: 999 });
 assert.strictEqual(effectiveOutputUnitPrice(missingHistoricalPrice), null);
 assert.strictEqual(missingHistoricalPrice.amount, "");
@@ -20288,7 +20536,9 @@ eval(extractAsyncFunction("confirmQuoteDependencyChange"));
         self.assertIn("PRICING_REFERENCE_PREVIEW_PLACEHOLDERS", js)
         self.assertIn('placeholder="${escapeHtml(PRICING_REFERENCE_PREVIEW_PLACEHOLDERS[field] || "")}"', js)
         self.assertIn("function outputEditorPlaceholder", js)
-        self.assertIn('placeholder="${escapeHtml(outputEditorPlaceholder(field))}"', js)
+        price_editor = js.split('function outputEditorHtml', 1)[1].split('function renderOutputEditCell', 1)[0].split('if (priceField) {', 1)[1].split("return '<input", 1)[0]
+        self.assertNotIn('placeholder=', price_editor)
+        self.assertIn('escapeHtml(outputEditorPlaceholder(field))', js)
         self.assertIn("function clarificationAnswerPlaceholder", js)
         self.assertIn('placeholder="${escapeHtml(clarificationAnswerPlaceholder(question))}"', js)
 
@@ -20826,7 +21076,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("await handleGenerate();", js)
         self.assertIn("downloadCurrentExcelFile();", js)
         self.assertIn("await waitForUiPaint();", download_handler)
-        self.assertIn("commitActiveOutputEditor();", download_handler)
+        self.assertIn('if (commitActiveOutputEditor() === "blocked") return;', download_handler)
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(false));", download_handler)
         self.assertIn('title: "Regenerating Excel"', loading_options_body)
         self.assertIn("await handleGenerate();", download_handler)
@@ -20887,6 +21137,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
 
         node = require_node(self)
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -21076,11 +21327,11 @@ assert.strictEqual(
         self.assertIn("+ ???", js)
         self.assertNotIn('? "???"', summary_body)
         self.assertIn('data-output-edit-field="${field}"', js)
-        self.assertIn('renderOutputEditCell(row, index, "unit_price_override")', table_body)
+        self.assertIn('renderOutputPriceCells(row, index)', table_body)
         self.assertIn("catalog_unit_price", js)
         self.assertIn("effectiveOutputUnitPrice", js)
         self.assertIn("quoteAmountValue(row.amount, outputRowFxMultiplier(row))", js)
-        self.assertIn("quoteAmountValue(row.catalog_unit_price)", js)
+        self.assertIn("outputPriceAuthority(row)", js)
         self.assertIn("Unit price must be a number or Included.", js)
         self.assertNotIn('renderOutputEditCell(row, index, "price_mode")', table_body)
         self.assertNotIn("pricingStatusLabel(row.status)", table_body)
@@ -21088,6 +21339,7 @@ assert.strictEqual(
         node = require_node(self)
 
         script = r"""
+function applyPricingAuthorityProjection(row){return row;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -23446,6 +23698,7 @@ eval([
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -23946,6 +24199,7 @@ eval([
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -24089,6 +24343,7 @@ eval([
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -24796,6 +25051,7 @@ eval([
 
         node = require_node(self)
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -25297,10 +25553,12 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn("unit_price_override", js)
         self.assertIn("catalog_unit_price", js)
         self.assertIn("Included", js)
-        self.assertIn("<th>Unit price</th>", html)
+        self.assertIn("<th>Reference price</th>", html)
+        self.assertIn("<th>FX</th>", html)
+        self.assertIn("<th>Quoted unit price</th>", html)
         self.assertNotIn("<th>Price mode</th>", html)
-        self.assertIn('Click on any field in the table below to change it.', html)
-        self.assertIn('Unit price accepts a number or "Included".', html)
+        self.assertIn('Click the quoted unit price to edit. Custom prices do not use FX.', html)
+        self.assertIn('Use Included or restore reference pricing inside the editor. Press Escape to cancel.', html)
         self.assertNotIn("Double click a row value to amend it.", html)
         self.assertNotIn("<datalist", js)
         self.assertNotIn('<option value="Included"></option>', js)
@@ -25638,9 +25896,9 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn(".output-unit-price-editor", css)
         self.assertIn(".output-unit-price-cell", css)
         self.assertIn(".output-unit-price-content", css)
-        self.assertIn(".output-col-description { width: 32%; }", css)
-        self.assertIn(".output-col-unit-price { width: 13%; }", css)
-        self.assertIn(".output-col-actions { width: 13%; }", css)
+        self.assertIn(".output-col-description { width: 20%; }", css)
+        self.assertIn(".output-col-unit-price { width: 14%; }", css)
+        self.assertIn(".output-col-actions { width: 8%; }", css)
         self.assertIn(".output-match-table th:nth-child(3),", css)
         self.assertIn(".output-match-table th:nth-child(6),", css)
         self.assertIn(".output-match-table th:nth-child(7),", css)
@@ -25657,6 +25915,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         node = require_node(self)
 
         script = r"""
+function applyPricingAuthorityProjection(row){return row;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26255,6 +26514,21 @@ assert.ok(source.includes("refreshOutputRowsFromLineItems();"));
         node = require_node(self)
 
         script = r"""
+let blockedOutputDraftSaveOptions=null;
+let committedOutputCurrency="";
+// This extracted event carrier has no admitted catalogue; live tests cover trust.
+function outputCatalogueBaseline(){return null;}
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+const outputRowIdentities=new WeakMap();
+let activeOutputEditor=null;
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function selectedPricingReferenceCurrency(){return "SGD";}
+function collectQuoteCurrency(){return "SGD";}
+function queueQuoteSessionDraftStateSave(){}
+function testCommitOutputEditor(editor){editor.setAttribute=()=>{};editor.setCustomValidity=()=>{};editor.closest=()=>null;activeOutputEditor={editor,row:state.outputRows[Number(editor.dataset.outputRow)],revision:state.outputRevision,denomination:"reference",staged:false};return commitOutputEditor(editor);}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26299,12 +26573,12 @@ eval([
   "roundCommercialCents",
   "quoteAmountValue",
   "recalculateOutputRow",
-  "outputCellDisplayValue",
+  "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "outputEditorPlaceholder",
   "outputEditorHtml",
   "renderOutputEditCell",
-  "commitOutputEditor",
-  "applyOutputIncludedAction",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "appIsBusy", "applyOutputIncludedAction",
   "handleOutputEditorCommit",
 ].map(extractFunction).join("\n"));
 
@@ -26334,7 +26608,7 @@ function renderPricingMatches() {
   if (!pendingFocusout) return;
   const editor = pendingFocusout;
   pendingFocusout = null;
-  handleOutputEditorCommit({ target: { closest: () => editor }, type: "focusout" });
+  handleOutputEditorCommit({ target: { closest: (selector) => selector === ".output-unit-price-editor" ? null : editor }, type: "focusout" });
 }
 function renderMatchSummary() {}
 function syncControlStates() {}
@@ -26344,7 +26618,7 @@ applyOutputIncludedAction({ dataset: { outputRow: "0" } });
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_override"), "Included");
 
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
   value: "",
   isConnected: false,
@@ -26352,7 +26626,7 @@ commitOutputEditor({
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 assert.strictEqual(outputCellDisplayValue(state.outputRows[0], "unit_price_override"), "Included");
 
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
   value: "",
   isConnected: true,
@@ -26365,11 +26639,12 @@ const replacedEditor = {
   value: "45.50",
   isConnected: true,
 };
+activeOutputEditor={editor:replacedEditor,row:state.outputRows[1],revision:state.outputRevision};
 pendingFocusout = replacedEditor;
 applyOutputIncludedAction({
   dataset: { outputRow: "1" },
   closest: (selector) => selector === ".output-edit-cell"
-    ? { querySelector: () => replacedEditor }
+    ? { contains: () => true, querySelector: () => replacedEditor }
     : null,
 });
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
@@ -26381,7 +26656,8 @@ const normalEditor = {
   value: "3",
   isConnected: true,
 };
-handleOutputEditorCommit({ target: { closest: () => normalEditor }, type: "focusout" });
+activeOutputEditor={editor:normalEditor,row:state.outputRows[0],revision:state.outputRevision};
+handleOutputEditorCommit({ target: { closest: (selector) => selector === ".output-unit-price-editor" ? null : normalEditor }, type: "focusout" });
 assert.strictEqual(state.outputRows[0].quantity, "3");
 assert.strictEqual(state.outputRows[0].price_mode, "Included");
 """
@@ -26464,6 +26740,19 @@ assert.strictEqual(elements.pricingReviewMessages.innerHTML, "");
         node = require_node(self)
 
         script = r"""
+let blockedOutputDraftSaveOptions=null;
+let committedOutputCurrency="";
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+const outputRowIdentities=new WeakMap();
+let activeOutputEditor=null;
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function selectedPricingReferenceCurrency(){return "SGD";}
+function collectQuoteCurrency(){return "SGD";}
+function queueQuoteSessionDraftStateSave(){}
+function testCommitOutputEditor(editor){editor.setAttribute=()=>{};editor.setCustomValidity=()=>{};editor.closest=()=>null;activeOutputEditor={editor,row:state.outputRows[Number(editor.dataset.outputRow)],revision:state.outputRevision,denomination:"reference",staged:false};return commitOutputEditor(editor);}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26507,7 +26796,7 @@ eval([
   "downloadFileIsFresh",
   "pdfFileIsFresh",
   "updateDownloadButton",
-  "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
   "hideOutputDeleteModal",
   "confirmOutputRowDelete",
 ].map(extractFunction).join("\n"));
@@ -26570,20 +26859,21 @@ assert.strictEqual(pdfFileIsFresh(), true);
 assert.strictEqual(elements.sideDownloadButton.href, "/api/quote-sessions/old/download/xlsx");
 assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/old/view/pdf");
 
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "unit_price_override", outputRow: "0" },
   value: "not-a-price",
   isConnected: true,
 });
-assert.strictEqual(state.outputRevision, 1);
+assert.strictEqual(state.outputRevision, 0);
 assert.strictEqual(state.downloadFile.url, "/api/quote-sessions/old/download/xlsx");
 assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/old/view/pdf");
-assert.strictEqual(state.outputRows[0].unit_price_override, "not-a-price");
-assert.strictEqual(outputRowsValid().valid, false);
-assert.strictEqual(downloadFileIsFresh(), false);
-assert.strictEqual(pdfFileIsFresh(), false);
-assert.strictEqual(elements.sideDownloadButton.href, "#");
-assert.strictEqual(elements.sideDownloadButton.download, "");
+assert.strictEqual(state.outputRows[0].unit_price_override, "10");
+assert.strictEqual(activeOutputEditor.editor.value, "not-a-price");
+assert.strictEqual(commitActiveOutputEditor(), "blocked");
+assert.strictEqual(outputRowsValid().valid, true);
+assert.strictEqual(downloadFileIsFresh(), true);
+assert.strictEqual(pdfFileIsFresh(), true);
+revokeOutputEditor();
 
 setDownloadFiles([
   { url: "/api/jobs/new/files/quotation.xlsx", name: "quotation.xlsx" },
@@ -26595,7 +26885,7 @@ setDownloadFiles([
 assert.strictEqual(downloadFileIsFresh(), true);
 assert.strictEqual(pdfFileIsFresh(), true);
 confirmOutputRowDelete();
-assert.strictEqual(state.outputRevision, 2);
+assert.strictEqual(state.outputRevision, 1);
 assert.strictEqual(state.outputRows.length, 1);
 assert.strictEqual(state.downloadFile.url, "/api/quote-sessions/new/download/xlsx");
 assert.strictEqual(state.pdfFile.url, "/api/quote-sessions/new/view/pdf");
@@ -26617,6 +26907,11 @@ assert.strictEqual(elements.sideDownloadButton.href, "#");
         node = require_node(self)
 
         script = r"""
+function quoteCurrencyControlValue(){return elements.quoteCurrency.value;}
+function collectQuoteCurrency(){return "SGD";}
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
+function outputPriceAuthority(row){return row.pricing_authority || null;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26639,7 +26934,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
-const quoteCurrency = {};
+const quoteCurrency = {value:"USD",setCustomValidity(){}};
 const quoteCurrencyCustom = { value: "" };
 const projectTitle = {};
 const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
@@ -26656,6 +26951,7 @@ const elements = {
   quoteExchangeRate: {},
 };
 const state = {
+  lineItems: [],
   outputRows: [{ description: "Generated row", amount: 100 }],
   outputRevision: 0,
   downloadFile: { url: "/api/jobs/old/files/quotation.xlsx", name: "quotation.xlsx" },
@@ -26717,6 +27013,9 @@ assert.strictEqual(saved, false);
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
+function outputPriceAuthority(row){return row.pricing_authority || null;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -26746,7 +27045,7 @@ const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
-  quoteCurrency: { value: "" },
+  quoteCurrency: { value: "", setCustomValidity(){} },
   quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "" },
   quoteExchangeRateField: { hidden: true },
@@ -26759,6 +27058,7 @@ const elements = {
   selectedPricingReferenceTax: { textContent: "" },
 };
 const state = {
+  lineItems: [],
   pricingReferenceId: "sgd-ref",
   pricingReferenceSource: "bundled",
   pricingReferences: [
@@ -26919,6 +27219,7 @@ assert.strictEqual(elements.quoteTaxRate.value, "8");
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27079,6 +27380,8 @@ assert.strictEqual(workflowStage, "ready_to_analyze");
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27270,6 +27573,9 @@ assert.strictEqual(elements.profileSelect.value, "local::missing-saved-reference
         node = require_node(self)
 
         script = r"""
+let committedOutputCurrency="";
+function commitActiveOutputEditor(){return "unchanged";}
+function outputPriceAuthority(row){return row.pricing_authority || null;}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27307,7 +27613,7 @@ const CUSTOM_CURRENCY_VALUE = "__CUSTOM__";
 const CURRENCY_OPTIONS = [["SGD"], ["AUD"], ["CNY"], ["EUR"], ["GBP"], ["IDR"], ["MYR"], ["THB"], ["USD"]];
 const QUOTE_COMMERCIAL_FIELD_KEYS = ["quoteCurrency", "quoteExchangeRate", "quoteTaxLabel", "quoteTaxRate"];
 const elements = {
-  quoteCurrency: { value: "" },
+  quoteCurrency: { value: "", setCustomValidity(){} },
   quoteCurrencyCustom: { value: "", hidden: true, required: false },
   quoteExchangeRate: { value: "" },
   quoteExchangeRateField: { hidden: true },
@@ -27327,6 +27633,7 @@ const elements = {
   dateLabel: { value: "" },
 };
 const state = {
+  lineItems: [],
   pricingReferenceId: "sgd-ref",
   pricingReferenceSource: "bundled",
   pricingReferences: [
@@ -27501,6 +27808,7 @@ assert.strictEqual(collectQuoteCurrency(), "JPY");
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -27739,6 +28047,7 @@ assert.deepStrictEqual(normalizeQuoteCommercialReview(durableReview), durableRev
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -28040,6 +28349,7 @@ const saved = {
         node = require_node(self)
 
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -29413,6 +29723,7 @@ async function act() {
     def test_browser_generation_serializes_and_confirms_latest_draft_save(self):
         node = require_node(self)
         script = r"""
+function commitActiveOutputEditor(){return "unchanged";}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -32287,7 +32598,7 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         self.assertIn(".side-workspace .assistant-output .message-list:empty", css)
         self.assertIn("width: min(100%, var(--workspace-content-width));", css)
         self.assertIn("width: auto;", css)
-        self.assertIn(".output-col-description { width: 32%; }", css)
+        self.assertIn(".output-col-description { width: 20%; }", css)
         self.assertIn("margin: 0 0 12px;", css)
         self.assertIn(".quote-basis-title-row h3", css)
 
@@ -32348,6 +32659,20 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         node = require_node(self)
 
         script = r"""
+let blockedOutputDraftSaveOptions=null;
+let committedOutputCurrency="";
+function applyPricingAuthorityProjection(row){return row;}
+// This description-only carrier has no admitted catalogue; real rendered tests cover trust.
+function outputCatalogueBaseline(){return null;}
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+const outputRowIdentities=new WeakMap();
+let activeOutputEditor=null;
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function queueQuoteSessionDraftStateSave(){}
+function testCommitOutputEditor(editor){editor.setAttribute=()=>{};editor.setCustomValidity=()=>{};editor.closest=()=>null;activeOutputEditor={editor,row:state.outputRows[Number(editor.dataset.outputRow)],revision:state.outputRevision,denomination:"reference",staged:false};return commitOutputEditor(editor);}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -32405,13 +32730,13 @@ eval([
   "pricingReferenceOrder",
   "compareOrderValues",
   "sortOutputRows",
-  "outputCellDisplayValue",
+  "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "renderOutputEditCell",
-  "renderPricingMatches",
+  "renderOutputPriceCells", "renderPricingMatches",
   "snapshotOutputRows",
   "outputRowsToLineItems",
   "outputRowsValid",
-  "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
 ].map(extractFunction).join("\n"));
 
 function selectedPricingReferenceCurrency() { return "SGD"; }
@@ -32494,7 +32819,7 @@ state.outputRows = [normalizeOutputRow({
   ...catalogMetadata,
   description: "nos. standard reception counter",
 })];
-commitOutputEditor({
+testCommitOutputEditor({
   dataset: { outputEditorField: "description", outputRow: "0" },
   value: manualDescription,
   isConnected: true,
@@ -32549,6 +32874,13 @@ assert.strictEqual(outputRowsToLineItems(state.outputRows)[0].description, manua
         node = require_node(self)
 
         script = r"""
+function applyPricingAuthorityProjection(row){return row;}
+function currentPricingReference(){return {items:[]};}
+function pricingReferenceCatalogItem(){return null;}
+function normalizeOutputPricingAuthority(raw){return raw || null;}
+function pricingAuthorityPrice(a){return a && ["included","manual","catalog"].includes(a.variant)?a.price:null;}
+function buildPricingAuthority(variant,row,options={}){return {variant,price:variant==="included"?0:options.price};}
+function queueQuoteSessionDraftStateSave(){}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
@@ -32614,7 +32946,7 @@ eval([
   "bracketedCatalogReferenceParts",
   "outputCatalogDescription",
   "outputRowFromLineItem",
-  "outputCellDisplayValue",
+  "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
   "outputRowsValid",
   "rowNeedsManualInput",
   "matchSummaryStats",

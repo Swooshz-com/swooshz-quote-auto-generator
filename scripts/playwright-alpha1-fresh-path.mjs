@@ -654,7 +654,29 @@ try {
   await pricedRow.locator('[data-output-edit-field="quantity"]').click();
   const qty=pricedRow.locator('[data-output-editor-field="quantity"]');
   await qty.fill("2"); await qty.press("Enter");
-  await includedRow.locator('[data-output-edit-field="unit_price_override"]').click();
+  const quotedPriceSelector = '.output-unit-price-cell[data-output-edit-field="unit_price_override"][data-output-denomination="quote"]';
+  const cataloguePrice = Number(fixtureCatalogById.get(included.pricing_keyword).sale_unit_price);
+  const catalogueBefore = await page.evaluate(() => JSON.stringify(state.pricingReferences));
+  const includedIdentity = { id: included.source_basis_line_id, description: included.description, keyword: included.pricing_keyword };
+  assert(includedIdentity.id && Number.isFinite(cataloguePrice), "Included fixture needs a stable identity and independently known catalogue price.");
+  const requireCatalogueReference = async () => {
+    assert(await includedRow.locator('.output-unit-price-cell').count() === 2, "Both price columns must remain present.");
+    const left = includedRow.locator('.output-unit-price-cell:not([data-output-edit-field])');
+    assert(await left.count() === 1 && await left.isVisible(), "LEFT catalogue reference must remain visible.");
+    assert((await left.locator('.output-cell-text').innerText()).trim() === cataloguePrice.toFixed(2), "LEFT catalogue price differs from the unchanged authoritative fixture.");
+    assert(await left.getAttribute('tabindex') === null && await left.locator('[data-output-editor-field]').count() === 0, "LEFT catalogue reference must remain read-only.");
+    const provenance = await includedRow.evaluate(element => {
+      const row = state.outputRows[Number(element.dataset.outputRow)];
+      return { id: row?.source_basis_line_id, description: row?.description, keyword: row?.pricing_keyword, baseline: row && outputCatalogueBaseline(row), catalogue: JSON.stringify(state.pricingReferences) };
+    });
+    assert(provenance.id === includedIdentity.id && provenance.description === includedIdentity.description && provenance.keyword === includedIdentity.keyword, "Pricing action changed the selected row identity or catalogue match.");
+    assert(provenance.baseline === cataloguePrice && provenance.catalogue === catalogueBefore, "Catalogue provenance changed: " + JSON.stringify({ ...provenance, catalogue: provenance.catalogue === catalogueBefore, cataloguePrice }));
+  };
+  await requireCatalogueReference();
+  const beforeLeftClick = await page.evaluate(() => JSON.stringify({ rows: state.outputRows, revision: state.outputRevision }));
+  await includedRow.locator('.output-unit-price-cell:not([data-output-edit-field]) .output-cell-text').click();
+  assert(await page.locator('[data-output-editor-field="unit_price_override"]').count() === 0 && await page.evaluate(() => JSON.stringify({ rows: state.outputRows, revision: state.outputRevision })) === beforeLeftClick, "LEFT inspection opened an editor or changed quotation pricing.");
+  await includedRow.locator(quotedPriceSelector).click();
   await page.evaluate(() => {
     window.__alpha1IncludedEvents=[];
     for (const capture of [true,false]) document.querySelector("#pricingMatchesBody").addEventListener("click",event=>{
@@ -665,8 +687,61 @@ try {
   const includedEvents=await page.evaluate(()=>window.__alpha1IncludedEvents);
   assert(includedEvents.some(e=>e.type==="click"&&e.phase==="capture"),"Included action click did not reach the live pricing table.");
   assert(includedEvents.some(e=>e.type==="click"&&e.phase==="bubble"),"Included action click did not bubble through the live pricing table.");
-  await includedRow.locator("[data-output-edit-field='unit_price_override']").filter({hasText:"Included"}).waitFor({state:"visible"});
-  assert(Math.abs(Number((await includedRow.locator(".amount-cell").innerText()).replace(/[^0-9.-]/g,"")))<0.005,"Included row amount is not zero.");
+  const requireIncludedAmountZero = async () => {
+    const amountText = (await includedRow.locator(".amount-cell").innerText()).trim();
+    assert(/^-?\d+(?:\.\d+)?$/.test(amountText) && Number(amountText) === 0, "Included row amount must be a rendered numeric zero.");
+  };
+  const requireVisibleIncluded = async () => {
+    await requireCatalogueReference();
+    const right = includedRow.locator(quotedPriceSelector);
+    assert(await right.count() === 1 && await right.isVisible() && (await right.locator('.output-cell-text').innerText()).trim() === "Included", "RIGHT quoted price must display Included.");
+    assert(await right.getAttribute('tabindex') === '0' && await right.locator('[data-output-editor-field]').count() === 0, "RIGHT must remain editable, with no editor until explicitly activated.");
+    const authority = await includedRow.evaluate(element => {
+      const row = state.outputRows[Number(element.dataset.outputRow)];
+      return { raw: row?.pricing_authority, trusted: row && outputPriceAuthority(row), amount: row?.amount };
+    });
+    assert(authority.raw?.variant === "included" && authority.raw.price === 0 && authority.trusted?.variant === "included" && authority.trusted.price === 0 && authority.amount === 0, "Included row lost raw/trusted authority or numeric zero amount.");
+    await requireIncludedAmountZero();
+  };
+  await requireVisibleIncluded();
+  const includedAmountCell = includedRow.locator(".amount-cell");
+  const includedAmountText = await includedAmountCell.innerText();
+  const includedAmountControls = [{text: includedAmountText, accepted: true}];
+  try {
+    for (const text of ["", "???", "1.00"]) {
+      await includedAmountCell.evaluate((cell, value) => { cell.textContent = value; }, text);
+      let rejected = false;
+      try { await requireIncludedAmountZero(); } catch { rejected = true; }
+      assert(rejected, "Included zero assertion accepted a blank, unresolved or nonzero amount.");
+      includedAmountControls.push({text, accepted: false});
+    }
+  } finally {
+    await includedAmountCell.evaluate((cell, value) => { cell.textContent = value; }, includedAmountText);
+  }
+  await requireVisibleIncluded();
+  await writeJson("included-amount-dom-controls.json", includedAmountControls);
+  // The verified fixture supports restoration; the stress carrier separately covers unavailable rejection.
+  await includedRow.locator(quotedPriceSelector).focus();
+  await includedRow.locator(quotedPriceSelector).press('Enter');
+  const restore = includedRow.locator('[data-output-reference-action]');
+  assert(await restore.isEnabled(), "Verified catalogue restore must be enabled.");
+  assert((await includedRow.locator('.output-unit-price-editor button').allTextContents()).map(text => text.trim()).join('|') === 'Included|Use reference price', "RIGHT editor button order changed.");
+  await restore.click();
+  await requireCatalogueReference();
+  const restored = await includedRow.evaluate(element => {
+    const row = state.outputRows[Number(element.dataset.outputRow)];
+    return { raw: row?.pricing_authority, trusted: row && outputPriceAuthority(row), quantity: row?.quantity, amount: row?.amount, rate: collectQuoteExchangeRate() };
+  });
+  assert(restored.raw?.variant === 'catalog' && restored.raw.price === cataloguePrice && restored.trusted?.variant === 'catalog' && restored.trusted.price === cataloguePrice, "Use reference price did not restore verified catalogue authority.");
+  const restoredAmount = (await includedRow.locator('.amount-cell').innerText()).trim();
+  const expectedRestoredAmount = Math.round(cataloguePrice * Number(restored.quantity) * Number(restored.rate) * 100) / 100;
+  assert(/^-?\d+(?:\.\d+)?$/.test(restoredAmount) && Number(restoredAmount) === expectedRestoredAmount && restored.amount === cataloguePrice * Number(restored.quantity), "Catalogue restore did not apply applicable FX to the line amount.");
+  assert(await includedRow.locator('[data-output-editor-field]').count() === 0, "Restoration left an editor open.");
+  await includedRow.locator(quotedPriceSelector).focus();
+  await includedRow.locator(quotedPriceSelector).press('Enter');
+  await includedRow.locator('[data-output-included-action]').press('Space');
+  await requireVisibleIncluded();
+  await writeJson('s3-pricing-actions.json', { includedIdentity, cataloguePrice, restored, expectedRestoredAmount, unavailableRejectionCarrier: 'playwright-ai-basis-chat-stress.mjs' });
   expectedNumbers=[Math.round(price*2*100)/100,Math.round(price*2*1.09*100)/100];
   await page.screenshot({path:path.join(dirs.captures,"06-edited-lines.png"),fullPage:true});
   const editSaveTarget=await captureConfirmedSaveTarget(originalUploads, "commercial");
@@ -677,6 +752,11 @@ try {
   requireVisibleEditedQuantity(await pricedRow.locator('[data-output-edit-field="quantity"] .output-cell-text').innerText(),"after editing");
   assert(Number(durable.draft_state?.outputRows?.find((r)=>r.description===priced.description)?.quantity)===2,"Independent readback lost quantity 2.");
   assert(durable.draft_state?.outputRows?.find((r)=>r.description===included.description)?.price_mode==="Included","Independent readback lost Included state.");
+  const requirePersistedIncluded = (detail) => {
+    const row = detail.draft_state?.outputRows?.find(row => row.description === included.description);
+    assert(row?.pricing_authority?.variant === "included" && row.pricing_authority.price === 0 && row.amount === 0, "Saved Included authority and numeric zero amount must persist.");
+  };
+  requirePersistedIncluded(durable);
   const beforeGen=trace.jobs.length;
   assert(await page.locator('#outputSidePanel.is-active').isVisible(), 'Fresh confirmation did not reach Output.');
   assert(await page.locator('#sideDownloadButton').getAttribute('aria-disabled') !== 'true', 'Current XLSX action is disabled.');
@@ -701,8 +781,9 @@ try {
   assert(job.request.payload.pricing_reference_source==="local","XLSX request lost pricing-reference source.");
   assert(Number(xlsxReadback.draft_state.outputRows.find(r=>r.description===priced.description)?.quantity)===2,"Post-generation durable state changed the latest edit.");
   requireVisibleEditedQuantity(await pricedRow.locator('[data-output-edit-field="quantity"] .output-cell-text').innerText(),"after generation");
-  assert((await includedRow.locator('[data-output-edit-field="unit_price_override"]').innerText()).includes("Included"),"Visible Output lost the Included edit after generation.");
+  await requireVisibleIncluded();
   assert(xlsxReadback.draft_state.outputRows.find(r=>r.description===included.description)?.price_mode==="Included","Post-generation durable state lost Included edit.");
+  requirePersistedIncluded(xlsxReadback);
   assert(new URL(await page.locator("#sideDownloadButton").getAttribute("href"),baseUrl).toString()===new URL(exp.url,baseUrl).toString(),"Fresh quote does not point to current XLSX.");
   const downloaded=await fs.readFile(downloadPath);
   const digest=createHash("sha256").update(downloaded).digest("hex");
@@ -722,6 +803,22 @@ try {
   assert(createHash("sha256").update(protectedBytes).digest("hex")===digest,"Protected XLSX response does not match UI download.");
   await fs.writeFile(path.join(dirs.downloads,"alpha1-protected.xlsx"),protectedBytes);
   await page.screenshot({path:path.join(dirs.captures,"08-current-xlsx-ready.png"),fullPage:true});
+  await page.locator('#backToDashboardButton').click();
+  await page.locator('#dashboardLoadingModal').waitFor({ state: 'hidden' });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.locator('#dashboardLoadingModal').waitFor({ state: 'hidden' });
+  await page.locator('.dashboard-session-card[data-quote-session-id="' + sessionId + '"]').click();
+  await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+  await page.locator('#outputSidePanel.is-active').waitFor({ state: 'visible' });
+  assert(await page.evaluate(id => state.quoteSessionId === id && !state.quoteSessionRestoreBusy, sessionId), 'Saved Included reopen changed session identity.');
+  await requireVisibleIncluded();
+  requireVisibleEditedQuantity(await pricedRow.locator('[data-output-edit-field="quantity"] .output-cell-text').innerText(), 'after saved session reopen');
+  const reopenedDetail = await readSession(sessionId, baseUrl);
+  requirePersistedIncluded(reopenedDetail);
+  requireDurablePricingAuthority(reopenedDetail);
+  const reopenedExport = reopenedDetail.exports?.xlsx;
+  assert(reopenedExport?.exists === true && reopenedExport.stale === false && reopenedExport.sha256 === digest && reopenedExport.publication_id === exp.publication_id, 'Saved session reopen lost the current protected XLSX identity.');
+  assert(new URL(await page.locator('#sideDownloadButton').getAttribute('href'), baseUrl).toString() === protectedUrl, 'Reopened quote lost its current XLSX link.');
   const beforeLogoutResponse=await api.get(baseUrl+"/api/session");
   const beforeLogoutStatus=beforeLogoutResponse.status(); assert(beforeLogoutStatus===200,"Auth disappeared before logout.");
   assert((await beforeLogoutResponse.json()).authenticated===true,"Authenticated API context was not authenticated before logout.");
@@ -740,7 +837,7 @@ try {
   assert(trace.console.length===0,"Browser console errors/warnings: "+trace.console.slice(0,5).join(" | "));
   assert(trace.pageErrors.length===0,"Browser errors: "+trace.pageErrors.slice(0,5).join(" | "));
   assert(!trace.jobs.some((entry)=>entry.request?.type==="generate_pdf"),"Harness unexpectedly invoked the PDF generation path.");
-  completedChecks.push("generate_download_current_session_job_hash","xlsx_content_and_ui","logout_access_denial"); phase="browser_complete"; await writeJson("progress.json",{phase,completedChecks}); await writeJson("result.json",{result:"FRESH_ONLY_MOCK_ALPHA1_BROWSER_PHASE_COMPLETE",modifyExecuted:false,sessionId,workspace:"workspace-internal-alpha",profileId,pricingReference:fixtureId,mockDraftInvocations:1,realProviderCalls:0,normalizedRows:items.map((row)=>({selector:row.pricing_keyword,id:row.catalog_item_id,description:row.description,unit:row.unit,price:row.unit_price_override??row.effective_unit_price??row.catalog_unit_price})),includedDescription,digest,size:downloaded.length,xlsxValidation:validated,evidenceRoot:runRoot});
+  completedChecks.push("generate_download_current_session_job_hash","xlsx_content_and_ui","logout_access_denial"); phase="browser_complete"; await writeJson("progress.json",{phase,completedChecks}); await writeJson("result.json",{result:"FRESH_ONLY_MOCK_ALPHA1_BROWSER_PHASE_COMPLETE",modifyExecuted:false,savedSessionReopened:true,sessionId,workspace:"workspace-internal-alpha",profileId,pricingReference:fixtureId,mockDraftInvocations:1,realProviderCalls:0,normalizedRows:items.map((row)=>({selector:row.pricing_keyword,id:row.catalog_item_id,description:row.description,unit:row.unit,price:row.unit_price_override??row.effective_unit_price??row.catalog_unit_price})),includedDescription,digest,size:downloaded.length,xlsxValidation:validated,evidenceRoot:runRoot});
   await emitStdout(JSON.stringify({result:"FRESH_ONLY_MOCK_ALPHA1_BROWSER_PHASE_COMPLETE",sessionId,realProviderCalls:0,mockDraftInvocations:1,digest,evidenceRoot:runRoot}));
 } catch (error) {
   await captureActualView(error).catch(()=>{});

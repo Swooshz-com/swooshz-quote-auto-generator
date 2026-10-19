@@ -6,6 +6,9 @@ import { createHash } from 'node:crypto';
 // Component fixtures are synthetic and run only against the isolated G3 server.
 // Operator actions, normalisation, persistence and XLSX generation use real code.
 export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
+  const predecessorBytes=await fs.readFile(new URL('../tests/fixtures/fxui-c17-predecessor.json',import.meta.url));
+  assert.equal(createHash('sha256').update(predecessorBytes).digest('hex'),'1db57ff326ad072ecef74f146c5c5c1965fe5d55c1028de0ff30dcf0ea5a0d99');
+  const predecessor=JSON.parse(predecessorBytes);
   const fixture = await page.evaluate(() => {
     const reference=currentPricingReference();
     const catalog=(reference.authority_items || reference.items).find(item=>item.sale_unit_price>0);
@@ -53,12 +56,178 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   await page.waitForFunction(()=>!state.isPreparingOutput);
   const index=await page.evaluate(()=>state.outputRows.findIndex(r=>r.source_basis_line_id==='c17-selected'));
   const cell=page.locator('[data-output-edit-field="unit_price_override"][data-output-row="'+index+'"]');
-  assert.equal((await cell.innerText()).trim(),(fixture.catalogPrice*3).toFixed(2));
-  await cell.click();
   const editor=page.locator('[data-output-editor-field="unit_price_override"]');
-  assert.equal(await editor.inputValue(),String(fixture.catalogPrice*3));
+  const rowSnapshot=()=>page.evaluate(i=>({row:JSON.stringify(state.outputRows[i]),revision:state.outputRevision}),index);
+  await page.evaluate(async()=>{clearQuoteSessionDraftSaveTimer();await saveQuoteSessionDraftState();});
+  const keyboardProof=await verifyOutputModeKeyboardActivation(page,index,outputDir);
+  const catalogueBefore=await rowSnapshot();
+  const sourceCell=page.locator('tr[data-output-row="'+index+'"] td:nth-child(5)');
+  assert.equal(await sourceCell.locator('.output-cell-text').innerText(),fixture.catalogPrice.toFixed(2));
+  assert.equal(await sourceCell.getAttribute('data-output-edit-field'),null);
+  assert.equal(await cell.locator('.output-cell-text').innerText(),(fixture.catalogPrice*3).toFixed(2));
+  await sourceCell.click();assert.equal(await editor.count(),0);assert.deepEqual(await rowSnapshot(),catalogueBefore);
+  await cell.locator('.output-cell-text').click();assert.equal(await editor.inputValue(),'');
+  await editor.fill('999');await editor.press('Escape');
+  assert.deepEqual(await rowSnapshot(),catalogueBefore,'Escape must preserve catalogue authority');
+  // A catalogue restore already at the verified baseline is a true no-op.
+  await cell.click();await page.locator('[data-output-reference-action]').click();
+  assert.deepEqual(await rowSnapshot(),catalogueBefore);
+  // R05/R06: right-side editing stages empty, retains invalid text and blocks effects.
+  await cell.click();assert.equal(await editor.inputValue(),'');
+  assert.equal(await page.locator('tr[data-output-row="'+index+'"] [data-output-edit-field="unit_price_override"]').count(),1);
+  assert.equal(await page.locator('.output-fx-cell input').count(),0);
+  const staged=await page.evaluate(()=>quoteSessionDraftComparisonKey(currentQuoteSessionDraftState()));
+  const effects=[];const observe=r=>{if(r.method()!=='GET')effects.push(r.url());};page.on('request',observe);
+  for(const text of ['', '-1','nonsense','1.005','1.00000000000000000001']) {
+    await editor.fill(text);await editor.press('Enter');
+    assert.equal(await editor.inputValue(),text);
+    assert.equal(await editor.getAttribute('aria-invalid'),'true');
+    const alert=cell.locator('.output-editor-error');assert.equal(await alert.getAttribute('role'),'alert');assert.match(await alert.getAttribute('class'),/sr-only/);
+    assert.deepEqual(await alert.evaluate(e=>({width:e.getBoundingClientRect().width,height:e.getBoundingClientRect().height,clip:getComputedStyle(e).clip})),{width:1,height:1,clip:'rect(0px, 0px, 0px, 0px)'});
+    const pageCount=page.context().pages().length;
+    const blocked=await page.evaluate(async()=>{
+      const before={revision:state.outputRevision,panel:state.activeSidePanel,rows:JSON.stringify(state.outputRows)};
+      const save=await saveQuoteSessionDraftState();const generation=await handleGenerate();const moved=setSidePanel('customer',{force:true});
+      const fresh=await startNewQuote();const discard=await discardCurrentQuoteDraftSession();const restore=await modifyDashboardQuote('blocked-synthetic');const duplicate=await duplicateDashboardQuote('blocked-synthetic');
+      return {save,generation,moved,fresh,discard,restore,duplicate,before,after:{revision:state.outputRevision,panel:state.activeSidePanel,rows:JSON.stringify(state.outputRows)}};
+    });
+    assert.equal(blocked.save,null);assert.equal(blocked.generation,false);assert.equal(blocked.moved,false);for(const key of ['fresh','discard','restore','duplicate'])assert.equal(blocked[key],false);assert.deepEqual(blocked.after,blocked.before);assert.equal(page.context().pages().length,pageCount);
+  }
+  await page.locator('#sideDownloadButton').click();
+  await page.locator('#sideViewPdfButton').evaluate(e=>e.click());
+  assert.equal(await page.locator('#excelGeneratingModal').isVisible(),false);
+  assert.equal(effects.length,0,'Invalid editor must reject before mutable HTTP requests');page.off('request',observe);
+  assert.equal(await page.evaluate(()=>quoteSessionDraftComparisonKey(currentQuoteSessionDraftState())),staged);
+  await editor.press('Escape');assert.deepEqual(await rowSnapshot(),catalogueBefore);
+  // Direct right-side input commits explicit Q authority and cannot apply FX again.
+  await cell.click();assert.equal(await editor.inputValue(),'');await editor.fill('1');
+  await editor.evaluate(e=>{globalThis.detachedFxEditor=e;});await editor.press('Enter');
+  await page.evaluate(()=>{detachedFxEditor.dispatchEvent(new Event('change',{bubbles:true}));detachedFxEditor.dispatchEvent(new FocusEvent('focusout',{bubbles:true}));});
+  const overridden=await rowSnapshot();assert.equal(overridden.revision,catalogueBefore.revision+1);
+  assert.equal(JSON.parse(overridden.row).pricing_authority.price_currency,'AUD');
+  assert.equal(await cell.locator('.output-cell-text').innerText(),'1.00');
+  assert.equal(await sourceCell.locator('.output-cell-text').innerText(),fixture.catalogPrice.toFixed(2));
+  const catalogueProof=await verifyCatalogueBaselineDisplay(page,index,fixture,outputDir);
+  // A late/background browser checkpoint must not consume valid but uncommitted text.
+  await cell.locator('.output-cell-text').click();await editor.fill('2');
+  const checkpoint=await page.evaluate(()=>{const before={rows:JSON.stringify(state.outputRows),revision:state.outputRevision};saveSessionState();renderPricingMatches(state.outputRows);return {before,after:{rows:JSON.stringify(state.outputRows),revision:state.outputRevision},pending:activeOutputEditor?.editor.value};});
+  assert.deepEqual(checkpoint.after,checkpoint.before);assert.equal(checkpoint.pending,'2');await editor.press('Escape');
+  // R07: select/custom prospective currencies cannot reinterpret committed tags.
+  const currencyGuard=await page.evaluate(()=>{
+    const before=JSON.stringify(state.outputRows);const revision=state.outputRevision;
+    elements.quoteCurrency.value='USD';handleQuoteDetailFieldChange({target:elements.quoteCurrency});
+    const select=collectQuoteCurrency();
+    elements.quoteCurrency.value=CUSTOM_CURRENCY_VALUE;elements.quoteCurrencyCustom.value='XYZ';handleQuoteDetailFieldChange({target:elements.quoteCurrencyCustom});
+    const custom=collectQuoteCurrency();
+    elements.quoteExchangeRate.value='2';handleQuoteDetailFieldChange({target:elements.quoteExchangeRate});
+    const amount=outputCellDisplayValue(state.outputRows.find(r=>r.source_basis_line_id==='c17-selected'),'amount');
+    elements.quoteExchangeRate.value='3';handleQuoteDetailFieldChange({target:elements.quoteExchangeRate});
+    return {before,after:JSON.stringify(state.outputRows),select,custom,amount,revision};
+  });
+  assert.equal(currencyGuard.select,'AUD');assert.equal(currencyGuard.custom,'AUD');assert.equal(currencyGuard.amount,'2.00');
+  assert.equal(currencyGuard.before,currencyGuard.after);
+  // R04: consume the exact C17 producer's immutable untagged manual authority in
+  // the browser under its original reference context, then restore the carrier.
+  const legacy=await page.evaluate(payload=>{
+    const prior={id:state.pricingReferenceId,source:state.pricingReferenceSource,references:state.pricingReferences,currency:collectQuoteCurrency(),fx:elements.quoteExchangeRate.value};
+    try {
+      const reference={...payload.pricing_reference,id:payload.pricing_reference_id,source:payload.pricing_reference_source,digest_sha256:payload.quote_session.draft_state.quoteDetails.commercial_snapshot.pricing_basis.digest};
+      state.pricingReferences=[reference];state.pricingReferenceId=reference.id;state.pricingReferenceSource=reference.source;
+      setQuoteCurrencyControls(payload.currency || payload.quote_session.commercials.currency);elements.quoteExchangeRate.value='2';
+      const row=normalizeOutputRow(payload.line_items[0]);
+      return {mode:outputPriceDenomination(row),tag:row.pricing_authority.price_currency,price:outputPriceAuthority(row)?.price,amount:outputCellDisplayValue(row,'amount')};
+    } finally {state.pricingReferenceId=prior.id;state.pricingReferenceSource=prior.source;state.pricingReferences=prior.references;setQuoteCurrencyControls(prior.currency);elements.quoteExchangeRate.value=prior.fx;}
+  },predecessor);
+  assert.equal(legacy.mode,'reference');assert.equal(legacy.tag,undefined);assert.equal(legacy.price,1);assert.equal(legacy.amount,'4.00');
+  // R08 uses actual production math; no unit-first or arbitrary-decimal rewrite.
+  const math=await page.evaluate(()=>({line:quoteAmountValue(roundCommercialCents(3*1.01),1.37),unit:quoteAmountValue(1.01,1.37),edge:roundCommercialCents(.1*1.15)}));
+  assert.deepEqual(math,{line:4.15,unit:1.38,edge:.11});
+  const headings=await page.locator('.output-match-table thead th').allTextContents();
+  assert.equal(headings[4],'Reference price SGD');assert.equal(headings[5],'FX AUD per SGD');assert.equal(headings[6],'Quoted unit price AUD');
+  // R09 actual text bounds must remain inside every desktop heading cell.
+  for (const width of [1440, 1100]) {
+    await page.setViewportSize({width,height:1000});
+    const bounds=await page.locator('.output-match-table th').evaluateAll(cells=>cells.map(cell=>{
+      const range=document.createRange();range.selectNodeContents(cell);
+      const text=range.getBoundingClientRect(),box=cell.getBoundingClientRect();
+      const words=[...cell.textContent.matchAll(/\S+/g)].map(match=>{const word=document.createRange();word.setStart(cell.firstChild,match.index);word.setEnd(cell.firstChild,match.index+match[0].length);return word.getClientRects().length;});
+      return {label:cell.textContent,left:text.left-box.left,right:box.right-text.right,overflow:cell.scrollWidth-cell.clientWidth,words};
+    }));
+    assert.equal(bounds.every(cell=>cell.left>=-1 && cell.right>=-1 && cell.overflow<=1 && cell.words.every(lines=>lines===1)),true,JSON.stringify({width,bounds}));
+  }
+  // R09 narrow cards retain both denominations and currency labels.
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.locator('tr[data-output-row="'+index+'"] td[data-output-label^="Reference price"]').isVisible(),true);
+  assert.equal(await page.locator('tr[data-output-row="'+index+'"] td[data-output-label^="Quoted unit price"]').isVisible(),true);
+  const mobileBefore=await rowSnapshot();await cell.click();await editor.fill('1.005');await editor.press('Enter');
+  const mobileAlert=cell.locator('.output-editor-error');assert.equal(await mobileAlert.getAttribute('role'),'alert');
+  assert.deepEqual(await mobileAlert.evaluate(e=>({width:e.getBoundingClientRect().width,height:e.getBoundingClientRect().height,clip:getComputedStyle(e).clip})),{width:1,height:1,clip:'rect(0px, 0px, 0px, 0px)'});
+  assert.equal(await editor.getAttribute('aria-invalid'),'true');assert.equal(await cell.locator('small').count(),0);
+  assert.equal(await cell.evaluate(e=>e.scrollWidth-e.clientWidth<=1),true);
+  await page.screenshot({path:path.join(outputDir,'fxui-mobile.png'),fullPage:true});
+  await editor.press('Escape');assert.deepEqual(await rowSnapshot(),mobileBefore);
+  await page.setViewportSize({width:1440,height:1000});
+  // Explicitly exercise Included and zero, then restore the final quote override.
+  await cell.locator('.output-cell-text').click();await editor.fill('0');await editor.press('Enter');
+  assert.equal((await rowSnapshot()).row.includes('"variant":"manual"'),true);
+  await cell.locator('.output-cell-text').click();await page.locator('[data-output-included-action]').click();
+  assert.equal(JSON.parse((await rowSnapshot()).row).pricing_authority.variant,'included');
+  await cell.click();
   await editor.fill('1');await editor.press('Enter');
-  assert.equal((await cell.innerText()).trim(),'1.00');
+  assert.equal(await cell.locator('.output-cell-text').innerText(),'1.00');
+  // Resolve through reference mode, then exercise positive and incomplete-Q admission.
+  await cell.click();await page.locator('[data-output-reference-action]').click();
+  assert.equal(JSON.parse((await rowSnapshot()).row).pricing_authority.variant,'catalog');
+  const prospective=await page.evaluate(async()=>{
+    elements.quoteCurrency.value='USD';handleQuoteDetailFieldChange({target:elements.quoteCurrency});
+    const resolved=collectQuoteCurrency();const revision=state.outputRevision;
+    elements.quoteCurrency.value=CUSTOM_CURRENCY_VALUE;elements.quoteCurrencyCustom.value='';handleQuoteDetailFieldChange({target:elements.quoteCurrency});
+    const save=await saveQuoteSessionDraftState();const generation=await handleGenerate();const after=state.outputRevision;
+    elements.quoteCurrencyCustom.value='JPY';handleQuoteDetailFieldChange({target:elements.quoteCurrencyCustom});const custom=collectQuoteCurrency();
+    elements.quoteCurrency.value='AUD';handleQuoteDetailFieldChange({target:elements.quoteCurrency});
+    return {resolved,revision,save,generation,after,custom};
+  });
+  assert.equal(prospective.resolved,'USD');assert.equal(prospective.custom,'JPY');assert.equal(prospective.save,null);assert.equal(prospective.generation,false);assert.equal(prospective.after,prospective.revision);
+  await cell.click();await editor.fill('1');await editor.press('Enter');
+  await page.evaluate(async()=>{clearQuoteSessionDraftSaveTimer();await saveQuoteSessionDraftState();});
+  // Accepted large decimals must reopen in the author's decimal grammar.
+  for(const denomination of ['quote']) {
+    await cell.click();
+    await editor.fill('10000000000000000000000');await editor.press('Enter');
+    assert.equal(await page.evaluate(i=>outputPriceAuthority(state.outputRows[i])?.price,index),1e22,'Approved decimal must actually commit before reopening');
+    await page.evaluate(async()=>{clearQuoteSessionDraftSaveTimer();await saveQuoteSessionDraftState();});
+    const effects=[];const observe=request=>{if(request.method()!=='GET')effects.push(request.url());};page.on('request',observe);
+    try {
+      for(const key of ['Enter','Tab']) {
+        const before=await page.evaluate(i=>({row:JSON.stringify(state.outputRows[i]),revision:state.outputRevision,key:quoteSessionDraftComparisonKey(currentQuoteSessionDraftState()),file:state.downloadFile,fileRevision:state.downloadFileRevision}),index);
+        await cell.locator('.output-cell-text').click();assert.equal(await editor.inputValue(),'10000000000000000000000');
+        await editor.press(key);
+        if(key==='Tab'){assert.equal(await editor.count(),1);await page.keyboard.press('Escape');}
+        const after=await page.evaluate(i=>({row:JSON.stringify(state.outputRows[i]),revision:state.outputRevision,key:quoteSessionDraftComparisonKey(currentQuoteSessionDraftState()),file:state.downloadFile,fileRevision:state.downloadFileRevision}),index);
+        await fs.writeFile(path.join(outputDir,'fxui-large-'+denomination+'-'+key+'-noop.json'),JSON.stringify({before,after},null,2));
+        assert.deepEqual(after,before,'Large admitted '+denomination+' reopen must be an exact no-op');
+      }
+      assert.equal(effects.length,0,'Untouched large-price editor must not save');
+    } finally {page.off('request',observe);}
+  }
+  await cell.locator('.output-cell-text').click();await editor.fill('1');await editor.press('Enter');
+  await page.evaluate(async()=>{clearQuoteSessionDraftSaveTimer();await saveQuoteSessionDraftState();});
+  const identity=await page.evaluate(()=>{
+    const prior={rows:structuredClone(state.outputRows),lineItems:structuredClone(state.lineItems),revision:state.outputRevision,sort:state.outputSortMode,errors:[...state.outputErrors]};
+    try {
+      const selected=state.outputRows.findIndex(r=>r.source_basis_line_id==='c17-selected');
+      const other=state.outputRows.findIndex(r=>r.source_basis_line_id==='c17-control');
+      state.outputSortMode='name';
+      const description=elements.pricingMatchesBody.querySelector('tr[data-output-row="'+selected+'"] td[data-output-edit-field="description"]');
+      const destination=elements.pricingMatchesBody.querySelector('tr[data-output-row="'+other+'"] td[data-output-edit-field="unit_price_override"]');
+      openOutputCellEditor(description);activeOutputEditor.editor.value='AAA reordered synthetic row';
+      openOutputCellEditor(destination);
+      return activeOutputEditor?.row.source_basis_line_id;
+    } finally {
+      revokeOutputEditor();clearQuoteSessionDraftSaveTimer();state.outputRows=prior.rows;state.lineItems=prior.lineItems;state.outputRevision=prior.revision;state.outputSortMode=prior.sort;renderOutputValidationMessages(prior.errors);renderPricingMatches(state.outputRows);renderMatchSummary({pricing_matches:state.outputRows});
+    }
+  });
+  assert.equal(identity,'c17-control','R09 commit-triggered sort must retain the clicked row identity');
   await page.locator('#backToDashboardButton').click();
   await page.locator('#dashboardLoadingModal').waitFor({state:'hidden'});
   await page.locator('#dashboardSearchInput').fill('Synthetic');
@@ -69,7 +238,9 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   await page.locator('.dashboard-session-card[data-quote-session-id="'+sessionId+'"]').click();
   await page.locator('[data-dashboard-panel-action="modify-session"]').click();
   await page.locator('#outputSidePanel.is-active').waitFor({timeout:30000});
-  assert.equal((await cell.innerText()).trim(),'1.00');
+  assert.equal(await cell.locator('.output-cell-text').innerText(),'1.00');
+  assert.equal(await page.locator('tr[data-output-row="'+index+'"] td:nth-child(5) .output-cell-text').innerText(),fixture.catalogPrice.toFixed(2),'Catalogue baseline survives saved/reopened override');
+  assert.equal(await page.locator('tr[data-output-row="'+index+'"] .output-fx-cell').innerText(),'Not used\nRate: 3');
   await fs.mkdir(outputDir,{recursive:true});
   await page.screenshot({path:path.join(outputDir,'owner-uat-c17-output.png'),fullPage:true});
   const downloadPromise=page.waitForEvent('download',{timeout:60000});
@@ -88,10 +259,279 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   assert.equal(row.pricing_authority.price_currency,'AUD');
   assert.equal(row.pricing_authority.price,1);
   assert.equal(row.approved_quote_amount,2);
+  const savedLine=saved.draft_state.lineItems.find(r=>r.source_basis_line_id==='c17-selected');
+  assert.deepEqual(savedLine.pricing_authority,row.pricing_authority);
   const bytes=await fs.readFile(target),sha256=createHash('sha256').update(bytes).digest('hex');
   assert.equal(sha256,saved.exports.xlsx.sha256);
   assert.equal(saved.exports.xlsx.stale,false);
-  const proof={status:'OWNER_UAT_C17_RENDERED_SERVER_CURRENT_XLSX_PASS',sessionId,fixture,fx:3,manualQuoteUnitPrice:1,approvedQuoteAmount:2,bytes:bytes.length,sha256,providerCalls:0,seed:'Existing local G3 mock response plus explicit component fixture; no live injection'};
+  const proof={status:'FXUI_G3_RENDERED_SERVER_CURRENT_XLSX_PASS',ui:'OWNER_ACCEPTED_S3',uiSourceSHA256:createHash('sha256').update(await fs.readFile(new URL('../webapp/static/app.js',import.meta.url))).digest('hex'),keyboardProof,catalogueProof,requirements:['R01','R02','R03','R05','R06','R07','R08','R09','R10','R11'],pageErrors:0,sessionId,fixture,fx:3,manualQuoteUnitPrice:1,approvedQuoteAmount:2,bytes:bytes.length,sha256,providerCalls:0,seed:'Existing local G3 mock response plus explicit component fixture; no live injection'};
+  await fs.writeFile(path.join(outputDir,'owner-uat-c17-proof.json'),JSON.stringify(proof,null,2));
+  proof.delayedGeneration=await verifyDelayedGenerationAdmission(page,cell,editor,index,outputDir);
   await fs.writeFile(path.join(outputDir,'owner-uat-c17-proof.json'),JSON.stringify(proof,null,2));
   return proof;
+}
+
+
+async function verifyDelayedGenerationAdmission(page,cell,editor,index,outputDir) {
+  await page.evaluate(()=>hideExcelGeneratingModal());
+  await cell.locator('.output-cell-text').click();await editor.fill('2');await editor.press('Enter');
+  await page.evaluate(()=>clearQuoteSessionDraftSaveTimer());
+  let releaseSave,signalSave;
+  const gate=new Promise(resolve=>releaseSave=resolve),entered=new Promise(resolve=>signalSave=resolve);
+  const pauseSave=async route=>{if(route.request().method()==='POST'){signalSave();await gate;}await route.continue();};
+  let jobs=0;const observe=request=>{if(request.method()==='POST' && new URL(request.url()).pathname==='/api/jobs')jobs++;};
+  await page.route('**/api/quote-sessions',pauseSave);page.on('request',observe);
+  try {
+    await page.locator('#sideDownloadButton').click();await entered;
+    const focusTrail=[];let reachedPrice=false;
+    for(let count=0;count<40;count++) {
+      await page.keyboard.press('Shift+Tab');
+      const focus=await page.evaluate(()=>({tag:document.activeElement.tagName,id:document.activeElement.id,field:document.activeElement.dataset.outputEditField}));focusTrail.push(focus);
+      if(focus.field==='unit_price_override'){reachedPrice=true;break;}
+    }
+    assert.equal(reachedPrice,true,'Exercise keyboard traversal behind the existing modal');
+    await page.keyboard.press('Enter');assert.equal(await editor.count(),0,'Busy generation must refuse opening another editor');
+    // Inject only a transient editor fixture to challenge final dispatch even if
+    // a future entry or delayed event bypasses the busy opening guard.
+    await page.evaluate(i=>{
+      const row=state.outputRows[i],cell=elements.pricingMatchesBody.querySelector('tr[data-output-row="'+i+'"] [data-output-edit-field="unit_price_override"]');
+      cell.innerHTML=outputEditorHtml(row,i,'unit_price_override',{denomination:outputPriceDenomination(row)});
+      const editor=cell.querySelector('[data-output-editor-field]');editor.value='1.005';
+      activeOutputEditor={editor,row,revision:state.outputRevision,denomination:outputPriceDenomination(row),staged:false};editor.focus();
+    },index);
+    const before=await page.evaluate(()=>({revision:state.outputRevision,rows:JSON.stringify(state.outputRows),admission:commitActiveOutputEditor({commit:false})}));
+    assert.equal(before.admission,'blocked');releaseSave();
+    await page.waitForFunction(()=>!state.isGenerating);
+    assert.equal(jobs,0,'Invalid editor after awaited synchronization must block final job dispatch');
+    assert.equal(await editor.inputValue(),'1.005');
+    assert.deepEqual(await page.evaluate(()=>({revision:state.outputRevision,rows:JSON.stringify(state.outputRows)})),{revision:before.revision,rows:before.rows});
+    await editor.press('Escape');await page.evaluate(()=>hideExcelGeneratingModal());
+    await page.unroute('**/api/quote-sessions',pauseSave);
+    const download=page.waitForEvent('download',{timeout:60000});await page.locator('#sideDownloadButton').click();await download;
+    await page.waitForFunction(()=>!state.isGenerating);
+    assert.equal(jobs,1,'Resolved editor positive control dispatches exactly one real generation job');
+    const evidence={busyOpeningRefused:true,focusTrail,invalidRetained:'1.005',negativeJobs:0,positiveJobs:jobs,revisionPreserved:true};
+    await fs.writeFile(path.join(outputDir,'fxui-delayed-generation-proof.json'),JSON.stringify(evidence,null,2));return evidence;
+  } finally {releaseSave();await page.unroute('**/api/quote-sessions',pauseSave);page.off('request',observe);}
+}
+
+
+// Native activation and delegated handlers run in the real loaded application.
+// Synthetic row seeding and save-queue counts are isolated here; the surrounding
+// owner flow separately verifies real HTTP persistence and protected XLSX output.
+async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
+  await page.evaluate(i=>{
+    clearQuoteSessionDraftSaveTimer();
+    globalThis.fxModeTest={prior:{...state},fx:elements.quoteExchangeRate.value,
+      queue:queueQuoteSessionDraftStateSave,blocked:blockedOutputDraftSaveOptions,
+      row:structuredClone(state.outputRows[i]),saves:0};
+    fxModeTest.catalog=outputCatalogueBaseline(fxModeTest.row);
+    queueQuoteSessionDraftStateSave=()=>{fxModeTest.saves++;};blockedOutputDraftSaveOptions=null;
+    globalThis.seedFxModeTest=mode=>{
+      revokeOutputEditor();Object.assign(state,fxModeTest.prior);elements.quoteExchangeRate.value='2';
+      const row={...structuredClone(fxModeTest.row),quantity:3,price_mode:'Priced'};delete row.display_price;
+      const priced=mode==='catalog'?row:synchronizeOwnedOutputRowPrice(row,'10',{force:true,quoteCurrencyPrice:mode==='quote'});
+      state.outputRows=fxModeTest.prior.outputRows.map((r,j)=>normalizeOutputRow(j===i?priced:structuredClone(r)));
+      fxModeTest.saves=0;blockedOutputDraftSaveOptions=null;
+      renderPricingMatches(state.outputRows);state.lineItems=outputRowsToLineItems();syncControlStates();
+    };
+  },index);
+  const editor=page.locator('[data-output-editor-field="unit_price_override"]');
+  const row=page.locator('tr[data-output-row="'+index+'"]');
+  const cell=row.locator('td:nth-child(7)'),reference=row.locator('td:nth-child(5)');
+  const snapshot=()=>page.evaluate(()=>({rows:JSON.stringify(state.outputRows),lineItems:JSON.stringify(state.lineItems),revision:state.outputRevision,
+    draft:JSON.parse(quoteSessionDraftComparisonKey(currentQuoteSessionDraftState())),file:state.downloadFile,fileRevision:state.downloadFileRevision,
+    pdf:state.pdfFile,pdfRevision:state.pdfFileRevision,saves:fxModeTest.saves}));
+  const activate=async(selector,action)=>{const button=row.locator(selector);if(action==='pointer')await button.click();else {await button.focus();await page.keyboard.press(action);}};
+  const effects=[],outcomes=[];const observe=request=>{if(request.method()!=='GET')effects.push(request.url());};page.on('request',observe);
+  try {
+    for(const mode of ['catalog','reference','quote'])for(const key of ['Enter','F2','pointer']){
+      await page.evaluate(mode=>seedFxModeTest(mode),mode);const before=await snapshot();
+      assert.equal(await reference.getAttribute('data-output-edit-field'),null);assert.equal(await reference.getAttribute('tabindex'),null);
+      await reference.click();assert.equal(await editor.count(),0);assert.deepEqual(await snapshot(),before);
+      assert.equal(await cell.locator('small').count(),0);assert.equal(await row.locator('[data-output-price-mode]').count(),0);
+      if(key==='pointer')await cell.click();else {await cell.focus();await page.keyboard.press(key);}
+      assert.equal(await editor.inputValue(),mode==='quote'?'10':'');
+      assert.equal(await editor.getAttribute('placeholder'),null);
+      assert.deepEqual(await row.locator('.output-price-editor-actions button').allTextContents(),['Included','Use reference price']);
+      const colors=await row.locator('.output-price-editor-actions button').evaluateAll(es=>es.map(e=>getComputedStyle(e).backgroundColor));assert.notEqual(colors[0],colors[1]);
+      await editor.fill('1.005');await editor.press('Enter');assert.equal(await editor.getAttribute('aria-invalid'),'true');
+      assert.equal(await page.evaluate(()=>commitActiveOutputEditor({commit:false})),'blocked');assert.deepEqual(await snapshot(),before);
+      await editor.press('Tab');assert.equal(await row.locator('[data-output-included-action]').evaluate(e=>document.activeElement===e),true);
+      assert.deepEqual(await snapshot(),before);await page.keyboard.press('Escape');assert.equal(await editor.count(),0);assert.deepEqual(await snapshot(),before);
+      outcomes.push({mode,opening:key,staged:mode!=='quote',readonlyReference:true,cancelUnchanged:true});
+    }
+    for(const action of ['Enter','Space','pointer']){
+      await page.evaluate(()=>seedFxModeTest('catalog'));const before=await snapshot();await cell.click();await editor.fill('1');
+      await editor.evaluate(e=>{globalThis.fxModeDetachedEditor=e;});await editor.press('Enter');
+      await page.evaluate(()=>{fxModeDetachedEditor.dispatchEvent(new Event('change',{bubbles:true}));fxModeDetachedEditor.dispatchEvent(new FocusEvent('focusout',{bubbles:true}));});
+      assert.deepEqual(await page.evaluate(i=>({variant:outputPriceAuthority(state.outputRows[i]).variant,tag:outputPriceAuthority(state.outputRows[i]).price_currency,
+        price:outputPriceAuthority(state.outputRows[i]).price,amount:outputCellDisplayValue(state.outputRows[i],'amount'),revision:state.outputRevision,saves:fxModeTest.saves}),index),
+        {variant:'manual',tag:'AUD',price:1,amount:'3.00',revision:before.revision+1,saves:1});
+      await cell.click();await editor.fill('1.005');await activate('[data-output-reference-action]',action);
+      assert.deepEqual(await page.evaluate(i=>({variant:outputPriceAuthority(state.outputRows[i]).variant,price:outputPriceAuthority(state.outputRows[i]).price,
+        amount:outputCellDisplayValue(state.outputRows[i],'amount'),revision:state.outputRevision,saves:fxModeTest.saves}),index),
+        {variant:'catalog',price:await page.evaluate(()=>fxModeTest.catalog),amount:'180.00',revision:before.revision+2,saves:2});
+      const restored=await snapshot();await cell.click();await activate('[data-output-reference-action]',action);assert.deepEqual(await snapshot(),restored,'Already-catalogue restoration is a no-op');
+      await cell.click();await editor.fill('1.005');await activate('[data-output-included-action]',action);
+      assert.deepEqual(await page.evaluate(i=>({variant:outputPriceAuthority(state.outputRows[i]).variant,amount:outputCellDisplayValue(state.outputRows[i],'amount'),saves:fxModeTest.saves}),index),{variant:'included',amount:'0.00',saves:3});
+      assert.equal(await editor.count(),0);outcomes.push({action,quoteOverride:true,restoredCatalogue:true,restoreNoop:true,included:true});
+    }
+    assert.deepEqual(effects,[]);
+  } finally {
+    await fs.writeFile(path.join(outputDir,'fxui-native-mode-activation.json'),JSON.stringify({outcomes,effects},null,2));page.off('request',observe);
+    await page.evaluate(()=>{revokeOutputEditor();clearQuoteSessionDraftSaveTimer();Object.assign(state,fxModeTest.prior);
+      elements.quoteExchangeRate.value=fxModeTest.fx;queueQuoteSessionDraftStateSave=fxModeTest.queue;blockedOutputDraftSaveOptions=fxModeTest.blocked;
+      renderPricingMatches(state.outputRows);renderOutputValidationMessages(state.outputErrors);syncControlStates();
+      delete globalThis.seedFxModeTest;delete globalThis.fxModeTest;delete globalThis.fxModeDetachedEditor;});
+  }
+  return {outcomes,effects};
+}
+
+// Render the real production price cells into the live owner table. Only source
+// fixtures change: no price authority, draft, save, revision or export mutation.
+async function verifyCatalogueBaselineDisplay(page,index,fixture,outputDir) {
+  await page.evaluate(()=>{clearQuoteSessionDraftSaveTimer();globalThis.baselineTestPrior={...state};globalThis.baselineTestCurrency=collectQuoteCurrency();globalThis.baselineTestFx=elements.quoteExchangeRate.value;globalThis.baselineTestQueue=queueQuoteSessionDraftStateSave;globalThis.baselineTestBlocked=blockedOutputDraftSaveOptions;globalThis.baselineTestSaves=0;queueQuoteSessionDraftStateSave=()=>baselineTestSaves++;blockedOutputDraftSaveOptions=null;});
+  const effects=[],outcomes=[],fullTableOutcomes=[];
+  const observe=request=>{if(request.method()!=='GET')effects.push(request.url());};page.on('request',observe);
+  const cases=['valid','same-currency','zero','missing-item','missing-key','missing-basis','missing-digest','missing-reference','changed-source','missing-currency','ambiguous-item','ambiguous-reference','stale-digest','stale-identity','stale-currency','stale-row-basis','wrong-section','wrong-description','wrong-unit','missing-unit','missing-section','explicit-General','invalid-price','bracketed-description'];
+  try {
+    // Full-table delegated entry complements the exhaustive cell-boundary matrix.
+    for(const name of ['valid','missing-item','ambiguous-item','stale-digest','reference-manual']) {
+      const check=await page.evaluate(({name,index})=>{
+        revokeOutputEditor();Object.assign(state,baselineTestPrior);setQuoteCurrencyControls(baselineTestCurrency);elements.quoteExchangeRate.value=baselineTestFx;
+        state.pricingReferences=structuredClone(baselineTestPrior.pricingReferences);state.quoteCommercialSnapshot=structuredClone(baselineTestPrior.quoteCommercialSnapshot);
+        state.outputRows=structuredClone(baselineTestPrior.outputRows);
+        const reference=currentPricingReference(),items=reference.authority_items || reference.items,item=pricingReferenceCatalogItem(reference,state.outputRows[index].pricing_keyword);
+        if(name==='missing-item')items.splice(items.indexOf(item),1);
+        if(name==='ambiguous-item')items.push(structuredClone(item));
+        if(name==='stale-digest')state.quoteCommercialSnapshot.pricing_basis.digest='sha256:'+'a'.repeat(64);
+        if(name==='reference-manual'){
+          elements.quoteExchangeRate.value='2';
+          state.outputRows[index]=normalizeOutputRow(synchronizeOwnedOutputRowPrice({...state.outputRows[index],quantity:3},'10',{force:true,quoteCurrencyPrice:false}));
+        }
+        // Settle the normal derived pricingMatches projection before the no-effect check.
+        renderPricingMatches(state.outputRows);renderPricingMatches(state.outputRows);
+        const snapshot=()=>JSON.stringify({rows:state.outputRows,lineItems:state.lineItems,revision:state.outputRevision,refs:state.pricingReferences,
+          key:quoteSessionDraftComparisonKey(currentQuoteSessionDraftState()),file:state.downloadFile,fileRevision:state.downloadFileRevision,saves:baselineTestSaves});
+        const before=snapshot();renderPricingMatches(state.outputRows);return {before,after:snapshot()};
+      },{name,index});
+      await fs.writeFile(path.join(outputDir,'full-table-'+name+'.json'),JSON.stringify(check,null,2));
+      const before=JSON.parse(check.before),after=JSON.parse(check.after);
+      if(name==='stale-digest'){
+        const oldKey=JSON.parse(before.key),newKey=JSON.parse(after.key);
+        assert.equal(newKey.quoteCommercialReview.reason_code,'pricing_reference_digest_mismatch');
+        assert.deepEqual(newKey,{...oldKey,quoteCommercialReview:newKey.quoteCommercialReview},'Only the required stale-reference review marker may change');
+        before.key=after.key;
+      }
+      assert.deepEqual(after,before,name+' full-table rendering must preserve all prices, authority, revision, artifacts and save effects');
+      const tr=page.locator('tr[data-output-row="'+index+'"]'),reference=tr.locator('td:nth-child(5)'),quoted=tr.locator('td:nth-child(7)');
+      const unavailable=['missing-item','ambiguous-item','stale-digest'].includes(name);
+      assert.equal(await reference.locator('.output-cell-text').innerText(),unavailable?'Unavailable':fixture.catalogPrice.toFixed(2));
+      assert.equal(await reference.getAttribute('data-output-edit-field'),null);assert.equal(await quoted.locator('small').count(),0);
+      if(name==='reference-manual'){
+        assert.equal(await quoted.locator('.output-cell-text').innerText(),'20.00');assert.equal(await tr.locator('.amount-cell').innerText(),'60.00');
+        assert.equal(await tr.locator('.output-fx-cell').innerText(),'2\nOn custom reference 10.00 SGD');
+        assert.equal(await page.evaluate(i=>outputPriceAuthority(state.outputRows[i]).price_currency,index),undefined);
+      }
+      if(unavailable){
+        await quoted.click();const restore=tr.locator('[data-output-reference-action]');assert.equal(await restore.isDisabled(),true);
+        const blocked=await restore.evaluate(button=>{const before=JSON.stringify(state),saves=baselineTestSaves,result=applyOutputReferencePricing(button);return {before,after:JSON.stringify(state),saves,afterSaves:baselineTestSaves,result};});
+        assert.equal(blocked.result,'unchanged');assert.equal(blocked.after,blocked.before);assert.equal(blocked.afterSaves,blocked.saves);
+        await page.locator('[data-output-editor-field]').press('Escape');
+      }
+      fullTableOutcomes.push({name,unavailable,commercialStateUnchanged:true,reviewRequired:name==='stale-digest',restoreGuarded:unavailable});
+    }
+    await page.evaluate(()=>{revokeOutputEditor();Object.assign(state,baselineTestPrior);setQuoteCurrencyControls(baselineTestCurrency);elements.quoteExchangeRate.value=baselineTestFx;renderPricingMatches(state.outputRows);});
+    for(const name of cases) {
+      const result=await page.evaluate(({name,index})=>{
+        Object.assign(state,baselineTestPrior);setQuoteCurrencyControls(baselineTestCurrency);
+        state.pricingReferences=structuredClone(baselineTestPrior.pricingReferences);
+        state.quoteCommercialSnapshot=structuredClone(baselineTestPrior.quoteCommercialSnapshot);
+        state.outputRows=structuredClone(baselineTestPrior.outputRows);
+        const reference=currentPricingReference(),row=state.outputRows[index];
+        const items=reference.authority_items || reference.items;
+        const item=pricingReferenceCatalogItem(reference,row.pricing_keyword);
+        if(!item)throw new Error('Positive catalogue fixture must resolve before mutations');
+        row.catalog_unit_price=999999; // Deliberately untrustworthy cached projection.
+        if(name==='same-currency'){setQuoteCurrencyControls('SGD');row.pricing_authority.price_currency='SGD';}
+        if(name==='zero')item.sale_unit_price=0;
+        if(name==='missing-item')items.splice(items.indexOf(item),1);
+        if(name==='missing-key')row.pricing_keyword='';
+        if(name==='missing-basis')state.quoteCommercialSnapshot=null;
+        if(name==='missing-digest')delete reference.digest_sha256;
+        if(name==='missing-reference')state.pricingReferences=[];
+        if(name==='changed-source')state.pricingReferenceSource='different-source';
+        if(name==='missing-currency')delete reference.currency;
+        if(name==='ambiguous-item')items.push(structuredClone(item));
+        if(name==='ambiguous-reference')state.pricingReferences.push(structuredClone(reference));
+        if(name==='stale-digest')state.quoteCommercialSnapshot.pricing_basis.digest='sha256:'+ 'a'.repeat(64);
+        if(name==='stale-identity')state.quoteCommercialSnapshot.pricing_basis.id='different-synthetic-reference';
+        if(name==='stale-currency')state.quoteCommercialSnapshot.pricing_basis.currency='USD';
+        if(name==='stale-row-basis')row.pricing_basis_digest='sha256:'+ 'b'.repeat(64);
+        if(name==='wrong-section')row.section='Different synthetic section';
+        if(name==='wrong-description')row.description='Different synthetic description';
+        if(name==='wrong-unit')row.unit='Different synthetic unit';
+        if(name==='missing-unit'){row.unit='';item.unit='';item.unit_hint='';}
+        if(name==='missing-section'){row.section='';item.section='';}
+        if(name==='explicit-General'){row.section='General';item.section='General';}
+        if(name==='invalid-price')item.sale_unit_price=null,item.catalog_unit_price=null,item.unit_price=null;
+        if(name==='bracketed-description')row.description='['+item.description+'] - Synthetic detail';
+        row.pricing_authority.context=pricingAuthorityContext(row);
+        const snapshot=()=>JSON.stringify(state);
+        const before=snapshot();
+        const html=renderOutputPriceCells(row,index);
+        const tr=elements.pricingMatchesBody.querySelector('tr[data-output-row="'+index+'"]');
+        const cells=[...tr.children];cells[4].outerHTML=html;cells[5].remove();cells[6].remove();
+        return {before,after:snapshot(),mode:outputPriceDenomination(row),price:row.pricing_authority.price,
+          tag:row.pricing_authority.price_currency,amount:outputCellDisplayValue(row,'amount')};
+      },{name,index});
+      assert.equal(result.after,result.before,name+' display must preserve all commercial state');
+      // Missing reference metadata invalidates existing authority too; preserve those guards.
+      if(!['missing-digest','missing-reference','changed-source','missing-currency'].includes(name))assert.deepEqual({mode:result.mode,price:result.price,tag:result.tag,amount:result.amount},{mode:'quote',price:1,tag:name==='same-currency'?'SGD':'AUD',amount:'2.00'},name+' must not apply FX or replace the quote price');
+      const tr=page.locator('tr[data-output-row="'+index+'"]'),reference=tr.locator('td:nth-child(5)');
+      const expected=['valid','same-currency','bracketed-description','explicit-General'].includes(name)?fixture.catalogPrice.toFixed(2):name==='zero'?'0.00':'Unavailable';
+      assert.equal(await reference.locator('.output-cell-text').innerText(),expected,name);
+      assert.equal(await reference.locator('input,button,[tabindex],[contenteditable]').count(),0,name+' reference must remain read-only during a valid override');
+      {
+        assert.equal(await reference.getAttribute('data-output-edit-field'),null);
+        assert.equal(await reference.getAttribute('tabindex'),null);
+        assert.match(await reference.ariaSnapshot(),/Catalogue reference \(read-only\)/);
+        if(!['missing-digest','missing-reference','changed-source','missing-currency'].includes(name)) {
+          assert.equal(await tr.locator('.output-fx-cell').innerText(),'Not used\nRate: 3');
+          assert.equal(await tr.locator('[data-output-edit-field="unit_price_override"]').count(),1);
+        }
+        await reference.locator('.output-cell-text').click();assert.equal(await page.locator('[data-output-editor-field]').count(),0);
+      }
+      const quoted=tr.locator('td:nth-child(7)');
+      assert.equal(await quoted.locator('small').count(),0,name+' must omit redundant right-column captions');
+      if(expected==='Unavailable'){
+        await quoted.click();const restore=tr.locator('[data-output-reference-action]');assert.equal(await restore.isDisabled(),true,name);
+        const rejected=await restore.evaluate(button=>{const before=JSON.stringify(state),saves=baselineTestSaves;const result=applyOutputReferencePricing(button);return {before,after:JSON.stringify(state),saves,beyond:baselineTestSaves,result};});
+        assert.equal(rejected.result,'unchanged',name);assert.equal(rejected.after,rejected.before,name+' disabled handler must reject');assert.equal(rejected.beyond,rejected.saves);
+        await page.locator('[data-output-editor-field]').press('Escape');
+      }
+      if(['valid','zero'].includes(name)){
+        await quoted.click();await tr.locator('[data-output-reference-action]').click();
+        assert.equal(await page.evaluate(i=>outputPriceAuthority(state.outputRows[i]).variant,index),'catalog');
+        assert.equal(await quoted.locator('.output-cell-text').innerText(),name==='zero'?'0.00':(fixture.catalogPrice*3).toFixed(2));
+      }
+      if(['valid','missing-item','stale-digest'].includes(name)) {
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await reference.isVisible(),true);
+        const bounds=await reference.evaluate(e=>({overflow:e.scrollWidth-e.clientWidth,label:e.dataset.outputLabel,text:e.innerText}));
+        assert.equal(bounds.overflow<=1,true,JSON.stringify(bounds));assert.equal(bounds.label,'Reference price SGD');
+        await page.screenshot({path:path.join(outputDir,'catalogue-baseline-'+name+'-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
+      }
+      outcomes.push({name,reference:expected,mode:result.mode,amount:result.amount,commercialStateUnchanged:result.before===result.after});
+    }
+    assert.equal(effects.length,0,'Source display must not send mutable HTTP requests');
+  } finally {
+    page.off('request',observe);
+    await page.setViewportSize({width:1440,height:1000});
+    await page.evaluate(()=>{Object.assign(state,baselineTestPrior);setQuoteCurrencyControls(baselineTestCurrency);queueQuoteSessionDraftStateSave=baselineTestQueue;blockedOutputDraftSaveOptions=baselineTestBlocked;elements.quoteExchangeRate.value=baselineTestFx;delete globalThis.baselineTestFx;delete globalThis.baselineTestQueue;delete globalThis.baselineTestBlocked;delete globalThis.baselineTestSaves;delete globalThis.baselineTestCurrency;delete globalThis.baselineTestPrior;renderPricingMatches(state.outputRows);});
+    await fs.writeFile(path.join(outputDir,'catalogue-baseline-display-proof.json'),JSON.stringify({outcomes,fullTableOutcomes,effects},null,2));
+  }
+  return {outcomes,fullTableOutcomes,effects};
 }

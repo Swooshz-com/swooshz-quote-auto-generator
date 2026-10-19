@@ -4887,6 +4887,15 @@ def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if effective is None and not raw_authority:
             effective = quote_commercial_historical_effective_unit_price(row)
+        # Only a schema/context/currency-validated manual authority may bypass FX.
+        # Current reference ownership/digest validation remains in normalization.
+        manual_authority = normalize_pricing_authority(
+            raw_authority,
+            row,
+            reference_authority={"detail": pricing_basis} if isinstance(pricing_basis, dict) else None,
+            quote_currency=clean_text(details.get("currency")).upper(),
+        ) if raw_authority and raw_authority.get("variant") == "manual" else None
+        row_exchange_rate = pricing_authority_exchange_rate(manual_authority, saved_exchange_rate)
         quantity = parse_float_or_none(row.get("quantity"))
         raw_override = parse_float_or_none(raw_row.get("unit_price_override"))
         basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
@@ -4894,12 +4903,12 @@ def quote_commercial_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if raw_override is not None or basis_amount is None:
                 basis_amount = round_commercial_cents(quantity * effective)
                 row["pricing_basis_amount"] = basis_amount
-            if parse_float_or_none(row.get("approved_quote_amount")) is None and saved_exchange_rate is not None and basis_amount is not None:
-                row["approved_quote_amount"] = round_commercial_cents(basis_amount * saved_exchange_rate)
+            if parse_float_or_none(row.get("approved_quote_amount")) is None and row_exchange_rate is not None and basis_amount is not None:
+                row["approved_quote_amount"] = round_commercial_cents(basis_amount * row_exchange_rate)
             elif raw_override is not None:
                 row["approved_quote_amount"] = (
-                    round_commercial_cents(basis_amount * saved_exchange_rate)
-                    if saved_exchange_rate is not None and basis_amount is not None
+                    round_commercial_cents(basis_amount * row_exchange_rate)
+                    if row_exchange_rate is not None and basis_amount is not None
                     else None
                 )
         resolved["line_items"].append(row)
@@ -4998,6 +5007,25 @@ def quote_commercial_state_errors(
     if saved_profile_id and saved_profile_id != current_profile_id:
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
 
+    raw_rows = saved_draft_state.get("outputRows")
+    if not isinstance(raw_rows, list):
+        raw_rows = payload.get("line_items") if isinstance(payload.get("line_items"), list) else []
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            continue
+        raw_authority = raw_row.get("pricing_authority") if isinstance(raw_row.get("pricing_authority"), dict) else {}
+        included = (
+            clean_text(raw_row.get("price_mode")).lower() == "included"
+            or clean_text(raw_row.get("display_price")).lower() == "included"
+            or raw_authority.get("variant") == "included"
+        )
+        for key in ("pricing_basis_amount", "approved_quote_amount"):
+            if raw_row.get(key) in (None, ""):
+                continue
+            captured_amount = parse_float_or_none(raw_row[key])
+            if captured_amount is None or captured_amount < 0 or (included and captured_amount != 0):
+                errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
+                break
     canonical = quote_commercial_payload(payload)
     rows = canonical.get("line_items") if isinstance(canonical.get("line_items"), list) else []
     if any(
@@ -5008,8 +5036,9 @@ def quote_commercial_state_errors(
     validated_rows = normalize_line_items(canonical, auth_session=auth_session)
     if rows and len(validated_rows) != len(rows):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
-    rows = validated_rows
-    for row in rows:
+    # Compare captured canonical amounts, not values normalization just recomputed.
+    # Explicit valid price edits have already refreshed their derived amounts above.
+    for row, captured_row in zip(validated_rows, rows):
         if not isinstance(row, dict):
             continue
         authority = row.get("pricing_authority") if isinstance(row.get("pricing_authority"), dict) else None
@@ -5027,7 +5056,7 @@ def quote_commercial_state_errors(
             errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
             break
         quantity = parse_float_or_none(row.get("quantity"))
-        basis_amount = parse_float_or_none(row.get("pricing_basis_amount"))
+        basis_amount = parse_float_or_none(captured_row.get("pricing_basis_amount"))
         expected_basis = (
             round_commercial_cents(quantity * effective)
             if quantity is not None and quantity > 0
@@ -5040,9 +5069,11 @@ def quote_commercial_state_errors(
         ):
             errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
             break
-        approved_amount = parse_float_or_none(row.get("approved_quote_amount"))
+        approved_amount = parse_float_or_none(captured_row.get("approved_quote_amount"))
         if approved_amount is not None and expected_basis is not None and exchange_rate is not None and exchange_rate > 0:
-            expected_amount = round_commercial_cents(expected_basis * exchange_rate)
+            expected_amount = round_commercial_cents(
+                expected_basis * pricing_authority_exchange_rate(authority, exchange_rate)
+            )
             if round_commercial_cents(approved_amount) != expected_amount:
                 errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
                 break
@@ -26668,7 +26699,14 @@ def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) ->
                 has_invalid_row = True
                 continue
             base_amount = round_commercial_cents(quantity * effective)
-            quote_amount = round_commercial_cents(base_amount * exchange_rate) if exchange_rate is not None and base_amount is not None else None
+            manual_authority = normalize_pricing_authority(
+                row.get("pricing_authority"),
+                row,
+                reference_authority={"detail": commercial_state["snapshot"]["pricing_basis"]},
+                quote_currency=currency,
+            ) if isinstance(row.get("pricing_authority"), dict) and row["pricing_authority"].get("variant") == "manual" else None
+            row_exchange_rate = pricing_authority_exchange_rate(manual_authority, exchange_rate)
+            quote_amount = round_commercial_cents(base_amount * row_exchange_rate) if row_exchange_rate is not None and base_amount is not None else None
             if quote_amount is None:
                 has_invalid_row = True
             else:
