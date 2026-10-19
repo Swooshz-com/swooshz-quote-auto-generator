@@ -707,37 +707,72 @@ async function main() {
     await page.locator("#sideNextButton:not(.is-disabled)").waitFor({ timeout: 15000 });
     await page.locator("#sideNextButton").click();
     await page.locator("#outputSidePanel.is-active").waitFor({ timeout: 15000 });
-    const pendingUnitPriceCells = page.locator('#pricingMatchesBody .output-unit-price-cell[data-output-edit-field="unit_price_override"][data-output-denomination]', { hasText: "???" });
+    const quotedPriceSelector = '.output-unit-price-cell[data-output-edit-field="unit_price_override"][data-output-denomination="quote"]';
+    const pendingUnitPriceCells = page.locator('#pricingMatchesBody ' + quotedPriceSelector, { hasText: "???" });
     await pendingUnitPriceCells.first().waitFor({ timeout: 15000 });
-    const outputIncludedRows = await pendingUnitPriceCells.evaluateAll((cells) => (
-      cells.slice(0, 2).map((cell) => cell.getAttribute("data-output-row")).filter(Boolean)
-    ));
-    if (!outputIncludedRows.length) {
-      throw new Error("Expected at least one pending output unit price cell.");
-    }
-    for (const row of outputIncludedRows) {
-      const rowPrices = page.locator(`#pricingMatchesBody .output-unit-price-cell[data-output-row="${row}"]`);
-      const unitPriceCell = rowPrices.locator('xpath=self::*[@data-output-edit-field="unit_price_override"][@data-output-denomination]');
-      if (await rowPrices.count() !== 2 || await unitPriceCell.count() !== 1) throw new Error("Expected two prices with exactly one active denomination.");
-      const denomination = await unitPriceCell.getAttribute("data-output-denomination");
-      if (!["reference", "quote"].includes(denomination)) throw new Error("Active price has no explicit denomination.");
-      const inactivePrice = rowPrices.locator('xpath=self::*[not(@data-output-edit-field)]');
-      const beforeInactiveClick = await page.evaluate(() => state.outputRevision);
-      await inactivePrice.locator(".output-cell-text").click();
-      if (await page.locator('[data-output-editor-field="unit_price_override"]').count() !== 0
-        || await page.evaluate(() => state.outputRevision) !== beforeInactiveClick) {
-        throw new Error("Inactive price incorrectly opened an editor or changed the row.");
+    const outputIncludedRows = await pendingUnitPriceCells.evaluateAll((cells) => cells.slice(0, 2).map((cell) => cell.getAttribute("data-output-row")));
+    if (outputIncludedRows.length !== 2 || new Set(outputIncludedRows).size !== 2) throw new Error("Expected two distinct pending quoted-price rows for sequential Included actions.");
+    const beforeIncluded = await page.evaluate((indices) => {
+      return indices.map((index) => {
+        const row = state.outputRows[Number(index)];
+        return { id: row.source_basis_line_id, description: row.description, section: row.section, quantity: row.quantity, unit: row.unit, keyword: row.pricing_keyword, baseline: outputCatalogueBaseline(row) };
+      });
+    }, outputIncludedRows);
+    // These unresolved rows have no catalogue match; a numeric LEFT price would invent provenance.
+    if (beforeIncluded.some((row) => row.baseline !== null || row.keyword) || new Set(beforeIncluded.map(row => JSON.stringify(row))).size !== 2) throw new Error("Sequential unresolved fixture unexpectedly acquired catalogue provenance: " + JSON.stringify(beforeIncluded));
+    const readIncluded = (index) => page.evaluate(({ index, indices }) => {
+      const row = state.outputRows[Number(index)];
+      const tr = document.querySelector('#pricingMatchesBody tr[data-output-row="' + index + '"]');
+      const left = tr?.querySelector('.output-unit-price-cell:not([data-output-edit-field])');
+      const right = tr?.querySelector('.output-unit-price-cell[data-output-edit-field="unit_price_override"][data-output-denomination="quote"]');
+      return { id: row?.source_basis_line_id, description: row?.description, keyword: row?.pricing_keyword,
+        section: row?.section, quantity: row?.quantity, unit: row?.unit,
+        prices: tr?.querySelectorAll('.output-unit-price-cell').length,
+        left: left?.querySelector('.output-cell-text')?.textContent?.trim(),
+        leftReadOnly: !!left && !left.hasAttribute('tabindex') && !left.querySelector('[data-output-editor-field]'),
+        right: right?.querySelector('.output-cell-text')?.textContent?.trim(),
+        closed: !!right && !right.querySelector('[data-output-editor-field]'),
+        raw: row?.pricing_authority, trusted: row && outputPriceAuthority(row), amount: row?.amount,
+        amountText: tr?.querySelector('.amount-cell')?.textContent?.trim() };
+    }, { index, indices: outputIncludedRows });
+    const requireIncluded = (actual, expected) => {
+      if (actual.prices !== 2 || !actual.leftReadOnly || actual.left !== "Unavailable"
+        || actual.right !== "Included" || !actual.closed
+        || actual.id !== expected.id || actual.description !== expected.description || actual.keyword !== expected.keyword
+        || actual.section !== expected.section || actual.quantity !== expected.quantity || actual.unit !== expected.unit
+        || actual.raw?.variant !== "included" || actual.raw.price !== 0
+        || actual.trusted?.variant !== "included" || actual.trusted.price !== 0 || actual.amount !== 0
+        || !/^-?\d+(?:\.\d+)?$/.test(actual.amountText) || Number(actual.amountText) !== 0) {
+        throw new Error("Sequential Included lost RIGHT authority, numeric zero, LEFT provenance or row identity: " + JSON.stringify(actual));
       }
-      await unitPriceCell.locator(".output-cell-text").click();
-      const includedButton = unitPriceCell.locator(".output-unit-price-editor .output-included-button");
-      await includedButton.waitFor({ timeout: 15000 });
-      await includedButton.click();
+    };
+    for (const [position, index] of outputIncludedRows.entries()) {
+      const tr = page.locator('#pricingMatchesBody tr[data-output-row="' + index + '"]');
+      const left = tr.locator('.output-unit-price-cell:not([data-output-edit-field])');
+      const right = tr.locator(quotedPriceSelector);
+      const beforeInspection = await page.evaluate(() => JSON.stringify({ rows: state.outputRows, revision: state.outputRevision }));
+      await left.locator('.output-cell-text').click();
+      if (await page.locator('[data-output-editor-field="unit_price_override"]').count() !== 0
+        || await page.evaluate(() => JSON.stringify({ rows: state.outputRows, revision: state.outputRevision })) !== beforeInspection) throw new Error("LEFT inspection edited commercial state.");
+      await right.locator('.output-cell-text').click();
+      const restore = right.locator('[data-output-reference-action]');
+      if (!await restore.isDisabled()) throw new Error("Unavailable catalogue restoration must be disabled.");
+      // A dispatched click must also fail closed at the production handler, beyond native disabled UI.
+      await restore.dispatchEvent('click');
+      if (await page.evaluate(() => JSON.stringify({ rows: state.outputRows, revision: state.outputRevision })) !== beforeInspection) throw new Error("Unavailable catalogue restoration changed commercial state.");
+      await right.locator('.output-unit-price-editor .output-included-button').click();
+      for (const completed of outputIncludedRows.slice(0, position + 1)) requireIncluded(await readIncluded(completed), beforeIncluded[outputIncludedRows.indexOf(completed)]);
     }
-    const outputUnitPrices = await page.locator("#pricingMatchesBody tr").evaluateAll((rows, selectedRows) => (
-      selectedRows.map((row) => rows[Number(row)]?.querySelector(".output-unit-price-cell .output-cell-text")?.textContent?.trim() || "")
-    ), outputIncludedRows);
-    if (outputUnitPrices.some((value) => value !== "Included")) {
-      throw new Error(`Sequential Included clicks did not persist: ${JSON.stringify(outputUnitPrices)}.`);
+    const validIncluded = await readIncluded(outputIncludedRows[0]);
+    const negatives = [
+      { right: "Unavailable" }, { left: "Included" }, { leftReadOnly: false }, { closed: false }, { quantity: 999 },
+      { id: "different-row" }, { raw: { variant: "included", price: 1 } }, { trusted: null }, { amount: "0" },
+      ...["", "???", "1.00"].map((amountText) => ({ amountText })),
+    ];
+    for (const negative of negatives) {
+      let rejected = false;
+      try { requireIncluded({ ...validIncluded, ...negative }, beforeIncluded[0]); } catch { rejected = true; }
+      if (!rejected) throw new Error("Included assertion accepted invalid control: " + JSON.stringify(negative));
     }
     const outputShot = await screenshot(page, "ai-output-included-overlay.png");
 
