@@ -19957,6 +19957,10 @@ def catalog_line_contradicts_item(
     item_tokens: set[str] = set()
     for value in catalog_inference_values(item):
         item_tokens.update(catalog_inference_tokens(value))
+    spatial = catalog_spatial_context_parts(detail_text)
+    if spatial and item_tokens and catalog_attribute_conflicts(catalog_family_tokens(spatial[0]), item_tokens):
+        # Context attributes cannot cancel a conflicting primary-object attribute.
+        return True
     if line_tokens and item_tokens and catalog_attribute_conflicts(line_tokens, item_tokens):
         return True
     if catalog_detail_matches_other_catalog_object_family(

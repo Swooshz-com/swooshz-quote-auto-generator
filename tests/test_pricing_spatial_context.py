@@ -67,6 +67,21 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertTrue(webapp.catalog_line_contradicts_item(
             '[ nos work desk ] - wooden task seats at work desks', selected, catalog_items=[selected, other]))
 
+    def test_context_material_cannot_mask_primary_attribute_conflict(self):
+        selected, other = self.catalogue()
+        other['description'] = 'nos wooden work desk'
+        other['match_terms'] = ['wooden work desk']
+        for detail, contradiction in (
+            ('wooden task seats at wooden work desks', False),
+            ('metal task seats at work desks', True),
+            ('metal task seats at wooden work desks', True),
+        ):
+            for bracketed in (False, True):
+                text = '[ nos wooden task seat ] - ' + detail if bracketed else detail
+                with self.subTest(text=text):
+                    self.assertEqual(webapp.catalog_line_contradicts_item(
+                        text, selected, catalog_items=[selected, other]), contradiction)
+
     def selection_payload(self, detail, unit='nos'):
         payload, _ = self.fixture._owner_possible_match_payload(False, detail)
         lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload, payload['profile_id'])
