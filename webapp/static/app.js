@@ -292,6 +292,7 @@ const state = {
   blockingClarificationQuestions: [],
   boothDimensions: { ...DEFAULT_BOOTH_DIMENSIONS },
   originalAnalysisSnapshot: null,
+  pricingLedgerRevisions: {},
   pendingQuoteDependencyChanges: [],
   basisConfirmed: false,
   isAnalysisRunning: false,
@@ -1597,6 +1598,8 @@ function newClientErrorReference() {
   }
   return `ERR-${Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
 }
+
+const PRICING_SELECTION_STALE_MESSAGE = "This quote changed in another tab or session. Reopen it to see the latest version, then select the match again.";
 
 function genericFailureMessage(data = {}) {
   const reference = typeof data === "string" ? "" : errorReferenceFrom(data);
@@ -4344,6 +4347,7 @@ function buildSessionSnapshot() {
     blockingClarificationQuestions: state.blockingClarificationQuestions,
     boothDimensions: state.boothDimensions,
     originalAnalysisSnapshot: state.originalAnalysisSnapshot,
+    pricingLedgerRevisions: state.pricingLedgerRevisions,
     basisConfirmed: state.basisConfirmed,
     aiFailed: state.aiFailed,
     draftSource: state.draftSource,
@@ -4925,6 +4929,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.blockingClarificationQuestions = Array.isArray(restoredState.blockingClarificationQuestions) ? restoredState.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
   state.originalAnalysisSnapshot = restoredState.originalAnalysisSnapshot || null;
+  state.pricingLedgerRevisions = isPlainObject(restoredState.pricingLedgerRevisions) ? restoredState.pricingLedgerRevisions : {};
   state.basisConfirmed = Boolean(restoredState.basisConfirmed);
   state.draftSource = restoredState.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
@@ -7194,7 +7199,7 @@ function authoritativeBasisKeyClass(value = "") {
   return String(value).normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
-function authoritativeBasisKeyIsUnsafe(value = "") {
+function authoritativeBasisKeyIsUnsafeUncached(value = "") {
   if (QUOTE_BASIS_UNSAFE_KEYS.has(String(value))) return true;
   const keyClass = authoritativeBasisKeyClass(value);
   const parts = new Set(keyClass.split("_").filter(Boolean));
@@ -7204,9 +7209,34 @@ function authoritativeBasisKeyIsUnsafe(value = "") {
   return ["_file_handle", "_temp_path", "_temporary_path", "_tmp_path"].some((suffix) => keyClass.endsWith(suffix));
 }
 
+// The key check is pure; basis edits revalidate the same few keys on every interaction.
+const AUTHORITATIVE_BASIS_KEY_SAFETY = new Map();
+function authoritativeBasisKeyIsUnsafe(value = "") {
+  const key = String(value);
+  if (AUTHORITATIVE_BASIS_KEY_SAFETY.has(key)) return AUTHORITATIVE_BASIS_KEY_SAFETY.get(key);
+  const unsafe = authoritativeBasisKeyIsUnsafeUncached(key);
+  if (AUTHORITATIVE_BASIS_KEY_SAFETY.size < 4096) AUTHORITATIVE_BASIS_KEY_SAFETY.set(key, unsafe);
+  return unsafe;
+}
+
+// Exact TextEncoder UTF-8 length (lone surrogates count as U+FFFD) without allocating per string.
+function authoritativeBasisUtf8Length(text) {
+  let length = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) length += 1;
+    else if (code < 0x800) length += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length && (text.charCodeAt(index + 1) & 0xfc00) === 0xdc00) {
+      length += 4;
+      index += 1;
+    } else length += 3;
+  }
+  return length;
+}
+
 function admitAuthoritativeBasisValue(value) {
   const budget = { nodes: 0, bytes: 0 };
-  const byteLength = (text) => new TextEncoder().encode(text).length;
+  const byteLength = authoritativeBasisUtf8Length;
   const admit = (current, depth) => {
     if (depth > AUTHORITATIVE_BASIS_LIMITS.depth) throw new TypeError("Quote basis exceeds the maximum depth.");
     budget.nodes += 1;
@@ -9149,6 +9179,7 @@ function buildPayload(options = {}) {
     quote_basis: persistedBasis.quote_basis,
     quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: includeDraftContext ? (state.outputRows.length ? outputRowsToLineItems(state.outputRows) : state.lineItems) : [],
+    ...(isPlainObject(state.originalAnalysisSnapshot?.pricing_analysis_seal) ? { pricing_analysis_seal: state.originalAnalysisSnapshot.pricing_analysis_seal } : {}),
     analysis_findings: state.analysisFindings,
     blocking_clarification_questions: state.blockingClarificationQuestions,
     view_pdf: options.viewPdf === true,
@@ -9208,6 +9239,7 @@ function buildLineItemNormalizePayload() {
     quote_basis: persistedBasis.quote_basis,
     quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: state.lineItems.map(normalizeLineItem),
+    ...(isPlainObject(state.originalAnalysisSnapshot?.pricing_analysis_seal) ? { pricing_analysis_seal: state.originalAnalysisSnapshot.pricing_analysis_seal } : {}),
   };
 }
 
@@ -11355,7 +11387,35 @@ function basisFieldLabel(field) {
 }
 
 function updateQuoteBasisCard(source = "edited") {
-  elements.basisReviewSurface.innerHTML = renderQuoteBasisMessage(state.quoteBasis, source);
+  replaceChangedMarkup(elements.basisReviewSurface, renderQuoteBasisMessage(state.quoteBasis, source));
+}
+
+// Same resulting DOM as assigning innerHTML, but unchanged nodes are kept so a one-line
+// basis edit does not rebuild and restyle every other line and possible match.
+function replaceChangedMarkup(container, html) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  replaceChangedChildNodes(container, template.content);
+}
+
+function replaceChangedChildNodes(target, source) {
+  const current = [...target.childNodes];
+  const next = [...source.childNodes];
+  if (current.length !== next.length) {
+    target.replaceChildren(...next);
+    return;
+  }
+  next.forEach((node, index) => {
+    const existing = current[index];
+    if (existing.isEqualNode(node)) return;
+    const sameElementShell = existing.nodeType === Node.ELEMENT_NODE
+      && node.nodeType === Node.ELEMENT_NODE
+      && existing.tagName === node.tagName
+      && existing.attributes.length === node.attributes.length
+      && [...node.attributes].every((attribute) => existing.getAttribute(attribute.name) === attribute.value);
+    if (sameElementShell) replaceChangedChildNodes(existing, node);
+    else existing.replaceWith(node);
+  });
 }
 
 function possibleMatchBasisDetailText(line = {}) {
@@ -12910,7 +12970,24 @@ function applyDraftLineItems(lineItems = []) {
 
 async function refreshLineItemsFromServer() {
   if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
-  const result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
+  let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+  if (selections.length && quoteSessionDraftSavePromise) {
+    // The selection request saves this draft itself; let any earlier save land first, then read the
+    // row revisions that save returned, so this tab's own save is never taken for another tab's.
+    await quoteSessionDraftSavePromise.catch(() => null);
+    selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+  }
+  let result;
+  if (selections.length && safeQuoteSessionId(state.quoteSessionId || "")) {
+    result = await postJson("/api/quote-sessions/pricing-selections", {
+      ...buildLineItemNormalizePayload(),
+      pricing_selections: selections,
+    });
+    const session = isPlainObject(result.data?.quote_session) ? result.data.quote_session : null;
+    if (result.ok && isPlainObject(session?.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [safeQuoteSessionId(state.quoteSessionId || "")]: session.pricing_ledger.rows };
+  } else {
+    result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
+  }
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
   state.lineItems = result.data.line_items.map((item) => (
     typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
@@ -12931,7 +13008,32 @@ function captureOriginalAnalysisSnapshot(data = {}) {
     analysis_mode: normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode),
     reference_file_signature: referenceFilesDependencySignature(),
     warnings: Array.isArray(data.warnings) ? [...data.warnings] : [],
+    // Opaque server seal of this analysis' rows and catalogue matches; the server verifies it.
+    pricing_analysis_seal: isPlainObject(data.pricing_analysis_seal) ? data.pricing_analysis_seal : null,
   };
+}
+
+
+// Unpriced rows whose basis line the operator bound to a catalogue match (a Possible Match click).
+function pendingPricingSelections() {
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const revisions = isPlainObject(state.pricingLedgerRevisions?.[sessionId]) ? state.pricingLedgerRevisions[sessionId] : {};
+  const rows = new Map();
+  state.lineItems.forEach((item) => {
+    const rowId = String(item?.source_basis_line_id || "");
+    if (rowId) rows.set(rowId, rows.has(rowId) ? null : item);
+  });
+  const selections = new Map();
+  (state.quoteBasisSections || []).forEach((section) => (section?.lines || []).forEach((line) => {
+    const itemId = String(line?.pricing_keyword || "").trim();
+    if (!itemId || line.custom_pricing || normalizeBasisTag(line.tag) !== "Include") return;
+    const rowId = [line.id, line.source_line_item_id].map((value) => String(value || "")).find((value) => rows.get(value));
+    const row = rowId ? rows.get(rowId) : null;
+    if (!row || ["catalog", "manual", "included"].includes(row.pricing_authority?.variant) || selections.has(rowId)) return;
+    const revision = revisions[rowId];
+    selections.set(rowId, { source_basis_line_id: rowId, catalog_item_id: itemId, expected_revision: Number.isInteger(revision) && revision >= 0 ? revision : 0 });
+  }));
+  return [...selections.values()].slice(0, 100);
 }
 
 function openBlockingClarifications(questions = [], findings = [], project = {}) {
@@ -13765,6 +13867,8 @@ async function saveCurrentQuoteSession(options = {}) {
       savedSessionId, currentContext.session_id === savedSessionId ? currentContext.run_id : ""
     );
     mergeDashboardQuoteSession(session);
+    // The server row revisions this tab last saw; a selection is accepted only against them.
+    if (isPlainObject(session.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [savedSessionId]: session.pricing_ledger.rows };
     if (payloadDraftKey) {
       rememberConfirmedQuoteSessionDraft(savedSessionId, payloadDraftKey, payloadDraftFileKey);
     }
@@ -14766,6 +14870,8 @@ async function modifyDashboardQuote(sessionId, options = {}) {
     state.dashboardSelectedSessionIds = [];
     state.dashboardActiveSessionId = safeSessionId;
     mergeDashboardQuoteSession({ ...detailedSession, has_draft_state: true });
+    const ledgerRows = detailedSession?.pricing_ledger?.rows;
+    if (ledgerRows && typeof ledgerRows === "object" && !Array.isArray(ledgerRows)) state.pricingLedgerRevisions = { [safeSessionId]: ledgerRows };
     rememberRestoredQuoteSessionBaseline(safeSessionId);
     clearDashboardOperation();
     showQuoteFlow();
@@ -15955,7 +16061,7 @@ async function confirmBasis(options = {}) {
       state.basisConfirmed = false;
       setWorkflowStage("basis_review");
       setResultStatus("Failed", "is-bad");
-      showBlockedBasisAction(genericFailureMessage(refreshed.data));
+      showBlockedBasisAction(refreshed.data?.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE : genericFailureMessage(refreshed.data));
       return;
     }
     state.basisConfirmed = true;

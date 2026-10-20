@@ -526,6 +526,7 @@ POST_RATE_LIMITS = {
     "/api/settings/profiles": 30,
     "/api/settings/profiles/:id": 30,
     "/api/quote-sessions": 30,
+    "/api/quote-sessions/pricing-selections": 30,
     "/api/quote-sessions/:id": 30,
     "/api/feedback": 10,
     # Privileged detail reads append audits, so cap them below status writes.
@@ -10692,6 +10693,8 @@ def rate_limit_path_key(path: str) -> str:
         return "/api/support/feedback/:id"
     if re.fullmatch(r"/api/settings/pricing-references/[A-Za-z0-9_-]+", normalized_path):
         return "/api/settings/pricing-references/:id"
+    if normalized_path == "/api/quote-sessions/pricing-selections":
+        return normalized_path
     if re.fullmatch(r"/api/quote-sessions/[A-Za-z0-9_-]+", normalized_path):
         return "/api/quote-sessions/:id"
     if re.fullmatch(r"/api/settings/profiles/[A-Za-z0-9_-]+/export\.json", normalized_path):
@@ -15906,6 +15909,7 @@ class DatabaseSqagStorage:
         metadata["commercials"] = quote_session_commercials(payload, patch)
         if isinstance(patch.get("draft_state"), dict):
             metadata["draft_state"] = quote_session_draft_state(patch)
+            apply_pricing_ledger_save(metadata, existing, self)
         metadata["publication"] = {
             "state": "staged",
             "run_id": run_id,
@@ -16291,6 +16295,7 @@ class DatabaseSqagStorage:
                 ]
             if isinstance(patch.get("draft_state"), dict):
                 metadata["draft_state"] = quote_session_draft_state(patch)
+                apply_pricing_ledger_save(metadata, existing, self)
             (
                 stored_generated_quote,
                 pending_artifacts,
@@ -16496,6 +16501,15 @@ class DatabaseSqagStorage:
             raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
 
     def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "") -> dict[str, Any]:
+        patch = quote_session_patch_payload(payload)
+        requested_session_id = safe_quote_session_id(session_id or patch.get("session_id") or payload.get("session_id"), "")
+        if not requested_session_id:
+            return self._create_or_update_quote_session(payload, result, output_dir, session_id, publish=publish, generation_run_id=generation_run_id, generation_job_id=generation_job_id)
+        # Saves and pricing selections for one quote apply its ledger one at a time.
+        with pricing_ledger_mutation(self, requested_session_id):
+            return self._create_or_update_quote_session(payload, result, output_dir, session_id, publish=publish, generation_run_id=generation_run_id, generation_job_id=generation_job_id)
+
+    def _create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "") -> dict[str, Any]:
         persistence_review = quote_commercial_persistence_preflight(payload)
         if persistence_review:
             error = QuoteCommercialStateError(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
@@ -16570,6 +16584,7 @@ class DatabaseSqagStorage:
             metadata["status"]["quote_generated"] = status_patch["quote_generated"]
         if isinstance(patch.get("draft_state"), dict):
             metadata["draft_state"] = quote_session_draft_state(patch)
+            apply_pricing_ledger_save(metadata, existing, self)
         stored_generated_quote = False
         pending_artifacts: list[ArtifactBatchItem] = []
         if (
@@ -16784,6 +16799,16 @@ class DatabaseSqagStorage:
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("Staged quote session is not valid.") from exc
         metadata = normalized_quote_session_metadata(metadata if isinstance(metadata, dict) else {})
+        if clean_text(current_metadata.get("updated_at")) != clean_text(metadata.get("updated_at")):
+            # A save landed after this version was staged (staging stamps both copies with one
+            # time; every save, including a pricing selection's, restamps it). Publish the staged
+            # outputs but keep that newer save's draft and pricing ledger, so promotion never
+            # reinstates a catalogue grant the later save superseded.
+            for key in QUOTE_SESSION_SAVE_OWNED_METADATA_KEYS:
+                if key in current_metadata:
+                    metadata[key] = copy.deepcopy(current_metadata[key])
+                else:
+                    metadata.pop(key, None)
 
         expected_by_name = {
             clean_text(item.get("name")): item
@@ -19908,6 +19933,27 @@ def catalog_line_contradicts_item(
     return line_ratio < 0.2 and item_ratio < 0.2
 
 
+def unresolved_detail_contradicts_selected_reference(
+    detail: Any,
+    line_text: Any,
+    item: dict[str, Any],
+    *,
+    catalog_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Judge an unclaimed row's detail under the basis line's exact selected reference.
+
+    An explicit selection is written as "[ reference ] - detail". The unclaimed source
+    row's original wording is that same detail, so it keeps every family and attribute
+    check but not the generic low-overlap rule an established reference already waives.
+    """
+    bracketed = bracketed_catalog_reference_parts(line_text)
+    if bracketed and not bracketed_catalog_reference_parts(detail):
+        _tokens, established, mismatch, _detail = catalog_family_evidence_tokens(line_text, item, catalog_items)
+        if established and not mismatch:
+            detail = f"[ {bracketed[0]} ] - {clean_text(detail)}"
+    return catalog_line_contradicts_item(detail, item, catalog_items=catalog_items)
+
+
 def reject_catalog_line_item_authority(
     row: dict[str, Any],
     *,
@@ -22532,6 +22578,7 @@ def quote_basis_sections_with_catalog_exact_lines(
     mark_unmatched_confirm_custom: bool = False,
     *,
     provider_result: bool = False,
+    reviewed_selection: bool = False,
 ) -> list[dict[str, Any]]:
     invalid_pricing_keyword_flag = "_invalid_pricing_keyword"
     invalid_pricing_keyword_value_flag = "_invalid_pricing_keyword_value"
@@ -22698,8 +22745,7 @@ def quote_basis_sections_with_catalog_exact_lines(
         associated_source_items = matched_source_items or (
             catalog_fallback_items if len(catalog_fallback_items) == 1 else []
         )
-        evidence_descriptions.extend(item.get("description") for item in associated_source_items)
-        return any(
+        if any(
             catalog_line_contradicts_item(
                 evidence,
                 catalog_item,
@@ -22707,6 +22753,23 @@ def quote_basis_sections_with_catalog_exact_lines(
             )
             for evidence in evidence_descriptions
             if clean_text(evidence)
+        ):
+            return True
+        return any(
+            unresolved_detail_contradicts_selected_reference(
+                source_item.get("description"),
+                line.get("text"),
+                catalog_item,
+                catalog_items=exact_catalog_items,
+            )
+            if reviewed_selection and not catalog_item_for_pricing_keyword(source_item.get("pricing_keyword"))
+            else catalog_line_contradicts_item(
+                source_item.get("description"),
+                catalog_item,
+                catalog_items=exact_catalog_items,
+            )
+            for source_item in associated_source_items
+            if clean_text(source_item.get("description"))
         )
 
     catalog_items_by_section: dict[str, list[dict[str, Any]]] = {}
@@ -23499,6 +23562,7 @@ def line_items_with_resolved_basis_catalog(
     catalog_lookup: dict[str, dict[str, Any]],
     *,
     provider_result: bool = False,
+    reviewed_selection: bool = False,
 ) -> list[dict[str, Any]]:
     if not line_items or not sections or not catalog_lookup:
         return line_items
@@ -23648,14 +23712,27 @@ def line_items_with_resolved_basis_catalog(
         if not catalog_item:
             resolved_items.append(item)
             continue
-        if any(
-            catalog_line_contradicts_item(
-                evidence,
+        # A reviewed selection reads this unclaimed row's wording as detail of its exact reference.
+        description_contradicts = (
+            unresolved_detail_contradicts_selected_reference
+            if reviewed_selection
+            else lambda detail, _line_text, selected, **kwargs: catalog_line_contradicts_item(detail, selected, **kwargs)
+        )
+        if (
+            clean_text(basis_line.get("text"))
+            and catalog_line_contradicts_item(
+                basis_line.get("text"),
                 catalog_item,
                 catalog_items=list(catalog_lookup.values()),
             )
-            for evidence in (item.get("description"), basis_line.get("text"))
-            if clean_text(evidence)
+        ) or (
+            clean_text(item.get("description"))
+            and description_contradicts(
+                item.get("description"),
+                basis_line.get("text"),
+                catalog_item,
+                catalog_items=list(catalog_lookup.values()),
+            )
         ):
             resolved_items.append(
                 reject_catalog_line_item_authority(
@@ -24069,17 +24146,588 @@ def line_items_aligned_to_quote_basis(
     return aligned if approved_only else (aligned or line_items)
 
 
+# Server pricing ledger. A row carries a trusted catalogue price only while this server
+# grants that exact row, catalogue item, reference and catalogue unit: either a fresh,
+# not-yet-saved analysis seal it issued for the quote, or a grant recorded in the quote's
+# persisted ledger. Request JSON (pricing_authority variants, keywords, flags, old saved
+# rows) never grants. Saves only record row state: any change bumps the row revision and a
+# grant the saved state no longer supports is superseded for good. An operator selection
+# becomes a grant only through the conditional pricing-selections operation on the row's
+# current revision. Manual and Included prices stay operator overrides of a live grant.
+PRICING_LEDGER_SCHEMA = "swooshz.sqag.pricing-ledger.v1"
+PRICING_ANALYSIS_SEAL_SCHEMA = "swooshz.sqag.pricing-analysis-seal.v1"
+PRICING_ANALYSIS_SEAL_PREFIX = b"sqag-pricing-analysis-seal-v1\0"
+PRICING_ANALYSIS_SEAL_MAC_RE = re.compile(r"v1\.[A-Za-z0-9_-]{43}")
+PRICING_ANALYSIS_ID_RE = re.compile(r"analysis-[a-f0-9]{24}")
+# Local single-user mode has no configured secret; seals there last for this process only.
+PRICING_ANALYSIS_SEAL_LOCAL_KEY = secrets.token_bytes(32)
+PRICING_LEDGER_MAX_ROWS = 400
+PRICING_LEDGER_MAX_ANALYSES = 20
+PRICING_ANALYSIS_SEAL_MAX_ROWS = 200
+PRICING_SELECTION_MAX = 100
+PRICING_SELECTION_STALE_MESSAGE = "This quote changed in another tab or session. Reopen it to see the latest version, then select the match again."
+PRICING_LEDGER_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+PRICING_LEDGER_LOCKS_LOCK = threading.Lock()
+
+
+def pricing_unit_quantity_basis(unit: Any) -> str:
+    """What one unit of quantity counts; units sharing a basis are one-to-one aliases."""
+    canonical = canonical_pricing_authority_unit(normalize_pricing_unit(unit)).lower()
+    if not canonical:
+        return ""
+    if canonical in LINEAR_TAKEOFF_UNITS:
+        return "length:metre"
+    return {"sqm": "area:sqm", "nos": "count:piece", "sets": "count:set", "lot": "count:lot"}.get(canonical, "other:" + canonical)
+
+
+def pricing_units_share_quantity_basis(source_unit: Any, catalog_unit: Any) -> bool:
+    """A quantity is reused only when both units count the same thing; nothing is converted."""
+    basis = pricing_unit_quantity_basis(source_unit)
+    return bool(basis) and basis == pricing_unit_quantity_basis(catalog_unit)
+
+
+def pricing_ledger_scope_for_storage(storage: Any) -> str:
+    if isinstance(storage, DatabaseSqagStorage):
+        return json.dumps(["database", storage.workspace_id, storage.user_id], separators=(",", ":"))
+    return json.dumps(["local"], separators=(",", ":"))
+
+
+def pricing_ledger_scope_for_auth_session(auth_session: dict[str, Any] | None) -> str:
+    """The storage identity a request's quote sessions live in (mirrors app_storage_for_auth_session)."""
+    if configured_storage_mode() != "database":
+        return json.dumps(["local"], separators=(",", ":"))
+    workspace_id = trusted_workspace_id(
+        platform_workspace_id_from_auth_session(auth_session),
+        allow_local=configured_app_mode() == "local",
+    )
+    if not workspace_id:
+        return ""
+    user_id = privacy_safe_tracking_id(platform_user_id_from_auth_session(auth_session), "")
+    return json.dumps(["database", workspace_id, user_id], separators=(",", ":"))
+
+
+@contextlib.contextmanager
+def pricing_ledger_mutation(storage: Any, session_id: str):
+    """Serialise every ledger read-modify-write for one quote in this process."""
+    if not isinstance(storage, DatabaseSqagStorage):
+        with quote_session_mutation(session_id):
+            yield
+        return
+    identity = (pricing_ledger_scope_for_storage(storage), session_id)
+    with PRICING_LEDGER_LOCKS_LOCK:
+        lock = PRICING_LEDGER_LOCKS.setdefault(identity, threading.RLock())
+    with lock:
+        yield
+
+
+def pricing_analysis_seal_key() -> bytes | None:
+    secret = session_secret()
+    if secret:
+        return hmac.new(secret.encode("utf-8"), b"sqag-pricing-analysis-seal-key-v1", hashlib.sha256).digest()
+    return None if configured_app_mode() == "deploy" else PRICING_ANALYSIS_SEAL_LOCAL_KEY
+
+
+def pricing_analysis_seal_canonical(value: Any) -> Any:
+    """Browser JSON keeps 2.0 as 2; MAC the value both runtimes round-trip identically."""
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {key: pricing_analysis_seal_canonical(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [pricing_analysis_seal_canonical(item) for item in value]
+    return value
+
+
+def pricing_analysis_seal_mac(key: bytes, scope: str, body: dict[str, Any]) -> str:
+    claims = json.dumps(
+        {"scope": scope, "body": pricing_analysis_seal_canonical(body)},
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+    return "v1." + b64url_encode(hmac.new(key, PRICING_ANALYSIS_SEAL_PREFIX + claims.encode("utf-8"), hashlib.sha256).digest())
+
+
+def pricing_ledger_quantity(value: Any) -> float | None:
+    quantity = parse_float_or_none(value)
+    return quantity if quantity is not None and math.isfinite(quantity) and quantity > 0 else None
+
+
+def pricing_analysis_source_units(raw_rows: Any) -> dict[str, str]:
+    """The unit each provider row was measured in, before any catalogue unit is applied to it."""
+    units: dict[str, list[str]] = {}
+    for raw in raw_rows if isinstance(raw_rows, list) else []:
+        row_id = safe_resource_id(raw.get("source_basis_line_id"), "") if isinstance(raw, dict) else ""
+        if not row_id:
+            continue
+        unit = normalize_pricing_unit(raw.get("unit"))
+        parts = normalized_line_text_quantity_parts(raw.get("description"), raw.get("quantity"), unit)
+        units.setdefault(row_id, []).append(canonical_pricing_authority_unit(parts["unit"] if parts.get("from_text_prefix") else unit))
+    return {row_id: values[0] for row_id, values in units.items() if len(values) == 1}
+
+
+def issue_pricing_analysis_seal(
+    payload: dict[str, Any],
+    line_items: list[dict[str, Any]],
+    auth_session: dict[str, Any] | None = None,
+    *,
+    source_units: dict[str, str],
+) -> dict[str, Any] | None:
+    """Seal this analysis result: which rows it produced, in which unit, and which it matched.
+
+    A match is sealed only when the provider's own unit and the priced row's unit both count
+    the same thing as the catalogue unit; a re-unit from pieces to sets or area is never sealed.
+    """
+    key = pricing_analysis_seal_key()
+    scope = pricing_ledger_scope_for_auth_session(auth_session)
+    if not key or not scope:
+        return None
+    authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
+    if not authority.get("ok") or pricing_reference_authority_error(payload, auth_session=auth_session):
+        return None
+    source, reference_id, digest, currency = pricing_authority_reference_identity(authority)
+    if not source or not reference_id or not PRICING_REFERENCE_DIGEST_RE.fullmatch(digest):
+        return None
+    session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
+    counts: dict[str, int] = {}
+    for item in line_items:
+        row_id = safe_resource_id(item.get("source_basis_line_id"), "") if isinstance(item, dict) else ""
+        if row_id:
+            counts[row_id] = counts.get(row_id, 0) + 1
+    rows = []
+    for item in line_items:
+        row_id = safe_resource_id(item.get("source_basis_line_id"), "") if isinstance(item, dict) else ""
+        if not row_id or counts[row_id] != 1:
+            continue
+        unit = canonical_pricing_authority_unit(normalize_pricing_unit(item.get("unit")))
+        source_unit = source_units.get(row_id, "")
+        entry: dict[str, Any] = {"id": row_id, "unit": source_unit, "quantity": pricing_ledger_quantity(item.get("quantity"))}
+        claim = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
+        catalog_unit = canonical_pricing_authority_unit(claim.get("catalog_unit"))
+        if (
+            claim.get("variant") == "catalog"
+            and clean_text(claim.get("catalog_item_id"))
+            and claim.get("catalog_digest") == digest
+            and claim.get("catalog_source") == source
+            and entry["quantity"] is not None
+            and pricing_units_share_quantity_basis(source_unit, catalog_unit)
+            and pricing_units_share_quantity_basis(unit, catalog_unit)
+        ):
+            entry.update(catalog_item_id=clean_text(claim["catalog_item_id"]), catalog_unit=catalog_unit)
+        rows.append(entry)
+    if len(rows) > PRICING_ANALYSIS_SEAL_MAX_ROWS:
+        return None
+    body = {
+        "schema": PRICING_ANALYSIS_SEAL_SCHEMA,
+        "analysis_id": "analysis-" + secrets.token_hex(12),
+        "issued_at": round(time.time(), 6),
+        "session_id": safe_quote_session_id(session.get("session_id"), ""),
+        "reference": {"source": source, "id": reference_id, "digest": digest, "currency": currency},
+        "rows": rows,
+    }
+    return {**body, "mac": pricing_analysis_seal_mac(key, scope, body)}
+
+
+def verified_pricing_analysis_seal(raw: Any, *, scope: str, session_id: str) -> dict[str, Any] | None:
+    """Return a seal this server issued for this storage scope and quote session, else None."""
+    key = pricing_analysis_seal_key()
+    if not key or not scope or not isinstance(raw, dict) or set(raw) != {
+        "schema", "analysis_id", "issued_at", "session_id", "reference", "rows", "mac",
+    }:
+        return None
+    mac = raw.get("mac")
+    if not isinstance(mac, str) or not PRICING_ANALYSIS_SEAL_MAC_RE.fullmatch(mac):
+        return None
+    body = {key_name: value for key_name, value in raw.items() if key_name != "mac"}
+    if not hmac.compare_digest(mac, pricing_analysis_seal_mac(key, scope, body)):
+        return None
+    if (
+        raw.get("schema") != PRICING_ANALYSIS_SEAL_SCHEMA
+        or raw.get("session_id") != session_id
+        or not isinstance(raw.get("analysis_id"), str)
+        or not PRICING_ANALYSIS_ID_RE.fullmatch(raw["analysis_id"])
+        or isinstance(raw.get("issued_at"), bool)
+        or not isinstance(raw.get("issued_at"), (int, float))
+        or not isinstance(raw.get("reference"), dict)
+        or not isinstance(raw.get("rows"), list)
+    ):
+        return None
+    return copy.deepcopy(raw)
+
+
+def pricing_analysis_seal_from_payload(payload: dict[str, Any]) -> Any:
+    if isinstance(payload.get("pricing_analysis_seal"), dict):
+        return payload["pricing_analysis_seal"]
+    session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
+    return pricing_analysis_seal_from_draft_state(session.get("draft_state"))
+
+
+def pricing_analysis_seal_from_draft_state(draft_state: Any) -> Any:
+    draft = draft_state if isinstance(draft_state, dict) else {}
+    snapshot = draft.get("originalAnalysisSnapshot") if isinstance(draft.get("originalAnalysisSnapshot"), dict) else {}
+    return snapshot.get("pricing_analysis_seal")
+
+
+def empty_pricing_ledger(origin: str) -> dict[str, Any]:
+    return {"schema": PRICING_LEDGER_SCHEMA, "revision": 0, "origin": origin, "analysis": None, "analyses": [], "rows": {}}
+
+
+# Fields a quote-session save writes; publication promotion keeps a newer save's copy of them.
+QUOTE_SESSION_SAVE_OWNED_METADATA_KEYS = (
+    "updated_at", "customer_summary", "quote_company_profile", "pricing_reference", "commercials",
+    "draft_state", "pricing_ledger",
+)
+PRICING_LEDGER_GRANT_FIELDS = ("catalog_item_id", "catalog_unit", "catalog_source", "catalog_digest", "reference_id")
+
+
+def normalized_pricing_ledger_grant(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or value.get("state") not in {"live", "superseded"} or value.get("origin") not in {"analysis", "operator", "legacy"}:
+        return None
+    grant = {"state": value["state"], "origin": value["origin"]}
+    for key in PRICING_LEDGER_GRANT_FIELDS:
+        if not isinstance(value.get(key), str):
+            return None
+        grant[key] = value[key]
+    if not grant["catalog_item_id"] or not PRICING_REFERENCE_DIGEST_RE.fullmatch(grant["catalog_digest"]):
+        return None
+    return grant
+
+
+def normalized_pricing_ledger(value: Any) -> dict[str, Any]:
+    """Validate a persisted ledger. A damaged ledger grants nothing; it is never re-bootstrapped."""
+    ledger = empty_pricing_ledger("invalid")
+    if not isinstance(value, dict) or value.get("schema") != PRICING_LEDGER_SCHEMA or value.get("origin") not in {"new", "legacy"}:
+        return ledger
+    revision = value.get("revision")
+    rows = value.get("rows")
+    analyses = value.get("analyses")
+    if type(revision) is not int or revision < 0 or not isinstance(rows, dict) or not isinstance(analyses, list):
+        return ledger
+    normalized = empty_pricing_ledger(value["origin"])
+    normalized["revision"] = revision
+    normalized["analyses"] = [item for item in analyses if isinstance(item, str) and PRICING_ANALYSIS_ID_RE.fullmatch(item)][-PRICING_LEDGER_MAX_ANALYSES:]
+    analysis = value.get("analysis")
+    if isinstance(analysis, dict) and isinstance(analysis.get("issued_at"), (int, float)) and not isinstance(analysis.get("issued_at"), bool):
+        normalized["analysis"] = {"issued_at": float(analysis["issued_at"])}
+    for row_id, entry in list(rows.items())[:PRICING_LEDGER_MAX_ROWS]:
+        if safe_resource_id(row_id, "") != row_id or not isinstance(entry, dict):
+            return ledger
+        rev, changed_at = entry.get("rev"), entry.get("changed_at")
+        if type(rev) is not int or rev < 0 or isinstance(changed_at, bool) or not isinstance(changed_at, (int, float)):
+            return ledger
+        normalized["rows"][row_id] = {
+            "rev": rev,
+            "changed_at": float(changed_at),
+            "fingerprint": entry["fingerprint"] if isinstance(entry.get("fingerprint"), str) else "",
+            "source_unit": entry["source_unit"] if isinstance(entry.get("source_unit"), str) else None,
+            "grant": normalized_pricing_ledger_grant(entry.get("grant")),
+        }
+    return normalized
+
+
+def pricing_ledger_draft_rows(draft_state: Any) -> dict[str, dict[str, Any]]:
+    """Each source row of a saved draft, with its basis line; ambiguous rows or lines read as absent."""
+    draft = draft_state if isinstance(draft_state, dict) else {}
+    rows: dict[str, list[dict[str, Any]]] = {}
+    for row in draft.get("lineItems") if isinstance(draft.get("lineItems"), list) else []:
+        row_id = safe_resource_id(row.get("source_basis_line_id"), "") if isinstance(row, dict) else ""
+        if row_id:
+            rows.setdefault(row_id, []).append(row)
+    lines: dict[str, list[dict[str, Any]]] = {}
+    for section in draft.get("quoteBasisSections") if isinstance(draft.get("quoteBasisSections"), list) else []:
+        for line in section.get("lines") if isinstance(section, dict) and isinstance(section.get("lines"), list) else []:
+            if isinstance(line, dict):
+                for line_id in {safe_resource_id(line.get("id"), ""), safe_resource_id(line.get("source_line_item_id"), "")} - {""}:
+                    lines.setdefault(line_id, []).append(line)
+    return {
+        row_id: {
+            "row": matches[0] if len(matches) == 1 else None,
+            "line": lines[row_id][0] if len(lines.get(row_id, [])) == 1 else None,
+        }
+        for row_id, matches in rows.items()
+    }
+
+
+def pricing_ledger_row_fingerprint(view: dict[str, Any] | None) -> str:
+    row = (view or {}).get("row")
+    line = (view or {}).get("line")
+    if not isinstance(row, dict):
+        return "absent"
+    authority = row.get("pricing_authority") if isinstance(row.get("pricing_authority"), dict) else {}
+    line = line if isinstance(line, dict) else {}
+    material = [
+        normalize_basis_tag(line.get("tag")) if line else "",
+        clean_text(line.get("pricing_keyword")),
+        bool(line.get("custom_pricing")),
+        parse_float_or_none(line.get("quantity")),
+        canonical_pricing_authority_unit(line.get("unit")),
+        parse_float_or_none(row.get("quantity")),
+        canonical_pricing_authority_unit(row.get("unit")),
+        clean_text(row.get("price_mode")).lower(),
+        clean_text(authority.get("variant")).lower(),
+        clean_text(row.get("pricing_keyword")),
+    ]
+    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
+
+
+def pricing_ledger_grant_supported(grant: dict[str, Any], view: dict[str, Any] | None, draft_state: Any) -> bool:
+    """Whether a saved draft still supports a grant (Manual/Included rows only override its price)."""
+    row = (view or {}).get("row")
+    line = (view or {}).get("line")
+    if not isinstance(row, dict) or not isinstance(line, dict):
+        return False
+    # Analysis matches arrive as Confirm (priced, awaiting review); Exclude/Custom end the grant.
+    if normalize_basis_tag(line.get("tag")) not in {"Include", "Confirm"} or line.get("custom_pricing"):
+        return False
+    bound = {clean_text(line.get("pricing_keyword")), clean_text(row.get("pricing_keyword"))} - {""}
+    if bound - {grant["catalog_item_id"]}:
+        return False
+    if not pricing_units_share_quantity_basis(row.get("unit"), grant["catalog_unit"]):
+        return False
+    draft = draft_state if isinstance(draft_state, dict) else {}
+    reference = (clean_text(draft.get("pricingReferenceSource")), clean_text(draft.get("pricingReferenceId")))
+    if all(reference) and reference != (grant["catalog_source"], grant["reference_id"]):
+        return False
+    return True
+
+
+def bootstrap_legacy_pricing_ledger(draft_state: Any) -> dict[str, Any]:
+    """A quote saved before the ledger keeps exactly the catalogue prices it had persisted."""
+    ledger = empty_pricing_ledger("legacy")
+    draft = draft_state if isinstance(draft_state, dict) else {}
+    for row_id, view in pricing_ledger_draft_rows(draft_state).items():
+        row = view["row"]
+        authority = row.get("pricing_authority") if isinstance(row, dict) and isinstance(row.get("pricing_authority"), dict) else {}
+        grant = None
+        if authority.get("variant") == "catalog":
+            grant = normalized_pricing_ledger_grant({
+                "state": "live", "origin": "legacy",
+                "catalog_item_id": authority.get("catalog_item_id"), "catalog_unit": authority.get("catalog_unit"),
+                "catalog_source": authority.get("catalog_source"), "catalog_digest": authority.get("catalog_digest"),
+                "reference_id": clean_text(row.get("pricing_reference_id") or draft.get("pricingReferenceId")),
+            })
+        ledger["rows"][row_id] = {"rev": 1, "changed_at": 0.0, "fingerprint": pricing_ledger_row_fingerprint(view),
+                                  "source_unit": None, "grant": grant}
+        if len(ledger["rows"]) >= PRICING_LEDGER_MAX_ROWS:
+            break
+    return ledger
+
+
+def effective_pricing_ledger(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not metadata:
+        return empty_pricing_ledger("new")
+    if "pricing_ledger" in metadata:
+        return normalized_pricing_ledger(metadata.get("pricing_ledger"))
+    return bootstrap_legacy_pricing_ledger(metadata.get("draft_state"))
+
+
+def pricing_ledger_new_row() -> dict[str, Any]:
+    return {"rev": 0, "changed_at": 0.0, "fingerprint": "", "source_unit": None, "grant": None}
+
+
+def pricing_ledger_seal_grants(seal: dict[str, Any] | None, ledger: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """Grants a seal still offers, or None once it is ingested or older than the latest analysis.
+
+    Rows the ledger saw change after the seal was issued are stale and offered nothing.
+    """
+    if not seal or seal["analysis_id"] in ledger["analyses"]:
+        return None
+    current = ledger.get("analysis")
+    issued_at = float(seal["issued_at"])
+    if current and issued_at <= current["issued_at"]:
+        return None
+    reference = seal["reference"] if isinstance(seal.get("reference"), dict) else {}
+    grants: dict[str, dict[str, Any]] = {}
+    for entry in seal["rows"][:PRICING_ANALYSIS_SEAL_MAX_ROWS]:
+        if not isinstance(entry, dict):
+            continue
+        row_id = safe_resource_id(entry.get("id"), "")
+        known = ledger["rows"].get(row_id)
+        if not row_id or (known and known["changed_at"] > issued_at):
+            continue
+        grant = normalized_pricing_ledger_grant({
+            "state": "live", "origin": "analysis",
+            "catalog_item_id": entry.get("catalog_item_id"), "catalog_unit": entry.get("catalog_unit"),
+            "catalog_source": reference.get("source"), "catalog_digest": reference.get("digest"),
+            "reference_id": reference.get("id"),
+        }) if entry.get("catalog_item_id") else None
+        grants[row_id] = {"grant": grant, "source_unit": entry.get("unit") if isinstance(entry.get("unit"), str) else None}
+    return grants
+
+
+def pricing_ledger_after_save(
+    existing: dict[str, Any] | None,
+    draft_state: Any,
+    *,
+    scope: str,
+    session_id: str,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """The ledger after a save: ingest a fresh analysis seal, record row changes, supersede unsupported grants."""
+    now = time.time() if now is None else now
+    ledger = copy.deepcopy(effective_pricing_ledger(existing))
+    changed = False
+    seal = verified_pricing_analysis_seal(
+        pricing_analysis_seal_from_draft_state(draft_state), scope=scope, session_id=session_id,
+    )
+    offered = pricing_ledger_seal_grants(seal, ledger)
+    if seal and offered is not None:
+        ledger["analyses"] = (ledger["analyses"] + [seal["analysis_id"]])[-PRICING_LEDGER_MAX_ANALYSES:]
+        ledger["analysis"] = {"issued_at": float(seal["issued_at"])}
+        for row_id, offer in offered.items():
+            entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
+            entry.update(grant=offer["grant"], source_unit=offer["source_unit"], rev=entry["rev"] + 1, changed_at=now)
+        changed = True
+    views = pricing_ledger_draft_rows(draft_state)
+    for row_id in list(dict.fromkeys([*views, *ledger["rows"]])):
+        view = views.get(row_id)
+        entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
+        fingerprint = pricing_ledger_row_fingerprint(view)
+        if fingerprint != entry["fingerprint"]:
+            entry.update(fingerprint=fingerprint, rev=entry["rev"] + 1, changed_at=now)
+            changed = True
+        grant = entry.get("grant")
+        if grant and grant["state"] == "live" and not pricing_ledger_grant_supported(grant, view, draft_state):
+            entry["grant"] = {**grant, "state": "superseded"}
+            entry["rev"] += 1
+            entry["changed_at"] = now
+            changed = True
+    if len(ledger["rows"]) > PRICING_LEDGER_MAX_ROWS:
+        absent = [row_id for row_id, entry in ledger["rows"].items()
+                  if entry["fingerprint"] == "absent" and not (entry.get("grant") or {}).get("state") == "live"]
+        for row_id in absent[: len(ledger["rows"]) - PRICING_LEDGER_MAX_ROWS]:
+            ledger["rows"].pop(row_id)
+    if changed or ledger["origin"] not in {"new", "legacy"}:
+        ledger["revision"] += 1
+    if ledger["origin"] == "invalid":
+        ledger["origin"] = "new"
+    return ledger
+
+
+def apply_pricing_ledger_save(metadata: dict[str, Any], existing: dict[str, Any] | None, storage: Any) -> None:
+    """Hook for every save that writes a draft: the persisted ledger follows the saved draft."""
+    metadata["pricing_ledger"] = pricing_ledger_after_save(
+        existing if existing else None,
+        metadata.get("draft_state"),
+        scope=pricing_ledger_scope_for_storage(storage),
+        session_id=safe_quote_session_id(metadata.get("session_id"), ""),
+    )
+
+
+def public_pricing_ledger(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Row revisions a client sends back as the expected state of a selection; no prices or grants."""
+    ledger = effective_pricing_ledger(metadata)
+    return {"revision": ledger["revision"], "rows": {row_id: entry["rev"] for row_id, entry in ledger["rows"].items()}}
+
+
+@dataclass
+class PricingLedgerView:
+    ledger: dict[str, Any]
+    seal_grants: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def grant(self, row_id: str) -> dict[str, Any] | None:
+        offer = self.seal_grants.get(row_id)
+        if offer is not None:
+            return offer["grant"]
+        entry = self.ledger["rows"].get(row_id) or {}
+        grant = entry.get("grant")
+        return grant if grant and grant["state"] == "live" else None
+
+    def source_unit(self, row_id: str) -> str | None:
+        offer = self.seal_grants.get(row_id)
+        if offer is not None and offer.get("source_unit") is not None:
+            return offer["source_unit"]
+        return (self.ledger["rows"].get(row_id) or {}).get("source_unit")
+
+
+def read_pricing_ledger_record(storage: Any, session_id: str) -> tuple[dict[str, Any], bool]:
+    """(persisted metadata, editable by the current user) for a quote session; ({}, True) when absent."""
+    if isinstance(storage, DatabaseSqagStorage):
+        metadata, _draft_files = storage._read_quote_session_metadata_for_workspace(session_id)
+        if not metadata:
+            return {}, True
+        return metadata, storage._quote_session_editable_by_current_user(metadata)
+    metadata = read_quote_session_metadata(session_id)
+    return (normalized_quote_session_metadata(metadata) if metadata else {}), True
+
+
+def pricing_ledger_view_for_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+    *,
+    storage: Any = None,
+) -> PricingLedgerView:
+    """The server's current grants for the quote a request names, plus a fresh unsaved analysis seal."""
+    session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
+    session_id = safe_quote_session_id(session.get("session_id"), "")
+    metadata: dict[str, Any] = {}
+    scope = pricing_ledger_scope_for_auth_session(auth_session)
+    if session_id:
+        try:
+            storage = storage or quote_session_storage_for_auth_session(auth_session)
+        except SqagStorageAccessError as exc:
+            if exc.reason != "protected_local_quote_session_storage_unavailable":
+                raise
+            storage = None
+        if storage is not None:
+            scope = pricing_ledger_scope_for_storage(storage)
+            # Read the quote as committed, never mid-way through a concurrent save.
+            with pricing_ledger_mutation(storage, session_id):
+                metadata, editable = read_pricing_ledger_record(storage, session_id)
+            if not editable:
+                return PricingLedgerView(empty_pricing_ledger("invalid"))
+    ledger = effective_pricing_ledger(metadata)
+    seal = verified_pricing_analysis_seal(pricing_analysis_seal_from_payload(payload), scope=scope, session_id=session_id)
+    return PricingLedgerView(ledger, pricing_ledger_seal_grants(seal, ledger) or {})
+
+
+def line_items_with_pricing_ledger(
+    line_items: list[dict[str, Any]],
+    view: PricingLedgerView,
+) -> list[dict[str, Any]]:
+    """Final trust gate: a catalogue price survives only where the server grants it."""
+    counts: dict[str, int] = {}
+    for item in line_items:
+        row_id = safe_resource_id(item.get("source_basis_line_id"), "") if isinstance(item, dict) else ""
+        counts[row_id] = counts.get(row_id, 0) + 1
+    result = []
+    for item in line_items:
+        authority = item.get("pricing_authority") if isinstance(item, dict) and isinstance(item.get("pricing_authority"), dict) else {}
+        if authority.get("variant") != "catalog":
+            result.append(item)
+            continue
+        row_id = safe_resource_id(item.get("source_basis_line_id"), "")
+        grant = view.grant(row_id) if row_id and counts.get(row_id) == 1 else None
+        granted = bool(
+            grant
+            and authority.get("catalog_item_id") == grant["catalog_item_id"]
+            and authority.get("catalog_digest") == grant["catalog_digest"]
+            and authority.get("catalog_source") == grant["catalog_source"]
+            and canonical_pricing_authority_unit(authority.get("catalog_unit")) == grant["catalog_unit"]
+            # The digest binds the reference content; a pre-ledger grant may not have recorded its id.
+            and (not grant["reference_id"] or clean_text(item.get("pricing_reference_id") or grant["reference_id"]) == grant["reference_id"])
+            and pricing_units_share_quantity_basis(item.get("unit"), grant["catalog_unit"])
+        )
+        result.append(item if granted else reject_catalog_line_item_authority(item))
+    return result
+
+
 def line_items_with_confirmed_basis_selections(
     payload: dict[str, Any],
     line_items: list[dict[str, Any]],
     auth_session: dict[str, Any] | None = None,
+    *,
+    ledger_view: PricingLedgerView | None = None,
 ) -> list[dict[str, Any]]:
-    """Admit an explicit, uniquely identified selection for an unresolved row."""
+    """Price an unresolved row from the server's live grant for its uniquely identified basis line.
+
+    The grant comes only from the conditional pricing-selections operation (or this quote's
+    analysis seal); the request's own row authority and the basis line binding are evidence of
+    which row and item, never of trust. Old pricing on a rejected row is never promoted.
+    """
     raw_items = payload.get("line_items")
-    if not isinstance(raw_items, list):
+    if not isinstance(raw_items, list) or ledger_view is None:
         return line_items
     if not any(isinstance(item.get("pricing_authority"), dict)
-               and item["pricing_authority"].get("variant") == "none" for item in line_items):
+               and item["pricing_authority"].get("variant") in {"none", "historical"} for item in line_items):
         return line_items
     raw_sections = payload.get("quote_basis_sections")
     if not isinstance(raw_sections, list) or not any(
@@ -24098,6 +24746,7 @@ def line_items_with_confirmed_basis_selections(
         payload, pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
     )
     basis_lines = [line for section in sections for line in section.get("lines") or [] if isinstance(line, dict)]
+    source, reference_id, digest, currency = pricing_authority_reference_identity(authority)
     result = []
     for item in line_items:
         source_id = safe_resource_id(item.get("source_basis_line_id"), "")
@@ -24106,31 +24755,31 @@ def line_items_with_confirmed_basis_selections(
         selected = [line for line in basis_lines if source_id
                     and source_id in {safe_resource_id(line.get("id"), ""), safe_resource_id(line.get("source_line_item_id"), "")}]
         current = item.get("pricing_authority") or {}
-        if len(originals) != 1 or len(selected) != 1 or current.get("variant") != "none":
+        if len(originals) != 1 or len(selected) != 1 or current.get("variant") not in {"none", "historical"}:
             result.append(item)
             continue
         original, line = originals[0], selected[0]
-        # Persisted prices, changed catalogue selectors and invalid authorities are not a new selection.
-        if clean_text(original.get("pricing_keyword")) or normalize_basis_tag(line.get("tag")) != "Include" or line.get("custom_pricing"):
-            result.append(item)
-            continue
-        supplied = original.get("pricing_authority")
-        if supplied is not None and (not isinstance(supplied, dict) or supplied.get("variant") != "none"
-                                    or normalize_pricing_authority(supplied, original) is None):
+        if normalize_basis_tag(line.get("tag")) != "Include" or line.get("custom_pricing"):
             result.append(item)
             continue
         keyword = clean_text(line.get("pricing_keyword"))
+        grant = ledger_view.grant(source_id)
         catalog_item = lookup.get(keyword)
         quantity = parse_float_or_none(item.get("quantity"))
-        selected_quantity = parse_float_or_none(line.get("quantity"))
-        unit = normalize_pricing_unit(item.get("unit"))
-        if (not catalog_item or clean_text(catalog_item.get("id")) != keyword
-                or quantity is None or quantity <= 0 or selected_quantity != quantity
-                or parse_float_or_none(original.get("quantity")) != selected_quantity
-                or not unit or normalize_pricing_unit(line.get("unit")) != unit
-                or normalize_pricing_unit(catalog_item_unit_hint(catalog_item)) != unit
-                or any(catalog_line_contradicts_item(text, catalog_item, catalog_items=list(lookup.values()))
-                       for text in (original.get("description"), line.get("text")) if clean_text(text))):
+        unit = normalize_pricing_unit(line.get("unit"))
+        if (not grant or grant["catalog_item_id"] != keyword
+                or (grant["catalog_source"], grant["reference_id"], grant["catalog_digest"]) != (source, reference_id, digest)
+                or not catalog_item or clean_text(catalog_item.get("id")) != keyword
+                or quantity is None or quantity <= 0
+                or parse_float_or_none(original.get("quantity")) != quantity
+                or parse_float_or_none(line.get("quantity")) != quantity
+                or canonical_pricing_authority_unit(unit) != grant["catalog_unit"]
+                or canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)) != grant["catalog_unit"]
+                or not pricing_units_share_quantity_basis(ledger_view.source_unit(source_id) or original.get("unit"), unit)
+                or (clean_text(line.get("text")) and catalog_line_contradicts_item(
+                    line.get("text"), catalog_item, catalog_items=list(lookup.values())))
+                or (clean_text(original.get("description")) and unresolved_detail_contradicts_selected_reference(
+                    original.get("description"), line.get("text"), catalog_item, catalog_items=list(lookup.values())))):
             result.append(item)
             continue
         price = pricing_reference_sale_unit_price(catalog_item)
@@ -24143,10 +24792,9 @@ def line_items_with_confirmed_basis_selections(
             "description": clean_customer_quote_line_text(catalog_item.get("description")),
             "pricing_keyword": keyword, "catalog_description": clean_customer_quote_line_text(catalog_item.get("description")),
             "pricing_reference_description": clean_text(catalog_item.get("description")),
-            "status": "matched", "price_mode": "Priced", "catalog_unit_price": price,
+            "unit": unit, "status": "matched", "price_mode": "Priced", "catalog_unit_price": price,
             "effective_unit_price": price, "unit_price_override": price,
         })
-        source, reference_id, digest, currency = pricing_authority_reference_identity(authority)
         next_item.update(pricing_reference_source=source, pricing_reference_id=reference_id,
                          pricing_basis_digest=digest, pricing_basis_currency=currency)
         next_item["pricing_authority"] = build_pricing_authority(
@@ -24164,18 +24812,180 @@ def line_items_with_confirmed_basis_selections(
     return result
 
 
+class PricingSelectionConflict(Exception):
+    def __init__(self, refusals: list[dict[str, str]], public_ledger: dict[str, Any]):
+        super().__init__("Pricing selection is stale.")
+        self.refusals = refusals
+        self.public_ledger = public_ledger
+
+
+def pricing_selection_requests(value: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(value, list) or not 1 <= len(value) <= PRICING_SELECTION_MAX:
+        return None
+    requests = []
+    seen: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"source_basis_line_id", "catalog_item_id", "expected_revision"}:
+            return None
+        row_id = safe_resource_id(entry.get("source_basis_line_id"), "")
+        item_id = clean_text(entry.get("catalog_item_id"))
+        revision = entry.get("expected_revision")
+        if not row_id or row_id in seen or not item_id or len(item_id) > 200 or type(revision) is not int or revision < 0:
+            return None
+        seen.add(row_id)
+        requests.append({"source_basis_line_id": row_id, "catalog_item_id": item_id, "expected_revision": revision})
+    return requests
+
+
+def pricing_selection_refusal(
+    request: dict[str, Any],
+    view: dict[str, Any] | None,
+    source_unit: str | None,
+    catalog_item: dict[str, Any] | None,
+    lookup: dict[str, dict[str, Any]],
+) -> str:
+    """Why the persisted row cannot take this catalogue item now ("" when it can)."""
+    row = (view or {}).get("row")
+    line = (view or {}).get("line")
+    item_id = request["catalog_item_id"]
+    if not isinstance(row, dict) or not isinstance(line, dict):
+        return "ineligible"
+    authority = row.get("pricing_authority") if isinstance(row.get("pricing_authority"), dict) else {}
+    if (normalize_basis_tag(line.get("tag")) != "Include" or line.get("custom_pricing")
+            or clean_text(line.get("pricing_keyword")) != item_id
+            or authority.get("variant") in {"manual", "included"}
+            or clean_text(row.get("price_mode")).lower() == "included"
+            or pricing_ledger_quantity(row.get("quantity")) is None):
+        return "ineligible"
+    if not catalog_item or clean_text(catalog_item.get("id")) != item_id or pricing_reference_sale_unit_price(catalog_item) is None:
+        return "not_in_catalogue"
+    catalog_unit = catalog_item_unit_hint(catalog_item)
+    if not all(pricing_units_share_quantity_basis(unit, catalog_unit) for unit in (source_unit or row.get("unit"), row.get("unit"))):
+        return "unit_review_required"
+    catalog_items = list(lookup.values())
+    if (clean_text(line.get("text")) and catalog_line_contradicts_item(line.get("text"), catalog_item, catalog_items=catalog_items)) or (
+        clean_text(row.get("description")) and unresolved_detail_contradicts_selected_reference(
+            row.get("description"), line.get("text"), catalog_item, catalog_items=catalog_items)):
+        return "contradiction"
+    return ""
+
+
+def write_quote_session_pricing_ledger(storage: Any, session_id: str, expected: dict[str, Any], ledger: dict[str, Any]) -> None:
+    """Commit a new ledger only if the session is still exactly as it was read (compare-and-swap)."""
+    if isinstance(storage, DatabaseSqagStorage):
+        def commit(connection: Any) -> None:
+            row = connection.execute(
+                "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                (storage.workspace_id, session_id),
+            ).fetchone()
+            raw = row["metadata_json"] if row is not None else None
+            current = json.loads(raw) if isinstance(raw, str) else None
+            if not isinstance(current, dict) or normalized_quote_session_metadata(current) != expected:
+                raise PricingSelectionConflict([], public_pricing_ledger(current if isinstance(current, dict) else {}))
+            updated = normalized_quote_session_metadata({**expected, "pricing_ledger": ledger})
+            cursor = connection.execute(
+                "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ? and metadata_json = ?",
+                (json.dumps(updated, ensure_ascii=True, sort_keys=True), storage.workspace_id, session_id, raw),
+            )
+            if getattr(cursor, "rowcount", 0) != 1:
+                raise PricingSelectionConflict([], public_pricing_ledger(current))
+
+        storage._run_storage_transaction(commit)
+        return
+    current = read_quote_session_metadata(session_id)
+    if not current or normalized_quote_session_metadata(current) != expected:
+        raise PricingSelectionConflict([], public_pricing_ledger(current or {}))
+    write_quote_session_metadata({**expected, "pricing_ledger": ledger})
+
+
+def apply_pricing_selections(
+    payload: dict[str, Any],
+    selections: list[dict[str, Any]],
+    storage: Any,
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Record operator selections as server grants against the rows' current revisions.
+
+    The request's draft is saved first (saves never grant), then each selection is checked
+    against that persisted row and committed atomically. A stale expected revision rejects the
+    whole request before anything is written.
+    """
+    session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
+    session_id = safe_quote_session_id(session.get("session_id"), "")
+    with pricing_ledger_mutation(storage, session_id):
+        existing, editable = read_pricing_ledger_record(storage, session_id)
+        if not editable:
+            raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
+        before = effective_pricing_ledger(existing)
+        stale = [
+            {"source_basis_line_id": request["source_basis_line_id"], "status": "refused", "reason": "stale"}
+            for request in selections
+            if (before["rows"].get(request["source_basis_line_id"]) or {}).get("rev", 0) != request["expected_revision"]
+        ]
+        if stale:
+            raise PricingSelectionConflict(stale, public_pricing_ledger(existing))
+        saved = storage.create_or_update_quote_session(payload)
+        if safe_quote_session_id(saved.get("session_id"), "") != session_id:
+            raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
+        persisted, _editable = read_pricing_ledger_record(storage, session_id)
+        ledger = copy.deepcopy(effective_pricing_ledger(persisted))
+        views = pricing_ledger_draft_rows(persisted.get("draft_state"))
+        reference = exact_pricing_reference_authority(payload, auth_session=auth_session)
+        source, reference_id, digest, _currency = pricing_authority_reference_identity(reference)
+        lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload), auth_session=auth_session)
+        outcomes = []
+        changed = False
+        now = time.time()
+        for request in selections:
+            row_id, item_id = request["source_basis_line_id"], request["catalog_item_id"]
+            entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
+            catalog_item = lookup.get(item_id)
+            reason = pricing_selection_refusal(request, views.get(row_id), entry.get("source_unit"), catalog_item, lookup)
+            if not reason and not (source and reference_id and PRICING_REFERENCE_DIGEST_RE.fullmatch(digest)):
+                reason = "reference_changed"
+            if reason:
+                outcomes.append({"source_basis_line_id": row_id, "status": "refused", "reason": reason})
+                continue
+            grant = {
+                "state": "live", "origin": "operator", "catalog_item_id": item_id,
+                "catalog_unit": canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)),
+                "catalog_source": source, "catalog_digest": digest, "reference_id": reference_id,
+            }
+            if entry.get("grant") != grant:
+                entry.update(grant=grant, rev=entry["rev"] + 1, changed_at=now)
+                changed = True
+            outcomes.append({"source_basis_line_id": row_id, "status": "selected"})
+        if changed:
+            ledger["revision"] += 1
+            write_quote_session_pricing_ledger(storage, session_id, normalized_quote_session_metadata(persisted), ledger)
+            persisted = {**normalized_quote_session_metadata(persisted), "pricing_ledger": ledger}
+        view = PricingLedgerView(effective_pricing_ledger(persisted))
+        line_items = normalize_line_items_for_quote_basis_review(payload, auth_session=auth_session, ledger_view=view)
+        return {
+            # Same contract as /api/line-items/normalize, plus each selection's outcome.
+            "status": "normalized",
+            "selections": outcomes,
+            "line_items": line_items,
+            "quote_session": {**saved, "pricing_ledger": public_pricing_ledger(persisted)},
+        }
+
+
 def normalize_line_items_for_quote_basis_review(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
+    *,
+    ledger_view: PricingLedgerView | None = None,
 ) -> list[dict[str, Any]]:
     commercial_state = quote_commercial_state(payload)
     if commercial_state.get("review_required"):
         return []
     if pricing_reference_authority_error(payload, auth_session=auth_session):
         return []
+    ledger_view = ledger_view or pricing_ledger_view_for_payload(payload, auth_session)
     if commercial_state.get("owned"):
         line_items = normalize_line_items(payload, auth_session=auth_session)
-        line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session)
+        line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session, ledger_view=ledger_view)
+        line_items = line_items_with_pricing_ledger(line_items, ledger_view)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
     trusted_input_authorities: dict[str, dict[str, Any]] = {}
     trusted_input_items = normalize_line_items(payload, auth_session=auth_session)
@@ -24191,6 +25001,7 @@ def normalize_line_items_for_quote_basis_review(
         pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
     )
     if not sections:
+        line_items = line_items_with_pricing_ledger(line_items, ledger_view)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
     catalog_lookup = pricing_catalog_runtime_lookup_for_payload(
@@ -24203,12 +25014,14 @@ def normalize_line_items_for_quote_basis_review(
         line_items,
         list(catalog_lookup.values()),
         provider_result=True,
+        reviewed_selection=True,
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
         sections,
         catalog_lookup,
         provider_result=True,
+        reviewed_selection=True,
     )
     line_items = line_items_aligned_to_quote_basis(
         line_items,
@@ -24219,7 +25032,8 @@ def normalize_line_items_for_quote_basis_review(
         exchange_rate=quote_exchange_rate_from_payload(payload),
         quote_currency=quote_currency_from_payload(payload),
     )
-    line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session)
+    line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session, ledger_view=ledger_view)
+    line_items = line_items_with_pricing_ledger(line_items, ledger_view)
     return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
 
@@ -24235,7 +25049,9 @@ def normalize_line_items_for_final_brief(
     line_items = normalize_line_items(payload, auth_session=auth_session)
     if not line_items:
         return []
+    ledger_view = pricing_ledger_view_for_payload(payload, auth_session)
     if commercial_state.get("owned"):
+        line_items = line_items_with_pricing_ledger(line_items, ledger_view)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
     sections = normalize_quote_basis_sections(
@@ -24249,6 +25065,7 @@ def normalize_line_items_for_final_brief(
             auth_session=auth_session,
         )
         line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
+    line_items = line_items_with_pricing_ledger(line_items, ledger_view)
     return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
 
@@ -24580,6 +25397,13 @@ def normalize_ai_draft(
         "project": dimensions,
     }
     if has_payload_context:
+        source_units = pricing_analysis_source_units(raw_line_items)
+        # Later stages see these rows re-unit to their catalogue items; only this stage still
+        # holds the unit the provider measured each row in, so it is carried forward internally.
+        result["_pricing_analysis_source_units"] = source_units
+        seal = issue_pricing_analysis_seal(payload, line_items, auth_session=auth_session, source_units=source_units)
+        if seal is not None:
+            result["pricing_analysis_seal"] = seal
         snapshot = pricing_reference_snapshot_for_payload(payload)
         actual_ids = {
             clean_text(item.get("id"))
@@ -25445,6 +26269,13 @@ def finalized_remote_draft_result(
                 line.pop("pricing_keyword", None)
     adjusted_basis = quote_basis_from_sections(adjusted_sections)
     final_line_items = line_items or fallback_line_items
+    # The seal attests provider-derived rows only, in the units the provider measured them in.
+    # Request/default fallback rows keep request trust and never become analysis matches.
+    provider_units = ai_basis.get("_pricing_analysis_source_units")
+    seal = issue_pricing_analysis_seal(
+        payload, line_items, auth_session=auth_session,
+        source_units=provider_units if isinstance(provider_units, dict) else {},
+    ) if has_payload_context and source.strip().lower() != "local" else None
     diagnostic_details = ai_draft_diagnostic_details(source, adjusted_basis, adjusted_sections, final_line_items)
     if isinstance(diagnostic_metadata, dict):
         diagnostic_details.update({key: value for key, value in diagnostic_metadata.items() if value not in (None, "", [], {})})
@@ -25460,6 +26291,7 @@ def finalized_remote_draft_result(
         "quote_basis_sections": adjusted_sections,
         "line_items": final_line_items,
         "project": project,
+        **({"pricing_analysis_seal": seal} if seal is not None else {}),
         **(
             {"_forensic_pricing_counts": copy.deepcopy(ai_basis["_forensic_pricing_counts"])}
             if isinstance(ai_basis.get("_forensic_pricing_counts"), dict)
@@ -27860,6 +28692,8 @@ def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any
     for key in ("customer_summary", "quote_company_profile", "pricing_reference", "commercials", "status", "exports", "owner", "draft_state", "publication"):
         if isinstance(metadata.get(key), dict):
             normalized[key].update(copy.deepcopy(metadata[key]))
+    if "pricing_ledger" in metadata:
+        normalized["pricing_ledger"] = normalized_pricing_ledger(metadata.get("pricing_ledger"))
     publication = normalized["publication"]
     active_publication_id = safe_quote_publication_id(
         publication.get("active_publication_id"),
@@ -28552,6 +29386,7 @@ def create_or_update_quote_session(
     draft_file_records: list[dict[str, Any]] | None = None
     if draft_state_supplied:
         metadata["draft_state"] = quote_session_draft_state(patch)
+        apply_pricing_ledger_save(metadata, existing, storage)
         draft_file_records = (
             quote_session_draft_files(patch)
             if "draft_files" in patch
@@ -28683,6 +29518,7 @@ def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool 
     published = quote_session_is_published(normalized)
     public.pop("publication", None)
     public.pop("owner", None)
+    public["pricing_ledger"] = public_pricing_ledger(normalized)
     draft_state = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
     public["has_draft_state"] = bool(draft_state)
     draft_progress = quote_session_draft_progress(draft_state)
@@ -32282,13 +33118,19 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 )
                 return
             payload = resolved_payload
-            self.send_json({
-                "status": "normalized",
-                "line_items": normalize_line_items_for_quote_basis_review(
+            try:
+                line_items = normalize_line_items_for_quote_basis_review(
                     payload,
                     auth_session=self.current_auth_session(),
-                ),
-            })
+                )
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            self.send_json({"status": "normalized", "line_items": line_items})
+            return
+
+        if parsed.path == "/api/quote-sessions/pricing-selections":
+            self.handle_pricing_selections(payload, auth_session)
             return
 
         if parsed.path == "/api/quote-sessions":
@@ -32597,6 +33439,67 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         except SqagStorageAccessError as exc:
             self.send_json(storage_access_error_payload(exc), status=exc.status)
             return None
+
+    def handle_pricing_selections(self, payload: dict[str, Any], auth_session: dict[str, Any] | None) -> None:
+        """Record explicit catalogue selections as server pricing grants (see apply_pricing_selections)."""
+        allowed, error = self.require_permission("canGenerateQuote")
+        if not allowed:
+            self.send_json(error, status=403)
+            return
+        selections = pricing_selection_requests(payload.get("pricing_selections"))
+        session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
+        if selections is None or not safe_quote_session_id(session.get("session_id"), ""):
+            self.send_json({"status": "blocked", "errors": ["Pricing selection request is invalid."]}, status=400)
+            return
+        commercial_review_block = quote_commercial_review_preflight(payload, auth_session=auth_session)
+        if commercial_review_block:
+            self.send_json(commercial_review_block, status=400)
+            return
+        pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
+        if pricing_reference_error:
+            if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                log_database_pricing_reference_resolution_block(payload)
+            self.send_json(pricing_reference_authority_blocked_result(
+                payload, [pricing_reference_error], auth_session=self.current_auth_session(),
+            ), status=400)
+            return
+        resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+        if resolved_payload is None:
+            log_database_pricing_reference_resolution_block(payload)
+            self.send_json(pricing_reference_authority_blocked_result(
+                payload, [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], auth_session=self.current_auth_session(),
+            ), status=400)
+            return
+        storage = self.current_quote_session_storage()
+        if storage is None:
+            return
+        try:
+            result = apply_pricing_selections(resolved_payload, selections, storage, auth_session=self.current_auth_session())
+        except PricingSelectionConflict as exc:
+            self.send_json({
+                "status": "conflict",
+                "errors": [PRICING_SELECTION_STALE_MESSAGE],
+                "selections": exc.refusals,
+                "pricing_ledger": exc.public_ledger,
+            }, status=409)
+            return
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
+            return
+        except ValueError as exc:
+            self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
+            return
+        except Exception as exc:  # pragma: no cover - defensive HTTP boundary
+            error_reference = new_error_reference()
+            write_local_log("server_error", {
+                "error_reference": error_reference,
+                "reason": "pricing_selection_failed",
+                "session_id": safe_quote_session_id(session.get("session_id"), ""),
+                "errors": safe_error_messages([exc.__class__.__name__]),
+            })
+            self.send_json({"status": "failed", "errors": safe_error_messages([f"Unexpected local runner error. Reference: {error_reference}."])}, status=500)
+            return
+        self.send_json(result)
 
     def current_quote_session_storage(self) -> LocalSqagStorage | DatabaseSqagStorage | None:
         try:

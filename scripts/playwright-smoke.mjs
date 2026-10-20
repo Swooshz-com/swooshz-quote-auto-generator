@@ -2304,10 +2304,12 @@ async function verifyServerPricingReferenceReviewDurability(page) {
     await page.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 15000 });
 
     const established = await page.evaluate(async () => {
+      // The operator's catalogue selection on a stable row; Confirm records it with the server ledger.
       state.quoteBasisSections = normalizeQuoteBasisSections([{
         id: "smoke-floor",
         title: "Floor Design",
         lines: [{
+          id: "smoke-floor-carpet",
           tag: "Include",
           text: "Needle punch carpet in colour",
           include: true,
@@ -2323,6 +2325,7 @@ async function verifyServerPricingReferenceReviewDurability(page) {
         unit: "sqm",
         description: "Needle punch carpet in colour",
         pricing_keyword: "synthetic-floor-needle-punch-carpet",
+        source_basis_line_id: "smoke-floor-carpet",
       })];
       const normalized = await refreshLineItemsFromServer();
       if (!normalized.ok) throw new Error(`Catalogue A normalization failed: ${JSON.stringify(normalized.data)}.`);
