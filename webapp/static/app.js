@@ -9912,14 +9912,18 @@ function dedupeOutputRows(rows = []) {
   return deduped;
 }
 
-function outputRowBasisMatchRank(row = {}, basisEntry = null, basisSourceIds = new Set()) {
+function outputRowBasisMatchRank(row = {}, basisEntry = null, basisSourceIds = new Set(), uniqueSourceIds = new Set()) {
   const line = basisEntry?.line;
   const sectionTitle = basisEntry?.section?.title || basisEntry?.section?.id || "";
-  if (!line || !outputRowSectionMatchesBasis(row, sectionTitle)) return 0;
+  if (!line) return 0;
   const lineIds = [line.id, line.source_line_item_id].map((value) => String(value || "").trim()).filter(Boolean);
   const sourceId = String(row.source_basis_line_id || "").trim();
-  if (sourceId && lineIds.includes(sourceId)) return 4;
+  const sectionMatches = outputRowSectionMatchesBasis(row, sectionTitle);
+  if (sourceId && lineIds.includes(sourceId)) return sectionMatches || uniqueSourceIds.has(sourceId) ? 4 : 0;
   if (sourceId && basisSourceIds.has(sourceId)) return 0;
+  // A server-admitted selection can use the catalogue section instead of its reference section.
+  // Stable row identity owns that mapping; heuristic matches still require the same section.
+  if (!sectionMatches) return 0;
   const keywordMatch = row.pricing_keyword && line.pricing_keyword && String(row.pricing_keyword) === String(line.pricing_keyword);
   if (keywordMatch) return 3;
   if (outputRowCoversBasisLine(row, line.text || "", sectionTitle)
@@ -9961,16 +9965,25 @@ function outputRowsAlignedToBasis(generatedRows = []) {
     return dedupeOutputRows(generatedRows.filter(outputRowAllowedByBasis).map(inheritBasisOutputFields));
   }
   const entries = quoteBasisOutputEntries(normalizedSections);
-  const basisSourceIds = new Set(entries.flatMap(({ line }) => [line.id, line.source_line_item_id])
-    .map((value) => String(value || "").trim())
-    .filter(Boolean));
+  const basisSourceCounts = new Map();
+  entries.forEach(({ line }) => {
+    new Set([line.id, line.source_line_item_id].map((value) => String(value || "").trim()).filter(Boolean))
+      .forEach((id) => basisSourceCounts.set(id, (basisSourceCounts.get(id) || 0) + 1));
+  });
+  const generatedSourceCounts = new Map();
+  generatedRows.forEach((row) => {
+    const id = String(row.source_basis_line_id || "").trim();
+    if (id) generatedSourceCounts.set(id, (generatedSourceCounts.get(id) || 0) + 1);
+  });
+  const basisSourceIds = new Set(basisSourceCounts.keys());
+  const uniqueSourceIds = new Set([...basisSourceCounts].filter(([id, count]) => count === 1 && generatedSourceCounts.get(id) === 1).map(([id]) => id));
   const usedIndexes = new Set();
   return entries.map((basisEntry) => {
     let bestIndex = -1;
     let bestRank = 0;
     generatedRows.forEach((row, index) => {
       if (usedIndexes.has(index)) return;
-      const rank = outputRowBasisMatchRank(row, basisEntry, basisSourceIds);
+      const rank = outputRowBasisMatchRank(row, basisEntry, basisSourceIds, uniqueSourceIds);
       if (rank > bestRank) {
         bestIndex = index;
         bestRank = rank;

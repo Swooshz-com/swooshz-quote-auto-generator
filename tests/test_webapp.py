@@ -41874,7 +41874,7 @@ main().catch((error) => {
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["xlsx"]["status"], "PASS")
         self.assertEqual({row["id"] for row in result["u1"] if row.get("expected") is not None},
-                         {"u1-graphic", "u1-carpet", "u1-historical", "u1-confirmed"})
+                         {"u1-count", "u1-graphic", "u1-carpet", "u1-historical", "u1-confirmed"})
         # Unselected HISTORICAL, review-only and lot-to-pieces rows stay unpriced.
         self.assertEqual([row["quoted"] for row in result["u1"] if row["id"] in {"u1-review", "u1-legacy", "u1-video"}], ["???", "???", "???"])
         self.assertEqual(result["historicalReopen"]["variants"], ["historical", "historical"])
@@ -41894,7 +41894,7 @@ main().catch((error) => {
             self.skipTest(message)
         with tempfile.TemporaryDirectory() as tmp:
             completed = subprocess.run(
-                [node, "scripts/playwright-owner-uat-basis-repair.mjs", "--lines=6", "--latency-ms=800", "--inflight-save"],
+                [node, "scripts/playwright-owner-uat-basis-repair.mjs", "--lines=6", "--latency-ms=800", "--inflight-save", "--fresh-analysis"],
                 cwd=str(ROOT),
                 env={**os.environ, "SQAG_OWNER_UAT_EVIDENCE_ROOT": tmp, "PYTHON": sys.executable},
                 text=True,
@@ -41908,6 +41908,9 @@ main().catch((error) => {
             result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["inflightSave"])
+        self.assertTrue(result["freshAnalysis"])
+        self.assertNotIn("historicalReopen", result)
+        self.assertIn({"source_basis_line_id": "u1-count", "status": "selected"}, result["selectionOutcomes"])
         self.assertEqual(result["selectionStatuses"], [200])
         self.assertEqual(result["xlsx"]["status"], "PASS")
 

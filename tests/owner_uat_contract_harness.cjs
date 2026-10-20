@@ -148,6 +148,37 @@ if (input.mode==='reopen') {
   assert.strictEqual(quoteAmountValue(roundCommercialCents(3*1.01),1.37),4.15);
   assert.strictEqual(roundCommercialCents(.1*1.15),.11);
   console.log(JSON.stringify(state.outputRows[0]));
+} else if (input.mode==='alignment') {
+  const sectionTitleKey=(value)=>String(value||'').toLowerCase();
+  const normalizeQuoteBasisTitle=(value)=>value;
+  const outputRowCoversBasisLine=()=>true;
+  eval(extract('outputRowSectionMatchesBasis'));
+  eval(extract('outputRowBasisMatchRank'));
+  const entry={section:{title:'Imported reference heading'},line:{id:'basis-row',source_line_item_id:'source-row',pricing_keyword:'selected-item'}};
+  const ownedIds=new Set(['basis-row','source-row','other-row']);
+  for(const variant of ['catalog','manual','included','historical']) {
+    const row={section:'Canonical catalogue category',source_basis_line_id:'source-row',pricing_keyword:'selected-item',pricing_authority:{variant}};
+    assert.strictEqual(outputRowBasisMatchRank(row,entry,ownedIds,new Set(['source-row'])),4,'Stable source identity must survive a catalogue section change');
+    assert.strictEqual(outputRowBasisMatchRank(row,entry,ownedIds,new Set()),0,'A non-unique source identity must not cross sections');
+    assert.strictEqual(outputRowBasisMatchRank({...row,source_basis_line_id:'other-row'},entry,ownedIds),0,'Another owned row must never transfer by keyword');
+    assert.strictEqual(outputRowBasisMatchRank({...row,source_basis_line_id:''},entry,ownedIds),0,'An unidentified row must remain section-scoped');
+    assert.strictEqual(outputRowBasisMatchRank({...row,source_basis_line_id:'unrelated-row'},entry,ownedIds),0,'An unrelated row must remain section-scoped');
+  }
+  const normalizeQuoteBasisSections=(sections)=>sections;
+  const quoteBasisOutputEntries=(sections)=>sections.flatMap((section)=>(section.lines||[]).map((line)=>({section,line})));
+  const inheritBasisOutputFieldsForEntry=(row)=>row;
+  const outputRowFromBasisEntry=({line})=>({source_basis_line_id:line.id});
+  eval(extract('outputRowsAlignedToBasis'));
+  const row={section:'Canonical catalogue category',source_basis_line_id:'source-row',pricing_authority:{variant:'catalog'}};
+  state.quoteBasisSections=[{...entry.section,lines:[entry.line]}];
+  assert.strictEqual(outputRowsAlignedToBasis([row])[0],row,'Unique basis and generated source IDs preserve the admitted row');
+  state.quoteBasisSections=[{...entry.section,lines:[entry.line,{...entry.line,id:'duplicate-basis-row'}]}];
+  assert(outputRowsAlignedToBasis([row]).every((output)=>!output.pricing_authority),'Duplicate basis source IDs must not cross sections');
+  state.quoteBasisSections=[{...entry.section,lines:[entry.line]}];
+  assert(outputRowsAlignedToBasis([row,{...row}]).every((output)=>!output.pricing_authority),'Duplicate generated source IDs must not cross sections');
+  state.quoteBasisSections=[{...entry.section,lines:[{...entry.line,id:'source-row'}]}];
+  assert.strictEqual(outputRowsAlignedToBasis([row])[0],row,'Repeating the same ID within one basis line is one owner');
+  console.log(JSON.stringify({status:'STABLE_ROW_SECTION_ALIGNMENT_PASS'}));
 } else if (input.mode==='selection') {
   state.lineItems=[input.row];state.outputRows=[{...input.row}];
   const line={...input.line,tag:'Custom',custom_pricing:true,possible_pricing_matches:[input.match]};
