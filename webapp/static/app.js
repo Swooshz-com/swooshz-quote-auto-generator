@@ -12970,11 +12970,15 @@ function applyDraftLineItems(lineItems = []) {
 
 async function refreshLineItemsFromServer() {
   if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
-  const selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+  let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+  if (selections.length && quoteSessionDraftSavePromise) {
+    // The selection request saves this draft itself; let any earlier save land first, then read the
+    // row revisions that save returned, so this tab's own save is never taken for another tab's.
+    await quoteSessionDraftSavePromise.catch(() => null);
+    selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+  }
   let result;
   if (selections.length && safeQuoteSessionId(state.quoteSessionId || "")) {
-    // The selection request saves this draft itself; let any earlier save land first.
-    if (quoteSessionDraftSavePromise) await quoteSessionDraftSavePromise.catch(() => null);
     result = await postJson("/api/quote-sessions/pricing-selections", {
       ...buildLineItemNormalizePayload(),
       pricing_selections: selections,

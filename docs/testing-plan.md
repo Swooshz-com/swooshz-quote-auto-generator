@@ -111,6 +111,18 @@ npm run playwright:smoke
   `--measure-only --cpu-throttle=4 --catalog-extra=300` (optionally
   `--cpu-profile`); it reports Event Timing input-to-paint per click and the
   time until `Preparing Output` paints.
+- The analysis seal attests only rows derived from the provider's result, in
+  the unit the provider measured each row in (carried internally from the first
+  normalisation, before rows re-unit to their catalogue items). Request or
+  profile-default fallback rows are never sealed as analysis matches. Cover this
+  through `POST /api/draft` with a deterministic provider stub, not only
+  `normalize_ai_draft`.
+- Database/object publication promotion publishes the staged outputs but keeps
+  the draft and pricing ledger of any save that landed after staging, so a
+  later saved Exclude or replacement is never undone by promotion. The
+  rendered script's `--inflight-save` option starts a delayed draft save that
+  is still in flight at Confirm and expects the single pricing-selections
+  request to succeed (no false "changed in another tab" refusal).
 ## Manual price and restored search contract
 
 Output defaults to editable reference prices, read-only FX and derived quoted unit prices.

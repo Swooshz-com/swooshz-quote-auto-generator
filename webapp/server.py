@@ -16799,6 +16799,16 @@ class DatabaseSqagStorage:
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("Staged quote session is not valid.") from exc
         metadata = normalized_quote_session_metadata(metadata if isinstance(metadata, dict) else {})
+        if clean_text(current_metadata.get("updated_at")) != clean_text(metadata.get("updated_at")):
+            # A save landed after this version was staged (staging stamps both copies with one
+            # time; every save, including a pricing selection's, restamps it). Publish the staged
+            # outputs but keep that newer save's draft and pricing ledger, so promotion never
+            # reinstates a catalogue grant the later save superseded.
+            for key in QUOTE_SESSION_SAVE_OWNED_METADATA_KEYS:
+                if key in current_metadata:
+                    metadata[key] = copy.deepcopy(current_metadata[key])
+                else:
+                    metadata.pop(key, None)
 
         expected_by_name = {
             clean_text(item.get("name")): item
@@ -24360,6 +24370,11 @@ def empty_pricing_ledger(origin: str) -> dict[str, Any]:
     return {"schema": PRICING_LEDGER_SCHEMA, "revision": 0, "origin": origin, "analysis": None, "analyses": [], "rows": {}}
 
 
+# Fields a quote-session save writes; publication promotion keeps a newer save's copy of them.
+QUOTE_SESSION_SAVE_OWNED_METADATA_KEYS = (
+    "updated_at", "customer_summary", "quote_company_profile", "pricing_reference", "commercials",
+    "draft_state", "pricing_ledger",
+)
 PRICING_LEDGER_GRANT_FIELDS = ("catalog_item_id", "catalog_unit", "catalog_source", "catalog_digest", "reference_id")
 
 
@@ -25382,9 +25397,11 @@ def normalize_ai_draft(
         "project": dimensions,
     }
     if has_payload_context:
-        seal = issue_pricing_analysis_seal(
-            payload, line_items, auth_session=auth_session, source_units=pricing_analysis_source_units(raw_line_items),
-        )
+        source_units = pricing_analysis_source_units(raw_line_items)
+        # Later stages see these rows re-unit to their catalogue items; only this stage still
+        # holds the unit the provider measured each row in, so it is carried forward internally.
+        result["_pricing_analysis_source_units"] = source_units
+        seal = issue_pricing_analysis_seal(payload, line_items, auth_session=auth_session, source_units=source_units)
         if seal is not None:
             result["pricing_analysis_seal"] = seal
         snapshot = pricing_reference_snapshot_for_payload(payload)
@@ -26252,10 +26269,13 @@ def finalized_remote_draft_result(
                 line.pop("pricing_keyword", None)
     adjusted_basis = quote_basis_from_sections(adjusted_sections)
     final_line_items = line_items or fallback_line_items
+    # The seal attests provider-derived rows only, in the units the provider measured them in.
+    # Request/default fallback rows keep request trust and never become analysis matches.
+    provider_units = ai_basis.get("_pricing_analysis_source_units")
     seal = issue_pricing_analysis_seal(
-        payload, final_line_items, auth_session=auth_session,
-        source_units=pricing_analysis_source_units(ai_basis.get("line_items")),
-    ) if has_payload_context else None
+        payload, line_items, auth_session=auth_session,
+        source_units=provider_units if isinstance(provider_units, dict) else {},
+    ) if has_payload_context and source.strip().lower() != "local" else None
     diagnostic_details = ai_draft_diagnostic_details(source, adjusted_basis, adjusted_sections, final_line_items)
     if isinstance(diagnostic_metadata, dict):
         diagnostic_details.update({key: value for key, value in diagnostic_metadata.items() if value not in (None, "", [], {})})

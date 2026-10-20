@@ -41883,6 +41883,34 @@ main().catch((error) => {
             "POST /api/quote-sessions/pricing-selections"), 1)
         self.assertIn('"bad": []', result["xlsx"]["validator"])
 
+    def test_owner_uat_confirm_with_inflight_draft_save_is_not_a_cross_tab_conflict(self):
+        # G2-m2: a draft save still in flight at Confirm bumps the clicked rows' revisions; the single
+        # pricing-selections request must use the revisions that save returned, not report another tab.
+        node = require_node(self)
+        if not (ROOT / "node_modules" / "playwright" / "package.json").exists():
+            message = "Playwright is required for the rendered owner-UAT in-flight save regression."
+            if os.environ.get("CI"):
+                self.fail(message)
+            self.skipTest(message)
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.run(
+                [node, "scripts/playwright-owner-uat-basis-repair.mjs", "--lines=6", "--latency-ms=800", "--inflight-save"],
+                cwd=str(ROOT),
+                env={**os.environ, "SQAG_OWNER_UAT_EVIDENCE_ROOT": tmp, "PYTHON": sys.executable},
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+                timeout=600,
+            )
+            self.assertEqual(completed.returncode, 0, (completed.stderr or completed.stdout)[-4000:])
+            [run_dir] = [path for path in Path(tmp).iterdir() if path.is_dir()]
+            result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["inflightSave"])
+        self.assertEqual(result["selectionStatuses"], [200])
+        self.assertEqual(result["xlsx"]["status"], "PASS")
+
     def test_owner_uat_possible_match_selection_keeps_review_for_unit_and_family_conflicts(self):
         competing = "synthetic vinyl floor finish"
         cases = {
@@ -42289,6 +42317,238 @@ main().catch((error) => {
             self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
             self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
             self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "carpet-row"))
+
+    def _ledger_draft(self, runner, headers, payload, provider_raw):
+        """POST /api/draft with the provider's raw JSON fed through the real normaliser (no network, no paid AI)."""
+        original = webapp.read_dotenv_value
+
+        def dotenv(name, *args, **kwargs):
+            return "sk-test-redacted" if name == "OPENAI_API_KEY" else original(name, *args, **kwargs)
+
+        def provider(provider_payload, _key, auth_session=None):
+            return webapp.normalize_ai_draft(copy.deepcopy(provider_raw), provider_payload, require_confidence=True, auth_session=auth_session)
+
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv), \
+                mock.patch.object(webapp, "request_openai_quote_basis", side_effect=provider):
+            response = self._ledger_post(runner, headers, "/api/draft", payload)
+        self.assertEqual(response["status"], 200, response["text"][-800:])
+        self.assertEqual(response["body"]["source"], "openai")
+        return response["body"]
+
+    def _ledger_draft_payload(self, session_id):
+        payload = valid_payload()
+        payload.update(pricing_reference_source="local", pricing_reference={
+            "id": payload["pricing_reference_id"], "source": "local", "currency": "SGD"})
+        payload["quote_session"] = {"session_id": session_id}
+        for key in ("line_items", "quote_basis_sections", "quote_basis"):
+            payload.pop(key, None)
+        return payload
+
+    def _ledger_carry_draft(self, payload, drafted):
+        """Carry a drafted result into the next request and saved draft the way the browser does."""
+        request = copy.deepcopy(payload)
+        request["line_items"] = copy.deepcopy(drafted["line_items"])
+        request["quote_basis_sections"] = copy.deepcopy(drafted["quote_basis_sections"])
+        if drafted.get("pricing_analysis_seal") is not None:
+            request["pricing_analysis_seal"] = copy.deepcopy(drafted["pricing_analysis_seal"])
+        return self._ledger_sync(request)
+
+    def _ledger_laundering_payload(self, session_id):
+        """A request row carrying a self-built current catalogue authority, and a degenerate provider result naming it."""
+        payload = self._ledger_draft_payload(session_id)
+        lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload, payload["profile_id"])
+        row = {"section": "Floors", "description": "Synthetic carpet tile flooring across the full booth footprint",
+               "quantity": 2, "unit": "sqm", "pricing_keyword": self.LEDGER_CARPET, "source_basis_line_id": "launder-row"}
+        row["pricing_authority"] = webapp.build_pricing_authority(
+            "catalog", row, price=koncept_catalog_sale_unit_price(self.LEDGER_CARPET),
+            reference_authority=webapp.exact_pricing_reference_authority(payload), catalog_item=lookup[self.LEDGER_CARPET])
+        payload["line_items"] = [row]
+        payload["quote_basis_sections"] = [{"id": "floors", "title": "Floors", "lines": [
+            {"id": "launder-row", "tag": "Confirm", "text": row["description"], "quantity": 2, "unit": "sqm", "confidence_pct": 80}]}]
+        provider_raw = {"analysis_findings": [], "blocking_clarification_questions": [], "project": {"width_m": 6, "depth_m": 6},
+                        "quote_basis_sections": [{"id": "booth", "title": "Booth", "lines": [
+                            {"id": "dimension-line", "tag": "Confirm", "text": "Booth footprint 6m x 6m", "confidence_pct": 80}]}],
+                        "line_items": [{"source_basis_line_id": "launder-row", "unit": "sqm"}]}
+        return payload, provider_raw
+
+    def test_ledger_m1_request_fallback_rows_never_become_sealed_analysis_matches(self):
+        # G2-M1: a provider result with no usable rows falls back to the request's own rows; the seal must not sign them.
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for boundary in ("finalize", "draft-endpoint"):
+                with self.subTest(boundary=boundary):
+                    session_id = f"quote-ledger-launder-{boundary}"
+                    payload, provider_raw = self._ledger_laundering_payload(session_id)
+                    if boundary == "finalize":
+                        # The provider's raw result, exactly as G2 reproduced it at the finalisation boundary.
+                        drafted = webapp.finalized_remote_draft_result(
+                            payload, copy.deepcopy(provider_raw), "openai", "OpenAI",
+                            webapp.booth_dimensions_from_payload(payload), webapp.normalize_line_items(payload))
+                    else:
+                        drafted = self._ledger_draft(runner, headers, payload, provider_raw)
+                    [fallback] = drafted["line_items"]
+                    self.assertEqual(fallback["source_basis_line_id"], "launder-row")
+                    seal = drafted["pricing_analysis_seal"]
+                    self.assertFalse(any(entry.get("catalog_item_id") for entry in seal["rows"]), seal["rows"])
+                    request = self._ledger_carry_draft(payload, drafted)
+                    self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "launder-row"))
+                    saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+                    self.assertEqual(saved["status"], 200, saved["text"][-800:])
+                    ledger = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]
+                    self.assertIn(seal["analysis_id"], ledger["analyses"])
+                    self.assertIsNone((ledger["rows"].get("launder-row") or {}).get("grant"))
+                    self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "launder-row"))
+                    self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "launder-row"))
+                    # Positive control: the operator's authenticated selection still prices the same row.
+                    request["quote_basis_sections"].append(copy.deepcopy(payload["quote_basis_sections"][0]))
+                    self._ledger_click(request, "launder-row", self.LEDGER_CARPET)
+                    resaved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+                    self.assertEqual(resaved["status"], 200, resaved["text"][-800:])
+                    selected = self._ledger_select(runner, headers, request, "launder-row", self.LEDGER_CARPET,
+                                                   self._ledger_revision(resaved, "launder-row"))
+                    self.assertEqual(selected["body"]["selections"], [{"source_basis_line_id": "launder-row", "status": "selected"}])
+                    self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, request), "launder-row"), price)
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "launder-row"), price)
+
+    def test_ledger_m3_draft_endpoint_seals_the_provider_unit_not_the_catalogue_unit(self):
+        # Through the real /api/draft chain the analysed rows are re-unit to their catalogue items before the
+        # final seal; the seal must still attest the provider's own unit, so 10 pcs never price as 10 sets.
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        letters = "synthetic-graphics-synthetic-backlit-letters"
+        rows = [("carpet-row", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "sqm", self.LEDGER_CARPET),
+                ("letters-row", "Graphics", "Synthetic backlit letters for the fascia", 10, "pcs", letters)]
+        sections = {}
+        for row_id, section, text, quantity, unit, claim in rows:
+            sections.setdefault(section, []).append({"id": row_id, "tag": "Confirm", "text": text, "quantity": quantity,
+                                                     "unit": unit, "confidence_pct": 82, "pricing_keyword": claim})
+        provider_raw = {"analysis_findings": [], "blocking_clarification_questions": [],
+                        "quote_basis_sections": [{"id": title.lower(), "title": title, "lines": lines} for title, lines in sections.items()],
+                        "line_items": [{"section": section, "source_basis_line_id": row_id, "description": text, "quantity": quantity,
+                                        "unit": unit, "pricing_keyword": claim} for row_id, section, text, quantity, unit, claim in rows]}
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            payload = self._ledger_draft_payload("quote-ledger-m3-draft")
+            drafted = self._ledger_draft(runner, headers, payload, provider_raw)
+            sealed = {entry["id"]: entry for entry in drafted["pricing_analysis_seal"]["rows"]}
+            self.assertEqual(sealed["letters-row"]["unit"], "nos")
+            self.assertNotIn("catalog_item_id", sealed["letters-row"])
+            self.assertEqual(sealed["carpet-row"]["catalog_item_id"], self.LEDGER_CARPET)
+            self.assertNotIn("_pricing_analysis_source_units", json.dumps(drafted))
+            request = self._ledger_carry_draft(payload, drafted)
+            normalized = self._ledger_normalize(runner, headers, request)
+            self.assertIsNone(self._ledger_price(normalized, "letters-row"))
+            self.assertEqual(self._ledger_price(normalized, "carpet-row"), price)
+            saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+            self.assertEqual(saved["status"], 200, saved["text"][-800:])
+            brief = self._ledger_brief_rows(request)
+            self.assertIsNone(self._ledger_price(brief, "letters-row"))
+            self.assertEqual(self._ledger_price(brief, "carpet-row"), price)
+            # A later operator selection of the per-set item still sees the provider's pieces and refuses it.
+            self._ledger_line(request, "letters-row")["tag"] = "Include"
+            self._ledger_sync(request)
+            resaved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+            selected = self._ledger_select(runner, headers, request, "letters-row", letters, self._ledger_revision(resaved, "letters-row"))
+            self.assertEqual(selected["body"]["selections"],
+                             [{"source_basis_line_id": "letters-row", "status": "refused", "reason": "unit_review_required"}])
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "letters-row"))
+
+    def test_ledger_m2_publication_promotion_never_restores_a_grant_superseded_after_staging(self):
+        # Root contract item 3 on the database publication path: a generation is staged, the operator then saves
+        # an Exclude, and only afterwards is the staged version promoted. Promotion must not reinstate the grant.
+        from webapp.forensics import ForensicStore
+
+        catalog = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))
+        items = catalog["items"] if isinstance(catalog, dict) else catalog
+        carpet_text = "Synthetic carpet tile flooring across the full booth footprint"
+        for artifact_mode in ("database", "object"):
+            for interleaved in (False, True):
+                with self.subTest(artifact_mode=artifact_mode, interleaved_exclude=interleaved), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    database_url = f"sqlite:///{(root / 'sqag-ledger-publication.sqlite3').as_posix()}"
+                    env = {"APP_MODE": "local", "USER_TYPE": "admin", "SESSION_SECRET": "test-session-secret-ledger-publication",
+                           "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": artifact_mode,
+                           "SQAG_DATABASE_URL": database_url, "QUOTE_DATA_ROOT": str(root / "data")}
+                    owner = self.platform_auth_session("workspace-ledger-pub", membership_role="operator", user_id="ledger-pub-owner")
+                    backend = webapp.InMemoryObjectStorageBackend()
+                    backend_context = (mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend)
+                                       if artifact_mode == "object" else contextlib.nullcontext())
+                    with mock.patch.dict(os.environ, env, clear=True), backend_context:
+                        cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(owner)}"
+                        headers = {"Cookie": cookie, webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(cookie)}
+                        webapp.apply_sqag_storage_migrations(database_url)
+                        webapp.app_storage_for_auth_session(self.platform_auth_session(
+                            "workspace-ledger-pub", membership_role="admin", user_id="ledger-pub-admin")).save_pricing_reference(
+                            webapp.normalize_pricing_reference_payload({"id": "ledger-pub-pricing", "label": "Ledger Publication Pricing",
+                                                                         "currency": "SGD", "items": copy.deepcopy(items)}))
+                        storage = webapp.app_storage_for_auth_session(owner)
+                        detail = storage.pricing_reference_detail("ledger-pub-pricing", source="company")
+                        basis = {"currency": "SGD", "source": "company", "id": "ledger-pub-pricing", "digest": detail["digest_sha256"]}
+                        base = valid_payload()
+                        base.update(pricing_reference_id="ledger-pub-pricing", pricing_reference_source="company",
+                                    pricing_reference={"id": "ledger-pub-pricing", "source": "company", "currency": "SGD"})
+                        session_id = "quote-ledger-publication"
+                        request, _draft = self._ledger_analysis([("matched-row", "Floors", carpet_text, 2, "sqm", self.LEDGER_CARPET)],
+                                                                session_id=session_id, auth_session=owner, payload=base)
+                        request["quote_session"]["draft_state"].pop("quoteDetails")
+                        self._ledger_line(request, "matched-row")["tag"] = "Include"
+                        self._ledger_sync(request, pricing_basis=basis)
+                        lookup = webapp.pricing_catalog_runtime_lookup_for_payload(request, request["profile_id"], auth_session=owner)
+                        price = webapp.pricing_reference_sale_unit_price(lookup[self.LEDGER_CARPET])
+
+                        def grant_state():
+                            metadata = storage._read_quote_session_metadata_for_workspace(session_id)[0]
+                            return ((metadata["pricing_ledger"]["rows"].get("matched-row") or {}).get("grant") or {}).get("state")
+
+                        with LocalRunnerServer() as runner:
+                            def post(path, body):
+                                self.reset_rate_limit_state()
+                                return self.http_json(runner, "POST", path, body=copy.deepcopy(body), headers=headers)
+
+                            saved = post("/api/quote-sessions", request)
+                            self.assertEqual(saved["status"], 200, saved["text"][-800:])
+                            self.assertEqual(grant_state(), "live")
+                            # The generation stages a version from the priced (Include) draft.
+                            output_dir = root / "out"
+                            output_dir.mkdir()
+                            (output_dir / "quotation.xlsx").write_bytes(b"synthetic-staged-xlsx")
+                            with storage.connection() as connection:
+                                run_id = ForensicStore(connection, "workspace-ledger-pub", "pid-test-v1-" + "p" * 24).record_run_started(
+                                    "generate", {"synthetic": True}, job_id="job-ledger-pub")
+                            storage.create_or_update_quote_session(copy.deepcopy(request), result={"status": "completed"},
+                                                                   output_dir=output_dir, publish=False,
+                                                                   generation_run_id=run_id, generation_job_id="job-ledger-pub")
+                            if interleaved:
+                                # The operator saves an Exclude while the version is staged; the grant is superseded.
+                                excluded = copy.deepcopy(request)
+                                self._ledger_line(excluded, "matched-row")["tag"] = "Exclude"
+                                self._ledger_sync(excluded, pricing_basis=basis)
+                                self.assertEqual(post("/api/quote-sessions", excluded)["status"], 200)
+                                self.assertEqual(grant_state(), "superseded")
+                            evidence = storage.quote_session_evidence_files(session_id, run_id)
+                            with storage.connection() as connection:
+                                storage.publish_quote_session_forensic_transaction(connection, session_id, run_id, evidence)
+                                connection.commit()
+                            promoted = storage._read_quote_session_metadata_for_workspace(session_id)[0]
+                            self.assertEqual(promoted["publication"]["state"], "published")
+                            self.assertEqual(promoted["publication"]["run_id"], run_id)
+                            self.assertNotIn("pending_run_id", promoted["publication"])
+                            # The stale tab still holds the Include draft; it prices only when no Exclude superseded it.
+                            stale_rows = post("/api/line-items/normalize", request)
+                            self.assertEqual(stale_rows["status"], 200, stale_rows["text"][-800:])
+                            brief = webapp.normalize_line_items_for_final_brief(copy.deepcopy(request), auth_session=owner)
+                            if interleaved:
+                                self.assertEqual(grant_state(), "superseded")
+                                [line] = [line for section in promoted["draft_state"]["quoteBasisSections"]
+                                          for line in section["lines"] if line.get("id") == "matched-row"]
+                                self.assertEqual(line["tag"], "Exclude")
+                                self.assertIsNone(self._ledger_price(stale_rows["body"]["line_items"], "matched-row"))
+                                self.assertIsNone(self._ledger_price(brief, "matched-row"))
+                            else:
+                                self.assertEqual(grant_state(), "live")
+                                self.assertEqual(self._ledger_price(stale_rows["body"]["line_items"], "matched-row"), price)
+                                self.assertEqual(self._ledger_price(brief, "matched-row"), price)
+                            self.assertTrue(storage.quote_session_export_artifact(session_id, "xlsx"))
 
     def test_ledger_selection_refuses_ineligible_contradicting_and_unknown_items(self):
         with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:

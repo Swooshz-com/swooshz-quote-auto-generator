@@ -16,6 +16,8 @@ const measureOnly = args.includes("--measure-only");
 const fillerLines = Number((args.find((arg) => arg.startsWith("--lines=")) || "--lines=60").split("=")[1]);
 const latencyMs = Number((args.find((arg) => arg.startsWith("--latency-ms=")) || "--latency-ms=1500").split("=")[1]);
 const cpuProfile = args.includes("--cpu-profile");
+// m2: start a draft autosave that is still in flight (delayed by --latency-ms) when Confirm is clicked.
+const inflightSave = args.includes("--inflight-save");
 const cpuThrottle = Number((args.find((arg) => arg.startsWith("--cpu-throttle=")) || "--cpu-throttle=1").split("=")[1]);
 const profiledFunctions = (args.find((arg) => arg.startsWith("--profile=")) || "--profile=").split("=")[1].split(",").filter(Boolean);
 const extraCatalogItems = Number((args.find((arg) => arg.startsWith("--catalog-extra=")) || "--catalog-extra=0").split("=")[1]);
@@ -179,7 +181,7 @@ const summarize = (samples) => {
   }));
 };
 
-const result = { runRoot, fillerLines, latencyMs, cpuThrottle, catalogItems: catalog.length, cases: cases.length };
+const result = { runRoot, fillerLines, latencyMs, cpuThrottle, inflightSave, catalogItems: catalog.length, cases: cases.length, selectionStatuses: [] };
 const timings = [];
 try {
   server = startServer();
@@ -191,6 +193,9 @@ try {
   if (cpuThrottle > 1) await cdp.send("Emulation.setCPUThrottlingRate", { rate: cpuThrottle });
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("response", (response) => {
+    if (new URL(response.url()).pathname === "/api/quote-sessions/pricing-selections") result.selectionStatuses.push(response.status());
+  });
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.origin !== baseUrl) return route.abort();
@@ -341,6 +346,10 @@ try {
   const confirmStarted = Date.now();
   const networkBefore = network.length;
   await page.evaluate(() => { window.__ownerUatProfile = {}; window.__ownerUatEvents = []; });
+  if (inflightSave) {
+    // The save carries the clicked lines, so it bumps those rows' server revisions while Confirm runs.
+    await page.evaluate(() => { window.__ownerUatInflightSave = saveQuoteSessionDraftState({}); });
+  }
   await page.locator("#sideNextButton").click();
   await page.locator("#excelGeneratingModal.is-open").waitFor({ state: "visible", timeout: 30000 });
   const preparingVisibleMs = Date.now() - confirmStarted;
@@ -358,6 +367,8 @@ try {
   // The preparing state must paint before the (delayed) normalisation round trip can finish.
   assert(latencyMs < 500 || preparingVisibleMs < latencyMs, "preparing state waited for network work", result.confirm);
   assert(timings.every((sample) => !sample.requests.some((entry) => entry.endsWith("/api/line-items/normalize") || entry.endsWith("/api/quote-sessions/pricing-selections"))), "a basis click waited on normalisation", timings.map((sample) => sample.requests));
+  // A save of this same tab is never reported as a change from another tab.
+  assert(result.selectionStatuses.length === 1 && result.selectionStatuses[0] === 200, "single-tab Confirm selection was refused", result.selectionStatuses);
   // The selection clicks become prices only through one server-recorded selection request at Confirm.
   assert(result.confirm.networkDuringConfirm.filter((entry) => entry.startsWith("POST /api/quote-sessions/pricing-selections ")).length === 1, "Confirm did not record the selections with the server", result.confirm.networkDuringConfirm);
   result.clickTimings = summarize(timings);
