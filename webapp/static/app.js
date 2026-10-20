@@ -7,6 +7,7 @@ const LAST_SELECTION_STORAGE_KEY = "swooshz_last_selection_v1";
 const QUOTE_SESSION_STORAGE_KEY = "swooshz_quote_session_v1";
 const WORKSPACE_VIEW_STORAGE_KEY = "swooshz_workspace_view_v1";
 const DASHBOARD_OPERATION_STORAGE_KEY = "swooshz_dashboard_operation_v1";
+const AUTH_RECOVERY_STORAGE_KEY = "swooshz_auth_recovery_v1";
 const DASHBOARD_OPERATION_MAX_AGE_MS = 15 * 60 * 1000;
 // Recovery windows are deliberately phase/type specific: a request that never received a
 // server acknowledgement is retried only briefly, while 10-15 minute draft analysis gets
@@ -304,6 +305,10 @@ const state = {
   pendingAnalysisMode: ANALYSIS_MODE_STANDARD,
   isBooting: true,
   isPageUnloading: false,
+  isSigningOut: false,
+  authenticationRecoveryRequested: false,
+  authenticationRecoveryBoot: false,
+  browserRecoveryFileOperations: 0,
   csrfHeaderName: CSRF_HEADER_NAME,
   csrfToken: "",
   authRequired: false,
@@ -1356,6 +1361,7 @@ function clearLastSelectionState() {
 }
 
 function saveLastSelectionPatch(patch = {}) {
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return;
   const currentScope = currentBrowserRecoveryScope();
   if (!currentScope) return;
   try {
@@ -1891,6 +1897,15 @@ function setImageUploadStatus(message = "") {
 }
 
 async function addImagesFromFiles(files) {
+  return withBrowserRecoveryFileOperation(() => readImagesFromFiles(files));
+}
+
+async function withBrowserRecoveryFileOperation(operation) {
+  state.browserRecoveryFileOperations += 1;
+  try { return await operation(); } finally { state.browserRecoveryFileOperations -= 1; }
+}
+
+async function readImagesFromFiles(files) {
   const referenceFiles = Array.from(files).filter(isAcceptedReferenceFile);
   if (!referenceFiles.length) {
     if (Array.from(files).length) setImageUploadStatus("Only JPG, PNG, WebP, or PDF files can be added.");
@@ -2303,6 +2318,8 @@ function customCurrencyInputIsValid(input = elements.pricingReferenceCurrencyCus
 
 let committedOutputCurrency = "";
 let activeOutputEditor = null;
+let browserRecoveryEpoch = 0;
+let authenticationRecoveryPromise = null;
 let blockedOutputDraftSaveOptions = null;
 const outputRowIdentities = new WeakMap();
 
@@ -3996,6 +4013,7 @@ function safeWorkspaceViewJson() {
 }
 
 function saveWorkspaceViewState() {
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return;
   if (state.isBooting || !currentBrowserRecoveryScope()) return;
   try {
     window.localStorage.setItem(WORKSPACE_VIEW_STORAGE_KEY, JSON.stringify(buildWorkspaceViewSnapshot()));
@@ -4168,13 +4186,20 @@ function sessionFileRecordsFromDraft() {
 }
 
 function persistSessionFiles(records = []) {
+  if (state.isSigningOut || state.isRecoveryScopeTransitioning) return Promise.reject(new Error("Browser recovery is leaving this session."));
   const currentScope = currentBrowserRecoveryScope();
+  const recoveryEpoch = browserRecoveryEpoch;
   if (!currentScope) return Promise.resolve();
   const validRecords = records
     .filter((record) => record?.session_file_key && record?.data_url)
     .map((record) => ({ ...record, browserRecoveryScope: currentScope }));
   if (!validRecords.length) return Promise.resolve();
   return openSessionFileDb().then((db) => new Promise((resolve, reject) => {
+    if (recoveryEpoch !== browserRecoveryEpoch || currentScope !== currentBrowserRecoveryScope()
+      || state.isSigningOut || state.isRecoveryScopeTransitioning) {
+      reject(new Error("Browser recovery scope changed before file persistence."));
+      return;
+    }
     const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readwrite");
     const store = transaction.objectStore(QUOTE_SESSION_FILE_STORE_NAME);
     validRecords.forEach((record) => store.put(record));
@@ -4368,6 +4393,7 @@ function buildSessionSnapshot() {
 }
 
 function clearSessionState() {
+  browserRecoveryEpoch += 1;
   try {
     window.localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
   } catch {
@@ -4377,6 +4403,7 @@ function clearSessionState() {
 }
 
 async function purgeBrowserRecoveryState() {
+  browserRecoveryEpoch += 1;
   try {
     window.localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
   } catch {
@@ -4384,10 +4411,12 @@ async function purgeBrowserRecoveryState() {
   }
   clearWorkspaceViewState();
   clearLastSelectionState();
+  try { window.localStorage.removeItem(AUTH_RECOVERY_STORAGE_KEY); } catch { /* Scope checks still deny stale restoration. */ }
   await clearSessionFiles().catch(() => {});
 }
 
 function saveSessionState() {
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return;
   if (commitActiveOutputEditor({ commit: false }) === "blocked") return;
   if (state.isBooting || !currentBrowserRecoveryScope()) return;
   try {
@@ -4772,6 +4801,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       ...savedState,
     };
   const canRestoreBrowserTransientAuthority = !containerMalformed
+    && options.suppressAutomaticOperations !== true
     && !nestedSession
     && draftCandidates.length === 0
     && !options.sessionId
@@ -4965,7 +4995,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.pricingMatches = Array.isArray(restoredState.pricingMatches) ? restoredState.pricingMatches : [];
   state.pricingIssues = [];
   state.activeJob = null;
-  rejectedRestoredActiveJob = false;
+  rejectedRestoredActiveJob = options.suppressAutomaticOperations === true && Boolean(restoredState.activeJob);
   if (canRestoreBrowserTransientAuthority && savedBasisChat && Reflect.ownKeys(savedBasisChat).length) {
     try {
       const detachedActiveJob = restoredState.activeJob === undefined || restoredState.activeJob === null
@@ -5009,7 +5039,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   }
   updateDownloadButton();
   setResultStatus(state.aiFailed ? "No usable AI draft" : state.downloadFile ? "Completed" : "No job yet", state.aiFailed ? "is-bad" : state.downloadFile ? "is-ok" : "");
-  setWorkflowStage(restoredWorkflowStage(rejectedRestoredActiveJob ? { ...restoredState, workflowStage: "" } : restoredState));
+  setWorkflowStage(restoredWorkflowStage(rejectedRestoredActiveJob || options.suppressAutomaticOperations === true
+    ? { ...restoredState, workflowStage: "" } : restoredState));
   if (state.aiFailed) {
     showAiFailureBanner();
   } else {
@@ -5018,7 +5049,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   const restoredPanel = restoredQuoteSessionSidePanel(restoredState, options);
   setSidePanel(restoredPanel, { force: true });
   renderQuoteCommercialReviewState();
-  try {
+  if (!state.authenticationRecoveryRequested && !state.isSigningOut && !state.isRecoveryScopeTransitioning) try {
     window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(buildSessionSnapshot()));
     persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
   } catch {
@@ -5038,7 +5069,7 @@ async function restoreSessionState() {
     await purgeBrowserRecoveryState();
     return false;
   }
-  return applyQuoteSessionSnapshot(saved);
+  return applyQuoteSessionSnapshot(saved, { suppressAutomaticOperations: authenticationRecoveryMarkerPresent() });
 }
 
 function clearLegacyLocalCompanyPresets() {
@@ -10463,6 +10494,21 @@ function outputRowsToLineItems(rows = state.outputRows) {
   });
 }
 
+function pricingSelectionReviewMessage(row, rows) {
+  const rowId = String(row?.source_basis_line_id || "");
+  if (!rowId || rows.filter((item) => String(item?.source_basis_line_id || "") === rowId).length !== 1) return "";
+  const issues = (Array.isArray(state.pricingIssues) ? state.pricingIssues : []).filter((issue) => issue?.source_basis_line_id === rowId);
+  if (issues.length !== 1) return "";
+  const messages = {
+    unit_review_required: "The selected reference uses a different quantity unit. Review the unit and enter a price manually if needed.",
+    contradiction: "The selected reference does not match this item's details. Review the item and choose another reference or enter a price manually.",
+    not_in_catalogue: "The selected reference is unavailable. Choose another reference or enter a price manually.",
+    reference_changed: "The pricing reference has changed. Select a current reference or enter a price manually.",
+    ineligible: "This item needs pricing review. Choose a reference or enter a price manually.",
+  };
+  return Object.prototype.hasOwnProperty.call(messages, issues[0].reason) ? messages[issues[0].reason] : "";
+}
+
 function outputRowsValid(rows = state.outputRows) {
   const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
   const errors = [];
@@ -10483,7 +10529,7 @@ function outputRowsValid(rows = state.outputRows) {
       } else if (unitPrice !== null && unitPrice < 0) {
         errors.push(`${label}: Unit price must be 0 or greater.`);
       } else if (unitPrice === null && catalogUnitPrice === null) {
-        errors.push(`${label}: Unit price is required.`);
+        errors.push(`${label}: ${pricingSelectionReviewMessage(row, rows) || "Unit price is required."}`);
       }
     }
   });
@@ -12982,7 +13028,10 @@ function applyDraftLineItems(lineItems = []) {
 }
 
 async function refreshLineItemsFromServer() {
-  if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
+  if (!state.lineItems.length) {
+    state.pricingIssues = [];
+    return { ok: true, data: { status: "normalized", line_items: [] } };
+  }
   let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
   if (selections.length && quoteSessionDraftSavePromise) {
     // The selection request saves this draft itself; let any earlier save land first, then read the
@@ -13002,6 +13051,10 @@ async function refreshLineItemsFromServer() {
     result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
   }
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
+  const refusalReasons = new Set(["unit_review_required", "contradiction", "not_in_catalogue", "reference_changed", "ineligible"]);
+  state.pricingIssues = (Array.isArray(result.data.selections) ? result.data.selections : [])
+    .filter((entry) => entry?.status === "refused" && typeof entry.source_basis_line_id === "string" && refusalReasons.has(entry.reason))
+    .map((entry) => ({ source_basis_line_id: entry.source_basis_line_id, reason: entry.reason }));
   state.lineItems = result.data.line_items.map((item) => (
     typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
   )).map(normalizeLineItem);
@@ -13425,6 +13478,7 @@ async function applySessionData(data = {}) {
   state.authRequired = Boolean(data.auth_required);
   state.authenticated = Boolean(data.authenticated);
   state.authUser = data.user && typeof data.user === "object" ? data.user : null;
+  state.authenticationRecoveryBoot = false;
   state.browserRecoveryScope = nextRecoveryScope;
   if (data.permissions && typeof data.permissions === "object") {
     state.permissions = { ...state.permissions, ...data.permissions };
@@ -13459,7 +13513,107 @@ async function refreshSessionToken(options = {}) {
   return ok && isPlainObject(data) && data.response_parse_failed !== true && await applySessionData(data);
 }
 
+function authenticationRecoveryMarkerPresent() {
+  try { return window.localStorage.getItem(AUTH_RECOVERY_STORAGE_KEY) === "1"; } catch { return true; }
+}
+
+function authenticationRecoveryDraftSnapshot() {
+  const snapshot = buildSessionSnapshot();
+  snapshot.activeJob = null;
+  snapshot.basisChat = null;
+  snapshot.restorableOverlay = "";
+  snapshot.workflowStage = restoredWorkflowStage({ ...snapshot, workflowStage: "" });
+  return snapshot;
+}
+
+function finishAuthenticationRecovery() {
+  if (!authenticationRecoveryMarkerPresent()) return;
+  try {
+    const raw = window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY);
+    const saved = raw ? JSON.parse(raw) : null;
+    if (saved && (saved.browserRecoveryScope !== currentBrowserRecoveryScope()
+      || saved.activeJob || saved.basisChat?.authorityOwner || saved.basisChat?.proposal)) return;
+    if (window.localStorage.getItem(DASHBOARD_OPERATION_STORAGE_KEY) !== null) return;
+    window.localStorage.removeItem(AUTH_RECOVERY_STORAGE_KEY);
+  } catch { /* Retain the replay fence until a verified idle snapshot is durable. */ }
+}
+
+async function recoverRequiredAuthentication(status, data = {}) {
+  if (status !== 401 || data?.status !== "auth_required") return false;
+  if (state.isSigningOut || state.isRecoveryScopeTransitioning || state.isPageUnloading) return true;
+  if (authenticationRecoveryPromise) { await authenticationRecoveryPromise; return true; }
+  // Keep the rejected-session write barrier after a blocked checkpoint, while
+  // allowing local edits and an explicit retry through the existing Dashboard.
+  state.authenticationRecoveryRequested = true;
+  clearQuoteSessionDraftSaveTimer();
+  state.authRequired = true;
+  state.authenticated = false;
+  state.csrfToken = "";
+  renderAuthState();
+  const epoch = browserRecoveryEpoch;
+  const scope = currentBrowserRecoveryScope();
+  const principal = state.authUser;
+  const sessionId = state.quoteSessionId;
+  const isCurrent = () => epoch === browserRecoveryEpoch
+    && scope === currentBrowserRecoveryScope() && principal === state.authUser
+    && sessionId === state.quoteSessionId
+    && !state.isSigningOut && !state.isRecoveryScopeTransitioning && !state.isPageUnloading;
+  authenticationRecoveryPromise = (async () => {
+    try {
+      // Clean boot has not adopted a draft: retain existing records verbatim,
+      // but fence their operation intents until verified-scope restoration.
+      const cleanBoot = (state.isBooting || state.authenticationRecoveryBoot) && !scope && !state.quoteSessionId
+        && !state.images.length && !state.headerLogo && !state.lineItems.length && !state.outputRows.length
+        && !state.quoteBasisSections.length && !state.activeJob && !activeOutputEditor && !state.browserRecoveryFileOperations
+        && !["clientName", "projectTitle", "showName", "projectNumber"].some(name => String(elements[name]?.value || "").trim());
+      if (cleanBoot) state.authenticationRecoveryBoot = true;
+      if (!cleanBoot && (state.isBooting || !scope || state.browserRecoveryFileOperations || pricingReferenceShouldWarnBeforeUnload()
+        || String(elements.basisChatPrompt?.value || "").trim()
+        || commitActiveOutputEditor() === "blocked")) throw new Error("Recovery checkpoint blocked.");
+      clearQuoteSessionDraftSaveTimer();
+      if (!isCurrent()) return false;
+      window.localStorage.setItem(AUTH_RECOVERY_STORAGE_KEY, "1");
+      if (window.localStorage.getItem(AUTH_RECOVERY_STORAGE_KEY) !== "1") throw new Error("Recovery marker failed.");
+      if (!cleanBoot) {
+        const snapshot = authenticationRecoveryDraftSnapshot();
+        const draftKey = JSON.stringify({ ...snapshot, savedAt: "" });
+        const fileRecords = sessionFileRecordsFromDraft();
+        const fileKey = JSON.stringify(fileRecords);
+        const basisPromptText = elements.basisChatPrompt?.value;
+        const snapshotText = JSON.stringify(snapshot);
+        const workspaceText = JSON.stringify({ ...buildWorkspaceViewSnapshot(), restorableOverlay: "" });
+        window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, snapshotText);
+        window.localStorage.setItem(WORKSPACE_VIEW_STORAGE_KEY, workspaceText);
+        window.localStorage.removeItem(DASHBOARD_OPERATION_STORAGE_KEY);
+        if (window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) !== snapshotText
+          || window.localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY) !== workspaceText
+          || window.localStorage.getItem(DASHBOARD_OPERATION_STORAGE_KEY) !== null) throw new Error("Recovery storage failed.");
+        await persistSessionFiles(fileRecords);
+        if (!isCurrent()) return false;
+        if (activeOutputEditor || state.browserRecoveryFileOperations || pricingReferenceShouldWarnBeforeUnload()
+          || elements.basisChatPrompt?.value !== basisPromptText
+          || JSON.stringify({ ...authenticationRecoveryDraftSnapshot(), savedAt: "" }) !== draftKey
+          || JSON.stringify(sessionFileRecordsFromDraft()) !== fileKey) throw new Error("Draft changed during recovery checkpoint.");
+      }
+      if (!isCurrent()) return false;
+      markPageUnloading();
+      window.location.assign("/login");
+      return true;
+    } catch (_error) {
+      if (isCurrent()) renderMessages(["Sign in is required. Keep this page open, resolve pending edits or browser storage, then try Dashboard again."], "error");
+      return false;
+    } finally {
+      clearQuoteSessionDraftSaveTimer();
+    }
+  })();
+  const pending = authenticationRecoveryPromise;
+  const navigating = await pending;
+  if (!navigating && authenticationRecoveryPromise === pending) authenticationRecoveryPromise = null;
+  return true;
+}
+
 async function postJson(url, payload, options = {}) {
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return { ok: false, status: 401, data: { status: "auth_required" } };
   let response;
   try {
     response = await fetchPostJsonResponse(url, payload);
@@ -13468,8 +13622,10 @@ async function postJson(url, payload, options = {}) {
   }
 
   let data = await jsonFromResponse(response, options);
+  if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
   const refreshFailure = {};
-  if (response.status === 403 && await refreshSessionToken({ ...options, refreshFailure })) {
+  if (response.status === 403 && await refreshSessionToken({ ...options, refreshFailure })
+    && !state.authenticationRecoveryRequested && !state.isSigningOut && !state.isPageUnloading) {
     try {
       response = await fetchPostJsonResponse(url, payload);
       data = await jsonFromResponse(response, options);
@@ -13477,6 +13633,7 @@ async function postJson(url, payload, options = {}) {
       return postJsonFetchFailure(url, error);
     }
   }
+  if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
   // Keep the original safe status/reference while carrying this save's actual refresh interruption.
   if (options.persistSession === false && refreshFailure.failure?.fetch_failed === true) {
     data = { ...data, fetch_failed: true, page_unloading: refreshFailure.failure.page_unloading === true };
@@ -13519,6 +13676,7 @@ async function getJson(url, options = {}) {
   }
 
   const data = await jsonFromResponse(response, options);
+  if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
   await adoptServerQuoteCommercialReview(data, options);
   if (!response.ok) {
     const failure = options.persistSession === false
@@ -13638,6 +13796,7 @@ function quoteDraftHasOutputState() {
 }
 
 function quoteSessionDraftStateCanSave() {
+  if (state.authenticationRecoveryRequested) return false;
   return Boolean(
     state.quoteSessionDraftSaveStarted
     && !state.isRecoveryScopeTransitioning,
@@ -14194,6 +14353,7 @@ function showDashboard(options = {}) {
 }
 
 async function returnToDashboard() {
+  if (state.authenticationRecoveryRequested) return recoverRequiredAuthentication(401, { status: "auth_required" });
   if (commitActiveOutputEditor() === "blocked") return false;
   if (appIsBusy()) return;
   let dashboardLoadStarted = false;
@@ -14238,6 +14398,7 @@ async function returnToDashboard() {
 }
 
 async function handleTopbarBrandClick() {
+  if (state.authenticationRecoveryRequested) return recoverRequiredAuthentication(401, { status: "auth_required" });
   if (appIsBusy()) return;
   if (state.activeAppView === "dashboard") {
     elements.quoteDashboardPanel?.scrollTo?.({ top: 0, behavior: "smooth" });
@@ -14269,8 +14430,9 @@ async function loadQuoteDashboard(options = {}) {
   state.dashboardSelectedSessionIds = [];
   renderQuoteDashboard();
   try {
-    const { ok, data } = await getJson("/api/quote-sessions", { logFetchFailure: false });
+    const { ok, data, status } = await getJson("/api/quote-sessions", { logFetchFailure: false });
     if (state.quoteSessionDashboardLoadId !== loadId) return;
+    if (status === 401 && data?.status === "auth_required") return;
     if (!ok) {
       state.quoteSessions = [];
       state.quoteSessionLoadError = genericFailureMessage(data);
@@ -14778,6 +14940,7 @@ function normalizeDashboardOperation(operation = {}) {
 }
 
 function saveDashboardOperation(operation = {}) {
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return null;
   const normalized = normalizeDashboardOperation({ ...operation, browserRecoveryScope: currentBrowserRecoveryScope(), startedAt: operation.startedAt || new Date().toISOString() });
   state.dashboardOperation = normalized;
   try {
@@ -15778,11 +15941,13 @@ function logClientEvent(event, details = {}) {
 }
 
 async function initializeSession() {
-  const { ok, data } = await getJson("/api/session");
+  const { ok, data, status } = await getJson("/api/session");
   if (ok && await applySessionData(data)) {
-    return;
+    return true;
   }
   if (elements.healthText) elements.healthText.textContent = "Local session unavailable";
+  if (status !== 401 || data?.status !== "auth_required") renderMessages(genericFailureMessages(data), "error");
+  return false;
 }
 
 function syncControlStates() {
@@ -16962,6 +17127,7 @@ function wireEvents() {
   if (elements.topbarLogoutLink) {
     elements.topbarLogoutLink.addEventListener("click", async (event) => {
       event.preventDefault();
+        state.isSigningOut = true;
       const href = elements.topbarLogoutLink.getAttribute("href") || "/logout";
       const headers = state.csrfToken
         ? { [state.csrfHeaderName]: state.csrfToken }
@@ -16973,11 +17139,13 @@ function wireEvents() {
           credentials: "same-origin",
           redirect: "manual",
         });
-        if (!response.ok) return;
+          if (!response.ok) { state.isSigningOut = false; return; }
         const logoutLocation = response.headers.get("X-SQAG-Logout-Location") || "/signed-out";
-        await purgeBrowserRecoveryState();
+          markPageUnloading();
+          await purgeBrowserRecoveryState();
         window.location.assign(logoutLocation);
       } catch (_error) {
+          state.isSigningOut = false;
         return;
       }
     });
@@ -16996,7 +17164,7 @@ function wireEvents() {
     elements.imageInput.value = "";
   });
 
-  elements.headerLogoInput.addEventListener("change", async (event) => {
+  elements.headerLogoInput.addEventListener("change", (event) => withBrowserRecoveryFileOperation(async () => {
     const presentationBeforeLogoChange = quoteCompanyPresentationSignature();
     const file = (event.target.files || [])[0];
     if (file) {
@@ -17038,7 +17206,7 @@ function wireEvents() {
     if (quoteSessionDraftStateCanSave()) {
       queueQuoteSessionDraftStateSave({ quoteGenerated: quoteSessionHasFreshOutputExports() });
     }
-  });
+  }));
   elements.headerLogoPreview.addEventListener("click", () => {
     elements.headerLogoInput.click();
   });
@@ -17511,13 +17679,19 @@ async function setInitialValues() {
 async function boot() {
   let dashboardOperation = null;
   let workspaceView = null;
+  let sessionReady = false;
   setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
   wireEvents();
   clearLegacyLocalCompanyPresets();
   try {
-    await initializeSession();
+    sessionReady = await initializeSession();
+    if (!sessionReady) return;
     workspaceView = restoredWorkspaceViewState();
-    dashboardOperation = restoredDashboardOperation();
+    const recoveringAuthentication = authenticationRecoveryMarkerPresent();
+    if (recoveringAuthentication) {
+      clearDashboardOperation();
+      if (workspaceView) workspaceView = { ...workspaceView, restorableOverlay: "" };
+    } else dashboardOperation = restoredDashboardOperation();
     if (dashboardOperation) setDashboardLoadingState(true, dashboardOperationLoadingOptions(dashboardOperation));
     await loadProfiles();
     const quoteRestored = await setInitialValues();
@@ -17527,8 +17701,10 @@ async function boot() {
     checkHealth();
   } finally {
     state.isBooting = false;
+    if (!sessionReady) setDashboardLoadingState(false);
     syncControlStates();
   }
+  finishAuthenticationRecovery();
   if (state.activeJob) setDashboardLoadingState(false);
   await resumeSavedJob();
   if (dashboardOperation && !state.activeJob) {

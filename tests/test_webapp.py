@@ -4025,7 +4025,7 @@ eval([
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
   "quoteFxMultiplier", "outputRowFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
   "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
-  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "outputRowsValid", "dashboardCommercialsFromState",
+  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "pricingSelectionReviewMessage", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
 
@@ -21473,6 +21473,7 @@ eval(extractFunction("normalizeOutputRow"));
 eval(extractFunction("pricingAuthorityNumber"));
 eval(extractFunction("unitPriceEditKind"));
 eval(extractFunction("synchronizeOwnedOutputRowPrice"));
+eval(extractFunction("pricingSelectionReviewMessage"));
 eval(extractFunction("outputRowsValid"));
 eval(extractFunction("outputQuantityPartsFromPricingMatch"));
 eval(extractFunction("outputRowFromPricingMatch"));
@@ -26153,7 +26154,7 @@ eval([
   "refreshOutputRowsFromLineItems",
   "ensureOutputRowsFromLineItems",
   "outputRowsToLineItems",
-  "outputRowsValid",
+  "pricingSelectionReviewMessage", "outputRowsValid",
 ].map(extractFunction).join("\n"));
 
 const plainCounter = {
@@ -26870,7 +26871,7 @@ eval([
   "pricingReferenceLineText",
   "orderNumber",
   "outputRowsToLineItems",
-  "outputRowsValid",
+  "pricingSelectionReviewMessage", "outputRowsValid",
   "setDownloadFiles",
   "revisionNumber",
   "markOutputRowsDirty",
@@ -28926,6 +28927,7 @@ const constantSource = constantNames.map(name => {
   return match[0];
 }).join("\n");
 const window = { clearTimeout, setTimeout, crypto: { getRandomValues: bytes => bytes.fill(17) } };
+let browserRecoveryEpoch = 0;
 let quoteSessionDraftSaveTimer = null;
 let quoteSessionInitialSavePromise = null;
 let quoteSessionDraftSavePromise = null;
@@ -32816,7 +32818,7 @@ eval([
   "renderOutputPriceCells", "renderPricingMatches",
   "snapshotOutputRows",
   "outputRowsToLineItems",
-  "outputRowsValid",
+  "pricingSelectionReviewMessage", "outputRowsValid",
   "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
 ].map(extractFunction).join("\n"));
 
@@ -33028,7 +33030,7 @@ eval([
   "outputCatalogDescription",
   "outputRowFromLineItem",
   "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
-  "outputRowsValid",
+  "pricingSelectionReviewMessage", "outputRowsValid",
   "rowNeedsManualInput",
   "matchSummaryStats",
   "formatSubtotalValue",
