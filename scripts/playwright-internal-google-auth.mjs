@@ -132,4 +132,8 @@ try {
   await anonymousApi.dispose();
   await browser.close();
   harness.kill("SIGTERM");
+  await new Promise(resolve => harness.exitCode !== null ? resolve() : harness.once("exit", resolve));
 }
+
+// Keep expired-session navigation/recovery in the existing synthetic auth gate.
+await import("./playwright-dashboard-auth-recovery.mjs");
