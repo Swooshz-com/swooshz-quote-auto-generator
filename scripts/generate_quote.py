@@ -427,6 +427,16 @@ def canonical_pricing_authority_unit(value: Any) -> str:
     return text
 
 
+def unit_quantity_basis(unit: Any) -> str:
+    """What one unit of quantity counts (mirrors the webapp); nothing is ever converted."""
+    canonical = canonical_pricing_authority_unit(normalize_unit(unit)).lower()
+    if not canonical:
+        return ""
+    if canonical in {"m", "m length", "m run"}:
+        return "length:metre"
+    return {"sqm": "area:sqm", "nos": "count:piece", "sets": "count:set", "lot": "count:lot"}.get(canonical, "other:" + canonical)
+
+
 def pricing_authority_version_is_valid(value: Any) -> bool:
     return type(value) is int and value == PRICING_AUTHORITY_VERSION
 
@@ -912,7 +922,13 @@ def prepare_lines(
             else:
                 item_id = clean_text(authority.get("catalog_item_id"))
                 match = next((row for row in price_rows if row.pricing_id == item_id), None)
-                if match is None or match.sale_unit_price != pricing_authority_number(authority.get("price")):
+                row_basis = unit_quantity_basis(normalized_unit)
+                if (
+                    match is None
+                    or match.sale_unit_price != pricing_authority_number(authority.get("price"))
+                    or not row_basis
+                    or row_basis != unit_quantity_basis(authority.get("catalog_unit"))
+                ):
                     status = "unmatched"
                     match = None
                 else:

@@ -292,6 +292,7 @@ const state = {
   blockingClarificationQuestions: [],
   boothDimensions: { ...DEFAULT_BOOTH_DIMENSIONS },
   originalAnalysisSnapshot: null,
+  pricingLedgerRevisions: {},
   pendingQuoteDependencyChanges: [],
   basisConfirmed: false,
   isAnalysisRunning: false,
@@ -1597,6 +1598,8 @@ function newClientErrorReference() {
   }
   return `ERR-${Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
 }
+
+const PRICING_SELECTION_STALE_MESSAGE = "This quote changed in another tab or session. Reopen it to see the latest version, then select the match again.";
 
 function genericFailureMessage(data = {}) {
   const reference = typeof data === "string" ? "" : errorReferenceFrom(data);
@@ -4344,6 +4347,7 @@ function buildSessionSnapshot() {
     blockingClarificationQuestions: state.blockingClarificationQuestions,
     boothDimensions: state.boothDimensions,
     originalAnalysisSnapshot: state.originalAnalysisSnapshot,
+    pricingLedgerRevisions: state.pricingLedgerRevisions,
     basisConfirmed: state.basisConfirmed,
     aiFailed: state.aiFailed,
     draftSource: state.draftSource,
@@ -4925,6 +4929,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.blockingClarificationQuestions = Array.isArray(restoredState.blockingClarificationQuestions) ? restoredState.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
   state.originalAnalysisSnapshot = restoredState.originalAnalysisSnapshot || null;
+  state.pricingLedgerRevisions = isPlainObject(restoredState.pricingLedgerRevisions) ? restoredState.pricingLedgerRevisions : {};
   state.basisConfirmed = Boolean(restoredState.basisConfirmed);
   state.draftSource = restoredState.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
@@ -7105,8 +7110,6 @@ function normalizePossiblePricingMatches(value = []) {
     if (entry.catalog_unit_price !== undefined && entry.catalog_unit_price !== null && String(entry.catalog_unit_price).trim() !== "") {
       match.catalog_unit_price = entry.catalog_unit_price;
     }
-    // Opaque server receipt issued with this offered match; the server verifies it on admission.
-    if (typeof entry.selection_receipt === "string" && /^v1\.[A-Za-z0-9_-]{43}$/.test(entry.selection_receipt)) match.selection_receipt = entry.selection_receipt;
     const score = Number(entry.score);
     if (Number.isFinite(score)) match.score = score;
     matches.push(match);
@@ -7155,7 +7158,6 @@ function normalizeBasisLines(line = "") {
       if (line.catalog_unit_price !== undefined && line.catalog_unit_price !== null && String(line.catalog_unit_price).trim() !== "") next.catalog_unit_price = line.catalog_unit_price;
       if (line.catalog_description) next.catalog_description = cleanCustomerQuoteLineText(line.catalog_description);
       if (line.pricing_reference_description) next.pricing_reference_description = pricingReferenceLineText(line.pricing_reference_description);
-      if (next.pricing_keyword && typeof line.selection_receipt === "string" && /^v1\.[A-Za-z0-9_-]{43}$/.test(line.selection_receipt)) next.selection_receipt = line.selection_receipt;
       if (orderNumber(line.category_order) !== null) next.category_order = orderNumber(line.category_order);
       if (orderNumber(line.item_order) !== null) next.item_order = orderNumber(line.item_order);
       if (quantityParts.quantity !== undefined && quantityParts.quantity !== null && String(quantityParts.quantity).trim() !== "") next.quantity = quantityParts.quantity;
@@ -9177,6 +9179,7 @@ function buildPayload(options = {}) {
     quote_basis: persistedBasis.quote_basis,
     quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: includeDraftContext ? (state.outputRows.length ? outputRowsToLineItems(state.outputRows) : state.lineItems) : [],
+    ...(isPlainObject(state.originalAnalysisSnapshot?.pricing_analysis_seal) ? { pricing_analysis_seal: state.originalAnalysisSnapshot.pricing_analysis_seal } : {}),
     analysis_findings: state.analysisFindings,
     blocking_clarification_questions: state.blockingClarificationQuestions,
     view_pdf: options.viewPdf === true,
@@ -9236,6 +9239,7 @@ function buildLineItemNormalizePayload() {
     quote_basis: persistedBasis.quote_basis,
     quote_basis_sections: persistedBasis.quote_basis_sections,
     line_items: state.lineItems.map(normalizeLineItem),
+    ...(isPlainObject(state.originalAnalysisSnapshot?.pricing_analysis_seal) ? { pricing_analysis_seal: state.originalAnalysisSnapshot.pricing_analysis_seal } : {}),
   };
 }
 
@@ -11446,8 +11450,6 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
     pricing_reference_description: reference,
   };
   if (match.unit) nextLine.unit = match.unit;
-  if (match.selection_receipt) nextLine.selection_receipt = match.selection_receipt;
-  else delete nextLine.selection_receipt;
   if (match.catalog_unit_price !== undefined && match.catalog_unit_price !== null && String(match.catalog_unit_price).trim() !== "") {
     nextLine.catalog_unit_price = match.catalog_unit_price;
   }
@@ -12968,7 +12970,20 @@ function applyDraftLineItems(lineItems = []) {
 
 async function refreshLineItemsFromServer() {
   if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
-  const result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
+  const selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+  let result;
+  if (selections.length && safeQuoteSessionId(state.quoteSessionId || "")) {
+    // The selection request saves this draft itself; let any earlier save land first.
+    if (quoteSessionDraftSavePromise) await quoteSessionDraftSavePromise.catch(() => null);
+    result = await postJson("/api/quote-sessions/pricing-selections", {
+      ...buildLineItemNormalizePayload(),
+      pricing_selections: selections,
+    });
+    const session = isPlainObject(result.data?.quote_session) ? result.data.quote_session : null;
+    if (result.ok && isPlainObject(session?.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [safeQuoteSessionId(state.quoteSessionId || "")]: session.pricing_ledger.rows };
+  } else {
+    result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
+  }
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
   state.lineItems = result.data.line_items.map((item) => (
     typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
@@ -12989,7 +13004,32 @@ function captureOriginalAnalysisSnapshot(data = {}) {
     analysis_mode: normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode),
     reference_file_signature: referenceFilesDependencySignature(),
     warnings: Array.isArray(data.warnings) ? [...data.warnings] : [],
+    // Opaque server seal of this analysis' rows and catalogue matches; the server verifies it.
+    pricing_analysis_seal: isPlainObject(data.pricing_analysis_seal) ? data.pricing_analysis_seal : null,
   };
+}
+
+
+// Unpriced rows whose basis line the operator bound to a catalogue match (a Possible Match click).
+function pendingPricingSelections() {
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const revisions = isPlainObject(state.pricingLedgerRevisions?.[sessionId]) ? state.pricingLedgerRevisions[sessionId] : {};
+  const rows = new Map();
+  state.lineItems.forEach((item) => {
+    const rowId = String(item?.source_basis_line_id || "");
+    if (rowId) rows.set(rowId, rows.has(rowId) ? null : item);
+  });
+  const selections = new Map();
+  (state.quoteBasisSections || []).forEach((section) => (section?.lines || []).forEach((line) => {
+    const itemId = String(line?.pricing_keyword || "").trim();
+    if (!itemId || line.custom_pricing || normalizeBasisTag(line.tag) !== "Include") return;
+    const rowId = [line.id, line.source_line_item_id].map((value) => String(value || "")).find((value) => rows.get(value));
+    const row = rowId ? rows.get(rowId) : null;
+    if (!row || ["catalog", "manual", "included"].includes(row.pricing_authority?.variant) || selections.has(rowId)) return;
+    const revision = revisions[rowId];
+    selections.set(rowId, { source_basis_line_id: rowId, catalog_item_id: itemId, expected_revision: Number.isInteger(revision) && revision >= 0 ? revision : 0 });
+  }));
+  return [...selections.values()].slice(0, 100);
 }
 
 function openBlockingClarifications(questions = [], findings = [], project = {}) {
@@ -13823,6 +13863,8 @@ async function saveCurrentQuoteSession(options = {}) {
       savedSessionId, currentContext.session_id === savedSessionId ? currentContext.run_id : ""
     );
     mergeDashboardQuoteSession(session);
+    // The server row revisions this tab last saw; a selection is accepted only against them.
+    if (isPlainObject(session.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [savedSessionId]: session.pricing_ledger.rows };
     if (payloadDraftKey) {
       rememberConfirmedQuoteSessionDraft(savedSessionId, payloadDraftKey, payloadDraftFileKey);
     }
@@ -14824,6 +14866,8 @@ async function modifyDashboardQuote(sessionId, options = {}) {
     state.dashboardSelectedSessionIds = [];
     state.dashboardActiveSessionId = safeSessionId;
     mergeDashboardQuoteSession({ ...detailedSession, has_draft_state: true });
+    const ledgerRows = detailedSession?.pricing_ledger?.rows;
+    if (ledgerRows && typeof ledgerRows === "object" && !Array.isArray(ledgerRows)) state.pricingLedgerRevisions = { [safeSessionId]: ledgerRows };
     rememberRestoredQuoteSessionBaseline(safeSessionId);
     clearDashboardOperation();
     showQuoteFlow();
@@ -16013,7 +16057,7 @@ async function confirmBasis(options = {}) {
       state.basisConfirmed = false;
       setWorkflowStage("basis_review");
       setResultStatus("Failed", "is-bad");
-      showBlockedBasisAction(genericFailureMessage(refreshed.data));
+      showBlockedBasisAction(refreshed.data?.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE : genericFailureMessage(refreshed.data));
       return;
     }
     state.basisConfirmed = true;

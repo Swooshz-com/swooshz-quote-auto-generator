@@ -17,7 +17,8 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
     const controlCatalog=(reference.authority_items || reference.items).find(item=>item.sale_unit_price>0 && item.id!==catalog.id);
     if(!controlCatalog)throw new Error('Synthetic positive control catalog is missing');
     const control={section:controlCatalog.section,description:controlCatalog.description,quantity:2,unit:normalizeUnit(controlCatalog.unit || controlCatalog.unit_hint),pricing_keyword:controlCatalog.id,source_basis_line_id:'c17-control',price_mode:'Priced'};
-    control.pricing_authority=buildPricingAuthority('catalog',control,{price:controlCatalog.sale_unit_price,catalogItem:controlCatalog,reference});
+    // Both rows are operator selections; only the server-recorded selection at Confirm prices them.
+    control.pricing_authority=buildPricingAuthority('none',control);
     const review={section:catalog.section,description:'Synthetic review '+catalog.description,quantity:2,unit,pricing_keyword:'',source_basis_line_id:'c17-selected',price_mode:'Priced'};
     review.pricing_authority=buildPricingAuthority('none',review);
     state.lineItems=[control,review];
@@ -31,7 +32,7 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   await page.locator('#outputSidePanel.is-active').waitFor();
   await page.locator('#quoteBasisButton').click();
   await page.locator('[data-basis-possible-match-index="0"]').click();
-  const normalizationPromise=page.waitForResponse(r=>r.url().endsWith('/api/line-items/normalize'));
+  const normalizationPromise=page.waitForResponse(r=>r.url().endsWith('/api/quote-sessions/pricing-selections'));
   await page.locator('#sideNextButton',{hasText:'Confirm Quotation Basis'}).click();
   const normalizationResponse=await normalizationPromise;
   await fs.mkdir(outputDir,{recursive:true});

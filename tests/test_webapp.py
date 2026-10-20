@@ -388,6 +388,82 @@ def recovered_convergence_payload(
     return payload
 
 
+def with_server_analysis_seal(payload: dict, auth_session: dict | None = None) -> dict:
+    """Have this server analyse the payload's own draft and carry its pricing seal, as the browser does.
+
+    Catalogue trust comes from the server (pricing ledger or analysis seal), never from request rows,
+    so fixtures that stand for an AI-matched draft must carry the server's seal for those rows.
+    """
+    rows = [{key: value for key, value in row.items() if key != "pricing_authority"}
+            for row in copy.deepcopy(payload.get("line_items") or []) if isinstance(row, dict)]
+    sections = copy.deepcopy(payload.get("quote_basis_sections") or [])
+    if not sections:
+        # The provider reports each row on its own basis line, as a real analysis does.
+        grouped: dict[str, list] = {}
+        for row in rows:
+            if row.get("source_basis_line_id"):
+                grouped.setdefault(row.get("section") or "General", []).append({
+                    "id": row["source_basis_line_id"], "tag": "Confirm", "text": row.get("description", ""),
+                    "quantity": row.get("quantity"), "unit": row.get("unit"), "confidence_pct": 90,
+                    **({"pricing_keyword": row["pricing_keyword"]} if row.get("pricing_keyword") else {}),
+                })
+        sections = [{"id": re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "general", "title": title, "lines": lines}
+                    for title, lines in grouped.items()]
+    raw = {"analysis_findings": [], "blocking_clarification_questions": [], "quote_basis_sections": sections, "line_items": rows}
+    context = {key: value for key, value in payload.items() if key not in {"line_items", "quote_basis_sections", "quote_basis"}}
+    seal = webapp.normalize_ai_draft(raw, context, auth_session=auth_session).get("pricing_analysis_seal")
+    if seal is None:
+        raise AssertionError("The server issued no analysis seal for this fixture.")
+    payload["pricing_analysis_seal"] = seal
+    return payload
+
+
+@contextlib.contextmanager
+def pre_ledger_grants_for(payload: dict):
+    """Stand in for the storage of a quote persisted before the pricing ledger with exactly these rows.
+
+    Its persisted catalogue rows are the only grants (bootstrap_legacy_pricing_ledger); request rows
+    added later still grant nothing. For generator-boundary tests that start from saved rows.
+    """
+    view = webapp.PricingLedgerView(webapp.bootstrap_legacy_pricing_ledger({
+        "lineItems": copy.deepcopy(payload.get("line_items") or []),
+        "pricingReferenceId": payload.get("pricing_reference_id"),
+    }))
+    with mock.patch.object(webapp, "pricing_ledger_view_for_payload", return_value=view):
+        yield view
+
+
+def persist_as_pre_ledger_quote(payload: dict, storage=None) -> dict:
+    """Persist the payload's saved draft as a quote saved before the pricing ledger existed.
+
+    Such quotes keep exactly the catalogue prices they persisted (and nothing the request adds later).
+    """
+    request = copy.deepcopy(payload)
+    session_id = request["quote_session"]["session_id"]
+    draft = request["quote_session"].setdefault("draft_state", {})
+    draft.setdefault("lineItems", copy.deepcopy(request.get("line_items") or draft.get("outputRows") or []))
+    storage = storage or webapp.LocalSqagStorage()
+    storage.create_or_update_quote_session(request)
+    if isinstance(storage, webapp.DatabaseSqagStorage):
+        with storage.connection() as connection:
+            [raw] = connection.execute(
+                "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                (storage.workspace_id, session_id),
+            ).fetchone()
+            metadata = json.loads(raw)
+            metadata.pop("pricing_ledger", None)
+            connection.execute(
+                "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ?",
+                (json.dumps(metadata, ensure_ascii=True, sort_keys=True), storage.workspace_id, session_id),
+            )
+            connection.commit()
+        return payload
+    metadata = webapp.read_quote_session_metadata(session_id)
+    metadata.pop("pricing_ledger", None)
+    webapp.write_quote_session_metadata(metadata)
+    return payload
+
+
 def synthetic_publication_authority() -> dict:
     digest = hashlib.sha256(b"synthetic-publication-authority").hexdigest()
     return {
@@ -3092,7 +3168,8 @@ class WebappServerTest(unittest.TestCase):
             row["pricing_authority"]["price_currency"] = currency
         payload["quote_session"]["draft_state"]["outputRows"] = [row]
         payload["line_items"] = copy.deepcopy([row])
-        return payload
+        # A saved catalogue price is trusted only as the quote persisted it (pre-ledger quote).
+        return persist_as_pre_ledger_quote(payload)
 
     def test_owned_quote_currency_manual_fx_generation_and_session_totals(self):
         cases = (
@@ -3406,8 +3483,10 @@ class WebappServerTest(unittest.TestCase):
             "unit": "sqm",
             "description": "Printed graphics",
             "pricing_keyword": "new-quote-printed-graphics",
+            "source_basis_line_id": "new-quote-graphics",
         }]
         payload["quote_basis_sections"] = []
+        with_server_analysis_seal(payload)
 
         self.assertFalse(webapp.quote_commercial_state(payload)["owned"])
         [item] = webapp.normalize_line_items(payload)
@@ -15746,7 +15825,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "unit": "sqm",
             "description": "sqm synthetic carpet tile",
             "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+            "source_basis_line_id": "delegated-carpet",
         }]
+        with_server_analysis_seal(payload)
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             result = webapp.run_quote_job(
@@ -33067,7 +33148,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         )
         self.assertIn("if (!refreshed.ok)", confirm_body)
         self.assertIn("state.basisConfirmed = false;", confirm_body)
-        self.assertIn("showBlockedBasisAction(genericFailureMessage(refreshed.data));", confirm_body)
+        self.assertIn('showBlockedBasisAction(refreshed.data?.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE : genericFailureMessage(refreshed.data));', confirm_body)
         self.assertNotIn("Pricing refresh unavailable", confirm_body)
         missing_branch = confirm_body.split("if (missing.length)", 1)[1].split("state.isPreparingOutput", 1)[0]
         confirm_block_branch = confirm_body.split("if (confirmBlockReason)", 1)[1].split("if (state.aiFailed)", 1)[0]
@@ -33855,8 +33936,11 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                     "unit": "sqm",
                     "description": "Workspace printed graphics",
                     "pricing_keyword": "workspace-row",
+                    "source_basis_line_id": "sqag212-commercial-row",
                 }
                 payload = owned_payload([catalog_row])
+                # Workspace A saved this catalogue row before the pricing ledger existed.
+                persist_as_pre_ledger_quote(payload, storage=workspace_a)
                 state = webapp.quote_commercial_state(payload)
                 self.assertFalse(state["review_required"])
                 self.assertIsNone(payload["quote_session"]["draft_state"]["quoteCommercialReview"])
@@ -34288,7 +34372,8 @@ async function main() {
       state.quoteBasisSections = normalizeQuoteBasisSections([{
         id: "g3-graphics",
         title: "Graphics",
-        lines: [{ tag: "Include", text: "Workspace printed graphics", include: true, quantity: 2, unit: "sqm", pricing_keyword: "workspace-row" }],
+        // A stable row the operator bound to the catalogue; Confirm records the selection with the server.
+        lines: [{ id: "g3-workspace-row", tag: "Include", text: "Workspace printed graphics", include: true, quantity: 2, unit: "sqm", pricing_keyword: "workspace-row" }],
       }]);
       state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
       state.lineItems = [normalizeLineItem({
@@ -34297,6 +34382,7 @@ async function main() {
         unit: "sqm",
         description: "Workspace printed graphics",
         pricing_keyword: "workspace-row",
+        source_basis_line_id: "g3-workspace-row",
       })];
       const normalized = await refreshLineItemsFromServer();
       if (!normalized.ok) throw new Error(`fresh normalization failed: ${JSON.stringify({
@@ -40586,9 +40672,11 @@ main().catch((error) => {
                 "unit": "sqm",
                 "description": "sqm synthetic carpet tile",
                 "pricing_keyword": "synthetic-floors-synthetic-carpet-tile",
+                "source_basis_line_id": "imported-logo-carpet",
             }]
             for section in ("company", "quote_text", "signature", "rich_text"):
                 payload[section].update(restored_profile["defaults"][section])
+            with_server_analysis_seal(payload)
 
             result = webapp.run_quote_job(
                 payload,
@@ -40883,6 +40971,7 @@ main().catch((error) => {
             "unit": "sqm",
             "description": "Synthetic internal graphics",
             "pricing_keyword": "synthetic-internal-graphics-row",
+            "source_basis_line_id": "synthetic-internal-graphics",
         }]
         payload["company"] = {"name": "", "header_details": ""}
         payload["quote_text"]["payment_terms"] = []
@@ -40901,6 +40990,7 @@ main().catch((error) => {
             payload["pricing_reference"] = webapp.public_company_pricing_reference(saved_reference)
             with mock.patch.object(webapp, "company_config_store", return_value=store):
                 listed_references = webapp.list_pricing_references(company_id)
+                with_server_analysis_seal(payload)
                 result = webapp.run_quote_job(
                     payload,
                     output_root=root / "out",
@@ -41636,10 +41726,20 @@ main().catch((error) => {
             self.assertFalse(webapp.quote_commercial_state(payload)["review_required"])
         return payload, catalog
 
+    def _owner_granted_payload(self, owned, session_id):
+        """The fixture payload naming a quote whose server ledger holds the operator's selection."""
+        payload, catalog = self._owner_selected_suggestion_payload(owned)
+        self._owner_server_selection(payload, catalog, session_id)
+        payload.setdefault("quote_session", {})["session_id"] = session_id
+        return payload, catalog
+
     def test_owner_specific_selection_binds_current_catalogue_in_fresh_and_owned_quotes(self):
         for owned in (False, True):
             with self.subTest(owned=owned):
-                payload, catalog = self._owner_selected_suggestion_payload(owned)
+                unselected, catalog = self._owner_selected_suggestion_payload(owned)
+                self.assertFalse(any(row.get("pricing_authority", {}).get("variant") == "catalog"
+                                     for row in webapp.normalize_line_items_for_quote_basis_review(unselected)))
+                payload, catalog = self._owner_granted_payload(owned, f"quote-owner-binds-{int(owned)}")
                 before = copy.deepcopy(payload)
                 rows = webapp.normalize_line_items_for_quote_basis_review(payload)
                 self.assertEqual(payload, before)
@@ -41656,24 +41756,31 @@ main().catch((error) => {
                 self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), rows)
 
     def test_owner_specific_selection_rejects_unbound_ambiguous_and_nonapproved_rows(self):
-        for owned in (False, True):
-            for variant in ("missing-id", "wrong-id", "duplicate-row", "duplicate-basis", "different-quantity", "different-unit", "unknown-catalogue", "custom", "confirm", "exclude", "invalid-authority", "historical"):
-                with self.subTest(owned=owned, variant=variant):
-                    payload, catalog = self._owner_selected_suggestion_payload(owned)
-                    row=payload["line_items"][0];line=payload["quote_basis_sections"][0]["lines"][0]
-                    if variant == "missing-id": row.pop("source_basis_line_id")
-                    elif variant == "wrong-id": row["source_basis_line_id"] = "another-row"
-                    elif variant == "duplicate-row": payload["line_items"].append(copy.deepcopy(row))
-                    elif variant == "duplicate-basis": payload["quote_basis_sections"][0]["lines"].append(copy.deepcopy(line))
-                    elif variant == "different-quantity": line["quantity"] = 3
-                    elif variant == "different-unit": line["unit"] = "nos"
-                    elif variant == "unknown-catalogue": line["pricing_keyword"] = "unknown-catalogue"
-                    elif variant in ("custom", "confirm", "exclude"): line["tag"] = variant.title()
-                    elif variant == "invalid-authority": row["pricing_authority"]["context"]["source_basis_line_id"] = "another-row"
-                    elif variant == "historical": row["pricing_authority"] = webapp.build_pricing_authority("historical", row)
-                    payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
-                    rows=webapp.normalize_line_items_for_quote_basis_review(payload)
-                    self.assertFalse(any(item.get("pricing_authority", {}).get("variant") == "catalog" for item in rows))
+        structural = ("missing-id", "wrong-id", "duplicate-row", "duplicate-basis", "different-quantity", "different-unit",
+                      "unknown-catalogue", "custom", "confirm", "exclude")
+        for granted in (False, True):
+            for owned in (False, True):
+                # Without a server grant no request shape prices; with one, only the granted row and line do.
+                for variant in structural + (() if granted else ("invalid-authority", "historical")):
+                    with self.subTest(granted=granted, owned=owned, variant=variant):
+                        if granted:
+                            payload, catalog = self._owner_granted_payload(owned, f"quote-owner-reject-{int(owned)}-{variant}")
+                        else:
+                            payload, catalog = self._owner_selected_suggestion_payload(owned)
+                        row=payload["line_items"][0];line=payload["quote_basis_sections"][0]["lines"][0]
+                        if variant == "missing-id": row.pop("source_basis_line_id")
+                        elif variant == "wrong-id": row["source_basis_line_id"] = "another-row"
+                        elif variant == "duplicate-row": payload["line_items"].append(copy.deepcopy(row))
+                        elif variant == "duplicate-basis": payload["quote_basis_sections"][0]["lines"].append(copy.deepcopy(line))
+                        elif variant == "different-quantity": line["quantity"] = 3
+                        elif variant == "different-unit": line["unit"] = "nos"
+                        elif variant == "unknown-catalogue": line["pricing_keyword"] = "unknown-catalogue"
+                        elif variant in ("custom", "confirm", "exclude"): line["tag"] = variant.title()
+                        elif variant == "invalid-authority": row["pricing_authority"]["context"]["source_basis_line_id"] = "another-row"
+                        elif variant == "historical": row["pricing_authority"] = webapp.build_pricing_authority("historical", row)
+                        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+                        rows=webapp.normalize_line_items_for_quote_basis_review(payload)
+                        self.assertFalse(any(item.get("pricing_authority", {}).get("variant") == "catalog" for item in rows))
 
     def test_owner_specific_selection_preserves_manual_included_and_reference_guards(self):
         for variant in ("manual", "included"):
@@ -41690,9 +41797,9 @@ main().catch((error) => {
             payload["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"][field]=value
             self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(payload), [])
 
-    def _owner_possible_match_payload(self, owned, detail, row_unit="lot", line_unit="sqm", row_description=None):
-        # Owner UAT U1 shape: an unpriced AI row in its own unit and wording, and an explicit
-        # Possible Match selection written as "[ reference ] - detail" in the catalogue unit.
+    def _owner_possible_match_payload(self, owned, detail, row_unit="sqm", line_unit="sqm", row_description=None):
+        # Owner UAT U1 shape: an unpriced AI row in its own wording, and an explicit Possible
+        # Match selection written as "[ reference ] - detail" in the catalogue unit.
         payload, catalog = self._owner_selected_suggestion_payload(owned)
         row = payload["line_items"][0]
         line = payload["quote_basis_sections"][0]["lines"][0]
@@ -41704,30 +41811,43 @@ main().catch((error) => {
             payload["quote_session"]["draft_state"]["lineItems"] = copy.deepcopy(payload["line_items"])
         return payload, catalog
 
-    def test_owner_uat_possible_match_selection_prices_unrelated_wording_and_unit_change(self):
+    def _owner_server_selection(self, payload, catalog, session_id):
+        """Record the selection through the server transaction; the browser click alone never prices."""
+        request = copy.deepcopy(payload)
+        request["quote_session"] = {"session_id": session_id}
+        self._ledger_sync(request)
+        result = webapp.apply_pricing_selections(request, [{
+            "source_basis_line_id": "selected-row", "catalog_item_id": catalog["id"], "expected_revision": 0,
+        }], webapp.LocalSqagStorage())
+        return request, result
+
+    def test_owner_uat_possible_match_selection_prices_unrelated_wording(self):
         detail = "Grey loop pile across reception zone"
+        price = None
         for owned in (False, True):
             with self.subTest(owned=owned):
                 payload, catalog = self._owner_possible_match_payload(owned, detail)
-                before = copy.deepcopy(payload)
-                rows = webapp.normalize_line_items_for_quote_basis_review(payload)
-                self.assertEqual(payload, before)
-                [selected] = [row for row in rows if row.get("source_basis_line_id") == "selected-row"]
                 price = webapp.pricing_reference_sale_unit_price(catalog)
+                self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None
+                                     for row in webapp.normalize_line_items_for_quote_basis_review(payload)))
+                request, result = self._owner_server_selection(payload, catalog, f"quote-owner-wording-{int(owned)}")
+                self.assertEqual(result["selections"], [{"source_basis_line_id": "selected-row", "status": "selected"}])
+                [selected] = [row for row in result["line_items"] if row.get("source_basis_line_id") == "selected-row"]
                 self.assertEqual(selected["pricing_authority"]["variant"], "catalog")
                 self.assertEqual(selected["pricing_authority"]["catalog_item_id"], catalog["id"])
                 self.assertEqual(selected["pricing_authority"]["price"], price)
                 self.assertEqual(selected["unit"], "sqm")
-                self.assertEqual(selected["pricing_authority"]["context"]["unit"], "sqm")
                 self.assertEqual(selected["pricing_basis_amount"], webapp.round_commercial_cents(2 * price))
-                repeated = {**payload, "line_items": rows}
-                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), rows)
-        payload, catalog = self._owner_possible_match_payload(False, detail)
-        payload["quote_exchange_rate"] = 0.7391
-        [selected] = webapp.normalize_line_items_for_quote_basis_review(payload)
-        basis_amount = webapp.round_commercial_cents(2 * webapp.pricing_reference_sale_unit_price(catalog))
-        self.assertEqual(selected["pricing_basis_amount"], basis_amount)
-        self.assertEqual(selected["approved_quote_amount"], webapp.round_commercial_cents(basis_amount * 0.7391))
+                # The pre-commercial review shape reads the same server grant for the same quote.
+                fresh = {key: value for key, value in copy.deepcopy(payload).items() if key != "quote_session"}
+                fresh["quote_session"] = {"session_id": request["quote_session"]["session_id"]}
+                fresh["quote_exchange_rate"] = 0.7391
+                [converted] = webapp.normalize_line_items_for_quote_basis_review(fresh)
+                basis_amount = webapp.round_commercial_cents(2 * price)
+                self.assertEqual(converted["pricing_basis_amount"], basis_amount)
+                self.assertEqual(converted["approved_quote_amount"], webapp.round_commercial_cents(basis_amount * 0.7391))
+                repeated = {**fresh, "line_items": [converted]}
+                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), [converted])
 
     def test_owner_uat_basis_repair_rendered_browser_regression(self):
         # Rendered U1/U2 path: real server, UI, normalisation, persistence and XLSX; synthetic draft only.
@@ -41754,70 +41874,81 @@ main().catch((error) => {
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["xlsx"]["status"], "PASS")
         self.assertEqual({row["id"] for row in result["u1"] if row.get("expected") is not None},
-                         {"u1-video", "u1-graphic", "u1-carpet", "u1-historical", "u1-confirmed"})
-        self.assertEqual([row["quoted"] for row in result["u1"] if row["id"] in {"u1-review", "u1-legacy"}], ["???", "???"])
-        # Reopened saved quote: both rows HISTORICAL; only the fresh offer carried receipts.
+                         {"u1-graphic", "u1-carpet", "u1-historical", "u1-confirmed"})
+        # Unselected HISTORICAL, review-only and lot-to-pieces rows stay unpriced.
+        self.assertEqual([row["quoted"] for row in result["u1"] if row["id"] in {"u1-review", "u1-legacy", "u1-video"}], ["???", "???", "???"])
         self.assertEqual(result["historicalReopen"]["variants"], ["historical", "historical"])
-        self.assertTrue(result["historicalReopen"]["historical"] and all(result["historicalReopen"]["historical"]))
-        self.assertFalse(any(result["historicalReopen"]["legacy"]))
+        self.assertEqual(result["historicalReopen"]["receiptFields"], 0)
+        self.assertEqual([entry.split(" +")[0] for entry in result["confirm"]["networkDuringConfirm"]].count(
+            "POST /api/quote-sessions/pricing-selections"), 1)
         self.assertIn('"bad": []', result["xlsx"]["validator"])
 
     def test_owner_uat_possible_match_selection_keeps_review_for_unit_and_family_conflicts(self):
         competing = "synthetic vinyl floor finish"
         cases = {
-            "line-not-in-catalogue-unit": {"detail": "Grey loop pile across reception zone", "line_unit": "lot"},
-            "detail-names-competing-family": {"detail": competing},
-            "row-wording-names-competing-family": {"detail": "Grey loop pile across reception zone", "row_description": competing},
+            "lot-row-in-sqm-catalogue": ({"detail": "Grey loop pile across reception zone", "row_unit": "lot"}, "unit_review_required"),
+            "detail-names-competing-family": ({"detail": competing}, "contradiction"),
+            "row-wording-names-competing-family": ({"detail": "Grey loop pile across reception zone", "row_description": competing}, "contradiction"),
         }
         for owned in (False, True):
-            for label, options in cases.items():
+            for label, (options, reason) in cases.items():
                 with self.subTest(owned=owned, case=label):
-                    payload, _ = self._owner_possible_match_payload(owned, **options)
-                    rows = webapp.normalize_line_items_for_quote_basis_review(payload)
-                    self.assertFalse(any(row.get("pricing_authority", {}).get("variant") == "catalog" for row in rows))
-                    self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows))
+                    payload, catalog = self._owner_possible_match_payload(owned, **options)
+                    _request, result = self._owner_server_selection(payload, catalog, f"quote-owner-conflict-{int(owned)}-{label}")
+                    self.assertEqual(result["selections"], [{"source_basis_line_id": "selected-row", "status": "refused", "reason": reason}])
+                    self.assertFalse(any(row.get("pricing_authority", {}).get("variant") == "catalog" for row in result["line_items"]))
+                    self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in result["line_items"]))
 
     OWNER_HISTORICAL_CLAIM = "synthetic-graphics-synthetic-hanging-banner"
-    OWNER_HISTORICAL_SELECTION = "synthetic-floors-synthetic-carpet-tile"
 
-    def _owner_historical_selection(self, owned, *, unit="sqm", session_id="quote-owner-historical"):
-        # Owner UAT U1 (G2 amendment): the AI wrongly claims a catalogue item, the real normaliser
-        # rejects it as HISTORICAL and offers Possible Matches; the operator then clicks one. The
-        # click is serialised as the browser does it, including the receipt issued with that match.
-        payload = valid_payload()
-        payload.update(pricing_reference_source="local", pricing_reference={
-            "id": payload["pricing_reference_id"], "source": "local", "currency": "SGD",
-        }, quote_session={"session_id": session_id})
+    # --- Alpha1 root pricing ledger (M1/M2/M3): the server, not the browser's row JSON, owns pricing trust. ---
+    LEDGER_SESSION = "quote-ledger-alpha1"
+    LEDGER_CARPET = "synthetic-floors-synthetic-carpet-tile"
+
+    def _ledger_analysis(self, rows, *, session_id=LEDGER_SESSION, auth_session=None, payload=None):
+        """Run the real analysis normaliser on synthetic rows and carry its result the way the browser does.
+
+        rows: (row_id, section, text, quantity, unit, claimed_catalogue_id_or_None)
+        """
+        payload = copy.deepcopy(payload) if payload is not None else valid_payload()
+        if payload["pricing_reference"].get("source") == "local":
+            payload.update(pricing_reference_source="local", pricing_reference={
+                "id": payload["pricing_reference_id"], "source": "local", "currency": "SGD"})
+        payload["quote_session"] = {"session_id": session_id}
         for key in ("line_items", "quote_basis_sections", "quote_basis"):
             payload.pop(key, None)
-        text = "Synthetic carpet tile flooring across the full booth footprint"
-        claim = self.OWNER_HISTORICAL_CLAIM
-        raw = {"analysis_findings": [], "blocking_clarification_questions": [], "quote_basis_sections": [{
-            "id": "floors", "title": "Floors", "lines": [{"id": "carpet-row", "tag": "Confirm", "text": text,
-                                                          "quantity": 2, "unit": unit, "confidence_pct": 82, "pricing_keyword": claim}]}],
-            "line_items": [{"section": "Floors", "source_basis_line_id": "carpet-row", "description": text,
-                            "quantity": 2, "unit": unit, "pricing_keyword": claim}]}
-        draft = webapp.normalize_ai_draft(raw, payload, require_confidence=True)
-        [row] = [item for item in draft["line_items"] if item.get("source_basis_line_id") == "carpet-row"]
-        self.assertEqual(row["pricing_authority"]["variant"], "historical")
-        self.assertEqual(row.get("pricing_keyword", ""), "")
-        sections = copy.deepcopy(draft["quote_basis_sections"])
-        [(section, index, line)] = [(section, index, line) for section in sections
-                                    for index, line in enumerate(section["lines"]) if line.get("id") == "carpet-row"]
-        matches = {match["pricing_keyword"]: match for match in line["possible_pricing_matches"]}
-        self.assertTrue(all(webapp.PRICING_SELECTION_RECEIPT_RE.fullmatch(match["selection_receipt"]) for match in matches.values()))
-        match = matches[self.OWNER_HISTORICAL_SELECTION]
-        selected = {key: value for key, value in line.items() if key not in {"custom_pricing", "custom_confirmed", "possible_pricing_matches"}}
-        selected.update(tag="Include", text="[ " + match["description"] + " ] - " + line["text"], unit=match["unit"],
-                        pricing_keyword=match["pricing_keyword"], catalog_description=match["description"],
-                        pricing_reference_description=match["description"], catalog_unit_price=999999,
-                        selection_receipt=match["selection_receipt"])
-        section["lines"][index] = selected
+        sections = {}
+        raw_rows = []
+        for row_id, section, text, quantity, unit, claim in rows:
+            line = {"id": row_id, "tag": "Confirm", "text": text, "quantity": quantity, "unit": unit, "confidence_pct": 82}
+            row = {"section": section, "source_basis_line_id": row_id, "description": text, "quantity": quantity, "unit": unit}
+            if claim:
+                line["pricing_keyword"] = claim
+                row["pricing_keyword"] = claim
+            sections.setdefault(section, []).append(line)
+            raw_rows.append(row)
+        raw = {"analysis_findings": [], "blocking_clarification_questions": [], "line_items": raw_rows,
+               "quote_basis_sections": [{"id": re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-"), "title": title, "lines": lines}
+                                        for title, lines in sections.items()]}
+        draft = webapp.normalize_ai_draft(raw, payload, require_confidence=True, auth_session=auth_session)
         request = copy.deepcopy(payload)
         request["line_items"] = copy.deepcopy(draft["line_items"])
-        request["quote_basis_sections"] = sections
-        request["quote_basis"] = webapp.quote_basis_from_sections(sections)
-        if owned:
+        request["quote_basis_sections"] = copy.deepcopy(draft["quote_basis_sections"])
+        request["quote_basis"] = webapp.quote_basis_from_sections(request["quote_basis_sections"])
+        if draft.get("pricing_analysis_seal") is not None:
+            # Browser JSON has one number type: 2.0 comes back as 2.
+            request["pricing_analysis_seal"] = json.loads(json.dumps(draft["pricing_analysis_seal"]), parse_float=lambda text: (
+                int(float(text)) if float(text).is_integer() else float(text)))
+        self._ledger_sync(request)
+        return request, draft
+
+    def _ledger_sync(self, request, pricing_basis=None):
+        """Mirror the browser draft state saved with each request, including its owned commercial details."""
+        request["quote_basis"] = webapp.quote_basis_from_sections(request["quote_basis_sections"])
+        session = request.setdefault("quote_session", {"session_id": self.LEDGER_SESSION})
+        session.setdefault("commercials", {"currency": "SGD", "exchange_rate": 1})
+        draft = session.setdefault("draft_state", {})
+        if "quoteDetails" not in draft:
             details = {"currency": "SGD", "exchange_rate": 1, "tax": {"label": "GST", "rate": 0.09},
                        "company": {"name": "Synthetic Company", "header_details": "Synthetic header"},
                        "quote_text": {"terms_heading": "Terms", "payment_terms": [], "notes_heading": "Notes", "standard_notes": []},
@@ -41827,149 +41958,610 @@ main().catch((error) => {
                 "owner": "quote", "lifecycle": "RECOVERED", "origin": "session_recovery",
                 "presence": {key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
                              for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()},
-                "pricing_basis": {"currency": "SGD", "source": "local", "id": payload["pricing_reference_id"],
-                                  "digest": webapp.pricing_reference_catalog_digest(json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8")))},
+                "pricing_basis": pricing_basis or {"currency": "SGD", "source": "local", "id": request["pricing_reference_id"],
+                                                   "digest": webapp.pricing_reference_catalog_digest(json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8")))},
             }
-            request["quote_session"] = {"session_id": session_id, "commercials": {"currency": "SGD", "exchange_rate": 1},
-                "draft_state": {"quoteCommercialLifecycle": "RECOVERED", "quoteDetails": details,
-                                "lineItems": copy.deepcopy(request["line_items"])}}
-            self.assertTrue(webapp.quote_commercial_state(request)["owned"])
-            self.assertFalse(webapp.quote_commercial_state(request)["review_required"])
-        return request, matches
+            draft.update(quoteCommercialLifecycle="RECOVERED", quoteDetails=details)
+        draft.update(lineItems=copy.deepcopy(request["line_items"]),
+                     quoteBasisSections=copy.deepcopy(request["quote_basis_sections"]),
+                     quoteBasis=copy.deepcopy(request["quote_basis"]))
+        snapshot = draft.setdefault("originalAnalysisSnapshot", {})
+        if request.get("pricing_analysis_seal") is not None:
+            snapshot["pricing_analysis_seal"] = copy.deepcopy(request["pricing_analysis_seal"])
+        return request
 
-    def _owner_historical_selected_row(self, request):
-        rows = webapp.normalize_line_items_for_quote_basis_review(request)
-        return [row for row in rows if row.get("source_basis_line_id") == "carpet-row"]
+    def _ledger_line(self, request, row_id):
+        [line] = [line for section in request["quote_basis_sections"] for line in section["lines"]
+                  if line.get("id") == row_id]
+        return line
 
-    def test_owner_uat_historical_row_admits_fresh_receipted_possible_match_selection(self):
-        catalog = webapp.pricing_catalog_runtime_lookup_for_payload(valid_payload(), "synthetic-exhibition-fixture-template")[self.OWNER_HISTORICAL_SELECTION]
-        price = webapp.pricing_reference_sale_unit_price(catalog)
-        for owned in (False, True):
-            with self.subTest(owned=owned):
-                request, _ = self._owner_historical_selection(owned)
-                before = copy.deepcopy(request)
-                [row] = self._owner_historical_selected_row(request)
-                self.assertEqual(request, before)
-                self.assertEqual(row["pricing_authority"]["variant"], "catalog")
-                self.assertEqual(row["pricing_authority"]["catalog_item_id"], self.OWNER_HISTORICAL_SELECTION)
-                self.assertEqual(row["pricing_authority"]["price"], price)
-                self.assertNotEqual(price, 999999)
-                self.assertEqual(row["unit"], "sqm")
-                self.assertEqual(row["pricing_basis_amount"], webapp.round_commercial_cents(2 * price))
-                repeated = {**request, "line_items": webapp.normalize_line_items_for_quote_basis_review(request)}
-                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), repeated["line_items"])
-        request, _ = self._owner_historical_selection(False)
-        request["quote_exchange_rate"] = 0.7391
-        [row] = self._owner_historical_selected_row(request)
-        self.assertEqual(row["approved_quote_amount"], webapp.round_commercial_cents(webapp.round_commercial_cents(2 * price) * 0.7391))
+    def _ledger_click(self, request, row_id, item_id):
+        """The browser's Possible Match click: local only, it binds the basis line to the catalogue item."""
+        lookup = webapp.pricing_catalog_runtime_lookup_for_payload(request, request["profile_id"])
+        item = lookup[item_id]
+        line = self._ledger_line(request, row_id)
+        for key in ("custom_pricing", "custom_confirmed", "possible_pricing_matches", "selection_receipt"):
+            line.pop(key, None)
+        line.update(tag="Include", text="[ " + item["description"] + " ] - " + line["text"], unit=item["unit_hint"],
+                    pricing_keyword=item_id, catalog_description=item["description"],
+                    pricing_reference_description=item["description"], catalog_unit_price=999999)
+        return self._ledger_sync(request)
 
-    def test_owner_uat_production_draft_offers_receipts_only_for_unclaimed_rows(self):
-        request, matches = self._owner_historical_selection(False)
-        finalized = webapp.finalized_remote_draft_result(
-            {key: value for key, value in request.items() if key not in {"line_items", "quote_basis_sections", "quote_basis"}},
-            webapp.normalize_ai_draft({"analysis_findings": [], "blocking_clarification_questions": [],
-                                       "quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
-                                           {"id": "carpet-row", "tag": "Confirm", "text": "Synthetic carpet tile flooring across the full booth footprint",
-                                            "quantity": 2, "unit": "sqm", "confidence_pct": 82}]}],
-                                       "line_items": [{"section": "Floors", "source_basis_line_id": "carpet-row", "quantity": 2, "unit": "sqm",
-                                                       "description": "Synthetic carpet tile flooring across the full booth footprint"}]},
-                                      request, require_confidence=True),
-            "openai", "OpenAI", {}, [],
-        )
-        offered = [match for section in finalized["quote_basis_sections"] for line in section["lines"]
-                   for match in line.get("possible_pricing_matches") or []]
-        self.assertTrue(offered)
-        self.assertTrue(all(webapp.PRICING_SELECTION_RECEIPT_RE.fullmatch(match.get("selection_receipt", "")) for match in offered))
-        # A row the AI still claims is never offered a receipt for its own claim.
-        claimed_payload = copy.deepcopy(request)
-        claimed_payload["line_items"][0]["pricing_keyword"] = self.OWNER_HISTORICAL_CLAIM
-        sections = copy.deepcopy(claimed_payload["quote_basis_sections"])
-        for section in sections:
-            for line in section["lines"]:
-                line["possible_pricing_matches"] = [{"pricing_keyword": key} for key in matches]
-        webapp.attach_possible_match_selection_receipts(sections, claimed_payload["line_items"], claimed_payload)
-        self.assertFalse(any(match.get("selection_receipt") for section in sections for line in section["lines"]
-                             for match in line["possible_pricing_matches"]))
-        with mock.patch.object(webapp, "configured_app_mode", return_value="deploy"), mock.patch.object(webapp, "session_secret", return_value=""):
-            self.assertIsNone(webapp.pricing_selection_receipt_key())
+    def _ledger_runner_headers(self, runner):
+        session = self.http_json(runner, "GET", "/api/session")["body"]
+        return {"Origin": runner.base_url, session["csrf_header"]: session["csrf_token"]}
 
-    def test_owner_uat_historical_row_rejects_selection_without_a_valid_fresh_receipt(self):
-        def other_receipt(request, _matches, **changes):
-            authority = copy.deepcopy(webapp.exact_pricing_reference_authority(request))
-            row = copy.deepcopy(request["line_items"][0])
-            auth_session = changes.pop("auth_session", None)
-            if "digest" in changes:
-                authority["detail"]["digest_sha256"] = changes.pop("digest")
-            if "session_id" in changes:
-                request = {**request, "quote_session": {**request["quote_session"], "session_id": changes.pop("session_id")}}
-            row.update(changes)
-            catalog = webapp.pricing_catalog_runtime_lookup_for_payload(request, request["profile_id"])[self.OWNER_HISTORICAL_SELECTION]
-            receipt = webapp.pricing_selection_receipt(request, auth_session, authority, row, catalog)
-            self.assertNotIn(receipt, ("", _matches[self.OWNER_HISTORICAL_SELECTION]["selection_receipt"]))
-            return receipt
+    def _ledger_post(self, runner, headers, path, body):
+        self.reset_rate_limit_state()
+        return self.http_json(runner, "POST", path, body=copy.deepcopy(body), headers=headers)
 
-        def set_line(request, **values):
-            for section in request["quote_basis_sections"]:
-                for line in section["lines"]:
-                    if line.get("id") == "carpet-row":
-                        line.update(values)
-                        for key in [key for key, value in values.items() if value is None]:
-                            line.pop(key)
+    def _ledger_select(self, runner, headers, request, row_id, item_id, revision):
+        return self._ledger_post(runner, headers, "/api/quote-sessions/pricing-selections", {
+            **request, "pricing_selections": [{"source_basis_line_id": row_id, "catalog_item_id": item_id,
+                                               "expected_revision": revision}]})
 
-        def resync(request):
-            request["quote_basis"] = webapp.quote_basis_from_sections(request["quote_basis_sections"])
-            if "draft_state" in request["quote_session"]:
-                request["quote_session"]["draft_state"]["lineItems"] = copy.deepcopy(request["line_items"])
+    @staticmethod
+    def _ledger_revision(response, row_id):
+        ledger = ((response.get("body") or {}).get("quote_session") or {}).get("pricing_ledger") or {}
+        return (ledger.get("rows") or {}).get(row_id, 0)
 
-        other_scope = {"auth_mode": webapp.INTERNAL_AUTH_MODE, "user": {"subject": "synthetic-other-subject", "account": "synthetic-other-account"}}
-        cases = {
-            "historical-no-receipt": lambda request, matches: set_line(request, selection_receipt=None),
-            "forged-receipt": lambda request, matches: set_line(request, selection_receipt="v1." + "A" * 43),
-            "malformed-receipt": lambda request, matches: set_line(request, selection_receipt="v1." + matches[self.OWNER_HISTORICAL_SELECTION]["selection_receipt"][3:-1]),
-            "receipt-for-another-offered-item": lambda request, matches: set_line(request, selection_receipt=next(
-                match["selection_receipt"] for key, match in matches.items() if key != self.OWNER_HISTORICAL_SELECTION)),
-            "replayed-from-another-quote": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, session_id="quote-another-quote")),
-            "issued-to-another-signed-in-user": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, auth_session=other_scope)),
-            "stale-reference-digest": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, digest="sha256:" + "0" * 64)),
-            "issued-for-other-row-wording": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, description="Synthetic carpet tile in the meeting room")),
-            "issued-for-other-quantity": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, quantity=3)),
-            "changed-quantity-after-offer": lambda request, matches: (set_line(request, quantity=3), request["line_items"][0].update(quantity=3)),
-            "changed-unit": lambda request, matches: set_line(request, unit="nos"),
-            "duplicate-source-row": lambda request, matches: request["line_items"].append(copy.deepcopy(request["line_items"][0])),
-            "duplicate-basis-line": lambda request, matches: request["quote_basis_sections"][0]["lines"].append(copy.deepcopy(next(
-                line for section in request["quote_basis_sections"] for line in section["lines"] if line.get("id") == "carpet-row"))),
-            "competing-family-detail": lambda request, matches: set_line(request, text="[ " + matches[self.OWNER_HISTORICAL_SELECTION]["description"] + " ] - Synthetic vinyl floor finish"),
-            "review-only-custom": lambda request, matches: set_line(request, tag="Custom", custom_pricing=True),
-            "confirm-not-include": lambda request, matches: set_line(request, tag="Confirm"),
-            "invalid-historical-authority": lambda request, matches: request["line_items"][0]["pricing_authority"]["context"].update(source_basis_line_id="another-row"),
-            "row-still-claims-catalogue": lambda request, matches: request["line_items"][0].update(pricing_keyword=self.OWNER_HISTORICAL_CLAIM),
-            "trusted-authority-forged": lambda request, matches: request["line_items"][0].update(pricing_authority={
-                **request["line_items"][0]["pricing_authority"], "variant": "catalog"}),
-        }
-        for owned in (False, True):
-            for label, mutate in cases.items():
-                with self.subTest(owned=owned, case=label):
-                    request, matches = self._owner_historical_selection(owned)
-                    mutate(request, matches)
-                    resync(request)
-                    rows = webapp.normalize_line_items_for_quote_basis_review(request)
-                    self.assertFalse(any(row.get("pricing_authority", {}).get("variant") == "catalog" for row in rows), label)
-                    self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows), label)
+    @staticmethod
+    def _ledger_price(rows, row_id):
+        matches = [row for row in rows if row.get("source_basis_line_id") == row_id]
+        if len(matches) != 1:
+            return None
+        authority = matches[0].get("pricing_authority") or {}
+        return authority.get("price") if authority.get("variant") == "catalog" else None
 
-    def test_owner_uat_selection_never_rereads_measured_quantities_across_dimensions(self):
-        for row_unit, catalog_unit, conflict in (("m", "sqm", True), ("m length", "sqm", True), ("sqm", "m length", True),
-                                                 ("lot", "sqm", False), ("nos", "sqm", False), ("sqm", "sqm", False),
-                                                 ("m run", "m length", False), ("", "sqm", False)):
-            self.assertEqual(webapp.pricing_units_measure_conflict(row_unit, catalog_unit), conflict, (row_unit, catalog_unit))
-        for owned in (False, True):
-            with self.subTest(owned=owned, path="none"):
-                payload, _ = self._owner_possible_match_payload(owned, "Grey loop pile across reception zone", row_unit="m")
-                rows = webapp.normalize_line_items_for_quote_basis_review(payload)
-                self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows))
-            with self.subTest(owned=owned, path="historical"):
-                request, _ = self._owner_historical_selection(owned, unit="m")
-                rows = webapp.normalize_line_items_for_quote_basis_review(request)
-                self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows))
+    def _ledger_normalize(self, runner, headers, request):
+        response = self._ledger_post(runner, headers, "/api/line-items/normalize", request)
+        self.assertEqual(response["status"], 200, response["text"][-800:])
+        return response["body"]["line_items"]
+
+    def _ledger_brief_rows(self, request):
+        # The exact normaliser that feeds /api/generate and the XLSX generator.
+        return webapp.normalize_line_items_for_final_brief(copy.deepcopy(request))
+
+    def _ledger_env(self):
+        return {"APP_MODE": "local", "USER_TYPE": "operator", "SQAG_STORAGE_MODE": "local"}
+
+    def _historical_carpet_quote(self, *, unit="sqm", session_id=LEDGER_SESSION):
+        request, draft = self._ledger_analysis(
+            [("carpet-row", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, unit,
+              self.OWNER_HISTORICAL_CLAIM)], session_id=session_id)
+        [row] = request["line_items"]
+        self.assertEqual(row["pricing_authority"]["variant"], "historical")
+        return request
+
+    def test_ledger_selection_route_has_its_own_rate_limit(self):
+        self.assertEqual(webapp.rate_limit_path_key("/api/quote-sessions/pricing-selections"), "/api/quote-sessions/pricing-selections")
+        self.assertEqual(webapp.POST_RATE_LIMITS["/api/quote-sessions/pricing-selections"], 30)
+        self.assertEqual(webapp.rate_limit_path_key("/api/quote-sessions/quote-abc123"), "/api/quote-sessions/:id")
+
+    def test_ledger_units_share_quantity_basis_only_for_one_to_one_aliases(self):
+        compatible = [("sqm", "sqm"), ("m2", "sqm"), ("nos", "nos"), ("pcs", "nos"), ("piece", "nos"),
+                      ("m", "m length"), ("m run", "m length"), ("m", "m"), ("sets", "sets"), ("lot", "lot")]
+        incompatible = [("pcs", "sets"), ("nos", "sets"), ("nos", "sqm"), ("pcs", "sqm"), ("lot", "sqm"),
+                        ("lot", "nos"), ("sets", "lot"), ("m", "sqm"), ("m length", "sqm"), ("sqm", "m length"),
+                        ("", "sqm"), ("sqm", ""), ("roll", "sqm"), ("nos", "lot")]
+        for source, catalogue in compatible:
+            self.assertTrue(webapp.pricing_units_share_quantity_basis(source, catalogue), (source, catalogue))
+        for source, catalogue in incompatible:
+            self.assertFalse(webapp.pricing_units_share_quantity_basis(source, catalogue), (source, catalogue))
+
+    def test_ledger_m1_forged_historical_authority_never_prices_without_server_selection(self):
+        # M1 and the same-root self-built authority: no request JSON can turn a rejected row into a catalogue price.
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        lookup = webapp.pricing_catalog_runtime_lookup_for_payload(valid_payload(), "synthetic-exhibition-fixture-template")
+
+        def forge(request, case):
+            row = request["line_items"][0]
+            if case == "variant-flipped-to-none":
+                row["pricing_authority"] = {**row["pricing_authority"], "variant": "none"}
+            elif case == "authority-deleted":
+                row.pop("pricing_authority")
+            elif case == "self-built-catalogue-authority":
+                reference = webapp.exact_pricing_reference_authority(request)
+                row.update(pricing_keyword=self.LEDGER_CARPET, unit="sqm", status="matched")
+                row["pricing_authority"] = webapp.build_pricing_authority(
+                    "catalog", row, price=price, reference_authority=reference, catalog_item=lookup[self.LEDGER_CARPET])
+            return self._ledger_sync(request)
+
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for saved in (False, True):
+                for case in ("variant-flipped-to-none", "authority-deleted", "self-built-catalogue-authority"):
+                    with self.subTest(saved=saved, case=case):
+                        request = self._historical_carpet_quote(session_id=f"quote-ledger-m1-{int(saved)}-{case}")
+                        if saved:
+                            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+                        self._ledger_click(request, "carpet-row", self.LEDGER_CARPET)
+                        forge(request, case)
+                        self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
+                        self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "carpet-row"))
+                        # The pre-commercial review shape (no saved draft carried) re-derives basis matches itself.
+                        review_shape = copy.deepcopy(request)
+                        review_shape["quote_session"].pop("draft_state")
+                        self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, review_shape), "carpet-row"))
+                        self.assertIsNone(self._ledger_price(self._ledger_brief_rows(review_shape), "carpet-row"))
+
+    def test_ledger_fresh_selection_prices_unsaved_and_saved_reopened_quotes(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for saved in (False, True):
+                with self.subTest(saved=saved):
+                    request = self._historical_carpet_quote(session_id=f"quote-ledger-fresh-{int(saved)}")
+                    revision = 0
+                    if saved:
+                        saved_response = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+                        self.assertEqual(saved_response["status"], 200)
+                        revision = self._ledger_revision(saved_response, "carpet-row")
+                        self.assertGreater(revision, 0)
+                        reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{request['quote_session']['session_id']}")
+                        self.assertEqual(reopened["body"]["quote_session"]["pricing_ledger"]["rows"]["carpet-row"], revision)
+                        # Clients see row revisions only, never the server's grants.
+                        self.assertEqual(set(reopened["body"]["quote_session"]["pricing_ledger"]), {"revision", "rows"})
+                        self.assertNotIn('"grant"', reopened["text"])
+                    self._ledger_click(request, "carpet-row", self.LEDGER_CARPET)
+                    # Before the server records the operator's selection, the click alone never prices.
+                    self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
+                    selected = self._ledger_select(runner, headers, request, "carpet-row", self.LEDGER_CARPET, revision)
+                    self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                    self.assertEqual(selected["body"]["selections"], [{"source_basis_line_id": "carpet-row", "status": "selected"}])
+                    self.assertEqual(self._ledger_price(selected["body"]["line_items"], "carpet-row"), price)
+                    self.assertNotIn("selection_receipt", selected["text"])
+                    self.assertNotIn("pricing_analysis_seal", selected["text"])
+                    rows = self._ledger_normalize(runner, headers, request)
+                    self.assertEqual(self._ledger_price(rows, "carpet-row"), price)
+                    [row] = [row for row in rows if row["source_basis_line_id"] == "carpet-row"]
+                    self.assertEqual(row["unit"], "sqm")
+                    self.assertEqual(row["pricing_basis_amount"], webapp.round_commercial_cents(2 * price))
+                    # The confirmed rows, saved and reopened, still price at generation; same-unit quantity edits re-price.
+                    request["line_items"] = rows
+                    self._ledger_sync(request)
+                    self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "carpet-row"), price)
+                    request["line_items"][0]["quantity"] = 5
+                    self._ledger_line(request, "carpet-row")["quantity"] = 5
+                    self._ledger_sync(request)
+                    self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+                    [brief_row] = self._ledger_brief_rows(request)
+                    self.assertEqual(brief_row["pricing_authority"]["price"], price)
+                    self.assertEqual(brief_row["pricing_basis_amount"], webapp.round_commercial_cents(5 * price))
+
+    def test_ledger_m2_saved_exclusion_replacement_and_replay_never_revive_a_selection(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        vinyl = "synthetic-floors-synthetic-vinyl-floor-finish"
+
+        def exclude(request):
+            self._ledger_line(request, "carpet-row")["tag"] = "Exclude"
+
+        def replace(request):
+            self._ledger_click(request, "carpet-row", vinyl)
+
+        def remove(request):
+            request["line_items"] = []
+
+        def unit_change(request):
+            request["line_items"][0]["unit"] = "nos"
+            self._ledger_line(request, "carpet-row")["unit"] = "nos"
+
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for label, supersede in (("exclude", exclude), ("replacement", replace), ("row-removed", remove), ("unit-changed", unit_change)):
+                with self.subTest(change=label):
+                    request = self._historical_carpet_quote(session_id=f"quote-ledger-m2-{label}")
+                    self._ledger_click(request, "carpet-row", self.LEDGER_CARPET)
+                    selection_request = copy.deepcopy(request)
+                    selected = self._ledger_select(runner, headers, request, "carpet-row", self.LEDGER_CARPET, 0)
+                    self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                    granted_revision = self._ledger_revision(selected, "carpet-row")
+                    self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"), price)
+                    changed = copy.deepcopy(request)
+                    supersede(changed)
+                    self._ledger_sync(changed)
+                    self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", changed)["status"], 200)
+                    # The old browser state and the old selection request are both stale now.
+                    self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, selection_request), "carpet-row"))
+                    self.assertIsNone(self._ledger_price(self._ledger_brief_rows(selection_request), "carpet-row"))
+                    replay = self._ledger_select(runner, headers, selection_request, "carpet-row", self.LEDGER_CARPET, granted_revision)
+                    self.assertEqual(replay["status"], 409, replay["text"][-800:])
+                    self.assertNotIn("line_items", replay["body"])
+                    self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, selection_request), "carpet-row"))
+
+    def test_ledger_concurrent_tabs_and_stale_revisions_fail_closed(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            base = self._historical_carpet_quote(session_id="quote-ledger-tabs")
+            saved = self._ledger_post(runner, headers, "/api/quote-sessions", base)
+            revision = self._ledger_revision(saved, "carpet-row")
+            tab_a = self._ledger_click(copy.deepcopy(base), "carpet-row", self.LEDGER_CARPET)
+            tab_b = copy.deepcopy(base)
+            self._ledger_line(tab_b, "carpet-row")["tag"] = "Exclude"
+            self._ledger_sync(tab_b)
+            # Tab B saves its Exclude first; tab A's selection was made against the older row revision.
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", tab_b)["status"], 200)
+            stale = self._ledger_select(runner, headers, tab_a, "carpet-row", self.LEDGER_CARPET, revision)
+            self.assertEqual(stale["status"], 409)
+            self.assertEqual(stale["body"]["selections"], [{"source_basis_line_id": "carpet-row", "status": "refused", "reason": "stale"}])
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, tab_a), "carpet-row"))
+            # A selection made on the current revision succeeds; a stale tab saving afterwards supersedes it.
+            current = self.http_json(runner, "GET", "/api/quote-sessions/quote-ledger-tabs")["body"]["quote_session"]
+            fresh = self._ledger_select(runner, headers, tab_a, "carpet-row", self.LEDGER_CARPET,
+                                        current["pricing_ledger"]["rows"]["carpet-row"])
+            self.assertEqual(fresh["status"], 200, fresh["text"][-800:])
+            self.assertEqual(self._ledger_price(fresh["body"]["line_items"], "carpet-row"), price)
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", tab_b)["status"], 200)
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, tab_a), "carpet-row"))
+            # Concurrent selections against one revision: exactly one commits.
+            racing = self._historical_carpet_quote(session_id="quote-ledger-race")
+            self._ledger_click(racing, "carpet-row", self.LEDGER_CARPET)
+            race_revision = self._ledger_revision(self._ledger_post(runner, headers, "/api/quote-sessions", racing), "carpet-row")
+            statuses = []
+            threads = [threading.Thread(target=lambda: statuses.append(
+                self._ledger_select(runner, headers, racing, "carpet-row", self.LEDGER_CARPET, race_revision)["status"]))
+                for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+            self.assertEqual(sorted(statuses), [200, 409, 409, 409])
+
+    def test_ledger_m3_incompatible_units_stay_unpriced_and_same_basis_controls_price(self):
+        cases = [
+            # (label, section, text, quantity, row unit, catalogue id, priced?)
+            ("pcs-to-sets", "Graphics", "Synthetic backlit letters for the fascia", 10, "pcs", "synthetic-graphics-synthetic-backlit-letters", False),
+            ("nos-to-sqm", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "nos", self.LEDGER_CARPET, False),
+            ("pcs-to-sqm", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "pcs", self.LEDGER_CARPET, False),
+            ("lot-to-sqm", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 1, "lot", self.LEDGER_CARPET, False),
+            ("m-to-sqm", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 6, "m", self.LEDGER_CARPET, False),
+            ("sets-to-sets", "Graphics", "Synthetic backlit letters for the fascia", 2, "sets", "synthetic-graphics-synthetic-backlit-letters", True),
+            ("sqm-to-sqm", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "sqm", self.LEDGER_CARPET, True),
+            ("m-to-m-length", "Floors", "Synthetic floor trim along the booth edge", 6, "m", "synthetic-floors-synthetic-floor-trim", True),
+            ("pcs-to-nos", "Structures", "Synthetic rigging point above the stand", 3, "pcs", "synthetic-structures-synthetic-rigging-point", True),
+        ]
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for label, section, text, quantity, unit, item_id, priced in cases:
+                with self.subTest(case=label):
+                    request, _ = self._ledger_analysis([("unit-row", section, text, quantity, unit, None)],
+                                                       session_id=f"quote-ledger-m3-{label}")
+                    self._ledger_click(request, "unit-row", item_id)
+                    selected = self._ledger_select(runner, headers, request, "unit-row", item_id, 0)
+                    self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                    expected = koncept_catalog_sale_unit_price(item_id) if priced else None
+                    status = {"source_basis_line_id": "unit-row", "status": "selected"} if priced else {
+                        "source_basis_line_id": "unit-row", "status": "refused", "reason": "unit_review_required"}
+                    self.assertEqual(selected["body"]["selections"], [status])
+                    self.assertEqual(self._ledger_price(selected["body"]["line_items"], "unit-row"), expected)
+                    rows = self._ledger_normalize(runner, headers, request)
+                    self.assertEqual(self._ledger_price(rows, "unit-row"), expected)
+                    confirmed = self._ledger_sync({**copy.deepcopy(request), "line_items": copy.deepcopy(rows)})
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(confirmed), "unit-row"), expected)
+                    if priced:
+                        [row] = rows
+                        self.assertEqual(row["pricing_basis_amount"], webapp.round_commercial_cents(quantity * expected))
+
+    def test_ledger_m3_analysis_claims_in_incompatible_units_never_price(self):
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            request, draft = self._ledger_analysis([
+                ("letters-row", "Graphics", "Synthetic backlit letters for the fascia", 10, "pcs", "synthetic-graphics-synthetic-backlit-letters"),
+                ("carpet-row", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "sqm", self.LEDGER_CARPET),
+            ], session_id="quote-ledger-m3-analysis")
+            rows = self._ledger_normalize(runner, headers, request)
+            self.assertIsNone(self._ledger_price(rows, "letters-row"))
+            self.assertEqual(self._ledger_price(rows, "carpet-row"), koncept_catalog_sale_unit_price(self.LEDGER_CARPET))
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "letters-row"))
+
+    def test_ledger_analysis_matches_price_through_the_server_seal_only(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            request, draft = self._ledger_analysis([
+                ("carpet-row", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "sqm", self.LEDGER_CARPET),
+            ], session_id="quote-ledger-seal")
+            seal = draft["pricing_analysis_seal"]
+            self.assertEqual(seal["session_id"], "quote-ledger-seal")
+            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"), price)
+            unsealed = copy.deepcopy(request)
+            unsealed.pop("pricing_analysis_seal")
+            unsealed["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, unsealed), "carpet-row"))
+            tampered = copy.deepcopy(request)
+            tampered["pricing_analysis_seal"]["rows"][0]["catalog_item_id"] = "synthetic-floors-synthetic-raised-deck-panel"
+            tampered["quote_session"]["draft_state"]["originalAnalysisSnapshot"]["pricing_analysis_seal"] = tampered["pricing_analysis_seal"]
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, tampered), "carpet-row"))
+            other_quote = copy.deepcopy(request)
+            other_quote["quote_session"]["session_id"] = "quote-ledger-other"
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, other_quote), "carpet-row"))
+            # Once saved, the server ledger holds the grant: it survives reopen without the seal...
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, unsealed), "carpet-row"), price)
+            # ...and a saved Exclude is never undone by replaying the analysis seal.
+            excluded = copy.deepcopy(request)
+            self._ledger_line(excluded, "carpet-row")["tag"] = "Exclude"
+            self._ledger_sync(excluded)
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", excluded)["status"], 200)
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "carpet-row"))
+
+    def test_ledger_selection_refuses_ineligible_contradicting_and_unknown_items(self):
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            cases = {
+                "not-included": (lambda request: self._ledger_line(request, "carpet-row").update(tag="Confirm"), self.LEDGER_CARPET, "ineligible"),
+                "custom-pricing": (lambda request: self._ledger_line(request, "carpet-row").update(tag="Custom", custom_pricing=True), self.LEDGER_CARPET, "ineligible"),
+                "line-bound-elsewhere": (lambda request: None, "synthetic-floors-synthetic-raised-deck-panel", "ineligible"),
+                "unknown-item": (lambda request: self._ledger_line(request, "carpet-row").update(pricing_keyword="synthetic-unknown"), "synthetic-unknown", "not_in_catalogue"),
+                "competing-family": (lambda request: self._ledger_line(request, "carpet-row").update(
+                    text="[ synthetic carpet tile ] - Synthetic vinyl floor finish"), self.LEDGER_CARPET, "contradiction"),
+                "duplicate-row": (lambda request: request["line_items"].append(copy.deepcopy(request["line_items"][0])), self.LEDGER_CARPET, "ineligible"),
+            }
+            for label, (mutate, item_id, reason) in cases.items():
+                with self.subTest(case=label):
+                    request = self._historical_carpet_quote(session_id=f"quote-ledger-refuse-{label}")
+                    self._ledger_click(request, "carpet-row", self.LEDGER_CARPET)
+                    mutate(request)
+                    self._ledger_sync(request)
+                    selected = self._ledger_select(runner, headers, request, "carpet-row", item_id, 0)
+                    self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                    self.assertEqual(selected["body"]["selections"], [
+                        {"source_basis_line_id": "carpet-row", "status": "refused", "reason": reason}])
+                    self.assertFalse(any(self._ledger_price([row], "carpet-row") for row in selected["body"]["line_items"]))
+            for invalid in ([], [{"source_basis_line_id": "carpet-row"}], [{"source_basis_line_id": "carpet-row", "catalog_item_id": self.LEDGER_CARPET, "expected_revision": -1}],
+                            [{"source_basis_line_id": "carpet-row", "catalog_item_id": self.LEDGER_CARPET, "expected_revision": True}]):
+                request = self._historical_carpet_quote(session_id="quote-ledger-invalid")
+                response = self._ledger_post(runner, headers, "/api/quote-sessions/pricing-selections", {**request, "pricing_selections": invalid})
+                self.assertEqual(response["status"], 400, invalid)
+            no_session = self._historical_carpet_quote()
+            no_session["quote_session"].pop("session_id")
+            response = self._ledger_select(runner, headers, no_session, "carpet-row", self.LEDGER_CARPET, 0)
+            self.assertEqual(response["status"], 400)
+
+    def test_ledger_interrupted_selection_commit_fails_closed_and_retries_cleanly(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            request = self._historical_carpet_quote(session_id="quote-ledger-interrupted")
+            self._ledger_click(request, "carpet-row", self.LEDGER_CARPET)
+            with mock.patch.object(webapp, "write_quote_session_pricing_ledger", side_effect=OSError("synthetic disk failure")):
+                failed = self._ledger_select(runner, headers, request, "carpet-row", self.LEDGER_CARPET, 0)
+            self.assertEqual(failed["status"], 500)
+            self.assertRegex(failed["text"], r"ERR-[0-9A-F]{8}")
+            self.assertNotIn("synthetic disk failure", failed["text"])
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
+            current = self.http_json(runner, "GET", "/api/quote-sessions/quote-ledger-interrupted")["body"]["quote_session"]
+            retried = self._ledger_select(runner, headers, request, "carpet-row", self.LEDGER_CARPET,
+                                          current["pricing_ledger"]["rows"]["carpet-row"])
+            self.assertEqual(retried["status"], 200, retried["text"][-800:])
+            self.assertEqual(self._ledger_price(retried["body"]["line_items"], "carpet-row"), price)
+
+    def test_ledger_legacy_saved_quotes_keep_persisted_prices_and_never_promote_historical_rows(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            priced, _ = self._ledger_analysis([
+                ("carpet-row", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "sqm", self.LEDGER_CARPET),
+            ], session_id="quote-ledger-legacy")
+            historical = self._historical_carpet_quote(session_id="quote-ledger-legacy-historical")
+            for request in (priced, historical):
+                self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+                # A quote saved before the ledger existed has no ledger key.
+                metadata = webapp.read_quote_session_metadata(request["quote_session"]["session_id"])
+                metadata.pop("pricing_ledger", None)
+                webapp.write_quote_session_metadata(metadata)
+                request.pop("pricing_analysis_seal", None)
+                request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal", None)
+            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, priced), "carpet-row"), price)
+            self._ledger_click(historical, "carpet-row", self.LEDGER_CARPET)
+            for case in ("variant-flipped-to-none", "click-only"):
+                attempt = copy.deepcopy(historical)
+                if case == "variant-flipped-to-none":
+                    row = attempt["line_items"][0]
+                    row["pricing_authority"] = {**row["pricing_authority"], "variant": "none"}
+                    self._ledger_sync(attempt)
+                self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, attempt), "carpet-row"), case)
+            # A fresh, server-recorded selection on the legacy HISTORICAL row prices from the current catalogue.
+            selected = self._ledger_select(runner, headers, historical, "carpet-row", self.LEDGER_CARPET, 0)
+            self.assertEqual(selected["status"], 409)
+            current = self.http_json(runner, "GET", "/api/quote-sessions/quote-ledger-legacy-historical")["body"]["quote_session"]
+            selected = self._ledger_select(runner, headers, historical, "carpet-row", self.LEDGER_CARPET,
+                                           current["pricing_ledger"]["rows"]["carpet-row"])
+            self.assertEqual(selected["status"], 200, selected["text"][-800:])
+            self.assertEqual(self._ledger_price(selected["body"]["line_items"], "carpet-row"), price)
+
+    def test_ledger_manual_and_included_overrides_stay_authoritative_and_restore_reference_price(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            request, _ = self._ledger_analysis([
+                ("carpet-row", "Floors", "Synthetic carpet tile flooring across the full booth footprint", 2, "sqm", self.LEDGER_CARPET),
+            ], session_id="quote-ledger-overrides")
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+            catalogue_row = copy.deepcopy(request["line_items"][0])
+            reference = webapp.exact_pricing_reference_authority(request)
+            for variant, expected in (("manual", 17.0), ("included", 0.0)):
+                with self.subTest(variant=variant):
+                    override = copy.deepcopy(request)
+                    row = override["line_items"][0]
+                    row["pricing_authority"] = webapp.build_pricing_authority(variant, row, price=17, reference_authority=reference)
+                    if variant == "included":
+                        row.update(price_mode="Included", display_price="Included")
+                    self._ledger_sync(override)
+                    self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", override)["status"], 200)
+                    [brief_row] = self._ledger_brief_rows(override)
+                    self.assertEqual(brief_row["pricing_authority"]["variant"], variant)
+                    self.assertEqual(brief_row["pricing_authority"]["price"], expected)
+                    # Use Reference Price restores the current, server-granted catalogue binding.
+                    restored = copy.deepcopy(override)
+                    restored["line_items"][0] = copy.deepcopy(catalogue_row)
+                    self._ledger_sync(restored)
+                    self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", restored)["status"], 200)
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(restored), "carpet-row"), price)
+
+    def test_ledger_generator_refuses_catalogue_rows_in_another_quantity_basis(self):
+        import generate_quote as quote_generator
+
+        letters = "synthetic-graphics-synthetic-backlit-letters"
+        payload = valid_payload()
+        payload["line_items"] = [{"section": "Graphics", "quantity": 10, "unit": "sets", "description": "Synthetic backlit letters",
+                                  "pricing_keyword": letters, "source_basis_line_id": "letters-row"}]
+        with_server_analysis_seal(payload)
+        brief = webapp.payload_to_brief(payload)
+        [row] = brief["line_items"]
+        self.assertEqual(row["pricing_authority"]["variant"], "catalog")
+        catalog = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))
+        items = catalog["items"] if isinstance(catalog, dict) else catalog
+        digest = brief["_pricing_reference_authority"]["digest"]
+        price_rows = [quote_generator.PriceRow(row_number=index, section=item["section"], description=item["description"],
+                                               unit_hint=webapp.catalog_item_unit_hint(item), cost=webapp.pricing_reference_sale_unit_price(item),
+                                               gst_multiplier=1.09, markup=1, remark="", pricing_id=item["id"], aliases=[],
+                                               catalog_digest=digest, catalog_currency="SGD")
+                      for index, item in enumerate(items, start=1)]
+
+        def generated(unit):
+            candidate = copy.deepcopy(brief)
+            candidate["line_items"][0]["unit"] = unit
+            candidate["line_items"][0]["pricing_authority"]["context"]["unit"] = webapp.canonical_pricing_authority_unit(unit)
+            [line] = quote_generator.prepare_lines(candidate, price_rows, allow_ambiguous=True, authority_required=True,
+                                                   trusted_pricing_reference=candidate["_pricing_reference_authority"])
+            return line
+
+        self.assertEqual(generated("sets").match_status, "matched")
+        self.assertEqual(generated("sets").amount, webapp.round_commercial_cents(10 * koncept_catalog_sale_unit_price(letters)))
+        # Defence in depth: a brief that reached the generator with 10 pieces never prices them as 10 sets.
+        for unit in ("pcs", "nos", "sqm", "lot", ""):
+            with self.subTest(unit=unit):
+                line = generated(unit)
+                self.assertEqual(line.match_status, "unmatched")
+                self.assertIsNone(line.amount)
+
+    def test_ledger_forged_catalogue_row_never_reaches_a_priced_workbook(self):
+        payload = valid_payload()
+        reference = webapp.exact_pricing_reference_authority(payload)
+        lookup = webapp.pricing_catalog_runtime_lookup_for_payload(payload, payload["profile_id"])
+        row = {"section": "Floors", "quantity": 2, "unit": "sqm", "description": "Synthetic carpet tile flooring",
+               "pricing_keyword": self.LEDGER_CARPET, "source_basis_line_id": "forged-row"}
+        row["pricing_authority"] = webapp.build_pricing_authority(
+            "catalog", row, price=koncept_catalog_sale_unit_price(self.LEDGER_CARPET), reference_authority=reference,
+            catalog_item=lookup[self.LEDGER_CARPET])
+        payload["line_items"] = [row]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = webapp.run_quote_job(payload, output_root=Path(tmp) / "out", tmp_root=Path(tmp) / "tmp")
+        self.assertNotEqual(result["status"], "completed")
+        self.assertEqual([match["status"] for match in result["pricing_matches"]], ["unmatched"])
+        self.assertFalse(any(item.get("name") == "quotation.xlsx" for item in result.get("files") or []))
+
+    def test_ledger_database_sessions_isolate_users_workspaces_and_quotes(self):
+        catalog = json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8"))
+        items = catalog["items"] if isinstance(catalog, dict) else catalog
+        carpet_text = "Synthetic carpet tile flooring across the full booth footprint"
+        with tempfile.TemporaryDirectory() as tmp:
+            database_url = f"sqlite:///{(Path(tmp) / 'sqag-ledger.sqlite3').as_posix()}"
+            env = {"APP_MODE": "local", "USER_TYPE": "admin", "SESSION_SECRET": "test-session-secret-ledger-isolation",
+                   "SQAG_STORAGE_MODE": "database", "SQAG_DATABASE_URL": database_url, "QUOTE_DATA_ROOT": str(Path(tmp) / "data")}
+            owner = self.platform_auth_session("workspace-ledger", membership_role="operator", user_id="ledger-owner")
+            colleague = self.platform_auth_session("workspace-ledger", membership_role="operator", user_id="ledger-colleague")
+            outsider = self.platform_auth_session("workspace-ledger-other", membership_role="admin", user_id="ledger-owner")
+
+            def headers(session):
+                cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(session)}"
+                return {"Cookie": cookie, webapp.configured_csrf_header_name(): webapp.csrf_token_for_cookie_header(cookie)}
+
+            with mock.patch.dict(os.environ, env, clear=True):
+                webapp.apply_sqag_storage_migrations(database_url)
+                for workspace in ("workspace-ledger", "workspace-ledger-other"):
+                    webapp.app_storage_for_auth_session(self.platform_auth_session(workspace, membership_role="admin", user_id="ledger-admin")).save_pricing_reference(
+                        webapp.normalize_pricing_reference_payload({"id": "ledger-db-pricing", "label": "Ledger DB Pricing",
+                                                                     "currency": "SGD", "items": copy.deepcopy(items)}))
+                owner_storage = webapp.app_storage_for_auth_session(owner)
+                detail = owner_storage.pricing_reference_detail("ledger-db-pricing", source="company")
+                basis = {"currency": "SGD", "source": "company", "id": "ledger-db-pricing", "digest": detail["digest_sha256"]}
+                base = valid_payload()
+                base.update(pricing_reference_id="ledger-db-pricing", pricing_reference_source="company",
+                            pricing_reference={"id": "ledger-db-pricing", "source": "company", "currency": "SGD"})
+                request, draft = self._ledger_analysis([
+                    ("carpet-row", "Floors", carpet_text, 2, "sqm", self.OWNER_HISTORICAL_CLAIM),
+                    ("matched-row", "Floors", carpet_text, 3, "sqm", self.LEDGER_CARPET),
+                ], session_id="quote-ledger-db", auth_session=owner, payload=base)
+                self.assertIsNotNone(draft.get("pricing_analysis_seal"))
+                request["quote_session"]["draft_state"].pop("quoteDetails")
+                line = self._ledger_line(request, "carpet-row")
+                line.update(tag="Include", text="[ synthetic carpet tile ] - " + carpet_text, unit="sqm", pricing_keyword=self.LEDGER_CARPET)
+                for key in ("custom_pricing", "custom_confirmed", "possible_pricing_matches"):
+                    line.pop(key, None)
+                self._ledger_sync(request, pricing_basis=basis)
+                lookup = webapp.pricing_catalog_runtime_lookup_for_payload(request, request["profile_id"], auth_session=owner)
+                price = webapp.pricing_reference_sale_unit_price(lookup[self.LEDGER_CARPET])
+                with LocalRunnerServer() as runner:
+                    def post(session, path, body):
+                        self.reset_rate_limit_state()
+                        return self.http_json(runner, "POST", path, body=copy.deepcopy(body), headers=headers(session))
+
+                    def select(session, body, revision):
+                        return post(session, "/api/quote-sessions/pricing-selections", {**body, "pricing_selections": [
+                            {"source_basis_line_id": "carpet-row", "catalog_item_id": self.LEDGER_CARPET, "expected_revision": revision}]})
+
+                    selected = select(owner, request, 0)
+                    self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                    self.assertEqual(self._ledger_price(selected["body"]["line_items"], "carpet-row"), price)
+                    self.assertEqual(self._ledger_price(selected["body"]["line_items"], "matched-row"), price)
+                    owner_ledger = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")[0]["pricing_ledger"]
+                    # Another user in the same workspace cannot use or change the owner's grants.
+                    colleague_rows = post(colleague, "/api/line-items/normalize", request)
+                    self.assertEqual(colleague_rows["status"], 200, colleague_rows["text"][-800:])
+                    self.assertIsNone(self._ledger_price(colleague_rows["body"]["line_items"], "carpet-row"))
+                    self.assertIsNone(self._ledger_price(colleague_rows["body"]["line_items"], "matched-row"))
+                    revision = selected["body"]["quote_session"]["pricing_ledger"]["rows"]["carpet-row"]
+                    self.assertEqual(select(colleague, request, revision)["status"], 403)
+                    # Another workspace sees no ledger for the same quote id, and the owner's seal is not valid there.
+                    outside_rows = post(outsider, "/api/line-items/normalize", request)
+                    self.assertEqual(outside_rows["status"], 200, outside_rows["text"][-800:])
+                    self.assertIsNone(self._ledger_price(outside_rows["body"]["line_items"], "carpet-row"))
+                    self.assertIsNone(self._ledger_price(outside_rows["body"]["line_items"], "matched-row"))
+                    # The owner's analysis seal replayed into another quote prices nothing.
+                    replayed = copy.deepcopy(request)
+                    replayed["quote_session"]["session_id"] = "quote-ledger-db-copy"
+                    copied_rows = post(owner, "/api/line-items/normalize", replayed)
+                    self.assertEqual(copied_rows["status"], 200, copied_rows["text"][-800:])
+                    self.assertIsNone(self._ledger_price(copied_rows["body"]["line_items"], "matched-row"))
+                    self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")[0]["pricing_ledger"], owner_ledger)
+                    # Two authenticated tabs of the owner race one selection on a fresh row revision: exactly one commits.
+                    race = copy.deepcopy(request)
+                    race["quote_session"]["session_id"] = "quote-ledger-db-race"
+                    race_saved = post(owner, "/api/quote-sessions", race)
+                    self.assertEqual(race_saved["status"], 200, race_saved["text"][-800:])
+                    race_revision = race_saved["body"]["quote_session"]["pricing_ledger"]["rows"]["carpet-row"]
+                    statuses = []
+
+                    def race_select():
+                        response = self.http_json(runner, "POST", "/api/quote-sessions/pricing-selections", body={
+                            **copy.deepcopy(race), "pricing_selections": [{"source_basis_line_id": "carpet-row",
+                                "catalog_item_id": self.LEDGER_CARPET, "expected_revision": race_revision}]}, headers=headers(owner))
+                        statuses.append(response["status"])
+
+                    self.reset_rate_limit_state()
+                    racers = [threading.Thread(target=race_select) for _ in range(4)]
+                    for racer in racers:
+                        racer.start()
+                    for racer in racers:
+                        racer.join(timeout=30)
+                    self.assertEqual(sorted(statuses), [200, 409, 409, 409])
+                    # The owner's grants persist in the database and price the final brief; the colleague's do not exist.
+                    confirmed = self._ledger_sync({**copy.deepcopy(request), "line_items": selected["body"]["line_items"]}, pricing_basis=basis)
+                    self.assertEqual(self._ledger_price(webapp.normalize_line_items_for_final_brief(copy.deepcopy(confirmed), auth_session=owner), "carpet-row"), price)
+                    self.assertIsNone(self._ledger_price(webapp.normalize_line_items_for_final_brief(copy.deepcopy(confirmed), auth_session=colleague), "carpet-row"))
+                # A ledger commit against changed metadata is refused (database compare-and-swap).
+                persisted = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")[0]
+                stale = webapp.normalized_quote_session_metadata({**persisted, "updated_at": "2000-01-01T00:00:00Z"})
+                with self.assertRaises(webapp.PricingSelectionConflict):
+                    webapp.write_quote_session_pricing_ledger(owner_storage, "quote-ledger-db", stale, webapp.empty_pricing_ledger("new"))
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")[0]["pricing_ledger"], owner_ledger)
 
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {
@@ -42067,6 +42659,7 @@ main().catch((error) => {
                 "source_basis_line_id": "stale-chair-copy",
             }],
         }
+        with_server_analysis_seal(payload)
 
         items = webapp.normalize_line_items_for_quote_basis_review(payload)
 
@@ -45477,7 +46070,8 @@ process.stdout.write("ok");
         self.assertEqual(owned_rejection["status"], "unmatched")
         self.assertNotIn("effective_unit_price", owned_rejection)
         negative_payload["line_items"] = [owned_rejection]
-        negative_brief = webapp.payload_to_brief(negative_payload)
+        with pre_ledger_grants_for(negative_payload):
+            negative_brief = webapp.payload_to_brief(negative_payload)
         self.assertIs(negative_brief["_pricing_authority_enforced"], True)
 
         def generator_rows(brief, catalog_items=None):
@@ -45663,7 +46257,8 @@ process.stdout.write("ok");
                     trusted_pricing_reference=raw_brief["_pricing_reference_authority"],
                 ))
                 payload["line_items"] = [rebound]
-                owned_brief = webapp.payload_to_brief(payload)
+                with pre_ledger_grants_for(payload):
+                    owned_brief = webapp.payload_to_brief(payload)
                 assert_residual_unpriced(quote_generator.prepare_lines(
                     owned_brief,
                     generator_rows(owned_brief, residual_items),
@@ -45698,6 +46293,7 @@ process.stdout.write("ok");
                     "description": description,
                     "pricing_keyword": "arbitrary-wall-luminaire-01",
                     "price_mode": "Priced",
+                    "source_basis_line_id": "sqag212-positive-row",
                 }]
                 [normalized] = webapp.normalize_line_items(payload)
                 self.assertEqual(normalized["pricing_authority"]["variant"], "catalog")
@@ -45708,7 +46304,8 @@ process.stdout.write("ok");
                     catalog_lookup=lookup,
                 )
                 payload["line_items"] = [owned]
-                brief = webapp.payload_to_brief(payload)
+                with pre_ledger_grants_for(payload):
+                    brief = webapp.payload_to_brief(payload)
                 [generated] = quote_generator.prepare_lines(
                     brief,
                     generator_rows(brief, positive_items),
@@ -45734,6 +46331,7 @@ process.stdout.write("ok");
                     "description": description,
                     "pricing_keyword": item_id,
                     "price_mode": "Priced",
+                    "source_basis_line_id": "sqag212-identity-row",
                 }]
                 [catalog_row] = webapp.normalize_line_items(payload)
                 self.assertEqual(catalog_row["pricing_authority"]["variant"], "catalog")
@@ -45745,7 +46343,8 @@ process.stdout.write("ok");
                 )
                 self.assertEqual(owned_row["pricing_authority"]["variant"], "catalog")
                 payload["line_items"] = [owned_row]
-                brief = webapp.payload_to_brief(payload)
+                with pre_ledger_grants_for(payload):
+                    brief = webapp.payload_to_brief(payload)
                 lines = quote_generator.prepare_lines(
                     brief,
                     generator_rows(brief),
@@ -45829,7 +46428,7 @@ process.stdout.write("ok");
         predecessor_row = {
             "section": "Lighting", "quantity": 2, "unit": "nos",
             "description": "[ nos wall light ]", "pricing_keyword": "arbitrary-wall-luminaire-01",
-            "price_mode": "Priced",
+            "price_mode": "Priced", "source_basis_line_id": "sqag212-predecessor-row",
         }
         predecessor_lookup = webapp.pricing_catalog_runtime_lookup_for_payload(predecessor_payload)
         predecessor_authority = webapp.build_pricing_authority(
@@ -45845,7 +46444,9 @@ process.stdout.write("ok");
         }]
         [predecessor_result] = webapp.normalize_line_items(predecessor_payload)
         self.assertEqual(predecessor_result["pricing_authority"], predecessor_authority)
-        predecessor_brief = webapp.payload_to_brief(predecessor_payload)
+        # The consumable authority still needs a server grant for this row (here: a pre-ledger saved row).
+        with pre_ledger_grants_for(predecessor_payload):
+            predecessor_brief = webapp.payload_to_brief(predecessor_payload)
         predecessor_lines = quote_generator.prepare_lines(
             predecessor_brief,
             generator_rows(predecessor_brief),
@@ -46357,6 +46958,7 @@ process.stdout.write("ok");
                 "description": "[ nos wall light ] - for final layout",
                 "pricing_keyword": "arbitrary-wall-luminaire-01",
                 "price_mode": "Priced",
+                "source_basis_line_id": "sqag212-published-row",
             }],
         })
         quote_session["session_id"] = session_id
@@ -46406,6 +47008,8 @@ process.stdout.write("ok");
                 "id": pricing_id,
                 "digest": reference_authority["detail"]["digest_sha256"],
             }
+            # The quote was saved with this catalogue row before the pricing ledger existed.
+            persist_as_pre_ledger_quote(payload, storage=storage)
 
             cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(auth_session)}"
             with LocalRunnerServer() as runner:
@@ -47084,6 +47688,7 @@ class PricingDraftG3Regression(unittest.TestCase):
                 reviewed = webapp.normalize_line_items_for_quote_basis_review({
                     **payload, "line_items": finalized["line_items"],
                     "quote_basis_sections": review_sections,
+                    "pricing_analysis_seal": finalized["pricing_analysis_seal"],
                 })
                 self.assertEqual(len(reviewed), 1)
                 self.assertEqual(reviewed[0]["source_basis_line_id"], "provider-row-a")
@@ -47161,12 +47766,15 @@ class PricingDraftG3Regression(unittest.TestCase):
             "line_items": finalized["line_items"],
             "quote_basis_sections": review_sections,
         }
+        review_payload["pricing_analysis_seal"] = finalized.get("pricing_analysis_seal")
         reviewed = webapp.normalize_line_items_for_quote_basis_review(review_payload)
         self.assertEqual(len(reviewed), 2)
+        # A row with no stable source id cannot be tracked by the server pricing ledger, so the
+        # analysis match it carried never becomes a trusted price at review (fails closed).
         review_a = next(row for row in reviewed if row.get("quantity") == 2)
-        self.assertEqual(review_a["pricing_keyword"], "arbitrary-wall-luminaire-01")
-        self.assertEqual(review_a["pricing_authority"]["variant"], "catalog")
-        self.assertEqual(review_a["effective_unit_price"], 40)
+        self.assertEqual(review_a.get("pricing_keyword", ""), "")
+        self.assertNotEqual(review_a["pricing_authority"]["variant"], "catalog")
+        self.assertNotIn("effective_unit_price", review_a)
         review_b = next(row for row in reviewed if row.get("quantity") == 9)
         self.assertEqual(review_b.get("pricing_keyword", ""), "")
         self.assertEqual(review_b["pricing_authority"]["variant"], "none")

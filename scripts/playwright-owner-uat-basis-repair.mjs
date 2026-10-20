@@ -61,15 +61,16 @@ for (let index = 0; index < extraCatalogItems; index++) {
 }
 const byName = (name) => catalog.find((item) => item.description.endsWith(" " + name));
 
-// U1 owner cases: explicit selections the server previously refused, a normal AI-confirmed row, and review-only controls.
+// U1 owner cases: explicit selections the server records as pricing grants, a normal AI-confirmed row, and controls.
 const cases = [
-  { id: "u1-video", kind: "select", section: "AV Equipment Rental Items", text: "Large wall-mounted video display for exterior feature wall", quantity: 2, unit: "lot", select: "55 inch LED TV Monitor" },
+  // M3: 2 lot is not 2 pieces; the selection is refused for unit review and the row stays unpriced.
+  { id: "u1-video", kind: "unit-review", section: "AV Equipment Rental Items", text: "Large wall-mounted video display for exterior feature wall", quantity: 2, unit: "lot", select: "55 inch LED TV Monitor" },
   { id: "u1-graphic", kind: "select", section: "Graphics and Printing", text: "Printed graphic on rear feature wall", quantity: 12.5, unit: "sqm", select: "Printed Wall Graphic" },
   { id: "u1-carpet", kind: "select", section: "Flooring", text: "Grey carpet tile flooring across the full booth footprint", quantity: 36, unit: "sqm", claim: "Printed Fabric Banner", select: "Grey Carpet Tile" },
-  // G2 amendment: rows saved as HISTORICAL after a rejected AI claim. A fresh receipted click must price;
-  // a match offered before receipts existed (legacy) must not promote the old state.
+  // Rows saved as HISTORICAL after a rejected AI claim. A fresh server-recorded selection on the reopened
+  // quote prices; the other row gets no selection, so its old state is never promoted.
   { id: "u1-historical", kind: "historical", section: "Flooring", text: "Blue carpet tile flooring for the lounge zone", quantity: 18, unit: "sqm", claim: "Printed Floor Sticker", select: "Blue Carpet Tile" },
-  { id: "u1-legacy", kind: "legacy", section: "Flooring", text: "Needle punch carpet for the storage corner", quantity: 6, unit: "sqm", claim: "Printed Wall Panel", select: "Needle Punch Carpet" },
+  { id: "u1-legacy", kind: "legacy", section: "Flooring", text: "Needle punch carpet for the storage corner", quantity: 6, unit: "sqm", claim: "Printed Wall Panel" },
   { id: "u1-confirmed", kind: "confirm", section: "Lighting and Electrical", text: "6 inch Spotlight", quantity: 7, unit: "nos", claim: "6 inch Spotlight" },
   { id: "u1-review", kind: "review", section: "Furniture Rental", text: "Custom reception desk with curved timber cladding", quantity: 1, unit: "lot" },
 ];
@@ -194,11 +195,11 @@ try {
     const url = new URL(route.request().url());
     if (url.origin !== baseUrl) return route.abort();
     // Model hosted round-trip latency on the endpoints the basis flow waits for.
-    if (latencyMs > 0 && route.request().method() === "POST" && ["/api/line-items/normalize", "/api/quote-sessions"].includes(url.pathname)) {
+    if (latencyMs > 0 && route.request().method() === "POST" && ["/api/line-items/normalize", "/api/quote-sessions", "/api/quote-sessions/pricing-selections"].includes(url.pathname)) {
       await new Promise((resolve) => setTimeout(resolve, latencyMs));
     }
     network.push({ at: Date.now(), method: route.request().method(), path: url.pathname });
-    if (url.pathname === "/api/line-items/normalize") await fs.writeFile(path.join(runRoot, "normalize-request-" + network.length + ".json"), route.request().postData() || "");
+    if (["/api/line-items/normalize", "/api/quote-sessions/pricing-selections"].includes(url.pathname)) await fs.writeFile(path.join(runRoot, url.pathname.split("/").pop() + "-request-" + network.length + ".json"), route.request().postData() || "");
     return route.continue();
   });
   await page.addInitScript(() => {
@@ -246,20 +247,23 @@ try {
     state.lineItems = state.lineItems.map((item) => ids.includes(item.source_basis_line_id)
       ? normalizeLineItem({ ...item, pricing_authority: { ...item.pricing_authority, variant: "historical" } })
       : item);
-    state.quoteBasisSections = cloneQuoteBasisSections(state.quoteBasisSections.map((section) => ({ ...section, lines: (section.lines || []).map((line) => (
-      line.id === "u1-legacy" ? { ...line, possible_pricing_matches: (line.possible_pricing_matches || []).map(({ selection_receipt, ...match }) => match) } : line
-    )) })));
-    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
     await saveQuoteSessionDraftState({});
     return state.quoteSessionId;
   }, historicalIds);
   const historicalShape = (draftState) => {
     const lines = (draftState?.quoteBasisSections || []).flatMap((section) => section.lines || []);
-    const receipts = (id) => (lines.find((line) => line.id === id)?.possible_pricing_matches || []).map((match) => Boolean(match.selection_receipt));
-    return { variants: historicalIds.map((id) => (draftState?.lineItems || []).find((item) => item.source_basis_line_id === id)?.pricing_authority?.variant), historical: receipts("u1-historical"), legacy: receipts("u1-legacy") };
+    return {
+      variants: historicalIds.map((id) => (draftState?.lineItems || []).find((item) => item.source_basis_line_id === id)?.pricing_authority?.variant),
+      offered: historicalIds.map((id) => (lines.find((line) => line.id === id)?.possible_pricing_matches || []).length),
+      receiptFields: lines.flatMap((line) => line.possible_pricing_matches || []).filter((match) => "selection_receipt" in match).length,
+    };
   };
-  const savedShape = historicalShape((await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(historicalSessionId))).json()).quote_session?.draft_state);
-  assert(savedShape.variants.every((variant) => variant === "historical") && savedShape.historical.length && savedShape.historical.every(Boolean) && savedShape.legacy.length && !savedShape.legacy.some(Boolean), "saved HISTORICAL quote shape", savedShape);
+  const savedDetail = (await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(historicalSessionId))).json()).quote_session;
+  const savedShape = historicalShape(savedDetail?.draft_state);
+  assert(savedShape.variants.every((variant) => variant === "historical") && savedShape.offered.every((count) => count > 0) && savedShape.receiptFields === 0, "saved HISTORICAL quote shape", savedShape);
+  // The server ledger tracks the saved rows; the browser only echoes their revisions back.
+  assert(historicalIds.every((id) => Number.isInteger(savedDetail?.pricing_ledger?.rows?.[id])), "saved quote has no server row revisions", savedDetail?.pricing_ledger);
+  assert(!JSON.stringify(savedDetail).includes('"grant"'), "server pricing grants leaked to the client", savedDetail?.pricing_ledger);
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
   if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
@@ -314,9 +318,9 @@ try {
     result.cpuProfileTop = [...selfTime.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([name, ms]) => name + " " + ms.toFixed(1) + "ms");
   }
   // U1 owner selections and the normal AI-confirmed row.
-  for (const entry of cases.filter((item) => ["select", "historical", "legacy"].includes(item.kind))) await timedClick(page, await possibleMatchControl(page, entry.id, byName(entry.select).id), "possible_match", timings);
+  for (const entry of cases.filter((item) => ["select", "historical", "unit-review"].includes(item.kind))) await timedClick(page, await possibleMatchControl(page, entry.id, byName(entry.select).id), "possible_match", timings);
   await timedClick(page, await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]'), "tick", timings);
-  await timedClick(page, await basisControl(page, "u1-review", "[data-basis-tag]:not([data-basis-tag='Exclude'])"), "tick", timings);
+  for (const id of ["u1-review", "u1-legacy"]) await timedClick(page, await basisControl(page, id, "[data-basis-tag]:not([data-basis-tag='Exclude'])"), "tick", timings);
   // Resolve any remaining server-added review line (for example an id-less duplicate) with a real cross.
   for (let guard = 0; guard < 10; guard++) {
     const pending = await page.evaluate(() => {
@@ -353,7 +357,9 @@ try {
   assert(preparingTitle.trim() === "Preparing Output", "confirm did not show the preparing state", preparingTitle);
   // The preparing state must paint before the (delayed) normalisation round trip can finish.
   assert(latencyMs < 500 || preparingVisibleMs < latencyMs, "preparing state waited for network work", result.confirm);
-  assert(timings.every((sample) => !sample.requests.some((entry) => entry.endsWith("/api/line-items/normalize"))), "a basis click waited on normalisation", timings.map((sample) => sample.requests));
+  assert(timings.every((sample) => !sample.requests.some((entry) => entry.endsWith("/api/line-items/normalize") || entry.endsWith("/api/quote-sessions/pricing-selections"))), "a basis click waited on normalisation", timings.map((sample) => sample.requests));
+  // The selection clicks become prices only through one server-recorded selection request at Confirm.
+  assert(result.confirm.networkDuringConfirm.filter((entry) => entry.startsWith("POST /api/quote-sessions/pricing-selections ")).length === 1, "Confirm did not record the selections with the server", result.confirm.networkDuringConfirm);
   result.clickTimings = summarize(timings);
   await writeJson("timings-raw.json", { timings, confirm: result.confirm });
   if (measureOnly) {
@@ -378,35 +384,35 @@ try {
       assert(row?.authority?.variant === "catalog" && row.authority.catalog_item_id === expected.item.id && row.authority.price === price, "selected catalogue authority missing or wrong", { expected, row });
       assert(Number(row.reference) === price && Number(row.quoted.replace(/,/g, "")) === quoted && Number(row.amount.replace(/,/g, "")) === amount, "quoted price/amount differ from catalogue x FX", { expected: { price, quoted, amount }, row });
     }
-    for (const id of ["u1-review", "u1-legacy"]) {
+    for (const id of ["u1-review", "u1-legacy", "u1-video"]) {
       const review = await rowFor(id);
-      assert(review && !["catalog", "manual", "included"].includes(review.authority?.variant) && review.quoted === "???" && review.amount === "???", "unreceipted or review-only row was priced without authority", { id, review });
+      assert(review && !["catalog", "manual", "included"].includes(review.authority?.variant) && review.quoted === "???" && review.amount === "???", "unselected, review-only or incompatible-unit row was priced", { id, review });
       pricing.push({ id, row: review });
     }
     await writeJson("u1-pricing.json", pricing);
     result.u1 = pricing.map((entry) => ({ id: entry.id, catalogId: entry.catalogId, quoted: entry.row?.quoted, amount: entry.row?.amount, expected: entry.amount }));
 
     // Output edits on an admitted selection: quantity, Included, Use Reference Price, manual quote-currency override.
-    const video = byName("55 inch LED TV Monitor");
-    const videoRow = () => rowFor("u1-video");
-    const cellFor = async (field, extra = "") => page.locator('[data-output-row="' + (await videoRow()).index + '"][data-output-edit-field="' + field + '"]' + extra).first();
+    const editedItem = byName("Printed Wall Graphic");
+    const editedRow = () => rowFor("u1-graphic");
+    const cellFor = async (field, extra = "") => page.locator('[data-output-row="' + (await editedRow()).index + '"][data-output-edit-field="' + field + '"]' + extra).first();
     await (await cellFor("quantity")).click();
     await page.locator('[data-output-editor-field="quantity"]').fill("3");
     await page.locator('[data-output-editor-field="quantity"]').press("Enter");
-    let edited = await videoRow();
-    assert(Number(edited.amount.replace(/,/g, "")) === cents(cents(3 * video.sale_unit_price) * fxRate), "quantity edit amount", edited);
+    let edited = await editedRow();
+    assert(Number(edited.amount.replace(/,/g, "")) === cents(cents(3 * editedItem.sale_unit_price) * fxRate), "quantity edit amount", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
     await page.locator("[data-output-included-action]").click();
-    edited = await videoRow();
+    edited = await editedRow();
     assert(edited.authority?.variant === "included" && edited.quoted === "Included" && Number(edited.amount) === 0, "Included action", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
     await page.locator("[data-output-reference-action]").click();
-    edited = await videoRow();
-    assert(edited.authority?.variant === "catalog" && Number(edited.quoted.replace(/,/g, "")) === cents(video.sale_unit_price * fxRate), "Use reference price", edited);
+    edited = await editedRow();
+    assert(edited.authority?.variant === "catalog" && Number(edited.quoted.replace(/,/g, "")) === cents(editedItem.sale_unit_price * fxRate), "Use reference price", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
     await page.locator('[data-output-editor-field="unit_price_override"]').fill("199.99");
     await page.locator('[data-output-editor-field="unit_price_override"]').press("Enter");
-    edited = await videoRow();
+    edited = await editedRow();
     assert(edited.authority?.variant === "manual" && edited.authority.price_currency === quoteCurrency && edited.quoted === "199.99" && Number(edited.amount.replace(/,/g, "")) === cents(3 * 199.99), "manual quote-currency override", edited);
     result.outputEdits = "PASS";
 
@@ -415,7 +421,7 @@ try {
     const sessionId = await page.evaluate(() => state.quoteSessionId);
     await page.waitForFunction(async (id) => {
       const detail = await fetch("/api/quote-sessions/" + encodeURIComponent(id)).then((r) => r.json());
-      const row = detail.quote_session?.draft_state?.outputRows?.find((item) => item.source_basis_line_id === "u1-video");
+      const row = detail.quote_session?.draft_state?.outputRows?.find((item) => item.source_basis_line_id === "u1-graphic");
       return row?.pricing_authority?.variant === "manual" && Number(row.quantity) === 3;
     }, sessionId, { timeout: 30000, polling: 500 });
     const beforeReload = await Promise.all(expectations.map((expected) => rowFor(expected.id)));
@@ -457,18 +463,19 @@ try {
     // Bind each amount to its own workbook row (description + quantity) and check the totals block.
     const quantityText = (quantity, unit) => String(quantity) + " " + unit;
     const expectedRows = [
-      ...expectations.filter((entry) => entry.id !== "u1-video").map((entry) => ({ id: entry.id, description: entry.item.description, quantity: quantityText(entry.quantity, entry.item.unit_hint), amount: pricing.find((row) => row.id === entry.id).amount })),
-      { id: "u1-video", description: video.description, quantity: quantityText(3, video.unit_hint), amount: cents(3 * 199.99) },
+      ...expectations.filter((entry) => entry.id !== "u1-graphic").map((entry) => ({ id: entry.id, description: entry.item.description, quantity: quantityText(entry.quantity, entry.item.unit_hint), amount: pricing.find((row) => row.id === entry.id).amount })),
+      { id: "u1-graphic", description: editedItem.description, quantity: quantityText(3, editedItem.unit_hint), amount: cents(3 * 199.99) },
       { id: "u1-review", description: cases.find((entry) => entry.id === "u1-review").text, quantity: quantityText(1, "lot"), amount: 500 },
     ];
-    const receipts = await page.evaluate(() => state.quoteBasisSections.flatMap((section) => section.lines || []).map((line) => line.selection_receipt).filter(Boolean));
-    assert(receipts.length >= 1, "admitted selection lost its receipt before export", receipts.length);
+    // The analysis seal is opaque transport between this browser and the server; it never reaches the workbook.
+    const receipts = await page.evaluate(() => [state.originalAnalysisSnapshot?.pricing_analysis_seal?.mac].filter(Boolean));
+    assert(receipts.length === 1, "analysis seal missing from the browser draft", receipts.length);
     const check = spawn(python, ["-c", [
       "import json,sys,zipfile,xml.etree.ElementTree as ET",
       "z=zipfile.ZipFile(sys.argv[1]); M='{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'",
       "xml=''.join(z.read(n).decode('utf8','replace') for n in z.namelist() if n.endswith('.xml'))",
       "assert '???' not in xml, 'unresolved marker in workbook'",
-      "assert not any(r in xml for r in json.loads(sys.argv[3])), 'selection receipt leaked into workbook'",
+      "assert not any(r in xml for r in json.loads(sys.argv[3])) and 'pricing_analysis_seal' not in xml, 'analysis seal leaked into workbook'",
       "ss=[''.join(t.text or '' for t in si.iter(M+'t')) for si in ET.fromstring(z.read('xl/sharedStrings.xml')).iter(M+'si')] if 'xl/sharedStrings.xml' in z.namelist() else []",
       "def cell(c):",
       " v=c.find(M+'v'); i=c.find(M+'is'); t=c.get('t'); f=c.find(M+'f')",

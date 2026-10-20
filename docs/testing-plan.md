@@ -79,26 +79,38 @@ npm run playwright:smoke
   selector to another row; alignment must recalculate trusted amounts and
   repeated normalization must preserve the result.
 - Possible Match selection, AI Confirm ticking, quote-basis click responsiveness
-  or Confirm Quotation Basis: run the `test_owner_uat_*` cases in
-  `tests.test_webapp` and `npm run playwright:owner-uat-basis`. The rendered
-  script uses the real server, UI, normalisation, persistence and XLSX path with
-  a deterministic synthetic draft, a saved (`EXISTING`) quote, similar catalogue
-  entries, a non-reference quote currency and injected request latency. It
-  checks trusted catalogue authority, FX-correct quoted price and amount,
-  review-only rows staying `???`, Output edits, reopen and protected XLSX
-  amounts bound to their own workbook rows plus the totals block. It also
-  saves and reopens rows whose earlier AI claim was rejected (`HISTORICAL`): a
-  fresh click on a Possible Match must price, while a match offered without a
-  selection receipt (a quote saved before receipts existed) must stay `???`.
-  Each offered Possible Match carries a server `selection_receipt` (an HMAC
-  bound to the signed-in scope, quote session, source row wording, unit and
-  quantity, catalogue item, unit and price, and pricing reference digest); a
-  `HISTORICAL` row is admitted only with a receipt that matches the current
-  request, and a measured quantity is never re-read across dimensions (for
-  example `m` as `sqm`). For timing evidence add `--measure-only --cpu-throttle=4
-  --catalog-extra=300` (optionally `--cpu-profile`); it reports Event Timing
-  input-to-paint per click and the time until `Preparing Output` paints.
-
+  or Confirm Quotation Basis: run the `test_owner_uat_*` and `test_ledger_*`
+  cases in `tests.test_webapp` and `npm run playwright:owner-uat-basis`. The
+  rendered script uses the real server, UI, normalisation, persistence and XLSX
+  path with a deterministic synthetic draft, a saved (`EXISTING`) quote, similar
+  catalogue entries, a non-reference quote currency and injected request
+  latency. It checks trusted catalogue authority, FX-correct quoted price and
+  amount, review-only rows staying `???`, Output edits, reopen and protected
+  XLSX amounts bound to their own workbook rows plus the totals block.
+- Pricing trust is server state (the quote's `pricing_ledger`), never request
+  JSON. A row keeps a catalogue price only while the server grants that exact
+  row, item, reference digest and catalogue unit: an analysis match sealed by
+  the server (`pricing_analysis_seal`, ingested into the ledger on the next
+  save) or an operator selection recorded by `POST
+  /api/quote-sessions/pricing-selections` against the row's current revision.
+  Saves never grant: they bump the row revision on any change and permanently
+  supersede a grant after a saved Exclude, Custom, removed row, other catalogue
+  item, other pricing reference or incompatible unit. Manual and Included stay
+  operator overrides; Use Reference Price restores only a live grant. The
+  `test_ledger_*` cases cover forged authority (variant flip, deleted authority,
+  self-built catalogue authority), replay after a saved exclusion or
+  replacement, stale revisions and concurrent tabs, an interrupted commit,
+  legacy quotes (persisted catalogue prices kept, `HISTORICAL` rows never
+  promoted), cross-user, cross-workspace and cross-quote isolation in sqlite
+  database mode, and units: a quantity is reused only when both units count the
+  same thing (`pcs`/`nos`, `m`/`m length`/`m run`, `sqm`, `sets`, `lot`); `10 pcs`
+  is never `10 sets`, and count, lot or length is never area. Such rows stay
+  unpriced for manual review; no conversion factor is inferred. The rendered
+  script expects the `lot` video row to stay `???` and exactly one
+  pricing-selections request at Confirm. For timing evidence add
+  `--measure-only --cpu-throttle=4 --catalog-extra=300` (optionally
+  `--cpu-profile`); it reports Event Timing input-to-paint per click and the
+  time until `Preparing Output` paints.
 ## Manual price and restored search contract
 
 Output defaults to editable reference prices, read-only FX and derived quoted unit prices.

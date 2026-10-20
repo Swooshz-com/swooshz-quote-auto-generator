@@ -53,7 +53,11 @@ class OwnerUatContractTest(unittest.TestCase):
                                unit='sqm', catalog_unit_price=999999)))
                 payload.update(result)
                 payload['quote_basis'] = webapp.quote_basis_from_sections(payload['quote_basis_sections'])
-                admitted = webapp.normalize_line_items_for_quote_basis_review(payload)
+                # The browser click alone never prices; the server records the selection, then prices it.
+                self.assertNotEqual(webapp.normalize_line_items_for_quote_basis_review(payload)[0]['pricing_authority']['variant'], 'catalog')
+                _request, outcome = self.fixture._owner_server_selection(payload, catalog, f'quote-owner-contract-{int(owned)}')
+                self.assertEqual(outcome['selections'], [{'source_basis_line_id': 'selected-row', 'status': 'selected'}])
+                admitted = outcome['line_items']
                 self.assertEqual(admitted[0]['pricing_authority']['variant'], 'catalog')
                 self.assertEqual(admitted[0]['pricing_authority']['price'], webapp.pricing_reference_sale_unit_price(catalog))
                 self.assertNotEqual(admitted[0]['pricing_authority']['price'], 999999)
