@@ -307,6 +307,7 @@ const state = {
   isPageUnloading: false,
   isSigningOut: false,
   authenticationRecoveryRequested: false,
+  authenticationRecoveryBoot: false,
   browserRecoveryFileOperations: 0,
   csrfHeaderName: CSRF_HEADER_NAME,
   csrfToken: "",
@@ -1360,6 +1361,7 @@ function clearLastSelectionState() {
 }
 
 function saveLastSelectionPatch(patch = {}) {
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return;
   const currentScope = currentBrowserRecoveryScope();
   if (!currentScope) return;
   try {
@@ -4011,7 +4013,7 @@ function safeWorkspaceViewJson() {
 }
 
 function saveWorkspaceViewState() {
-  if (state.authenticationRecoveryRequested) return;
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return;
   if (state.isBooting || !currentBrowserRecoveryScope()) return;
   try {
     window.localStorage.setItem(WORKSPACE_VIEW_STORAGE_KEY, JSON.stringify(buildWorkspaceViewSnapshot()));
@@ -4184,6 +4186,7 @@ function sessionFileRecordsFromDraft() {
 }
 
 function persistSessionFiles(records = []) {
+  if (state.isSigningOut || state.isRecoveryScopeTransitioning) return Promise.reject(new Error("Browser recovery is leaving this session."));
   const currentScope = currentBrowserRecoveryScope();
   const recoveryEpoch = browserRecoveryEpoch;
   if (!currentScope) return Promise.resolve();
@@ -4192,7 +4195,8 @@ function persistSessionFiles(records = []) {
     .map((record) => ({ ...record, browserRecoveryScope: currentScope }));
   if (!validRecords.length) return Promise.resolve();
   return openSessionFileDb().then((db) => new Promise((resolve, reject) => {
-    if (recoveryEpoch !== browserRecoveryEpoch || currentScope !== currentBrowserRecoveryScope()) {
+    if (recoveryEpoch !== browserRecoveryEpoch || currentScope !== currentBrowserRecoveryScope()
+      || state.isSigningOut || state.isRecoveryScopeTransitioning) {
       reject(new Error("Browser recovery scope changed before file persistence."));
       return;
     }
@@ -4412,7 +4416,7 @@ async function purgeBrowserRecoveryState() {
 }
 
 function saveSessionState() {
-  if (state.authenticationRecoveryRequested) return;
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return;
   if (commitActiveOutputEditor({ commit: false }) === "blocked") return;
   if (state.isBooting || !currentBrowserRecoveryScope()) return;
   try {
@@ -5045,7 +5049,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   const restoredPanel = restoredQuoteSessionSidePanel(restoredState, options);
   setSidePanel(restoredPanel, { force: true });
   renderQuoteCommercialReviewState();
-  try {
+  if (!state.authenticationRecoveryRequested && !state.isSigningOut && !state.isRecoveryScopeTransitioning) try {
     window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(buildSessionSnapshot()));
     persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
   } catch {
@@ -13452,6 +13456,7 @@ async function applySessionData(data = {}) {
   state.authRequired = Boolean(data.auth_required);
   state.authenticated = Boolean(data.authenticated);
   state.authUser = data.user && typeof data.user === "object" ? data.user : null;
+  state.authenticationRecoveryBoot = false;
   state.browserRecoveryScope = nextRecoveryScope;
   if (data.permissions && typeof data.permissions === "object") {
     state.permissions = { ...state.permissions, ...data.permissions };
@@ -13535,9 +13540,13 @@ async function recoverRequiredAuthentication(status, data = {}) {
     try {
       // Clean boot has not adopted a draft: retain existing records verbatim,
       // but fence their operation intents until verified-scope restoration.
-      const cleanBoot = state.isBooting && !scope && !state.quoteSessionId
-        && !state.images.length && !state.activeJob && !activeOutputEditor;
+      const cleanBoot = (state.isBooting || state.authenticationRecoveryBoot) && !scope && !state.quoteSessionId
+        && !state.images.length && !state.headerLogo && !state.lineItems.length && !state.outputRows.length
+        && !state.quoteBasisSections.length && !state.activeJob && !activeOutputEditor && !state.browserRecoveryFileOperations
+        && !["clientName", "projectTitle", "showName", "projectNumber"].some(name => String(elements[name]?.value || "").trim());
+      if (cleanBoot) state.authenticationRecoveryBoot = true;
       if (!cleanBoot && (state.isBooting || !scope || state.browserRecoveryFileOperations || pricingReferenceShouldWarnBeforeUnload()
+        || String(elements.basisChatPrompt?.value || "").trim()
         || commitActiveOutputEditor() === "blocked")) throw new Error("Recovery checkpoint blocked.");
       clearQuoteSessionDraftSaveTimer();
       if (!isCurrent()) return false;
@@ -13548,7 +13557,7 @@ async function recoverRequiredAuthentication(status, data = {}) {
         const draftKey = JSON.stringify({ ...snapshot, savedAt: "" });
         const fileRecords = sessionFileRecordsFromDraft();
         const fileKey = JSON.stringify(fileRecords);
-        const chatPrompt = elements.basisChatPrompt?.value;
+        const basisPromptText = elements.basisChatPrompt?.value;
         const snapshotText = JSON.stringify(snapshot);
         const workspaceText = JSON.stringify({ ...buildWorkspaceViewSnapshot(), restorableOverlay: "" });
         window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, snapshotText);
@@ -13560,7 +13569,7 @@ async function recoverRequiredAuthentication(status, data = {}) {
         await persistSessionFiles(fileRecords);
         if (!isCurrent()) return false;
         if (activeOutputEditor || state.browserRecoveryFileOperations || pricingReferenceShouldWarnBeforeUnload()
-          || elements.basisChatPrompt?.value !== chatPrompt
+          || elements.basisChatPrompt?.value !== basisPromptText
           || JSON.stringify({ ...authenticationRecoveryDraftSnapshot(), savedAt: "" }) !== draftKey
           || JSON.stringify(sessionFileRecordsFromDraft()) !== fileKey) throw new Error("Draft changed during recovery checkpoint.");
       }
@@ -13582,7 +13591,7 @@ async function recoverRequiredAuthentication(status, data = {}) {
 }
 
 async function postJson(url, payload, options = {}) {
-  if (state.authenticationRecoveryRequested) return { ok: false, status: 401, data: { status: "auth_required" } };
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return { ok: false, status: 401, data: { status: "auth_required" } };
   let response;
   try {
     response = await fetchPostJsonResponse(url, payload);
@@ -14909,7 +14918,7 @@ function normalizeDashboardOperation(operation = {}) {
 }
 
 function saveDashboardOperation(operation = {}) {
-  if (state.authenticationRecoveryRequested) return null;
+  if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return null;
   const normalized = normalizeDashboardOperation({ ...operation, browserRecoveryScope: currentBrowserRecoveryScope(), startedAt: operation.startedAt || new Date().toISOString() });
   state.dashboardOperation = normalized;
   try {
@@ -15910,11 +15919,12 @@ function logClientEvent(event, details = {}) {
 }
 
 async function initializeSession() {
-  const { ok, data } = await getJson("/api/session");
+  const { ok, data, status } = await getJson("/api/session");
   if (ok && await applySessionData(data)) {
     return true;
   }
   if (elements.healthText) elements.healthText.textContent = "Local session unavailable";
+  if (status !== 401 || data?.status !== "auth_required") renderMessages(genericFailureMessages(data), "error");
   return false;
 }
 
@@ -17647,11 +17657,13 @@ async function setInitialValues() {
 async function boot() {
   let dashboardOperation = null;
   let workspaceView = null;
+  let sessionReady = false;
   setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
   wireEvents();
   clearLegacyLocalCompanyPresets();
   try {
-    if (!await initializeSession()) return;
+    sessionReady = await initializeSession();
+    if (!sessionReady) return;
     workspaceView = restoredWorkspaceViewState();
     const recoveringAuthentication = authenticationRecoveryMarkerPresent();
     if (recoveringAuthentication) {
@@ -17667,6 +17679,7 @@ async function boot() {
     checkHealth();
   } finally {
     state.isBooting = false;
+    if (!sessionReady) setDashboardLoadingState(false);
     syncControlStates();
   }
   finishAuthenticationRecovery();

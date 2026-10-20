@@ -10,6 +10,15 @@ const { chromium } = createRequire(import.meta.url)("playwright");
 const evidence = process.env.SQAG_AUTH_RECOVERY_EVIDENCE_ROOT || path.join(root, "_logs/browser/dashboard-auth-recovery");
 await fs.mkdir(evidence, { recursive: true });
 const baseline = process.argv.includes("--baseline");
+const appOverride = process.env.SQAG_AUTH_RECOVERY_APP_SOURCE ? await fs.readFile(process.env.SQAG_AUTH_RECOVERY_APP_SOURCE, "utf8") : null;
+const appSource = appOverride || await fs.readFile(path.join(root, "webapp/static/app.js"), "utf8");
+const logoutStart = appSource.indexOf("async (event) => {", appSource.indexOf("function wireEvents()"));
+let logoutDepth = 0, logoutEnd = logoutStart;
+for (let i = appSource.indexOf("{", logoutStart); i < appSource.length; i++) {
+  if (appSource[i] === "{") logoutDepth++;
+  if (appSource[i] === "}" && --logoutDepth === 0) { logoutEnd = i + 1; break; }
+}
+const logoutCallbackSource = appSource.slice(logoutStart, logoutEnd);
 const harness = spawn(process.env.PYTHON || "python", ["tests/internal_google_browser_harness.py"], {
   cwd: root, env: { ...process.env, PYTHONUNBUFFERED: "1" }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
 });
@@ -29,6 +38,7 @@ async function freshPage() {
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
   await page.route("**/api/log", route => route.fulfill({ status: 204, body: "" }));
+  if (appOverride) await page.route("**/static/app.js*", route => route.fulfill({ status: 200, contentType: "text/javascript", body: appOverride }));
   await page.route("**/api/quote-sessions", route => route.fulfill({ status: 200, contentType: "application/json", body: '{"quote_sessions":[]}' }));
   await page.goto(base + "/login");
   await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
@@ -62,6 +72,107 @@ async function blockedRecovery(page) {
   assert.notEqual(new URL(page.url()).pathname, "/login");
 }
 async function runAdditionalCases() {
+  if (!process.argv.includes("--review-logout-red") && !process.argv.includes("--review-boot-red")) {
+    const { page, context } = await freshPage();
+    await seed(page);
+    const login = await loginBoundary(page);
+    await page.evaluate(() => { elements.basisChatPrompt.value = "Synthetic unsent basis request"; });
+    await rejectedDashboard(page);
+    await blockedRecovery(page);
+    assert.equal(login.count, 0);
+    assert.equal(await page.evaluate(() => elements.basisChatPrompt.value), "Synthetic unsent basis request");
+    await page.evaluate(() => { elements.basisChatPrompt.value = "  "; });
+    await page.locator("#topbarBrandButton").click({ noWaitAfter: true });
+    await page.waitForURL(base + "/login");
+    cases.push({ id: "unsent-basis-prompt-blocks-login-until-resolved", result: "PASS" });
+    await context.close();
+  }
+  if (!process.argv.includes("--review-boot-red")) {
+    const { page, context } = await freshPage();
+    await seed(page);
+    await page.evaluate(() => saveSessionState());
+    const login = await loginBoundary(page);
+    let releaseDashboard, releaseLogout;
+    await page.route("**/api/quote-sessions", route => new Promise(resolve => {
+      releaseDashboard = async () => { await route.fulfill({ status: 401, contentType: "application/json", body: '{"status":"auth_required"}' }); resolve(); };
+    }));
+    await page.route("**/logout", route => new Promise(resolve => {
+      releaseLogout = async () => { await route.fulfill({ status: 204, headers: { "X-SQAG-Logout-Location": "/signed-out" } }); resolve(); };
+    }));
+    await page.evaluate(callbackSource => {
+      // Run the exact production callback; adapt navigation only so the old
+      // document's delayed response can settle deterministically after purge.
+      window.logoutRecoveryTargets = [];
+      const action = new Function("window", "return (" + callbackSource + ");")({ location: { assign: target => window.logoutRecoveryTargets.push(target) } });
+      void action({ preventDefault() {} });
+    }, logoutCallbackSource);
+    for (let attempt = 0; !releaseLogout && attempt < 50; attempt++) await page.waitForTimeout(20);
+    assert.equal(typeof releaseLogout, "function");
+    await page.evaluate(() => { window.lateDashboardSettled = false; void loadQuoteDashboard().finally(() => { window.lateDashboardSettled = true; }); });
+    for (let attempt = 0; !releaseDashboard && attempt < 50; attempt++) await page.waitForTimeout(20);
+    assert.equal(typeof releaseDashboard, "function");
+    await releaseLogout();
+    await page.waitForFunction(() => window.logoutRecoveryTargets.length === 1);
+    assert.equal(await page.evaluate(() => localStorage.getItem("swooshz_quote_session_v1")), null);
+    await releaseDashboard();
+    await page.waitForFunction(() => window.lateDashboardSettled);
+    const after = await page.evaluate(() => ({ quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY), workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY), selection: localStorage.getItem(LAST_SELECTION_STORAGE_KEY) }));
+    assert.equal(after.quote === null && after.workspace === null && after.selection === null, true, "Late dashboard response repopulated recovery after logout purge");
+    assert.equal(login.count, 0);
+    cases.push({ id: "production-logout-purge-before-delayed401-no-repopulation", result: "PASS", navigationAdapterOnly: true });
+    await context.close();
+  }
+  for (const fault of ["403", "500", "network"]) {
+    const { page, context } = await freshPage();
+    await seed(page);
+    const before = await page.evaluate(() => { saveSessionState(); return localStorage.getItem(QUOTE_SESSION_STORAGE_KEY); });
+    await page.route("**/api/session", route => fault === "network" ? route.abort("connectionfailed") : route.fulfill({ status: Number(fault), contentType: "application/json", body: '{"status":"failed"}' }));
+    await page.reload();
+    await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+    const failedBoot = await page.evaluate(() => ({ busy: state.quoteSessionDashboardBusy, dashboardDisabled: elements.topbarBrandButton.disabled, customer: elements.clientName.value, scope: currentBrowserRecoveryScope(), stored: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) }));
+    assert.equal(failedBoot.busy, false, "Unverified boot left dashboard loading stuck");
+    assert.equal(failedBoot.dashboardDisabled, false);
+    assert.equal(failedBoot.customer, "");
+    assert.equal(failedBoot.scope, "");
+    assert.equal(failedBoot.stored, before);
+    cases.push({ id: "initial-session-" + fault + "-releases-loading-without-restoring", result: "PASS" });
+    await context.close();
+  }
+  {
+    const { page, context } = await freshPage();
+    await seed(page);
+    const before = await page.evaluate(() => { saveSessionState(); return localStorage.getItem(QUOTE_SESSION_STORAGE_KEY); });
+    const login = await loginBoundary(page);
+    await authFailure(page, "**/api/session");
+    await page.addInitScript(() => {
+      window.restoreAuthMarkerStorage = Storage.prototype.setItem;
+      Storage.prototype.setItem = function(key, value) { if (key === "swooshz_auth_recovery_v1") throw new Error("Synthetic quota"); return window.restoreAuthMarkerStorage.call(this, key, value); };
+    });
+    await page.reload();
+    await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && authenticationRecoveryPromise === null);
+    assert.equal(login.count, 0);
+    assert.equal(await page.evaluate(() => localStorage.getItem(QUOTE_SESSION_STORAGE_KEY)), before);
+    const guidance = await page.evaluate(() => document.body.textContent);
+    assert(guidance.includes("Keep this page open") && guidance.includes("browser storage") && guidance.includes("try Dashboard again"));
+    assert.equal(await page.locator("#topbarBrandButton").isEnabled(), true);
+    await page.evaluate(() => {
+      Storage.prototype.setItem = window.restoreAuthMarkerStorage;
+      state.images = [{ name: "new-unverified.png", type: "image/png", data_url: "data:image/png;base64,AQID" }];
+      setInputValue(elements.clientName, "New unverified edit");
+    });
+    await page.locator("#topbarBrandButton").click({ noWaitAfter: true });
+    await blockedRecovery(page);
+    assert.equal(login.count, 0);
+    assert.equal(await page.evaluate(() => state.images.length), 1);
+    assert.equal(await page.evaluate(() => localStorage.getItem(QUOTE_SESSION_STORAGE_KEY)), before);
+    await page.evaluate(() => { state.images = []; setInputValue(elements.clientName, ""); });
+    await page.locator("#topbarBrandButton").click({ noWaitAfter: true });
+    await page.waitForURL(base + "/login");
+    assert.equal(login.count, 1);
+    assert.equal(await page.evaluate(() => localStorage.getItem("swooshz_quote_session_v1")), before);
+    cases.push({ id: "initial401-marker-storage-failure-existing-control-retry", result: "PASS" });
+    await context.close();
+  }
   {
     const { page, context } = await freshPage();
     await seed(page);

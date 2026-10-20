@@ -28926,6 +28926,7 @@ const constantSource = constantNames.map(name => {
   return match[0];
 }).join("\n");
 const window = { clearTimeout, setTimeout, crypto: { getRandomValues: bytes => bytes.fill(17) } };
+let browserRecoveryEpoch = 0;
 let quoteSessionDraftSaveTimer = null;
 let quoteSessionInitialSavePromise = null;
 let quoteSessionDraftSavePromise = null;
