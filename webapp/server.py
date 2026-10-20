@@ -5925,6 +5925,10 @@ def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
             pricing_reference_description = clean_text(value.get("pricing_reference_description"))
             if pricing_reference_description:
                 line["pricing_reference_description"] = pricing_reference_description
+            # Opaque server receipt for an explicit Possible Match selection; verified at admission.
+            selection_receipt = value.get("selection_receipt")
+            if pricing_keyword and isinstance(selection_receipt, str) and PRICING_SELECTION_RECEIPT_RE.fullmatch(selection_receipt):
+                line["selection_receipt"] = selection_receipt
             catalog_unit_price = parse_float_or_none(value.get("catalog_unit_price"))
             if catalog_unit_price is not None:
                 line["catalog_unit_price"] = catalog_unit_price
@@ -24121,17 +24125,114 @@ def line_items_aligned_to_quote_basis(
     return aligned if approved_only else (aligned or line_items)
 
 
+PRICING_SELECTION_RECEIPT_PREFIX = b"sqag-pricing-selection-receipt-v1\0"
+PRICING_SELECTION_RECEIPT_RE = re.compile(r"v1\.[A-Za-z0-9_-]{43}")
+PRICING_UNIT_MEASURE_DIMENSIONS = {"sqm": "area", **{unit: "length" for unit in LINEAR_TAKEOFF_UNITS}}
+
+
+def pricing_units_measure_conflict(row_unit: Any, catalog_unit: Any) -> bool:
+    """A quantity in one measured dimension is never re-read as another (m is not sqm)."""
+    row_dimension = PRICING_UNIT_MEASURE_DIMENSIONS.get(normalize_pricing_unit(row_unit).lower())
+    catalog_dimension = PRICING_UNIT_MEASURE_DIMENSIONS.get(normalize_pricing_unit(catalog_unit).lower())
+    return bool(row_dimension and catalog_dimension and row_dimension != catalog_dimension)
+
+
+def pricing_selection_receipt_key() -> bytes | None:
+    secret = session_secret()
+    if not secret and configured_app_mode() == "deploy":
+        return None
+    return (secret or PROCESS_CSRF_TOKEN).encode("utf-8")
+
+
+def pricing_selection_receipt(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None,
+    reference_authority: dict[str, Any],
+    row: dict[str, Any],
+    catalog_item: dict[str, Any],
+) -> str:
+    """Server MAC over one offered Possible Match, bound to who, which quote, which row and which reference.
+
+    The receipt carries no data of its own: admission recomputes every bound value from the
+    current request, so any change to the row, quantity, item, unit, price, reference digest,
+    signed-in scope or quote session makes it fail. Rows the AI claimed carry no receipt.
+    """
+    key = pricing_selection_receipt_key()
+    quantity = parse_float_or_none(row.get("quantity"))
+    price = pricing_reference_sale_unit_price(catalog_item)
+    item_id = clean_text(catalog_item.get("id"))
+    source, reference_id, digest, currency = pricing_authority_reference_identity(reference_authority)
+    if not key or quantity is None or quantity <= 0 or price is None or not item_id or not digest:
+        return ""
+    session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
+    claims = json.dumps({
+        "scope": browser_recovery_scope(auth_session),
+        "quote_session_id": safe_quote_session_id(session.get("session_id"), ""),
+        # Row identity in the cleaned form both runtimes round-trip (display normalisation is idempotent).
+        "row": [safe_resource_id(row.get("source_basis_line_id"), ""),
+                clean_customer_quote_line_text(row.get("description")),
+                canonical_pricing_authority_unit(normalize_pricing_unit(row.get("unit")))],
+        "quantity": quantity,
+        "catalog_item_id": item_id,
+        "catalog_unit": canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)),
+        "price": price,
+        "reference": [source, reference_id, digest, currency],
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "v1." + b64url_encode(hmac.new(key, PRICING_SELECTION_RECEIPT_PREFIX + claims, hashlib.sha256).digest())
+
+
+def pricing_selection_receipt_valid(supplied: Any, expected: str) -> bool:
+    return (isinstance(supplied, str) and bool(expected)
+            and bool(PRICING_SELECTION_RECEIPT_RE.fullmatch(supplied)) and hmac.compare_digest(supplied, expected))
+
+
+def attach_possible_match_selection_receipts(
+    sections: list[dict[str, Any]],
+    line_items: list[dict[str, Any]],
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None = None,
+) -> None:
+    """Issue a receipt for each Possible Match offered on a uniquely mapped unpriced row."""
+    if not any(isinstance(line, dict) and line.get("possible_pricing_matches")
+               for section in sections for line in section.get("lines") or []):
+        return
+    authority = exact_pricing_reference_authority(payload, auth_session=auth_session)
+    if not authority.get("ok") or pricing_reference_authority_error(payload, auth_session=auth_session):
+        return
+    lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload), auth_session=auth_session)
+    for section in sections:
+        for line in section.get("lines") or []:
+            if not isinstance(line, dict) or not isinstance(line.get("possible_pricing_matches"), list):
+                continue
+            line_ids = {safe_resource_id(line.get("id"), ""), safe_resource_id(line.get("source_line_item_id"), "")} - {""}
+            rows = [row for row in line_items if isinstance(row, dict)
+                    and safe_resource_id(row.get("source_basis_line_id"), "") in line_ids]
+            for match in line["possible_pricing_matches"]:
+                match.pop("selection_receipt", None)
+                catalog_item = lookup.get(clean_text(match.get("pricing_keyword")))
+                if len(rows) != 1 or not catalog_item or clean_text(rows[0].get("pricing_keyword")):
+                    continue
+                receipt = pricing_selection_receipt(payload, auth_session, authority, rows[0], catalog_item)
+                if receipt:
+                    match["selection_receipt"] = receipt
+
+
 def line_items_with_confirmed_basis_selections(
     payload: dict[str, Any],
     line_items: list[dict[str, Any]],
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Admit an explicit, uniquely identified selection for an unresolved row."""
+    """Admit an explicit, uniquely identified selection for an unresolved row.
+
+    An unpriced (NONE) row admits a selection directly. A row whose earlier pricing was
+    rejected (HISTORICAL) admits only a new selection carrying the server receipt issued
+    for that exact offered match; its old pricing is never promoted.
+    """
     raw_items = payload.get("line_items")
     if not isinstance(raw_items, list):
         return line_items
     if not any(isinstance(item.get("pricing_authority"), dict)
-               and item["pricing_authority"].get("variant") == "none" for item in line_items):
+               and item["pricing_authority"].get("variant") in {"none", "historical"} for item in line_items):
         return line_items
     raw_sections = payload.get("quote_basis_sections")
     if not isinstance(raw_sections, list) or not any(
@@ -24158,7 +24259,7 @@ def line_items_with_confirmed_basis_selections(
         selected = [line for line in basis_lines if source_id
                     and source_id in {safe_resource_id(line.get("id"), ""), safe_resource_id(line.get("source_line_item_id"), "")}]
         current = item.get("pricing_authority") or {}
-        if len(originals) != 1 or len(selected) != 1 or current.get("variant") != "none":
+        if len(originals) != 1 or len(selected) != 1 or current.get("variant") not in {"none", "historical"}:
             result.append(item)
             continue
         original, line = originals[0], selected[0]
@@ -24167,10 +24268,12 @@ def line_items_with_confirmed_basis_selections(
             result.append(item)
             continue
         supplied = original.get("pricing_authority")
-        if supplied is not None and (not isinstance(supplied, dict) or supplied.get("variant") != "none"
+        if supplied is not None and (not isinstance(supplied, dict) or supplied.get("variant") not in {"none", "historical"}
                                     or normalize_pricing_authority(supplied, original) is None):
             result.append(item)
             continue
+        previously_rejected = current.get("variant") == "historical" or (
+            isinstance(supplied, dict) and supplied.get("variant") == "historical")
         keyword = clean_text(line.get("pricing_keyword"))
         catalog_item = lookup.get(keyword)
         quantity = parse_float_or_none(item.get("quantity"))
@@ -24183,10 +24286,14 @@ def line_items_with_confirmed_basis_selections(
                 or parse_float_or_none(original.get("quantity")) != selected_quantity
                 or not unit
                 or normalize_pricing_unit(catalog_item_unit_hint(catalog_item)) != unit
+                or pricing_units_measure_conflict(original.get("unit"), unit)
                 or (clean_text(line.get("text")) and catalog_line_contradicts_item(
                     line.get("text"), catalog_item, catalog_items=list(lookup.values())))
                 or (clean_text(original.get("description")) and unresolved_detail_contradicts_selected_reference(
-                    original.get("description"), line.get("text"), catalog_item, catalog_items=list(lookup.values())))):
+                    original.get("description"), line.get("text"), catalog_item, catalog_items=list(lookup.values())))
+                or (previously_rejected and not pricing_selection_receipt_valid(
+                    line.get("selection_receipt"),
+                    pricing_selection_receipt(payload, auth_session, authority, original, catalog_item)))):
             result.append(item)
             continue
         price = pricing_reference_sale_unit_price(catalog_item)
@@ -24625,6 +24732,8 @@ def normalize_ai_draft(
         legacy_basis = {}
     elif require_confidence:
         require_basis_confidence(sections)
+    if has_payload_context:
+        attach_possible_match_selection_receipts(sections, line_items, payload, auth_session=auth_session)
     result = {
         "analysis_findings": normalize_analysis_findings(parsed.get("analysis_findings")),
         "blocking_clarification_questions": blockers,
@@ -25503,6 +25612,8 @@ def finalized_remote_draft_result(
                 line.pop("pricing_keyword", None)
     adjusted_basis = quote_basis_from_sections(adjusted_sections)
     final_line_items = line_items or fallback_line_items
+    if has_payload_context:
+        attach_possible_match_selection_receipts(adjusted_sections, final_line_items, payload, auth_session=auth_session)
     diagnostic_details = ai_draft_diagnostic_details(source, adjusted_basis, adjusted_sections, final_line_items)
     if isinstance(diagnostic_metadata, dict):
         diagnostic_details.update({key: value for key, value in diagnostic_metadata.items() if value not in (None, "", [], {})})

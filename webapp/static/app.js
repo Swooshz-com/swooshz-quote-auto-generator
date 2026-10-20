@@ -7105,6 +7105,8 @@ function normalizePossiblePricingMatches(value = []) {
     if (entry.catalog_unit_price !== undefined && entry.catalog_unit_price !== null && String(entry.catalog_unit_price).trim() !== "") {
       match.catalog_unit_price = entry.catalog_unit_price;
     }
+    // Opaque server receipt issued with this offered match; the server verifies it on admission.
+    if (typeof entry.selection_receipt === "string" && /^v1\.[A-Za-z0-9_-]{43}$/.test(entry.selection_receipt)) match.selection_receipt = entry.selection_receipt;
     const score = Number(entry.score);
     if (Number.isFinite(score)) match.score = score;
     matches.push(match);
@@ -7153,6 +7155,7 @@ function normalizeBasisLines(line = "") {
       if (line.catalog_unit_price !== undefined && line.catalog_unit_price !== null && String(line.catalog_unit_price).trim() !== "") next.catalog_unit_price = line.catalog_unit_price;
       if (line.catalog_description) next.catalog_description = cleanCustomerQuoteLineText(line.catalog_description);
       if (line.pricing_reference_description) next.pricing_reference_description = pricingReferenceLineText(line.pricing_reference_description);
+      if (next.pricing_keyword && typeof line.selection_receipt === "string" && /^v1\.[A-Za-z0-9_-]{43}$/.test(line.selection_receipt)) next.selection_receipt = line.selection_receipt;
       if (orderNumber(line.category_order) !== null) next.category_order = orderNumber(line.category_order);
       if (orderNumber(line.item_order) !== null) next.item_order = orderNumber(line.item_order);
       if (quantityParts.quantity !== undefined && quantityParts.quantity !== null && String(quantityParts.quantity).trim() !== "") next.quantity = quantityParts.quantity;
@@ -11443,6 +11446,8 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
     pricing_reference_description: reference,
   };
   if (match.unit) nextLine.unit = match.unit;
+  if (match.selection_receipt) nextLine.selection_receipt = match.selection_receipt;
+  else delete nextLine.selection_receipt;
   if (match.catalog_unit_price !== undefined && match.catalog_unit_price !== null && String(match.catalog_unit_price).trim() !== "") {
     nextLine.catalog_unit_price = match.catalog_unit_price;
   }

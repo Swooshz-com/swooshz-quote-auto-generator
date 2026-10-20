@@ -86,7 +86,16 @@ npm run playwright:smoke
   entries, a non-reference quote currency and injected request latency. It
   checks trusted catalogue authority, FX-correct quoted price and amount,
   review-only rows staying `???`, Output edits, reopen and protected XLSX
-  values. For timing evidence add `--measure-only --cpu-throttle=4
+  amounts bound to their own workbook rows plus the totals block. It also
+  saves and reopens rows whose earlier AI claim was rejected (`HISTORICAL`): a
+  fresh click on a Possible Match must price, while a match offered without a
+  selection receipt (a quote saved before receipts existed) must stay `???`.
+  Each offered Possible Match carries a server `selection_receipt` (an HMAC
+  bound to the signed-in scope, quote session, source row wording, unit and
+  quantity, catalogue item, unit and price, and pricing reference digest); a
+  `HISTORICAL` row is admitted only with a receipt that matches the current
+  request, and a measured quantity is never re-read across dimensions (for
+  example `m` as `sqm`). For timing evidence add `--measure-only --cpu-throttle=4
   --catalog-extra=300` (optionally `--cpu-profile`); it reports Event Timing
   input-to-paint per click and the time until `Preparing Output` paints.
 

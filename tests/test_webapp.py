@@ -41754,8 +41754,13 @@ main().catch((error) => {
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["xlsx"]["status"], "PASS")
         self.assertEqual({row["id"] for row in result["u1"] if row.get("expected") is not None},
-                         {"u1-video", "u1-graphic", "u1-carpet", "u1-confirmed"})
-        self.assertEqual([row["quoted"] for row in result["u1"] if row["id"] == "u1-review"], ["???"])
+                         {"u1-video", "u1-graphic", "u1-carpet", "u1-historical", "u1-confirmed"})
+        self.assertEqual([row["quoted"] for row in result["u1"] if row["id"] in {"u1-review", "u1-legacy"}], ["???", "???"])
+        # Reopened saved quote: both rows HISTORICAL; only the fresh offer carried receipts.
+        self.assertEqual(result["historicalReopen"]["variants"], ["historical", "historical"])
+        self.assertTrue(result["historicalReopen"]["historical"] and all(result["historicalReopen"]["historical"]))
+        self.assertFalse(any(result["historicalReopen"]["legacy"]))
+        self.assertIn('"bad": []', result["xlsx"]["validator"])
 
     def test_owner_uat_possible_match_selection_keeps_review_for_unit_and_family_conflicts(self):
         competing = "synthetic vinyl floor finish"
@@ -41771,6 +41776,200 @@ main().catch((error) => {
                     rows = webapp.normalize_line_items_for_quote_basis_review(payload)
                     self.assertFalse(any(row.get("pricing_authority", {}).get("variant") == "catalog" for row in rows))
                     self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows))
+
+    OWNER_HISTORICAL_CLAIM = "synthetic-graphics-synthetic-hanging-banner"
+    OWNER_HISTORICAL_SELECTION = "synthetic-floors-synthetic-carpet-tile"
+
+    def _owner_historical_selection(self, owned, *, unit="sqm", session_id="quote-owner-historical"):
+        # Owner UAT U1 (G2 amendment): the AI wrongly claims a catalogue item, the real normaliser
+        # rejects it as HISTORICAL and offers Possible Matches; the operator then clicks one. The
+        # click is serialised as the browser does it, including the receipt issued with that match.
+        payload = valid_payload()
+        payload.update(pricing_reference_source="local", pricing_reference={
+            "id": payload["pricing_reference_id"], "source": "local", "currency": "SGD",
+        }, quote_session={"session_id": session_id})
+        for key in ("line_items", "quote_basis_sections", "quote_basis"):
+            payload.pop(key, None)
+        text = "Synthetic carpet tile flooring across the full booth footprint"
+        claim = self.OWNER_HISTORICAL_CLAIM
+        raw = {"analysis_findings": [], "blocking_clarification_questions": [], "quote_basis_sections": [{
+            "id": "floors", "title": "Floors", "lines": [{"id": "carpet-row", "tag": "Confirm", "text": text,
+                                                          "quantity": 2, "unit": unit, "confidence_pct": 82, "pricing_keyword": claim}]}],
+            "line_items": [{"section": "Floors", "source_basis_line_id": "carpet-row", "description": text,
+                            "quantity": 2, "unit": unit, "pricing_keyword": claim}]}
+        draft = webapp.normalize_ai_draft(raw, payload, require_confidence=True)
+        [row] = [item for item in draft["line_items"] if item.get("source_basis_line_id") == "carpet-row"]
+        self.assertEqual(row["pricing_authority"]["variant"], "historical")
+        self.assertEqual(row.get("pricing_keyword", ""), "")
+        sections = copy.deepcopy(draft["quote_basis_sections"])
+        [(section, index, line)] = [(section, index, line) for section in sections
+                                    for index, line in enumerate(section["lines"]) if line.get("id") == "carpet-row"]
+        matches = {match["pricing_keyword"]: match for match in line["possible_pricing_matches"]}
+        self.assertTrue(all(webapp.PRICING_SELECTION_RECEIPT_RE.fullmatch(match["selection_receipt"]) for match in matches.values()))
+        match = matches[self.OWNER_HISTORICAL_SELECTION]
+        selected = {key: value for key, value in line.items() if key not in {"custom_pricing", "custom_confirmed", "possible_pricing_matches"}}
+        selected.update(tag="Include", text="[ " + match["description"] + " ] - " + line["text"], unit=match["unit"],
+                        pricing_keyword=match["pricing_keyword"], catalog_description=match["description"],
+                        pricing_reference_description=match["description"], catalog_unit_price=999999,
+                        selection_receipt=match["selection_receipt"])
+        section["lines"][index] = selected
+        request = copy.deepcopy(payload)
+        request["line_items"] = copy.deepcopy(draft["line_items"])
+        request["quote_basis_sections"] = sections
+        request["quote_basis"] = webapp.quote_basis_from_sections(sections)
+        if owned:
+            details = {"currency": "SGD", "exchange_rate": 1, "tax": {"label": "GST", "rate": 0.09},
+                       "company": {"name": "Synthetic Company", "header_details": "Synthetic header"},
+                       "quote_text": {"terms_heading": "Terms", "payment_terms": [], "notes_heading": "Notes", "standard_notes": []},
+                       "signature": {}, "rich_text": {}}
+            details["commercial_snapshot"] = {
+                "schema": webapp.QUOTE_COMMERCIAL_SNAPSHOT_SCHEMA, "version": webapp.QUOTE_COMMERCIAL_SNAPSHOT_VERSION,
+                "owner": "quote", "lifecycle": "RECOVERED", "origin": "session_recovery",
+                "presence": {key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                             for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()},
+                "pricing_basis": {"currency": "SGD", "source": "local", "id": payload["pricing_reference_id"],
+                                  "digest": webapp.pricing_reference_catalog_digest(json.loads(KONCEPT_CATALOG.read_text(encoding="utf-8")))},
+            }
+            request["quote_session"] = {"session_id": session_id, "commercials": {"currency": "SGD", "exchange_rate": 1},
+                "draft_state": {"quoteCommercialLifecycle": "RECOVERED", "quoteDetails": details,
+                                "lineItems": copy.deepcopy(request["line_items"])}}
+            self.assertTrue(webapp.quote_commercial_state(request)["owned"])
+            self.assertFalse(webapp.quote_commercial_state(request)["review_required"])
+        return request, matches
+
+    def _owner_historical_selected_row(self, request):
+        rows = webapp.normalize_line_items_for_quote_basis_review(request)
+        return [row for row in rows if row.get("source_basis_line_id") == "carpet-row"]
+
+    def test_owner_uat_historical_row_admits_fresh_receipted_possible_match_selection(self):
+        catalog = webapp.pricing_catalog_runtime_lookup_for_payload(valid_payload(), "synthetic-exhibition-fixture-template")[self.OWNER_HISTORICAL_SELECTION]
+        price = webapp.pricing_reference_sale_unit_price(catalog)
+        for owned in (False, True):
+            with self.subTest(owned=owned):
+                request, _ = self._owner_historical_selection(owned)
+                before = copy.deepcopy(request)
+                [row] = self._owner_historical_selected_row(request)
+                self.assertEqual(request, before)
+                self.assertEqual(row["pricing_authority"]["variant"], "catalog")
+                self.assertEqual(row["pricing_authority"]["catalog_item_id"], self.OWNER_HISTORICAL_SELECTION)
+                self.assertEqual(row["pricing_authority"]["price"], price)
+                self.assertNotEqual(price, 999999)
+                self.assertEqual(row["unit"], "sqm")
+                self.assertEqual(row["pricing_basis_amount"], webapp.round_commercial_cents(2 * price))
+                repeated = {**request, "line_items": webapp.normalize_line_items_for_quote_basis_review(request)}
+                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(repeated), repeated["line_items"])
+        request, _ = self._owner_historical_selection(False)
+        request["quote_exchange_rate"] = 0.7391
+        [row] = self._owner_historical_selected_row(request)
+        self.assertEqual(row["approved_quote_amount"], webapp.round_commercial_cents(webapp.round_commercial_cents(2 * price) * 0.7391))
+
+    def test_owner_uat_production_draft_offers_receipts_only_for_unclaimed_rows(self):
+        request, matches = self._owner_historical_selection(False)
+        finalized = webapp.finalized_remote_draft_result(
+            {key: value for key, value in request.items() if key not in {"line_items", "quote_basis_sections", "quote_basis"}},
+            webapp.normalize_ai_draft({"analysis_findings": [], "blocking_clarification_questions": [],
+                                       "quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+                                           {"id": "carpet-row", "tag": "Confirm", "text": "Synthetic carpet tile flooring across the full booth footprint",
+                                            "quantity": 2, "unit": "sqm", "confidence_pct": 82}]}],
+                                       "line_items": [{"section": "Floors", "source_basis_line_id": "carpet-row", "quantity": 2, "unit": "sqm",
+                                                       "description": "Synthetic carpet tile flooring across the full booth footprint"}]},
+                                      request, require_confidence=True),
+            "openai", "OpenAI", {}, [],
+        )
+        offered = [match for section in finalized["quote_basis_sections"] for line in section["lines"]
+                   for match in line.get("possible_pricing_matches") or []]
+        self.assertTrue(offered)
+        self.assertTrue(all(webapp.PRICING_SELECTION_RECEIPT_RE.fullmatch(match.get("selection_receipt", "")) for match in offered))
+        # A row the AI still claims is never offered a receipt for its own claim.
+        claimed_payload = copy.deepcopy(request)
+        claimed_payload["line_items"][0]["pricing_keyword"] = self.OWNER_HISTORICAL_CLAIM
+        sections = copy.deepcopy(claimed_payload["quote_basis_sections"])
+        for section in sections:
+            for line in section["lines"]:
+                line["possible_pricing_matches"] = [{"pricing_keyword": key} for key in matches]
+        webapp.attach_possible_match_selection_receipts(sections, claimed_payload["line_items"], claimed_payload)
+        self.assertFalse(any(match.get("selection_receipt") for section in sections for line in section["lines"]
+                             for match in line["possible_pricing_matches"]))
+        with mock.patch.object(webapp, "configured_app_mode", return_value="deploy"), mock.patch.object(webapp, "session_secret", return_value=""):
+            self.assertIsNone(webapp.pricing_selection_receipt_key())
+
+    def test_owner_uat_historical_row_rejects_selection_without_a_valid_fresh_receipt(self):
+        def other_receipt(request, _matches, **changes):
+            authority = copy.deepcopy(webapp.exact_pricing_reference_authority(request))
+            row = copy.deepcopy(request["line_items"][0])
+            auth_session = changes.pop("auth_session", None)
+            if "digest" in changes:
+                authority["detail"]["digest_sha256"] = changes.pop("digest")
+            if "session_id" in changes:
+                request = {**request, "quote_session": {**request["quote_session"], "session_id": changes.pop("session_id")}}
+            row.update(changes)
+            catalog = webapp.pricing_catalog_runtime_lookup_for_payload(request, request["profile_id"])[self.OWNER_HISTORICAL_SELECTION]
+            receipt = webapp.pricing_selection_receipt(request, auth_session, authority, row, catalog)
+            self.assertNotIn(receipt, ("", _matches[self.OWNER_HISTORICAL_SELECTION]["selection_receipt"]))
+            return receipt
+
+        def set_line(request, **values):
+            for section in request["quote_basis_sections"]:
+                for line in section["lines"]:
+                    if line.get("id") == "carpet-row":
+                        line.update(values)
+                        for key in [key for key, value in values.items() if value is None]:
+                            line.pop(key)
+
+        def resync(request):
+            request["quote_basis"] = webapp.quote_basis_from_sections(request["quote_basis_sections"])
+            if "draft_state" in request["quote_session"]:
+                request["quote_session"]["draft_state"]["lineItems"] = copy.deepcopy(request["line_items"])
+
+        other_scope = {"auth_mode": webapp.INTERNAL_AUTH_MODE, "user": {"subject": "synthetic-other-subject", "account": "synthetic-other-account"}}
+        cases = {
+            "historical-no-receipt": lambda request, matches: set_line(request, selection_receipt=None),
+            "forged-receipt": lambda request, matches: set_line(request, selection_receipt="v1." + "A" * 43),
+            "malformed-receipt": lambda request, matches: set_line(request, selection_receipt="v1." + matches[self.OWNER_HISTORICAL_SELECTION]["selection_receipt"][3:-1]),
+            "receipt-for-another-offered-item": lambda request, matches: set_line(request, selection_receipt=next(
+                match["selection_receipt"] for key, match in matches.items() if key != self.OWNER_HISTORICAL_SELECTION)),
+            "replayed-from-another-quote": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, session_id="quote-another-quote")),
+            "issued-to-another-signed-in-user": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, auth_session=other_scope)),
+            "stale-reference-digest": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, digest="sha256:" + "0" * 64)),
+            "issued-for-other-row-wording": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, description="Synthetic carpet tile in the meeting room")),
+            "issued-for-other-quantity": lambda request, matches: set_line(request, selection_receipt=other_receipt(request, matches, quantity=3)),
+            "changed-quantity-after-offer": lambda request, matches: (set_line(request, quantity=3), request["line_items"][0].update(quantity=3)),
+            "changed-unit": lambda request, matches: set_line(request, unit="nos"),
+            "duplicate-source-row": lambda request, matches: request["line_items"].append(copy.deepcopy(request["line_items"][0])),
+            "duplicate-basis-line": lambda request, matches: request["quote_basis_sections"][0]["lines"].append(copy.deepcopy(next(
+                line for section in request["quote_basis_sections"] for line in section["lines"] if line.get("id") == "carpet-row"))),
+            "competing-family-detail": lambda request, matches: set_line(request, text="[ " + matches[self.OWNER_HISTORICAL_SELECTION]["description"] + " ] - Synthetic vinyl floor finish"),
+            "review-only-custom": lambda request, matches: set_line(request, tag="Custom", custom_pricing=True),
+            "confirm-not-include": lambda request, matches: set_line(request, tag="Confirm"),
+            "invalid-historical-authority": lambda request, matches: request["line_items"][0]["pricing_authority"]["context"].update(source_basis_line_id="another-row"),
+            "row-still-claims-catalogue": lambda request, matches: request["line_items"][0].update(pricing_keyword=self.OWNER_HISTORICAL_CLAIM),
+            "trusted-authority-forged": lambda request, matches: request["line_items"][0].update(pricing_authority={
+                **request["line_items"][0]["pricing_authority"], "variant": "catalog"}),
+        }
+        for owned in (False, True):
+            for label, mutate in cases.items():
+                with self.subTest(owned=owned, case=label):
+                    request, matches = self._owner_historical_selection(owned)
+                    mutate(request, matches)
+                    resync(request)
+                    rows = webapp.normalize_line_items_for_quote_basis_review(request)
+                    self.assertFalse(any(row.get("pricing_authority", {}).get("variant") == "catalog" for row in rows), label)
+                    self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows), label)
+
+    def test_owner_uat_selection_never_rereads_measured_quantities_across_dimensions(self):
+        for row_unit, catalog_unit, conflict in (("m", "sqm", True), ("m length", "sqm", True), ("sqm", "m length", True),
+                                                 ("lot", "sqm", False), ("nos", "sqm", False), ("sqm", "sqm", False),
+                                                 ("m run", "m length", False), ("", "sqm", False)):
+            self.assertEqual(webapp.pricing_units_measure_conflict(row_unit, catalog_unit), conflict, (row_unit, catalog_unit))
+        for owned in (False, True):
+            with self.subTest(owned=owned, path="none"):
+                payload, _ = self._owner_possible_match_payload(owned, "Grey loop pile across reception zone", row_unit="m")
+                rows = webapp.normalize_line_items_for_quote_basis_review(payload)
+                self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows))
+            with self.subTest(owned=owned, path="historical"):
+                request, _ = self._owner_historical_selection(owned, unit="m")
+                rows = webapp.normalize_line_items_for_quote_basis_review(request)
+                self.assertFalse(any(webapp.pricing_authority_price(row.get("pricing_authority")) is not None for row in rows))
 
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {

@@ -66,6 +66,10 @@ const cases = [
   { id: "u1-video", kind: "select", section: "AV Equipment Rental Items", text: "Large wall-mounted video display for exterior feature wall", quantity: 2, unit: "lot", select: "55 inch LED TV Monitor" },
   { id: "u1-graphic", kind: "select", section: "Graphics and Printing", text: "Printed graphic on rear feature wall", quantity: 12.5, unit: "sqm", select: "Printed Wall Graphic" },
   { id: "u1-carpet", kind: "select", section: "Flooring", text: "Grey carpet tile flooring across the full booth footprint", quantity: 36, unit: "sqm", claim: "Printed Fabric Banner", select: "Grey Carpet Tile" },
+  // G2 amendment: rows saved as HISTORICAL after a rejected AI claim. A fresh receipted click must price;
+  // a match offered before receipts existed (legacy) must not promote the old state.
+  { id: "u1-historical", kind: "historical", section: "Flooring", text: "Blue carpet tile flooring for the lounge zone", quantity: 18, unit: "sqm", claim: "Printed Floor Sticker", select: "Blue Carpet Tile" },
+  { id: "u1-legacy", kind: "legacy", section: "Flooring", text: "Needle punch carpet for the storage corner", quantity: 6, unit: "sqm", claim: "Printed Wall Panel", select: "Needle Punch Carpet" },
   { id: "u1-confirmed", kind: "confirm", section: "Lighting and Electrical", text: "6 inch Spotlight", quantity: 7, unit: "nos", claim: "6 inch Spotlight" },
   { id: "u1-review", kind: "review", section: "Furniture Rental", text: "Custom reception desk with curved timber cladding", quantity: 1, unit: "lot" },
 ];
@@ -236,6 +240,34 @@ try {
   await page.waitForFunction(() => state.quoteBasisSections.flatMap((section) => section.lines || []).length > 0 && !appIsBusy(), null, { timeout: 90000 });
   await page.waitForTimeout(500);
 
+  // Save the quote holding HISTORICAL rows (an earlier AI claim on them was rejected), then reopen it.
+  const historicalIds = cases.filter((entry) => ["historical", "legacy"].includes(entry.kind)).map((entry) => entry.id);
+  const historicalSessionId = await page.evaluate(async (ids) => {
+    state.lineItems = state.lineItems.map((item) => ids.includes(item.source_basis_line_id)
+      ? normalizeLineItem({ ...item, pricing_authority: { ...item.pricing_authority, variant: "historical" } })
+      : item);
+    state.quoteBasisSections = cloneQuoteBasisSections(state.quoteBasisSections.map((section) => ({ ...section, lines: (section.lines || []).map((line) => (
+      line.id === "u1-legacy" ? { ...line, possible_pricing_matches: (line.possible_pricing_matches || []).map(({ selection_receipt, ...match }) => match) } : line
+    )) })));
+    state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections);
+    await saveQuoteSessionDraftState({});
+    return state.quoteSessionId;
+  }, historicalIds);
+  const historicalShape = (draftState) => {
+    const lines = (draftState?.quoteBasisSections || []).flatMap((section) => section.lines || []);
+    const receipts = (id) => (lines.find((line) => line.id === id)?.possible_pricing_matches || []).map((match) => Boolean(match.selection_receipt));
+    return { variants: historicalIds.map((id) => (draftState?.lineItems || []).find((item) => item.source_basis_line_id === id)?.pricing_authority?.variant), historical: receipts("u1-historical"), legacy: receipts("u1-legacy") };
+  };
+  const savedShape = historicalShape((await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(historicalSessionId))).json()).quote_session?.draft_state);
+  assert(savedShape.variants.every((variant) => variant === "historical") && savedShape.historical.length && savedShape.historical.every(Boolean) && savedShape.legacy.length && !savedShape.legacy.some(Boolean), "saved HISTORICAL quote shape", savedShape);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
+  if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
+  await page.locator("#quoteBasisPanel").waitFor({ state: "visible", timeout: 30000 });
+  const reopenedShape = await page.evaluate(() => ({ quoteSessionId: state.quoteSessionId, lifecycle: state.quoteCommercialLifecycle, lineItems: state.lineItems, quoteBasisSections: state.quoteBasisSections }));
+  assert(reopenedShape.quoteSessionId === historicalSessionId && JSON.stringify(historicalShape(reopenedShape)) === JSON.stringify(savedShape), "reopened HISTORICAL quote shape", { saved: savedShape, reopened: historicalShape(reopenedShape), lifecycle: reopenedShape.lifecycle });
+  result.historicalReopen = { lifecycle: reopenedShape.lifecycle, ...savedShape };
+
   // Function-level attribution of each click (classic-script globals are rebindable).
   await page.evaluate((profiledNames) => {
     for (const name of ["updateQuoteBasisCard", "syncControlStates", "saveSessionState", "buildSessionSnapshot", "persistSessionFiles", "sessionFileRecordsFromDraft", "renderQuoteBasisMessage", "basisConfirmBlockReason", "quoteDependencyChangesForNext", "saveQuoteSessionDraftState", "queueQuoteSessionDraftStateSave", ...profiledNames]) {
@@ -282,7 +314,7 @@ try {
     result.cpuProfileTop = [...selfTime.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([name, ms]) => name + " " + ms.toFixed(1) + "ms");
   }
   // U1 owner selections and the normal AI-confirmed row.
-  for (const entry of cases.filter((item) => item.kind === "select")) await timedClick(page, await possibleMatchControl(page, entry.id, byName(entry.select).id), "possible_match", timings);
+  for (const entry of cases.filter((item) => ["select", "historical", "legacy"].includes(item.kind))) await timedClick(page, await possibleMatchControl(page, entry.id, byName(entry.select).id), "possible_match", timings);
   await timedClick(page, await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]'), "tick", timings);
   await timedClick(page, await basisControl(page, "u1-review", "[data-basis-tag]:not([data-basis-tag='Exclude'])"), "tick", timings);
   // Resolve any remaining server-added review line (for example an id-less duplicate) with a real cross.
@@ -335,7 +367,7 @@ try {
       const text = (selector) => cells?.querySelector(selector)?.innerText.trim() || "";
       return row ? { index, authority: outputPriceAuthority(row), quantity: row.quantity, rowAmount: row.amount, reference: text('.output-unit-price-cell:not([data-output-edit-field]) .output-cell-text'), quoted: text('[data-output-denomination="quote"] .output-cell-text'), amount: text('.amount-cell') } : null;
     }, id);
-    const expectations = [...cases.filter((item) => item.kind === "select").map((item) => ({ id: item.id, item: byName(item.select), quantity: item.quantity })), { id: "u1-confirmed", item: byName("6 inch Spotlight"), quantity: 7 }];
+    const expectations = [...cases.filter((item) => ["select", "historical"].includes(item.kind)).map((item) => ({ id: item.id, item: byName(item.select), quantity: item.quantity })), { id: "u1-confirmed", item: byName("6 inch Spotlight"), quantity: 7 }];
     const pricing = [];
     for (const expected of expectations) {
       const row = await rowFor(expected.id);
@@ -346,9 +378,11 @@ try {
       assert(row?.authority?.variant === "catalog" && row.authority.catalog_item_id === expected.item.id && row.authority.price === price, "selected catalogue authority missing or wrong", { expected, row });
       assert(Number(row.reference) === price && Number(row.quoted.replace(/,/g, "")) === quoted && Number(row.amount.replace(/,/g, "")) === amount, "quoted price/amount differ from catalogue x FX", { expected: { price, quoted, amount }, row });
     }
-    const review = await rowFor("u1-review");
-    assert(review && !["catalog", "manual", "included"].includes(review.authority?.variant) && review.quoted === "???" && review.amount === "???", "review-only custom row was priced without authority", review);
-    pricing.push({ id: "u1-review", row: review });
+    for (const id of ["u1-review", "u1-legacy"]) {
+      const review = await rowFor(id);
+      assert(review && !["catalog", "manual", "included"].includes(review.authority?.variant) && review.quoted === "???" && review.amount === "???", "unreceipted or review-only row was priced without authority", { id, review });
+      pricing.push({ id, row: review });
+    }
     await writeJson("u1-pricing.json", pricing);
     result.u1 = pricing.map((entry) => ({ id: entry.id, catalogId: entry.catalogId, quoted: entry.row?.quoted, amount: entry.row?.amount, expected: entry.amount }));
 
@@ -420,20 +454,43 @@ try {
     assert(detail.quote_session?.exports?.xlsx?.exists === true && detail.quote_session.exports.xlsx.stale === false, "protected XLSX export not current", detail.quote_session?.exports);
     const protectedBytes = await (await api.get(new URL(detail.quote_session.exports.xlsx.url, baseUrl).toString())).body();
     assert(protectedBytes.equals(await fs.readFile(xlsxPath)), "protected XLSX differs from the UI download");
-    const expectedNumbers = [...pricing.filter((entry) => entry.amount !== undefined && entry.id !== "u1-video").map((entry) => entry.amount), cents(3 * 199.99), 500];
+    // Bind each amount to its own workbook row (description + quantity) and check the totals block.
+    const quantityText = (quantity, unit) => String(quantity) + " " + unit;
+    const expectedRows = [
+      ...expectations.filter((entry) => entry.id !== "u1-video").map((entry) => ({ id: entry.id, description: entry.item.description, quantity: quantityText(entry.quantity, entry.item.unit_hint), amount: pricing.find((row) => row.id === entry.id).amount })),
+      { id: "u1-video", description: video.description, quantity: quantityText(3, video.unit_hint), amount: cents(3 * 199.99) },
+      { id: "u1-review", description: cases.find((entry) => entry.id === "u1-review").text, quantity: quantityText(1, "lot"), amount: 500 },
+    ];
+    const receipts = await page.evaluate(() => state.quoteBasisSections.flatMap((section) => section.lines || []).map((line) => line.selection_receipt).filter(Boolean));
+    assert(receipts.length >= 1, "admitted selection lost its receipt before export", receipts.length);
     const check = spawn(python, ["-c", [
-      "import json,sys,zipfile,re",
-      "z=zipfile.ZipFile(sys.argv[1]); nums=[]",
-      "for n in z.namelist():",
-      " if n.startswith('xl/worksheets/sheet'): nums+= [float(v) for v in re.findall(r'<v>(-?[0-9.]+(?:E-?[0-9]+)?)</v>', z.read(n).decode())]",
-      "missing=[v for v in json.loads(sys.argv[2]) if not any(abs(n-v)<=0.005 for n in nums)]",
-      "assert '???' not in ''.join(z.read(n).decode('utf8','replace') for n in z.namelist() if n.endswith('.xml')), 'unresolved marker in workbook'",
-      "print(json.dumps({'missing':missing,'numeric_cells':len(nums)})); sys.exit(1 if missing else 0)",
-    ].join("\n"), xlsxPath, JSON.stringify(expectedNumbers)], { cwd: sourceRoot, windowsHide: true });
+      "import json,sys,zipfile,xml.etree.ElementTree as ET",
+      "z=zipfile.ZipFile(sys.argv[1]); M='{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'",
+      "xml=''.join(z.read(n).decode('utf8','replace') for n in z.namelist() if n.endswith('.xml'))",
+      "assert '???' not in xml, 'unresolved marker in workbook'",
+      "assert not any(r in xml for r in json.loads(sys.argv[3])), 'selection receipt leaked into workbook'",
+      "ss=[''.join(t.text or '' for t in si.iter(M+'t')) for si in ET.fromstring(z.read('xl/sharedStrings.xml')).iter(M+'si')] if 'xl/sharedStrings.xml' in z.namelist() else []",
+      "def cell(c):",
+      " v=c.find(M+'v'); i=c.find(M+'is'); t=c.get('t'); f=c.find(M+'f')",
+      " text=ss[int(v.text)] if t=='s' and v is not None else (''.join(x.text or '' for x in i.iter(M+'t')) if i is not None else (v.text if v is not None else ''))",
+      " return (text, f.text if f is not None else None)",
+      "rows=[{''.join(ch for ch in c.get('r') if ch.isalpha()):cell(c) for c in r.iter(M+'c')} for n in z.namelist() if n.startswith('xl/worksheets/sheet') and n.endswith('.xml') for r in ET.fromstring(z.read(n)).iter(M+'row')]",
+      "get=lambda r,k: r.get(k,('',None))[0]",
+      "bad=[]",
+      "for e in json.loads(sys.argv[2]):",
+      " hit=[r for r in rows if get(r,'C')==e['description'] and get(r,'B')==e['quantity']]",
+      " if len(hit)!=1 or abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005: bad.append({'expected':e,'rows':[{k:v[0] for k,v in r.items()} for r in hit]})",
+      "items=[float(get(r,'E')) for r in rows if get(r,'B') and get(r,'C') and get(r,'E') and get(r,'B')!='Quantity']",
+      "totals={get(r,'D'):(float(get(r,'E')),r['E'][1]) for r in rows if get(r,'D') in ('Total','GST 9%','Total including GST') and get(r,'E')}",
+      "t=totals.get('Total'); g=totals.get('GST 9%'); a=totals.get('Total including GST')",
+      "ok=bool(t and g and a) and abs(t[0]-round(sum(items),2))<=0.005 and (t[1] or '').startswith('SUM(') and abs(g[0]-round(t[0]*0.09+1e-9,2))<=0.005 and abs(a[0]-round(t[0]+g[0],2))<=0.005",
+      "bad += [] if ok else [{'totals':totals,'item_sum':round(sum(items),2)}]",
+      "print(json.dumps({'bad':bad,'checked_rows':len(json.loads(sys.argv[2])),'item_rows':len(items),'totals':{k:v[0] for k,v in totals.items()}})); sys.exit(1 if bad else 0)",
+    ].join("\n"), xlsxPath, JSON.stringify(expectedRows), JSON.stringify(receipts)], { cwd: sourceRoot, windowsHide: true });
     let checkOut = ""; check.stdout.on("data", (chunk) => { checkOut += chunk; }); check.stderr.on("data", (chunk) => { checkOut += chunk; });
     const exitCode = await new Promise((resolve) => check.once("close", resolve));
     assert(exitCode === 0, "XLSX amounts", checkOut);
-    result.xlsx = { status: "PASS", expectedNumbers, validator: checkOut.trim() };
+    result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };
     result.status = "PASS";
   }
   assert(pageErrors.length === 0, "page errors", pageErrors);
