@@ -5288,6 +5288,26 @@ def bracketed_reference_matches_catalog_item(value: Any, item: dict[str, Any]) -
     )
 
 
+def catalog_spatial_context_parts(value: Any) -> tuple[str, str] | None:
+    """Split only a single, unambiguous spatial relation in independent wording.
+
+    This recognises grammar, not catalogue objects. Negation, coordination and
+    punctuation leave the existing conservative family checks in charge.
+    """
+    text = clean_customer_quote_line_text(value)
+    scope_text = re.sub(r"^(?:sqm|m|nos?|pcs?|lot|sets?)\.\s+", "", text, flags=re.IGNORECASE)
+    if re.search(r"\.(?:\s|$)|\s[-\u2013\u2014]\s", scope_text):
+        return None
+    if re.search(r"\b(?:no|not|never|nowhere|without|neither|nor|except|excluding|excluded|removed|omitted|deleted|absent|and|or|only)\b|\b[a-z]+n['\u2019]t\b|[,;:!?()\[\]/&+]", text, re.IGNORECASE):
+        return None
+    relations = list(re.finditer(r"\b(?:in front of|next to|at|around|near|beside|behind)\b", text, re.IGNORECASE))
+    if len(relations) != 1:
+        return None
+    relation = relations[0]
+    primary, context = text[:relation.start()].strip(), text[relation.end():].strip()
+    return (primary, context) if primary and context else None
+
+
 def catalog_usage_detail(reference: str, detail: str) -> str:
     reference = clean_customer_quote_line_text(reference)
     detail = clean_customer_quote_line_text(detail)
@@ -5302,6 +5322,12 @@ def catalog_usage_detail(reference: str, detail: str) -> str:
     detail_key = comparable_catalog_description_key(detail)
     if not detail_key or detail_key == reference_key or detail_key in reference_key:
         return ""
+    # Keep independently supplied primary wording when removing the selected
+    # name would leave only spatial context. The bracketed display name alone
+    # is never added to that evidence.
+    spatial = catalog_spatial_context_parts(detail)
+    if spatial and comparable_catalog_description_key_without_leading_unit(spatial[0]) == comparable_catalog_description_key_without_leading_unit(reference):
+        return detail
     lowered_reference = reference.lower()
     lowered_detail = detail.lower()
     if lowered_detail.startswith(lowered_reference):
@@ -19807,7 +19833,10 @@ def catalog_family_evidence_tokens(
         longest = max(length for length, _item_id in prefixes)
         matching_ids = {item_id for length, item_id in prefixes if length == longest}
         if matching_ids == {selected_id} and selected_id:
-            detail_text = " ".join(description_words[longest:])
+            # A name in original unbracketed wording is independent evidence.
+            # Do not erase it when it is the primary of a spatial description.
+            spatial = catalog_spatial_context_parts(line_text)
+            detail_text = clean_text(line_text) if spatial else " ".join(description_words[longest:])
             return catalog_family_tokens(detail_text), True, False, detail_text
         return set(), False, True, ""
 
@@ -19864,6 +19893,21 @@ def catalog_detail_matches_other_catalog_object_family(
         frozenset(sequence)
         for sequence in catalog_family_alternative_sequences(grouped.get(selected_id, [item]))
     }
+
+    spatial = catalog_spatial_context_parts(detail_text) if detail_text is not None else None
+    if spatial:
+        primary, _context = spatial
+        primary_tokens = catalog_family_tokens(primary)
+        primary_family_tokens = set(catalog_family_token_sequence(primary))
+        if any(alternative <= primary_family_tokens for alternative in selected_alternatives):
+            # A complete selected family must occur independently before the
+            # relation. Apply every existing conflict rule to that primary;
+            # only later contextual object evidence is then out of scope.
+            return catalog_detail_matches_other_catalog_object_family(
+                primary_tokens, item, catalog_items,
+                selected_reference_established=selected_reference_established,
+                detail_text=primary,
+            )
 
     for candidate_id, entries in grouped.items():
         if candidate_id == selected_id:

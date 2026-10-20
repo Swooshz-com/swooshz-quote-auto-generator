@@ -10494,6 +10494,21 @@ function outputRowsToLineItems(rows = state.outputRows) {
   });
 }
 
+function pricingSelectionReviewMessage(row, rows) {
+  const rowId = String(row?.source_basis_line_id || "");
+  if (!rowId || rows.filter((item) => String(item?.source_basis_line_id || "") === rowId).length !== 1) return "";
+  const issues = (Array.isArray(state.pricingIssues) ? state.pricingIssues : []).filter((issue) => issue?.source_basis_line_id === rowId);
+  if (issues.length !== 1) return "";
+  const messages = {
+    unit_review_required: "The selected reference uses a different quantity unit. Review the unit and enter a price manually if needed.",
+    contradiction: "The selected reference does not match this item's details. Review the item and choose another reference or enter a price manually.",
+    not_in_catalogue: "The selected reference is unavailable. Choose another reference or enter a price manually.",
+    reference_changed: "The pricing reference has changed. Select a current reference or enter a price manually.",
+    ineligible: "This item needs pricing review. Choose a reference or enter a price manually.",
+  };
+  return Object.prototype.hasOwnProperty.call(messages, issues[0].reason) ? messages[issues[0].reason] : "";
+}
+
 function outputRowsValid(rows = state.outputRows) {
   const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
   const errors = [];
@@ -10514,7 +10529,7 @@ function outputRowsValid(rows = state.outputRows) {
       } else if (unitPrice !== null && unitPrice < 0) {
         errors.push(`${label}: Unit price must be 0 or greater.`);
       } else if (unitPrice === null && catalogUnitPrice === null) {
-        errors.push(`${label}: Unit price is required.`);
+        errors.push(`${label}: ${pricingSelectionReviewMessage(row, rows) || "Unit price is required."}`);
       }
     }
   });
@@ -13013,7 +13028,10 @@ function applyDraftLineItems(lineItems = []) {
 }
 
 async function refreshLineItemsFromServer() {
-  if (!state.lineItems.length) return { ok: true, data: { status: "normalized", line_items: [] } };
+  if (!state.lineItems.length) {
+    state.pricingIssues = [];
+    return { ok: true, data: { status: "normalized", line_items: [] } };
+  }
   let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
   if (selections.length && quoteSessionDraftSavePromise) {
     // The selection request saves this draft itself; let any earlier save land first, then read the
@@ -13033,6 +13051,10 @@ async function refreshLineItemsFromServer() {
     result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
   }
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
+  const refusalReasons = new Set(["unit_review_required", "contradiction", "not_in_catalogue", "reference_changed", "ineligible"]);
+  state.pricingIssues = (Array.isArray(result.data.selections) ? result.data.selections : [])
+    .filter((entry) => entry?.status === "refused" && typeof entry.source_basis_line_id === "string" && refusalReasons.has(entry.reason))
+    .map((entry) => ({ source_basis_line_id: entry.source_basis_line_id, reason: entry.reason }));
   state.lineItems = result.data.line_items.map((item) => (
     typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
   )).map(normalizeLineItem);
