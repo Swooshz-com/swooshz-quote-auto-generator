@@ -67,6 +67,40 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertTrue(webapp.catalog_line_contradicts_item(
             '[ nos work desk ] - wooden task seats at work desks', selected, catalog_items=[selected, other]))
 
+    def test_single_terminal_full_stop_preserves_spatial_primary_scope(self):
+        selected, other = self.catalogue()
+        for detail in ('wooden task seats at work desks.',
+                       'nos wooden task seat at work desks.',
+                       'nos. wooden task seat at work desks.',
+                       'high-top wooden task seats at work desks.'):
+            with self.subTest(detail=detail):
+                self.assertEqual(webapp.catalog_spatial_context_parts(detail)[1], 'work desks.')
+            for bracketed in (False, True):
+                text = '[ nos wooden task seat ] - ' + detail if bracketed else detail
+                with self.subTest(text=text):
+                    self.assertFalse(webapp.catalog_line_contradicts_item(
+                        text, selected, catalog_items=[selected, other]))
+        for detail in ('wooden task seats at work desks. Work desks supplied',
+                       'wooden task seats at work desks. Work desks supplied.',
+                       'wooden task seats at work desks..',
+                       'wooden task seats at work desks...',
+                       'wooden task seats at work desks ...',
+                       'wooden task seats at work desks; work desks supplied.',
+                       'wooden task seats at work desks - work desks supplied.',
+                       'wooden task seats, at work desks.',
+                       'wooden task seats at work desks and cabinets.',
+                       'No wooden task seats at work desks.'):
+            with self.subTest(detail=detail):
+                self.assertIsNone(webapp.catalog_spatial_context_parts(detail))
+                self.assertTrue(webapp.catalog_line_contradicts_item(
+                    '[ nos wooden task seat ] - ' + detail, selected, catalog_items=[selected, other]))
+        for bracketed in (False, True):
+            detail = 'metal task seats at work desks.'
+            text = '[ nos wooden task seat ] - ' + detail if bracketed else detail
+            with self.subTest(text=text):
+                self.assertTrue(webapp.catalog_line_contradicts_item(
+                    text, selected, catalog_items=[selected, other]))
+
     def test_context_material_cannot_mask_primary_attribute_conflict(self):
         selected, other = self.catalogue()
         other['description'] = 'nos wooden work desk'

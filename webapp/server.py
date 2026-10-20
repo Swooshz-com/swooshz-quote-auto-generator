@@ -5296,6 +5296,8 @@ def catalog_spatial_context_parts(value: Any) -> tuple[str, str] | None:
     """
     text = clean_customer_quote_line_text(value)
     scope_text = re.sub(r"^(?:sqm|m|nos?|pcs?|lot|sets?)\.\s+", "", text, flags=re.IGNORECASE)
+    # A single final full stop ends this phrase; ellipses and sentence breaks do not.
+    scope_text = re.sub(r"(?<!\.)\.$", "", scope_text)
     if re.search(r"\.(?:\s|$)|\s[-\u2013\u2014]\s", scope_text):
         return None
     if re.search(r"\b(?:no|not|never|nowhere|without|neither|nor|except|excluding|excluded|removed|omitted|deleted|absent|and|or|only)\b|\b[a-z]+n['\u2019]t\b|[,;:!?()\[\]/&+]", text, re.IGNORECASE):

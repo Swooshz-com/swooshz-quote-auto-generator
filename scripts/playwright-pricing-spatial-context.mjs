@@ -18,7 +18,7 @@ replaceOnce('const dirs = Object.fromEntries(["data", "output", "temp", "pricing
 const nativeRunRoot = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-spatial-"));
 const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles", "logs", "downloads"].map((name) => [name,
   path.join(["logs", "downloads"].includes(name) ? runRoot : nativeRunRoot, name)]));`);
-replaceOnce('Bar Stool seating around the display', 'Bar Stools at Round Tables');
+replaceOnce('Bar Stool seating around the display', 'Bar Stools at Round Tables.');
 replaceOnce('  // U2: Confirm Quotation Basis must show its preparing state before slow network work completes.', `
   const beforeConfirm = await page.evaluate(() => {
     const row = state.lineItems.find((entry) => entry.source_basis_line_id === "u1-count");
