@@ -1,6 +1,7 @@
 """Independent primary-object wording survives spatial catalogue context and ledger checks."""
 import copy
 import json
+import subprocess
 import unittest
 from tests import test_webapp as fixtures
 
@@ -12,6 +13,23 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.fixture = fixtures.WebappServerTest('test_ledger_units_share_quantity_basis_only_for_one_to_one_aliases')
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+
+    def test_rendered_confirm_partial_refusal_manual_review_and_current_xlsx(self):
+        # unittest discovery is a required CI gate after Chromium installation.
+        # Match the existing owner-UAT wrapper: missing Playwright is a failure,
+        # and require_node fails in CI (only a missing local Node may skip).
+        result = subprocess.run(
+            [fixtures.require_node(self), 'scripts/playwright-pricing-spatial-context.mjs'],
+            text=True, capture_output=True, cwd=fixtures.ROOT, timeout=180,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        evidence = json.loads(result.stdout)
+        self.assertEqual(evidence['status'], 'PASS')
+        self.assertEqual(evidence['selectionStatuses'], [200])
+        self.assertEqual(evidence['spatialBeforeConfirm']['price'], None)
+        self.assertEqual(evidence['saveReopen'], 'PASS')
+        self.assertEqual(evidence['xlsx']['status'], 'PASS')
+        self.assertEqual(json.loads(evidence['xlsx']['validator'])['bad'], [])
 
     @staticmethod
     def catalogue():
