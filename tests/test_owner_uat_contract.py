@@ -42,6 +42,9 @@ class OwnerUatContractTest(unittest.TestCase):
     def test_fxui_r05_r10_deferred_save_temporal_contract(self):
         self.browser_contract(dict(mode='temporal'))
 
+    def test_output_alignment_preserves_stable_row_identity_across_reference_sections(self):
+        self.assertEqual(self.browser_contract(dict(mode='alignment'))['status'], 'STABLE_ROW_SECTION_ALIGNMENT_PASS')
+
     def test_selected_suggestion_after_output_reaches_real_server_catalogue_admission(self):
         for owned in (False, True):
             with self.subTest(owned=owned):

@@ -87,6 +87,12 @@ npm run playwright:smoke
   latency. It checks trusted catalogue authority, FX-correct quoted price and
   amount, review-only rows staying `???`, Output edits, reopen and protected
   XLSX amounts bound to their own workbook rows plus the totals block.
+  Include a fresh Custom proposal with equivalent `pcs`/`nos` units and a
+  saved catalogue `reference_section` different from its canonical section.
+  Confirm must retain the server-admitted row and its authority by stable
+  source ID through Output, save/reopen and XLSX; unidentified or unrelated
+  rows still require section-compatible heuristic matching. The in-flight
+  save regression uses `--fresh-analysis` to cover this without an initial reopen.
 - Pricing trust is server state (the quote's `pricing_ledger`), never request
   JSON. A row keeps a catalogue price only while the server grants that exact
   row, item, reference digest and catalogue unit: an analysis match sealed by

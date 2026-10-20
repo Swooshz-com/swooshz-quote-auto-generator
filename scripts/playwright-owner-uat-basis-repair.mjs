@@ -18,6 +18,7 @@ const latencyMs = Number((args.find((arg) => arg.startsWith("--latency-ms=")) ||
 const cpuProfile = args.includes("--cpu-profile");
 // m2: start a draft autosave that is still in flight (delayed by --latency-ms) when Confirm is clicked.
 const inflightSave = args.includes("--inflight-save");
+const freshAnalysis = args.includes("--fresh-analysis");
 const cpuThrottle = Number((args.find((arg) => arg.startsWith("--cpu-throttle=")) || "--cpu-throttle=1").split("=")[1]);
 const profiledFunctions = (args.find((arg) => arg.startsWith("--profile=")) || "--profile=").split("=")[1].split(",").filter(Boolean);
 const extraCatalogItems = Number((args.find((arg) => arg.startsWith("--catalog-extra=")) || "--catalog-extra=0").split("=")[1]);
@@ -61,12 +62,15 @@ for (let index = 0; index < extraCatalogItems; index++) {
   const [section, unit] = catalogSpec[index % catalogSpec.length];
   catalog.push(catalogItem(section, unit, "Reference Variant " + String.fromCharCode(65 + (index % 26)) + Math.floor(index / 26) + " Kit", 10 + (index % 50), [], [], [1 + (index % catalogSpec.length), 100 + index]));
 }
+// Imported catalogues can preserve a source section distinct from their canonical category.
+catalog.find((item) => item.description.endsWith(" Bar Stool")).reference_section = "Seating and Hospitality";
 const byName = (name) => catalog.find((item) => item.description.endsWith(" " + name));
 
 // U1 owner cases: explicit selections the server records as pricing grants, a normal AI-confirmed row, and controls.
 const cases = [
   // M3: 2 lot is not 2 pieces; the selection is refused for unit review and the row stays unpriced.
   { id: "u1-video", kind: "unit-review", section: "AV Equipment Rental Items", text: "Large wall-mounted video display for exterior feature wall", quantity: 2, unit: "lot", select: "55 inch LED TV Monitor" },
+  { id: "u1-count", kind: "select", section: "Seating and Hospitality", text: "Bar Stool seating around the display", quantity: 4, unit: "pcs", select: "Bar Stool", proposal: true },
   { id: "u1-graphic", kind: "select", section: "Graphics and Printing", text: "Printed graphic on rear feature wall", quantity: 12.5, unit: "sqm", select: "Printed Wall Graphic" },
   { id: "u1-carpet", kind: "select", section: "Flooring", text: "Grey carpet tile flooring across the full booth footprint", quantity: 36, unit: "sqm", claim: "Printed Fabric Banner", select: "Grey Carpet Tile" },
   // Rows saved as HISTORICAL after a rejected AI claim. A fresh server-recorded selection on the reopened
@@ -85,7 +89,7 @@ const sections = new Map();
 const lineItems = [];
 for (const entry of cases) {
   const claimed = entry.claim ? byName(entry.claim) : null;
-  const line = { id: entry.id, tag: "Confirm", text: claimed && entry.kind === "confirm" ? claimed.description : entry.text, quantity: entry.quantity, unit: entry.unit, confidence_pct: 82 };
+  const line = { id: entry.id, tag: entry.proposal ? "Custom" : "Confirm", ...(entry.proposal ? { custom_pricing: true } : {}), text: claimed && entry.kind === "confirm" ? claimed.description : entry.text, quantity: entry.quantity, unit: entry.unit, confidence_pct: 82 };
   if (claimed) line.pricing_keyword = claimed.id;
   if (!sections.has(entry.section)) sections.set(entry.section, { id: slug(entry.section), title: entry.section, lines: [] });
   sections.get(entry.section).lines.push(line);
@@ -181,7 +185,7 @@ const summarize = (samples) => {
   }));
 };
 
-const result = { runRoot, fillerLines, latencyMs, cpuThrottle, inflightSave, catalogItems: catalog.length, cases: cases.length, selectionStatuses: [] };
+const result = { runRoot, fillerLines, latencyMs, cpuThrottle, inflightSave, freshAnalysis, catalogItems: catalog.length, cases: cases.length, selectionStatuses: [] };
 const timings = [];
 try {
   server = startServer();
@@ -246,36 +250,38 @@ try {
   await page.waitForFunction(() => state.quoteBasisSections.flatMap((section) => section.lines || []).length > 0 && !appIsBusy(), null, { timeout: 90000 });
   await page.waitForTimeout(500);
 
-  // Save the quote holding HISTORICAL rows (an earlier AI claim on them was rejected), then reopen it.
-  const historicalIds = cases.filter((entry) => ["historical", "legacy"].includes(entry.kind)).map((entry) => entry.id);
-  const historicalSessionId = await page.evaluate(async (ids) => {
-    state.lineItems = state.lineItems.map((item) => ids.includes(item.source_basis_line_id)
-      ? normalizeLineItem({ ...item, pricing_authority: { ...item.pricing_authority, variant: "historical" } })
-      : item);
-    await saveQuoteSessionDraftState({});
-    return state.quoteSessionId;
-  }, historicalIds);
-  const historicalShape = (draftState) => {
-    const lines = (draftState?.quoteBasisSections || []).flatMap((section) => section.lines || []);
-    return {
-      variants: historicalIds.map((id) => (draftState?.lineItems || []).find((item) => item.source_basis_line_id === id)?.pricing_authority?.variant),
-      offered: historicalIds.map((id) => (lines.find((line) => line.id === id)?.possible_pricing_matches || []).length),
-      receiptFields: lines.flatMap((line) => line.possible_pricing_matches || []).filter((match) => "selection_receipt" in match).length,
+  if (!freshAnalysis) {
+    // Save the quote holding HISTORICAL rows (an earlier AI claim on them was rejected), then reopen it.
+    const historicalIds = cases.filter((entry) => ["historical", "legacy"].includes(entry.kind)).map((entry) => entry.id);
+    const historicalSessionId = await page.evaluate(async (ids) => {
+      state.lineItems = state.lineItems.map((item) => ids.includes(item.source_basis_line_id)
+        ? normalizeLineItem({ ...item, pricing_authority: { ...item.pricing_authority, variant: "historical" } })
+        : item);
+      await saveQuoteSessionDraftState({});
+      return state.quoteSessionId;
+    }, historicalIds);
+    const historicalShape = (draftState) => {
+      const lines = (draftState?.quoteBasisSections || []).flatMap((section) => section.lines || []);
+      return {
+        variants: historicalIds.map((id) => (draftState?.lineItems || []).find((item) => item.source_basis_line_id === id)?.pricing_authority?.variant),
+        offered: historicalIds.map((id) => (lines.find((line) => line.id === id)?.possible_pricing_matches || []).length),
+        receiptFields: lines.flatMap((line) => line.possible_pricing_matches || []).filter((match) => "selection_receipt" in match).length,
+      };
     };
-  };
-  const savedDetail = (await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(historicalSessionId))).json()).quote_session;
-  const savedShape = historicalShape(savedDetail?.draft_state);
-  assert(savedShape.variants.every((variant) => variant === "historical") && savedShape.offered.every((count) => count > 0) && savedShape.receiptFields === 0, "saved HISTORICAL quote shape", savedShape);
-  // The server ledger tracks the saved rows; the browser only echoes their revisions back.
-  assert(historicalIds.every((id) => Number.isInteger(savedDetail?.pricing_ledger?.rows?.[id])), "saved quote has no server row revisions", savedDetail?.pricing_ledger);
-  assert(!JSON.stringify(savedDetail).includes('"grant"'), "server pricing grants leaked to the client", savedDetail?.pricing_ledger);
-  await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
-  if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
-  await page.locator("#quoteBasisPanel").waitFor({ state: "visible", timeout: 30000 });
-  const reopenedShape = await page.evaluate(() => ({ quoteSessionId: state.quoteSessionId, lifecycle: state.quoteCommercialLifecycle, lineItems: state.lineItems, quoteBasisSections: state.quoteBasisSections }));
-  assert(reopenedShape.quoteSessionId === historicalSessionId && JSON.stringify(historicalShape(reopenedShape)) === JSON.stringify(savedShape), "reopened HISTORICAL quote shape", { saved: savedShape, reopened: historicalShape(reopenedShape), lifecycle: reopenedShape.lifecycle });
-  result.historicalReopen = { lifecycle: reopenedShape.lifecycle, ...savedShape };
+    const savedDetail = (await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(historicalSessionId))).json()).quote_session;
+    const savedShape = historicalShape(savedDetail?.draft_state);
+    assert(savedShape.variants.every((variant) => variant === "historical") && savedShape.offered.every((count) => count > 0) && savedShape.receiptFields === 0, "saved HISTORICAL quote shape", savedShape);
+    // The server ledger tracks the saved rows; the browser only echoes their revisions back.
+    assert(historicalIds.every((id) => Number.isInteger(savedDetail?.pricing_ledger?.rows?.[id])), "saved quote has no server row revisions", savedDetail?.pricing_ledger);
+    assert(!JSON.stringify(savedDetail).includes('"grant"'), "server pricing grants leaked to the client", savedDetail?.pricing_ledger);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
+    if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
+    await page.locator("#quoteBasisPanel").waitFor({ state: "visible", timeout: 30000 });
+    const reopenedShape = await page.evaluate(() => ({ quoteSessionId: state.quoteSessionId, lifecycle: state.quoteCommercialLifecycle, lineItems: state.lineItems, quoteBasisSections: state.quoteBasisSections }));
+    assert(reopenedShape.quoteSessionId === historicalSessionId && JSON.stringify(historicalShape(reopenedShape)) === JSON.stringify(savedShape), "reopened HISTORICAL quote shape", { saved: savedShape, reopened: historicalShape(reopenedShape), lifecycle: reopenedShape.lifecycle });
+    result.historicalReopen = { lifecycle: reopenedShape.lifecycle, ...savedShape };
+  }
 
   // Function-level attribution of each click (classic-script globals are rebindable).
   await page.evaluate((profiledNames) => {
@@ -295,6 +301,12 @@ try {
   const draftLines = await page.evaluate(() => state.quoteBasisSections.flatMap((section) => (section.lines || []).map((line) => ({ id: line.id, tag: line.tag, keyword: line.pricing_keyword || "", matches: (line.possible_pricing_matches || []).map((match) => match.pricing_keyword) }))));
   await writeJson("draft-lines.json", draftLines);
   result.basisLines = draftLines.length;
+  result.countProposalBeforeConfirm = await page.evaluate(() => {
+    const line = state.quoteBasisSections.flatMap((section) => section.lines || []).find((entry) => entry.id === "u1-count");
+    const row = state.lineItems.find((entry) => entry.source_basis_line_id === "u1-count");
+    return { tag: line?.tag, custom: line?.custom_pricing, variant: row?.pricing_authority?.variant, unit: row?.unit };
+  });
+  assert((result.countProposalBeforeConfirm.tag === "Custom" || result.countProposalBeforeConfirm.custom) && !["catalog", "manual", "included"].includes(result.countProposalBeforeConfirm.variant), "count selection must start as an unpriced AI proposal", result.countProposalBeforeConfirm);
 
   // U2: tick / cross / possible-match responsiveness on the large basis.
   const fillers = cases.filter((entry) => entry.kind === "filler");
@@ -343,6 +355,7 @@ try {
   assert(!unresolved.reason, "basis still blocked after resolving every line", unresolved);
 
   // U2: Confirm Quotation Basis must show its preparing state before slow network work completes.
+  const selectionResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/quote-sessions/pricing-selections");
   const confirmStarted = Date.now();
   const networkBefore = network.length;
   await page.evaluate(() => { window.__ownerUatProfile = {}; window.__ownerUatEvents = []; });
@@ -357,6 +370,17 @@ try {
   const confirmEvents = await page.evaluate(() => ({ events: window.__ownerUatEvents, profile: window.__ownerUatProfile }));
   await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 90000 });
   await page.waitForFunction(() => !state.isPreparingOutput && !appIsBusy(), null, { timeout: 90000 });
+  const selectionHttpResponse = await selectionResponse;
+  const selectionBody = await selectionHttpResponse.json();
+  const selectionRequest = selectionHttpResponse.request().postDataJSON();
+  result.selectedCountRequest = selectionRequest.pricing_selections.find((entry) => entry.source_basis_line_id === "u1-count");
+  assert(result.selectedCountRequest?.catalog_item_id === byName("Bar Stool").id && Number.isInteger(result.selectedCountRequest?.expected_revision), "Confirm did not submit this row and selected item revision", result.selectedCountRequest);
+  result.selectionOutcomes = selectionBody.selections;
+  const selectedCount = selectionBody.line_items.find((row) => row.source_basis_line_id === "u1-count");
+  const pricingBasis = await page.evaluate(() => collectQuoteDetails().commercial_snapshot.pricing_basis);
+  assert(selectionBody.selections.some((entry) => entry.source_basis_line_id === "u1-count" && entry.status === "selected"), "count proposal was not admitted at Confirm", selectionBody.selections);
+  assert(selectedCount?.pricing_authority?.variant === "catalog" && selectedCount.pricing_authority.catalog_item_id === byName("Bar Stool").id && selectedCount.pricing_authority.catalog_digest === pricingBasis.digest && selectedCount.pricing_reference_id === pricingBasis.id && selectedCount.pricing_authority.price === byName("Bar Stool").sale_unit_price, "server admission did not bind the selected row to the current reference", selectedCount);
+  result.selectedCountBoundary = { section: selectedCount.section, authority: selectedCount.pricing_authority, pricingBasis };
   result.confirm = {
     preparingVisibleMs, preparingTitle, outputReadyMs: Date.now() - confirmStarted,
     clickEventDurationMs: Math.max(0, ...confirmEvents.events.filter((entry) => ["click", "pointerup"].includes(entry.name)).map((entry) => entry.duration)),
