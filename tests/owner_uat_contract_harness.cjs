@@ -55,7 +55,7 @@ function filteredDashboardSessions(){return state.dashboardSearch?[]:state.quote
 function pagedDashboardSessions(v){return v;}
 function dashboardPageRange(n){return {start:n?1:0,end:n};}
 function dashboardDateFilterSummaryText(){return '';}
-for (const name of ['numberOrNull','formatAmount','pricingAuthorityPrice','pricingAuthorityNumber','unitPriceEditKind','roundCommercialCents','quoteFxMultiplier','quoteAmountValue','effectiveOutputUnitPrice','synchronizeOwnedOutputRowPrice','recalculateOutputRow','outputPriceAuthority','outputPriceDenomination','admittedOutputPrice','revokeOutputEditor','resumeBlockedOutputDraftSave','preserveOutputRowIdentity','outputRowIdentity','outputCellDisplayValue','outputEditorPlaceholder','outputEditorHtml','commitOutputEditor','applyPossiblePricingMatch','renderQuoteDashboard']) eval(extract(name));
+for (const name of ['normalizeUnit','numberOrNull','formatAmount','pricingAuthorityPrice','pricingAuthorityNumber','unitPriceEditKind','roundCommercialCents','quoteFxMultiplier','quoteAmountValue','effectiveOutputUnitPrice','synchronizeOwnedOutputRowPrice','recalculateOutputRow','outputPriceAuthority','outputPriceDenomination','admittedOutputPrice','revokeOutputEditor','resumeBlockedOutputDraftSave','preserveOutputRowIdentity','outputRowIdentity','outputCellDisplayValue','outputEditorPlaceholder','outputEditorHtml','commitOutputEditor','applyPossiblePricingMatch','renderQuoteDashboard']) eval(extract(name));
 if(source.includes('function outputRowFxMultiplier('))eval(extract('outputRowFxMultiplier'));
 if (input.mode==='reopen') {
   for(const variant of ['manual','catalog']) for(const denomination of variant==='catalog'?['reference']:['reference','quote']) {
