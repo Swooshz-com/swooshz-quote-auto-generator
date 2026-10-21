@@ -6,8 +6,8 @@ Source of truth: `.github/workflows/ci.yml`
 
 ## Hosted Alpha Trigger State
 
-The owner-approved Alpha 2 isolation work under #260 changed only the accepted
-Alpha 1 source/trigger metadata. Alpha 1 now follows deployment/alpha1 at
+Within Alpha 1's Coolify app, the owner-approved Alpha 2 isolation work under
+#260 changed only source/trigger metadata. Alpha 1 now follows deployment/alpha1 at
 292eb58769085d43831b278715f35b3749101290, with automatic Git deployments
 and PR previews disabled. Its existing running container, image, origin,
 runtime environment and resource limits were preserved; the change queued no
@@ -24,22 +24,31 @@ distinct TEST workspace. Independent session/tracking keys, the existing
 provider key, shared Google OAuth client, shared object bucket/runtime keys
 and exact approved tester map are bound through the server secret manager for
 runtime use only. Preview secret values and the preview tester map remain
-empty. The distinct TEST database URL remains unbound. Shared storage uses the
-application's workspace key namespace; credentials and provider failure
-boundaries are shared, with no provider-level prefix isolation claim. This is
+empty. The distinct TEST runtime database URL is bound after canonical
+migration 010 and actual runtime/migrator/maintenance POST checks passed.
+Shared storage uses the application's workspace key namespace; credentials
+and provider failure boundaries are shared, with no provider-level prefix isolation claim. This is
 an unqualified stopped baseline scaffold, not a working Alpha 2 environment or
 owner UAT pass.
 
 The shared Google client has an additive Alpha 2 callback; existing callbacks
 were retained. Owner-saved DNS is verified, without implying HTTPS readiness.
-CI continues to validate source only. Alpha 2 activation still depends on
-qualified TEST database credentials and migration state, isolated session and
-live artifact checks, TLS routing, durable image recovery with restore proof,
-and bounded resource observation/containment.
-Future Alpha 2 builds must use a separately reviewed off-host private-image
-route; no image build/publish or automatic deployment workflow is enabled by
-this status update. Do not merge Alpha 2 product work as evidence of runtime
-qualification, owner acceptance or independent review.
+Accepted-image custody and actual isolated local load identity proof passed
+without running the app. The disposable schema/ledger-only restore, full ACL
+projections and failed-transaction rollback drill passed; full TEST business
+data restoration is not established. The owned local fixture was removed and
+the local engine's original stopped state restored.
+
+CI continues to validate source only. Alpha 2 activation still depends on TEST
+workspace occupancy and authenticated session/persistence checks, live artifact
+checks, TLS routing, a qualified immutable registry image route, and a bounded
+host-side observer/containment path that survives controller or SSH loss.
+The installed Docker-image deployment performs a remote image pull; a cached
+local image plus digest metadata alone is not a qualified activation route.
+The proposed off-host private registry destination, pull credentials and inert
+build workflow still require review. No image build/publish or automatic
+deployment workflow is enabled by this status update. Do not merge Alpha 2
+product work as evidence of runtime qualification, owner acceptance or independent review.
 
 ## Active Workflow
 
