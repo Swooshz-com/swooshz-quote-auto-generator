@@ -659,10 +659,6 @@ OPENAI_BASIS_ANSWER_MODEL_ENV_NAME = "OPENAI_BASIS_ANSWER_MODEL"
 OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_REASONING_EFFORT"
 OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
 OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
-OPENAI_MODEL_REASONING_EFFORTS = {
-    "gpt-6-luna": frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
-    "gpt-6.1-sol": frozenset({"low", "medium", "high", "xhigh", "max"}),
-}
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
@@ -18842,8 +18838,13 @@ def configured_openai_route_model(env_name: str, fallback: str) -> str:
     return raw if raw != "" else fallback
 
 
-def supported_openai_draft_reasoning_efforts(model: str) -> set[str] | frozenset[str]:
-    return OPENAI_MODEL_REASONING_EFFORTS.get(model, frozenset())
+def valid_openai_model_identifier(value: Any) -> bool:
+    """Bound syntax only; the provider owns model availability and compatibility."""
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", value) is not None
+
+
+def valid_openai_reasoning_effort(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is not None
 
 
 @dataclass(frozen=True, repr=False)
@@ -18874,7 +18875,9 @@ def validated_provider_model_label(provider: str, value: Any) -> str:
     if not isinstance(value, str):
         return ""
     provider_value = clean_text(provider).lower()
-    if provider_value == AI_PROVIDER_OPENAI and value in OPENAI_MODEL_REASONING_EFFORTS:
+    # Syntax admission is not permission to persist arbitrary operator settings.
+    # Only the fixed support-route model has a source-owned public label.
+    if provider_value == AI_PROVIDER_OPENAI and value == OPENAI_BASIS_LINE_MODEL:
         return value
     if provider_value == AI_PROVIDER_DEEPSEEK and value in {DEEPSEEK_PRO_MODEL, DEEPSEEK_FLASH_MODEL}:
         return value
@@ -19032,7 +19035,6 @@ def validate_openai_small_route_model(model: str, effort: str = OPENAI_SMALL_REA
     if (
         model != OPENAI_BASIS_LINE_MODEL
         or effort != OPENAI_SMALL_REASONING_EFFORT
-        or effort not in supported_openai_draft_reasoning_efforts(model)
     ):
         openai_request_configuration_invalid()
 
@@ -19048,7 +19050,11 @@ def begin_ai_transport_operation(feature: str, provider: str, model: str) -> dic
         "request_validation": False,
     }
     AI_LOG_TRACKING_CONTEXT.transport_operation = operation
-    if not validated_provider_model_label(provider_value, model):
+    if not (
+        valid_openai_model_identifier(model)
+        if provider_value == AI_PROVIDER_OPENAI
+        else validated_provider_model_label(provider_value, model)
+    ):
         operation["request_validation"] = True
         openai_request_configuration_invalid()
     return operation
@@ -19075,7 +19081,11 @@ def next_ai_transport_send_number(feature: str, provider: str, model: str) -> in
         operation = begin_ai_transport_operation(feature, provider, model)
     if operation.get("request_validation") is True:
         openai_request_configuration_invalid()
-    if not validated_provider_model_label(provider, model):
+    if not (
+        valid_openai_model_identifier(model)
+        if clean_text(provider).lower() == AI_PROVIDER_OPENAI
+        else validated_provider_model_label(provider, model)
+    ):
         operation["request_validation"] = True
         openai_request_configuration_invalid()
     operation["attempt_number"] = int(operation.get("attempt_number", 0)) + 1
@@ -25629,7 +25639,7 @@ def validate_draft_responses_envelope(
         draft_request_invalid()
     if body["reasoning"] != {"effort": configured_effort}:
         draft_request_invalid()
-    if configured_effort not in supported_openai_draft_reasoning_efforts(configured_model):
+    if not valid_openai_model_identifier(configured_model) or not valid_openai_reasoning_effort(configured_effort):
         draft_request_invalid()
     messages = body["input"]
     if not isinstance(messages, list) or len(messages) != 1:

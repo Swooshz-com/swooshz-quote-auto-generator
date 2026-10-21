@@ -33296,7 +33296,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             {
                 "provider": "openai",
                 "nested": ({"model": ""},),
-                "model_candidates": ("gpt-6.1-sol", ""),
+                "model_candidates": ("", ""),
             },
         )
         self.assertEqual(
@@ -33308,7 +33308,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         })
         self.assertEqual(
             missing_provider["generation_configuration"],
-            {"model": "gpt-6.1-sol"},
+            {"model": ""},
         )
         unknown_pair = webapp.project_generation_configuration_evidence({
             "generation_configuration": {
@@ -33324,6 +33324,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
     def test_generation_model_canaries_are_projected_before_compaction_and_actual_persistence(self):
         canaries = (
             "PRIVATE_CANARY/customer confidential note",
+            "PRIVATE_CANARY-future-model",
             "!!!",
             "private@example.invalid",
             "model\nPRIVATE_CANARY",

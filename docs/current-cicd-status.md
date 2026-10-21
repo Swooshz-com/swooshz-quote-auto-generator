@@ -135,11 +135,15 @@ Source of truth: `.github/workflows/ci.yml`
   `OPENAI_DRAFT_REASONING_EFFORT`, `OPENAI_DRAFT_HIGH_QUALITY_MODEL`, and
   `OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Each operation captures its
   selected mode's pair once for payload validation and telemetry. Missing, blank
-  or API-incompatible settings fail before provider transport; source defaults
+  or malformed settings fail before provider transport; source defaults
   and local `.env` values cannot fill deployed gaps. The requested runtime pairs
-  are `gpt-6.1-sol/high` and `gpt-6.1-sol/max`; supported configured alternatives
-  are validated without a source-enforced pair. Local development retains `.env`
-  support. These request checks do not change process-only liveness or perform
+  are `gpt-6.1-sol/high` and `gpt-6-astra/high`. Bounded model and effort
+  identifiers pass through without a source allowlist. The provider owns model
+  access, reasoning compatibility and image/PDF capability; an incompatible pair
+  fails truthfully after one send without a model/effort downgrade. Arbitrary
+  configured model labels are redacted from logs, telemetry and evidence. Local
+  development retains `.env` support. These request checks do not change
+  process-only liveness or perform
   configuration mutation, deployment or provider verification.
 - `APP_MODE=deploy` requires an explicit `SQAG_AUTH_MODE` of `platform` or
   `internal_google`, plus `AUTH_REQUIRED=true`; missing, unknown, local, mixed,
