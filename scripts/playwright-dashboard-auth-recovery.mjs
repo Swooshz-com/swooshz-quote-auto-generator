@@ -589,9 +589,14 @@ async function runAdditionalCases() {
     await rejectedDashboard(page);
     await page.waitForURL(base + "/login");
     await page.unroute("**/login");
-    await page.route("**/api/session", route => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...originalSession, browser_recovery_scope: scope + "-other-identity", user: { subject: "synthetic-other-subject" } }) }));
+    // The new identity has a valid session; retire the old identity's expired
+    // Dashboard response before booting so it cannot start another login.
+    await page.unroute("**/api/quote-sessions");
+    await page.route("**/api/quote-sessions", route => route.fulfill({ status: 200, contentType: "application/json", body: '{"quote_sessions":[]}' }));
+    const nextScope = scope + "-other-identity";
+    await page.route("**/api/session", route => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...originalSession, browser_recovery_scope: nextScope, user: { subject: "synthetic-other-subject" } }) }));
     await page.goto(base);
-    await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+    await page.waitForFunction(expectedScope => typeof state !== "undefined" && !state.isBooting && !state.isRecoveryScopeTransitioning && !state.isPageUnloading && currentBrowserRecoveryScope() === expectedScope, nextScope);
     assert.notEqual(await page.locator("#clientName").inputValue(), "Synthetic unsaved customer");
     assert.equal(await page.evaluate(() => state.images.length), 0);
     assert.notEqual(await page.evaluate(() => state.quoteSessionId), "quote-auth-recovery-synthetic");
