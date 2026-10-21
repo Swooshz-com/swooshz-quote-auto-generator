@@ -20470,6 +20470,8 @@ const state = {
 let routedPanel = "";
 let nextCalls = 0;
 let saveCalls = 0;
+function appIsBusy() { return false; }
+async function withQuoteStepLoading(operation) { return await operation(); }
 function hideQuoteDependencyConfirmModal() { state.pendingQuoteDependencyChanges = []; }
 function applyPendingPricingReferenceSelection() { return true; }
 function clearGeneratedQuoteState() {}
@@ -21165,9 +21167,9 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn('workspacePaneFooter: qs(".workspace-pane-footer")', js)
         self.assertIn('workspacePaneFooter.classList.toggle("is-output-step", isOutputStep)', js)
         self.assertIn('elements.sideDownloadButton.addEventListener("click", async (event) => {', js)
-        self.assertIn('elements.sideViewPdfButton.addEventListener("click", async (event) => {', js)
+        self.assertIn('elements.sideViewPdfButton.addEventListener("click", handleViewPdf);', js)
         download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
-        pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
+        pdf_handler = js.split("async function handleViewPdf(event)", 1)[1].split("function pricingMatchStatus", 1)[0]
         loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function generationFinalizingModalOptions", 1)[0]
         finalizing_options_body = js.split("function generationFinalizingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
         resumed_generation_body = js.split('if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {', 1)[1].split("async function checkHealth", 1)[0]
@@ -21181,6 +21183,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("await handleGenerate();", download_handler)
         self.assertIn("downloadCurrentExcelFile();", download_handler)
         self.assertIn("hideExcelGeneratingModal();", download_handler)
+        self.assertIn("if (pdfFileIsFresh(state.pdfFile)) return viewCurrentPdfFile();", pdf_handler)
         self.assertIn("await handleGenerate({ viewPdf: true });", pdf_handler)
         self.assertIn("viewCurrentPdfFile(state.pdfFile, pdfWindow);", pdf_handler)
         self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile(state.pdfFile, pdfWindow);"))
@@ -34675,6 +34678,24 @@ async function main() {
     const diagnostic = await page.evaluate(() => typeof state === "undefined" ? { appStateAvailable: false } : ({
       appStateAvailable: true, panel: state.activeSidePanel, sessionId: state.quoteSessionId,
       checkpointCurrent: customerStepCheckpointIsCurrent(), restoreBusy: state.quoteSessionRestoreBusy,
+      checkpointDifferences: (() => {
+        const saved = state.customerStepCheckpoint;
+        const current = customerStepCheckpointForCurrent();
+        return { savedPresent: Boolean(saved), currentPresent: Boolean(current),
+          differentCustomerPaths: (() => {
+            const changed = [];
+            function compare(left, right, path = "customer") {
+              if (quoteCommercialStrictDataEqual(left, right)) return;
+              if (isPlainObject(left) && isPlainObject(right)) {
+                for (const key of new Set([...Object.keys(left), ...Object.keys(right)])) compare(left[key], right[key], path + "." + key);
+              } else changed.push({ path, savedType: typeof left, currentType: typeof right });
+            }
+            compare(saved?.customer, current?.customer);
+            return changed;
+          })(),
+          differentFields: [...new Set([...Object.keys(saved || {}), ...Object.keys(current || {})])]
+            .filter((key) => !quoteCommercialStrictDataEqual(saved?.[key], current?.[key])) };
+      })(),
       restoreError: state.quoteSessionLoadError || "",
     })).catch((captureError) => ({ captureError: String(captureError) }));
     console.error(JSON.stringify({ scope: exerciseRestoration ? "alpha2" : "alpha1", diagnostic, consoleProblems }));

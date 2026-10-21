@@ -13,6 +13,7 @@ const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
 const { chromium, request } = createRequire(path.join(sourceRoot, "package.json"))("playwright");
 const args = process.argv.slice(2);
 const measureOnly = args.includes("--measure-only");
+const reliability = args.includes("--alpha2-reliability");
 const fillerLines = Number((args.find((arg) => arg.startsWith("--lines=")) || "--lines=60").split("=")[1]);
 const latencyMs = Number((args.find((arg) => arg.startsWith("--latency-ms=")) || "--latency-ms=1500").split("=")[1]);
 const cpuProfile = args.includes("--cpu-profile");
@@ -104,10 +105,23 @@ await fs.writeFile(path.join(fixtureDir, "pricing-catalog.json"), JSON.stringify
 const canonicalize = spawnSync(python, ["-c", "import json,sys; sys.path.insert(0, sys.argv[1]); from webapp import server as w; p=sys.argv[2]; d=json.load(open(p, encoding='utf-8')); open(p, 'w', encoding='utf-8').write(json.dumps(w.pricing_reference_catalog_payload(d), indent=2))", sourceRoot, path.join(fixtureDir, "pricing-catalog.json")], { cwd: sourceRoot, windowsHide: true, encoding: "utf8", env: { ...process.env, SQAG_DISABLE_DOTENV: "1" } });
 if (canonicalize.status !== 0) throw new Error("catalogue canonicalisation failed: " + canonicalize.stderr);
 for (const item of JSON.parse(await fs.readFile(path.join(fixtureDir, "pricing-catalog.json"), "utf8")).items) catalog[catalog.findIndex((entry) => entry.id === item.id)] = item;
+if (reliability) {
+  const secondDir = path.join(dirs.pricing, fixtureId + "-replacement");
+  await fs.cp(fixtureDir, secondDir, { recursive: true });
+  const metadata = JSON.parse(await fs.readFile(path.join(secondDir, "reference.json"), "utf8"));
+  metadata.id = fixtureId + "-replacement";
+  metadata.label = "Synthetic Replacement Reference";
+  await fs.writeFile(path.join(secondDir, "reference.json"), JSON.stringify(metadata));
+  const replacement = JSON.parse(await fs.readFile(path.join(secondDir, "pricing-catalog.json"), "utf8"));
+  for (const item of replacement.items) item.sale_unit_price += 1;
+  await fs.writeFile(path.join(secondDir, "pricing-catalog.json"), JSON.stringify(replacement));
+}
 await fs.cp(path.join(sourceRoot, "tests/fixtures/quote-generator/profiles", profileId), path.join(dirs.profiles, profileId), { recursive: true });
 
 let server, browser, serverErr = "";
 const network = [];
+let checkpointGate = null;
+let detailFailurePath = "";
 function startServer() {
   const child = spawn(python, [path.join(sourceRoot, "tests/alpha1_fresh_mock_harness.py"), sourceRoot, dirs.data, dirs.output, dirs.temp, dirs.logs, dirs.pricing, dirs.profiles, scenarioPath], {
     cwd: sourceRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
@@ -203,6 +217,18 @@ try {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.origin !== baseUrl) return route.abort();
+    if (detailFailurePath && url.pathname === detailFailurePath && route.request().method() === "GET") {
+      detailFailurePath = "";
+      return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "failed", error_reference: "ERR-1234ABCD" }) });
+    }
+    if (checkpointGate && url.pathname === "/api/quote-sessions" && route.request().method() === "POST"
+      && route.request().postDataJSON()?.draft_state?.customerStepCheckpoint) {
+      const gate = checkpointGate;
+      gate.requests += 1;
+      gate.arrived();
+      await gate.wait;
+      if (gate.fail) return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "failed", error_reference: "ERR-1234ABCD" }) });
+    }
     // Model hosted round-trip latency on the endpoints the basis flow waits for.
     if (latencyMs > 0 && route.request().method() === "POST" && ["/api/line-items/normalize", "/api/quote-sessions", "/api/quote-sessions/pricing-selections"].includes(url.pathname)) {
       await new Promise((resolve) => setTimeout(resolve, latencyMs));
@@ -236,7 +262,40 @@ try {
     await page.locator("#quoteExchangeRate").fill(String(fxRate));
     await page.locator("#quoteExchangeRate").press("Tab");
   }
-  await page.locator("#sideNextButton").click();
+  if (reliability) {
+    for (const fail of [true, false]) {
+      let release, arrived;
+      const arrival = new Promise((resolve) => { arrived = resolve; });
+      checkpointGate = { fail, requests: 0, arrived, wait: new Promise((resolve) => { release = resolve; }) };
+      checkpointGate.release = release;
+      await page.locator("#sideNextButton").click();
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible" });
+      if (fail) await page.screenshot({ path: path.join(runRoot, "customer-next-pending.png") });
+      await page.waitForFunction(() => state.customerStepCheckpointSaveBusy);
+      // Repeated activation cannot enqueue another checkpoint while its acknowledgement is pending.
+      await page.evaluate(() => { void goToNextSidePanel(); });
+      await page.waitForFunction(() => document.querySelector("#sideNextButton").getAttribute("aria-disabled") === "true");
+      let arrivalTimer;
+      try {
+        await Promise.race([arrival, new Promise((_, reject) => { arrivalTimer = setTimeout(() => reject(new Error("Customer checkpoint request did not arrive")), 30000); })]);
+      } finally { clearTimeout(arrivalTimer); }
+      assert(checkpointGate.requests === 1, "Customer Next dispatched duplicate checkpoint requests", checkpointGate.requests);
+      release();
+      await page.waitForFunction(() => !appIsBusy() && !state.customerStepCheckpointSaveBusy);
+      if (fail) {
+        assert(await page.evaluate(() => state.activeSidePanel === "customer" && !customerStepCheckpointIsCurrent()), "failed Customer save advanced or unlocked the flow");
+        assert(await page.locator("#excelGeneratingModal").isVisible() && (await page.locator("#excelGeneratingMessage").innerText()).includes("could not be saved")
+          && !(await page.locator("#excelGeneratingSpinner").isVisible()), "Customer failure not visible or spinner retained");
+        await page.screenshot({ path: path.join(runRoot, "customer-save-failure.png") });
+        await page.locator("#excelGeneratingCloseButton").click();
+      }
+      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden" });
+      checkpointGate = null;
+    }
+    result.customerNextFailureRetry = "PASS";
+  } else {
+    await page.locator("#sideNextButton").click();
+  }
   await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
   const preset = await page.locator("#presetSelect option").evaluateAll((options, id) => options.map((o) => o.value).find((value) => value.startsWith("profile:" + id + ":")), profileId);
   await page.locator("#presetSelect").selectOption(preset);
@@ -274,6 +333,41 @@ try {
     // The server ledger tracks the saved rows; the browser only echoes their revisions back.
     assert(historicalIds.every((id) => Number.isInteger(savedDetail?.pricing_ledger?.rows?.[id])), "saved quote has no server row revisions", savedDetail?.pricing_ledger);
     assert(!JSON.stringify(savedDetail).includes('"grant"'), "server pricing grants leaked to the client", savedDetail?.pricing_ledger);
+    if (reliability) {
+      await page.evaluate((id) => {
+        clearQuoteSessionDraftSaveTimer();
+        showDashboard({ load: false });
+        state.dashboardActiveSessionId = id;
+        state.dashboardSelectedSessionIds = [id];
+        renderQuoteDashboard();
+      }, historicalSessionId);
+      const beforeFailure = await page.evaluate((id) => ({
+        summary: JSON.stringify(dashboardSessionById(id)),
+        current: (() => { const draft = currentQuoteSessionDraftState(); delete draft.savedAt; return JSON.stringify(draft); })(),
+        sessionId: state.quoteSessionId,
+      }), historicalSessionId);
+      for (const action of ["modify-session", "duplicate-session"]) {
+        detailFailurePath = "/api/quote-sessions/" + encodeURIComponent(historicalSessionId);
+        const beforePosts = network.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length;
+        await page.locator('[data-dashboard-panel-action="' + action + '"]').click();
+        await page.waitForFunction(() => !state.quoteSessionRestoreBusy && !state.quoteSessionDashboardBusy);
+        const afterFailure = await page.evaluate((id) => ({
+          summary: JSON.stringify(dashboardSessionById(id)),
+          current: (() => { const draft = currentQuoteSessionDraftState(); delete draft.savedAt; return JSON.stringify(draft); })(),
+          sessionId: state.quoteSessionId,
+          view: state.activeAppView, error: state.quoteSessionLoadError,
+        }), historicalSessionId);
+        assert(afterFailure.summary === beforeFailure.summary && afterFailure.current === beforeFailure.current
+          && afterFailure.sessionId === beforeFailure.sessionId && afterFailure.view === "dashboard" && afterFailure.error,
+          "failed detail request changed saved/current quote or hid failure", { action, summaryUnchanged: afterFailure.summary === beforeFailure.summary, currentUnchanged: afterFailure.current === beforeFailure.current, view: afterFailure.view, hasError: Boolean(afterFailure.error) });
+        assert(network.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length === beforePosts,
+          "failed detail request saved or duplicated a quote", action);
+      }
+      await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+      await page.waitForFunction((id) => state.quoteSessionId === id && state.activeAppView === "quote" && !appIsBusy(), historicalSessionId);
+      assert(await page.evaluate(() => !state.quoteSessionLoadError), "successful retry retained a stale load error");
+      result.dashboardDetailFailureRetry = "PASS";
+    }
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
     if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
@@ -554,6 +648,62 @@ try {
     const exitCode = await new Promise((resolve) => check.once("close", resolve));
     assert(exitCode === 0, "XLSX amounts", checkOut);
     result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };
+    if (reliability) {
+      await page.locator("#backToDashboardButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard");
+      await page.locator('[data-quote-session-id="' + sessionId + '"]').first().click();
+      await page.locator('[data-dashboard-panel-action="duplicate-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.dashboardActiveSessionId && state.dashboardActiveSessionId !== id, sessionId);
+      const duplicateId = await page.evaluate(() => state.dashboardActiveSessionId);
+      await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, duplicateId);
+      await page.locator('button[data-side-panel="customer"]').click();
+      const replacementOption = await page.locator("#profileSelect option").evaluateAll((options, id) => options.map((option) => option.value).find((value) => value.endsWith("::" + id)), fixtureId + "-replacement");
+      assert(replacementOption, "replacement reference is absent");
+      await page.locator("#profileSelect").selectOption(replacementOption);
+      const beforeChange = await page.evaluate(() => ({ rows: JSON.stringify(state.outputRows), reference: state.pricingReferenceId }));
+      await page.locator("#sideNextButton").click();
+      await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "visible" });
+      assert(!(await page.locator("#excelGeneratingModal").isVisible()), "dependency confirmation started a loading request");
+      await page.locator("#cancelQuoteDependencyConfirmButton").click();
+      assert(await page.evaluate((before) => JSON.stringify(state.outputRows) === before.rows && state.pricingReferenceId === before.reference, beforeChange), "cancelled reference change altered output");
+      await page.locator("#sideNextButton").click();
+      await page.locator("#confirmQuoteDependencyChangeButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeSidePanel === "quote_company");
+      assert(await page.evaluate((id) => state.pricingReferenceId === id && !state.outputRows.length && !state.lineItems.length && !state.basisConfirmed, fixtureId + "-replacement"), "reference change kept old output or authority");
+      assert(!(await page.locator("#analysisConfirmModal").isVisible()), "reference change auto-started analysis confirmation");
+      await page.locator("#sideNextButton").click();
+      await page.locator("#analysisConfirmModal").waitFor({ state: "visible" });
+      assert(!(await page.locator("#excelGeneratingModal").isVisible()), "analysis choice was treated as pending work");
+      await page.locator("#analysisConfirmStartButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeSidePanel === "basis" && state.quoteBasisSections.length);
+      for (let guard = 0; guard < cases.length + 10; guard++) {
+        const pending = await page.evaluate(() => {
+          for (const section of state.quoteBasisSections) {
+            const index = (section.lines || []).findIndex((line) => !basisLineIsInformationalDimension(line) && (normalizeBasisTag(line.tag) === "Confirm" || isPendingAiProposalLine(line)));
+            if (index >= 0) return { section: section.id, index };
+          }
+          return null;
+        });
+        if (!pending) break;
+        await page.locator('#basisReviewSurface [data-basis-section="' + pending.section + '"][data-basis-line-index="' + pending.index + "\"][data-basis-tag]:not([data-basis-tag='Exclude'])").first().click();
+      }
+      const normalizeBefore = network.filter((entry) => entry.method === "POST" && entry.path === "/api/line-items/normalize").length;
+      await page.locator("#sideNextButton").click();
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible" });
+      await page.evaluate(() => { void goToNextSidePanel(); });
+      await page.waitForFunction(() => !appIsBusy() && state.activeSidePanel === "output");
+      assert(network.filter((entry) => entry.method === "POST" && entry.path === "/api/line-items/normalize").length === normalizeBefore + 1,
+        "Duplicate/reference Confirm dispatched more than once");
+      const confirmed = await page.evaluate(() => {
+        const row = state.outputRows.find((item) => item.source_basis_line_id === "u1-confirmed");
+        return { reference: state.pricingReferenceId, confirmed: state.basisConfirmed, price: pricingAuthorityPrice(outputPriceAuthority(row)), variant: outputPriceAuthority(row)?.variant };
+      });
+      assert(confirmed.confirmed && confirmed.reference === fixtureId + "-replacement" && confirmed.variant === "catalog"
+        && confirmed.price === byName("6 inch Spotlight").sale_unit_price + 1, "first Confirm after Duplicate/reference change did not admit the new reference", confirmed);
+      result.duplicateReferenceSingleConfirm = "PASS";
+    }
+
     result.status = "PASS";
   }
   assert(pageErrors.length === 0, "page errors", pageErrors);
@@ -576,6 +726,7 @@ try {
   console.error(JSON.stringify(result, null, 2));
   process.exitCode = 1;
 } finally {
+  checkpointGate?.release?.();
   if (browser) await browser.close().catch(() => {});
   if (server?.child && server.child.exitCode === null) server.child.kill();
 }

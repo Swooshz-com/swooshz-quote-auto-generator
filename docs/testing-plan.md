@@ -277,3 +277,26 @@ A fix is not complete until the failing behavior has a regression test at the ri
 - CI checks for repository-wide syntax, unit, and smoke coverage.
 
 When production code changes without a matching automated test, the final report must say which affected feature remains manually tested or untested and why.
+
+## Quote reopening and Next acknowledgement
+
+For dashboard Modify/Duplicate detail loading or Next loading changes, run
+`python -m unittest tests.test_quote_flow_reliability` and
+`node scripts/playwright-owner-uat-basis-repair.mjs --lines=6 --latency-ms=300 --alpha2-reliability`.
+The synthetic rendered mode covers a failed Customer checkpoint, visible failure
+with stopped spinner, dismissal and retry, duplicate activation suppression,
+failed Modify/Duplicate reads preserving saved/current drafts without a save,
+and a successful Modify retry. It then covers Duplicate plus a cancelled and
+confirmed pricing-reference replacement, fresh analysis and one Confirm reaching
+Output with the replacement catalogue price. Dependency and analysis choices
+must remain pauses; neither starts a loading request before confirmation.
+Existing protected XLSX amount, pricing-ledger and reopen checks remain active.
+The unit contract also covers saved Customer checkpoint address equivalence
+(NFC and whitespace) while preserving display text and invalidating substantive
+address changes, and fresh protected PDF reuse without a new generation job.
+Run the existing G3 restored-session browser test for the first Modify path.
+The native Alpha smoke additionally verifies a saved/current PDF reopens through
+the protected inline endpoint without another generation job. Real LibreOffice
+conversion, native PDF viewer/rendering and hosted persistence qualification
+remain separate; the synthetic mode does not substitute for native PDF smoke or
+owner UAT.
