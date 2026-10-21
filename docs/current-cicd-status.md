@@ -19,18 +19,23 @@ Docker-image app with deployment/alpha2 source provenance at the same
 accepted revision. It has no routed domain, no source integration, no running
 container and no deployment job. Automatic Git deployments and PR previews are
 disabled. Its port and health contract match Alpha 1, with a separate 1 CPU /
-2 GiB runtime ceiling and no shared writable mount. Non-secret runtime settings
-are prepared for a distinct TEST workspace and object bucket. Independent
-session/tracking keys, the existing provider key and the exact approved tester
-map are bound through the server secret manager for runtime use only; preview
-values remain empty. Dedicated OAuth and TEST storage credentials remain
-unbound. This is an unqualified stopped baseline scaffold, not a working
-Alpha 2 environment or owner UAT pass.
+2 GiB runtime ceiling and no shared writable mount. Runtime settings retain a
+distinct TEST workspace. Independent session/tracking keys, the existing
+provider key, shared Google OAuth client, shared object bucket/runtime keys
+and exact approved tester map are bound through the server secret manager for
+runtime use only. Preview secret values and the preview tester map remain
+empty. The distinct TEST database URL remains unbound. Shared storage uses the
+application's workspace key namespace; credentials and provider failure
+boundaries are shared, with no provider-level prefix isolation claim. This is
+an unqualified stopped baseline scaffold, not a working Alpha 2 environment or
+owner UAT pass.
 
+The shared Google client has an additive Alpha 2 callback; existing callbacks
+were retained. Owner-saved DNS is verified, without implying HTTPS readiness.
 CI continues to validate source only. Alpha 2 activation still depends on
-qualified TEST database/object credentials and migration state, independent
-Google OAuth/session configuration, approved DNS/TLS routing, durable image
-recovery with restore proof, and bounded resource observation/containment.
+qualified TEST database credentials and migration state, isolated session and
+live artifact checks, TLS routing, durable image recovery with restore proof,
+and bounded resource observation/containment.
 Future Alpha 2 builds must use a separately reviewed off-host private-image
 route; no image build/publish or automatic deployment workflow is enabled by
 this status update. Do not merge Alpha 2 product work as evidence of runtime
