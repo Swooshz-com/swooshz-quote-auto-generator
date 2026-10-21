@@ -11508,7 +11508,13 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
     catalog_description: reference,
     pricing_reference_description: reference,
   };
-  if (match.unit) nextLine.unit = match.unit;
+  // Cached candidates can predate server admission filtering. Preserve incompatible units so
+  // choosing a reference cannot silently turn a length/count/lot quantity into an area quantity.
+  const quantityBasis = (unit) => {
+    const canonical = normalizeUnit(unit).toLowerCase();
+    return ["m", "m length", "m run"].includes(canonical) ? "length:metre" : canonical;
+  };
+  if (match.unit && quantityBasis(currentLine.unit) && quantityBasis(currentLine.unit) === quantityBasis(match.unit)) nextLine.unit = match.unit;
   if (match.catalog_unit_price !== undefined && match.catalog_unit_price !== null && String(match.catalog_unit_price).trim() !== "") {
     nextLine.catalog_unit_price = match.catalog_unit_price;
   }

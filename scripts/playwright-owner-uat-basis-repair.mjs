@@ -308,6 +308,20 @@ try {
   });
   assert((result.countProposalBeforeConfirm.tag === "Custom" || result.countProposalBeforeConfirm.custom) && !["catalog", "manual", "included"].includes(result.countProposalBeforeConfirm.variant), "count selection must start as an unpriced AI proposal", result.countProposalBeforeConfirm);
 
+  // Fresh proposals offer only choices Confirm can honour. Keep a synthetic old cached
+  // candidate to prove that a pre-upgrade invalid choice is still refused at the real boundary.
+  result.unitCandidateBeforeConfirm = await page.evaluate(() => {
+    const line = state.quoteBasisSections.flatMap((section) => section.lines || []).find((entry) => entry.id === "u1-video");
+    return { unit: line?.unit, candidates: line?.possible_pricing_matches || [] };
+  });
+  assert(result.unitCandidateBeforeConfirm.unit === "lot" && result.unitCandidateBeforeConfirm.candidates.length === 0,
+    "incompatible unit candidates were offered as actionable choices", result.unitCandidateBeforeConfirm);
+  await page.evaluate((item) => {
+    const line = state.quoteBasisSections.flatMap((section) => section.lines || []).find((entry) => entry.id === "u1-video");
+    line.possible_pricing_matches = [{ pricing_keyword: item.id, description: item.description, unit: item.unit_hint, section: item.section }];
+    updateQuoteBasisCard("edited");
+  }, byName("55 inch LED TV Monitor"));
+
   // U2: tick / cross / possible-match responsiveness on the large basis.
   const fillers = cases.filter((entry) => entry.kind === "filler");
   for (const [index, entry] of fillers.entries()) {
@@ -376,11 +390,18 @@ try {
   result.selectedCountRequest = selectionRequest.pricing_selections.find((entry) => entry.source_basis_line_id === "u1-count");
   assert(result.selectedCountRequest?.catalog_item_id === byName("Bar Stool").id && Number.isInteger(result.selectedCountRequest?.expected_revision), "Confirm did not submit this row and selected item revision", result.selectedCountRequest);
   result.selectionOutcomes = selectionBody.selections;
+  assert(selectionBody.selections.some((entry) => entry.source_basis_line_id === "u1-video" && entry.status === "refused" && entry.reason === "unit_review_required"),
+    "cached incompatible choice did not receive a truthful refusal", selectionBody.selections);
+  const selectedVideoLine = selectionRequest.quote_basis_sections.flatMap((section) => section.lines || []).find((line) => line.id === "u1-video");
+  assert(selectedVideoLine?.unit === "lot", "cached choice silently converted the basis quantity unit", selectedVideoLine);
   const selectedCount = selectionBody.line_items.find((row) => row.source_basis_line_id === "u1-count");
   const pricingBasis = await page.evaluate(() => collectQuoteDetails().commercial_snapshot.pricing_basis);
   assert(selectionBody.selections.some((entry) => entry.source_basis_line_id === "u1-count" && entry.status === "selected"), "count proposal was not admitted at Confirm", selectionBody.selections);
   assert(selectedCount?.pricing_authority?.variant === "catalog" && selectedCount.pricing_authority.catalog_item_id === byName("Bar Stool").id && selectedCount.pricing_authority.catalog_digest === pricingBasis.digest && selectedCount.pricing_reference_id === pricingBasis.id && selectedCount.pricing_authority.price === byName("Bar Stool").sale_unit_price, "server admission did not bind the selected row to the current reference", selectedCount);
-  result.selectedCountBoundary = { section: selectedCount.section, authority: selectedCount.pricing_authority, pricingBasis };
+  const selectedCountLine = selectionRequest.quote_basis_sections.flatMap((section) => section.lines || []).find((line) => line.id === "u1-count");
+  assert(selectedCount.quantity === 4 && selectedCountLine?.quantity === 4 && selectedCount.pricing_basis_amount === cents(4 * byName("Bar Stool").sale_unit_price),
+    "Confirm failed to price the valid proposal at its saved basis quantity", { selectedCount, selectedCountLine });
+  result.selectedCountBoundary = { section: selectedCount.section, quantity: selectedCount.quantity, basisQuantity: selectedCountLine.quantity, authority: selectedCount.pricing_authority, pricingBasis };
   result.confirm = {
     preparingVisibleMs, preparingTitle, outputReadyMs: Date.now() - confirmStarted,
     clickEventDurationMs: Math.max(0, ...confirmEvents.events.filter((entry) => ["click", "pointerup"].includes(entry.name)).map((entry) => entry.duration)),
