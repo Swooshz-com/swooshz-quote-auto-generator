@@ -7001,6 +7001,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "section": "AV Equipment Rental Items",
                 "description": f'nos. {size}" LED TV Monitor (With Speaker - Full HD)',
                 "unit_hint": "nos",
+                "sale_unit_price": 100 + size,
                 "match_terms": ["display"],
                 "object_families": ["av_equipment"],
                 "category_order": 1,
@@ -7019,7 +7020,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                             "tag": "Custom",
                             "text": "Large wall-mounted video display for exterior feature wall.",
                             "quantity": 1,
-                            "unit": "lot",
+                            "unit": "nos",
                             "confidence_pct": 88,
                         }
                     ],
@@ -31625,7 +31626,7 @@ assert.strictEqual(selectedPossibleMatchLine.pricing_keyword, "av-equipment-rent
 assert.strictEqual(selectedPossibleMatchLine.catalog_description, 'nos. 85" LED TV Monitor (With Speaker - Full HD)');
 assert.strictEqual(selectedPossibleMatchLine.pricing_reference_description, 'nos. 85" LED TV Monitor (With Speaker - Full HD)');
 assert.strictEqual(selectedPossibleMatchLine.quantity, 1);
-assert.strictEqual(selectedPossibleMatchLine.unit, "nos");
+assert.strictEqual(selectedPossibleMatchLine.unit, "lot");
 assert.strictEqual(selectedPossibleMatchLine.custom_pricing, undefined);
 assert.strictEqual(selectedPossibleMatchLine.custom_confirmed, undefined);
 assert.strictEqual(selectedPossibleMatchLine.possible_pricing_matches, undefined);
@@ -42065,6 +42066,154 @@ main().catch((error) => {
         [row] = request["line_items"]
         self.assertEqual(row["pricing_authority"]["variant"], "historical")
         return request
+
+    def test_proposal_candidates_share_selection_unit_and_detail_admission(self):
+        # Candidate suggestions must be actionable; a click does not authorise conversions.
+        catalog = webapp.pricing_catalog_runtime_lookup_for_payload(valid_payload(), webapp.DEFAULT_PROFILE_ID)
+        for unit, expected in (("sqm", True), ("m length", False), ("lot", False), ("nos", False)):
+            with self.subTest(unit=unit):
+                raw = {"quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+                    {"id": "proposal", "tag": "Custom", "custom_pricing": True,
+                     "text": "Synthetic carpet tile flooring across the full booth footprint", "quantity": 2,
+                     "unit": unit, "confidence_pct": 82}]}], "line_items": [
+                    {"source_basis_line_id": "proposal", "section": "Floors",
+                     "description": "Synthetic carpet tile flooring across the full booth footprint",
+                     "quantity": 2, "unit": unit}]}
+                result = webapp.normalize_ai_draft(raw, valid_payload(), require_confidence=True)
+                [line] = [line for section in result["quote_basis_sections"] for line in section["lines"]
+                          if line.get("id") == "proposal"]
+                offered = line.get("possible_pricing_matches", [])
+                self.assertEqual(any(match["pricing_keyword"] == self.LEDGER_CARPET for match in offered), expected)
+                self.assertNotIn("synthetic-floors-synthetic-raised-deck-panel", [match["pricing_keyword"] for match in offered])
+                for match in offered:
+                    item = catalog[match["pricing_keyword"]]
+                    selected = {**line, "tag": "Include", "custom_pricing": False,
+                                "pricing_keyword": item["id"], "unit": item["unit_hint"],
+                                "text": "[ " + item["description"] + " ] - " + line["text"]}
+                    [row] = [row for row in result["line_items"] if row.get("source_basis_line_id") == "proposal"]
+                    reason = webapp.pricing_selection_refusal({"catalog_item_id": item["id"]},
+                        {"line": selected, "row": row}, unit, item, catalog)
+                    self.assertEqual(reason, "", (match, reason))
+
+    def test_proposal_candidates_keep_neutral_detail_selection_waiver(self):
+        item = {"id": "neutral-catalogue-item", "description": "sqm Plain woven modular reusable textile floor covering supply",
+                "unit_hint": "sqm", "section": "Synthetic Floors", "sale_unit_price": 14.4,
+                "match_terms": ["installation"], "object_families": ["textile_covering"]}
+        catalog = {item["id"]: item}
+        detail = "Installation across reception lounge corridor entrance storage corner demonstration zone"
+        line = {"id": "neutral-proposal", "tag": "Custom", "custom_pricing": True,
+                "text": detail, "quantity": 2, "unit": "sqm", "confidence_pct": 82}
+        row = {"source_basis_line_id": "neutral-proposal", "section": "Synthetic Floors", "description": detail, "quantity": 2, "unit": "sqm"}
+        sections = webapp.quote_basis_sections_with_catalog_exact_lines(
+            [{"id": "floors", "title": "Synthetic Floors", "lines": [line]}], [row], list(catalog.values()), provider_result=True)
+        matches = [match for section in sections for entry in section["lines"] for match in entry.get("possible_pricing_matches", [])]
+        self.assertIn(item["id"], [match["pricing_keyword"] for match in matches])
+        self.assertTrue(webapp.catalog_line_contradicts_item(detail, item, catalog_items=list(catalog.values())))
+        selected = {**line, "tag": "Include", "custom_pricing": False, "pricing_keyword": item["id"],
+                    "text": "[ " + item["description"] + " ] - " + detail}
+        self.assertEqual(webapp.pricing_selection_refusal({"catalog_item_id": item["id"]},
+            {"line": selected, "row": row}, "sqm", item, catalog), "")
+
+    def test_proposal_candidates_never_borrow_units_from_ambiguous_source_rows(self):
+        catalog = list(webapp.pricing_catalog_runtime_lookup_for_payload(valid_payload(), webapp.DEFAULT_PROFILE_ID).values())
+        line = {"id": "proposal", "tag": "Custom", "custom_pricing": True,
+                "text": "Synthetic carpet tile flooring across the full booth footprint", "quantity": 2,
+                "unit": "sqm", "confidence_pct": 82}
+        rows = [{"source_basis_line_id": "proposal", "section": "Synthetic Floors", "description": line["text"], "quantity": 2, "unit": unit}
+                for unit in ("sqm", "lot")]
+        sections = webapp.quote_basis_sections_with_catalog_exact_lines(
+            [{"id": "floors", "title": "Synthetic Floors", "lines": [line]}], rows, catalog,
+            provider_result=True, source_units={})
+        matches = [match for section in sections for entry in section["lines"]
+                   for match in entry.get("possible_pricing_matches", [])]
+        self.assertEqual(matches, [])
+        control = webapp.quote_basis_sections_with_catalog_exact_lines(
+            [{"id": "floors", "title": "Synthetic Floors", "lines": [line]}], rows[:1], catalog,
+            provider_result=True, source_units={"proposal": "sqm"})
+        self.assertIn(self.LEDGER_CARPET, [match["pricing_keyword"] for section in control
+            for entry in section["lines"] for match in entry.get("possible_pricing_matches", [])])
+
+    def test_proposal_candidates_keep_provider_unit_through_finalization(self):
+        payload = valid_payload()
+        payload["quote_session"] = {"session_id": "quote-candidate-source-unit"}
+        raw = {"quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+            {"id": "proposal", "tag": "Custom", "custom_pricing": True,
+             "text": "Synthetic carpet tile flooring across the full booth footprint", "quantity": 2,
+             "unit": "sqm", "confidence_pct": 82}]}], "line_items": [
+            {"source_basis_line_id": "proposal", "section": "Floors",
+             "description": "Synthetic carpet tile flooring across the full booth footprint", "quantity": 2, "unit": "lot"}]}
+        normalized = webapp.normalize_ai_draft(raw, payload, require_confidence=True)
+        self.assertEqual(normalized["_pricing_analysis_source_units"], {"proposal": "lot"})
+        finalized = webapp.finalized_remote_draft_result(payload, normalized, "openai", "OpenAI", {}, [])
+        for result in (normalized, finalized):
+            [line] = [line for section in result["quote_basis_sections"] for line in section["lines"]
+                      if line.get("id") == "proposal"]
+            self.assertNotIn("possible_pricing_matches", line)
+        [sealed] = [row for row in finalized["pricing_analysis_seal"]["rows"] if row["id"] == "proposal"]
+        self.assertEqual(sealed["unit"], "lot")
+        self.assertNotIn("catalog_item_id", sealed)
+
+    def test_ledger_direct_selection_preserves_compatible_unit_aliases(self):
+        cases = [
+            (unit, "Floors", "Synthetic floor trim along the booth edge", "synthetic-floors-synthetic-floor-trim", True)
+            for unit in ("m", "m run", "m length")
+        ] + [
+            (unit, "Structures", "Synthetic rigging point above the stand", "synthetic-structures-synthetic-rigging-point", True)
+            for unit in ("pcs", "nos")
+        ] + [
+            (unit, "Floors", "Synthetic floor trim along the booth edge", "synthetic-floors-synthetic-floor-trim", False)
+            for unit in ("lot", "sets", "sqm")
+        ]
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for index, (unit, section, text, item_id, valid) in enumerate(cases):
+                with self.subTest(unit=unit, item=item_id):
+                    request, _ = self._ledger_analysis([("alias-row", section, text, 3, unit, None)],
+                        session_id=f"quote-ledger-alias-{index}")
+                    self._ledger_click(request, "alias-row", item_id)
+                    # A valid direct/cached request need not rewrite an equivalent basis unit.
+                    self._ledger_line(request, "alias-row")["unit"] = unit
+                    self._ledger_sync(request)
+                    selected = self._ledger_select(runner, headers, request, "alias-row", item_id, 0)
+                    self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                    expected = koncept_catalog_sale_unit_price(item_id) if valid else None
+                    self.assertEqual(self._ledger_price(selected["body"]["line_items"], "alias-row"), expected)
+                    if valid:
+                        self.assertEqual(selected["body"]["selections"], [{"source_basis_line_id": "alias-row", "status": "selected"}])
+                        [row] = selected["body"]["line_items"]
+                        self.assertEqual(row["quantity"], 3)
+                        self.assertEqual(row["pricing_basis_amount"], webapp.round_commercial_cents(3 * expected))
+                        self.assertEqual(row["unit"], "m length" if section == "Floors" else "nos")
+                        request["line_items"] = [row]
+                        self._ledger_sync(request)
+                        self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+                        self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, request), "alias-row"), expected)
+                    else:
+                        self.assertEqual(selected["body"]["selections"], [{"source_basis_line_id": "alias-row", "status": "refused", "reason": "unit_review_required"}])
+                        persisted = webapp.read_quote_session_metadata(request["quote_session"]["session_id"])
+                        self.assertIsNone(webapp.PricingLedgerView(webapp.effective_pricing_ledger(persisted)).grant("alias-row"))
+
+    def test_ledger_selection_refuses_quantity_or_basis_unit_divergence_without_grant(self):
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for label, quantity, unit, reason in (
+                ("mismatch", 3, "sqm", "ineligible"),
+                ("missing", None, "sqm", "ineligible"),
+                ("zero", 0, "sqm", "ineligible"),
+                ("basis-unit", 2, "nos", "unit_review_required"),
+            ):
+                with self.subTest(case=label):
+                    request = self._historical_carpet_quote(session_id="quote-ledger-parity-" + label)
+                    self._ledger_click(request, "carpet-row", self.LEDGER_CARPET)
+                    self._ledger_line(request, "carpet-row").update(quantity=quantity, unit=unit)
+                    self._ledger_sync(request)
+                    selected = self._ledger_select(runner, headers, request, "carpet-row", self.LEDGER_CARPET, 0)
+                    self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                    self.assertEqual(selected["body"]["selections"], [
+                        {"source_basis_line_id": "carpet-row", "status": "refused", "reason": reason}])
+                    self.assertIsNone(self._ledger_price(selected["body"]["line_items"], "carpet-row"))
+                    persisted = webapp.read_quote_session_metadata(request["quote_session"]["session_id"])
+                    self.assertIsNone(webapp.PricingLedgerView(webapp.effective_pricing_ledger(persisted)).grant("carpet-row"))
 
     def test_ledger_selection_route_has_its_own_rate_limit(self):
         self.assertEqual(webapp.rate_limit_path_key("/api/quote-sessions/pricing-selections"), "/api/quote-sessions/pricing-selections")

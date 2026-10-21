@@ -22629,6 +22629,7 @@ def quote_basis_sections_with_catalog_exact_lines(
     *,
     provider_result: bool = False,
     reviewed_selection: bool = False,
+    source_units: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     invalid_pricing_keyword_flag = "_invalid_pricing_keyword"
     invalid_pricing_keyword_value_flag = "_invalid_pricing_keyword_value"
@@ -23059,6 +23060,28 @@ def quote_basis_sections_with_catalog_exact_lines(
         score = len(overlap) * 10 + round(best_value_ratio * 10) + 8 + unit_bonus
         return score if score >= 20 else 0
 
+    # Candidate eligibility uses the same evidence as Confirm. Stable IDs prevent repeated text
+    # from borrowing another row's measured unit or detail; missing rows use the basis itself.
+    source_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in line_items:
+        row_id = safe_resource_id(row.get("source_basis_line_id"), "")
+        if row_id:
+            source_rows.setdefault(row_id, []).append(row)
+
+    def possible_match_compatibility(line: dict[str, Any], item: dict[str, Any]) -> str:
+        ids = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
+        rows = {id(row): row for row_id in ids for row in source_rows.get(row_id, [])}
+        if len(rows) > 1:
+            return "ineligible"
+        row = next(iter(rows.values())) if rows else {"description": line.get("text"), "unit": line.get("unit")}
+        measured_units = {source_units[row_id] for row_id in ids if source_units and row_id in source_units}
+        if len(measured_units) > 1:
+            return "unit_review_required"
+        selected = {**line, "text": f"[ {clean_text(item.get('description'))} ] - {clean_text(line.get('text'))}"}
+        return pricing_selection_compatibility_refusal(
+            selected, row, next(iter(measured_units), None), item, exact_catalog_items_by_id,
+        )
+
     def possible_catalog_items_for_line(line: dict[str, Any], section: dict[str, Any]) -> list[dict[str, Any]]:
         if is_default_dimension_basis_line(line) or clean_text(line.get("pricing_keyword")):
             return []
@@ -23081,7 +23104,7 @@ def quote_basis_sections_with_catalog_exact_lines(
         seen: set[str] = set()
         for score, item in scored:
             item_id = clean_text(item.get("id"))
-            if not item_id or item_id in seen:
+            if not item_id or item_id in seen or possible_match_compatibility(line, item):
                 continue
             seen.add(item_id)
             matches.append(possible_pricing_match_from_item(item, score))
@@ -24816,14 +24839,14 @@ def line_items_with_confirmed_basis_selections(
         grant = ledger_view.grant(source_id)
         catalog_item = lookup.get(keyword)
         quantity = parse_float_or_none(item.get("quantity"))
-        unit = normalize_pricing_unit(line.get("unit"))
+        unit = normalize_pricing_unit(catalog_item_unit_hint(catalog_item)) if catalog_item else ""
         if (not grant or grant["catalog_item_id"] != keyword
                 or (grant["catalog_source"], grant["reference_id"], grant["catalog_digest"]) != (source, reference_id, digest)
                 or not catalog_item or clean_text(catalog_item.get("id")) != keyword
                 or quantity is None or quantity <= 0
                 or parse_float_or_none(original.get("quantity")) != quantity
                 or parse_float_or_none(line.get("quantity")) != quantity
-                or canonical_pricing_authority_unit(unit) != grant["catalog_unit"]
+                or not pricing_units_share_quantity_basis(line.get("unit"), grant["catalog_unit"])
                 or canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)) != grant["catalog_unit"]
                 or not pricing_units_share_quantity_basis(ledger_view.source_unit(source_id) or original.get("unit"), unit)
                 or (clean_text(line.get("text")) and catalog_line_contradicts_item(
@@ -24907,10 +24930,26 @@ def pricing_selection_refusal(
             or clean_text(row.get("price_mode")).lower() == "included"
             or pricing_ledger_quantity(row.get("quantity")) is None):
         return "ineligible"
-    if not catalog_item or clean_text(catalog_item.get("id")) != item_id or pricing_reference_sale_unit_price(catalog_item) is None:
+    if pricing_ledger_quantity(line.get("quantity")) != pricing_ledger_quantity(row.get("quantity")):
+        return "ineligible"
+    if not catalog_item or clean_text(catalog_item.get("id")) != item_id:
+        return "not_in_catalogue"
+    return pricing_selection_compatibility_refusal(line, row, source_unit, catalog_item, lookup)
+
+
+def pricing_selection_compatibility_refusal(
+    line: dict[str, Any],
+    row: dict[str, Any],
+    source_unit: str | None,
+    catalog_item: dict[str, Any],
+    lookup: dict[str, dict[str, Any]],
+) -> str:
+    """Shared candidate/Confirm checks, including explicit selection's low-overlap waiver."""
+    if pricing_reference_sale_unit_price(catalog_item) is None:
         return "not_in_catalogue"
     catalog_unit = catalog_item_unit_hint(catalog_item)
-    if not all(pricing_units_share_quantity_basis(unit, catalog_unit) for unit in (source_unit or row.get("unit"), row.get("unit"))):
+    if not all(pricing_units_share_quantity_basis(unit, catalog_unit)
+               for unit in (source_unit if source_unit is not None else row.get("unit"), row.get("unit"), line.get("unit"))):
         return "unit_review_required"
     catalog_items = list(lookup.values())
     if (clean_text(line.get("text")) and catalog_line_contradicts_item(line.get("text"), catalog_item, catalog_items=catalog_items)) or (
@@ -25065,6 +25104,8 @@ def normalize_line_items_for_quote_basis_review(
         list(catalog_lookup.values()),
         provider_result=True,
         reviewed_selection=True,
+        source_units={row_id: ledger_view.source_unit(row_id) for row_id in ledger_view.ledger["rows"]
+                      if ledger_view.source_unit(row_id) is not None},
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
@@ -25373,6 +25414,7 @@ def normalize_ai_draft(
         if snapshot is not None:
             payload["_pricing_reference_snapshot"] = snapshot
     raw_line_items = parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []
+    source_units = pricing_analysis_source_units(raw_line_items)
     raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
     dimensions = booth_dimensions_from_payload({"project": raw_project}) if raw_project else {}
     pricing_reference_sections = (
@@ -25410,6 +25452,7 @@ def normalize_ai_draft(
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=has_payload_context,
         provider_result=has_payload_context,
+        source_units=source_units,
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
@@ -25447,7 +25490,6 @@ def normalize_ai_draft(
         "project": dimensions,
     }
     if has_payload_context:
-        source_units = pricing_analysis_source_units(raw_line_items)
         # Later stages see these rows re-unit to their catalogue items; only this stage still
         # holds the unit the provider measured each row in, so it is carried forward internally.
         result["_pricing_analysis_source_units"] = source_units
@@ -26182,6 +26224,8 @@ def unpack_ai_draft(
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=has_payload_context,
         provider_result=provider_result,
+        source_units=ai_draft.get("_pricing_analysis_source_units") if isinstance(
+            ai_draft.get("_pricing_analysis_source_units"), dict) else pricing_analysis_source_units(ai_draft.get("line_items")),
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
@@ -26284,6 +26328,8 @@ def finalized_remote_draft_result(
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=True,
         provider_result=source.strip().lower() != "local",
+        source_units=ai_basis.get("_pricing_analysis_source_units") if isinstance(
+            ai_basis.get("_pricing_analysis_source_units"), dict) else pricing_analysis_source_units(ai_basis.get("line_items")),
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,

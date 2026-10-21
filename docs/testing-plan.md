@@ -113,7 +113,13 @@ npm run playwright:smoke
   is never `10 sets`, and count, lot or length is never area. Such rows stay
   unpriced for manual review; no conversion factor is inferred. The rendered
   script expects the `lot` video row to stay `???` and exactly one
-  pricing-selections request at Confirm. For timing evidence add
+  pricing-selections request at Confirm. Fresh Possible Match candidates use the same
+  measured-unit and detail compatibility checks as Confirm; incompatible candidates
+  are omitted without inferring a quantity conversion. The rendered script injects
+  one synthetic pre-upgrade cached candidate and checks its explicit unit refusal.
+  Compatible aliases retain their saved basis quantity and use the server catalogue
+  unit and price. Quantity divergence refuses before any grant; original provider
+  units survive draft finalisation and saved-ledger review. For timing evidence add
   `--measure-only --cpu-throttle=4 --catalog-extra=300` (optionally
   `--cpu-profile`); it reports Event Timing input-to-paint per click and the
   time until `Preparing Output` paints.
