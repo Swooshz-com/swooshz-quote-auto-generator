@@ -20,9 +20,12 @@ accepted revision. It has no routed domain, no source integration, no running
 container and no deployment job. Automatic Git deployments and PR previews are
 disabled. Its port and health contract match Alpha 1, with a separate 1 CPU /
 2 GiB runtime ceiling and no shared writable mount. Non-secret runtime settings
-are prepared for a distinct TEST workspace and object bucket; credentials and
-Google tester identities remain absent. This is an unqualified stopped
-baseline scaffold, not a working Alpha 2 environment or owner UAT pass.
+are prepared for a distinct TEST workspace and object bucket. Independent
+session/tracking keys, the existing provider key and the exact approved tester
+map are bound through the server secret manager for runtime use only; preview
+values remain empty. Dedicated OAuth and TEST storage credentials remain
+unbound. This is an unqualified stopped baseline scaffold, not a working
+Alpha 2 environment or owner UAT pass.
 
 CI continues to validate source only. Alpha 2 activation still depends on
 qualified TEST database/object credentials and migration state, independent
