@@ -156,7 +156,7 @@ def main() -> int:
         if api_key != 'ordinary-mock-only-no-network': raise RuntimeError('unexpected provider marker')
         if not isinstance(draft_configuration, _alpha_webapp_server.OpenAIDraftConfiguration): raise RuntimeError('missing captured draft configuration')
         if draft_configuration.analysis_mode != _alpha_webapp_server.draft_analysis_mode(payload): raise RuntimeError('draft mode mismatch')
-        if draft_configuration.reasoning_effort not in _alpha_webapp_server.supported_openai_draft_reasoning_efforts(draft_configuration.model): raise RuntimeError('incompatible synthetic draft configuration')
+        if not (_alpha_webapp_server.valid_openai_model_identifier(draft_configuration.model) and _alpha_webapp_server.valid_openai_reasoning_effort(draft_configuration.reasoning_effort)): raise RuntimeError('malformed synthetic draft configuration')
         authority = _alpha_webapp_server.exact_pricing_reference_authority(payload, auth_session=auth_session)
         if not authority.get('ok'): raise RuntimeError('fixture pricing authority did not resolve')
         if scenario_path is not None:

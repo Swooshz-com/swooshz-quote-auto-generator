@@ -116,8 +116,8 @@ def g3_mock_provider(payload, api_key, auth_session=None, *, draft_configuration
         raise RuntimeError("Synthetic provider requires captured draft configuration.")
     if draft_configuration.analysis_mode != server.draft_analysis_mode(payload):
         raise RuntimeError("Synthetic provider draft mode mismatch.")
-    if draft_configuration.reasoning_effort not in server.supported_openai_draft_reasoning_efforts(draft_configuration.model):
-        raise RuntimeError("Synthetic provider draft configuration is incompatible.")
+    if not (server.valid_openai_model_identifier(draft_configuration.model) and server.valid_openai_reasoning_effort(draft_configuration.reasoning_effort)):
+        raise RuntimeError("Synthetic provider draft configuration is malformed.")
     authority = server.exact_pricing_reference_authority(payload, auth_session=auth_session)
     if not authority.get("ok"):
         raise RuntimeError("Synthetic provider requires a resolved pricing reference.")

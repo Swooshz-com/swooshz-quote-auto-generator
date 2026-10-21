@@ -203,31 +203,38 @@ classes. Prompt text, filenames, media/base64, private identifiers/URLs, model
 configuration values, credentials, headers, and raw provider bodies are excluded.
 The fingerprint is not evidence of historical failure causation.
 
-The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates the configured full-draft model and reasoning pair against maintained API compatibility data, without selecting or enforcing a source-owned pair. The requested runtime settings are `gpt-6.1-sol/high` for Normal Analyse and `gpt-6.1-sol/max` for High Quality; they are configuration examples, not source defaults.
+The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates bounded syntax and exact equality to the captured full-draft model and reasoning settings. It does not keep a model registry or model-specific effort list. The requested runtime settings are `gpt-6.1-sol/high` for Normal Analyse and `gpt-6-astra/high` for High Quality; they are configuration examples, not source defaults.
 
 Reasoning configuration is fail-closed at that final boundary. Normal Analyse reads
 `OPENAI_DRAFT_MODEL` and `OPENAI_DRAFT_REASONING_EFFORT`; High Quality reads
 `OPENAI_DRAFT_HIGH_QUALITY_MODEL` and
 `OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Each selected mode requires both
-explicit settings. Missing, empty or whitespace-only values, unsupported pairs,
+explicit settings. Missing, empty, whitespace-only or malformed values,
 and assembled/configured mismatches reject with
 `failure_boundary=request_validation`, `attempt_number=0`, and zero sends.
 There are no source defaults or cross-mode fallbacks for full Analyse.
-The maintained supported models are [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
-with `low`, `medium`, `high`, `xhigh`, `max`, and
-[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) with
-`none`, `low`, `medium`, `high`, `xhigh`, `max`. This compatibility data validates
-the configured pair; it never selects one. Unknown model IDs fail closed. High Quality
-aliases retain their existing mode semantics. Reader tests cover missing,
+Model IDs admit 1-200 ASCII letters/digits and `._:/-`, starting with a letter
+or digit. After the existing trim/whitespace/lowercase normalisation, effort
+identifiers admit 1-64 ASCII letters/digits and `_-`, starting with a letter.
+Unknown syntactically valid model IDs and efforts reach Responses unchanged.
+The provider decides access, reasoning compatibility and image/PDF capability;
+accepting an identifier does not promise those capabilities.
+[GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
+and the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
+document the requested High Quality pair. There is no automatic discovery,
+provider retry, model substitution or effort downgrade for full Analyse.
+High Quality aliases retain their existing mode semantics. Reader tests cover missing,
 empty, whitespace, dotenv, and process-override values using mocked
 dotenv access. Each operation captures one immutable mode/model/effort snapshot
 for its assembled request, final validator and telemetry. A mid-prompt setting
 change must not alter the captured pair, trigger a false mismatch or misreport
-the sent model. Final-envelope tests cover unsupported configured/body efforts,
-configured/body mismatch, invalid explicit models, and model mismatch;
+the sent model. A later operation must observe changed settings. Final-envelope
+tests cover arbitrary/future model and effort identifiers in both modes,
+malformed configured/body efforts, configured/body mismatch, invalid explicit
+models, and model mismatch;
 `draft_quote_basis` must propagate request validation without local starter
 fallback. A six-page synthetic PDF exercises the valid High Quality
-`gpt-6.1-sol/xhigh` configuration through real local PDF rendering and mocked
+`gpt-6-astra/high` configuration through real local PDF rendering and mocked
 transport, preserving the original PDF and retaining no debug images. Support
 operations keep their existing route-specific defaults and validation. Run the focused oracle with
 `python -m unittest tests.test_openai_draft_request_contract`.
@@ -237,16 +244,22 @@ values; full Analyse requires explicit per-mode settings and has no source defau
 In deployed mode, full Analyse reads process environment values only, so missing or
 blank Coolify settings cannot fall through to a local `.env`. Local development
 retains `.env` support. Tests poison the dotenv reader to prove this distinction.
-Every explicit nonblank model value must reach route validation unchanged
-enough to be rejected when unsupported. Exercise `!!!` and unsupported
-`gpt-6-sol` through normal and High Quality full-draft construction,
-selected-line and answer basis-chat dispatch, and OpenAI pricing import and
-metadata requests. Each invalid configuration must report
+Full Analyse accepts operator-configured model/effort identifiers without source
+registration, and ignores attempted client overrides. Exercise malformed values
+through Normal and High Quality full-draft construction. Support operations keep
+their existing strict route model checks: exercise `!!!` and unsupported
+`gpt-6-sol` through selected-line and answer basis-chat dispatch, and OpenAI
+pricing import and metadata requests. Each invalid configuration must report
 `failure_boundary=request_validation`, `attempt_number=0`, and zero provider
 sends. A basis-chat request-validation failure is terminal; it must not fall
 through from an invalid answer route to a valid selected-line model. Provider,
 runtime, and model-output fallback tests must continue to prove the existing
-alternate-provider behavior.
+alternate-provider behavior. Syntactically valid configurations rejected by the
+provider must make one send, return the protected sanitised error reference, and
+never fall back to another model/effort. Arbitrary configuration canaries must
+not survive log projection, telemetry, generation-evidence compaction or the
+structural request hash. Only the fixed support-route model retains a public
+OpenAI diagnostic label; configurable full-Analyse labels are redacted.
 
 Contract coverage includes exact Responses field sets, invalid envelopes, whole
 request rejection, one-send failures, privacy canaries, and N-1/N/N+1 boundaries
