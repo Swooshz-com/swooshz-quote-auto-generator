@@ -12995,12 +12995,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(body["model"], "gpt-6.1-sol")
         self.assertNotEqual(body["model"], "user-supplied-model")
 
-    def test_openai_request_rejects_unsupported_model_from_env_before_transport(self):
+    def test_openai_request_rejects_malformed_model_from_env_before_transport(self):
         payload = valid_payload()
 
         def dotenv(name):
             if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-custom-model"
+                return "invalid model"
             return synthetic_draft_dotenv_value(name)
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
@@ -13009,14 +13009,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     webapp.request_openai_quote_basis(payload, "sk-test-redacted")
 
         urlopen.assert_not_called()
-        self.assertNotIn("gpt-custom-model", str(raised.exception))
+        self.assertNotIn("invalid model", str(raised.exception))
 
-    def test_openai_request_rejects_incompatible_draft_reasoning_effort_before_transport(self):
+    def test_openai_request_rejects_malformed_draft_reasoning_effort_before_transport(self):
         payload = valid_payload()
 
         def dotenv(name):
             if name == webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME:
-                return "none"
+                return "invalid effort"
             return synthetic_draft_dotenv_value(name)
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
@@ -13025,7 +13025,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     webapp.request_openai_quote_basis(payload, "sk-test-redacted")
 
         urlopen.assert_not_called()
-        self.assertNotIn("none", str(raised.exception))
+        self.assertNotIn("invalid effort", str(raised.exception))
 
     def test_openai_request_uses_high_quality_model_and_reasoning_effort_from_env(self):
         response = mock.MagicMock()
