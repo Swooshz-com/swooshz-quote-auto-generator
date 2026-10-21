@@ -111,7 +111,13 @@ function g3MockProviderBootstrap() {
   return String.raw`
 from webapp import server
 
-def g3_mock_provider(payload, api_key, auth_session=None):
+def g3_mock_provider(payload, api_key, auth_session=None, *, draft_configuration):
+    if not isinstance(draft_configuration, server.OpenAIDraftConfiguration):
+        raise RuntimeError("Synthetic provider requires captured draft configuration.")
+    if draft_configuration.analysis_mode != server.draft_analysis_mode(payload):
+        raise RuntimeError("Synthetic provider draft mode mismatch.")
+    if draft_configuration.reasoning_effort not in server.supported_openai_draft_reasoning_efforts(draft_configuration.model):
+        raise RuntimeError("Synthetic provider draft configuration is incompatible.")
     authority = server.exact_pricing_reference_authority(payload, auth_session=auth_session)
     if not authority.get("ok"):
         raise RuntimeError("Synthetic provider requires a resolved pricing reference.")
@@ -202,6 +208,12 @@ function startServer({ mockProvider = false, dataRoot = quoteDataRoot } = {}) {
     : ["webapp/server.py", "--host", options.host, "--port", String(options.port)];
   const runtimeEnv = { ...process.env, APP_MODE: "local" };
   if (mockProvider) {
+    Object.assign(runtimeEnv, {
+      OPENAI_DRAFT_MODEL: "gpt-6.1-sol",
+      OPENAI_DRAFT_REASONING_EFFORT: "high",
+      OPENAI_DRAFT_HIGH_QUALITY_MODEL: "gpt-6.1-sol",
+      OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT: "max",
+    });
     runtimeEnv.QUOTE_DATA_ROOT = dataRoot;
     runtimeEnv.SQAG_LOCAL_PRICING_REFERENCES_ROOT = path.join(dataRoot, "pricing-references");
   } else {

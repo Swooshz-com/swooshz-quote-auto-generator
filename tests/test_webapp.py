@@ -42496,7 +42496,9 @@ main().catch((error) => {
         def dotenv(name, *args, **kwargs):
             return "sk-test-redacted" if name == "OPENAI_API_KEY" else original(name, *args, **kwargs)
 
-        def provider(provider_payload, _key, auth_session=None):
+        def provider(provider_payload, _key, auth_session=None, *, draft_configuration):
+            self.assertIsInstance(draft_configuration, webapp.OpenAIDraftConfiguration)
+            self.assertEqual(draft_configuration.analysis_mode, webapp.draft_analysis_mode(provider_payload))
             return webapp.normalize_ai_draft(copy.deepcopy(provider_raw), provider_payload, require_confidence=True, auth_session=auth_session)
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv), \

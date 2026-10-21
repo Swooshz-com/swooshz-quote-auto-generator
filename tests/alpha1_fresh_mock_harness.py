@@ -87,6 +87,10 @@ def main() -> int:
     os.environ.update(
         {
             "APP_MODE": "local",
+            "OPENAI_DRAFT_MODEL": "gpt-6.1-sol",
+            "OPENAI_DRAFT_REASONING_EFFORT": "high",
+            "OPENAI_DRAFT_HIGH_QUALITY_MODEL": "gpt-6.1-sol",
+            "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT": "max",
             "AUTH_REQUIRED": "true",
             "SQAG_AUTH_MODE": "internal_google",
             "SESSION_SECRET": "synthetic-browser-session-secret-with-enough-entropy",
@@ -148,8 +152,11 @@ def main() -> int:
         return _alpha_real_connect(sock,address)
     _alpha_socket.socket.connect=_alpha_loopback_only
     scenario_path = Path(sys.argv[8]).resolve() if len(sys.argv) > 8 else None
-    def alpha1_mock_provider(payload, api_key, auth_session=None):
+    def alpha1_mock_provider(payload, api_key, auth_session=None, *, draft_configuration):
         if api_key != 'ordinary-mock-only-no-network': raise RuntimeError('unexpected provider marker')
+        if not isinstance(draft_configuration, _alpha_webapp_server.OpenAIDraftConfiguration): raise RuntimeError('missing captured draft configuration')
+        if draft_configuration.analysis_mode != _alpha_webapp_server.draft_analysis_mode(payload): raise RuntimeError('draft mode mismatch')
+        if draft_configuration.reasoning_effort not in _alpha_webapp_server.supported_openai_draft_reasoning_efforts(draft_configuration.model): raise RuntimeError('incompatible synthetic draft configuration')
         authority = _alpha_webapp_server.exact_pricing_reference_authority(payload, auth_session=auth_session)
         if not authority.get('ok'): raise RuntimeError('fixture pricing authority did not resolve')
         if scenario_path is not None:
