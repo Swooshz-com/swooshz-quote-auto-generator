@@ -648,12 +648,8 @@ RICH_TEXT_DETAIL_KEYS = {
 DRAFT_ANALYSIS_MODE_STANDARD = "standard"
 DRAFT_ANALYSIS_MODE_HIGH_QUALITY = "high_quality"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-OPENAI_DRAFT_MODEL = "gpt-6-luna"
-OPENAI_DRAFT_HIGH_QUALITY_MODEL = "gpt-6.1-sol"
 OPENAI_BASIS_LINE_MODEL = "gpt-6-luna"
 OPENAI_BASIS_ANSWER_MODEL = "gpt-6-luna"
-OPENAI_DRAFT_REASONING_EFFORT = "max"
-OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT = "high"
 OPENAI_SMALL_REASONING_EFFORT = "high"
 OPENAI_API_KEY_ENV_NAME = "OPENAI_API_KEY"
 OPENAI_DRAFT_MODEL_ENV_NAME = "OPENAI_DRAFT_MODEL"
@@ -664,8 +660,8 @@ OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_REASONING_EFFORT"
 OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
 OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
 OPENAI_MODEL_REASONING_EFFORTS = {
-    "gpt-6-luna": frozenset({"high", "max"}),
-    "gpt-6.1-sol": frozenset({"high"}),
+    "gpt-6-luna": frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
+    "gpt-6.1-sol": frozenset({"low", "medium", "high", "xhigh", "max"}),
 }
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
@@ -18846,25 +18842,32 @@ def configured_openai_route_model(env_name: str, fallback: str) -> str:
     return raw if raw != "" else fallback
 
 
-def configured_openai_draft_model(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
-    if mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
-        return configured_openai_route_model(
-            OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME,
-            OPENAI_DRAFT_HIGH_QUALITY_MODEL,
-        )
-    return configured_openai_route_model(OPENAI_DRAFT_MODEL_ENV_NAME, OPENAI_DRAFT_MODEL)
-
-
-def configured_openai_draft_reasoning_effort(mode: str = DRAFT_ANALYSIS_MODE_STANDARD) -> str:
-    if mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
-        raw = clean_text(read_dotenv_value(OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME)).lower()
-        return raw or OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
-    raw = clean_text(read_dotenv_value(OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME)).lower()
-    return raw or OPENAI_DRAFT_REASONING_EFFORT
-
-
 def supported_openai_draft_reasoning_efforts(model: str) -> set[str] | frozenset[str]:
     return OPENAI_MODEL_REASONING_EFFORTS.get(model, frozenset())
+
+
+@dataclass(frozen=True, repr=False)
+class OpenAIDraftConfiguration:
+    analysis_mode: str
+    model: str
+    reasoning_effort: str
+
+
+def capture_openai_draft_configuration(analysis_mode: str) -> OpenAIDraftConfiguration:
+    if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
+        model_name = OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME
+        effort_name = OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME
+    else:
+        model_name = OPENAI_DRAFT_MODEL_ENV_NAME
+        effort_name = OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME
+    # Deployed Analyse settings belong to the process environment (Coolify).
+    # Only local development reads .env; neither path supplies a source default.
+    read_setting = os.environ.get if configured_app_mode() == "deploy" else read_dotenv_value
+    return OpenAIDraftConfiguration(
+        analysis_mode=analysis_mode,
+        model=read_setting(model_name) or "",
+        reasoning_effort=clean_text(read_setting(effort_name)).lower(),
+    )
 
 
 def validated_provider_model_label(provider: str, value: Any) -> str:
@@ -25608,24 +25611,20 @@ def validate_draft_references(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
-def validate_draft_responses_envelope(body: Any, analysis_mode: str) -> tuple[bytes, str]:
+def validate_draft_responses_envelope(
+    body: Any,
+    analysis_mode: str,
+    *,
+    draft_configuration: OpenAIDraftConfiguration | None = None,
+) -> tuple[bytes, str]:
     """Exact Responses oracle and shape-only hash; no value-derived hashes."""
     if not isinstance(body, dict) or set(body) != {"model", "input", "reasoning"}:
         draft_request_invalid()
-    configured_model = configured_openai_draft_model(analysis_mode)
-    configured_effort = configured_openai_draft_reasoning_effort(analysis_mode)
-    expected_model = (
-        OPENAI_DRAFT_HIGH_QUALITY_MODEL
-        if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY
-        else OPENAI_DRAFT_MODEL
-    )
-    expected_effort = (
-        OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT
-        if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY
-        else OPENAI_DRAFT_REASONING_EFFORT
-    )
-    if configured_model != expected_model or configured_effort != expected_effort:
+    configuration = draft_configuration or capture_openai_draft_configuration(analysis_mode)
+    if configuration.analysis_mode != analysis_mode:
         draft_request_invalid()
+    configured_model = configuration.model
+    configured_effort = configuration.reasoning_effort
     if body["model"] != configured_model:
         draft_request_invalid()
     if body["reasoning"] != {"effort": configured_effort}:
@@ -25727,9 +25726,12 @@ def request_openai_quote_basis(
     payload: dict[str, Any],
     api_key: str,
     auth_session: dict[str, Any] | None = None,
+    *,
+    draft_configuration: OpenAIDraftConfiguration | None = None,
 ) -> dict[str, Any]:
     analysis_mode = draft_analysis_mode(payload)
-    model = configured_openai_draft_model(analysis_mode)
+    configuration = draft_configuration or capture_openai_draft_configuration(analysis_mode)
+    model = configuration.model
     begin_ai_transport_operation("draft_quote_basis", AI_PROVIDER_OPENAI, model)
     references = validate_draft_references(payload)
     prompt = build_quote_draft_prompt(payload, auth_session=auth_session)
@@ -25781,9 +25783,11 @@ def request_openai_quote_basis(
     body = {
         "model": model,
         "input": [{"role": "user", "content": content}],
-        "reasoning": {"effort": configured_openai_draft_reasoning_effort(analysis_mode)},
+        "reasoning": {"effort": configuration.reasoning_effort},
     }
-    encoded_body, shape_fingerprint = validate_draft_responses_envelope(body, analysis_mode)
+    encoded_body, shape_fingerprint = validate_draft_responses_envelope(
+        body, analysis_mode, draft_configuration=configuration,
+    )
     request = urllib.request.Request(
         OPENAI_RESPONSES_URL,
         data=encoded_body,
@@ -26515,7 +26519,8 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     openai_key = read_dotenv_value(OPENAI_API_KEY_ENV_NAME)
     image_count, pdf_count = ai_payload_media_counts(payload)
     analysis_mode = draft_analysis_mode(payload)
-    draft_model = configured_openai_draft_model(analysis_mode)
+    draft_configuration = capture_openai_draft_configuration(analysis_mode)
+    draft_model = draft_configuration.model
     if protected_mode and not openai_key:
         error_reference = new_error_reference()
         log_ai_call_attempt(
@@ -26546,6 +26551,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 payload,
                 openai_key,
                 auth_session=auth_session,
+                draft_configuration=draft_configuration,
             )
             try:
                 fallback_line_items = normalize_line_items(payload, auth_session=auth_session) or default_line_items(payload, auth_session=auth_session)

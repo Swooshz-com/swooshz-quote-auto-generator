@@ -130,6 +130,17 @@ Source of truth: `.github/workflows/ci.yml`
 ## Deploy Runtime Gate
 
 - CI still performs no deployment.
+- Normal and High Quality full Analyse each require explicit model and reasoning
+  settings in the deployed process environment (Coolify): `OPENAI_DRAFT_MODEL`,
+  `OPENAI_DRAFT_REASONING_EFFORT`, `OPENAI_DRAFT_HIGH_QUALITY_MODEL`, and
+  `OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Each operation captures its
+  selected mode's pair once for payload validation and telemetry. Missing, blank
+  or API-incompatible settings fail before provider transport; source defaults
+  and local `.env` values cannot fill deployed gaps. The requested runtime pairs
+  are `gpt-6.1-sol/high` and `gpt-6.1-sol/max`; supported configured alternatives
+  are validated without a source-enforced pair. Local development retains `.env`
+  support. These request checks do not change process-only liveness or perform
+  configuration mutation, deployment or provider verification.
 - `APP_MODE=deploy` requires an explicit `SQAG_AUTH_MODE` of `platform` or
   `internal_google`, plus `AUTH_REQUIRED=true`; missing, unknown, local, mixed,
   or incomplete configurations fail closed.

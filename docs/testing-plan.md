@@ -203,27 +203,41 @@ classes. Prompt text, filenames, media/base64, private identifiers/URLs, model
 configuration values, credentials, headers, and raw provider bodies are excluded.
 The fingerprint is not evidence of historical failure causation.
 
-The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates each full-draft model and reasoning pair: normal Analyse is `gpt-6-luna` with `max`; High Quality is `gpt-6.1-sol` with `high`. The model and effort are configured independently for the two modes.
+The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates the configured full-draft model and reasoning pair against maintained API compatibility data, without selecting or enforcing a source-owned pair. The requested runtime settings are `gpt-6.1-sol/high` for Normal Analyse and `gpt-6.1-sol/max` for High Quality; they are configuration examples, not source defaults.
 
 Reasoning configuration is fail-closed at that final boundary. Normal Analyse reads
 `OPENAI_DRAFT_MODEL` and `OPENAI_DRAFT_REASONING_EFFORT`; High Quality reads
 `OPENAI_DRAFT_HIGH_QUALITY_MODEL` and
-`OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Blank effective values use the
-mode defaults. Explicit model or effort mismatches reject with
-`failure_boundary=request_validation`, `attempt_number=0`, and zero sends. The
-normal route accepts only Luna/max; High Quality accepts only
-gpt-6.1-sol/high, with no fallback to gpt-6-sol. Luna low and medium
-reasoning are not accepted. Unknown model IDs fail closed. High Quality
+`OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Each selected mode requires both
+explicit settings. Missing, empty or whitespace-only values, unsupported pairs,
+and assembled/configured mismatches reject with
+`failure_boundary=request_validation`, `attempt_number=0`, and zero sends.
+There are no source defaults or cross-mode fallbacks for full Analyse.
+The maintained supported models are [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+with `low`, `medium`, `high`, `xhigh`, `max`, and
+[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) with
+`none`, `low`, `medium`, `high`, `xhigh`, `max`. This compatibility data validates
+the configured pair; it never selects one. Unknown model IDs fail closed. High Quality
 aliases retain their existing mode semantics. Reader tests cover missing,
 empty, whitespace, dotenv, and process-override values using mocked
-dotenv access. Final-envelope tests cover unsupported configured/body efforts,
+dotenv access. Each operation captures one immutable mode/model/effort snapshot
+for its assembled request, final validator and telemetry. A mid-prompt setting
+change must not alter the captured pair, trigger a false mismatch or misreport
+the sent model. Final-envelope tests cover unsupported configured/body efforts,
 configured/body mismatch, invalid explicit models, and model mismatch;
 `draft_quote_basis` must propagate request validation without local starter
-fallback. Run the focused oracle with
+fallback. A six-page synthetic PDF exercises the valid High Quality
+`gpt-6.1-sol/xhigh` configuration through real local PDF rendering and mocked
+transport, preserving the original PDF and retaining no debug images. Support
+operations keep their existing route-specific defaults and validation. Run the focused oracle with
 `python -m unittest tests.test_openai_draft_request_contract`.
 
-Configured OpenAI model readers apply route defaults only to absent or blank
-values. Every explicit nonblank model value must reach route validation unchanged
+OpenAI support-operation model readers apply route defaults only to absent or blank
+values; full Analyse requires explicit per-mode settings and has no source defaults.
+In deployed mode, full Analyse reads process environment values only, so missing or
+blank Coolify settings cannot fall through to a local `.env`. Local development
+retains `.env` support. Tests poison the dotenv reader to prove this distinction.
+Every explicit nonblank model value must reach route validation unchanged
 enough to be rejected when unsupported. Exercise `!!!` and unsupported
 `gpt-6-sol` through normal and High Quality full-draft construction,
 selected-line and answer basis-chat dispatch, and OpenAI pricing import and
