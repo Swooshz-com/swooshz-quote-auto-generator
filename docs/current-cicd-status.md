@@ -1,8 +1,37 @@
 # Current CI/CD Status
 
-Last updated: 2026-09-30
+Last updated: 2026-10-22
 
 Source of truth: `.github/workflows/ci.yml`
+
+## Hosted Alpha Trigger State
+
+The owner-approved Alpha 2 isolation work under #260 changed only the accepted
+Alpha 1 source/trigger metadata. Alpha 1 now follows deployment/alpha1 at
+292eb58769085d43831b278715f35b3749101290, with automatic Git deployments
+and PR previews disabled. Its existing running container, image, origin,
+runtime environment and resource limits were preserved; the change queued no
+deployment. Authenticated manual/API deployment remains possible and requires
+separate operation authority. A push to main is not an Alpha 1 promotion.
+
+The distinct Alpha 2 TEST app quote-internal is registered as a stopped
+Docker-image app with deployment/alpha2 source provenance at the same
+accepted revision. It has no routed domain, no source integration, no running
+container and no deployment job. Automatic Git deployments and PR previews are
+disabled. Its port and health contract match Alpha 1, with a separate 1 CPU /
+2 GiB runtime ceiling and no shared writable mount. Non-secret runtime settings
+are prepared for a distinct TEST workspace and object bucket; credentials and
+Google tester identities remain absent. This is an unqualified stopped
+baseline scaffold, not a working Alpha 2 environment or owner UAT pass.
+
+CI continues to validate source only. Alpha 2 activation still depends on
+qualified TEST database/object credentials and migration state, independent
+Google OAuth/session configuration, approved DNS/TLS routing, durable image
+recovery with restore proof, and bounded resource observation/containment.
+Future Alpha 2 builds must use a separately reviewed off-host private-image
+route; no image build/publish or automatic deployment workflow is enabled by
+this status update. Do not merge Alpha 2 product work as evidence of runtime
+qualification, owner acceptance or independent review.
 
 ## Active Workflow
 
