@@ -6303,27 +6303,68 @@ def quote_basis_sections_with_default_dimension_confirmation(
     sections: list[dict[str, Any]],
     dimensions: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    legacy = quote_basis_from_sections(sections)
-    adjusted = quote_basis_with_default_dimension_confirmation(legacy, dimensions)
-    if adjusted == legacy:
-        return copy.deepcopy(sections)
-    adjusted_sections = normalize_quote_basis_sections({"quote_basis": adjusted})
-    confidence_by_text = {
-        clean_text(line.get("text")).lower(): normalize_confidence_percent(line.get("confidence", line.get("confidence_pct")))
-        for section in sections
-        for line in (section.get("lines") or [])
-        if isinstance(line, dict) and clean_text(line.get("text"))
-    }
+    # Keep the structured rows authoritative. A legacy text round-trip loses their
+    # identities, measurements and catalogue bindings before final reconciliation.
+    quote_basis_from_sections(sections)  # Retain the section-identity validation.
+    adjusted_sections = copy.deepcopy(sections)
+    if clean_text(dimensions.get("dimension_source")) != "default":
+        return adjusted_sections
+
+    confirmation_text = default_booth_dimension_confirmation_line(dimensions).removeprefix("Confirm: ")
+    found_default_line = False
+    retained_sections = []
     for section in adjusted_sections:
+        next_lines = []
         for line in section.get("lines") or []:
             if not isinstance(line, dict):
+                next_lines.append(line)
                 continue
-            if normalize_confidence_percent(line.get("confidence", line.get("confidence_pct"))) is not None:
+            # A billable item's usage detail may mention the default footprint.
+            # Only rewrite unowned, unmeasured, unpriced informational reminders.
+            # An identified row can carry its measurements on a linked item instead.
+            has_row_identity = bool(
+                safe_resource_id(line.get("id"), "") or safe_resource_id(line.get("source_line_item_id"), "")
+            )
+            has_measurement_or_pricing = any(line.get(key) not in (None, "") for key in (
+                "quantity", "unit", "pricing_keyword", "catalog_description", "pricing_reference_description",
+                "catalog_unit_price", "effective_unit_price", "unit_price_override", "pricing_basis_amount",
+                "approved_quote_amount", "price_mode", "display_price",
+            ))
+            authority = line.get("pricing_authority")
+            has_pricing_authority = isinstance(authority, dict) and authority.get("variant") not in (None, "", "none")
+            informational = is_informational_dimension_basis_line(line) or clean_text(line.get("text")).lower().startswith("default booth size")
+            if (
+                has_row_identity or has_measurement_or_pricing or has_pricing_authority or line.get("custom_pricing")
+                or normalize_basis_tag(line.get("tag")) == "Custom" or not informational
+                or not line_references_default_booth_dimensions(line.get("text"), dimensions)
+            ):
+                next_lines.append(line)
                 continue
-            text = clean_text(line.get("text"))
-            inherited = confidence_by_text.get(text.lower())
-            line["confidence"] = inherited if inherited is not None else 50
-    return adjusted_sections
+            if found_default_line:
+                continue
+            line["tag"] = "Confirm"
+            line["text"] = confirmation_text
+            confidence = normalize_confidence_percent(line.get("confidence", line.get("confidence_pct")))
+            line["confidence"] = confidence if confidence is not None else 50
+            next_lines.append(line)
+            found_default_line = True
+        section["lines"] = next_lines
+        if next_lines:
+            retained_sections.append(section)
+
+    if not found_default_line:
+        target = next((section for section in retained_sections
+                       if "platform" in safe_section_id(section.get("id"))
+                       or "floor" in safe_section_id(section.get("id"))), None)
+        if target is None:
+            target = {
+                "id": DEFAULT_DIMENSION_BASIS_FIELD,
+                "title": quote_basis_title_from_key(DEFAULT_DIMENSION_BASIS_FIELD),
+                "lines": [],
+            }
+            retained_sections.append(target)
+        target["lines"].append({"tag": "Confirm", "text": confirmation_text, "confidence": 50})
+    return retained_sections
 
 
 def nested_value(payload: dict[str, Any], group: str, key: str, flat_key: str) -> Any:
@@ -22674,7 +22715,21 @@ def quote_basis_sections_with_catalog_exact_lines(
         return bool(clean_text(item.get("pricing_reference_description")) or clean_text(item.get("catalog_description")))
 
     def is_default_dimension_basis_line(line: dict[str, Any]) -> bool:
-        return is_informational_dimension_basis_line(line)
+        # A uniquely linked physical row can keep its measurements on its item.
+        # Dimension-like wording must not suppress that exact row's reconciliation.
+        if not is_informational_dimension_basis_line(line):
+            return False
+        line_ids = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
+        if len(line_ids) == 1:
+            source_id = next(iter(line_ids))
+            item_count = sum(safe_resource_id(item.get("source_basis_line_id"), "") == source_id for item in line_items)
+            basis_count = sum(
+                source_id in {safe_resource_id(candidate.get(key), "") for key in ("id", "source_line_item_id")}
+                for section in sections for candidate in section.get("lines") or [] if isinstance(candidate, dict)
+            )
+            if item_count == 1 and basis_count == 1:
+                return False
+        return True
 
     def mark_line_custom_for_manual_pricing(line: dict[str, Any]) -> None:
         bracketed = bracketed_catalog_reference_parts(line.get("text"))
@@ -23088,7 +23143,8 @@ def quote_basis_sections_with_catalog_exact_lines(
             return "ineligible"
         row = next(iter(rows.values())) if rows else {"description": line.get("text"), "unit": line.get("unit")}
         measured_units = {source_units[row_id] for row_id in ids if source_units and row_id in source_units}
-        if len(measured_units) > 1:
+        if len(measured_units) > 1 or (source_units is not None and (
+                len(measured_units) != 1 or not next(iter(measured_units)))):
             return "unit_review_required"
         selected = {**line, "text": f"[ {clean_text(item.get('description'))} ] - {clean_text(line.get('text'))}"}
         return pricing_selection_compatibility_refusal(
@@ -23873,6 +23929,34 @@ def line_items_with_resolved_basis_catalog(
     return resolved_items
 
 
+def provider_basis_description_key(value: Any, *, catalog_reference_only: bool = True) -> str:
+    bracketed = bracketed_catalog_reference_parts(value)
+    text = bracketed[0] if bracketed and catalog_reference_only else value
+    text = clean_customer_quote_line_text(text).casefold()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def provider_basis_measurements_match(
+    line: dict[str, Any], item: dict[str, Any], *, require_explicit: bool = False,
+) -> bool:
+    line_quantity = parse_float_or_none(line.get("quantity"))
+    item_quantity = parse_float_or_none(item.get("quantity"))
+    line_unit = normalize_pricing_unit(line.get("unit"))
+    item_unit = normalize_pricing_unit(item.get("unit"))
+    if require_explicit:
+        return bool(
+            line_quantity is not None and item_quantity is not None
+            and math.isfinite(line_quantity) and math.isfinite(item_quantity)
+            and not isinstance(line.get("quantity"), bool) and not isinstance(item.get("quantity"), bool)
+            and line_quantity > 0 and item_quantity > 0 and line_quantity == item_quantity
+            and line_unit and item_unit and line_unit == item_unit
+        )
+    if (line_quantity is not None and item_quantity is not None
+            and abs(line_quantity - item_quantity) > 0.001):
+        return False
+    return not (line_unit and item_unit and line_unit != item_unit)
+
+
 def line_items_aligned_to_quote_basis(
     line_items: list[dict[str, Any]],
     sections: list[dict[str, Any]],
@@ -23891,11 +23975,7 @@ def line_items_aligned_to_quote_basis(
     by_pricing_keyword: dict[str, list[int]] = {}
     by_description: dict[str, list[int]] = {}
 
-    def comparable_description(value: Any) -> str:
-        bracketed = bracketed_catalog_reference_parts(value)
-        text = bracketed[0] if bracketed else value
-        text = clean_customer_quote_line_text(text).casefold()
-        return re.sub(r"[^a-z0-9]+", " ", text).strip()
+    comparable_description = provider_basis_description_key
 
     non_output_source_ids: set[str] = set()
     non_output_description_keys: set[str] = set()
@@ -23978,18 +24058,7 @@ def line_items_aligned_to_quote_basis(
                 ids.append(source_id)
         return ids
 
-    def basis_line_dimensions_match_item(line: dict[str, Any], item: dict[str, Any]) -> bool:
-        line_quantity = parse_float_or_none(line.get("quantity"))
-        item_quantity = parse_float_or_none(item.get("quantity"))
-        if (
-            line_quantity is not None
-            and item_quantity is not None
-            and abs(line_quantity - item_quantity) > 0.001
-        ):
-            return False
-        line_unit = normalize_pricing_unit(line.get("unit"))
-        item_unit = normalize_pricing_unit(item.get("unit"))
-        return not (line_unit and item_unit and line_unit != item_unit)
+    basis_line_dimensions_match_item = provider_basis_measurements_match
 
     def existing_item_for_basis_line(line: dict[str, Any]) -> dict[str, Any] | None:
         line_ids = basis_line_ids(line)
@@ -24335,6 +24404,72 @@ def pricing_analysis_seal_mac(key: bytes, scope: str, body: dict[str, Any]) -> s
 def pricing_ledger_quantity(value: Any) -> float | None:
     quantity = parse_float_or_none(value)
     return quantity if quantity is not None and math.isfinite(quantity) and quantity > 0 else None
+
+
+def provider_rows_with_unique_basis_ids(
+    raw_rows: list[Any], sections: list[dict[str, Any]],
+) -> list[Any]:
+    """Bind only unambiguous raw measurements before pricing can rewrite their context.
+
+    The ID is the only copied field. Missing measurement provenance stays missing; a
+    catalogue unit or a later normalised row can never establish a provider unit.
+    """
+    rows = copy.deepcopy(raw_rows)
+    lines = [line for section in sections for line in section.get("lines") or [] if isinstance(line, dict)]
+    basis_id_counts: dict[str, int] = {}
+    for line in lines:
+        for row_id in {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}:
+            basis_id_counts[row_id] = basis_id_counts.get(row_id, 0) + 1
+    explicit_row_ids = {
+        safe_resource_id(row.get(key), "")
+        for row in rows if isinstance(row, dict)
+        for key in ("source_basis_line_id", "id", "source_line_item_id")
+    } - {""}
+    measurements = []
+    for row in rows:
+        if not isinstance(row, dict):
+            measurements.append({})
+            continue
+        unit = normalize_pricing_unit(row.get("unit"))
+        parts = normalized_line_text_quantity_parts(row.get("description"), row.get("quantity"), unit)
+        if parts.get("from_text_prefix") and (
+                (row.get("quantity") not in (None, "") and not provider_basis_measurements_match(
+                    {"quantity": parts["quantity"], "unit": parts["unit"]},
+                    {"quantity": row.get("quantity"), "unit": unit or parts["unit"]},
+                    require_explicit=True,
+                )) or (unit and unit != normalize_pricing_unit(parts["unit"]))):
+            measurements.append({})
+            continue
+        measurements.append({
+            "description": parts["text"],
+            "quantity": parts["quantity"] if parts.get("from_text_prefix") else row.get("quantity"),
+            "unit": parts["unit"] if parts.get("from_text_prefix") else unit,
+        })
+
+    def matches(line: dict[str, Any], measurement: dict[str, Any]) -> bool:
+        key = provider_basis_description_key(line.get("text"), catalog_reference_only=False)
+        return bool(key and key == provider_basis_description_key(
+            measurement.get("description"), catalog_reference_only=False,
+        ) and provider_basis_measurements_match(line, measurement, require_explicit=True))
+
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or any(clean_text(row.get(key)) for key in (
+                "source_basis_line_id", "id", "source_line_item_id")):
+            continue
+        owners = [line for line in lines if matches(line, measurements[index])]
+        if len(owners) != 1:
+            continue
+        line = owners[0]
+        row_ids = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
+        if len(row_ids) != 1:
+            continue
+        row_id = next(iter(row_ids))
+        if basis_id_counts.get(row_id) != 1 or row_id in explicit_row_ids:
+            continue
+        if sum(matches(line, measurement) for measurement in measurements) != 1:
+            continue
+        row["source_basis_line_id"] = row_id
+    return rows
 
 
 def pricing_analysis_source_units(raw_rows: Any) -> dict[str, str]:
@@ -25427,7 +25562,6 @@ def normalize_ai_draft(
         if snapshot is not None:
             payload["_pricing_reference_snapshot"] = snapshot
     raw_line_items = parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []
-    source_units = pricing_analysis_source_units(raw_line_items)
     raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
     dimensions = booth_dimensions_from_payload({"project": raw_project}) if raw_project else {}
     pricing_reference_sections = (
@@ -25435,6 +25569,9 @@ def normalize_ai_draft(
         if has_payload_context
         else []
     )
+    raw_sections = confirm_only_basis_sections(normalize_quote_basis_sections(parsed, pricing_reference_sections))
+    raw_line_items = provider_rows_with_unique_basis_ids(raw_line_items, raw_sections)
+    source_units = pricing_analysis_source_units(raw_line_items)
     trusted_input_authorities: dict[str, dict[str, Any]] = {}
     if has_payload_context and isinstance(payload.get("line_items"), list):
         trusted_input_items = normalize_line_items(
@@ -25460,7 +25597,7 @@ def normalize_ai_draft(
         else {}
     )
     sections = quote_basis_sections_with_catalog_exact_lines(
-        confirm_only_basis_sections(normalize_quote_basis_sections(parsed, pricing_reference_sections)),
+        raw_sections,
         line_items,
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=has_payload_context,
