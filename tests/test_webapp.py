@@ -7030,6 +7030,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "title": "Synthetic Lighting And AV",
                     "lines": [
                         {
+                            "id": "video-source-row",
                             "tag": "Custom",
                             "text": "Large wall-mounted video display for exterior feature wall.",
                             "quantity": 1,
@@ -7052,7 +7053,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     ],
                 },
             ],
-            "line_items": [],
+            # Actionable candidates require a provider-owned source measurement.
+            "line_items": [{
+                "source_basis_line_id": "video-source-row",
+                "section": "Synthetic Lighting And AV",
+                "description": "Large wall-mounted video display for exterior feature wall.",
+                "quantity": 1, "unit": "nos",
+            }],
         }
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7076,7 +7083,16 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
                     [],
                 )
+                basis_only = copy.deepcopy(ai_basis)
+                basis_only["line_items"] = []
+                unknown = webapp.finalized_remote_draft_result(
+                    payload, basis_only, "openai", "OpenAI",
+                    {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"}, [],
+                )
 
+        unknown_video = next(line for section in unknown["quote_basis_sections"] for line in section["lines"]
+                             if "video display" in line.get("text", ""))
+        self.assertNotIn("possible_pricing_matches", unknown_video)
         lines = [
             line
             for section in result["quote_basis_sections"]
