@@ -1,54 +1,95 @@
 # Current CI/CD Status
 
-Last updated: 2026-10-22
+Last updated: 2026-10-22 05:17 UTC
 
 Source of truth: `.github/workflows/ci.yml`
 
 ## Hosted Alpha Trigger State
 
-Within Alpha 1's Coolify app, the owner-approved Alpha 2 isolation work under
-#260 changed only source/trigger metadata. Alpha 1 now follows deployment/alpha1 at
-292eb58769085d43831b278715f35b3749101290, with automatic Git deployments
-and PR previews disabled. Its existing running container, image, origin,
-runtime environment and resource limits were preserved; the change queued no
-deployment. Authenticated manual/API deployment remains possible and requires
-separate operation authority. A push to main is not an Alpha 1 promotion.
+Alpha 1 remains available on accepted software
+`292eb58769085d43831b278715f35b3749101290` on `deployment/alpha1`, serving the
+same container and image. Automatic Git deployments and PR previews remain
+disabled. At the 05:14 UTC readback, it remained healthy with restart count
+zero. Authenticated manual/API deployment remains possible under separate
+operation authority; a push to `main` is not an Alpha 1 promotion. The owner
+accepts shared resources and intends to retire Alpha 1 only after Alpha 2 is
+properly working. Retirement has not occurred and is not authorised now.
 
-The distinct Alpha 2 TEST app quote-internal is registered as a stopped
-Docker-image app with deployment/alpha2 source provenance at the same
-accepted revision. It has no routed domain, no source integration, no running
-container and no deployment job. Automatic Git deployments and PR previews are
-disabled. Its port and health contract match Alpha 1, with a separate 1 CPU /
-2 GiB runtime ceiling and no shared writable mount. Runtime settings retain a
-distinct TEST workspace. Independent session/tracking keys, the existing
-provider key, shared Google OAuth client, shared object bucket/runtime keys
-and exact approved tester map are bound through the server secret manager for
-runtime use only. Preview secret values and the preview tester map remain
-empty. The distinct TEST runtime database URL is bound after canonical
-migration 010 and actual runtime/migrator/maintenance POST checks passed.
-Shared storage uses the application's workspace key namespace; credentials
-and provider failure boundaries are shared, with no provider-level prefix isolation claim. This is
-an unqualified stopped baseline scaffold, not a working Alpha 2 environment or
-owner UAT pass.
+The `quote-internal` app now has normal Git-backed Compose configuration from
+`deployment/alpha2` at
+`f5545bc9949fb77842a4d13ede734c7cfbfbf04f`, using
+`deploy/alpha2/compose.yaml`. It is manual-only, with automatic deployments
+and PR previews disabled. The single supported stopped-app PATCH and official
+Reload completed. One native private deployment job finished and created a
+container from the accepted image. At the 05:14 UTC readback, it was stopped;
+its last reported health was unhealthy, restart count was zero, and no OOM
+was reported. An independent 05:17 UTC readback verified the approved phase 1
+private-stop drill: healthy/running samples at 05:12:24, 05:12:26, and
+05:12:28 UTC were followed by stopped readbacks at 05:13:01, 05:13:03,
+05:13:05, and 05:13:07 UTC. The official stop exited 0. The container remains
+stopped; Alpha 1 and peers remain preserved, and no Alpha 2 public route exists.
 
-The shared Google client has an additive Alpha 2 callback; existing callbacks
-were retained. Owner-saved DNS is verified, without implying HTTPS readiness.
-Accepted-image custody and actual isolated local load identity proof passed
-without running the app. The disposable schema/ledger-only restore, full ACL
-projections and failed-transaction rollback drill passed; full TEST business
-data restoration is not established. The owned local fixture was removed and
-the local engine's original stopped state restored.
+Compose uses accepted software
+`292eb58769085d43831b278715f35b3749101290` from cached image
+`sha256:c652072d3741c893b008e4898942f702ddfc83e7cfa193bbd1bd339815a67871`,
+for `linux/amd64`, with 1 CPU, 2 GiB RAM, a 2 GiB combined RAM/swap limit,
+a 1 GiB reservation, and `pull_policy: never`. It has no source build, host
+ports, or mounts. The P1 registry proposal was superseded by the approved
+P2 cached-image Compose route; no registry token or resource was created.
+No image build/publish or automatic deployment workflow is enabled.
 
-CI continues to validate source only. Alpha 2 activation still depends on TEST
-workspace occupancy and authenticated session/persistence checks, live artifact
-checks, TLS routing, a qualified immutable registry image route, and a bounded
-host-side observer/containment path that survives controller or SSH loss.
-The installed Docker-image deployment performs a remote image pull; a cached
-local image plus digest metadata alone is not a qualified activation route.
-The proposed off-host private registry destination, pull credentials and inert
-build workflow still require review. No image build/publish or automatic
-deployment workflow is enabled by this status update. Do not merge Alpha 2
-product work as evidence of runtime qualification, owner acceptance or independent review.
+The VPS, Google, R2, account, bucket, and runtime-credential failure boundaries
+remain shared, with no provider-isolation claim. The existing TEST database
+and workspace are retained. The shared Google client has an additive Alpha 2
+callback; existing callbacks were retained. Owner-saved DNS is verified, but
+this does not establish an Alpha 2 public route or HTTPS readiness.
+
+The source Git manifest is 711 bytes with SHA-256
+`a156be91ec608be7d76cab4f1bcb3a741d0df17050da1391873e25ca7894eba0`. The
+installed official SSH return is 710 bytes with SHA-256
+`55b01b0311eaed98b09ceac8468c8369a9a7fcae30fcc25b380f0a51211161d5`, exactly
+the source with its final LF removed. The reviewed v5 guard verifies both
+identities and their direct byte relation; the original strict-predicate HOLD
+remains. No generic normalisation was used.
+
+The v4 detached-survival check, fresh 300-second admission, and two isolated
+cached-helper probes passed against Compose 5.5.0 with full service-policy,
+image, health, and resource-cap checks. The v3 native probe remains HOLD
+because of a checker string/integer mismatch; its native output was not
+retained. The v4 observer ended normally.
+The v5 helper-configuration qualification passed against the native 710-byte
+payload. The approved phase 1 private-stop drill passed, with official stop
+exit 0 and independent verification of three healthy/running samples followed
+by four stopped readbacks. A later observer reached terminal
+`STOPPED_VERIFIED` through `controller_observation_loss`, with reason
+`already_terminal_readback`, after the stop completed. Synchronous stop and
+readbacks exceeded the observer's 35-second window. This observer status does not negate
+phase 1 evidence. The later-phase custody finding remains a hold; no
+hot edit or replay was performed.
+
+The 47 offline guardian tests passed independently. The native phase 1 stop
+proof does not establish shared storage, authentication, public routing, or
+HTTPS readiness. TEST canonical migration 010
+is already applied, with POST and named-role ACL checks passed and a preboot
+workspace count of zero. The bounded accepted-image and schema/ledger recovery
+is proved, but full TEST business-data restoration is not established.
+Previously, accepted-image custody and isolated local load identity were
+proved without running the app. The disposable schema/ledger-only recovery,
+full ACL projections, and failed-transaction rollback drill passed.
+The local fixture was removed and the local engine's original stopped state
+restored. No migration or recovery was repeated for this configuration
+update. The runtime URI exists only in app configuration; migrator and
+maintenance components are absent. No paid model calls or new cloud resources
+were used.
+
+Source CI remains source-only and is not hosted product verification, owner
+UAT, or G2. Actual native PDF visual checks for fonts, logo, and pagination;
+hosted reopen/Next UAT; full acceptance; and representative-corpus,
+entitlement, provider, and large-input assurance remain open. Product image
+promotion was excluded from P2 and is not constructed or deployed. OpenRouter
+migration and DeepSeek removal remain queued after Alpha 2. A product-branch
+merge does not establish runtime qualification, owner acceptance, or
+independent review. Alpha 2 readiness remains conditional.
 
 ## Active Workflow
 
