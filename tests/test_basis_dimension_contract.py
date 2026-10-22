@@ -70,7 +70,7 @@ class BasisDimensionContractTest(unittest.TestCase):
         sections = self.structured_sections()
         original_rows = copy.deepcopy(sections[0]["lines"])
         sections[0]["lines"].insert(1, {
-            "id": "dimension-note", "tag": "Include", "text": "Default booth size is 6m x 6m",
+            "tag": "Include", "text": "Default booth size is 6m x 6m",
             "confidence": 68,
         })
         sections.append({"id": "flooring", "title": "Flooring", "lines": [
@@ -81,7 +81,7 @@ class BasisDimensionContractTest(unittest.TestCase):
         self.assertEqual(result[0]["lines"][0], original_rows[0])
         self.assertEqual(result[0]["lines"][2], original_rows[1])
         reminder = result[0]["lines"][1]
-        self.assertEqual(reminder["id"], "dimension-note")
+        self.assertNotIn("id", reminder)
         self.assertEqual(reminder["tag"], "Confirm")
         self.assertEqual(reminder["confidence"], 68)
         self.assertEqual(webapp.quote_basis_sections_with_default_dimension_confirmation(result, DEFAULT_DIMENSIONS), result)
@@ -114,6 +114,86 @@ class BasisDimensionContractTest(unittest.TestCase):
                 result = webapp.quote_basis_sections_with_default_dimension_confirmation(sections, DEFAULT_DIMENSIONS)
                 self.assertEqual(result[0], sections[0])
                 self.assertIs(type(result[0]["lines"][0]["quantity"]), type(quantity))
+
+    def test_identified_scope_with_measurements_on_linked_item_is_not_a_reminder(self):
+        items = [{"id": "synthetic-floor-item", "section": "Flooring",
+                  "description": "sqm Synthetic floor", "pricing_reference_description": "sqm Synthetic floor",
+                  "unit_hint": "sqm", "sale_unit_price": 37,
+                  "match_terms": ["synthetic floor"], "object_families": ["synthetic floor"]}]
+        payload = existing.WebappServerTest().sqag_212_payload(items)
+        existing.PricingDraftG3Regression.bind_test_snapshot(payload, webapp.exact_pricing_reference_authority(payload))
+        row = {"section": "Flooring", "source_basis_line_id": "linked-floor-row", "quantity": 36, "unit": "sqm",
+               "description": "sqm Synthetic floor", "pricing_keyword": "synthetic-floor-item"}
+        for identity in ({"id": "linked-floor-row"}, {"source_line_item_id": "linked-floor-row"},
+                         {"id": "linked-floor-row", "source_line_item_id": "linked-floor-row"}):
+            with self.subTest(identity=identity):
+                line = {"tag": "Confirm", "text": "Booth size defaults to 6m x 6m for the paid floor installation",
+                        "confidence": 91, **identity}
+                sections = [{"id": "flooring", "title": "Flooring", "lines": [line]}]
+                adjusted = webapp.quote_basis_sections_with_default_dimension_confirmation(sections, DEFAULT_DIMENSIONS)
+                self.assertEqual(adjusted[0]["lines"][0], line)
+                self.assertEqual(len(adjusted[0]["lines"]), 2)
+                self.assertEqual(webapp.quote_basis_sections_with_default_dimension_confirmation(adjusted, DEFAULT_DIMENSIONS), adjusted)
+                catalog = list(webapp.pricing_catalog_runtime_lookup_for_payload(payload).values())
+                reconciled = webapp.quote_basis_sections_with_catalog_exact_lines(
+                    adjusted, [row], catalog, mark_unmatched_confirm_custom=True, provider_result=True)
+                self.assertEqual(sum(bool(webapp.clean_text(entry.get("id") or entry.get("source_line_item_id")))
+                                     for section in reconciled for entry in section["lines"]), 1)
+                provider = {"project": {"booth_width": 6, "booth_depth": 6},
+                            "quote_basis_sections": sections, "line_items": [row]}
+                with mock.patch.object(webapp, "write_local_log"):
+                    finalized = webapp.finalized_remote_draft_result(payload, provider, "openai", "OpenAI", DEFAULT_DIMENSIONS, [])
+                identified = [entry for section in finalized["quote_basis_sections"] for entry in section["lines"]
+                              if entry.get("id") == "linked-floor-row" or entry.get("source_line_item_id") == "linked-floor-row"]
+                self.assertEqual(len(identified), 1)
+                self.assertIn("paid floor installation", identified[0]["text"])
+                self.assertEqual(float(identified[0]["quantity"]), 36)
+                self.assertEqual(identified[0]["unit"], "sqm")
+                self.assertEqual(identified[0]["pricing_keyword"], "synthetic-floor-item")
+                self.assertEqual(len(finalized["line_items"]), 1)
+                self.assertEqual(finalized["line_items"][0]["source_basis_line_id"], "linked-floor-row")
+                self.assertEqual(finalized["line_items"][0]["pricing_basis_amount"], 1332)
+                with mock.patch.object(webapp, "write_local_log"):
+                    repeated = webapp.finalized_remote_draft_result(payload, finalized, "openai", "OpenAI", DEFAULT_DIMENSIONS, [])
+                # Full normalization serializes enriched numeric quantities as text.
+                # Compare only that documented representation equivalence; retain every other field.
+                expected_sections = copy.deepcopy(finalized["quote_basis_sections"])
+                actual_sections = copy.deepcopy(repeated["quote_basis_sections"])
+                for comparable in (expected_sections, actual_sections):
+                    for section in comparable:
+                        for entry in section["lines"]:
+                            if entry.get("quantity") not in (None, ""):
+                                entry["quantity"] = webapp.clean_text(entry["quantity"])
+                self.assertEqual(actual_sections, expected_sections)
+                self.assertEqual(repeated["line_items"], finalized["line_items"])
+
+    def test_dimension_like_scope_does_not_borrow_ambiguous_or_foreign_item_measurements(self):
+        items = [{"id": "synthetic-floor-item", "section": "Flooring", "description": "sqm Synthetic floor",
+                  "pricing_reference_description": "sqm Synthetic floor", "unit_hint": "sqm", "sale_unit_price": 37}]
+        payload = existing.WebappServerTest().sqag_212_payload(items)
+        catalog = list(webapp.pricing_catalog_runtime_lookup_for_payload(payload).values())
+        line = {"id": "scope-a", "tag": "Confirm", "confidence": 91,
+                "text": "Booth size defaults to 6m x 6m for the paid floor installation"}
+        item = {"source_basis_line_id": "scope-a", "section": "Flooring", "description": "sqm Synthetic floor",
+                "quantity": 36, "unit": "sqm", "pricing_keyword": "synthetic-floor-item"}
+        scenarios = (
+            ([line], [{**item, "source_basis_line_id": "foreign-row"}], [line]),
+            ([{**line, "source_line_item_id": "different-row"}], [item], [{**line, "source_line_item_id": "different-row"}]),
+            ([line], [item, {**item, "quantity": 9}], [line]),
+            # Existing exact duplicate reconciliation retains the higher-confidence copy.
+            ([line, {**line, "confidence": 80}], [item], [line]),
+        )
+        for original_lines, provider_rows, expected_retained in scenarios:
+            with self.subTest(lines=len(original_lines), rows=len(provider_rows), identity=original_lines[0]):
+                original = copy.deepcopy(original_lines)
+                result = webapp.quote_basis_sections_with_catalog_exact_lines(
+                    [{"id": "flooring", "title": "Flooring", "lines": original_lines}],
+                    provider_rows, catalog, mark_unmatched_confirm_custom=True, provider_result=True)
+                retained = [entry for section in result for entry in section["lines"] if entry["text"] == line["text"]]
+                self.assertEqual(retained, expected_retained)
+                self.assertEqual(original_lines, original)
+                self.assertTrue(all(not entry.get("pricing_keyword") and "quantity" not in entry and "unit" not in entry
+                                    for entry in retained))
 
     def test_known_dimensions_return_an_independent_unchanged_copy(self):
         sections = self.structured_sections()

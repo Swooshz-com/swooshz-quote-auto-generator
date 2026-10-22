@@ -6320,7 +6320,11 @@ def quote_basis_sections_with_default_dimension_confirmation(
                 next_lines.append(line)
                 continue
             # A billable item's usage detail may mention the default footprint.
-            # Only rewrite unmeasured, unpriced informational reminders.
+            # Only rewrite unowned, unmeasured, unpriced informational reminders.
+            # An identified row can carry its measurements on a linked item instead.
+            has_row_identity = bool(
+                safe_resource_id(line.get("id"), "") or safe_resource_id(line.get("source_line_item_id"), "")
+            )
             has_measurement_or_pricing = any(line.get(key) not in (None, "") for key in (
                 "quantity", "unit", "pricing_keyword", "catalog_description", "pricing_reference_description",
                 "catalog_unit_price", "effective_unit_price", "unit_price_override", "pricing_basis_amount",
@@ -6330,7 +6334,7 @@ def quote_basis_sections_with_default_dimension_confirmation(
             has_pricing_authority = isinstance(authority, dict) and authority.get("variant") not in (None, "", "none")
             informational = is_informational_dimension_basis_line(line) or clean_text(line.get("text")).lower().startswith("default booth size")
             if (
-                has_measurement_or_pricing or has_pricing_authority or line.get("custom_pricing")
+                has_row_identity or has_measurement_or_pricing or has_pricing_authority or line.get("custom_pricing")
                 or normalize_basis_tag(line.get("tag")) == "Custom" or not informational
                 or not line_references_default_booth_dimensions(line.get("text"), dimensions)
             ):
@@ -22711,7 +22715,21 @@ def quote_basis_sections_with_catalog_exact_lines(
         return bool(clean_text(item.get("pricing_reference_description")) or clean_text(item.get("catalog_description")))
 
     def is_default_dimension_basis_line(line: dict[str, Any]) -> bool:
-        return is_informational_dimension_basis_line(line)
+        # A uniquely linked physical row can keep its measurements on its item.
+        # Dimension-like wording must not suppress that exact row's reconciliation.
+        if not is_informational_dimension_basis_line(line):
+            return False
+        line_ids = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
+        if len(line_ids) == 1:
+            source_id = next(iter(line_ids))
+            item_count = sum(safe_resource_id(item.get("source_basis_line_id"), "") == source_id for item in line_items)
+            basis_count = sum(
+                source_id in {safe_resource_id(candidate.get(key), "") for key in ("id", "source_line_item_id")}
+                for section in sections for candidate in section.get("lines") or [] if isinstance(candidate, dict)
+            )
+            if item_count == 1 and basis_count == 1:
+                return False
+        return True
 
     def mark_line_custom_for_manual_pricing(line: dict[str, Any]) -> None:
         bracketed = bracketed_catalog_reference_parts(line.get("text"))
