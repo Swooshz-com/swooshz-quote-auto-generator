@@ -6303,27 +6303,64 @@ def quote_basis_sections_with_default_dimension_confirmation(
     sections: list[dict[str, Any]],
     dimensions: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    legacy = quote_basis_from_sections(sections)
-    adjusted = quote_basis_with_default_dimension_confirmation(legacy, dimensions)
-    if adjusted == legacy:
-        return copy.deepcopy(sections)
-    adjusted_sections = normalize_quote_basis_sections({"quote_basis": adjusted})
-    confidence_by_text = {
-        clean_text(line.get("text")).lower(): normalize_confidence_percent(line.get("confidence", line.get("confidence_pct")))
-        for section in sections
-        for line in (section.get("lines") or [])
-        if isinstance(line, dict) and clean_text(line.get("text"))
-    }
+    # Keep the structured rows authoritative. A legacy text round-trip loses their
+    # identities, measurements and catalogue bindings before final reconciliation.
+    quote_basis_from_sections(sections)  # Retain the section-identity validation.
+    adjusted_sections = copy.deepcopy(sections)
+    if clean_text(dimensions.get("dimension_source")) != "default":
+        return adjusted_sections
+
+    confirmation_text = default_booth_dimension_confirmation_line(dimensions).removeprefix("Confirm: ")
+    found_default_line = False
+    retained_sections = []
     for section in adjusted_sections:
+        next_lines = []
         for line in section.get("lines") or []:
             if not isinstance(line, dict):
+                next_lines.append(line)
                 continue
-            if normalize_confidence_percent(line.get("confidence", line.get("confidence_pct"))) is not None:
+            # A billable item's usage detail may mention the default footprint.
+            # Only rewrite unmeasured, unpriced informational reminders.
+            has_measurement_or_pricing = any(line.get(key) not in (None, "") for key in (
+                "quantity", "unit", "pricing_keyword", "catalog_description", "pricing_reference_description",
+                "catalog_unit_price", "effective_unit_price", "unit_price_override", "pricing_basis_amount",
+                "approved_quote_amount", "price_mode", "display_price",
+            ))
+            authority = line.get("pricing_authority")
+            has_pricing_authority = isinstance(authority, dict) and authority.get("variant") not in (None, "", "none")
+            informational = is_informational_dimension_basis_line(line) or clean_text(line.get("text")).lower().startswith("default booth size")
+            if (
+                has_measurement_or_pricing or has_pricing_authority or line.get("custom_pricing")
+                or normalize_basis_tag(line.get("tag")) == "Custom" or not informational
+                or not line_references_default_booth_dimensions(line.get("text"), dimensions)
+            ):
+                next_lines.append(line)
                 continue
-            text = clean_text(line.get("text"))
-            inherited = confidence_by_text.get(text.lower())
-            line["confidence"] = inherited if inherited is not None else 50
-    return adjusted_sections
+            if found_default_line:
+                continue
+            line["tag"] = "Confirm"
+            line["text"] = confirmation_text
+            confidence = normalize_confidence_percent(line.get("confidence", line.get("confidence_pct")))
+            line["confidence"] = confidence if confidence is not None else 50
+            next_lines.append(line)
+            found_default_line = True
+        section["lines"] = next_lines
+        if next_lines:
+            retained_sections.append(section)
+
+    if not found_default_line:
+        target = next((section for section in retained_sections
+                       if "platform" in safe_section_id(section.get("id"))
+                       or "floor" in safe_section_id(section.get("id"))), None)
+        if target is None:
+            target = {
+                "id": DEFAULT_DIMENSION_BASIS_FIELD,
+                "title": quote_basis_title_from_key(DEFAULT_DIMENSION_BASIS_FIELD),
+                "lines": [],
+            }
+            retained_sections.append(target)
+        target["lines"].append({"tag": "Confirm", "text": confirmation_text, "confidence": 50})
+    return retained_sections
 
 
 def nested_value(payload: dict[str, Any], group: str, key: str, flat_key: str) -> Any:

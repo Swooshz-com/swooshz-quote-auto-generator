@@ -31785,9 +31785,11 @@ assert.strictEqual(basisDisplayTitle("Graphics / Signage"), "Graphics / Signage"
 assert.strictEqual(basisQuantityLabel({ quantity: 12, unit: "m length" }), "12 m length");
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 12, unit: "m length" }), "12 m");
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "nos" }), "2 nos.");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: 1, unit: "lot" }), "1 lot");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "" }), "2 (unit needed)");
 assert.strictEqual(basisQuantityLabel({ quantity: "m", unit: "length" }), "");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "1 lot");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "1 lot");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "Not measured");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "Not measured");
 assert.strictEqual(
   basisChatLineContext({ tag: "Include", text: "100mm raised platform", quantity: 36, unit: "sqm" }),
   "Include: 100mm raised platform"

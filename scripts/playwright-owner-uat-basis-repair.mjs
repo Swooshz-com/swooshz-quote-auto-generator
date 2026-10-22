@@ -35,6 +35,18 @@ const quoteCurrency = (args.find((arg) => arg.startsWith("--currency=")) || "--c
 const fxRate = quoteCurrency === "SGD" ? 1 : 0.7391;
 const cents = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
 
+// Normalized basis quantities are canonical text; seeded saved rows may be numeric.
+const exactPositiveQuantity = (value, expected) => {
+  if (typeof value !== "number" && !(typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value))) return false;
+  const quantity = Number(value);
+  return Number.isFinite(quantity) && quantity > 0 && quantity === expected;
+};
+assert(exactPositiveQuantity(4, 4) && exactPositiveQuantity("4", 4), "quantity assertion rejected a canonical representation");
+for (const invalid of [null, undefined, true, false, "", "4 sqm", " 4 ", NaN, Infinity, 0, -4, 9]) {
+  assert(!exactPositiveQuantity(invalid, 4), "quantity assertion accepted an invalid or changed measurement");
+}
+
+
 // Synthetic catalogue with deliberately similar entries; no shared prefix token across sections.
 const slug = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 function catalogItem(section, unit, name, price, extraFamilies = [], extraTerms = [], order = [0, 0]) {
@@ -399,7 +411,7 @@ try {
   assert(selectionBody.selections.some((entry) => entry.source_basis_line_id === "u1-count" && entry.status === "selected"), "count proposal was not admitted at Confirm", selectionBody.selections);
   assert(selectedCount?.pricing_authority?.variant === "catalog" && selectedCount.pricing_authority.catalog_item_id === byName("Bar Stool").id && selectedCount.pricing_authority.catalog_digest === pricingBasis.digest && selectedCount.pricing_reference_id === pricingBasis.id && selectedCount.pricing_authority.price === byName("Bar Stool").sale_unit_price, "server admission did not bind the selected row to the current reference", selectedCount);
   const selectedCountLine = selectionRequest.quote_basis_sections.flatMap((section) => section.lines || []).find((line) => line.id === "u1-count");
-  assert(selectedCount.quantity === 4 && selectedCountLine?.quantity === 4 && selectedCount.pricing_basis_amount === cents(4 * byName("Bar Stool").sale_unit_price),
+  assert(selectedCount.quantity === 4 && exactPositiveQuantity(selectedCountLine?.quantity, 4) && selectedCount.pricing_basis_amount === cents(4 * byName("Bar Stool").sale_unit_price),
     "Confirm failed to price the valid proposal at its saved basis quantity", { selectedCount, selectedCountLine });
   result.selectedCountBoundary = { section: selectedCount.section, quantity: selectedCount.quantity, basisQuantity: selectedCountLine.quantity, authority: selectedCount.pricing_authority, pricingBasis };
   result.confirm = {
