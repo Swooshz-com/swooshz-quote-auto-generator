@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-09-30
+Last updated: 2026-10-23
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -79,6 +79,11 @@ Source of truth: `.github/workflows/ci.yml`
 
 ## Validate App Checks
 
+- Pins only the `Validate app` runner to `ubuntu-24.04` for the locked Playwright
+  1.60.0 browser/dependency support. The `ubuntu-latest` move to Ubuntu 26.04
+  fails browser installation before tests. Review this pin when the locked
+  Playwright version supports a newer runner and the full rendered gate passes.
+  Other jobs, dependencies, security gates and workflow triggers are unchanged.
 - Installs Python 3.12.13 (the exact patch shared with the retrospective job) and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
   This current application dependency set is used only by `Validate app`; the
