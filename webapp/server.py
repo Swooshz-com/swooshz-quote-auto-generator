@@ -5696,7 +5696,7 @@ LEADING_QUANTITY_PREFIX_RE = re.compile(
     r"(?P<unit>"
     r"m\s+(?:length|run)"
     r"|sq\.?\s*m\.?"
-    r"|m\s*(?:2|\^2)"
+    r"|m\s*(?:2|\^2|\u00b2)"
     r"|sqm"
     r"|nos?\.?"
     r"|no\.?"
@@ -5720,7 +5720,7 @@ def format_quantity_number(value: float) -> int | float:
 def normalize_quantity_prefix_unit(value: Any) -> str:
     unit = clean_text(value).lower()
     unit = re.sub(r"\s+", " ", unit).strip(". ")
-    if unit in {"sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."}:
+    if unit in {"sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."}:
         return "sqm"
     if unit in {"nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"}:
         return "nos"
@@ -5761,7 +5761,7 @@ def quantity_unit_aliases(unit: Any) -> list[str]:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     aliases = {normalized} if normalized else set()
     if normalized == "sqm":
-        aliases.update({"sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."})
+        aliases.update({"sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."})
     if re.fullmatch(r"nos?\.?", normalized):
         aliases.update({"nos", "nos.", "no", "no.", "pcs", "pieces", "units"})
     if normalized == "m length":
@@ -6382,7 +6382,7 @@ def safe_segment(value: str, fallback: str = "file") -> str:
 def normalize_pricing_unit(value: Any) -> str:
     unit = clean_text(value)
     normalized = re.sub(r"\s+", " ", unit.lower()).strip(". ")
-    if normalized in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+    if normalized in {"m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
         return "sqm"
     if normalized in {"m run", "m. run"}:
         return "m run"
@@ -6408,7 +6408,7 @@ def canonical_pricing_authority_text(value: Any) -> str:
 def canonical_pricing_authority_unit(value: Any) -> str:
     text = canonical_pricing_authority_text(value)
     lower = text.lower().strip(". ")
-    if lower in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+    if lower in {"m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
         return "sqm"
     if lower in {"m run", "m. run"}:
         return "m run"
@@ -21467,33 +21467,61 @@ def provider_connection_error_message(provider: str, exc: BaseException) -> str:
 
 
 def response_output_text(data: dict[str, Any]) -> str:
-    if isinstance(data.get("output_text"), str):
-        return data["output_text"]
+    diagnostics = openai_response_failure_diagnostics(data)
+    if diagnostics.get("failure_boundary") == "provider_response_shape":
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics=diagnostics)
+    if diagnostics.get("responses_status") not in {"completed", "failed", "incomplete", "in_progress", "queued", "cancelled"}:
+        diagnostics.pop("responses_status", None)
+    if diagnostics.get("incomplete_reason") not in {"max_output_tokens", "content_filter"}:
+        diagnostics.pop("incomplete_reason", None)
+    diagnostics.pop("provider_error_code", None)
+    diagnostics.pop("provider_error_class", None)
+    diagnostics.update(draft_provider_error_diagnostics(data))
+    status = data.get("status")
+    if status == "failed":
+        raise OpenAIAnalysisError("AI response failed.", diagnostics={**diagnostics, "failure_boundary": "provider_response_contract"})
+    if status is not None and status != "completed":
+        raise AIModelOutputError("AI response was not completed.", diagnostics={**diagnostics, "failure_boundary": "provider_response_contract"})
+    if diagnostics.get("refusal_present") or data.get("error") is not None or data.get("incomplete_details"):
+        raise AIModelOutputError("AI response was incomplete or refused.", diagnostics={**diagnostics, "failure_boundary": "provider_response_contract"})
     chunks: list[str] = []
     for item in data.get("output") or []:
-        if not isinstance(item, dict):
-            continue
+        if item.get("status") is not None and item["status"] != "completed":
+            raise AIModelOutputError("AI response was not completed.", diagnostics={"failure_boundary": "provider_response_contract"})
         for content in item.get("content") or []:
-            if isinstance(content, dict) and isinstance(content.get("text"), str):
+            if "text" in content and not isinstance(content["text"], str):
+                raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+            if isinstance(content.get("text"), str):
                 chunks.append(content["text"])
-    return "\n".join(chunks).strip()
+    nested = "\n".join(chunks).strip()
+    shortcut = (data.get("output_text") or "").strip()
+    if shortcut and nested and shortcut != nested:
+        raise AIModelOutputError("AI response contained conflicting text.", diagnostics={"failure_boundary": "provider_response_contract"})
+    return shortcut or nested
 
 
 def chat_completions_output_text(data: dict[str, Any]) -> str:
-    chunks: list[str] = []
-    for choice in data.get("choices") or []:
-        if not isinstance(choice, dict):
-            continue
-        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
-        content = message.get("content")
-        if isinstance(content, str):
-            chunks.append(content)
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and isinstance(item.get("text"), str):
-                    chunks.append(item["text"])
-                elif isinstance(item, str):
-                    chunks.append(item)
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or len(data["choices"]) != 1:
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+    choice = data["choices"][0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+    message = choice["message"]
+    if (choice.get("finish_reason") is not None and choice["finish_reason"] != "stop") or message.get("refusal") is not None or data.get("error") is not None:
+        raise AIModelOutputError("AI response was incomplete or refused.", diagnostics={"failure_boundary": "provider_response_contract"})
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+    chunks = []
+    for item in content:
+        if isinstance(item, str):
+            chunks.append(item)
+        elif isinstance(item, dict) and item.get("type") != "refusal" and "refusal" not in item and isinstance(item.get("text"), str):
+            chunks.append(item["text"])
+        else:
+            raise AIModelOutputError("AI response content was invalid or refused.", diagnostics={"failure_boundary": "provider_response_contract"})
     return "\n".join(chunks).strip()
 
 
@@ -21515,6 +21543,7 @@ SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
     "provider_error_param",
     "request_shape_sha256",
     "failure_boundary",
+    "response_contract_reason",
     "http_status",
     "http_status_class",
     "provider_error_class",
@@ -21650,18 +21679,48 @@ def chat_completions_output_diagnostics(data: dict[str, Any], output_text: str) 
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
+    """One object, optionally fenced or surrounded by harmless explanatory prose.
+
+    Never extract an object from an array, discard another object, accept duplicate
+    keys, or turn non-JSON numeric constants into trusted model data.
+    """
+    if not isinstance(text, str) or len(text) > MAX_JOB_REQUEST_BYTES:
+        raise OpenAIAnalysisError("AI analysis returned invalid JSON.")
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
+    if cleaned.startswith("\x60\x60\x60"):
+        content_start = 7 if cleaned[3:7].lower() == "json" else 3
+        fence_end = cleaned.find("\x60\x60\x60", content_start)
+        if fence_end < 0 or any(char in cleaned[fence_end + 3:] for char in "[]{}\x60"):
+            raise OpenAIAnalysisError("AI analysis returned invalid JSON.")
+        cleaned = cleaned[content_start:fence_end].strip()
     start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise OpenAIAnalysisError("AI analysis did not return JSON.")
+    if start < 0 or any(char in cleaned[:start] for char in "[]{}"):
+        raise OpenAIAnalysisError("AI analysis JSON was not an object.")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_key")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value: str) -> None:
+        raise ValueError("non_json_number")
+
+    def finite_float(value: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non_finite_number")
+        return number
+
     try:
-        parsed = json.loads(cleaned[start:end + 1])
-    except json.JSONDecodeError as exc:
-        raise OpenAIAnalysisError("AI analysis returned invalid JSON.") from exc
+        decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_constant=invalid_constant, parse_float=finite_float)
+        parsed, end = decoder.raw_decode(cleaned[start:])
+        if any(char in cleaned[start + end:] for char in "[]{}"):
+            raise ValueError("trailing_structure")
+    except (ValueError, RecursionError) as exc:
+        raise OpenAIAnalysisError("AI analysis returned invalid JSON.") from None
     if not isinstance(parsed, dict):
         raise OpenAIAnalysisError("AI analysis JSON was not an object.")
     return parsed
@@ -22093,7 +22152,7 @@ def build_quote_draft_prompt(
         "and line count should follow the actual booth evidence. Use pricing_reference_sections from Quote context JSON as the fixed section list to match against first. "
         "Only create a new section when a line genuinely does not fit any provided pricing_reference_sections entry. "
         "Sort quote_basis_sections and line_items by pricing reference category_order, then item_order; keep source order for unresolved custom rows. "
-        "Each section must include id, title, and lines. Each line must include tag, text, confidence_pct, quantity, unit, and source_line_item_id when available. "
+        "Each section must include id, title, and lines. Each physical line must have one unique stable id, tag, text, confidence_pct, quantity and unit. Use the same id in its linked line_items source_basis_line_id; never reuse an identity for separate physical scope. Pure informational notes may omit measurements and need no output item. "
         "quote_basis_sections line text and line_items.description are customer-facing quotation text. Do not include provenance, reasoning, analysis, or source phrases such as taken from quotation title, visible in image, as seen in render, AI detected, assumed from, likely, appears to be, from reference image, or suggested by image. Put analysis reasons only in analysis_findings or internal notes. "
         "Use quote_basis_sections as the operator review surface for the same pricing sentences that will become output rows. "
         "Every line_items row must correspond to a quote_basis_sections line, and every customer-visible priced or manual-pricing quote_basis_sections line must have a matching line_items row. Do not add output-only rows or hidden catalog variants. "
@@ -22130,7 +22189,7 @@ def build_quote_draft_prompt(
         "Do not collapse a full section into a single subtotal unless that item is genuinely sold as one lump-sum service. "
         "Do not put clarification questions into line_items. Do not put generic review questions into quote_basis_sections. "
         "Quote Basis lines represent included, excluded, confirm, or custom scope; unresolved but quoteable uncertainty belongs in Confirm lines, while missing usable evidence belongs in empty quote_basis_sections and line_items. "
-        "Each line item must include section, quantity, unit, description, pricing_keyword, and source_basis_line_id where possible. Use sqm for square-metre quantities. Do not create ordinary quotation rows with missing quantity or unit. Keep pure informational booth-size lines in Quote Basis only unless they are explicitly included as 1 lot with display_price Included. "
+        "Each line item must include section, quantity, unit, description, pricing_keyword, and source_basis_line_id linked to exactly one physical basis line. Quantities must be positive JSON numbers, not locale-formatted or percent strings. Repeated measurements in text, structured fields and linked rows must agree; never choose one contradictory value. Use sqm for square-metre quantities. Do not create ordinary quotation rows with missing quantity or unit. Keep pure informational booth-size lines in Quote Basis only unless they are explicitly included as 1 lot with display_price Included. "
         "Use the pricing_catalog choices in Quote context JSON. When a catalog item applies, set "
         "pricing_keyword exactly to that catalog id from pricing_catalog, not an invented keyword. "
         "Do not include pricing amounts or internal costs. If no catalog item fits and the item should be customer-visible, keep pricing_keyword empty and let the Custom basis line flag it for manual pricing. "
@@ -22744,6 +22803,10 @@ def quote_basis_sections_with_catalog_exact_lines(
         line.pop("catalog_unit_price", None)
 
     def line_signature(line: dict[str, Any]) -> str:
+        # Identified physical scope never deduplicates by wording or even a
+        # repeated ID: retaining a collision lets ownership checks refuse it.
+        if any(safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")):
+            return ""
         pricing_keyword = clean_text(line.get("pricing_keyword"))
         if pricing_keyword:
             bracketed = bracketed_catalog_reference_parts(line.get("text"))
@@ -25430,6 +25493,8 @@ def normalize_basis_chat_result(
             raise OpenAIAnalysisError("AI basis chat returned an expanded proposal payload.")
         if set(replacement_value) - {"text", "tag", "confidence", "confidence_pct", "quantity", "unit"}:
             raise OpenAIAnalysisError("AI basis chat returned unsupported replacement-line fields.")
+        provider_row_confidence(replacement_value)
+        provider_row_measurement(replacement_value, replacement_value.get("text", ""))
         message = clean_multiline(raw_proposal.get("message") or parsed.get("message"))
         line_items = normalized_basis_chat_line_items(None, payload, auth_session=auth_session)
         sections = replacement_line_sections(
@@ -25549,12 +25614,225 @@ def pricing_authority_variant_counts(items: list[dict[str, Any]]) -> dict[str, i
     return counts
 
 
+def provider_quote_response_invalid(reason: str) -> None:
+    # Fixed codes only: no provider text, row IDs, measurements or catalogue values.
+    raise AIModelOutputError("AI analysis returned an inconsistent quote response.", diagnostics={
+        "failure_boundary": "model_output_contract", "response_contract_reason": reason,
+    })
+
+
+def provider_quantity(value: Any) -> Decimal | None:
+    """Fresh model measurements only; saved data/currency parsing stays unchanged."""
+    if value is None or value == "":
+        return None
+    if type(value) not in (int, float, str) or isinstance(value, bool):
+        provider_quote_response_invalid("quantity_type")
+    if isinstance(value, str) and not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value.strip()):
+        provider_quote_response_invalid("quantity_format")
+    try:
+        number = Decimal(str(value).strip())
+    except InvalidOperation:
+        provider_quote_response_invalid("quantity_format")
+    if not number.is_finite() or number <= 0 or not math.isfinite(float(number)) or float(number) <= 0:
+        provider_quote_response_invalid("quantity_range")
+    return number
+
+
+def provider_row_measurement(row: dict[str, Any], text: str) -> tuple[Decimal | None, str]:
+    quantity = provider_quantity(row.get("quantity"))
+    raw_unit = row.get("unit")
+    if raw_unit is not None and not isinstance(raw_unit, str):
+        provider_quote_response_invalid("unit_type")
+    unit = normalize_pricing_unit(raw_unit)
+    # Use the existing prefix grammar, but inspect its original numeric token before
+    # legacy parsing can strip punctuation or choose it over contradictory fields.
+    pattern = LEADING_QUANTITY_PREFIX_RE.pattern.replace(
+        r"(?P<quantity>\d[\d,]*(?:\.\d+)?)",
+        r"(?P<quantity>[-+]?(?:\d[\d,.]*(?:[eE][-+]?\d+)?|NaN|Infinity)%?)",
+    )
+    match = re.match(pattern, clean_text(text), flags=re.IGNORECASE)
+    if match:
+        prefix_quantity = provider_quantity(match.group("quantity"))
+        prefix_unit = normalize_quantity_prefix_unit(match.group("unit"))
+        if quantity is not None and quantity != prefix_quantity:
+            provider_quote_response_invalid("quantity_conflict")
+        if unit and not pricing_units_share_quantity_basis(unit, prefix_unit):
+            provider_quote_response_invalid("unit_conflict")
+        quantity, unit = prefix_quantity, unit or prefix_unit
+    return quantity, unit
+
+
+def provider_row_identity(row: dict[str, Any], keys: tuple[str, ...]) -> str:
+    values = []
+    for key in keys:
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        if not isinstance(value, str) or safe_resource_id(value, "") != value.strip():
+            provider_quote_response_invalid("row_identity_shape")
+        values.append(value.strip())
+    if len(set(values)) > 1:
+        provider_quote_response_invalid("row_identity_conflict")
+    return values[0] if values else ""
+
+
+def provider_row_confidence(row: dict[str, Any], *, required: bool = False) -> None:
+    values = [row[key] for key in ("confidence_pct", "confidence") if key in row]
+    if not values and required:
+        provider_quote_response_invalid("confidence_missing")
+    if any(type(value) is not int or not 0 <= value <= 100 for value in values):
+        provider_quote_response_invalid("confidence_scale")
+    if len(set(values)) > 1:
+        provider_quote_response_invalid("confidence_conflict")
+
+
+def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool) -> dict[str, Any]:
+    """Validate fresh response scope before normalisation, pricing or seal creation.
+
+    Missing optional fields remain supported. A supplied structured field must be
+    complete enough to preserve every row. Identity/measurement data is never
+    repaired from a catalogue or from a saved, already-normalised draft.
+    """
+    if not isinstance(parsed, dict):
+        provider_quote_response_invalid("draft_shape")
+    result = copy.deepcopy(parsed)
+    for key in ("line_items", "quote_basis_sections", "analysis_findings", "blocking_clarification_questions"):
+        if key in result and not isinstance(result[key], list):
+            provider_quote_response_invalid("draft_field_shape")
+    if "project" in result and not isinstance(result["project"], dict):
+        provider_quote_response_invalid("project_shape")
+    for key in ("booth_width", "booth_depth"):
+        if key in result.get("project", {}):
+            provider_quantity(result["project"][key])
+    if "quote_basis" in result and (not isinstance(result["quote_basis"], dict) or any(
+            not isinstance(value, str) for value in result["quote_basis"].values())):
+        provider_quote_response_invalid("legacy_basis_shape")
+    for field, text_key in (("analysis_findings", "text"), ("blocking_clarification_questions", "question")):
+        for row in result.get(field, []):
+            if not isinstance(row, dict) or not isinstance(row.get(text_key), str) or not row[text_key].strip():
+                provider_quote_response_invalid("supplementary_row_shape")
+            provider_row_confidence(row)
+    basis_rows = []
+    section_ids = set()
+    for section in result.get("quote_basis_sections", []):
+        if not isinstance(section, dict):
+            provider_quote_response_invalid("section_shape")
+        if "title" in section and not isinstance(section["title"], str):
+            provider_quote_response_invalid("section_shape")
+        section_id = safe_section_id(section.get("id") or section.get("title"), "")
+        if section_id and section_id in section_ids:
+            provider_quote_response_invalid("section_identity_collision")
+        section_ids.add(section_id)
+        if "lines" in section:
+            if not isinstance(section["lines"], list):
+                provider_quote_response_invalid("basis_rows_shape")
+            lines = section["lines"]
+        elif any(isinstance(section.get(key), str) and clean_text(section[key]) for key in ("text", "body")):
+            lines = multiline_list(section.get("text") or section.get("body"))
+        else:
+            provider_quote_response_invalid("basis_rows_shape")
+        for line in lines:
+            if isinstance(line, str) and line.strip():
+                if require_confidence:
+                    provider_quote_response_invalid("confidence_missing")
+                continue
+            if not isinstance(line, dict):
+                provider_quote_response_invalid("basis_row_shape")
+            texts = [line[key] for key in ("text", "line", "description") if key in line and line[key] not in (None, "")]
+            if not texts or any(not isinstance(text, str) or not text.strip() for text in texts):
+                provider_quote_response_invalid("basis_row_text")
+            if len({clean_text(text) for text in texts}) != 1:
+                provider_quote_response_invalid("basis_row_text_conflict")
+            if len(split_basis_decision_text(texts[0], line.get("tag"))) != 1:
+                provider_quote_response_invalid("basis_row_scope_split")
+            row_id = provider_row_identity(line, ("id", "source_line_item_id", "source_basis_line_id"))
+            if row_id:
+                line["id"] = row_id
+            provider_row_confidence(line, required=require_confidence)
+            basis_rows.append((row_id, provider_row_measurement(line, texts[0])))
+    raw_rows = result.get("line_items", [])
+    item_rows = []
+    for row in raw_rows:
+        if not isinstance(row, dict) or not isinstance(row.get("description"), str) or not row["description"].strip():
+            provider_quote_response_invalid("item_row_shape")
+        row_id = provider_row_identity(row, ("source_basis_line_id", "id", "source_line_item_id"))
+        if row_id:
+            row["source_basis_line_id"] = row_id
+        item_rows.append((row_id, provider_row_measurement(row, row["description"])))
+    for rows in (basis_rows, item_rows):
+        ids = [row_id for row_id, _ in rows if row_id]
+        if len(ids) != len(set(ids)):
+            provider_quote_response_invalid("row_identity_collision")
+    items_by_id = {row_id: measurement for row_id, measurement in item_rows if row_id}
+    for row_id, (quantity, unit) in basis_rows:
+        if not row_id or row_id not in items_by_id:
+            continue
+        item_quantity, item_unit = items_by_id[row_id]
+        if quantity is not None and item_quantity is not None and quantity != item_quantity:
+            provider_quote_response_invalid("linked_quantity_conflict")
+        if unit and item_unit and not pricing_units_share_quantity_basis(unit, item_unit):
+            provider_quote_response_invalid("linked_unit_conflict")
+    if raw_rows:
+        sections = normalize_quote_basis_sections(result)
+        bound_rows = provider_rows_with_unique_basis_ids(raw_rows, sections)
+        basis_ids = {row_id for row_id, _ in basis_rows if row_id}
+        for row in bound_rows:
+            row_id = safe_resource_id(row.get("source_basis_line_id"), "")
+            if not row_id or (result.get("quote_basis_sections") and row_id not in basis_ids):
+                provider_quote_response_invalid("item_identity_unresolved")
+        result["line_items"] = bound_rows
+    return result
+
+
+def require_provider_row_coverage(
+    raw_items: list[dict[str, Any]], raw_sections: list[dict[str, Any]],
+    items: list[dict[str, Any]], sections: list[dict[str, Any]],
+) -> None:
+    """Material provider identities must not disappear during derived assembly."""
+    original_basis_ids = {
+        safe_resource_id(line.get("id") or line.get("source_line_item_id"), "")
+        for section in raw_sections for line in section.get("lines", []) if isinstance(line, dict)
+    } - {""}
+    original_item_ids = {safe_resource_id(row.get("source_basis_line_id"), "") for row in raw_items} - {""}
+    basis_ids = [safe_resource_id(line.get("id") or line.get("source_line_item_id"), "")
+                 for section in sections for line in section.get("lines", []) if isinstance(line, dict)]
+    item_ids = [safe_resource_id(row.get("source_basis_line_id"), "") for row in items]
+    if any(basis_ids.count(row_id) != 1 for row_id in original_basis_ids | original_item_ids):
+        provider_quote_response_invalid("basis_row_coverage")
+    if any(item_ids.count(row_id) != 1 for row_id in original_item_ids):
+        provider_quote_response_invalid("item_row_coverage")
+
+
+def require_provider_amount_representable(
+    raw_rows: list[dict[str, Any]], catalog_lookup: dict[str, dict[str, Any]], exchange_rate: float | None,
+) -> None:
+    """Check trusted candidate arithmetic before normalisation can calculate a price."""
+    for row in raw_rows:
+        item = catalog_lookup.get(clean_text(row.get("pricing_keyword")))
+        if not item:
+            continue
+        quantity, _unit = provider_row_measurement(row, row["description"])
+        price = item.get("catalog_unit_price", item.get("sale_unit_price"))
+        if quantity is None or price in (None, ""):
+            continue
+        try:
+            amount = quantity * Decimal(str(price))
+            amounts = [amount]
+            if exchange_rate is not None:
+                amounts.append(amount * Decimal(str(exchange_rate)))
+            if any(not value.is_finite() or round_commercial_cents(float(value)) is None for value in amounts):
+                provider_quote_response_invalid("amount_range")
+        except (InvalidOperation, OverflowError, ValueError):
+            provider_quote_response_invalid("amount_range")
+
+
 def normalize_ai_draft(
     parsed: dict[str, Any],
     payload: dict[str, Any] | None = None,
     require_confidence: bool = False,
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    parsed = admit_provider_quote_draft(parsed, require_confidence=require_confidence)
     has_payload_context = payload is not None
     payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if has_payload_context and pricing_reference_snapshot_for_payload(payload) is None:
@@ -25580,13 +25858,6 @@ def normalize_ai_draft(
             auth_session=auth_session,
         )
         trusted_input_authorities = trusted_manual_included_input_authorities(trusted_input_items)
-    line_items = normalize_line_items(
-        {**payload, "line_items": raw_line_items},
-        use_catalog=has_payload_context,
-        auth_session=auth_session,
-        provider_result=has_payload_context,
-        trusted_input_authorities=trusted_input_authorities,
-    )
     catalog_lookup = (
         pricing_catalog_runtime_lookup_for_payload(
             payload,
@@ -25595,6 +25866,14 @@ def normalize_ai_draft(
         )
         if has_payload_context
         else {}
+    )
+    require_provider_amount_representable(raw_line_items, catalog_lookup, quote_exchange_rate_from_payload(payload))
+    line_items = normalize_line_items(
+        {**payload, "line_items": raw_line_items},
+        use_catalog=has_payload_context,
+        auth_session=auth_session,
+        provider_result=has_payload_context,
+        trusted_input_authorities=trusted_input_authorities,
     )
     sections = quote_basis_sections_with_catalog_exact_lines(
         raw_sections,
@@ -25619,6 +25898,7 @@ def normalize_ai_draft(
         exchange_rate=quote_exchange_rate_from_payload(payload),
         quote_currency=quote_currency_from_payload(payload),
     )
+    require_provider_row_coverage(raw_line_items, raw_sections, line_items, sections)
     legacy_basis = quote_basis_from_sections(sections)
     blockers = normalize_blocking_clarification_questions(parsed.get("blocking_clarification_questions"))
     if blockers:
@@ -25982,39 +26262,12 @@ def request_openai_quote_basis(
         response_diagnostics.pop("incomplete_reason", None)
     response_diagnostics["request_shape_sha256"] = shape_fingerprint
     response_diagnostics["attempt_number"] = 1
-    if (
-        not isinstance(data, dict)
-        or response_diagnostics.get("failure_boundary") == "provider_response_shape"
-    ):
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response shape was invalid.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
-        )
-    if (
-        ("output" in data and data.get("output") is not None and not isinstance(data.get("output"), list))
-        or ("output_text" in data and data.get("output_text") is not None and not isinstance(data.get("output_text"), str))
-    ):
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response shape was invalid.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
-        )
-    if response_diagnostics.get("responses_status") == "failed":
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response failed.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_contract"},
-        )
-    if response_diagnostics.get("responses_status") == "incomplete" or response_diagnostics.get("refusal_present"):
-        raise AIModelOutputError(
-            "OpenAI analysis response was incomplete or refused.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_contract"},
-        )
     try:
         output_text = response_output_text(data)
-    except (AttributeError, TypeError) as exc:
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response shape was invalid.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
-        ) from exc
+    except OpenAIAnalysisError as exc:
+        raise type(exc)(str(exc), diagnostics={
+            **response_diagnostics, **exc.diagnostics,
+        }) from None
     try:
         parsed = parse_json_object(output_text)
     except OpenAIAnalysisError as exc:
@@ -26030,9 +26283,10 @@ def request_openai_quote_basis(
             auth_session=auth_session,
         )
     except OpenAIAnalysisError as exc:
-        raise OpenAIAnalysisError(
+        raise type(exc)(
             str(exc),
-            diagnostics={**response_diagnostics, "failure_boundary": "application_normalization"},
+            diagnostics={**response_diagnostics, **safe_ai_output_diagnostics(exc.diagnostics),
+                         "failure_boundary": exc.diagnostics.get("failure_boundary", "application_normalization")},
         ) from exc
     except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
         raise OpenAIAnalysisError(
@@ -26514,6 +26768,9 @@ def finalized_remote_draft_result(
                 line["tag"] = "Custom"
                 line["custom_pricing"] = True
                 line.pop("pricing_keyword", None)
+    if source.strip().lower() != "local":
+        require_provider_row_coverage(ai_basis.get("line_items", []), ai_basis.get("quote_basis_sections", []),
+                                      line_items, adjusted_sections)
     adjusted_basis = quote_basis_from_sections(adjusted_sections)
     final_line_items = line_items or fallback_line_items
     # The seal attests provider-derived rows only, in the units the provider measured them in.
@@ -26799,7 +27056,16 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 error_reference=error_reference,
                 details=provider_failure_details,
             )
-            if protected_mode:
+            write_local_log(
+                "openai_draft_failed",
+                {
+                    "error_reference": error_reference,
+                    **provider_failure_details,
+                },
+            )
+            if protected_mode or exc.diagnostics.get("failure_boundary") in {
+                "model_output_contract", "model_output_json", "provider_response_shape", "provider_response_contract", "application_normalization",
+            } or exc.diagnostics.get("response_contract_reason"):
                 log_protected_ai_draft_block(
                     error_reference=error_reference,
                     reason="remote_ai_failed",
@@ -26808,13 +27074,6 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                     exc=exc,
                 )
                 return protected_ai_draft_blocked_result(error_reference)
-            write_local_log(
-                "openai_draft_failed",
-                {
-                    "error_reference": error_reference,
-                    **provider_failure_details,
-                },
-            )
 
     if remote_errors:
         try:

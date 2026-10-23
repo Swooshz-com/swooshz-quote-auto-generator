@@ -358,7 +358,7 @@ def clean_text(value: Any) -> str:
 def normalize_unit(unit: Any) -> str:
     text = clean_text(unit)
     lower = re.sub(r"\s+", " ", text.lower()).strip(". ")
-    if lower in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+    if lower in {"m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
         return "sqm"
     if lower in {"m run", "m. run"}:
         return "m run"
@@ -412,7 +412,7 @@ def canonical_pricing_authority_text(value: Any) -> str:
 def canonical_pricing_authority_unit(value: Any) -> str:
     text = canonical_pricing_authority_text(value)
     lower = text.lower().strip(". ")
-    if lower in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+    if lower in {"m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
         return "sqm"
     if lower in {"m run", "m. run"}:
         return "m run"

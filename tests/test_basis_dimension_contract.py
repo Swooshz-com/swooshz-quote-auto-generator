@@ -180,8 +180,8 @@ class BasisDimensionContractTest(unittest.TestCase):
             ([line], [{**item, "source_basis_line_id": "foreign-row"}], [line]),
             ([{**line, "source_line_item_id": "different-row"}], [item], [{**line, "source_line_item_id": "different-row"}]),
             ([line], [item, {**item, "quantity": 9}], [line]),
-            # Existing exact duplicate reconciliation retains the higher-confidence copy.
-            ([line, {**line, "confidence": 80}], [item], [line]),
+            # Duplicate physical IDs remain visible to ownership refusal; fresh admission rejects them.
+            ([line, {**line, "confidence": 80}], [item], [line, {**line, "confidence": 80}]),
         )
         for original_lines, provider_rows, expected_retained in scenarios:
             with self.subTest(lines=len(original_lines), rows=len(provider_rows), identity=original_lines[0]):

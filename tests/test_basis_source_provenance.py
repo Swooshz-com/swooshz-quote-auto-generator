@@ -127,6 +127,8 @@ class ProviderSourceSelectionTest(unittest.TestCase):
                  "quantity": 12, "unit": "sqm", "pricing_keyword": "synthetic-surface"},
                 {"section": "Surfaces", "description": DETAIL, "quantity": 12, "unit": "" if missing_unit else "sqm"},
             ]}
+        if missing_unit:
+            raw["line_items"][1]["source_basis_line_id"] = "dimension-note"
         if ambiguous:
             raw["line_items"].append(copy.deepcopy(raw["line_items"][1]))
             raw["quote_basis_sections"][0]["lines"].append({**raw["quote_basis_sections"][0]["lines"][1], "id": "second-note"})
@@ -233,14 +235,10 @@ class ProviderSourceSelectionTest(unittest.TestCase):
              mock.patch.object(webapp, "write_local_log"), existing.LocalRunnerServer() as runner:
             headers = self.fixture._ledger_runner_headers(runner)
             drafted = self.fixture._ledger_post(runner, headers, "/api/draft", payload)
-            self.assertEqual(drafted["status"], 200)
-            result = drafted["body"]
-        lines = [line for section in result["quote_basis_sections"] for line in section["lines"]
-                 if line.get("id") in {"dimension-note", "second-note"}]
-        self.assertTrue(lines)
-        self.assertFalse(any(line.get("possible_pricing_matches") for line in lines))
-        self.assertFalse(any(row.get("catalog_item_id") for row in result["pricing_analysis_seal"]["rows"]
-                             if row.get("id") in {"dimension-note", "second-note"}))
+            self.assertEqual(drafted["body"]["status"], "blocked")
+            self.assertTrue(drafted["body"]["error_reference"])
+            self.assertNotIn("pricing_analysis_seal", drafted["body"])
+            self.assertNotIn("line_items", drafted["body"])
 
     def test_rendered_missing_source_identity_selection_survives_output_and_reopen(self):
         node = existing.require_node(self)
@@ -259,7 +257,7 @@ class ProviderSourceSelectionTest(unittest.TestCase):
         self.assertEqual(result["saveReopen"], "PASS")
         self.assertEqual(result["xlsx"]["status"], "PASS")
         self.assertEqual(result["sourceProvenance"]["missingIdsRecovered"], ["u1-provenance", "u1-second-provenance"])
-        self.assertTrue(result["sourceProvenance"]["ambiguousOutputUnpriced"])
+        self.assertTrue(result["sourceProvenance"]["unmeasuredOutputUnpriced"])
         for row_id in ("u1-provenance", "u1-second-provenance"):
             self.assertIn({"source_basis_line_id": row_id, "status": "selected"}, result["selectionOutcomes"])
 

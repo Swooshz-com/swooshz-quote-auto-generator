@@ -1136,7 +1136,7 @@ function formatQuantityNumber(value) {
 
 function normalizeQuantityPrefixUnit(value = "") {
   const unit = String(value || "").toLowerCase().replace(/\s+/g, " ").replace(/\.+$/g, "").trim();
-  if (["sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."].includes(unit)) return "sqm";
+  if (["sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."].includes(unit)) return "sqm";
   if (["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"].includes(unit)) return "nos";
   if (["lot", "lots"].includes(unit)) return "lot";
   if (["set", "sets"].includes(unit)) return "set";
@@ -1165,7 +1165,7 @@ function quantityUnitAliases(unit = "") {
   const aliases = new Set();
   if (normalized) aliases.add(normalized);
   if (normalized === "sqm") {
-    ["sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."].forEach((alias) => aliases.add(alias));
+    ["sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."].forEach((alias) => aliases.add(alias));
   }
   if (/^nos?\.?$/.test(normalized)) {
     ["nos", "nos.", "no", "no.", "pcs", "pieces", "units"].forEach((alias) => aliases.add(alias));
@@ -1227,7 +1227,7 @@ function neutralizeFormulaText(value = "") {
 function normalizeUnit(value = "") {
   const text = String(value || "").normalize("NFC").trim();
   const lower = text.toLowerCase().replace(/\s+/g, " ").replace(/^[.\s]+|[.\s]+$/g, "");
-  if (["m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) {
+  if (["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) {
     return "sqm";
   }
   if (["m run", "m. run"].includes(lower)) return "m run";
@@ -2636,7 +2636,7 @@ function canonicalPricingAuthorityText(value = "") {
 function canonicalPricingAuthorityUnit(value = "") {
   const text = canonicalPricingAuthorityText(value);
   const lower = text.toLowerCase().replace(/^[. ]+|[. ]+$/g, "");
-  if (["m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) return "sqm";
+  if (["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) return "sqm";
   if (["m run", "m. run"].includes(lower)) return "m run";
   if (["m length", "m. length"].includes(lower)) return "m length";
   if (["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"].includes(lower)) return "nos";

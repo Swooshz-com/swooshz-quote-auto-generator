@@ -100,9 +100,9 @@ for (let index = 0; index < fillerLines; index++) {
   cases.push({ id: "filler-" + (index + 1), kind: "filler", section: catalog.find((item) => item.description.toLowerCase().includes(noun)).section, text: "Additional " + noun + " for zone " + (index + 1), quantity: (index % 4) + 1, unit: noun.includes("carpet") || noun.includes("graphic") || noun.includes("banner") || noun.includes("sticker") ? "sqm" : "nos" });
 }
 if (sourceProvenance) cases.push(
-  { id: "u1-provenance", kind: "select", section: "Flooring", text: "Provisional Grey carpet tile installation in the reception footprint", quantity: 12, unit: "sqm", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
-  { id: "u1-second-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile installation in the separate demonstration zone", quantity: 7, unit: "sqm", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
-  ...["a", "b"].map((suffix) => ({ id: "u1-ambiguous-" + suffix, kind: "ambiguous", section: "Flooring", text: "Grey carpet tile installation with ambiguous duplicate ownership", quantity: 3, unit: "sqm", proposal: true, missingSourceId: true })),
+  { id: "u1-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile physical installation", quantity: 12, unit: "m\u00b2", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
+  { id: "u1-second-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile physical installation", quantity: 7, unit: "m\u00b2", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
+  ...["a", "b"].map((suffix) => ({ id: "u1-unmeasured-" + suffix, kind: "unmeasured", section: "Flooring", text: "Grey carpet tile installation with missing original unit", quantity: 3, unit: "sqm", rawUnit: "", proposal: true })),
 );
 const sections = new Map();
 const lineItems = [];
@@ -112,7 +112,7 @@ for (const entry of cases) {
   if (claimed) line.pricing_keyword = claimed.id;
   if (!sections.has(entry.section)) sections.set(entry.section, { id: slug(entry.section), title: entry.section, lines: [] });
   sections.get(entry.section).lines.push(line);
-  lineItems.push({ section: entry.section, ...(entry.missingSourceId ? {} : { source_basis_line_id: entry.id }), description: line.text, quantity: entry.quantity, unit: entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
+  lineItems.push({ section: entry.section, ...(entry.missingSourceId ? {} : { source_basis_line_id: entry.id }), description: line.text, quantity: entry.quantity, unit: entry.rawUnit ?? entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
 }
 const scenarioPath = path.join(runRoot, "scenario.json");
 await fs.writeFile(scenarioPath, JSON.stringify({ raw: { analysis_findings: [], blocking_clarification_questions: [], quote_basis_sections: [...sections.values()], line_items: lineItems } }, null, 2));
@@ -428,17 +428,17 @@ try {
       const evidence = ids.map((id) => ({ id, line: lines.find((line) => line.id === id),
         row: state.lineItems.find((row) => row.source_basis_line_id === id),
         sealed: seal.rows.find((row) => row.id === id) }));
-      const ambiguous = lines.filter((line) => ["u1-ambiguous-a", "u1-ambiguous-b"].includes(line.id));
-      return { evidence, ambiguous, ambiguousHasGrant: seal.rows.some((row) => ["u1-ambiguous-a", "u1-ambiguous-b"].includes(row.id) && row.catalog_item_id) };
+      const unmeasured = lines.filter((line) => ["u1-unmeasured-a", "u1-unmeasured-b"].includes(line.id));
+      return { evidence, unmeasured, unmeasuredHasGrant: seal.rows.some((row) => ["u1-unmeasured-a", "u1-unmeasured-b"].includes(row.id) && row.catalog_item_id) };
     });
     assert(result.sourceProvenance.evidence.every(({ line, row, sealed }) => line?.tag === "Custom"
       && line.possible_pricing_matches?.length > 0 && row?.pricing_authority?.variant === "none"
       && sealed?.unit === "sqm" && !sealed.catalog_item_id), "missing raw IDs lost original measurement provenance", result.sourceProvenance);
-    assert(result.sourceProvenance.ambiguous.length > 0 && !result.sourceProvenance.ambiguousHasGrant
-      && result.sourceProvenance.ambiguous.every((line) => !line.possible_pricing_matches?.length), "ambiguous ownership offered an unactionable choice", result.sourceProvenance);
+    assert(result.sourceProvenance.unmeasured.map((line) => line.id).sort().join("|") === "u1-unmeasured-a|u1-unmeasured-b" && !result.sourceProvenance.unmeasuredHasGrant
+      && result.sourceProvenance.unmeasured.every((line) => !line.possible_pricing_matches?.length), "unmeasured ownership offered an unactionable choice", result.sourceProvenance);
     result.sourceProvenance.missingIdsRecovered = result.sourceProvenance.evidence.map((entry) => entry.id);
-    // Existing text-only basis merging can retain one note from two ambiguous raw rows.
-    result.sourceProvenance.ambiguityCounts = { rawRows: 2, authoredBasisIds: 2, retainedBasisRows: result.sourceProvenance.ambiguous.length };
+    // Distinct identified rows with missing original units remain visible and unpriced.
+    result.sourceProvenance.unmeasuredCounts = { rawRows: 2, authoredBasisIds: 2, retainedBasisRows: result.sourceProvenance.unmeasured.length };
   }
 
   // Fresh proposals offer only choices Confirm can honour. Keep a synthetic old cached
@@ -485,6 +485,13 @@ try {
   for (const entry of cases.filter((item) => ["select", "historical", "unit-review"].includes(item.kind))) await timedClick(page, await possibleMatchControl(page, entry.id, byName(entry.select).id), "possible_match", timings);
   await timedClick(page, await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]'), "tick", timings);
   for (const id of ["u1-review", "u1-legacy"]) await timedClick(page, await basisControl(page, id, "[data-basis-tag]:not([data-basis-tag='Exclude'])"), "tick", timings);
+  if (sourceProvenance) {
+    // Explicitly confirm both Custom physical rows through real controls: original blank
+    // measurement provenance must survive review without acquiring a price.
+    for (const id of ["u1-unmeasured-a", "u1-unmeasured-b"]) {
+      await timedClick(page, await basisControl(page, id, "[data-basis-tag]:not([data-basis-tag='Exclude'])"), "tick", timings);
+    }
+  }
   // Resolve any remaining server-added review line (for example an id-less duplicate) with a real cross.
   for (let guard = 0; guard < 10; guard++) {
     const pending = await page.evaluate(() => {
@@ -563,12 +570,12 @@ try {
       return row ? { index, authority: outputPriceAuthority(row), quantity: row.quantity, rowAmount: row.amount, reference: text('.output-unit-price-cell:not([data-output-edit-field]) .output-cell-text'), quoted: text('[data-output-denomination="quote"] .output-cell-text'), amount: text('.amount-cell') } : null;
     }, id);
     if (sourceProvenance) {
-      for (const id of ["u1-ambiguous-a", "u1-ambiguous-b"]) {
+      for (const id of ["u1-unmeasured-a", "u1-unmeasured-b"]) {
         const row = await rowFor(id);
-        assert(!row || (!row.authority && row.quoted === "???" && row.amount === "???"),
-          "ambiguous source identity acquired a quoted price", { id, row });
+        assert(row && row.authority?.variant === "none" && row.quoted === "???" && row.amount === "???",
+          "unmeasured physical row disappeared or acquired a quoted price", { id, row });
       }
-      result.sourceProvenance.ambiguousOutputUnpriced = true;
+      result.sourceProvenance.unmeasuredOutputUnpriced = true;
     }
     const expectations = [...cases.filter((item) => ["select", "historical"].includes(item.kind)).map((item) => ({ id: item.id, item: byName(item.select), quantity: item.quantity })), { id: "u1-confirmed", item: byName("6 inch Spotlight"), quantity: 7 }];
     const pricing = [];

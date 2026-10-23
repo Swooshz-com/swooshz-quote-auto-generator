@@ -183,6 +183,45 @@ draft key, save count and artifact identity; precision-changing input still reje
 
 ## Regression Standard
 
+### Fresh provider response admission
+
+Run `python -m unittest tests.test_provider_response_admission` together with
+`tests.test_basis_dimension_contract`, `tests.test_basis_source_provenance`,
+`tests.test_openai_draft_request_contract`, `tests.test_ai_basis_chat_stress`, and
+`tests.test_quote_flow_reliability`. Fixtures use synthetic data, denied outbound
+sockets and explicitly mocked provider responses. Full Analyse must reject
+inconsistent measurements or malformed scope before pricing and sealing, with a
+support-safe error reference rather than a substitute local draft.
+
+Cover canonical positive quantities, decimal-comma/percent/bool/nonfinite and
+float underflow rejection, coherent prefix-only measurements, conflicting text,
+structured and linked measurements, and unrepresentable derived prices. Keep
+same-text physical rows with distinct IDs through review, actual server selection,
+Output, save/reopen and protected XLSX. Coherent ID aliases and generic equivalent
+units (including Unicode square metres) must preserve original provenance;
+ambiguous/unbound identities reject the response without partial success. Blank
+original measurement units never gain a catalogue grant from a later display unit.
+
+Supplied arrays, objects and rows must have supported shapes, with no silent
+material row removal. JSON admission accepts one bounded object and rejects
+duplicate keys, array wrappers, extra objects and nested nonfinite numbers. Keep
+the demonstrated fenced/trailing-prose chat consumer until its response contract
+is explicitly changed. All OpenAI adapters share shape/completion/refusal checks;
+DeepSeek adapters enforce their existing completion finish reason. Routing,
+transport retries and support-operation provider failover remain unchanged.
+Confidence supplied by a fresh response is an integer from 0 to 100, including
+0 and 1; fractions, percent strings and conflicting aliases reject. Saved/user
+confidence and commercial-number normalisers remain compatible with their existing
+consumers, and saved blank seals/ledgers are never upgraded. Identified items-only
+and legacy basis shapes retain optional-field support; supplied structured basis
+must own every supplied material item exactly once.
+
+Existing genuinely empty-provider-row finalisation retains request rows only for
+review; its analysis seal grants no catalogue price to those fallback rows. The
+quote finaliser owns this recovery path until the recovery contract is explicitly
+replaced. Cover its unpriced save/selection boundary separately from malformed
+material responses, which must reject before any partial success.
+
 ### Full-draft Responses contract
 
 Run `python -m unittest tests.test_openai_draft_request_contract` for full-draft
