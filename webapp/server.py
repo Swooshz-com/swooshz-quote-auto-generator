@@ -34448,7 +34448,18 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if self.current_auth_session():
             return False
         if self.command == "GET" and not path.startswith("/api/"):
-            self.send_redirect("/login")
+            if internal_google_mode_enabled():
+                # A domain revisit must not let provider SSO undo app logout.
+                # Only the explicit sign-in action starts a new OIDC transaction.
+                self.send_auth_page(
+                    "Sign in required",
+                    "Sign in to open the internal UAT quote runner.",
+                    action_href="/login",
+                    action_label="Sign in",
+                    status=401,
+                )
+            else:
+                self.send_redirect("/login")
             return True
         self.send_json({
             "status": "auth_required",

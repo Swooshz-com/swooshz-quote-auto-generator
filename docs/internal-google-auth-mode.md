@@ -142,6 +142,23 @@ Logout is an authenticated, CSRF-checked `POST /logout`. `GET /logout` returns
 cookies and browser storage, and returns only a fixed safe navigation target in
 `X-SQAG-Logout-Location`.
 
+An anonymous document visit in the internal-Google lane renders the existing
+sign-in page with HTTP401; it does not automatically start an OIDC transaction.
+Revisiting the bare domain after logout stays outside the workspace until the
+tester chooses Sign in. Protected APIs continue returning HTTP401. Only the
+explicit /login action starts a fresh state/nonce/PKCE transaction. That request
+includes prompt=select_account so Google offers account selection, as documented
+in [Google's OIDC parameters](https://developers.google.com/identity/openid-connect/openid-connect#authenticationuriparameters).
+Logout ends this app's session, not the tester's Google-wide session. Account
+selection does not promise another password challenge; Google owns that step.
+The copied old app cookie remains revoked even after a new login succeeds.
+
+Synthetic browser coverage clicks the real Logout control, verifies cookie
+removal and server-side revocation, revisits the domain twice with zero provider
+requests, and then requires explicit sign-in and account choice before access
+returns. The provider transport is local and preserves the production OIDC query;
+no real Google account or provider request is part of this test.
+
 ## Readiness
 
 - `internal_google`: may make `internal_alpha_ready=true` only when every
