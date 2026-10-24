@@ -48350,7 +48350,44 @@ class PricingDraftG3Regression(unittest.TestCase):
     def test_inline_client_reference_is_not_an_authoritative_request_snapshot(self):
         fixture = WebappServerTest()
         payload = fixture.sqag_212_payload()
-        self.assertIsNone(webapp.capture_pricing_reference_snapshot(payload))
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(webapp, "configured_storage_mode", return_value="local"), \
+                mock.patch.object(webapp, "pricing_references_root", return_value=Path(tmp)):
+            self.assertIsNone(webapp.capture_pricing_reference_snapshot(payload))
+
+    def test_saved_reference_snapshot_ignores_poisoned_inline_catalog(self):
+        fixture = WebappServerTest()
+        saved_items = fixture.sqag_212_catalog_items()
+        payload = fixture.sqag_212_payload()
+        poisoned_items = copy.deepcopy(saved_items)
+        for item in poisoned_items:
+            item["sale_unit_price"] = 987654.32
+        payload["pricing_reference"].update({"currency": "USD", "items": poisoned_items})
+        payload["_pricing_reference_snapshot"] = webapp.PricingReferenceSnapshot(
+            source="local",
+            reference_id=payload["pricing_reference_id"],
+            digest="sha256:" + ("0" * 64),
+            currency="USD",
+            detail_json=json.dumps(payload["pricing_reference"]),
+        )
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(webapp, "configured_storage_mode", return_value="local"), \
+                mock.patch.object(webapp, "pricing_references_root", return_value=Path(tmp)):
+            write_test_pricing_reference(Path(tmp), payload["pricing_reference_id"], saved_items)
+            snapshot = webapp.capture_pricing_reference_snapshot(payload)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.source, "local")
+        self.assertEqual(snapshot.reference_id, payload["pricing_reference_id"])
+        self.assertEqual(snapshot.currency, "SGD")
+        self.assertEqual(
+            snapshot.digest,
+            webapp.pricing_reference_catalog_digest({"items": saved_items}),
+        )
+        self.assertEqual(
+            [(item["id"], item["sale_unit_price"]) for item in snapshot.detail()["items"]],
+            [(item["id"], item["sale_unit_price"]) for item in saved_items],
+        )
+        self.assertNotEqual(snapshot.digest, payload["_pricing_reference_snapshot"].digest)
 
     def test_ambiguous_same_context_provider_rows_do_not_multiply_or_cross_bind(self):
         fixture = WebappServerTest()
