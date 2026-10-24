@@ -50,6 +50,71 @@ class ProviderAdmissionTest(unittest.TestCase):
             self.assertIn(text, prompt)
         self.assertNotIn("source_basis_line_id where possible", prompt)
 
+    def test_actual_draft_request_declares_string_ids_and_existing_alphabet(self):
+        payload = existing.valid_payload()
+        payload["images"] = [{"name": "synthetic.png", "data_url": synthetic_image()}]
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"output_text":"{}"}'
+        with mock.patch.dict(os.environ, existing.isolated_env(), clear=True), \
+             mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
+             mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
+             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
+             mock.patch.object(s, "catalog_visual_image_entries_for_payload", return_value=[]), \
+             mock.patch.object(s, "normalize_ai_draft", return_value={"ok": True}), \
+             mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
+            s.request_openai_quote_basis(payload, "synthetic-mocked-key")
+        self.assertEqual(send.call_count, 1)
+        body = json.loads(send.call_args.args[0].data)
+        self.assertEqual(set(body), {"model", "input", "reasoning"})
+        self.assertEqual(len(body["input"]), 1)
+        self.assertEqual(body["input"][0]["role"], "user")
+        prompt = body["input"][0]["content"][0]["text"]
+        self.assertIn("All section id, physical line id, and linked source_basis_line_id values must be JSON strings", prompt)
+        self.assertIn("unique section ids matching ^[a-z0-9]+(?:-[a-z0-9]+)*$", prompt)
+        self.assertIn("Physical line id and linked source_basis_line_id values must match ^[A-Za-z0-9_-]+$", prompt)
+        self.assertIn("ASCII letters, digits, underscores, and hyphens only", prompt)
+        self.assertIn("Use the same id in its linked line_items source_basis_line_id", prompt)
+
+    def test_existing_row_identity_guard_accepts_declared_strings_and_rejects_other_types(self):
+        self.assertEqual(s.PROFILE_ID_RE.pattern, r"^[A-Za-z0-9_-]+$")
+        for identity in ("Physical_A-09", "7", "_"):
+            raw = draft()
+            raw["quote_basis_sections"][0]["id"] = "section-a-09"
+            raw["quote_basis_sections"][0]["lines"][0]["id"] = identity
+            raw["line_items"][0]["source_basis_line_id"] = identity
+            admitted = self.admit(raw)
+            self.assertEqual(admitted["line_items"][0]["source_basis_line_id"], identity)
+        for target in ("basis", "item"):
+            for identity in ("physical row", "physical.row", "physical/row", "\u00e9", 7, True, [], {}):
+                raw = draft()
+                row = raw["quote_basis_sections"][0]["lines"][0] if target == "basis" else raw["line_items"][0]
+                row["id" if target == "basis" else "source_basis_line_id"] = identity
+                with self.subTest(target=target, identity=identity), self.assertRaises(s.AIModelOutputError) as rejected:
+                    self.admit(raw)
+                self.assertEqual(rejected.exception.diagnostics["response_contract_reason"], "row_identity_shape")
+
+    def test_existing_section_canonical_type_guard_and_normalisation_collisions(self):
+        for identity in ("surface-7", "7", "a"):
+            raw = draft()
+            raw["quote_basis_sections"][0]["id"] = identity
+            self.assertEqual(s.normalize_ai_draft(raw, require_confidence=True)["quote_basis_sections"][0]["id"], identity)
+        for identity in (7, True, [], {}):
+            raw = draft()
+            raw["quote_basis_sections"][0]["id"] = identity
+            with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "section id must be a string"):
+                s.canonical_quote_basis_sections(raw)
+        raw = draft()
+        raw["quote_basis_sections"][0]["id"] = "NonCanonical_Section"
+        self.assertEqual(s.normalize_ai_draft(raw, require_confidence=True)["quote_basis_sections"][0]["id"], "surfaces")
+        raw["quote_basis_sections"].append({"id": "Different_NonCanonical", "title": "Surfaces", "lines": []})
+        with self.assertRaisesRegex(ValueError, "colliding identities"):
+            s.normalize_ai_draft(raw, require_confidence=True)
+        raw = draft()
+        raw["quote_basis_sections"].append({"id": "surfaces", "title": "Other", "lines": []})
+        with self.assertRaises(s.AIModelOutputError) as rejected:
+            self.admit(raw)
+        self.assertEqual(rejected.exception.diagnostics["response_contract_reason"], "section_identity_collision")
+
     def test_quantity_contract_accepts_exact_positive_canonical_values(self):
         for value in (1, 12, 12.0, 12.5, "12", "12.0", "12.5", "0.25"):
             with self.subTest(value=value):

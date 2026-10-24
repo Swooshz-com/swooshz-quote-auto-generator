@@ -58,7 +58,7 @@ from webapp import server as webapp
 from webapp import forensics as forensic_module
 from tests.test_openai_draft_request_contract import synthetic_image, synthetic_pdf
 
-AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
+GENERIC_REFERENCED_FAILURE_MESSAGE = "Failed. Please try again. Contact support if this keeps happening."
 
 
 def highly_compressible_rgb_png(width, height):
@@ -4899,6 +4899,36 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(lines[0].get("custom_pricing"), True)
         self.assertEqual(draft["line_items"], [])
 
+    def test_protected_draft_errors_show_safe_reference_for_each_failure_family(self):
+        payload = valid_payload()
+        for family in ("unconfigured", "contract", "transport"):
+            key = "" if family == "unconfigured" else "synthetic-private-key-canary"
+            failure = webapp.AIModelOutputError(
+                "PRIVATE_PROMPT_CANARY",
+                diagnostics={"failure_boundary": "model_output_contract", "response_contract_reason": "linked_quantity_conflict"},
+            ) if family == "contract" else webapp.OpenAIAnalysisError("PRIVATE_TRANSPORT_CANARY")
+            with self.subTest(family=family), \
+                 mock.patch.dict(os.environ, isolated_env(APP_MODE="deploy", OPENAI_API_KEY=key), clear=True), \
+                 mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value), \
+                 mock.patch.object(webapp, "request_openai_quote_basis", side_effect=failure) as provider, \
+                 mock.patch.object(webapp, "default_quote_basis", side_effect=AssertionError("FALLBACK_DENIED")), \
+                 mock.patch.object(webapp, "write_local_log", return_value=True) as log:
+                result = webapp.draft_quote_basis(payload)
+            self.assertEqual(result["status"], "blocked")
+            reference = result["error_reference"]
+            self.assertRegex(reference, r"^ERR-[A-F0-9]{8}$")
+            self.assertEqual(result["errors"], [f"Failed. Please try again. Contact support if this keeps happening. Reference: {reference}."])
+            self.assertEqual(provider.call_count, 0 if family == "unconfigured" else 1)
+            blocked = [call.args[1] for call in log.call_args_list if call.args[0] == "ai_draft_protected_mode_blocked"]
+            self.assertEqual(len(blocked), 1)
+            self.assertEqual(blocked[0]["error_reference"], reference)
+            serialised = json.dumps(result) + json.dumps([call.args for call in log.call_args_list])
+            for private_value in ("PRIVATE_PROMPT_CANARY", "PRIVATE_TRANSPORT_CANARY", "synthetic-private-key-canary"):
+                self.assertNotIn(private_value, serialised)
+            self.assertNotIn("environment", " ".join(result["errors"]).lower())
+            for field in ("quote_basis", "quote_basis_sections", "line_items", "pricing_analysis_seal"):
+                self.assertNotIn(field, result)
+
     def test_protected_draft_missing_remote_ai_blocks_without_local_fallback(self):
         payload = valid_payload()
         with (
@@ -4909,7 +4939,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             result = webapp.draft_quote_basis(payload)
 
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         self.assertNotEqual(result.get("source"), "local")
         self.assertNotIn("quote_basis", result)
         self.assertNotIn("quote_basis_sections", result)
@@ -4929,7 +4959,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             result = webapp.draft_quote_basis(payload)
 
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         self.assertNotEqual(result.get("source"), "local")
         self.assertNotIn("quote_basis", result)
         self.assertNotIn("quote_basis_sections", result)
@@ -5037,7 +5067,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(job["status"], "blocked")
         self.assertEqual(job["result"]["status"], "blocked")
-        self.assertEqual(job["result"]["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(job["result"]["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {job['result']['error_reference']}."])
         self.assertNotIn("quote_basis", job["result"])
         self.assertNotIn("line_items", job["result"])
 
@@ -5150,7 +5180,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         error_reference = result["error_reference"]
 
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         self.assertRegex(error_reference, r"^ERR-[0-9A-F]{8}$")
         self.assertEqual(attempt_details["error_reference"], error_reference)
         self.assertEqual(diagnostics["error_reference"], error_reference)
@@ -5356,7 +5386,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 error_reference = result["error_reference"]
 
                 self.assertEqual(result["status"], "blocked")
-                self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+                self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
                 self.assertEqual(diagnostics["failure_kind"], "provider_error")
                 self.assertEqual(diagnostics["failure_boundary"], "provider_response_shape")
                 self.assertEqual(diagnostics["attempt_number"], 1)
@@ -5411,7 +5441,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         error_reference = result["error_reference"]
 
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         self.assertRegex(error_reference, r"^ERR-[0-9A-F]{8}$")
         self.assertEqual(diagnostics["failure_kind"], "provider_error")
         self.assertEqual(diagnostics["failure_boundary"], "provider_response_shape")
@@ -5569,7 +5599,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         diagnostics = attempt_details["details"]
 
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         self.assertEqual(diagnostics["failure_kind"], "network_error")
         self.assertEqual(diagnostics["failure_boundary"], "provider_transport")
         self.assertEqual(diagnostics["attempt_number"], 1)
@@ -5639,7 +5669,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 diagnostics = attempt_details["details"]
 
                 self.assertEqual(result["status"], "blocked")
-                self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+                self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
                 self.assertEqual(diagnostics["failure_kind"], "provider_error")
                 self.assertEqual(diagnostics["failure_boundary"], expected_boundary)
                 self.assertEqual(diagnostics["attempt_number"], 1)
@@ -5712,7 +5742,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         diagnostics = attempt_details["details"]
 
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         self.assertEqual(diagnostics["failure_kind"], "upstream_unavailable")
         self.assertEqual(diagnostics["failure_boundary"], "provider_http")
         self.assertEqual(diagnostics["http_status"], 500)
@@ -12883,7 +12913,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("line_items", result)
         self.assertNotIn("source", result)
         self.assertNotIn("quote_basis_sections", result)
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         blocked_details = next(call.args[1] for call in write_log.call_args_list
                                if call.args[0] == "ai_draft_protected_mode_blocked")
         self.assertEqual(blocked_details["error_reference"], result["error_reference"])
@@ -12924,7 +12954,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("line_items", result)
         self.assertNotIn("source", result)
         self.assertNotIn("quote_basis_sections", result)
-        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result["errors"], [f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
         blocked_details = next(call.args[1] for call in write_log.call_args_list
                                if call.args[0] == "ai_draft_protected_mode_blocked")
         self.assertEqual(blocked_details["error_reference"], result["error_reference"])

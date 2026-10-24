@@ -662,7 +662,6 @@ OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
-AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
 QUOTE_SESSION_RETIRED_MESSAGE = "This quote session is no longer available. Please start a new quote. Contact support if this keeps happening."
@@ -22152,7 +22151,7 @@ def build_quote_draft_prompt(
         "and line count should follow the actual booth evidence. Use pricing_reference_sections from Quote context JSON as the fixed section list to match against first. "
         "Only create a new section when a line genuinely does not fit any provided pricing_reference_sections entry. "
         "Sort quote_basis_sections and line_items by pricing reference category_order, then item_order; keep source order for unresolved custom rows. "
-        "Each section must include id, title, and lines. Each physical line must have one unique stable id, tag, text, confidence_pct, quantity and unit. Use the same id in its linked line_items source_basis_line_id; never reuse an identity for separate physical scope. Pure informational notes may omit measurements and need no output item. "
+        "Each section must include id, title, and lines. Each physical line must have one unique stable id, tag, text, confidence_pct, quantity and unit. All section id, physical line id, and linked source_basis_line_id values must be JSON strings. Use unique section ids matching ^[a-z0-9]+(?:-[a-z0-9]+)*$ (lowercase ASCII letters and digits, separated by single hyphens). Physical line id and linked source_basis_line_id values must match ^[A-Za-z0-9_-]+$ (ASCII letters, digits, underscores, and hyphens only). Use the same id in its linked line_items source_basis_line_id; never reuse an identity for separate physical scope. Pure informational notes may omit measurements and need no output item. "
         "quote_basis_sections line text and line_items.description are customer-facing quotation text. Do not include provenance, reasoning, analysis, or source phrases such as taken from quotation title, visible in image, as seen in render, AI detected, assumed from, likely, appears to be, from reference image, or suggested by image. Put analysis reasons only in analysis_findings or internal notes. "
         "Use quote_basis_sections as the operator review surface for the same pricing sentences that will become output rows. "
         "Every line_items row must correspond to a quote_basis_sections line, and every customer-visible priced or manual-pricing quote_basis_sections line must have a matching line_items row. Do not add output-only rows or hidden catalog variants. "
@@ -26816,7 +26815,7 @@ def protected_ai_draft_mode_enabled(auth_session: dict[str, Any] | None = None) 
 def protected_ai_draft_blocked_result(error_reference: str) -> dict[str, Any]:
     return {
         "status": "blocked",
-        "errors": [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE],
+        "errors": generic_referenced_errors(error_reference),
         "error_reference": clean_text(error_reference),
     }
 
