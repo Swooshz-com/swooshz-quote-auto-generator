@@ -29,3 +29,6 @@ class QuoteFlowReliabilityTest(unittest.TestCase):
 
     def test_checkpoint_multiline_address_equivalence_preserves_substantive_changes(self):
         self.run_contract("checkpoint")
+
+    def test_resumed_pdf_current_unavailable_warning_review_and_excel_status(self):
+        self.run_contract("resume-status")

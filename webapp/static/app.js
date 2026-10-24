@@ -16706,21 +16706,28 @@ async function resumeSavedJob() {
       setSidePanel("output", { force: true });
     } else {
       setWorkflowStage("completed");
-      if (postCommitProjectionWarning) {
-        setResultStatus("Completed - refresh needed", "is-warn");
-        renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
-      } else {
-        setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
-        renderMessages([]);
-      }
-      clearPricingReviewMessages();
-      setSidePanel("output");
       setDownloadFiles(
         postCommitProjectionWarning
           ? (data.committed_files || [])
           : (data.files || []),
         data.quote_session?.exports,
       );
+      if (postCommitProjectionWarning) {
+        setResultStatus("Completed - refresh needed", "is-warn");
+        renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
+      } else if (viewPdf && !state.pdfFile) {
+        setResultStatus("PDF unavailable", "is-bad");
+        const pdfStatus = data.export_status?.pdf_status || data.export_status?.pdf_readiness || "";
+        const reason = pdfStatus === "workbook_export_unavailable"
+          ? "Workbook PDF export was unavailable, so no PDF was created."
+          : "The export completed but did not return a PDF file.";
+        renderMessages([state.downloadFile ? `${reason} Download Excel is still available.` : reason], "error");
+      } else {
+        setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
+        renderMessages([]);
+      }
+      clearPricingReviewMessages();
+      setSidePanel("output");
     }
     if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
     renderMatchSummary(data);

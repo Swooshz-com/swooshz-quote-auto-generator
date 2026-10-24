@@ -9,6 +9,67 @@ function extract(name) {
   const end = rest.slice(1).search(/\n(?:async )?function /);
   return end < 0 ? rest : rest.slice(0, end + 1);
 }
+async function resumedPdfStatusCases() {
+  const rows = [];
+  for (const scenario of ['current_pdf', 'missing_pdf', 'download_without_view', 'stale_no_entry', 'postcommit_warning', 'pricing_review', 'excel', 'workbook_unavailable', 'no_files']) {
+    const calls = { resumedStart: 0, poll: 0, persistentSave: 0, localSave: 0, updateDownload: 0, modalAttempt: 0, readyShown: 0, statuses: [], messages: [] };
+    const state = { activeJob: { id: 'job-synthetic-resume', type: scenario === 'excel' ? 'generate' : 'generate_pdf', phase: 'running', viewPdf: scenario !== 'excel' }, outputRevision: 5, outputRows: [], pdfFile: null };
+    const xlsx = { name: 'quotation.xlsx', url: '/api/quote-sessions/quote-synthetic/download/xlsx' };
+    const pdf = { name: 'quotation.pdf', url: '/api/quote-sessions/quote-synthetic/download/pdf' };
+    const current = scenario === 'current_pdf';
+    if (scenario === 'workbook_unavailable') state.activeJob.viewPdf = true;
+    const data = { status: scenario === 'pricing_review' ? 'needs_confirmation' : 'completed',
+      files: scenario === 'no_files' ? [] : [xlsx, ...(['current_pdf', 'download_without_view'].includes(scenario) ? [pdf] : [])],
+      quote_session: { session_id: 'quote-synthetic', exports: { xlsx: { url: xlsx.url }, pdf: { url: current ? pdf.url : null, view_url: current ? '/api/quote-sessions/quote-synthetic/view/pdf' : null } } } };
+    if (scenario === 'workbook_unavailable') data.export_status = { pdf_status: 'workbook_export_unavailable' };
+    if (scenario === 'postcommit_warning') {
+      data.post_commit_projection = { code: 'post_commit_projection_failed', retryable: true, message: 'Generation completed, but the session view could not be refreshed. Refresh to retry.' };
+      data.committed_files = [xlsx, pdf];
+    }
+    const context = vm.createContext({ state, Promise,
+      normalizeActiveJob: value => value, discardInvalidRestoredActiveJob() {},
+      setWorkflowStage() {}, setSidePanel() {}, showExcelGeneratingModal() {}, hideExcelGeneratingModal() {},
+      generationLoadingModalOptions: () => ({}), generationFinalizingModalOptions: () => ({}),
+      syncControlStates() {}, clearActiveJob: () => { state.activeJob = null; },
+      ensureSavedServerJobStarted: async () => { calls.resumedStart++; return { ok: true }; },
+      pollJob: async () => { calls.poll++; return { ok: true, data: { status: 'completed', result: data } }; },
+      isInterruptedJobPoll: () => false, currentGenerationContext: () => ({ session_id: 'quote-synthetic', run_id: 'run-synthetic' }),
+      safeQuoteSessionId: value => value, transitionGenerationContext() {},
+      setResultStatus: (label, tone) => calls.statuses.push({ label, tone }),
+      renderMessages: (messages, tone) => calls.messages.push({ messages, tone }),
+      clearPricingReviewMessages() {}, renderPricingMatches() {}, renderMatchSummary() {},
+      saveSessionState: () => { calls.localSave++; },
+      saveQuoteSessionDraftState: async () => { calls.persistentSave++; },
+      updateDownloadButton: () => { calls.updateDownload++; },
+      showGeneratedExportReadyModal: () => { calls.modalAttempt++; const ready = !!state.pdfFile; if (ready) calls.readyShown++; return ready; },
+    });
+    vm.runInContext(['resumeSavedJob', 'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
+    await context.resumeSavedJob();
+    assert.equal(calls.resumedStart, 1); assert.equal(calls.poll, 1);
+    assert.equal(state.isGenerating, false); assert.equal(state.activeJob, null);
+    if (scenario === 'postcommit_warning') {
+      assert.equal(calls.persistentSave, 0); assert.equal(calls.localSave, 1); assert.equal(calls.modalAttempt, 0);
+    } else assert.equal(calls.persistentSave, 1);
+    const final = calls.statuses.at(-1);
+    const expected = scenario === 'excel' ? 'Completed' : current ? 'PDF ready' : scenario === 'postcommit_warning' ? 'Completed - refresh needed' : scenario === 'pricing_review' ? 'Needs pricing review' : 'PDF unavailable';
+    assert.equal(final.label, expected, scenario);
+    if (!['pricing_review', 'no_files'].includes(scenario)) assert(state.downloadFile, scenario + ' retains Excel');
+    if (scenario === 'no_files') {
+      assert.equal(state.downloadFile, null);
+      assert(!calls.messages.at(-1).messages[0].includes('Download Excel is still available'));
+    } else if (['missing_pdf', 'download_without_view', 'stale_no_entry', 'workbook_unavailable'].includes(scenario)) {
+      assert(calls.messages.at(-1).messages[0].endsWith('Download Excel is still available.'));
+    }
+    if (scenario === 'workbook_unavailable') assert(calls.messages.at(-1).messages[0].startsWith('Workbook PDF export was unavailable'));
+    if (['missing_pdf', 'download_without_view', 'stale_no_entry', 'workbook_unavailable', 'no_files'].includes(scenario)) assert(!calls.statuses.some(item => item.label === 'PDF ready'));
+    rows.push({ scenario, expected_status: expected, actual_status: final.label, actual_tone: final.tone,
+      pdf_file_present: !!state.pdfFile, excel_file_present: !!state.downloadFile, calls,
+      contract_pass: final.label === expected });
+  }
+  assert(rows.every(row => row.contract_pass));
+  console.log(JSON.stringify({ resume_status_cases: rows }));
+}
+
 function fixture(names) {
   const calls = [];
   const node = () => ({ hidden: true, textContent: "", dataset: {}, focus() {}, classList: { add() {}, remove() {} } });
@@ -299,6 +360,8 @@ async function lifecycleCases() {
       assert(elements.excelGeneratingModal.hidden && !state.isPreparingOutput);
       assert.equal(requests, 2, "one retry must produce one save");
     }
+  } else if (mode === "resume-status") {
+    await resumedPdfStatusCases();
   } else if (mode === "checkpoint") {
     const { context: c, state } = fixture(["canonicalPricingAuthorityText", "customerStepCheckpointForCurrent"]);
     vm.runInContext(source.match(/^const PRICING_AUTHORITY_WHITESPACE_RE = .+;/m)[0], c);
