@@ -341,3 +341,39 @@ the protected inline endpoint without another generation job. Real LibreOffice
 conversion, native PDF viewer/rendering and hosted persistence qualification
 remain separate; the synthetic mode does not substitute for native PDF smoke or
 owner UAT.
+
+
+## Current quotation links and completed jobs
+
+Run `python -m unittest tests.test_quote_publication_projection tests.test_object_pdf_completion`
+for current publication eligibility, saved/list/job/resume projections and protected
+XLSX/PDF download plus PDF inline delivery. Historical completed status and evidence
+stay unchanged when an edit, replacement, missing/corrupt artifact or unknown read
+makes ordinary links unavailable. A failed attempt cannot present the independently
+valid prior saved pair as its own output. Committed projection warnings retain their
+bound recovery receipt; both ordinary PDF URLs remain unavailable until recovery.
+
+New eligible links carry an optional `publication` comparison. Retained bound links
+deny after replacement; old unbound URLs intentionally remain CURRENT aliases.
+Empty, duplicate, malformed, wrong-kind and mismatched comparisons deny before
+artifact bytes are read. This comparison grants no access: existing owner, workspace,
+role and authentication checks remain the separate gate. Direct `/api/generate`
+responses and asynchronous jobs never expose private publication identities or proof.
+
+Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
+eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity
+reads no PDF body. XLSX keeps its metadata/path projection; download independently
+verifies its bytes. Local XLSX projection uses path/size metadata without reading its
+body. Atomic completion uses already admitted committed files and adds no artifact
+read. Configuration lookup, storage and file work run outside `JOBS_LOCK`. The existing
+second-admission race retains its forensic admission sequencing; this correction does
+not redesign job reservation or replay policy.
+
+After a separately authorised installation, eligible PDF projections can make one
+additional existing object GET per view, or N per list, plus existing ancillary
+publication-authority reads. There is no new HEAD, SDK call, cache, retry or provider
+request. Synthetic local, SQLite BLOB and in-memory object tests do not qualify live
+S3 transport, installed performance, real PDF rendering, native viewer acceptance or
+owner UAT. Direct post-commit warning coverage uses the reachable local publication
+path; database/object generation finalises atomically and has no equivalent later
+projection-read warning branch.

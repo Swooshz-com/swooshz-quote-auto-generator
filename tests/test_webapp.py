@@ -16333,12 +16333,13 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 refreshed = webapp.get_quote_session("quote-export")
 
             self.assertEqual(session["exports"]["xlsx"]["filename"], "quotation.xlsx")
-            self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-export/download/xlsx")
+            self.assertRegex(session["exports"]["xlsx"]["url"], r"^/api/quote-sessions/quote-export/download/xlsx\?publication=[0-9a-f]{64}$")
             self.assertEqual(session["commercials"]["grand_total"], expected_commercials["grand_total"])
             self.assertEqual(session["commercials"]["exchange_rate"], 1.3499)
             self.assertEqual(refreshed["exports"]["xlsx"]["exists"], True)
-            self.assertEqual(refreshed["exports"]["pdf"]["exists"], False)
-            self.assertEqual(refreshed["exports"]["pdf"]["missing"], True)
+            self.assertIsNone(refreshed["exports"]["pdf"]["exists"])
+            self.assertIsNone(refreshed["exports"]["pdf"]["missing"])
+            self.assertEqual(refreshed["exports"]["pdf"]["availability"], "unverified")
             self.assertNotIn(str(tmp_path), json.dumps(refreshed))
 
     def _local_publication_case(
@@ -16748,7 +16749,9 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 partial_session = partial_new["quote_session"]
                 self.assertTrue(partial_session["status"]["quote_generated"])
                 self.assertFalse(partial_session["exports"]["xlsx"]["stale"])
-                self.assertTrue(partial_session["exports"]["pdf"]["exists"])
+                self.assertIsNone(partial_session["exports"]["pdf"]["exists"])
+                self.assertIsNone(partial_session["exports"]["pdf"]["url"])
+                self.assertIsNone(partial_session["exports"]["pdf"]["view_url"])
                 self.assertTrue(partial_session["exports"]["pdf"]["stale"])
                 self.assertEqual(
                     {item["name"] for item in webapp.quote_session_result_files(partial_session)},
@@ -17228,6 +17231,16 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                     for kind in ("xlsx", "pdf"):
                         self.assertIsNone(red["quote_session"]["exports"][kind]["exists"])
                         self.assertIsNone(red["quote_session"]["exports"][kind]["url"])
+                        self.assertIsNone(red["quote_session"]["exports"][kind].get("view_url"))
+                    red_receipt_urls = []
+                    for item in red["committed_files"]:
+                        kind = item["name"].rsplit(".", 1)[-1]
+                        self.assertRegex(item["url"], r"\?publication=[0-9a-f]{64}$")
+                        self.assertEqual(local_http_get_bytes(runner, item["url"]), (200, f"run472-red-{kind}".encode()))
+                        red_receipt_urls.append(item["url"])
+                        if kind == "pdf":
+                            self.assertEqual(local_http_get_bytes(runner, item["view_url"]), (200, b"run472-red-pdf"))
+                            red_receipt_urls.append(item["view_url"])
 
                     red_metadata = webapp.read_quote_session_metadata("quote-run472")
                     red_publication_id = red_metadata["publication"]["active_publication_id"]
@@ -17398,6 +17411,8 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                         job_id="job-472-persistent",
                     )
                     self.assertEqual(persistent["status"], "completed", persistent)
+                    for old_receipt in red_receipt_urls:
+                        self.assertEqual(local_http_get_bytes(runner, old_receipt)[0], 404)
                     self.assertEqual(
                         persistent["post_commit_projection"]["code"],
                         "post_commit_projection_failed",
@@ -18227,26 +18242,26 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
                 no_export = webapp.create_or_update_quote_session(no_export_payload)
 
             self.assertTrue(generated["exports"]["xlsx"]["exists"])
-            self.assertEqual(generated["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
+            self.assertRegex(generated["exports"]["xlsx"]["url"], r"^/api/quote-sessions/quote-stale/download/xlsx\?publication=[0-9a-f]{64}$")
             self.assertTrue(generated["status"]["quote_generated"])
             self.assertFalse(generated["status"].get("draft_modified", False))
             self.assertEqual(stale["commercials"]["grand_total"], 218)
             self.assertFalse(stale["status"]["quote_generated"])
             self.assertTrue(stale["status"]["draft_modified"])
             self.assertEqual(stale["exports"]["xlsx"]["filename"], "quotation.xlsx")
-            self.assertTrue(stale["exports"]["xlsx"]["exists"])
+            self.assertIsNone(stale["exports"]["xlsx"]["exists"])
             self.assertTrue(stale["exports"]["xlsx"]["stale"])
-            self.assertEqual(stale["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
-            self.assertTrue(stale["exports"]["pdf"]["exists"])
+            self.assertIsNone(stale["exports"]["xlsx"]["url"])
+            self.assertIsNone(stale["exports"]["pdf"]["exists"])
             self.assertTrue(stale["exports"]["pdf"]["stale"])
-            self.assertEqual(stale["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
+            self.assertIsNone(stale["exports"]["pdf"]["url"])
             for attempted in (stale, blocked, failed):
-                self.assertTrue(attempted["exports"]["xlsx"]["exists"])
+                self.assertIsNone(attempted["exports"]["xlsx"]["exists"])
                 self.assertTrue(attempted["exports"]["xlsx"]["stale"])
-                self.assertEqual(attempted["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
-                self.assertTrue(attempted["exports"]["pdf"]["exists"])
+                self.assertIsNone(attempted["exports"]["xlsx"]["url"])
+                self.assertIsNone(attempted["exports"]["pdf"]["exists"])
                 self.assertTrue(attempted["exports"]["pdf"]["stale"])
-                self.assertEqual(attempted["exports"]["pdf"]["url"], "/api/quote-sessions/quote-stale/download/pdf")
+                self.assertIsNone(attempted["exports"]["pdf"]["url"])
                 self.assertEqual(webapp.quote_session_result_files(attempted), [])
             self.assertIsNone(stale_download_path)
             for downloads in (stale_downloads, blocked_downloads, failed_downloads):
@@ -18271,7 +18286,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
             self.assertFalse(saved_after_generate["status"].get("draft_modified", False))
             self.assertTrue(saved_after_generate["exports"]["xlsx"]["exists"])
             self.assertFalse(saved_after_generate["exports"]["xlsx"]["stale"])
-            self.assertEqual(saved_after_generate["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-stale/download/xlsx")
+            self.assertRegex(saved_after_generate["exports"]["xlsx"]["url"], r"^/api/quote-sessions/quote-stale/download/xlsx\?publication=[0-9a-f]{64}$")
             self.assertTrue(saved_after_generate["exports"]["pdf"]["exists"])
             self.assertFalse(saved_after_generate["exports"]["pdf"]["stale"])
             self.assertFalse(no_export["status"]["quote_generated"])
@@ -36082,11 +36097,11 @@ main().catch((error) => {
         self.assertEqual(generated["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(edited["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
         self.assertTrue(fetched["exports"]["xlsx"]["stale"])
-        self.assertTrue(fetched["exports"]["xlsx"]["exists"])
-        self.assertEqual(fetched["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-db-stale/download/xlsx")
+        self.assertIsNone(fetched["exports"]["xlsx"]["exists"])
+        self.assertIsNone(fetched["exports"]["xlsx"]["url"])
         self.assertTrue(fetched["exports"]["pdf"]["stale"])
-        self.assertTrue(fetched["exports"]["pdf"]["exists"])
-        self.assertEqual(fetched["exports"]["pdf"]["url"], "/api/quote-sessions/quote-db-stale/download/pdf")
+        self.assertIsNone(fetched["exports"]["pdf"]["exists"])
+        self.assertIsNone(fetched["exports"]["pdf"]["url"])
         self.assertEqual(webapp.quote_session_result_files(fetched), [])
         self.assertEqual(fetched["generation_snapshot"]["profile"]["display_name"], "Generated Stale Profile")
         self.assertEqual(fetched["generation_snapshot"]["pricing_reference"]["display_name"], "Generated Stale Pricing")
@@ -44063,7 +44078,7 @@ main().catch((error) => {
                     viewed = get_response(f"/api/quote-sessions/{session_id}/view/pdf")
                     downloaded = get_response(f"/api/quote-sessions/{session_id}/download/pdf")
 
-        self.assertEqual(session["exports"]["pdf"]["view_url"], f"/api/quote-sessions/{session_id}/view/pdf")
+        self.assertRegex(session["exports"]["pdf"]["view_url"], rf"^/api/quote-sessions/{session_id}/view/pdf\?publication=[0-9a-f]{{64}}$")
         self.assertEqual(viewed[0], 200)
         self.assertIn("application/pdf", viewed[1].get("content-type", ""))
         self.assertEqual(viewed[1].get("content-disposition"), 'inline; filename="quotation.pdf"')

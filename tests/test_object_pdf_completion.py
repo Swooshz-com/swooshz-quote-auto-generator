@@ -86,14 +86,37 @@ class ObjectPdfCompletionTest(unittest.TestCase):
                 self.assertEqual(len(dispatched), 1)
                 self.assertIs(dispatched[0]["target"], webapp.run_job_worker)
                 self.assertIs(dispatched[0]["args"][0], webapp.finish_generate_pdf_job)
-                dispatched[0]["target"](*dispatched[0]["args"])
-
-                completed = webapp.get_job(job_id, auth_session)
+                publication_admitted = False
+                pdf_reads_after_admission = []
+                original_publish = webapp.DatabaseSqagStorage.publish_quote_session_forensic_transaction
+                original_resolve = webapp.DatabaseSqagStorage.quote_session_export_artifact
+                def publish(storage, *args, **kwargs):
+                    nonlocal publication_admitted
+                    metadata = original_publish(storage, *args, **kwargs)
+                    publication_admitted = True
+                    return metadata
+                def resolve(storage, session_id, kind, **kwargs):
+                    if publication_admitted and kind == "pdf":
+                        pdf_reads_after_admission.append(kind)
+                    return original_resolve(storage, session_id, kind, **kwargs)
+                with mock.patch.object(webapp.DatabaseSqagStorage, "publish_quote_session_forensic_transaction", new=publish), mock.patch.object(webapp.DatabaseSqagStorage, "quote_session_export_artifact", new=resolve):
+                    dispatched[0]["target"](*dispatched[0]["args"])
+                    self.assertTrue(publication_admitted)
+                    self.assertEqual(pdf_reads_after_admission, [])
+                    immediate = copy.deepcopy(webapp.JOBS[job_id]["result"])
+                    self.assertTrue(immediate["quote_session"]["exports"]["pdf"]["view_url"])
+                    self.assertEqual(immediate["quote_session"]["exports"]["pdf"]["filename"], "quotation.pdf")
+                    self.assertTrue(immediate["quote_session"]["exports"]["pdf"]["verified"])
+                    completed = webapp.get_job(job_id, auth_session)
+                    self.assertEqual(pdf_reads_after_admission, ["pdf"])
                 self.assertEqual(completed["status"], "completed", completed)
                 generator.assert_called_once()
                 result = completed["result"]
                 self.assertEqual(result["status"], "completed", result)
-                pdf_url = f"/api/quote-sessions/{session_id}/download/pdf"
+                pdf_url = result["quote_session"]["exports"]["pdf"]["url"]
+                self.assertRegex(pdf_url, rf"^/api/quote-sessions/{session_id}/download/pdf\?publication=[0-9a-f]{{64}}$")
+                pdf_view_url = result["quote_session"]["exports"]["pdf"]["view_url"]
+                self.assertEqual(pdf_view_url, pdf_url.replace("/download/pdf?", "/view/pdf?"))
                 pdf_files = [item for item in result["files"] if item["name"] == "quotation.pdf"]
                 self.assertEqual(len(pdf_files), 1)
                 self.assertEqual(pdf_files[0]["url"], pdf_url)
@@ -113,6 +136,8 @@ class ObjectPdfCompletionTest(unittest.TestCase):
                 reopened = reopened_storage.get_quote_session(session_id)
                 self.assertTrue(reopened["exports"]["pdf"]["exists"])
                 self.assertFalse(reopened["exports"]["pdf"]["stale"])
+                self.assertEqual(reopened["exports"]["pdf"]["view_url"], pdf_view_url)
+                self.assertEqual(pdf_files[0]["view_url"], pdf_view_url)
                 artifact = reopened_storage.quote_session_export_artifact(session_id, "pdf")
                 self.assertEqual(artifact["content"], pdf_bytes)
                 with reopened_storage.connection() as connection:
@@ -137,8 +162,10 @@ class ObjectPdfCompletionTest(unittest.TestCase):
                 cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(auth_session)}"
                 with existing.LocalRunnerServer() as runner:
                     response = existing.local_http_get_bytes(runner, pdf_url, headers={"Cookie": cookie})
+                    inline_response = existing.local_http_get_bytes(runner, pdf_view_url, headers={"Cookie": cookie})
                     unauthenticated = existing.local_http_get_bytes(runner, pdf_url)
                 self.assertEqual(response, (200, pdf_bytes))
+                self.assertEqual(inline_response, (200, pdf_bytes))
                 self.assertIn(unauthenticated[0], {401, 403})
                 self.assertFalse(output_dir.exists())
                 self.assertFalse(job_tmp.exists())

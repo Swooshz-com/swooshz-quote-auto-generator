@@ -12354,8 +12354,8 @@ class LocalSqagStorage:
     def pricing_reference_export_xlsx(self, reference_id: str, source: str = "") -> tuple[str, bytes] | None:
         return pricing_reference_export_xlsx(reference_id, source=source)
 
-    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None) -> dict[str, Any]:
-        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id, storage=self)
+    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, committed_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id, storage=self, committed_metadata=committed_metadata)
 
     def list_quote_sessions(self) -> list[dict[str, Any]]:
         return list_quote_sessions()
@@ -12366,9 +12366,67 @@ class LocalSqagStorage:
     def delete_quote_session(self, session_id: str) -> bool:
         return delete_quote_session(session_id)
 
-    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None) -> dict[str, Any] | None:
-        _ = session_id, kind, require_current_proof
-        return None
+    def quote_session_export_artifact(
+        self, session_id: str, kind: str, *, require_current_proof: bool | None = None,
+        expected_projection_identity: tuple[Any, ...] | None = None,
+        expected_publication: str | None = None,
+    ) -> dict[str, Any] | None:
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_kind = clean_text(kind).lower()
+        expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
+        if not safe_id or not expected_filename:
+            return None
+        metadata = read_quote_session_metadata(safe_id)
+        authority = local_current_publication_authority(quote_session_authority_payload(metadata))
+        proof = quote_session_current_v2_publication_proof(
+            metadata, metadata, workspace_id="local-workspace", owner_id="local-user",
+            authority=authority,
+        )
+        if proof is None:
+            return None
+        identity = quote_publication_projection_identity(metadata, self, safe_kind)
+        if (
+            identity is None
+            or (expected_projection_identity is not None and identity != expected_projection_identity)
+            or (expected_publication is not None and quote_publication_binding(identity) != expected_publication)
+        ):
+            return None
+        expected_artifact = proof["artifacts"].get(safe_kind)
+        if not isinstance(expected_artifact, dict):
+            return None
+        # Preserve the existing filesystem capability, retirement, owner and path gates.
+        capability = _quote_session_filesystem_capability()
+        if _quote_session_retirement_state(safe_id, capability)[0]:
+            return None
+        state = _read_local_quote_session_state(safe_id, capability)
+        if state["owner"] != safe_id or quote_publication_projection_identity(state["metadata"], self, safe_kind) != identity:
+            return None
+        path = quote_session_recorded_export_path(safe_id, safe_kind, state["metadata"])
+        if not path.exists() or not path.is_file():
+            return None
+        content = path.read_bytes()
+        artifact = {
+            "filename": path.name, "content_type": QUOTE_SESSION_EXPORT_CONTENT_TYPES[safe_kind],
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(), "content": content,
+        }
+        publication = proof["publication"]
+        return artifact if quote_artifact_matches_publication_proof(
+            artifact, expected_artifact, session_id=safe_id,
+            publication_id=publication["id"], run_id=publication["run_id"],
+        ) else None
+
+    def quote_session_export_metadata(self, session_id: str, kind: str, *, expected_projection_identity: tuple[Any, ...]) -> dict[str, Any] | None:
+        """Current local path/metadata projection; byte admission remains at delivery."""
+        metadata = read_quote_session_metadata(session_id)
+        if quote_publication_projection_identity(metadata, self, kind) != expected_projection_identity:
+            return None
+        if not quote_session_has_current_v2_publication(metadata, storage=self):
+            return None
+        path = quote_session_recorded_export_path(session_id, kind, metadata)
+        export = metadata["exports"][kind]
+        if not path.is_file() or path.stat().st_size != export["size_bytes"]:
+            return None
+        return {"filename": export["filename"], "sha256": export["sha256"], "size_bytes": export["size_bytes"]}
 
     def quote_session_export_file_path(self, session_id: str, kind: str) -> Path | None:
         safe_id = safe_quote_session_id(session_id, "")
@@ -14790,13 +14848,15 @@ class DatabaseSqagStorage:
         stored["items"] = items
         return stored, pending_artifacts, retained_kinds
 
-    def _quote_artifact_metadata(self, session_id: str, kind: str) -> dict[str, Any] | None:
+    def _quote_artifact_metadata(self, session_id: str, kind: str, *, expected_projection_identity: tuple[Any, ...] | None = None) -> dict[str, Any] | None:
         safe_id = safe_quote_session_id(session_id, "")
         safe_kind = clean_text(kind).lower()
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
         if not safe_id or not expected_filename:
             return None
         metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        if expected_projection_identity is not None and quote_publication_projection_identity(metadata, self, safe_kind) != expected_projection_identity:
+            return None
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         current_run_id = safe_reference(publication.get("run_id"), "run-")
         if current_run_id and self._publication_version_row(current_run_id) is not None:
@@ -15351,7 +15411,7 @@ class DatabaseSqagStorage:
             "content": content,
         }
 
-    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None) -> dict[str, Any] | None:
+    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None, expected_projection_identity: tuple[Any, ...] | None = None, expected_publication: str | None = None) -> dict[str, Any] | None:
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode not in {"database", "object"}:
             return None
@@ -15380,6 +15440,14 @@ class DatabaseSqagStorage:
                 authority=current_authority,
             )
             if publication_proof is None:
+                return None
+        if expected_projection_identity is not None or expected_publication is not None:
+            identity = quote_publication_projection_identity(metadata, self, safe_kind)
+            if (
+                identity is None
+                or (expected_projection_identity is not None and identity != expected_projection_identity)
+                or (expected_publication is not None and quote_publication_binding(identity) != expected_publication)
+            ):
                 return None
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
@@ -15454,55 +15522,9 @@ class DatabaseSqagStorage:
         )
 
     def _public_quote_session(self, metadata: dict[str, Any], *, include_draft_state: bool = False, draft_files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        public = public_quote_session(metadata, include_draft_state=False)
-        if not public:
-            return {}
-        published = quote_session_is_published(metadata)
-        if include_draft_state:
-            public["draft_state"] = copy.deepcopy(metadata.get("draft_state")) if isinstance(metadata.get("draft_state"), dict) else {}
-            public["draft_files"] = copy.deepcopy(draft_files or [])
-        has_stale_export = False
-        has_available_export = False
-        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
-            export = public.get("exports", {}).get(kind) if isinstance(public.get("exports"), dict) else None
-            if not isinstance(export, dict):
-                continue
-            metadata_export = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
-            raw_export = metadata_export if isinstance(metadata_export, dict) else export
-            recorded_filename = clean_text(raw_export.get("filename"))
-            safe_recorded = recorded_filename if recorded_filename == filename else ""
-            artifact = self._quote_artifact_metadata(public["session_id"], kind) if published and configured_artifact_storage_mode() in {"database", "object"} and safe_recorded else None
-            artifact_exists = bool(artifact)
-            stale = bool(artifact_exists and quote_session_export_is_stale(metadata, raw_export))
-            exists = artifact_exists
-            has_stale_export = has_stale_export or stale
-            has_available_export = has_available_export or (exists and not stale)
-            export["filename"] = safe_recorded or None
-            export["exists"] = exists
-            export["missing"] = bool(safe_recorded and not artifact_exists)
-            export["stale"] = stale
-            export["url"] = f"/api/quote-sessions/{public['session_id']}/download/{kind}" if exists else None
-            export["view_url"] = (
-                f"/api/quote-sessions/{public['session_id']}/view/pdf"
-                if kind == "pdf" and exists and not stale
-                else None
-            )
-            if artifact:
-                export["sha256"] = artifact["sha256"]
-                export["size_bytes"] = artifact["size_bytes"]
-            public["exports"][kind] = export
-        public["status"]["draft_modified"] = bool(has_stale_export and not has_available_export)
-        if has_stale_export and not has_available_export:
-            source_status = metadata.get("status") if isinstance(metadata.get("status"), dict) else {}
-            public["status"]["quote_generated"] = bool(
-                source_status.get("quote_generated") is True
-                and not quote_session_has_current_v2_publication(metadata, storage=self)
-            )
-        elif has_available_export:
-            public["status"]["quote_generated"] = True
-        else:
-            public["status"]["quote_generated"] = False
-        return public
+        return QuotePublicationReadView(self, metadata=metadata).project_saved(
+            include_draft_state=include_draft_state, draft_files=draft_files,
+        )
 
     def can_view_other_user_quote_sessions(self) -> bool:
         return self.role == "admin"
@@ -16747,13 +16769,13 @@ class DatabaseSqagStorage:
             if stored_generated_quote and self._expected_storage_failure(exc):
                 raise self._storage_unavailable_error(exc) from exc
             raise
-        committed_metadata = copy.deepcopy(normalized) if publish and stored_generated_quote else None
+        committed = copy.deepcopy(normalized) if publish and stored_generated_quote else None
         try:
             return self._public_quote_session(normalized)
         except Exception as exc:
-            if committed_metadata is None:
+            if committed is None:
                 raise
-            raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
+            raise PostCommitQuoteSessionProjectionError(committed) from exc
 
     def quote_session_evidence_files(self, session_id: str, run_id: str = "") -> list[dict[str, Any]]:
         safe_id = safe_quote_session_id(session_id, "")
@@ -16805,7 +16827,7 @@ class DatabaseSqagStorage:
         session_id: str,
         run_id: str,
         expected_files: list[dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         safe_id = safe_quote_session_id(session_id, "")
         safe_run_id = safe_reference(run_id, "run-")
         if not safe_id or not safe_run_id:
@@ -16843,7 +16865,7 @@ class DatabaseSqagStorage:
             clean_text(current_publication.get("state")).lower() == "published"
             and current_run_id == safe_run_id
         ):
-            return
+            return current_metadata
         if safe_reference(current_publication.get("pending_run_id"), "run-") != safe_run_id:
             raise ValueError("Staged quote session belongs to another generation run.")
 
@@ -16991,6 +17013,7 @@ class DatabaseSqagStorage:
             purpose="quote_publication",
             commit=False,
         )
+        return normalized
 
     def mark_quote_session_publication_failed(self, session_id: str, run_id: str, error_code: str) -> bool:
         safe_id = safe_quote_session_id(session_id, "")
@@ -27264,6 +27287,8 @@ def quote_session_result_files(session: dict[str, Any] | None) -> list[dict[str,
         url = clean_text(export.get("url"))
         if export.get("exists") is True and export.get("stale") is not True and url.startswith("/api/quote-sessions/"):
             item = {"name": filename, "url": url}
+            if kind == "pdf" and clean_text(export.get("view_url")):
+                item["view_url"] = export["view_url"]
             size = int(export.get("size_bytes") or 0)
             if size > 0:
                 item["bytes"] = str(size)
@@ -28680,6 +28705,65 @@ def quote_session_current_v2_publication_proof(
     return proof
 
 
+def quote_publication_projection_identity(
+    metadata: dict[str, Any],
+    storage: LocalSqagStorage | DatabaseSqagStorage,
+    kind: str,
+) -> tuple[Any, ...] | None:
+    """Immutable committed identity; current requester credentials are excluded."""
+    if kind not in QUOTE_SESSION_EXPORT_KINDS or not isinstance(metadata, dict):
+        return None
+    database = isinstance(storage, DatabaseSqagStorage)
+    workspace_id = storage.workspace_id if database else "local-workspace"
+    owner_id = storage._quote_session_owner_id(metadata) if database else "local-user"
+    proof = quote_session_current_v2_publication_proof(
+        metadata, metadata, workspace_id=workspace_id, owner_id=owner_id,
+        authority=None, require_authority=False,
+    )
+    if proof is None:
+        return None
+    publication = proof["publication"]
+    artifact = proof["artifacts"].get(kind)
+    if not isinstance(artifact, dict):
+        return None
+    # Fixed field order and exact types form the versioned canonical JSON array.
+    return (
+        "quote-publication-comparison-v1", "workspace" if database else "local",
+        proof["subject"]["workspace_id"], proof["subject"]["owner_id"],
+        proof["subject"]["session_id"], publication["id"],
+        publication["run_id"], publication["job_id"], proof["output_revision"],
+        proof["commercial_state_schema"], proof["commercial_state_digest"], kind,
+        artifact["filename"], artifact["publication_id"], artifact["run_id"],
+        artifact["sha256"], artifact["size_bytes"],
+    )
+
+
+def quote_publication_binding(identity: tuple[Any, ...] | None) -> str | None:
+    if identity is None:
+        return None
+    return hashlib.sha256(json.dumps(
+        identity, ensure_ascii=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def quote_publication_url(session_id: str, kind: str, identity: tuple[Any, ...] | None, *, inline: bool = False) -> str | None:
+    binding = quote_publication_binding(identity)
+    if binding is None:
+        return None
+    route = "view/pdf" if inline and kind == "pdf" else f"download/{kind}"
+    return f"/api/quote-sessions/{session_id}/{route}?publication={binding}"
+
+
+def quote_publication_query(query: str) -> tuple[bool, str | None]:
+    """Only absence selects CURRENT; an invalid supplied comparison denies."""
+    values = parse_qs(query, keep_blank_values=True).get("publication")
+    if values is None:
+        return True, None
+    if len(values) != 1 or re.fullmatch(r"[0-9a-f]{64}", values[0]) is None:
+        return False, None
+    return True, values[0]
+
+
 def quote_artifact_matches_publication_proof(
     artifact: Any,
     expected: Any,
@@ -29861,6 +29945,7 @@ def create_or_update_quote_session(
     session_id: str | None = None,
     *,
     storage: LocalSqagStorage | None = None,
+    committed_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     persistence_review = quote_commercial_persistence_preflight(payload)
     if persistence_review:
@@ -29959,6 +30044,8 @@ def create_or_update_quote_session(
             raise
     finally:
         QUOTE_SESSION_TRANSACTION_CONTEXT.reset(transaction_token)
+    if committed_publication is not None and committed_metadata is not None:
+        committed_metadata.update(copy.deepcopy(metadata))
     try:
         return public_quote_session(metadata)
     except Exception as exc:
@@ -30018,64 +30105,173 @@ def quote_session_draft_progress(draft_state: dict[str, Any]) -> dict[str, str]:
     }
 
 
+class QuotePublicationReadView:
+    """One response owns admitted scope, a copied snapshot and verified facts."""
+
+    def __init__(
+        self, storage: LocalSqagStorage | DatabaseSqagStorage, *,
+        metadata: dict[str, Any] | None = None,
+        job_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        self.storage = storage
+        self.metadata = copy.deepcopy(metadata) if isinstance(metadata, dict) else None
+        self.job = job_snapshot
+        self.facts: dict[str, dict[str, Any]] = {}
+        self.resolved = False
+
+    def _resolve(self) -> None:
+        if self.resolved:
+            return
+        self.resolved = True
+        if self.metadata is None:
+            result = self.job.get("result") if isinstance(self.job, dict) else None
+            session = result.get("quote_session") if isinstance(result, dict) else None
+            session_id = safe_quote_session_id(session.get("session_id"), "") if isinstance(session, dict) else ""
+            if not session_id:
+                self.metadata = {}
+                return
+            if isinstance(self.storage, DatabaseSqagStorage):
+                self.metadata, _draft_files = self.storage._read_quote_session_metadata(session_id)
+            else:
+                self.metadata = read_quote_session_metadata(session_id)
+        metadata = self.metadata or {}
+        expected = self.job.get("_quote_publication_identity") if isinstance(self.job, dict) else None
+        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+            raw = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
+            recorded = isinstance(raw, dict) and raw.get("filename") == filename
+            identity = quote_publication_projection_identity(metadata, self.storage, kind)
+            fact: dict[str, Any] = {"eligible": False, "identity": identity, "recorded": recorded}
+            self.facts[kind] = fact
+            if identity is None or (self.job is not None and (not isinstance(expected, dict) or expected.get(kind) != identity)):
+                continue
+            if kind == "pdf":
+                artifact = self.storage.quote_session_export_artifact(
+                    metadata["session_id"], kind, require_current_proof=True,
+                    expected_projection_identity=identity,
+                )
+            elif isinstance(self.storage, LocalSqagStorage):
+                artifact = self.storage.quote_session_export_metadata(metadata["session_id"], kind, expected_projection_identity=identity)
+            else:
+                # XLSX retains its metadata projection; delivery verifies the actual bytes.
+                artifact = self.storage._quote_artifact_metadata(metadata["session_id"], kind, expected_projection_identity=identity)
+                if artifact and (
+                    artifact.get("sha256") != raw.get("sha256")
+                    or artifact.get("size_bytes") != raw.get("size_bytes")
+                ):
+                    artifact = None
+                if artifact and not quote_session_has_current_v2_publication(metadata, storage=self.storage):
+                    artifact = None
+            if artifact is None:
+                continue
+            # Body bytes never enter the public facts.
+            fact.update({
+                "eligible": True, "sha256": artifact["sha256"], "size_bytes": artifact["size_bytes"],
+                "url": quote_publication_url(metadata["session_id"], kind, identity),
+                "view_url": quote_publication_url(metadata["session_id"], kind, identity, inline=True) if kind == "pdf" else None,
+            })
+
+    def project_saved(self, *, include_draft_state: bool = False, draft_files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        self._resolve()
+        normalized = normalized_quote_session_metadata(self.metadata or {})
+        if not normalized:
+            return {}
+        public = copy.deepcopy(normalized)
+        public.pop("publication", None)
+        public.pop("owner", None)
+        public["pricing_ledger"] = public_pricing_ledger(normalized)
+        draft = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
+        public["has_draft_state"] = bool(draft)
+        progress = quote_session_draft_progress(draft)
+        if progress:
+            public["draft_progress"] = progress
+        if include_draft_state:
+            public["draft_files"] = copy.deepcopy(draft_files or []) if isinstance(self.storage, DatabaseSqagStorage) else read_quote_session_draft_files(normalized["session_id"], normalized)
+        else:
+            public.pop("draft_state", None)
+            public.pop("draft_files", None)
+        has_stale = False
+        has_available = False
+        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+            export = public["exports"].get(kind)
+            export = export if isinstance(export, dict) else {}
+            fact = self.facts.get(kind, {})
+            recorded = export.get("filename") == filename
+            eligible = fact.get("eligible") is True
+            stale = bool(recorded and quote_session_export_is_stale(normalized, export))
+            export.update({
+                "filename": filename if recorded else None,
+                "exists": True if eligible else None if recorded else False,
+                "missing": None if recorded and not eligible else False,
+                "stale": stale, "verified": eligible,
+                "availability": "available" if eligible else "unverified" if recorded else "not_recorded",
+                "url": fact.get("url") if eligible else None,
+                "view_url": fact.get("view_url") if eligible else None,
+            })
+            if eligible:
+                export.update({"sha256": fact["sha256"], "size_bytes": fact["size_bytes"]})
+            public["exports"][kind] = export
+            has_stale = has_stale or stale
+            has_available = has_available or eligible
+        public["status"]["draft_modified"] = bool(has_stale and not has_available)
+        public["status"]["quote_generated"] = has_available
+        return public
+
+    def project_job(self) -> dict[str, Any]:
+        snapshot = self.job or {}
+        public = public_job(snapshot)
+        result = public.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("quote_session"), dict):
+            return public
+        if snapshot.get("type") not in {"generate", "generate_pdf"} or snapshot.get("status") != "completed" or result.get("status") != "completed":
+            return public
+        if result.get("post_commit_projection"):
+            return public
+        self._resolve()
+        session = result["quote_session"]
+        exports = session.get("exports") if isinstance(session.get("exports"), dict) else {}
+        files = []
+        by_name = {filename: kind for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items()}
+        for item in result.get("files", []) if isinstance(result.get("files"), list) else []:
+            kind = by_name.get(item.get("name")) if isinstance(item, dict) else None
+            if kind is None:
+                files.append(item)
+                continue
+            fact = self.facts.get(kind, {})
+            if fact.get("eligible"):
+                files.append({**item, "url": fact["url"], **({"view_url": fact["view_url"]} if kind == "pdf" else {})})
+        for kind in QUOTE_SESSION_EXPORT_KINDS:
+            export = exports.get(kind)
+            if not isinstance(export, dict):
+                continue
+            fact = self.facts.get(kind, {})
+            eligible = fact.get("eligible") is True
+            export.update({
+                "url": fact.get("url") if eligible else None,
+                "view_url": fact.get("view_url") if eligible else None,
+                "exists": True if eligible else None, "missing": False if eligible else None,
+                "verified": eligible, "availability": "available" if eligible else "unverified",
+            })
+        result["files"] = files
+        return public
+
+
 def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool = False) -> dict[str, Any]:
-    normalized = normalized_quote_session_metadata(metadata)
-    if not normalized:
-        return {}
-    session_id = normalized["session_id"]
-    public = copy.deepcopy(normalized)
-    published = quote_session_is_published(normalized)
-    public.pop("publication", None)
-    public.pop("owner", None)
-    public["pricing_ledger"] = public_pricing_ledger(normalized)
-    draft_state = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
-    public["has_draft_state"] = bool(draft_state)
-    draft_progress = quote_session_draft_progress(draft_state)
-    if draft_progress:
-        public["draft_progress"] = draft_progress
-    if not include_draft_state:
-        public.pop("draft_state", None)
-        public.pop("draft_files", None)
-    else:
-        public["draft_files"] = read_quote_session_draft_files(session_id, normalized)
-    has_stale_export = False
-    has_available_export = False
-    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
-        raw_export = public["exports"].get(kind) if isinstance(public["exports"].get(kind), dict) else {}
-        recorded_filename = clean_text(raw_export.get("filename"))
-        safe_recorded = recorded_filename if recorded_filename == filename else ""
-        export_path = (
-            quote_session_recorded_export_path(session_id, kind, normalized)
-            if safe_recorded
-            else None
-        )
-        file_exists = bool(published and export_path and export_path.exists() and export_path.is_file())
-        stale = bool(file_exists and quote_session_export_is_stale(normalized, raw_export))
-        exists = file_exists
-        has_stale_export = has_stale_export or stale
-        has_available_export = has_available_export or (exists and not stale)
-        raw_export["filename"] = safe_recorded or None
-        raw_export["exists"] = exists
-        raw_export["missing"] = bool(safe_recorded and not file_exists)
-        raw_export["stale"] = stale
-        raw_export["url"] = f"/api/quote-sessions/{session_id}/download/{kind}" if exists else None
-        raw_export["view_url"] = (
-            f"/api/quote-sessions/{session_id}/view/pdf"
-            if kind == "pdf" and exists and not stale
-            else None
-        )
-        if file_exists and export_path is not None:
-            raw_export["sha256"] = hashlib.sha256(export_path.read_bytes()).hexdigest()
-            raw_export["size_bytes"] = export_path.stat().st_size
-        public["exports"][kind] = raw_export
-    public["status"]["draft_modified"] = bool(has_stale_export and not has_available_export)
-    if has_stale_export and not has_available_export:
-        public["status"]["quote_generated"] = False
-    elif has_available_export:
-        public["status"]["quote_generated"] = True
-    else:
-        public["status"]["quote_generated"] = False
-    return public
+    return QuotePublicationReadView(LocalSqagStorage(), metadata=metadata).project_saved(include_draft_state=include_draft_state)
+
+
+def projected_public_job(snapshot: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = snapshot.get("result")
+    if (
+        snapshot.get("status") != "completed"
+        or snapshot.get("type") not in {"generate", "generate_pdf"}
+        or not isinstance(result, dict)
+        or not isinstance(result.get("quote_session"), dict)
+        or result.get("status") != "completed"
+        or result.get("post_commit_projection")
+    ):
+        return public_job(snapshot)
+    storage = quote_session_storage_for_auth_session(auth_session)
+    return QuotePublicationReadView(storage, job_snapshot=snapshot).project_job()
 
 
 def committed_quote_session_artifacts(metadata: dict[str, Any]) -> list[dict[str, str]]:
@@ -30150,6 +30346,7 @@ def committed_quote_session_projection(
         export["missing"] = None if has_recorded_export else False
         export["stale"] = None if has_recorded_export else False
         export["url"] = None
+        export["view_url"] = None
         exports[kind] = export
     public["exports"] = exports
     public.setdefault("status", {})["quote_generated"] = True
@@ -30162,6 +30359,7 @@ def committed_quote_session_projection(
 def committed_quote_session_downloads(
     metadata: dict[str, Any],
     artifacts: list[dict[str, str]],
+    *, storage: LocalSqagStorage | DatabaseSqagStorage,
 ) -> list[dict[str, str]]:
     session_id = safe_quote_session_id(metadata.get("session_id"), "")
     if not session_id:
@@ -30176,10 +30374,13 @@ def committed_quote_session_downloads(
         artifact = by_name.get(filename)
         if not artifact:
             continue
-        item = {
-            "name": filename,
-            "url": f"/api/quote-sessions/{session_id}/download/{kind}",
-        }
+        identity = quote_publication_projection_identity(metadata, storage, kind)
+        url = quote_publication_url(session_id, kind, identity)
+        if url is None:
+            continue
+        item = {"name": filename, "url": url}
+        if kind == "pdf":
+            item["view_url"] = quote_publication_url(session_id, kind, identity, inline=True)
         if clean_text(artifact.get("bytes")):
             item["bytes"] = clean_text(artifact.get("bytes"))
         digest = clean_text(artifact.get("sha256")).lower()
@@ -30505,7 +30706,7 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
     if clean_text(job.get("generation_run_id")):
         payload["generation_run_id"] = clean_text(job.get("generation_run_id"))
     if isinstance(job.get("result"), dict):
-        payload["result"] = job["result"]
+        payload["result"] = copy.deepcopy(job["result"])
     if isinstance(job.get("errors"), list) and job["errors"]:
         payload["errors"] = job["errors"]
     if clean_text(job.get("error_reference")):
@@ -30564,11 +30765,16 @@ def job_owner_context_from_auth_session(session: dict[str, Any] | None) -> dict[
     return owner
 
 
-def job_visible_to_auth_session(job: dict[str, Any], session: dict[str, Any] | None) -> bool:
-    if not protected_job_routes_enabled(session):
+def job_visibility_context(session: dict[str, Any] | None) -> tuple[bool, dict[str, str]]:
+    # Configuration and requester admission can read files; capture before JOBS_LOCK.
+    return protected_job_routes_enabled(session), job_owner_context_from_auth_session(session)
+
+
+def job_visible_to_context(job: dict[str, Any], context: tuple[bool, dict[str, str]]) -> bool:
+    protected, requester = context
+    if not protected:
         return True
     owner = job.get("owner") if isinstance(job.get("owner"), dict) else {}
-    requester = job_owner_context_from_auth_session(session)
     owner_user_id = clean_text(owner.get("user_id"))
     requester_user_id = clean_text(requester.get("user_id"))
     if not owner_user_id or not requester_user_id or owner_user_id != requester_user_id:
@@ -30578,6 +30784,10 @@ def job_visible_to_auth_session(job: dict[str, Any], session: dict[str, Any] | N
     if owner_workspace_id and owner_workspace_id != requester_workspace_id:
         return False
     return True
+
+
+def job_visible_to_auth_session(job: dict[str, Any], session: dict[str, Any] | None) -> bool:
+    return job_visible_to_context(job, job_visibility_context(session))
 
 
 def legacy_job_artifact_download_allowed(session: dict[str, Any] | None) -> bool:
@@ -30698,12 +30908,13 @@ def finish_draft_job(job_id: str, payload: dict[str, Any], auth_session: dict[st
 
 
 def finish_generate_job(job_id: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> None:
+    publication_identity: dict[str, tuple[Any, ...]] = {}
     try:
         pdf_mode = "workbook" if payload_requests_pdf_view(payload) else "none"
-        result = run_quote_job(payload, job_id=job_id, pdf_mode=pdf_mode, auth_session=safe_auth_session_for_async(auth_session))
+        result = run_quote_job(payload, job_id=job_id, pdf_mode=pdf_mode, auth_session=safe_auth_session_for_async(auth_session), publication_identity_capture=publication_identity)
         status_map = {"needs_confirmation": "needs_review"}
         status = status_map.get(clean_text(result.get("status")), clean_text(result.get("status")) or "failed")
-        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [])
+        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [], _quote_publication_identity=publication_identity)
     except Exception as exc:  # pragma: no cover - defensive worker boundary
         error_reference = new_error_reference()
         result = failed_result_payload(error_reference)
@@ -30719,11 +30930,12 @@ def payload_requests_pdf_view(payload: dict[str, Any]) -> bool:
 
 
 def finish_generate_pdf_job(job_id: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> None:
+    publication_identity: dict[str, tuple[Any, ...]] = {}
     try:
-        result = run_quote_job(payload, job_id=job_id, pdf_mode="workbook", auth_session=safe_auth_session_for_async(auth_session))
+        result = run_quote_job(payload, job_id=job_id, pdf_mode="workbook", auth_session=safe_auth_session_for_async(auth_session), publication_identity_capture=publication_identity)
         status_map = {"needs_confirmation": "needs_review"}
         status = status_map.get(clean_text(result.get("status")), clean_text(result.get("status")) or "failed")
-        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [])
+        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [], _quote_publication_identity=publication_identity)
     except Exception as exc:  # pragma: no cover - defensive worker boundary
         errors = safe_error_messages([str(exc)])
         error_reference = new_error_reference()
@@ -31647,13 +31859,14 @@ def finish_generation_forensics(
                         commit=False,
                     )
                 if atomic_publication and publication_storage is not None:
-                    publication_storage.publish_quote_session_forensic_transaction(
+                    committed_metadata = publication_storage.publish_quote_session_forensic_transaction(
                         store.connection,
                         publication_session_id,
                         run_id,
                         publication_files or [],
                     )
                     store.connection.commit()
+                    enriched["_committed_quote_metadata"] = committed_metadata
                 elif has_post_commit_projection_failure:
                     store.connection.commit()
             except Exception:
@@ -32056,6 +32269,7 @@ def create_job(
                 if generation_run_id else None
             ),
         )
+    visibility_context = job_visibility_context(auth_session)
     requested_job_id = clean_text(requested_job_id)
     if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
         return blocked(["Job request could not be resumed."], "job_resume_invalid")
@@ -32063,9 +32277,11 @@ def create_job(
         with JOBS_LOCK:
             existing = JOBS.get(requested_job_id)
             if existing:
-                if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
+                if existing.get("type") != normalized_type or not job_visible_to_context(existing, visibility_context):
                     return {"status": "blocked", "errors": ["Job request could not be resumed."]}
-                return public_job(existing)
+                existing = copy.deepcopy(existing)
+        if existing:
+            return projected_public_job(existing, auth_session)
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
     if normalized_type in {"draft", "generate", "generate_pdf"}:
         validated_session_id = validated_generation_session_id(payload, auth_session)
@@ -32214,11 +32430,14 @@ def create_job(
     }
     with JOBS_LOCK:
         existing = JOBS.get(job_id)
-        if existing:
-            if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
-                return blocked(["Job request could not be resumed."], "job_resume_invalid")
-            return public_job(existing)
-        JOBS[job_id] = job
+        rejected_resume = bool(existing and (existing.get("type") != normalized_type or not job_visible_to_context(existing, visibility_context)))
+        existing = copy.deepcopy(existing) if existing and not rejected_resume else None
+        if not existing and not rejected_resume:
+            JOBS[job_id] = job
+    if rejected_resume:
+        return blocked(["Job request could not be resumed."], "job_resume_invalid")
+    if existing:
+        return projected_public_job(existing, auth_session)
 
     worker = {
         "draft": finish_draft_job,
@@ -32234,15 +32453,18 @@ def create_job(
     set_job_state(job_id, status="running")
     thread.start()
     with JOBS_LOCK:
-        return public_job(JOBS[job_id])
+        snapshot = copy.deepcopy(JOBS[job_id])
+    return projected_public_job(snapshot, auth_session)
 
 
 def get_job(job_id: str, auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    visibility_context = job_visibility_context(auth_session)
     with JOBS_LOCK:
         job = JOBS.get(safe_resource_id(job_id, ""))
-        if job and not job_visible_to_auth_session(job, auth_session):
+        if job and not job_visible_to_context(job, visibility_context):
             return None
-        return public_job(job) if job else None
+        snapshot = copy.deepcopy(job) if job else None
+    return projected_public_job(snapshot, auth_session) if snapshot else None
 
 
 def _run_quote_job(
@@ -32253,6 +32475,7 @@ def _run_quote_job(
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
     scratch_ownership: dict[str, bool] | None = None,
+    publication_identity_capture: dict[str, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
     generation_run_id = clean_text(payload.get("_generation_run_id"))
     job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
@@ -32626,6 +32849,7 @@ def _run_quote_job(
     publication_storage: DatabaseSqagStorage | None = None
     publication_session_id = ""
     publication_files: list[dict[str, Any]] = []
+    committed_metadata: dict[str, Any] = {}
     if isinstance(payload.get("quote_session"), dict):
         try:
             storage = quote_session_storage or quote_session_storage_for_auth_session(auth_session)
@@ -32646,15 +32870,23 @@ def _run_quote_job(
                 )
             else:
                 result["quote_session"] = storage.create_or_update_quote_session(
-                    payload, result=result, output_dir=output_dir
+                    payload, result=result, output_dir=output_dir,
+                    **({"committed_metadata": committed_metadata} if isinstance(storage, LocalSqagStorage) else {}),
                 )
             if atomic_publication:
                 publication_storage = storage
                 publication_session_id = safe_quote_session_id(result["quote_session"].get("session_id"), "")
                 publication_files = storage.quote_session_evidence_files(publication_session_id, generation_run_id)
                 result["files"] = publication_files
-            elif artifact_mode in {"database", "object"}:
+            elif result_has_generated_quote(result) and (artifact_mode in {"database", "object"} or committed_metadata):
                 result["files"] = quote_session_result_files(result.get("quote_session"))
+            elif not result_has_generated_quote(result):
+                result.pop("files", None)
+                session = result.get("quote_session")
+                exports = session.get("exports") if isinstance(session, dict) and isinstance(session.get("exports"), dict) else {}
+                for export in exports.values():
+                    if isinstance(export, dict):
+                        export.update({"url": None, "view_url": None, "exists": None, "missing": None, "verified": False, "availability": "unverified"})
         except PostCommitQuoteSessionProjectionError as exc:
             projection_reference = new_error_reference()
             committed_metadata = exc.committed_metadata
@@ -32678,6 +32910,7 @@ def _run_quote_job(
             result["committed_files"] = committed_quote_session_downloads(
                 committed_metadata,
                 committed_artifacts,
+                storage=storage,
             )
             result["_committed_publication_artifacts"] = committed_artifacts
             result["_post_commit_projection_failure"] = warning
@@ -32822,6 +33055,17 @@ def _run_quote_job(
         publication_session_id=publication_session_id,
         publication_files=publication_files,
     )
+    atomic_committed_metadata = finalized.pop("_committed_quote_metadata", None)
+    if isinstance(atomic_committed_metadata, dict):
+        committed_metadata = atomic_committed_metadata
+    committed_identities = {}
+    if committed_metadata and clean_text(finalized.get("status")) == "completed":
+        committed_identities = {
+            kind: identity for kind in QUOTE_SESSION_EXPORT_KINDS
+            if (identity := quote_publication_projection_identity(committed_metadata, storage, kind)) is not None
+        }
+        if publication_identity_capture is not None:
+            publication_identity_capture.update(committed_identities)
     if publication_storage is not None and publication_session_id:
         if clean_text(finalized.get("status")) == clean_text(result.get("status")):
             published_session = copy.deepcopy(result.get("quote_session"))
@@ -32836,13 +33080,18 @@ def _run_quote_job(
                 }
                 exports = published_session.get("exports") if isinstance(published_session.get("exports"), dict) else {}
                 for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
-                    export = exports.get(kind) if isinstance(exports.get(kind), dict) else {}
+                    raw_export = committed_metadata.get("exports", {}).get(kind)
+                    export = copy.deepcopy(raw_export) if isinstance(raw_export, dict) else {}
                     available = available_names.get(filename)
-                    exists = bool(available)
+                    identity = committed_identities.get(kind)
+                    exists = bool(available and identity is not None and available.get("sha256") == export.get("sha256") and int(available.get("bytes") or 0) == export.get("size_bytes"))
                     export["exists"] = exists
+                    export["verified"] = exists
+                    export["availability"] = "available" if exists else "not_recorded"
                     export["missing"] = False
                     export["stale"] = False
-                    export["url"] = f"/api/quote-sessions/{publication_session_id}/download/{kind}" if exists else None
+                    export["url"] = quote_publication_url(publication_session_id, kind, identity) if exists else None
+                    export["view_url"] = quote_publication_url(publication_session_id, kind, identity, inline=True) if exists and kind == "pdf" else None
                     if available:
                         export["sha256"] = clean_text(available.get("sha256"))
                         export["size_bytes"] = int(available.get("bytes") or 0)
@@ -32921,7 +33170,10 @@ def run_quote_job(
     job_id: str | None = None,
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
+    *, publication_identity_capture: dict[str, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
+    if publication_identity_capture is not None:
+        publication_identity_capture.clear()
     commercial_review_block = quote_commercial_review_preflight(
         payload,
         auth_session=auth_session,
@@ -32954,6 +33206,7 @@ def run_quote_job(
             pdf_mode=pdf_mode,
             auth_session=auth_session,
             scratch_ownership=scratch_ownership,
+            publication_identity_capture=publication_identity_capture,
         )
     except BaseException:
         try:
@@ -33132,21 +33385,39 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_quote_session_storage()
             if storage is None:
                 return
-            self.send_json({"quote_sessions": storage.list_quote_sessions()})
+            try:
+                sessions = storage.list_quote_sessions()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:
+                error_reference = new_error_reference()
+                write_local_log("quote_publication_projection_failed", unexpected_error_log_details(error_reference, exc))
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
+            self.send_json({"quote_sessions": sessions})
             return
         quote_session_download_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)/download/([A-Za-z0-9_-]+)", path)
         if quote_session_download_match:
             storage = self.current_quote_session_storage()
             if storage is None:
                 return
-            self.send_quote_session_download(quote_session_download_match.group(1), quote_session_download_match.group(2), storage)
+            valid_comparison, comparison = quote_publication_query(parsed.query)
+            if not valid_comparison:
+                self.send_json({"error": "Not found"}, status=404)
+                return
+            self.send_quote_session_download(quote_session_download_match.group(1), quote_session_download_match.group(2), storage, expected_publication=comparison)
             return
         quote_session_pdf_view_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)/view/pdf", path)
         if quote_session_pdf_view_match:
             storage = self.current_quote_session_storage()
             if storage is None:
                 return
-            self.send_quote_session_download(quote_session_pdf_view_match.group(1), "pdf", storage, inline=True)
+            valid_comparison, comparison = quote_publication_query(parsed.query)
+            if not valid_comparison:
+                self.send_json({"error": "Not found"}, status=404)
+                return
+            self.send_quote_session_download(quote_session_pdf_view_match.group(1), "pdf", storage, inline=True, expected_publication=comparison)
             return
         quote_session_detail_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", path)
         if quote_session_detail_match:
@@ -33363,7 +33634,16 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         job_match = re.fullmatch(r"/api/jobs/([A-Za-z0-9_-]+)", path)
         if job_match:
             auth_session = self.current_auth_session()
-            job = get_job(job_match.group(1), auth_session=auth_session)
+            try:
+                job = get_job(job_match.group(1), auth_session=auth_session)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:
+                error_reference = new_error_reference()
+                write_local_log("quote_publication_projection_failed", unexpected_error_log_details(error_reference, exc))
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
             if not job:
                 if protected_job_routes_enabled(auth_session):
                     log_legacy_job_route_block("job_status_not_visible", route="status")
@@ -35030,6 +35310,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         storage: LocalSqagStorage | DatabaseSqagStorage,
         *,
         inline: bool = False,
+        expected_publication: str | None = None,
     ) -> None:
         safe_id = safe_quote_session_id(session_id, "")
         normalized_kind = clean_text(kind).lower()
@@ -35037,62 +35318,25 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if not safe_id or not expected_filename:
             self.send_json({"error": "Not found"}, status=404)
             return
-        artifact = storage.quote_session_export_artifact(safe_id, normalized_kind, require_current_proof=True)
-        if artifact is not None:
-            content_type = clean_text(artifact.get("content_type")) or QUOTE_SESSION_EXPORT_CONTENT_TYPES.get(normalized_kind, "application/octet-stream")
-            body = bytes(artifact.get("content") or b"")
-            safe_filename = safe_segment(artifact.get("filename"), expected_filename)
-        else:
-            if isinstance(storage, DatabaseSqagStorage):
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            metadata = read_quote_session_metadata(safe_id)
-            authority = local_current_publication_authority(
-                quote_session_authority_payload(metadata)
+        try:
+            artifact = storage.quote_session_export_artifact(
+                safe_id, normalized_kind, require_current_proof=True,
+                expected_publication=expected_publication,
             )
-            proof = quote_session_current_v2_publication_proof(
-                metadata,
-                {
-                    "status": copy.deepcopy(metadata.get("status")) if isinstance(metadata.get("status"), dict) else {},
-                    "draft_state": copy.deepcopy(metadata.get("draft_state")) if isinstance(metadata.get("draft_state"), dict) else {},
-                },
-                workspace_id="local-workspace",
-                owner_id="local-user",
-                authority=authority,
-            )
-            expected_artifact = (
-                proof.get("artifacts", {}).get(normalized_kind)
-                if isinstance(proof, dict) and isinstance(proof.get("artifacts"), dict)
-                else None
-            )
-            if not isinstance(expected_artifact, dict):
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            file_path = storage.quote_session_export_file_path(safe_id, normalized_kind)
-            if file_path is None:
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            body = file_path.read_bytes()
-            local_artifact = {
-                "filename": file_path.name,
-                "content_type": QUOTE_SESSION_EXPORT_CONTENT_TYPES[normalized_kind],
-                "size_bytes": len(body),
-                "sha256": hashlib.sha256(body).hexdigest(),
-                "content": body,
-            }
-            publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
-            publication_id = safe_quote_publication_id(publication.get("active_publication_id"), "")
-            if not quote_artifact_matches_publication_proof(
-                local_artifact,
-                expected_artifact,
-                session_id=safe_id,
-                publication_id=publication_id,
-                run_id="",
-            ):
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            content_type = local_artifact["content_type"]
-            safe_filename = expected_filename
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
+            return
+        except Exception as exc:
+            error_reference = new_error_reference()
+            write_local_log("quote_publication_read_failed", unexpected_error_log_details(error_reference, exc))
+            self.send_json(failed_result_payload(error_reference), status=500)
+            return
+        if artifact is None:
+            self.send_json({"error": "Not found"}, status=404)
+            return
+        content_type = clean_text(artifact.get("content_type")) or QUOTE_SESSION_EXPORT_CONTENT_TYPES.get(normalized_kind, "application/octet-stream")
+        body = bytes(artifact.get("content") or b"")
+        safe_filename = safe_segment(artifact.get("filename"), expected_filename)
         if not body:
             self.send_json({"error": "Not found"}, status=404)
             return
