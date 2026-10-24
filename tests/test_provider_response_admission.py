@@ -75,6 +75,98 @@ class ProviderAdmissionTest(unittest.TestCase):
         self.assertIn("ASCII letters, digits, underscores, and hyphens only", prompt)
         self.assertIn("Use the same id in its linked line_items source_basis_line_id", prompt)
 
+    def supplementary_request(self, raw, *, capture_only=False):
+        payload = existing.valid_payload()
+        payload["images"] = [{"name": "synthetic.png", "data_url": synthetic_image()}]
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({"output_text": json.dumps(raw)}).encode()
+        with mock.patch.dict(os.environ, existing.isolated_env(), clear=True), \
+             mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
+             mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
+             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
+             mock.patch.object(s, "catalog_visual_image_entries_for_payload", return_value=[]), \
+             mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
+            try:
+                if capture_only:
+                    with mock.patch.object(s, "normalize_ai_draft", return_value={"ok": True}):
+                        s.request_openai_quote_basis(payload, "synthetic-mocked-key")
+                else:
+                    s.request_openai_quote_basis(payload, "synthetic-mocked-key")
+            finally:
+                self.assertEqual(send.call_count, 1)
+            body = json.loads(send.call_args.args[0].data)
+            self.assertEqual(set(body), {"model", "input", "reasoning"})
+            return body["input"][0]["content"][0]["text"]
+
+    def test_actual_request_declares_optional_finding_object_shape(self):
+        prompt = self.supplementary_request(draft(), capture_only=True).split("Quote context JSON: ", 1)[0]
+        for text in ("analysis_findings must be an array of objects, never strings",
+                     "Each finding must contain text as a nonblank JSON string",
+                     "Omit analysis_findings or use [] when there are no findings",
+                     "do not output null, blank rows, or objects without text",
+                     "A finding may omit confidence",
+                     "confidence_pct or confidence must be an integer from 0 to 100",
+                     "supplied aliases must agree",
+                     "do not include blocking_clarification_questions in first-pass analysis"):
+            self.assertIn(text, prompt)
+
+    def test_supplementary_shapes_reject_before_pricing_or_sealing(self):
+        for field, key in (("analysis_findings", "text"), ("blocking_clarification_questions", "question")):
+            for row in ("Synthetic string", None, 3, True, [], {}, {"wrong_key": "Synthetic"},
+                        {key: ""}, {key: " \t\n "}, {key: None}, {key: 3}, {key: True}, {key: []}, {key: {}}):
+                raw = draft(); raw[field] = [{key: "Valid preceding row"}, row]
+                before = copy.deepcopy(raw)
+                with self.subTest(field=field, row=row), \
+                     mock.patch.object(s, "capture_pricing_reference_snapshot", side_effect=AssertionError("PRICING_REACHED")), \
+                     mock.patch.object(s, "normalize_line_items", side_effect=AssertionError("PRICING_REACHED")), \
+                     mock.patch.object(s, "issue_pricing_analysis_seal", side_effect=AssertionError("SEAL_REACHED")), \
+                     self.assertRaises(s.AIModelOutputError) as rejected:
+                    s.normalize_ai_draft(raw, {}, require_confidence=True)
+                self.assertEqual(rejected.exception.diagnostics["response_contract_reason"], "supplementary_row_shape")
+                self.assertEqual(raw, before)
+            raw = draft(); raw[field] = ["Synthetic string row"]
+            with self.subTest(field=field, actual_request=True), \
+                 mock.patch.object(s, "normalize_line_items", side_effect=AssertionError("PRICING_REACHED")), \
+                 mock.patch.object(s, "issue_pricing_analysis_seal", side_effect=AssertionError("SEAL_REACHED")), \
+                 self.assertRaises(s.AIModelOutputError) as rejected:
+                self.supplementary_request(raw)
+            self.assertEqual(rejected.exception.diagnostics["response_contract_reason"], "supplementary_row_shape")
+
+    def test_supplementary_optional_fields_and_confidence_contract(self):
+        for field, key in (("analysis_findings", "text"), ("blocking_clarification_questions", "question")):
+            for value in ([], [{key: "Synthetic observation"}], [{key: "Synthetic observation", "confidence_pct": 0}],
+                          [{key: "Synthetic observation", "confidence": 1}],
+                          [{key: "Synthetic observation", "confidence_pct": 100, "confidence": 100}]):
+                raw = draft(); raw[field] = value
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(self.admit(raw), raw)
+            self.assertEqual(self.admit(draft()), draft())
+            for value in (None, {}, "Synthetic", 3, True):
+                raw = draft(); raw[field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(s.AIModelOutputError) as rejected:
+                    self.admit(raw)
+                self.assertEqual(rejected.exception.diagnostics["response_contract_reason"], "draft_field_shape")
+            for confidence in ({"confidence_pct": True}, {"confidence_pct": 0.5}, {"confidence_pct": -1},
+                               {"confidence_pct": 101}, {"confidence_pct": "90%"}, {"confidence_pct": None},
+                               {"confidence_pct": 90, "confidence": 91}):
+                raw = draft(); raw[field] = [{key: "Synthetic", **confidence}]
+                with self.subTest(field=field, confidence=confidence), self.assertRaises(s.AIModelOutputError) as rejected:
+                    self.admit(raw)
+                self.assertEqual(rejected.exception.diagnostics["response_contract_reason"],
+                                 "confidence_conflict" if len(confidence) == 2 else "confidence_scale")
+
+    def test_typed_finding_normalization_and_existing_blocker_semantics(self):
+        raw = draft(); raw["analysis_findings"] = [{"text": "Synthetic observation", "confidence_pct": 90}]
+        good = s.normalize_ai_draft(raw, require_confidence=True)
+        self.assertEqual(good["analysis_findings"], [{"id": "finding-1", "text": "Synthetic observation", "confidence_pct": 90}])
+        self.assertEqual(len(good["line_items"]), 1)
+        raw["blocking_clarification_questions"] = [{"question": "Synthetic decision?"}]
+        blocked = s.normalize_ai_draft(raw, require_confidence=True)
+        self.assertEqual(blocked["blocking_clarification_questions"][0]["question"], "Synthetic decision?")
+        self.assertEqual(blocked["quote_basis_sections"], [])
+        self.assertEqual(blocked["line_items"], [])
+        self.assertEqual(blocked["analysis_findings"], good["analysis_findings"])
+
     def test_existing_row_identity_guard_accepts_declared_strings_and_rejects_other_types(self):
         self.assertEqual(s.PROFILE_ID_RE.pattern, r"^[A-Za-z0-9_-]+$")
         for identity in ("Physical_A-09", "7", "_"):

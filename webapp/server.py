@@ -22138,6 +22138,8 @@ def build_quote_draft_prompt(
         "credentials, file paths, or environment variables. "
         "Return only JSON. Do not write a confirmation message. "
         "First-pass JSON may include analysis_findings, but do not include blocking_clarification_questions in first-pass analysis. "
+        "If supplied, analysis_findings must be an array of objects, never strings. Each finding must contain text as a nonblank JSON string. "
+        "Omit analysis_findings or use [] when there are no findings; do not output null, blank rows, or objects without text. A finding may omit confidence; any supplied confidence_pct or confidence must be an integer from 0 to 100, and supplied aliases must agree. "
         "If the uploaded PDFs, extracted PDF pages, images, and quote context do not provide usable booth scope, return empty quote_basis_sections and line_items so the app can show an analysis failure. "
         "Populate editable draft content directly from the visible evidence and quote context. "
         "If quote context JSON includes user_feedback, treat it as the user's requested revision to the "
