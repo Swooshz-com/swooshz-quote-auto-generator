@@ -925,6 +925,53 @@ def bind_database_publication_authority(storage, payload: dict, *, suffix: str) 
     return authority
 
 
+def eligible_database_publication_fixture(storage, session_id: str, *, suffix: str):
+    """Create real saved authority and a revision-bearing draft, never a fabricated proof."""
+    payload = recovered_convergence_payload(
+        effective_unit_price=100, pricing_basis_amount=100,
+        approved_quote_amount=100, include_included_row=False,
+    )
+    payload["quote_session"]["session_id"] = session_id
+    payload["quote_session"]["status"] = {"quote_generated": True}
+    payload["quote_session"]["draft_state"]["outputRevision"] = 1
+    authority = bind_database_publication_authority(storage, payload, suffix=suffix)
+    return payload, {"status": "completed", "_publication_authority": authority,
+                     "files": [{"name": "quotation.xlsx"}]}
+
+
+def expected_publication_url(metadata, kind, *, session_id, workspace_id, owner_id):
+    """Independently join a canonical URL to the owning persisted publication receipt."""
+    publication = metadata["publication"]
+    proof = publication["proof"]
+    receipt = proof["publication"]
+    artifact = proof["artifacts"][kind]
+    filename = {"xlsx": "quotation.xlsx", "pdf": "quotation.pdf"}[kind]
+    expected_subject = {"session_id": session_id, "scope": "workspace",
+                        "workspace_id": workspace_id, "owner_id": owner_id}
+    if (metadata["session_id"] != session_id or publication["state"] != "published"
+            or proof["schema"] != "swooshz.sqag.quote-publication-proof.v2"
+            or proof["version"] != 2 or proof["subject"] != expected_subject
+            or proof["commercial_state_schema"] != "swooshz.sqag.commercial-state.v1"
+            or receipt["id"] != (publication.get("active_publication_id") or publication["run_id"])
+            or receipt["run_id"] != publication["run_id"]
+            or receipt["job_id"] != publication["job_id"]
+            or artifact["session_id"] != session_id or artifact["filename"] != filename
+            or artifact["publication_id"] != receipt["id"]
+            or artifact["run_id"] != receipt["run_id"]
+            or any(artifact[key] != metadata["exports"][kind][key]
+                   for key in ("filename", "publication_id", "run_id", "sha256", "size_bytes"))):
+        raise AssertionError("Persisted publication receipt is not bound to its expected owner/artifact.")
+    identity = [
+        "quote-publication-comparison-v1", "workspace", workspace_id, owner_id,
+        session_id, receipt["id"], receipt["run_id"], receipt["job_id"],
+        proof["output_revision"], proof["commercial_state_schema"],
+        proof["commercial_state_digest"], kind, filename, artifact["publication_id"],
+        artifact["run_id"], artifact["sha256"], artifact["size_bytes"],
+    ]
+    binding = hashlib.sha256(json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+    return f"/api/quote-sessions/{session_id}/download/{kind}?publication={binding}"
+
+
 class LocalRunnerServer:
     def __init__(self, *, allow_any_host=True, canonical_origin=True):
         self.allow_any_host = allow_any_host
@@ -8875,7 +8922,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(generate_response.status, 202)
         self.assertEqual(generate_body["status"], "completed")
         self.assertEqual(generate_body["quote_session"]["session_id"], "quote-platform-uat-smoke")
-        self.assertEqual(generate_body["quote_session"]["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-platform-uat-smoke/download/xlsx")
+        owned_metadata = json.loads(stored_sessions[0][2])
+        expected_url = expected_publication_url(owned_metadata, "xlsx", session_id="quote-platform-uat-smoke", workspace_id="workspace-123", owner_id="platform-user-123")
+        self.assertEqual(owned_metadata["publication"]["job_id"], job_id)
+        self.assertEqual(generate_body["quote_session"]["exports"]["xlsx"]["url"], expected_url)
         self.assertEqual([item["session_id"] for item in sessions_body["quote_sessions"]], ["quote-platform-uat-smoke"])
         self.assertEqual(download_response.status, 200)
         self.assertEqual(downloaded, xlsx_bytes)
@@ -35834,12 +35884,14 @@ main().catch((error) => {
                     workspace_a, payload, suffix="artifact"
                 )
                 session = workspace_a.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+                raw_session, _ = workspace_a._read_quote_session_metadata("quote-artifact")
+                expected_url = expected_publication_url(raw_session, "xlsx", session_id="quote-artifact", workspace_id="workspace-artifact-a", owner_id=workspace_a.user_id)
                 artifact = workspace_a.quote_session_export_artifact("quote-artifact", "xlsx")
                 blocked_artifact = workspace_b.quote_session_export_artifact("quote-artifact", "xlsx")
 
         self.assertTrue(session["exports"]["xlsx"]["exists"])
         self.assertEqual(session["exports"]["xlsx"]["size_bytes"], len(xlsx_bytes))
-        self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-artifact/download/xlsx")
+        self.assertEqual(session["exports"]["xlsx"]["url"], expected_url)
         self.assertFalse(session["exports"]["pdf"]["exists"])
         self.assertFalse(session["exports"]["pdf"].get("stale", False))
         self.assertEqual(artifact["filename"], "quotation.xlsx")
@@ -36177,6 +36229,7 @@ main().catch((error) => {
             raw_session, _ = workspace_a._read_quote_session_metadata("quote-object-artifact")
             self.assertTrue(webapp.quote_session_has_current_v2_publication(raw_session, storage=workspace_a), raw_session.get("publication"))
             self.assertTrue(webapp.quote_session_publication_authority_matches(raw_session, webapp.database_current_publication_authority(workspace_a, payload)))
+            expected_urls = {kind: expected_publication_url(raw_session, kind, session_id="quote-object-artifact", workspace_id="workspace-object-a", owner_id=workspace_a.user_id) for kind in ("xlsx", "pdf")}
             artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "xlsx")
             pdf_artifact = workspace_a.quote_session_export_artifact("quote-object-artifact", "pdf")
             blocked_artifact = workspace_b.quote_session_export_artifact("quote-object-artifact", "xlsx")
@@ -36256,18 +36309,15 @@ main().catch((error) => {
             blob_rows = connection.execute("select count(*) from sqag_quote_artifacts").fetchone()[0]
 
         self.assertTrue(session["exports"]["xlsx"]["exists"])
-        self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-artifact/download/xlsx")
+        self.assertEqual(session["exports"]["xlsx"]["url"], expected_urls["xlsx"])
         self.assertTrue(session["exports"]["pdf"]["exists"])
-        self.assertEqual(session["exports"]["pdf"]["url"], "/api/quote-sessions/quote-object-artifact/download/pdf")
+        self.assertEqual(session["exports"]["pdf"]["url"], expected_urls["pdf"])
         self.assertEqual(session["generation_snapshot"]["profile"]["display_name"], "Object Snapshot Profile")
         self.assertEqual(session["generation_snapshot"]["pricing_reference"]["display_name"], "Object Snapshot Pricing")
         result_files = webapp.quote_session_result_files(session)
         self.assertEqual(
             {item["url"] for item in result_files},
-            {
-                "/api/quote-sessions/quote-object-artifact/download/xlsx",
-                "/api/quote-sessions/quote-object-artifact/download/pdf",
-            },
+            set(expected_urls.values()),
         )
         self.assertNotIn("/api/jobs/", json.dumps(result_files))
         self.assertIsNotNone(artifact)
@@ -36278,7 +36328,10 @@ main().catch((error) => {
         self.assertEqual(fresh_downloads["xlsx"], (200, xlsx_bytes))
         self.assertEqual(fresh_downloads["pdf"], (200, pdf_bytes))
         for kind, expected in (("xlsx", xlsx_bytes), ("pdf", pdf_bytes)):
-            self.assertTrue(stale_session["exports"][kind]["exists"])
+            self.assertIsNone(stale_session["exports"][kind]["exists"])
+            self.assertIsNone(stale_session["exports"][kind]["missing"])
+            self.assertEqual(stale_session["exports"][kind]["availability"], "unverified")
+            self.assertIsNone(stale_session["exports"][kind]["url"])
             self.assertTrue(stale_session["exports"][kind]["stale"])
             self.assertIsNone(stale_artifacts[kind])
             self.assertEqual(stale_downloads[kind][0], 404)
@@ -36310,8 +36363,6 @@ main().catch((error) => {
         output_dir = tmp_path / "out" / "job-object-deleted"
         output_dir.mkdir(parents=True)
         (output_dir / "quotation.xlsx").write_bytes(b"xlsx-object-deleted")
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-object-deleted"}
         result = {"status": "completed", "files": [{"name": "quotation.xlsx", "url": "/api/jobs/job-object-deleted/files/quotation.xlsx"}]}
         env = {
             **self.deploy_auth_env(),
@@ -36331,18 +36382,29 @@ main().catch((error) => {
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-deleted"))
-            storage.create_or_update_quote_session(payload, result=result, output_dir=output_dir)
+            payload, publication_result = eligible_database_publication_fixture(storage, "quote-object-deleted", suffix="deleted")
+            storage.create_or_update_quote_session(payload, result={**result, **publication_result}, output_dir=output_dir)
+            initial = storage.get_quote_session("quote-object-deleted")
+            self.assertTrue(initial["status"]["quote_generated"])
+            self.assertTrue(initial["exports"]["xlsx"]["exists"])
+            self.assertTrue(initial["exports"]["xlsx"]["verified"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-object-deleted", "xlsx", require_current_proof=True))
             with webapp.sqlite_storage_connection(database_url) as connection:
                 connection.execute(
-                    "update sqag_object_artifacts set deleted_at = ?, retention_status = ? where workspace_id = ?",
-                    (webapp.utc_timestamp(), "deleted", "workspace-object-deleted"),
+                    "update sqag_object_artifacts set deleted_at = ?, retention_status = ? "
+                    "where workspace_id = ? and owner_type = ? and owner_id = ? and artifact_kind = ?",
+                    (webapp.utc_timestamp(), "deleted", "workspace-object-deleted", "generated_quote", "quote-object-deleted", "xlsx"),
                 )
                 connection.commit()
+            raw_session, _ = storage._read_quote_session_metadata("quote-object-deleted")
+            self.assertTrue(webapp.quote_session_has_current_v2_publication(raw_session, storage=storage))
             session = storage.get_quote_session("quote-object-deleted")
             artifact = storage.quote_session_export_artifact("quote-object-deleted", "xlsx")
 
-        self.assertFalse(session["exports"]["xlsx"]["exists"])
-        self.assertTrue(session["exports"]["xlsx"]["missing"])
+        self.assertIsNone(session["exports"]["xlsx"]["exists"])
+        self.assertIsNone(session["exports"]["xlsx"]["missing"])
+        self.assertEqual(session["exports"]["xlsx"]["availability"], "unverified")
+        self.assertIsNone(session["exports"]["xlsx"]["url"])
         self.assertIsNone(artifact)
 
     def test_object_artifact_storage_tombstone_during_retrieve_fails_closed(self):
@@ -39318,6 +39380,8 @@ main().catch((error) => {
         ):
             webapp.apply_sqag_storage_migrations(database_url)
             storage = webapp.app_storage_for_auth_session(self.platform_auth_session("workspace-object-omitted"))
+            old_payload, publication_result = eligible_database_publication_fixture(storage, "quote-object-omitted", suffix="omitted")
+            authority_objects = copy.deepcopy(backend._objects)
             storage.save_pricing_reference(pricing([b"old-visual-one", b"old-visual-two"], "Old Pricing"))
             omitted_visual = storage._object_metadata_from_row(
                 storage._object_artifact_row("pricing_reference", "omitted-object-pricing", "visual_1_2")
@@ -39327,13 +39391,18 @@ main().catch((error) => {
             old_output.mkdir(parents=True)
             (old_output / "quotation.xlsx").write_bytes(b"old-xlsx")
             (old_output / "quotation.pdf").write_bytes(b"old-pdf")
-            old_payload = valid_payload()
-            old_payload["quote_session"] = {"session_id": "quote-object-omitted"}
             storage.create_or_update_quote_session(
                 old_payload,
-                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
+                result={**publication_result, "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
                 output_dir=old_output,
             )
+            initial = storage.get_quote_session("quote-object-omitted")
+            self.assertTrue(initial["status"]["quote_generated"])
+            self.assertTrue(initial["exports"]["xlsx"]["exists"])
+            self.assertTrue(initial["exports"]["xlsx"]["verified"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-object-omitted", "xlsx", require_current_proof=True))
+            self.assertTrue(initial["exports"]["pdf"]["exists"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-object-omitted", "pdf", require_current_proof=True))
             omitted_pdf = storage._object_metadata_from_row(
                 storage._object_quote_artifact_row("quote-object-omitted", "pdf")
             )
@@ -39346,7 +39415,7 @@ main().catch((error) => {
             new_payload["client"]["name"] = "Replacement Client"
             storage.create_or_update_quote_session(
                 new_payload,
-                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                result={**publication_result, "files": [{"name": "quotation.xlsx"}]},
                 output_dir=new_output,
             )
             pricing_kinds = [
@@ -39361,7 +39430,8 @@ main().catch((error) => {
 
         self.assertEqual(pricing_kinds, ["visual_1_1"])
         self.assertEqual(quote_kinds, ["xlsx"])
-        self.assertEqual(len(backend._objects), 2)
+        self.assertEqual(len(backend._objects), len(authority_objects) + 2)
+        self.assertEqual({key: backend._objects[key] for key in authority_objects}, authority_objects)
         self.assertTrue(session["exports"]["xlsx"]["exists"])
         self.assertFalse(session["exports"]["pdf"]["exists"])
         self.assertIsNone(session["exports"]["pdf"]["url"])
@@ -39417,19 +39487,31 @@ main().catch((error) => {
             storage = webapp.app_storage_for_auth_session(
                 self.platform_auth_session("workspace-object-omitted-failure")
             )
+            payload, publication_result = eligible_database_publication_fixture(storage, "quote-object-omitted-failure", suffix="omitted-failure")
+            authority_objects = copy.deepcopy(backend._objects)
             storage.save_pricing_reference(pricing(2, "Original Pricing"))
             old_output = tmp_path / "out" / "old"
             old_output.mkdir(parents=True)
             (old_output / "quotation.xlsx").write_bytes(b"old-xlsx")
             (old_output / "quotation.pdf").write_bytes(b"old-pdf")
-            payload = valid_payload()
-            payload["quote_session"] = {"session_id": "quote-object-omitted-failure"}
             storage.create_or_update_quote_session(
                 payload,
-                result={"status": "completed", "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
+                result={**publication_result, "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}]},
                 output_dir=old_output,
             )
 
+            initial = storage.get_quote_session("quote-object-omitted-failure")
+            self.assertTrue(initial["status"]["quote_generated"])
+            self.assertTrue(initial["exports"]["xlsx"]["exists"])
+            self.assertTrue(initial["exports"]["xlsx"]["verified"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-object-omitted-failure", "xlsx", require_current_proof=True))
+            self.assertTrue(initial["exports"]["pdf"]["exists"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-object-omitted-failure", "pdf", require_current_proof=True))
+            prior_quote_metadata = copy.deepcopy(storage._read_quote_session_metadata("quote-object-omitted-failure")[0])
+            prior_quote_artifacts = {
+                kind: storage.quote_session_export_artifact("quote-object-omitted-failure", kind, require_current_proof=True)
+                for kind in ("xlsx", "pdf")
+            }
             backend.fail_kind = "visual_1_2"
             with self.assertRaises(webapp.SqagStorageAccessError) as pricing_failure:
                 storage.save_pricing_reference(pricing(1, "Failed Pricing"))
@@ -39440,10 +39522,15 @@ main().catch((error) => {
             with self.assertRaises(webapp.SqagStorageAccessError) as quote_failure:
                 storage.create_or_update_quote_session(
                     payload,
-                    result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                    result={**publication_result, "files": [{"name": "quotation.xlsx"}]},
                     output_dir=new_output,
                 )
 
+            after_quote_metadata = storage._read_quote_session_metadata("quote-object-omitted-failure")[0]
+            after_quote_artifacts = {
+                kind: storage.quote_session_export_artifact("quote-object-omitted-failure", kind, require_current_proof=True)
+                for kind in ("xlsx", "pdf")
+            }
             reference = storage.pricing_reference_detail("protected-omitted-pricing", source="company")
             session = storage.get_quote_session("quote-object-omitted-failure")
             pricing_kinds = [
@@ -39463,11 +39550,18 @@ main().catch((error) => {
 
         self.assertEqual(pricing_failure.exception.status, 503)
         self.assertEqual(quote_failure.exception.status, 503)
+        self.assertEqual(after_quote_metadata, prior_quote_metadata)
+        self.assertEqual(after_quote_artifacts, prior_quote_artifacts)
+        for kind, expected in (("xlsx", b"old-xlsx"), ("pdf", b"old-pdf")):
+            self.assertEqual(after_quote_artifacts[kind]["content"], expected)
+            self.assertEqual(after_quote_artifacts[kind]["size_bytes"], len(expected))
+            self.assertEqual(after_quote_artifacts[kind]["sha256"], hashlib.sha256(expected).hexdigest())
         self.assertEqual(reference["label"], "Original Pricing")
         self.assertEqual(pricing_kinds, ["visual_1_1", "visual_1_2"])
         self.assertEqual(quote_kinds, ["pdf", "xlsx"])
         self.assertTrue(session["exports"]["pdf"]["exists"])
-        self.assertEqual(len(backend._objects), 4)
+        self.assertEqual(len(backend._objects), len(authority_objects) + 4)
+        self.assertEqual({key: backend._objects[key] for key in authority_objects}, authority_objects)
 
     def test_database_replacements_remove_omitted_pricing_visuals_and_quote_exports(self):
         tmp_path = test_temp_root() / f"database-omitted-replacement-{time.time_ns()}"
@@ -39572,13 +39666,18 @@ main().catch((error) => {
             generated_output.mkdir(parents=True)
             prior_bytes = b"prior-customer-ready-xlsx"
             (generated_output / "quotation.xlsx").write_bytes(prior_bytes)
-            payload = valid_payload()
-            payload["quote_session"] = {"session_id": "quote-object-confirmation"}
+            payload, publication_result = eligible_database_publication_fixture(storage, "quote-object-confirmation", suffix="confirmation")
+            authority_objects = copy.deepcopy(backend._objects)
             storage.create_or_update_quote_session(
                 payload,
-                result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                result={**publication_result, "files": [{"name": "quotation.xlsx"}]},
                 output_dir=generated_output,
             )
+            initial = storage.get_quote_session("quote-object-confirmation")
+            self.assertTrue(initial["status"]["quote_generated"])
+            self.assertTrue(initial["exports"]["xlsx"]["exists"])
+            self.assertTrue(initial["exports"]["xlsx"]["verified"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-object-confirmation", "xlsx", require_current_proof=True))
             prior_metadata = storage._object_metadata_from_row(
                 storage._object_quote_artifact_row("quote-object-confirmation", "xlsx")
             )
@@ -39587,6 +39686,9 @@ main().catch((error) => {
             confirmation_output.mkdir(parents=True)
             confirmation_payload = copy.deepcopy(payload)
             confirmation_payload["client"]["name"] = "Needs Confirmation Client"
+            confirmation_payload["quote_session"]["draft_state"]["quoteDetails"]["client"]["name"] = "Needs Confirmation Client"
+            confirmation_payload["quote_session"]["draft_state"]["outputRevision"] += 1
+            confirmation_payload["quote_session"]["status"] = {"quote_generated": False}
             session = storage.create_or_update_quote_session(
                 confirmation_payload,
                 result={"status": "needs_confirmation", "files": []},
@@ -39601,11 +39703,14 @@ main().catch((error) => {
             ]
 
         self.assertEqual(active_kinds, ["xlsx"])
-        self.assertEqual(len(backend._objects), 1)
+        self.assertEqual(len(backend._objects), len(authority_objects) + 1)
+        self.assertEqual({key: backend._objects[key] for key in authority_objects}, authority_objects)
         self.assertFalse(session["status"]["quote_generated"])
-        self.assertTrue(session["exports"]["xlsx"]["exists"])
+        self.assertIsNone(session["exports"]["xlsx"]["exists"])
+        self.assertIsNone(session["exports"]["xlsx"]["missing"])
+        self.assertEqual(session["exports"]["xlsx"]["availability"], "unverified")
         self.assertTrue(session["exports"]["xlsx"]["stale"])
-        self.assertEqual(session["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-object-confirmation/download/xlsx")
+        self.assertIsNone(session["exports"]["xlsx"]["url"])
         self.assertEqual(webapp.quote_session_result_files(session), [])
         self.assertEqual(
             backend.retrieve_artifact(
@@ -39629,8 +39734,6 @@ main().catch((error) => {
         db_path = tmp_path / "sqag-storage.sqlite3"
         database_url = f"sqlite:///{db_path.as_posix()}"
         env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-batch-pdf-failure"}
 
         def snapshot(storage):
             rows = storage._active_object_artifact_rows(
@@ -39655,6 +39758,7 @@ main().catch((error) => {
             storage = webapp.app_storage_for_auth_session(
                 self.platform_auth_session("workspace-object-quote-batch-pdf-failure")
             )
+            payload, publication_result = eligible_database_publication_fixture(storage, "quote-batch-pdf-failure", suffix="batch-pdf-failure")
             old_output = tmp_path / "out" / "old"
             old_output.mkdir(parents=True)
             (old_output / "quotation.xlsx").write_bytes(b"old-batch-xlsx")
@@ -39662,11 +39766,18 @@ main().catch((error) => {
             storage.create_or_update_quote_session(
                 payload,
                 result={
-                    "status": "completed",
+                    **publication_result,
                     "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
                 },
                 output_dir=old_output,
             )
+            initial = storage.get_quote_session("quote-batch-pdf-failure")
+            self.assertTrue(initial["status"]["quote_generated"])
+            self.assertTrue(initial["exports"]["xlsx"]["exists"])
+            self.assertTrue(initial["exports"]["xlsx"]["verified"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-batch-pdf-failure", "xlsx", require_current_proof=True))
+            self.assertTrue(initial["exports"]["pdf"]["exists"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-batch-pdf-failure", "pdf", require_current_proof=True))
             before = snapshot(storage)
 
             new_output = tmp_path / "out" / "new"
@@ -39678,7 +39789,7 @@ main().catch((error) => {
                 storage.create_or_update_quote_session(
                     payload,
                     result={
-                        "status": "completed",
+                        **publication_result,
                         "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
                     },
                     output_dir=new_output,
@@ -39707,8 +39818,6 @@ main().catch((error) => {
         db_path = tmp_path / "sqag-storage.sqlite3"
         database_url = f"sqlite:///{db_path.as_posix()}"
         env = self.hosted_storage_env(SQAG_DATABASE_URL=database_url)
-        payload = valid_payload()
-        payload["quote_session"] = {"session_id": "quote-batch-omitted-pdf"}
 
         def snapshot(storage):
             rows = storage._active_object_artifact_rows(
@@ -39733,6 +39842,7 @@ main().catch((error) => {
             storage = webapp.app_storage_for_auth_session(
                 self.platform_auth_session("workspace-object-quote-batch-omitted-pdf")
             )
+            payload, publication_result = eligible_database_publication_fixture(storage, "quote-batch-omitted-pdf", suffix="batch-omitted-pdf")
             old_output = tmp_path / "out" / "old"
             old_output.mkdir(parents=True)
             (old_output / "quotation.xlsx").write_bytes(b"old-omitted-xlsx")
@@ -39740,11 +39850,18 @@ main().catch((error) => {
             storage.create_or_update_quote_session(
                 payload,
                 result={
-                    "status": "completed",
+                    **publication_result,
                     "files": [{"name": "quotation.xlsx"}, {"name": "quotation.pdf"}],
                 },
                 output_dir=old_output,
             )
+            initial = storage.get_quote_session("quote-batch-omitted-pdf")
+            self.assertTrue(initial["status"]["quote_generated"])
+            self.assertTrue(initial["exports"]["xlsx"]["exists"])
+            self.assertTrue(initial["exports"]["xlsx"]["verified"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-batch-omitted-pdf", "xlsx", require_current_proof=True))
+            self.assertTrue(initial["exports"]["pdf"]["exists"])
+            self.assertIsNotNone(storage.quote_session_export_artifact("quote-batch-omitted-pdf", "pdf", require_current_proof=True))
             before = snapshot(storage)
 
             new_output = tmp_path / "out" / "new"
@@ -39754,7 +39871,7 @@ main().catch((error) => {
             with self.assertRaises(webapp.SqagStorageAccessError) as raised:
                 storage.create_or_update_quote_session(
                     payload,
-                    result={"status": "completed", "files": [{"name": "quotation.xlsx"}]},
+                    result={**publication_result, "files": [{"name": "quotation.xlsx"}]},
                     output_dir=new_output,
                 )
             after = snapshot(storage)
@@ -40536,13 +40653,16 @@ main().catch((error) => {
                     created = webapp.create_job("generate", payload, auth_session=platform_session)
                     job = wait_for_job(created["job_id"], timeout=10.0, auth_session=platform_session)
 
+                raw_session, _ = storage._read_quote_session_metadata("quote-async-expired-artifact")
+                expected_url = expected_publication_url(raw_session, "xlsx", session_id="quote-async-expired-artifact", workspace_id=storage.workspace_id, owner_id=storage.user_id)
+                self.assertEqual(raw_session["publication"]["job_id"], created["job_id"])
                 sessions = storage.list_quote_sessions()
                 artifact = storage.quote_session_export_artifact("quote-async-expired-artifact", "xlsx")
 
         self.assertEqual(job["status"], "completed")
-        self.assertEqual(job["result"]["quote_session"]["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-async-expired-artifact/download/xlsx")
+        self.assertEqual(job["result"]["quote_session"]["exports"]["xlsx"]["url"], expected_url)
         self.assertEqual([item["session_id"] for item in sessions], ["quote-async-expired-artifact"])
-        self.assertEqual(sessions[0]["exports"]["xlsx"]["url"], "/api/quote-sessions/quote-async-expired-artifact/download/xlsx")
+        self.assertEqual(sessions[0]["exports"]["xlsx"]["url"], expected_url)
         self.assertEqual(artifact["filename"], "quotation.xlsx")
         self.assertEqual(artifact["content"], xlsx_bytes)
     def test_runtime_workspace_metadata_is_generic_and_has_no_repo_defaults(self):

@@ -360,6 +360,21 @@ artifact bytes are read. This comparison grants no access: existing owner, works
 role and authentication checks remain the separate gate. Direct `/api/generate`
 responses and asynchronous jobs never expose private publication identities or proof.
 
+Publication fault tests first establish an eligible revision-bearing draft with
+real saved profile/reference authority, then inject deletion, staleness or storage
+failure. Keep staged invisibility, raw committed completion, forensic idempotence,
+exact object/metadata rollback and prior byte/hash checks. Recorded but unverified
+exports expose unknown `exists`/`missing`, no ordinary URL, and `unverified`
+availability; preserved historical bytes are checked separately from current delivery.
+Bound URL expectations join known session/kind/owner identities to independently
+read persisted publication metadata, including the canonical comparison digest.
+The `--alpha1` smoke also joins the accepted job's actual generator workbook bytes
+to that metadata and retains the original owning-server HTTP receipt and browser
+workbook size/SHA256 checks. Its fixed JSON template identity uses the checked-in LF
+bytes, normalising only CRLF pairs; the receipt also keeps the raw working-tree
+template SHA256. Workbook bytes are never normalised. No result URL alone supplies
+its own expected identity.
+
 Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
 eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity
 reads no PDF body. XLSX keeps its metadata/path projection; download independently

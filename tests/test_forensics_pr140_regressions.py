@@ -15,6 +15,7 @@ from unittest import mock
 from webapp.forensics import ForensicStore, RetentionGraphHeld, iso_timestamp
 from webapp import server as webapp
 from scripts import enforce_forensic_retention
+from tests.test_webapp import eligible_database_publication_fixture, expected_publication_url
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1601,10 +1602,12 @@ class Pr140RegressionTest(unittest.TestCase):
                         "generate", {"synthetic": True}, job_id="job-publication123"
                     )
 
-                payload = {"quote_session": {"session_id": "quote-publication123"}}
+                payload, publication_result = eligible_database_publication_fixture(
+                    storage, "quote-publication123", suffix="atomic-forensics",
+                )
                 staged = storage.create_or_update_quote_session(
                     payload,
-                    result={"status": "completed"},
+                    result=publication_result,
                     output_dir=output_dir,
                     publish=False,
                     generation_run_id=run_id,
@@ -1626,7 +1629,7 @@ class Pr140RegressionTest(unittest.TestCase):
                 (output_dir / "quotation.xlsx").write_bytes(content)
                 retried = storage.create_or_update_quote_session(
                     payload,
-                    result={"status": "completed"},
+                    result=publication_result,
                     output_dir=output_dir,
                     publish=False,
                     generation_run_id=run_id,
@@ -1724,12 +1727,22 @@ class Pr140RegressionTest(unittest.TestCase):
                         1,
                     )
 
+                raw_published, _ = storage._read_quote_session_metadata("quote-publication123")
+                self.assertEqual(raw_published["publication"]["state"], "published")
+                self.assertEqual(raw_published["publication"]["run_id"], run_id)
+                self.assertEqual(raw_published["publication"]["job_id"], "job-publication123")
+                self.assertTrue(raw_published["status"]["quote_generated"])
+                self.assertTrue(webapp.quote_session_has_current_v2_publication(raw_published, storage=storage))
                 published = storage.get_quote_session("quote-publication123")
                 artifact = storage.quote_session_export_artifact(
-                    "quote-publication123", "xlsx"
+                    "quote-publication123", "xlsx", require_current_proof=True
                 )
                 self.assertTrue(published["status"]["quote_generated"])
                 self.assertTrue(published["exports"]["xlsx"]["exists"])
+                self.assertEqual(published["exports"]["xlsx"]["url"], expected_publication_url(
+                    raw_published, "xlsx", session_id="quote-publication123",
+                    workspace_id="workspace-publication", owner_id="synthetic-user",
+                ))
                 self.assertEqual(artifact["content"], content)
                 self.assertEqual(artifact["size_bytes"], len(content))
                 self.assertEqual(artifact["sha256"], digest)
