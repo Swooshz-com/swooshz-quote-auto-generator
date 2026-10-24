@@ -97,7 +97,7 @@ jobs:
 
   validate:
     name: Validate app
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - retrospective_exact_starting_head_red
       - secret-scan

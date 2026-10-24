@@ -123,7 +123,9 @@ Expected result:
 
 Expected result:
 
-- Fenced or extractable JSON is parsed when safe.
+- One bounded JSON object may be fenced or accompanied by harmless prose. Array wrappers, duplicate keys, multiple objects and nonfinite numbers reject.
+- Supplied incomplete, failed or refusal metadata rejects even when usable-looking JSON text is present.
+- Fresh replacement-line measurements must be coherent; supplied confidence is an integer from 0 to 100, with matching aliases.
 - Unusable output becomes a clean failure.
 - No exception escapes into the UI.
 - No partial proposal is applied.

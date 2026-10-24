@@ -4836,6 +4836,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        parsed["quote_basis_sections"][0]["lines"][0]["id"] = "carpet-row"
+        parsed["line_items"][0]["source_basis_line_id"] = "carpet-row"
         draft = webapp.normalize_ai_draft(parsed, {
             "profile_id": "synthetic-exhibition-fixture-template",
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -4884,6 +4886,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        # Informational scope is a basis-only note, never a material output row.
+        parsed["line_items"] = []
         draft = webapp.normalize_ai_draft(parsed, {
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
             "pricing_reference_source": "local",
@@ -5269,7 +5273,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "model_output_invalid",
             ),
             (
-                "application_normalization",
+                "model_output_contract",
                 {"output_text": json.dumps({
                     "quote_basis_sections": [{
                         "title": "Synthetic section",
@@ -5277,7 +5281,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     }],
                     "line_items": [],
                 })},
-                "schema_validation_failed",
+                "model_output_invalid",
             ),
         )
 
@@ -5755,6 +5759,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        # Identified items-only responses may derive their review rows.
+        parsed["quote_basis_sections"] = []
+        for index, row in enumerate(parsed["line_items"]):
+            row["source_basis_line_id"] = f"floor-row-{index}"
         draft = webapp.normalize_ai_draft(parsed, {
             "profile_id": "synthetic-exhibition-fixture-template",
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -5816,6 +5824,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        for index, line in enumerate(parsed["quote_basis_sections"][0]["lines"]):
+            line["id"] = f"deck-row-{index}"
+        parsed["line_items"][0]["source_basis_line_id"] = "deck-row-0"
         draft = webapp.normalize_ai_draft(parsed, {
             "profile_id": "synthetic-exhibition-fixture-template",
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -5860,6 +5871,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        with self.assertRaises(webapp.AIModelOutputError):
+            webapp.normalize_ai_draft(parsed)
+        # A genuine prefix-only response carries its own count; nothing is guessed.
+        parsed["quote_basis_sections"][0]["lines"][0]["id"] = "cabinet-row"
+        parsed["line_items"][0]["source_basis_line_id"] = "cabinet-row"
+        for row in (parsed["quote_basis_sections"][0]["lines"][0], parsed["line_items"][0]):
+            row.pop("quantity")
+            row.pop("unit")
         draft = webapp.normalize_ai_draft(parsed, {
             "profile_id": "synthetic-exhibition-fixture-template",
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -5867,7 +5886,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         })
 
         line = draft["quote_basis_sections"][0]["lines"][0]
-        self.assertEqual(line["quantity"], 2.0)
+        self.assertEqual(float(line["quantity"]), 2.0)
         self.assertEqual(line["unit"], "nos")
         self.assertEqual(
             line["text"],
@@ -5907,6 +5926,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        for index, line in enumerate(parsed["quote_basis_sections"][0]["lines"]):
+            line["id"] = f"structure-row-{index}"
+        parsed["line_items"][0]["source_basis_line_id"] = "structure-row-1"
         draft = webapp.normalize_ai_draft(parsed, {
             "profile_id": "synthetic-exhibition-fixture-template",
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -5956,6 +5978,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        parsed["quote_basis_sections"][0]["lines"][0]["id"] = "spotlight-row"
+        parsed["line_items"][0]["source_basis_line_id"] = "spotlight-row"
         draft = webapp.normalize_ai_draft(parsed, {
             "profile_id": "synthetic-exhibition-fixture-template",
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -5965,7 +5989,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         line = draft["quote_basis_sections"][0]["lines"][0]
         self.assertEqual(line["tag"], "Confirm")
         self.assertEqual(line["text"], "[ nos. synthetic spotlight 3 inch ]")
-        self.assertEqual(line["quantity"], 10)
+        self.assertEqual(float(line["quantity"]), 10)
         self.assertEqual(line["unit"], "nos")
         self.assertNotIn("custom_pricing", line)
         self.assertNotIn("custom_confirmed", line)
@@ -6130,6 +6154,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        with self.assertRaises(webapp.AIModelOutputError):
+            webapp.normalize_ai_draft(parsed)
+        # The wall graphic is separate physical scope, not an alias for the fascia.
+        parsed["quote_basis_sections"][0]["lines"].append({
+            "id": "wall-graphic-row", "tag": "Confirm", "text": "sqm synthetic printed wall graphic",
+            "quantity": 1, "unit": "sqm", "confidence_pct": 90})
+        parsed["line_items"][0]["source_basis_line_id"] = "wall-graphic-row"
         draft = webapp.normalize_ai_draft(parsed, {
             "profile_id": "synthetic-exhibition-fixture-template",
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
@@ -6144,8 +6175,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(selected_line["pricing_reference_description"], "sqm synthetic printed wall graphic")
         self.assertEqual(custom_line["text"], "synthetic printed brand fascia graphics")
         self.assertNotIn("pricing_keyword", custom_line)
-        self.assertEqual(draft["line_items"][0]["pricing_authority"]["variant"], "catalog")
-        self.assertEqual(draft["line_items"][0]["status"], "matched")
+        selected = next(row for row in draft["line_items"] if row.get("source_basis_line_id") == "wall-graphic-row")
+        self.assertEqual(selected["pricing_authority"]["variant"], "catalog")
+        self.assertEqual(selected["status"], "matched")
 
     def test_normalize_ai_draft_does_not_copy_invented_keyword_into_catalog_metadata(self):
         text = "synthetic printed brand fascia graphics"
@@ -7030,6 +7062,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "title": "Synthetic Lighting And AV",
                     "lines": [
                         {
+                            "id": "video-source-row",
                             "tag": "Custom",
                             "text": "Large wall-mounted video display for exterior feature wall.",
                             "quantity": 1,
@@ -7052,7 +7085,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     ],
                 },
             ],
-            "line_items": [],
+            # Actionable candidates require a provider-owned source measurement.
+            "line_items": [{
+                "source_basis_line_id": "video-source-row",
+                "section": "Synthetic Lighting And AV",
+                "description": "Large wall-mounted video display for exterior feature wall.",
+                "quantity": 1, "unit": "nos",
+            }],
         }
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -7076,7 +7115,16 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"},
                     [],
                 )
+                basis_only = copy.deepcopy(ai_basis)
+                basis_only["line_items"] = []
+                unknown = webapp.finalized_remote_draft_result(
+                    payload, basis_only, "openai", "OpenAI",
+                    {"booth_width": 6, "booth_depth": 6, "booth_size": "6m x 6m", "dimension_source": "user"}, [],
+                )
 
+        unknown_video = next(line for section in unknown["quote_basis_sections"] for line in section["lines"]
+                             if "video display" in line.get("text", ""))
+        self.assertNotIn("possible_pricing_matches", unknown_video)
         lines = [
             line
             for section in result["quote_basis_sections"]
@@ -7111,12 +7159,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "id": "surfaces",
                     "title": "Surfaces / Structures",
                     "lines": [
-                        {"tag": "Include", "text": "Custom booth wall.", "confidence_pct": 91}
+                        {"id": f"physical-row-{index}", "tag": "Include", "text": f"AI row {index}",
+                         "quantity": 1, "unit": "lot", "confidence_pct": 91}
+                        for index in range(20)
                     ],
                 }
             ],
             "line_items": [
                 {
+                    "source_basis_line_id": f"physical-row-{index}",
                     "section": "Section",
                     "quantity": 1,
                     "unit": "lot",
@@ -7192,9 +7243,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_items": [],
         }
 
-        draft = webapp.normalize_ai_draft(parsed)
-
-        lines = draft["quote_basis_sections"][0]["lines"]
+        # Fresh material responses may not smuggle several decisions in one row.
+        with self.assertRaises(webapp.AIModelOutputError):
+            webapp.normalize_ai_draft(parsed)
+        # Existing saved/user text normalisation still expands its supported form.
+        sections = webapp.confirm_only_basis_sections(webapp.normalize_quote_basis_sections(parsed))
+        lines = sections[0]["lines"]
         self.assertEqual(
             [line["text"] for line in lines],
             [
@@ -7224,8 +7278,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         with self.assertRaises(webapp.OpenAIAnalysisError) as context:
             webapp.normalize_ai_draft(parsed, require_confidence=True)
 
-        self.assertIn("confidence_pct", str(context.exception))
-        self.assertIn("Booth Structure", str(context.exception))
+        self.assertEqual(context.exception.diagnostics["response_contract_reason"], "confidence_missing")
+        self.assertEqual(str(context.exception), "AI analysis returned an inconsistent quote response.")
+        self.assertNotIn("Booth Structure", str(context.exception))
 
     def test_payload_to_brief_uses_dynamic_quote_basis_sections_for_notes(self):
         payload = valid_payload()
@@ -11279,6 +11334,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        for section, row, row_id in zip(parsed["quote_basis_sections"], parsed["line_items"], ("graphics-row", "av-row")):
+            section["lines"][0]["id"] = row_id
+            row["source_basis_line_id"] = row_id
+
         with tempfile.TemporaryDirectory() as tmp:
             ref_dir = Path(tmp) / "sort-test-ref"
             ref_dir.mkdir()
@@ -11428,6 +11487,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
+        parsed["line_items"][0]["source_basis_line_id"] = "demo-screen"
+        parsed["line_items"][1]["source_basis_line_id"] = "graphics-line"
         draft = webapp.normalize_ai_draft(parsed, {
             "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
             "pricing_reference_source": "local",
@@ -11564,8 +11625,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         cleaned = webapp.clean_customer_quote_line_text("Booth size taken from quotation title: 6m x 6m.")
         self.assertEqual(cleaned, "Booth size 6m x 6m.")
         draft = webapp.normalize_ai_draft({
-            "quote_basis_sections": [{"title": "Booth Dimensions", "lines": [{"tag": "Confirm", "text": "Booth size taken from quotation title: 6m x 6m.", "quantity": 1, "unit": "lot", "confidence_pct": 90}]}],
-            "line_items": [{"section": "Walls", "quantity": 12, "unit": "m", "description": "Partition wall as seen in render.", "pricing_keyword": ""}],
+            "quote_basis_sections": [{"title": "Booth Dimensions", "lines": [{"tag": "Confirm", "text": "Booth size taken from quotation title: 6m x 6m.", "quantity": 1, "unit": "lot", "confidence_pct": 90}, {"id": "wall-row", "tag": "Confirm", "text": "Partition wall as seen in render.", "quantity": 12, "unit": "m", "confidence_pct": 90}]}],
+            "line_items": [{"source_basis_line_id": "wall-row", "section": "Walls", "quantity": 12, "unit": "m", "description": "Partition wall as seen in render.", "pricing_keyword": ""}],
         }, valid_payload())
         dumped = json.dumps(draft)
         self.assertIn("Booth size 6m x 6m.", dumped)
@@ -12817,10 +12878,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         logged_events = [call.args[0] for call in write_log.call_args_list]
         self.assertIn("openai_draft_failed", logged_events)
-        self.assertIn("ai_draft_fallback_used", logged_events)
-        self.assertEqual(result["source"], "local")
-        self.assertTrue(result["ai_failed"])
-        self.assertIn("OpenAI returned no usable quote basis", "\n".join(result["provider_errors"]))
+        self.assertNotIn("ai_draft_fallback_used", logged_events)
+        self.assertEqual(result["status"], "blocked")
+        self.assertNotIn("line_items", result)
+        self.assertNotIn("source", result)
+        self.assertNotIn("quote_basis_sections", result)
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        blocked_details = next(call.args[1] for call in write_log.call_args_list
+                               if call.args[0] == "ai_draft_protected_mode_blocked")
+        self.assertEqual(blocked_details["error_reference"], result["error_reference"])
 
     def test_draft_quote_basis_treats_remote_clarifications_as_ai_failure(self):
         payload = valid_payload()
@@ -12853,11 +12919,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         logged_events = [call.args[0] for call in write_log.call_args_list]
         self.assertIn("openai_draft_failed", logged_events)
-        self.assertIn("ai_draft_fallback_used", logged_events)
-        self.assertEqual(result["source"], "local")
-        self.assertTrue(result["ai_failed"])
-        self.assertNotIn("blocking_clarification_questions", result)
-        self.assertIn("clarification questions instead of a usable quote basis", "\n".join(result["provider_errors"]))
+        self.assertNotIn("ai_draft_fallback_used", logged_events)
+        self.assertEqual(result["status"], "blocked")
+        self.assertNotIn("line_items", result)
+        self.assertNotIn("source", result)
+        self.assertNotIn("quote_basis_sections", result)
+        self.assertEqual(result["errors"], [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE])
+        blocked_details = next(call.args[1] for call in write_log.call_args_list
+                               if call.args[0] == "ai_draft_protected_mode_blocked")
+        self.assertEqual(blocked_details["error_reference"], result["error_reference"])
 
     def test_draft_quote_basis_uses_local_fallback_when_remote_ai_fails(self):
         payload = valid_payload()
@@ -12901,18 +12971,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload["project"].pop("booth_depth", None)
         payload["project"]["title"] = "RE: Demo Booth"
         ai_draft = {
-            "quote_basis": {
-                "platform": "Include: Booth size defaults to 6m x 6m for area-based quantities.",
-            },
-            "line_items": [
-                {
-                    "section": "Floor Design",
-                    "quantity": "36",
-                    "unit": "sqm",
-                    "description": "Needle punch carpet in colour",
-                    "pricing_keyword": "needle punch carpet in colour",
-                }
-            ],
+            "quote_basis_sections": [{"id": "platform", "title": "Platform", "lines": [{
+                "id": "dimension-note", "tag": "Include", "confidence_pct": 90,
+                "text": "Booth size defaults to 6m x 6m for area-based quantities."}]}],
+            "line_items": [],
         }
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""):
@@ -20470,6 +20532,8 @@ const state = {
 let routedPanel = "";
 let nextCalls = 0;
 let saveCalls = 0;
+function appIsBusy() { return false; }
+async function withQuoteStepLoading(operation) { return await operation(); }
 function hideQuoteDependencyConfirmModal() { state.pendingQuoteDependencyChanges = []; }
 function applyPendingPricingReferenceSelection() { return true; }
 function clearGeneratedQuoteState() {}
@@ -21165,9 +21229,9 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn('workspacePaneFooter: qs(".workspace-pane-footer")', js)
         self.assertIn('workspacePaneFooter.classList.toggle("is-output-step", isOutputStep)', js)
         self.assertIn('elements.sideDownloadButton.addEventListener("click", async (event) => {', js)
-        self.assertIn('elements.sideViewPdfButton.addEventListener("click", async (event) => {', js)
+        self.assertIn('elements.sideViewPdfButton.addEventListener("click", handleViewPdf);', js)
         download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
-        pdf_handler = js.split('elements.sideViewPdfButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
+        pdf_handler = js.split("async function handleViewPdf(event)", 1)[1].split("function pricingMatchStatus", 1)[0]
         loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function generationFinalizingModalOptions", 1)[0]
         finalizing_options_body = js.split("function generationFinalizingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
         resumed_generation_body = js.split('if (activeJob.type === "generate" || activeJob.type === "generate_pdf") {', 1)[1].split("async function checkHealth", 1)[0]
@@ -21181,6 +21245,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("await handleGenerate();", download_handler)
         self.assertIn("downloadCurrentExcelFile();", download_handler)
         self.assertIn("hideExcelGeneratingModal();", download_handler)
+        self.assertIn("if (pdfFileIsFresh(state.pdfFile)) return viewCurrentPdfFile();", pdf_handler)
         self.assertIn("await handleGenerate({ viewPdf: true });", pdf_handler)
         self.assertIn("viewCurrentPdfFile(state.pdfFile, pdfWindow);", pdf_handler)
         self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile(state.pdfFile, pdfWindow);"))
@@ -31785,9 +31850,11 @@ assert.strictEqual(basisDisplayTitle("Graphics / Signage"), "Graphics / Signage"
 assert.strictEqual(basisQuantityLabel({ quantity: 12, unit: "m length" }), "12 m length");
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 12, unit: "m length" }), "12 m");
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "nos" }), "2 nos.");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: 1, unit: "lot" }), "1 lot");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "" }), "2 (unit needed)");
 assert.strictEqual(basisQuantityLabel({ quantity: "m", unit: "length" }), "");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "1 lot");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "1 lot");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "Not measured");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "Not measured");
 assert.strictEqual(
   basisChatLineContext({ tag: "Include", text: "100mm raised platform", quantity: 36, unit: "sqm" }),
   "Include: 100mm raised platform"
@@ -34675,6 +34742,24 @@ async function main() {
     const diagnostic = await page.evaluate(() => typeof state === "undefined" ? { appStateAvailable: false } : ({
       appStateAvailable: true, panel: state.activeSidePanel, sessionId: state.quoteSessionId,
       checkpointCurrent: customerStepCheckpointIsCurrent(), restoreBusy: state.quoteSessionRestoreBusy,
+      checkpointDifferences: (() => {
+        const saved = state.customerStepCheckpoint;
+        const current = customerStepCheckpointForCurrent();
+        return { savedPresent: Boolean(saved), currentPresent: Boolean(current),
+          differentCustomerPaths: (() => {
+            const changed = [];
+            function compare(left, right, path = "customer") {
+              if (quoteCommercialStrictDataEqual(left, right)) return;
+              if (isPlainObject(left) && isPlainObject(right)) {
+                for (const key of new Set([...Object.keys(left), ...Object.keys(right)])) compare(left[key], right[key], path + "." + key);
+              } else changed.push({ path, savedType: typeof left, currentType: typeof right });
+            }
+            compare(saved?.customer, current?.customer);
+            return changed;
+          })(),
+          differentFields: [...new Set([...Object.keys(saved || {}), ...Object.keys(current || {})])]
+            .filter((key) => !quoteCommercialStrictDataEqual(saved?.[key], current?.[key])) };
+      })(),
       restoreError: state.quoteSessionLoadError || "",
     })).catch((captureError) => ({ captureError: String(captureError) }));
     console.error(JSON.stringify({ scope: exerciseRestoration ? "alpha2" : "alpha1", diagnostic, consoleProblems }));
@@ -42160,6 +42245,9 @@ main().catch((error) => {
              "unit": "sqm", "confidence_pct": 82}]}], "line_items": [
             {"source_basis_line_id": "proposal", "section": "Floors",
              "description": "Synthetic carpet tile flooring across the full booth footprint", "quantity": 2, "unit": "lot"}]}
+        with self.assertRaises(webapp.AIModelOutputError):
+            webapp.normalize_ai_draft(raw, payload, require_confidence=True)
+        raw["quote_basis_sections"][0]["lines"][0]["unit"] = "lot"
         normalized = webapp.normalize_ai_draft(raw, payload, require_confidence=True)
         self.assertEqual(normalized["_pricing_analysis_source_units"], {"proposal": "lot"})
         finalized = webapp.finalized_remote_draft_result(payload, normalized, "openai", "OpenAI", {}, [])
@@ -42554,8 +42642,14 @@ main().catch((error) => {
                 with self.subTest(boundary=boundary):
                     session_id = f"quote-ledger-launder-{boundary}"
                     payload, provider_raw = self._ledger_laundering_payload(session_id)
+                    # Malformed material rows now fail before any partial success.
+                    with self.assertRaises(webapp.AIModelOutputError):
+                        webapp.normalize_ai_draft(copy.deepcopy(provider_raw), payload, require_confidence=True)
+                    # Retain the existing genuinely empty-row recovery consumer: request
+                    # rows can be shown for review but must never become analysis grants.
+                    provider_raw["line_items"] = []
                     if boundary == "finalize":
-                        # The provider's raw result, exactly as G2 reproduced it at the finalisation boundary.
+                        # An informational-only provider result with genuinely no material rows.
                         drafted = webapp.finalized_remote_draft_result(
                             payload, copy.deepcopy(provider_raw), "openai", "OpenAI",
                             webapp.booth_dimensions_from_payload(payload), webapp.normalize_line_items(payload))
@@ -43093,7 +43187,11 @@ main().catch((error) => {
                 "source_basis_line_id": "stale-chair-copy",
             }],
         }
-        with_server_analysis_seal(payload)
+        # Seal only the genuinely analysed row, then keep the stale request extra.
+        analysed = copy.deepcopy(payload)
+        analysed["line_items"] = analysed["line_items"][:1]
+        with_server_analysis_seal(analysed)
+        payload["pricing_analysis_seal"] = analysed["pricing_analysis_seal"]
 
         items = webapp.normalize_line_items_for_quote_basis_review(payload)
 
@@ -43549,8 +43647,8 @@ main().catch((error) => {
         draft = webapp.normalize_ai_draft({
             "analysis_findings": [{"id": "visible-graphics", "text": "Large front graphics are visible.", "confidence_pct": 90}],
             "blocking_clarification_questions": [{"id": "confirm-size", "question": "Confirm booth size.", "answer_type": "text"}],
-            "quote_basis_sections": [{"id": "graphics", "title": "Graphics", "lines": [{"tag": "Include", "text": "Graphics"}]}],
-            "line_items": [{"section": "Graphics", "quantity": 1, "unit": "sqm", "description": "Graphics", "pricing_keyword": ""}],
+            "quote_basis_sections": [{"id": "graphics", "title": "Graphics", "lines": [{"id": "graphics-row", "tag": "Include", "text": "Graphics"}]}],
+            "line_items": [{"source_basis_line_id": "graphics-row", "section": "Graphics", "quantity": 1, "unit": "sqm", "description": "Graphics", "pricing_keyword": ""}],
         })
         self.assertEqual(draft["quote_basis_sections"], [])
         self.assertEqual(draft["line_items"], [])
@@ -47767,6 +47865,7 @@ class PricingDraftG3Regression(unittest.TestCase):
 
         scenarios = (
             ("basis-id", True, True),
+            ("identified-items-only", False, True),
             ("basis-without-id", True, False),
             ("no-basis-sections", False, False),
         )
@@ -47818,6 +47917,10 @@ class PricingDraftG3Regression(unittest.TestCase):
                     "line_items": [provider_row],
                 }
 
+                if not include_basis_id:
+                    with self.assertRaises(webapp.AIModelOutputError):
+                        webapp.normalize_ai_draft(provider_draft, payload)
+                    continue
                 normalized = webapp.normalize_ai_draft(provider_draft, payload)
                 assert_unpriced("normalized", normalized["line_items"])
 
@@ -48020,6 +48123,12 @@ class PricingDraftG3Regression(unittest.TestCase):
             }],
         }
 
+        with self.assertRaises(webapp.AIModelOutputError):
+            webapp.normalize_ai_draft(provider_draft, payload)
+        own_line = copy.deepcopy(provider_draft["quote_basis_sections"][0]["lines"][0])
+        own_line.update(id="provider-row-a", quantity=2)
+        provider_draft["quote_basis_sections"][0]["lines"].insert(0, own_line)
+
         def assert_rows(rows, stage):
             row_a = next(row for row in rows if row.get("source_basis_line_id") == "provider-row-a")
             self.assertEqual(row_a["pricing_authority"]["variant"], "catalog", stage)
@@ -48087,6 +48196,14 @@ class PricingDraftG3Regression(unittest.TestCase):
                         "description": "nos wall light", "pricing_keyword": "",
                     }],
                 }
+
+                with self.assertRaises(webapp.AIModelOutputError):
+                    webapp.normalize_ai_draft(provider_draft, payload)
+                provider_draft["line_items"][0]["quantity"] = 9
+                provider_draft["line_items"][1]["source_basis_line_id"] = "provider-row-b"
+                provider_draft["quote_basis_sections"][0]["lines"].append({
+                    "id": "provider-row-b", "tag": "Custom", "custom_pricing": True,
+                    "text": "nos wall light", "quantity": 9, "unit": "nos", "confidence_pct": 90})
 
                 def assert_rows(result, stage):
                     self.assertEqual(len(result["line_items"]), 2, stage)
@@ -48160,6 +48277,14 @@ class PricingDraftG3Regression(unittest.TestCase):
             }],
         }
 
+        with self.assertRaises(webapp.AIModelOutputError):
+            webapp.normalize_ai_draft(provider_draft, payload)
+        lines = provider_draft["quote_basis_sections"][0]["lines"]
+        lines[0]["id"] = "provider-row-b"
+        lines.insert(0, {**lines[0], "id": "provider-row-a", "quantity": 2})
+        for row, row_id in zip(provider_draft["line_items"], ("provider-row-a", "provider-row-b")):
+            row["source_basis_line_id"] = row_id
+
         def assert_unambiguous_rows(rows, stage):
             self.assertEqual(len(rows), 2, stage)
             row_a = next(row for row in rows if row.get("quantity") == 2)
@@ -48201,6 +48326,13 @@ class PricingDraftG3Regression(unittest.TestCase):
             "quote_basis_sections": review_sections,
         }
         review_payload["pricing_analysis_seal"] = finalized.get("pricing_analysis_seal")
+        # Losing saved identities cannot inherit the earlier analysis grant.
+        for row in review_payload["line_items"]:
+            row.pop("source_basis_line_id", None)
+        for section in review_sections:
+            for line in section["lines"]:
+                line.pop("id", None)
+                line.pop("source_line_item_id", None)
         reviewed = webapp.normalize_line_items_for_quote_basis_review(review_payload)
         self.assertEqual(len(reviewed), 2)
         # A row with no stable source id cannot be tracked by the server pricing ledger, so the
@@ -48218,7 +48350,44 @@ class PricingDraftG3Regression(unittest.TestCase):
     def test_inline_client_reference_is_not_an_authoritative_request_snapshot(self):
         fixture = WebappServerTest()
         payload = fixture.sqag_212_payload()
-        self.assertIsNone(webapp.capture_pricing_reference_snapshot(payload))
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(webapp, "configured_storage_mode", return_value="local"), \
+                mock.patch.object(webapp, "pricing_references_root", return_value=Path(tmp)):
+            self.assertIsNone(webapp.capture_pricing_reference_snapshot(payload))
+
+    def test_saved_reference_snapshot_ignores_poisoned_inline_catalog(self):
+        fixture = WebappServerTest()
+        saved_items = fixture.sqag_212_catalog_items()
+        payload = fixture.sqag_212_payload()
+        poisoned_items = copy.deepcopy(saved_items)
+        for item in poisoned_items:
+            item["sale_unit_price"] = 987654.32
+        payload["pricing_reference"].update({"currency": "USD", "items": poisoned_items})
+        payload["_pricing_reference_snapshot"] = webapp.PricingReferenceSnapshot(
+            source="local",
+            reference_id=payload["pricing_reference_id"],
+            digest="sha256:" + ("0" * 64),
+            currency="USD",
+            detail_json=json.dumps(payload["pricing_reference"]),
+        )
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(webapp, "configured_storage_mode", return_value="local"), \
+                mock.patch.object(webapp, "pricing_references_root", return_value=Path(tmp)):
+            write_test_pricing_reference(Path(tmp), payload["pricing_reference_id"], saved_items)
+            snapshot = webapp.capture_pricing_reference_snapshot(payload)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.source, "local")
+        self.assertEqual(snapshot.reference_id, payload["pricing_reference_id"])
+        self.assertEqual(snapshot.currency, "SGD")
+        self.assertEqual(
+            snapshot.digest,
+            webapp.pricing_reference_catalog_digest({"items": saved_items}),
+        )
+        self.assertEqual(
+            [(item["id"], item["sale_unit_price"]) for item in snapshot.detail()["items"]],
+            [(item["id"], item["sale_unit_price"]) for item in saved_items],
+        )
+        self.assertNotEqual(snapshot.digest, payload["_pricing_reference_snapshot"].digest)
 
     def test_ambiguous_same_context_provider_rows_do_not_multiply_or_cross_bind(self):
         fixture = WebappServerTest()
@@ -48250,6 +48419,13 @@ class PricingDraftG3Regression(unittest.TestCase):
                     "line_items": rows,
                 }
 
+                with self.assertRaises(webapp.AIModelOutputError):
+                    webapp.normalize_ai_draft(provider_draft, payload)
+                basis_line["id"] = "physical-row-a"
+                provider_draft["quote_basis_sections"][0]["lines"].append({**basis_line, "id": "physical-row-b"})
+                for row, row_id in zip(rows, ("physical-row-a", "physical-row-b")):
+                    row["source_basis_line_id"] = row_id
+
                 def assert_rows(result, stage):
                     self.assertEqual(len(result["line_items"]), 2, stage)
                     [selected] = [
@@ -48279,11 +48455,22 @@ class PricingDraftG3Regression(unittest.TestCase):
                 for section in review_sections:
                     for line in section.get("lines", []):
                         line.update({"tag": "Custom", "custom_pricing": True, "custom_confirmed": True})
-                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review({
+                reviewed = webapp.normalize_line_items_for_quote_basis_review({
                     **payload,
                     "line_items": finalized["line_items"],
                     "quote_basis_sections": review_sections,
-                }), [])
+                })
+                self.assertEqual(len(reviewed), 2)
+                self.assertEqual({row["source_basis_line_id"] for row in reviewed}, {"physical-row-a", "physical-row-b"})
+                # A saved historical marker may remain, but it conveys no price or catalogue grant.
+                self.assertEqual({row["pricing_authority"]["variant"] for row in reviewed}, {"historical", "none"})
+                for row in reviewed:
+                    self.assertEqual(row["pricing_keyword"], "")
+                    self.assertEqual(row["status"], "unmatched")
+                    for key in ("effective_unit_price", "catalog_unit_price", "pricing_basis_amount", "approved_quote_amount"):
+                        self.assertNotIn(key, row)
+                    self.assertNotIn("price", row["pricing_authority"])
+                    self.assertNotIn("catalog_item_id", row["pricing_authority"])
 
     def test_owned_quote_draft_still_sanitizes_provider_prices_and_rebinds_exact_selector(self):
         fixture = WebappServerTest()

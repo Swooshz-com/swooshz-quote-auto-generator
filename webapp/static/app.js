@@ -1136,7 +1136,7 @@ function formatQuantityNumber(value) {
 
 function normalizeQuantityPrefixUnit(value = "") {
   const unit = String(value || "").toLowerCase().replace(/\s+/g, " ").replace(/\.+$/g, "").trim();
-  if (["sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."].includes(unit)) return "sqm";
+  if (["sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."].includes(unit)) return "sqm";
   if (["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"].includes(unit)) return "nos";
   if (["lot", "lots"].includes(unit)) return "lot";
   if (["set", "sets"].includes(unit)) return "set";
@@ -1165,7 +1165,7 @@ function quantityUnitAliases(unit = "") {
   const aliases = new Set();
   if (normalized) aliases.add(normalized);
   if (normalized === "sqm") {
-    ["sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."].forEach((alias) => aliases.add(alias));
+    ["sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."].forEach((alias) => aliases.add(alias));
   }
   if (/^nos?\.?$/.test(normalized)) {
     ["nos", "nos.", "no", "no.", "pcs", "pieces", "units"].forEach((alias) => aliases.add(alias));
@@ -1227,7 +1227,7 @@ function neutralizeFormulaText(value = "") {
 function normalizeUnit(value = "") {
   const text = String(value || "").normalize("NFC").trim();
   const lower = text.toLowerCase().replace(/\s+/g, " ").replace(/^[.\s]+|[.\s]+$/g, "");
-  if (["m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) {
+  if (["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) {
     return "sqm";
   }
   if (["m run", "m. run"].includes(lower)) return "m run";
@@ -2636,7 +2636,7 @@ function canonicalPricingAuthorityText(value = "") {
 function canonicalPricingAuthorityUnit(value = "") {
   const text = canonicalPricingAuthorityText(value);
   const lower = text.toLowerCase().replace(/^[. ]+|[. ]+$/g, "");
-  if (["m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) return "sqm";
+  if (["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) return "sqm";
   if (["m run", "m. run"].includes(lower)) return "m run";
   if (["m length", "m. length"].includes(lower)) return "m length";
   if (["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"].includes(lower)) return "nos";
@@ -8962,34 +8962,37 @@ async function confirmQuoteDependencyChange() {
     hideQuoteDependencyConfirmModal();
     return;
   }
-  const originPanel = state.activeSidePanel;
-  hideQuoteDependencyConfirmModal();
-  let generatedStateCleared = false;
-  if (changes.includes("pricing_reference")) {
-    generatedStateCleared = applyPendingPricingReferenceSelection();
-  }
-  if (changes.includes("reference_files") && !generatedStateCleared) {
-    clearGeneratedQuoteState();
-    generatedStateCleared = true;
-  }
-  if (generatedStateCleared) {
-    setWorkflowStage(hasReferenceFilesForNavigation() ? "ready_to_analyze" : "needs_images");
-  }
-  if (!hasReferenceFilesForNavigation()) {
-    if (generatedStateCleared) await saveQuoteSessionDraftState({ quoteGenerated: false });
-    updateSidePanelNav();
-    return;
-  }
-  const targetPanel = originPanel === "images" ? "customer" : "quote_company";
-  if (originPanel === "customer") {
-    await advanceCustomerStep();
-    return;
-  }
-  const moved = setSidePanel(targetPanel, { notify: true });
-  if (!moved) updateSidePanelNav();
-  if (generatedStateCleared || moved) {
-    await saveQuoteSessionDraftState({ quoteGenerated: false });
-  }
+  if (appIsBusy()) return;
+  await withQuoteStepLoading(async () => {
+    const originPanel = state.activeSidePanel;
+    hideQuoteDependencyConfirmModal();
+    let generatedStateCleared = false;
+    if (changes.includes("pricing_reference")) {
+      generatedStateCleared = applyPendingPricingReferenceSelection();
+    }
+    if (changes.includes("reference_files") && !generatedStateCleared) {
+      clearGeneratedQuoteState();
+      generatedStateCleared = true;
+    }
+    if (generatedStateCleared) {
+      setWorkflowStage(hasReferenceFilesForNavigation() ? "ready_to_analyze" : "needs_images");
+    }
+    if (!hasReferenceFilesForNavigation()) {
+      const saved = !generatedStateCleared || await saveQuoteSessionDraftState({ quoteGenerated: false });
+      updateSidePanelNav();
+      return Boolean(saved);
+    }
+    const targetPanel = originPanel === "images" ? "customer" : "quote_company";
+    if (originPanel === "customer") {
+      return await advanceCustomerStep();
+    }
+    const moved = setSidePanel(targetPanel, { notify: true });
+    if (!moved) updateSidePanelNav();
+    if (generatedStateCleared || moved) {
+      return Boolean(await saveQuoteSessionDraftState({ quoteGenerated: false }));
+    }
+    return false;
+  });
 }
 
 function quoteCompanyPresentationSignature() {
@@ -9405,7 +9408,10 @@ function showExcelGeneratingModal(options = {}) {
   elements.excelGeneratingMessage.textContent = options.message || "Preparing the quotation workbook.";
   if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = false;
   if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
-  if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+  if (elements.excelGeneratingActionButton) {
+    elements.excelGeneratingActionButton.hidden = false;
+    elements.excelGeneratingActionButton.dataset.exportAction = "";
+  }
   if (["excel_ready", "pdf_ready"].includes(state.restorableOverlay)) {
     state.restorableOverlay = "";
     saveWorkspaceViewState();
@@ -9440,6 +9446,7 @@ function showGeneratedExportReadyModal(viewPdf = false) {
   if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = true;
   if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = false;
   if (elements.excelGeneratingActionButton) {
+    elements.excelGeneratingActionButton.hidden = false;
     elements.excelGeneratingActionButton.textContent = viewPdf ? "Open PDF" : "Download Excel";
     elements.excelGeneratingActionButton.dataset.exportAction = viewPdf ? "pdf" : "excel";
   }
@@ -9557,6 +9564,28 @@ function viewCurrentPdfFile(file = state.pdfFile, preparedWindow = null) {
   link.click();
   link.remove();
   return true;
+}
+
+async function handleViewPdf(event) {
+  event.preventDefault();
+  if (elements.sideViewPdfButton.getAttribute("aria-disabled") === "true") {
+    const validation = outputRowsValid();
+    if (!validation.valid) renderOutputValidationMessages(validation.errors);
+    return;
+  }
+  if (commitActiveOutputEditor() === "blocked") return;
+  if (pdfFileIsFresh(state.pdfFile)) return viewCurrentPdfFile();
+  const pdfWindow = window.open("about:blank", "_blank");
+  let openedPdf = false;
+  showExcelGeneratingModal(generationLoadingModalOptions(true));
+  await waitForUiPaint();
+  try {
+    const generated = await handleGenerate({ viewPdf: true });
+    if (generated) openedPdf = viewCurrentPdfFile(state.pdfFile, pdfWindow);
+  } finally {
+    if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();
+    hideExcelGeneratingModal();
+  }
 }
 
 function pricingMatchStatus(row = {}) {
@@ -11171,10 +11200,10 @@ function basisQuantityLabel(line = {}) {
 
 function basisQuantityDisplayLabel(line = {}) {
   const quantityText = basisQuantityText(line.quantity);
-  if (!quantityText) return "1 lot";
+  if (!quantityText) return "Not measured";
   let unit = normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
   if (/^nos?\.?$/i.test(unit)) unit = "nos.";
-  return `${quantityText}${unit ? ` ${unit}` : ""}`;
+  return `${quantityText}${unit ? ` ${unit}` : " (unit needed)"}`;
 }
 
 function basisChatLineContext(line = {}) {
@@ -14283,8 +14312,8 @@ function handleQuoteDetailFieldChange(event = {}) {
 }
 
 async function startQuoteSessionDraftSaveAfterCustomerStep() {
-  if (!markQuoteSessionDraftSaveStartedAfterCustomerStep()) return;
-  await saveQuoteSessionDraftState({ quoteGenerated: false });
+  if (!markQuoteSessionDraftSaveStartedAfterCustomerStep() && !quoteSessionDraftStateCanSave()) return null;
+  return await saveQuoteSessionDraftState({ quoteGenerated: false });
 }
 
 async function saveQuoteSessionDraftStateAfterPanelMove(panelName = state.activeSidePanel) {
@@ -14924,7 +14953,13 @@ async function loadQuoteSessionDetail(sessionId = "") {
     return null;
   }
   const session = data.quote_session && typeof data.quote_session === "object" ? data.quote_session : null;
-  return session && safeQuoteSessionId(session.session_id || "") === safeSessionId ? session : null;
+  if (!session || safeQuoteSessionId(session.session_id || "") !== safeSessionId) {
+    state.quoteSessionLoadError = genericFailureMessage(data);
+    renderQuoteDashboard();
+    return null;
+  }
+  state.quoteSessionLoadError = "";
+  return session;
 }
 
 function dashboardRestoreError(message) {
@@ -15027,6 +15062,10 @@ async function modifyDashboardQuote(sessionId, options = {}) {
   setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(safeSessionId);
+    if (!detailedSession) {
+      finishDashboardOperation();
+      return false;
+    }
     let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
     if (!Object.keys(draftState).length && safeSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
@@ -15078,6 +15117,10 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
   setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(sourceSessionId);
+    if (!detailedSession) {
+      finishDashboardOperation();
+      return false;
+    }
     let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
     if (!Object.keys(draftState).length && sourceSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
@@ -16771,7 +16814,7 @@ function customerStepCheckpointForCurrent() {
     pricingReferenceSource: state.pricingReferenceSource,
     pricingReferenceDigest: digest,
     customer: {
-      client: details.client,
+      client: { ...details.client, address: canonicalPricingAuthorityText(details.client.address) },
       project: details.project,
       quote_date: details.quote_date,
       project_number: details.project_number,
@@ -17013,7 +17056,46 @@ function goToPreviousSidePanel() {
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
 
+async function withQuoteStepLoading(operation) {
+  if (appIsBusy()) return false;
+  state.isPreparingOutput = true;
+  state.quoteSessionLoadError = "";
+  showExcelGeneratingModal({
+    eyebrow: "Quotation output",
+    title: "Preparing Output",
+    message: "Saving the quotation before continuing.",
+  });
+  syncControlStates();
+  let result;
+  try {
+    await waitForUiPaint();
+    result = await operation();
+    return result;
+  } catch {
+    const errorReference = newClientErrorReference();
+    state.quoteSessionLoadError = genericFailureMessage({ error_reference: errorReference });
+    logClientEvent("client_error", { error_reference: errorReference, errors: [GENERIC_FAILURE_MESSAGE] });
+    result = false;
+    return false;
+  } finally {
+    state.isPreparingOutput = false;
+    if (!state.isPageUnloading) {
+      hideExcelGeneratingModal();
+      if (result === false && state.quoteSessionLoadError) {
+        showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message: state.quoteSessionLoadError });
+        elements.excelGeneratingSpinner.hidden = true;
+        elements.excelGeneratingActions.hidden = false;
+        elements.excelGeneratingActionButton.hidden = true;
+        elements.excelGeneratingModal.classList.add("is-ready");
+        elements.excelGeneratingCloseButton?.focus();
+      }
+    }
+    syncControlStates();
+  }
+}
+
 async function goToNextSidePanel(options = {}) {
+  if (appIsBusy() || state.customerStepCheckpointSaveBusy) return false;
   if (commitActiveOutputEditor() === "blocked") return false;
   const index = activeSidePanelIndex();
   if (elements.sideNextButton?.getAttribute("aria-disabled") === "true") {
@@ -17033,30 +17115,37 @@ async function goToNextSidePanel(options = {}) {
   }
   if (state.activeSidePanel === "quote_company") {
     if (quoteHasDerivedResults()) {
-      const moved = setSidePanel("basis", { notify: true });
-      if (moved) await saveQuoteSessionDraftState({ quoteGenerated: quoteSessionHasFreshOutputExports() });
-      return;
+      return await withQuoteStepLoading(async () => {
+        const moved = setSidePanel("basis", { notify: true });
+        if (!moved) return false;
+        const saved = await saveQuoteSessionDraftState({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+        if (!saved) setSidePanel("quote_company", { force: true });
+        return Boolean(saved);
+      });
+    } else {
+      requestStartAnalysis();
     }
-    requestStartAnalysis();
     return;
   }
   if (state.activeSidePanel === "basis") {
-    confirmBasis();
+    await confirmBasis();
     return;
   }
   if (state.activeSidePanel === "output") return;
-  if (state.activeSidePanel === "customer") {
-    applyPendingPricingReferenceSelection();
-    await advanceCustomerStep();
-    return;
-  }
-  const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
-  const moved = setSidePanel(nextPanel, { notify: true });
-  if (moved && nextPanel === "customer") {
-    await startQuoteSessionDraftSaveAfterCustomerStep();
-  } else if (moved) {
-    await saveQuoteSessionDraftState({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
-  }
+  return await withQuoteStepLoading(async () => {
+    if (state.activeSidePanel === "customer") {
+      applyPendingPricingReferenceSelection();
+      return await advanceCustomerStep();
+    }
+    const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
+    const moved = setSidePanel(nextPanel, { notify: true });
+    if (!moved) return false;
+    const saved = nextPanel === "customer"
+      ? await startQuoteSessionDraftSaveAfterCustomerStep()
+      : await saveQuoteSessionDraftState({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
+    if (!saved) setSidePanel(SIDE_PANEL_SEQUENCE[index], { force: true });
+    return Boolean(saved);
+  });
 }
 
 function handleQuoteBasisClick(event) {
@@ -17277,26 +17366,7 @@ function wireEvents() {
       hideExcelGeneratingModal();
     }
   });
-  elements.sideViewPdfButton.addEventListener("click", async (event) => {
-    event.preventDefault();
-    if (elements.sideViewPdfButton.getAttribute("aria-disabled") === "true") {
-      const validation = outputRowsValid();
-      if (!validation.valid) renderOutputValidationMessages(validation.errors);
-      return;
-    }
-    if (commitActiveOutputEditor() === "blocked") return;
-    const pdfWindow = window.open("about:blank", "_blank");
-    let openedPdf = false;
-    showExcelGeneratingModal(generationLoadingModalOptions(true));
-    await waitForUiPaint();
-    try {
-      const generated = await handleGenerate({ viewPdf: true });
-      if (generated) openedPdf = viewCurrentPdfFile(state.pdfFile, pdfWindow);
-    } finally {
-      if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();
-      hideExcelGeneratingModal();
-    }
-  });
+  elements.sideViewPdfButton.addEventListener("click", handleViewPdf);
   elements.excelGeneratingActionButton?.addEventListener("click", () => {
     handleGeneratedExportReadyAction();
   });

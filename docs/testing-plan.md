@@ -32,6 +32,8 @@ npm run playwright:smoke
 ## Feature Coverage Guide
 
 - Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.
+- Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
+- Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
 - Pricing reference import, catalog matching, currency/tax metadata, or template parsing: add/update parser and normalization tests, then run the relevant `tests.test_webapp` and `tests.test_generate_quote` cases.
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
@@ -181,6 +183,45 @@ draft key, save count and artifact identity; precision-changing input still reje
 
 ## Regression Standard
 
+### Fresh provider response admission
+
+Run `python -m unittest tests.test_provider_response_admission` together with
+`tests.test_basis_dimension_contract`, `tests.test_basis_source_provenance`,
+`tests.test_openai_draft_request_contract`, `tests.test_ai_basis_chat_stress`, and
+`tests.test_quote_flow_reliability`. Fixtures use synthetic data, denied outbound
+sockets and explicitly mocked provider responses. Full Analyse must reject
+inconsistent measurements or malformed scope before pricing and sealing, with a
+support-safe error reference rather than a substitute local draft.
+
+Cover canonical positive quantities, decimal-comma/percent/bool/nonfinite and
+float underflow rejection, coherent prefix-only measurements, conflicting text,
+structured and linked measurements, and unrepresentable derived prices. Keep
+same-text physical rows with distinct IDs through review, actual server selection,
+Output, save/reopen and protected XLSX. Coherent ID aliases and generic equivalent
+units (including Unicode square metres) must preserve original provenance;
+ambiguous/unbound identities reject the response without partial success. Blank
+original measurement units never gain a catalogue grant from a later display unit.
+
+Supplied arrays, objects and rows must have supported shapes, with no silent
+material row removal. JSON admission accepts one bounded object and rejects
+duplicate keys, array wrappers, extra objects and nested nonfinite numbers. Keep
+the demonstrated fenced/trailing-prose chat consumer until its response contract
+is explicitly changed. All OpenAI adapters share shape/completion/refusal checks;
+DeepSeek adapters enforce their existing completion finish reason. Routing,
+transport retries and support-operation provider failover remain unchanged.
+Confidence supplied by a fresh response is an integer from 0 to 100, including
+0 and 1; fractions, percent strings and conflicting aliases reject. Saved/user
+confidence and commercial-number normalisers remain compatible with their existing
+consumers, and saved blank seals/ledgers are never upgraded. Identified items-only
+and legacy basis shapes retain optional-field support; supplied structured basis
+must own every supplied material item exactly once.
+
+Existing genuinely empty-provider-row finalisation retains request rows only for
+review; its analysis seal grants no catalogue price to those fallback rows. The
+quote finaliser owns this recovery path until the recovery contract is explicitly
+replaced. Cover its unpriced save/selection boundary separately from malformed
+material responses, which must reject before any partial success.
+
 ### Full-draft Responses contract
 
 Run `python -m unittest tests.test_openai_draft_request_contract` for full-draft
@@ -277,3 +318,26 @@ A fix is not complete until the failing behavior has a regression test at the ri
 - CI checks for repository-wide syntax, unit, and smoke coverage.
 
 When production code changes without a matching automated test, the final report must say which affected feature remains manually tested or untested and why.
+
+## Quote reopening and Next acknowledgement
+
+For dashboard Modify/Duplicate detail loading or Next loading changes, run
+`python -m unittest tests.test_quote_flow_reliability` and
+`node scripts/playwright-owner-uat-basis-repair.mjs --lines=6 --latency-ms=300 --alpha2-reliability`.
+The synthetic rendered mode covers a failed Customer checkpoint, visible failure
+with stopped spinner, dismissal and retry, duplicate activation suppression,
+failed Modify/Duplicate reads preserving saved/current drafts without a save,
+and a successful Modify retry. It then covers Duplicate plus a cancelled and
+confirmed pricing-reference replacement, fresh analysis and one Confirm reaching
+Output with the replacement catalogue price. Dependency and analysis choices
+must remain pauses; neither starts a loading request before confirmation.
+Existing protected XLSX amount, pricing-ledger and reopen checks remain active.
+The unit contract also covers saved Customer checkpoint address equivalence
+(NFC and whitespace) while preserving display text and invalidating substantive
+address changes, and fresh protected PDF reuse without a new generation job.
+Run the existing G3 restored-session browser test for the first Modify path.
+The native Alpha smoke additionally verifies a saved/current PDF reopens through
+the protected inline endpoint without another generation job. Real LibreOffice
+conversion, native PDF viewer/rendering and hosted persistence qualification
+remain separate; the synthetic mode does not substitute for native PDF smoke or
+owner UAT.
