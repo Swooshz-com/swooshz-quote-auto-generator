@@ -1,0 +1,148 @@
+"""First object-mode PDF completion uses durable bytes after owned scratch cleanup."""
+import copy
+import hashlib
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from tests import test_webapp as existing
+
+
+webapp = existing.webapp
+
+
+class ObjectPdfCompletionTest(unittest.TestCase):
+    def setUp(self):
+        self.fixture = existing.WebappServerTest()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+
+    def test_first_pdf_object_completion_remains_durable_after_owned_scratch_cleanup(self):
+        backend = webapp.InMemoryObjectStorageBackend()
+        auth_session = self.fixture.platform_auth_session("workspace-first-object-pdf")
+        session_id = "quote-first-object-pdf"
+        job_id = "job-first-object-pdf"
+        xlsx_bytes = b"PK\x03\x04synthetic-first-object-workbook"
+        pdf_bytes = b"%PDF-1.4\nsynthetic first object PDF\n%%EOF\n"
+        dispatched = []
+
+        with tempfile.TemporaryDirectory(dir=existing.test_temp_root()) as temporary:
+            root = Path(temporary)
+            output_root, tmp_root = root / "output", root / "scratch"
+            database_url = f"sqlite:///{(root / 'storage.sqlite3').as_posix()}"
+            env = existing.isolated_env(**{
+                **self.fixture.platform_launch_env(),
+                **self.fixture.hosted_storage_env(SQAG_DATABASE_URL=database_url),
+                "QUOTE_DATA_ROOT": str(root / "data"),
+                "QUOTE_OUTPUT_ROOT": str(output_root),
+                "QUOTE_TMP_ROOT": str(tmp_root),
+                "QUOTE_LOG_ROOT": str(existing.ROOT / "_logs" / "app" / "first-object-pdf" / root.name),
+            })
+            payload = self.fixture._run466_payload(
+                session_id, "Synthetic first PDF surface", 0, quote_generated=False
+            )
+            output_dir, job_tmp = output_root / job_id, tmp_root / job_id
+
+            def synthetic_generator(command, **kwargs):
+                self.assertEqual(Path(command[1]), webapp.GENERATOR_PATH)
+                self.assertEqual(command[command.index("--pdf-mode") + 1], "workbook")
+                self.assertEqual(Path(command[command.index("--out") + 1]), output_dir)
+                self.assertEqual(webapp.get_job(job_id, auth_session)["status"], "running")
+                self.assertTrue(job_tmp.is_dir())
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
+                (output_dir / "quotation.pdf").write_bytes(pdf_bytes)
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.dict(webapp.JOBS, {}, clear=True),
+                mock.patch.object(webapp, "read_dotenv_value", side_effect=existing.env_only_dotenv_value),
+                mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+                mock.patch.object(webapp, "validated_platform_auth_session", side_effect=lambda session: session),
+                mock.patch.object(webapp.urllib.request, "urlopen", side_effect=AssertionError("EXTERNAL_NETWORK_DENIED")),
+                mock.patch.object(webapp.subprocess, "run", side_effect=synthetic_generator) as generator,
+            ):
+                self.assertEqual(webapp.configured_artifact_storage_mode(), "object")
+                self.assertIs(webapp.configured_object_storage_backend(), backend)
+                webapp.apply_sqag_storage_migrations(database_url)
+                storage = webapp.app_storage_for_auth_session(auth_session)
+                existing.bind_database_publication_authority(storage, payload, suffix="first-object-pdf")
+                initial = storage.create_or_update_quote_session(copy.deepcopy(payload))
+                self.assertFalse(initial["exports"]["pdf"]["exists"])
+                self.assertIsNone(storage.quote_session_export_artifact(session_id, "pdf"))
+
+                # Control only scheduling; admission, worker and job-state functions run unchanged.
+                with mock.patch.object(webapp.threading, "Thread") as thread:
+                    queued = webapp.create_job(
+                        "generate_pdf", payload, auth_session=auth_session, requested_job_id=job_id
+                    )
+                    self.assertEqual(queued["status"], "running", queued)
+                    thread.return_value.start.assert_called_once_with()
+                    dispatched.append(thread.call_args.kwargs)
+                self.assertEqual(len(dispatched), 1)
+                self.assertIs(dispatched[0]["target"], webapp.run_job_worker)
+                self.assertIs(dispatched[0]["args"][0], webapp.finish_generate_pdf_job)
+                dispatched[0]["target"](*dispatched[0]["args"])
+
+                completed = webapp.get_job(job_id, auth_session)
+                self.assertEqual(completed["status"], "completed", completed)
+                generator.assert_called_once()
+                result = completed["result"]
+                self.assertEqual(result["status"], "completed", result)
+                pdf_url = f"/api/quote-sessions/{session_id}/download/pdf"
+                pdf_files = [item for item in result["files"] if item["name"] == "quotation.pdf"]
+                self.assertEqual(len(pdf_files), 1)
+                self.assertEqual(pdf_files[0]["url"], pdf_url)
+                self.assertEqual(pdf_files[0]["sha256"], hashlib.sha256(pdf_bytes).hexdigest())
+                self.assertEqual(int(pdf_files[0]["bytes"]), len(pdf_bytes))
+                self.assertNotIn("/api/jobs/", str(result["files"]))
+                exported = result["quote_session"]["exports"]["pdf"]
+                self.assertTrue(exported["exists"])
+                self.assertFalse(exported["stale"])
+                self.assertEqual(exported["url"], pdf_url)
+                self.assertEqual(exported["sha256"], hashlib.sha256(pdf_bytes).hexdigest())
+                self.assertEqual(exported["size_bytes"], len(pdf_bytes))
+                self.assertFalse(output_dir.exists())
+                self.assertFalse(job_tmp.exists())
+
+                reopened_storage = webapp.app_storage_for_auth_session(auth_session)
+                reopened = reopened_storage.get_quote_session(session_id)
+                self.assertTrue(reopened["exports"]["pdf"]["exists"])
+                self.assertFalse(reopened["exports"]["pdf"]["stale"])
+                artifact = reopened_storage.quote_session_export_artifact(session_id, "pdf")
+                self.assertEqual(artifact["content"], pdf_bytes)
+                with reopened_storage.connection() as connection:
+                    object_row = connection.execute(
+                        "select * from sqag_object_artifacts where workspace_id = ? "
+                        "and owner_type = ? and owner_id = ? and artifact_kind = ? "
+                        "and status = ? and retention_status = ? and deleted_at is null",
+                        (reopened_storage.workspace_id, "generated_quote_version",
+                         completed["generation_run_id"], "pdf", "active", "active"),
+                    ).fetchone()
+                self.assertIsNotNone(object_row)
+                object_metadata = reopened_storage._object_metadata_from_row(object_row)
+                self.assertEqual(object_metadata.storage_key, object_row["object_key_ref"])
+                self.assertTrue(object_metadata.storage_key)
+                self.assertEqual(object_metadata.checksum_sha256, hashlib.sha256(pdf_bytes).hexdigest())
+                self.assertEqual(object_metadata.size_bytes, len(pdf_bytes))
+                self.assertTrue(backend.verify_metadata(object_metadata, workspace_id=reopened_storage.workspace_id))
+                self.assertEqual(
+                    backend.retrieve_artifact(object_metadata, workspace_id=reopened_storage.workspace_id),
+                    pdf_bytes,
+                )
+                cookie = f"{webapp.SESSION_COOKIE_NAME}={webapp.signed_cookie_value(auth_session)}"
+                with existing.LocalRunnerServer() as runner:
+                    response = existing.local_http_get_bytes(runner, pdf_url, headers={"Cookie": cookie})
+                    unauthenticated = existing.local_http_get_bytes(runner, pdf_url)
+                self.assertEqual(response, (200, pdf_bytes))
+                self.assertIn(unauthenticated[0], {401, 403})
+                self.assertFalse(output_dir.exists())
+                self.assertFalse(job_tmp.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
