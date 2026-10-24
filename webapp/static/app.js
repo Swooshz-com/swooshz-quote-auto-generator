@@ -17210,7 +17210,6 @@ function handleBeforeUnload(event) {
     return undefined;
   }
   if (!pricingReferenceShouldWarnBeforeUnload()) {
-    markPageUnloading();
     return undefined;
   }
   event.preventDefault();

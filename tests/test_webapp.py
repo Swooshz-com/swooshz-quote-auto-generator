@@ -29247,6 +29247,8 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
+if (scenario.tentativeBoundary) required.push("handleBeforeUnload");
+const pricingReferenceShouldWarnBeforeUnload = () => false;
 if (scenario.kind === "dashboard-failure") required.push("returnToDashboard", "restoredQuoteSessionHasChanged", "handleTopbarBrandClick", "setDashboardLoadingState", "showDashboard", "loadQuoteDashboard", "appIsBusy");
 if (scenario.kind === "excel") { constantNames.push(); required.push("downloadCurrentExcelFile", "downloadFileIsFresh", "pdfFileIsFresh", "quoteSessionHasFreshOutputExports", "markOutputRowsDirty", "revisionNumber", "setDownloadFiles", "pollJob", "isInterruptedJobPoll", "handleInterruptedJobPoll", "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage", "handleGeneratedExportReadyAction"); }
 if (scenario.kind === "dashboard-order") required.push("returnToDashboard", "restoredQuoteSessionHasChanged");
@@ -29492,7 +29494,13 @@ async function act() {
     if (scenario.refreshBoundary) {
       releaseResponse(); await tick();
       assert.strictEqual(calls.filter(c => c.url === "/api/session").length, 1, "Did not reach actual refresh leg");
-      if (scenario.unloading) markPageUnloading();
+      if (scenario.tentativeBoundary) {
+        handleBeforeUnload({ preventDefault() { throw new Error("Unexpected pricing warning"); } });
+        assert.strictEqual(state.isPageUnloading, false);
+      } else if (scenario.unloading) markPageUnloading();
+    } else if (scenario.tentativeBoundary) {
+      handleBeforeUnload({ preventDefault() { throw new Error("Unexpected pricing warning"); } });
+      assert.strictEqual(state.isPageUnloading, false);
     } else state.isPageUnloading = Boolean(scenario.unloading);
     releaseResponse();
     await settle(pending);
@@ -29850,6 +29858,19 @@ async function act() {
 
     def test_sqag212_actual_auth_refresh_replays_once_with_valid_acknowledgement(self):
         self.run_sqag212_production_save_chain({"status": 403, "refresh": "success", "realRefresh": True})
+
+    def test_sqag212_stopped_tentative_navigation_is_not_an_unloading_save(self):
+        for consumer in ("draft", "generate"):
+            with self.subTest(consumer=consumer, stage="original-body"):
+                self.run_sqag212_production_save_chain({"originalBoundary": True,
+                    "consumer": consumer, "tentativeBoundary": True, "unloading": False,
+                    "bodyAbort": True, "status": 200, "gated": True})
+            for fault in ("fetch", "body"):
+                with self.subTest(consumer=consumer, stage="refresh", fault=fault):
+                    self.run_sqag212_production_save_chain({"originalBoundary": True,
+                        "refreshBoundary": True, "realRefresh": True, "refreshFault": fault,
+                        "consumer": consumer, "tentativeBoundary": True, "unloading": False,
+                        "status": 403, "gated": True})
 
     def test_sqag212_response_body_abort_preserves_only_original_unload(self):
         for consumer in ("generate", "draft"):
@@ -30238,7 +30259,12 @@ const cleanUnloadEvent = {
 assert.strictEqual(pricingReferenceShouldWarnBeforeUnload(), false);
 assert.strictEqual(handleBeforeUnload(cleanUnloadEvent), undefined);
 assert.strictEqual(unloadPrevented, false);
-assert.strictEqual(state.isPageUnloading, true);
+assert.strictEqual(state.isPageUnloading, false, "A stopped tentative navigation must leave the live document usable");
+const registeredPagehide = new Map();
+const window = { addEventListener: (event, handler) => registeredPagehide.set(event, handler) };
+eval(normalizedSource.split("\n").find(line => line.includes('window.addEventListener("pagehide", markPageUnloading)')));
+registeredPagehide.get("pagehide")({ persisted: false });
+assert.strictEqual(state.isPageUnloading, true, "Actual pagehide retains the recovery fence");
 """
         completed = subprocess.run(
             [node, "-e", script],

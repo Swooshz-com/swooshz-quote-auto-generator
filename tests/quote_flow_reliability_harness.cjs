@@ -12,7 +12,7 @@ function extract(name) {
 function fixture(names) {
   const calls = [];
   const node = () => ({ hidden: true, textContent: "", dataset: {}, focus() {}, classList: { add() {}, remove() {} } });
-  const elements = Object.fromEntries(["excelGeneratingModal", "excelGeneratingSpinner", "excelGeneratingActions", "excelGeneratingActionButton", "excelGeneratingCloseButton"].map((name) => [name, node()]));
+  const elements = Object.fromEntries(["excelGeneratingModal", "excelGeneratingSpinner", "excelGeneratingActions", "excelGeneratingActionButton", "excelGeneratingCloseButton", "excelGeneratingEyebrow", "excelGeneratingTitle", "excelGeneratingMessage"].map((name) => [name, node()]));
   elements.sideNextButton = { getAttribute() { return "false"; } };
   const state = { isPreparingOutput: false, activeSidePanel: "customer", quoteSessionLoadError: "" };
   const context = vm.createContext({ state, elements, calls, Promise,
@@ -20,6 +20,7 @@ function fixture(names) {
     GENERIC_FAILURE_MESSAGE: "Failed. Please try again.",
     newClientErrorReference: () => "ERR-1234ABCD",
     genericFailureMessage: () => "Failed. Reference: ERR-1234ABCD.",
+    genericFailureMessages: () => ["Failed. Reference: ERR-1234ABCD."],
     logClientEvent: (_event, details) => { calls.push({ errorReference: details.error_reference }); },
     syncControlStates() {}, waitForUiPaint: async () => { calls.push("paint"); },
     showExcelGeneratingModal() { elements.excelGeneratingModal.hidden = false; elements.excelGeneratingSpinner.hidden = false; calls.push("show"); },
@@ -33,9 +34,153 @@ function fixture(names) {
   vm.runInContext(names.map(extract).join("\n"), context);
   return { context, calls, state, elements };
 }
+
+// Ordinary beforeunload is tentative: Chrome can stop before pagehide/commit.
+// Dispatch the real registered handlers, rather than injecting a terminal flag.
+function lifecycleFixture(names = []) {
+  const f = fixture(["showExcelGeneratingModal", "hideExcelGeneratingModal", "markPageUnloading", "handleBeforeUnload", ...names]);
+  const { context: c, state, elements } = f;
+  const handlers = new Map();
+  state.isPageUnloading = false;
+  state.isRecoveryScopeTransitioning = false;
+  state.lineItems = [{}]; state.outputRows = []; state.pendingQuoteDependencyChanges = ["pricing_reference"];
+  c.window = { addEventListener: (event, handler) => handlers.set(event, handler) };
+  c.pricingReferenceShouldWarnBeforeUnload = () => false;
+  vm.runInContext(source.split(/\r?\n/).filter(line => /^  window\.addEventListener\("(?:beforeunload|pagehide)"/.test(line)).join("\n"), c);
+  assert.equal(handlers.get("beforeunload"), c.handleBeforeUnload);
+  assert.equal(handlers.get("pagehide"), c.markPageUnloading);
+  f.beforeunload = () => handlers.get("beforeunload")({ preventDefault() { throw Error("Unexpected warning"); } });
+  f.pagehide = () => handlers.get("pagehide")({ persisted: false });
+  return f;
+}
+async function lifecycleCases() {
+  const families = ["images", "customer", "quote_company", "dependency_customer", "dependency_images", "dependency_basis", "basis"];
+  let cases = 0;
+  for (const family of families) for (const phase of ["ordinary", "cancel_before", "cancel_pending", "pagehide_pending"]) for (const outcome of ["success", "failure", "throw"]) {
+    const f = lifecycleFixture(["withQuoteStepLoading", "advanceCustomerStep", "goToNextSidePanel", "confirmQuoteDependencyChange", "confirmBasis"]);
+    const { context: c, state, elements } = f;
+    const panel = family.replace("dependency_", "");
+    const panels = ["images", "customer", "quote_company", "basis", "output"];
+    state.activeSidePanel = panel;
+    c.SIDE_PANEL_SEQUENCE = panels;
+    c.activeSidePanelIndex = () => panels.indexOf(state.activeSidePanel);
+    c.setSidePanel = next => { state.activeSidePanel = next; return true; };
+    c.quoteHasDerivedResults = () => true;
+    c.quoteSessionHasFreshOutputExports = () => false;
+    c.ensureClientQuoteSessionId = () => "quote-test";
+    c.customerStepCheckpointForCurrent = () => ({ sessionId: "quote-test" });
+    c.hasReferenceFilesForNavigation = () => true;
+    c.markQuoteSessionDraftSaveStartedAfterCustomerStep = () => { state.quoteSessionDraftSaveStarted = true; };
+    c.currentQuoteSessionDraftState = () => ({});
+    c.safeQuoteSessionId = id => id;
+    c.quoteCommercialStrictDataEqual = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    c.pendingPricingReferenceSelectionChanged = () => false;
+    c.saveSessionState = () => {};
+    c.updateSidePanelNav = () => {};
+    c.hideQuoteDependencyConfirmModal = () => {};
+    c.clearGeneratedQuoteState = () => {};
+    c.setWorkflowStage = () => {};
+    c.applyPendingPricingReferenceSelection = () => false;
+    c.normalizeActiveJob = value => value;
+    c.newClientOperationId = () => "operation-test";
+    c.basisConfirmBlockReason = () => "";
+    c.missingDetailFields = () => [];
+    c.clearActiveJob = () => { state.activeJob = null; };
+    c.showBlockedBasisAction = () => {};
+    c.refreshOutputRowsFromLineItems = () => {};
+    c.snapshotOutputRows = rows => rows;
+    c.outputRowsToLineItems = () => [{}];
+    c.renderPricingMatches = () => {};
+    c.renderMatchSummary = () => {};
+    c.setResultStatus = () => {};
+    c.outputRowsValid = () => ({ errors: [] });
+    c.renderOutputValidationMessages = () => {};
+    let release, requests = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    async function operation() {
+      requests++; await gate;
+      if (outcome === "throw") throw Error("synthetic-controlled-error");
+      if (outcome === "failure") { state.quoteSessionLoadError = "Synthetic failure. Reference: ERR-1234ABCD."; return null; }
+      return { session_id: "quote-test" };
+    }
+    c.saveQuoteSessionDraftState = family === "basis" ? async () => ({ session_id: "quote-test" }) : operation;
+    c.startQuoteSessionDraftSaveAfterCustomerStep = operation;
+    c.refreshLineItemsFromServer = async () => ({ ok: Boolean(await operation()), data: {} });
+    if (phase === "cancel_before") f.beforeunload();
+    const pending = family.startsWith("dependency_") ? c.confirmQuoteDependencyChange() : c.goToNextSidePanel();
+    // Attach rejection handling before releasing the synthetic transport.
+    const settled = pending.then(value => ({ value }), error => ({ error }));
+    await new Promise(setImmediate);
+    assert.equal(requests, 1, family);
+    assert(state.isPreparingOutput && !elements.excelGeneratingModal.hidden);
+    await c.goToNextSidePanel();
+    assert.equal(requests, 1, "Busy clicks cannot dispatch another save");
+    if (phase === "cancel_pending") f.beforeunload();
+    if (phase === "pagehide_pending") { f.beforeunload(); f.pagehide(); }
+    assert.equal(state.isPageUnloading, phase === "pagehide_pending");
+    release(); const result = await settled;
+    assert.equal(state.isPreparingOutput, false);
+    assert.equal(requests, 1);
+    if (phase !== "pagehide_pending") {
+      if (family === "basis" || outcome === "success") assert(elements.excelGeneratingModal.hidden, family + ": terminal loading must close");
+      else assert(!elements.excelGeneratingModal.hidden && elements.excelGeneratingSpinner.hidden && !elements.excelGeneratingActions.hidden);
+    }
+    if (family === "basis" && outcome === "throw") assert(result.error);
+    if (family === "customer" && outcome !== "success") assert.equal(state.activeSidePanel, "customer");
+    cases++;
+  }
+  const f = lifecycleFixture(["withQuoteStepLoading", "goToNextSidePanel", "postJsonFetchFailure", "jsonFromResponse", "getJson", "fetchCompanyProfileExport", "finishDashboardOperation"]);
+  const { context: c, state, calls } = f;
+  let logged = 0, cleared = 0;
+  c.logClientEvent = () => { logged++; };
+  c.fetchFailureLogDetails = url => ({ url, reason: "fetch_failed" });
+  c.safeProfileId = value => value;
+  c.clearDashboardOperation = () => { cleared++; };
+  c.fetch = async () => { throw Error("synthetic-fetch-failure"); };
+  f.beforeunload();
+  assert.equal(c.postJsonFetchFailure("/synthetic").data.page_unloading, false);
+  assert.equal((await c.getJson("/synthetic")).data.page_unloading, false);
+  await c.fetchCompanyProfileExport("profile-test");
+  c.finishDashboardOperation(); assert.equal(cleared, 1); assert.equal(logged, 3);
+  const abortedBody = { json: async () => { const error = Error("synthetic-body"); error.name = "AbortError"; throw error; } };
+  assert.equal((await c.jsonFromResponse(abortedBody, { persistSession: false })).page_unloading, false);
+  f.pagehide();
+  assert.equal(c.postJsonFetchFailure("/synthetic").data.page_unloading, true);
+  assert.equal((await c.getJson("/synthetic")).data.page_unloading, true);
+  await c.fetchCompanyProfileExport("profile-test");
+  c.finishDashboardOperation(); assert.equal(cleared, 1); assert.equal(logged, 3);
+  assert.equal((await c.jsonFromResponse(abortedBody, { persistSession: false })).page_unloading, true);
+  const mode = lifecycleFixture(["withQuoteStepLoading", "goToNextSidePanel"]);
+  mode.beforeunload(); mode.state.activeSidePanel = "quote_company";
+  await mode.context.goToNextSidePanel(); assert(mode.calls.includes("analysis_choice"));
+  mode.state.activeSidePanel = "output"; const before = mode.calls.length;
+  await mode.context.goToNextSidePanel(); assert.equal(mode.calls.length, before);
+  const transfer = lifecycleFixture(); transfer.state.isRecoveryScopeTransitioning = true;
+  transfer.beforeunload(); assert.equal(transfer.state.isPageUnloading, true, "Explicit scope transfer fence remains terminal");
+  for (const departure of ["stopped", "pagehide", "signout"]) {
+    const auth = lifecycleFixture(["recoverRequiredAuthentication"]);
+    const a = auth.context, s = auth.state;
+    a.authenticationRecoveryPromise = null; a.browserRecoveryEpoch = 1;
+    a.currentBrowserRecoveryScope = () => "synthetic-scope";
+    a.clearQuoteSessionDraftSaveTimer = () => {};
+    a.renderAuthState = () => {};
+    a.renderMessages = () => {};
+    a.commitActiveOutputEditor = () => "blocked";
+    s.authenticated = true; s.csrfToken = "synthetic-token";
+    auth.beforeunload();
+    if (departure === "pagehide") auth.pagehide();
+    if (departure === "signout") s.isSigningOut = true;
+    assert.equal(await a.recoverRequiredAuthentication(401, { status: "auth_required" }), true);
+    assert.equal(Boolean(s.authenticationRecoveryRequested), departure === "stopped");
+    assert.equal(s.csrfToken, departure === "stopped" ? "" : "synthetic-token");
+  }
+  console.log(JSON.stringify({ lifecycle_cases: cases, handler_events: "actual beforeunload/pagehide", provider_requests: 0 }));
+}
+
 (async () => {
   const mode = process.argv[2];
   if (mode === "loading") {
+    await lifecycleCases();
     const { context: c, calls, state, elements } = fixture(["withQuoteStepLoading"]);
     let release;
     const pending = new Promise((resolve) => { release = resolve; });
