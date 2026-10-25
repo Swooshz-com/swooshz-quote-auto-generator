@@ -4,6 +4,22 @@ This index describes the active documentation set for the internal SQAG/SAQG
 quote-generator module. SQAG owns the quote-specific local workflow. Future
 platform concerns belong in `Swooshz-com/swooshz-platform`.
 
+## Source Map
+
+Recorded against source `292eb58769085d43831b278715f35b3749101290`.
+The quote-module maintainers own these entry points; programme issue #143
+and delivery child #212 track the current work. Update this map when an entry
+point or source of truth moves.
+
+| Part | Entry points and sources of truth |
+| --- | --- |
+| Web requests, saved quotes and access | `webapp/server.py`; browser behaviour in `webapp/static/app.js`; Google admission in `webapp/internal_google_auth.py` |
+| Artifact persistence and forensics | `webapp/object_storage.py`, `webapp/forensics.py` and the storage contracts listed below |
+| Workbook generation | `scripts/generate_quote.py` and `templates/`; selected profile/reference authority is defined by `AGENTS.md` |
+| Database evolution | `migrations/`, `webapp/postgres_migrations.py` and [migration runbook](postgres-migration-runbook.md) |
+| Validation | `tests/`, browser commands in `package.json`, [testing plan](testing-plan.md) and `.github/workflows/ci.yml` |
+| Agent guidance and tracking | `AGENTS.md`, [playbook index](agent-playbooks/INDEX.md) and `.github/toolkit-programme.json` |
+
 ## Current Docs
 
 - `docs/sqag-current-status.md`: current RC verdict plus SQAG namespace cleanup
