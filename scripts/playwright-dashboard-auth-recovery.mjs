@@ -189,6 +189,18 @@ async function runAdditionalCases() {
     await seed(page);
     const snapshot = await page.evaluate(() => buildSessionSnapshot());
     let duplicatePosts = 0;
+    let normalizePosts = 0;
+    await page.route("**/api/line-items/normalize", route => {
+      normalizePosts++;
+      const payload = route.request().postDataJSON();
+      assert.equal(payload.quote_session?.session_id, "quote-auth-ordinary-copy");
+      assert.equal(payload.pricing_analysis_seal, undefined);
+      assert(Array.isArray(payload.line_items));
+      assert.equal(payload.line_items.some(row => row.pricing_authority?.variant === "catalog"), false);
+      // This empty-draft transport fixture grants no authority. Real pricing
+      // normalisation and explicit confirmation retain separate guarded tests.
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "normalized", line_items: payload.line_items }) });
+    });
     await page.route("**/api/quote-sessions/quote-auth-ordinary-source", route => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ quote_session: { session_id: "quote-auth-ordinary-source", draft_state: snapshot } }) }));
     await page.route("**/api/quote-sessions", route => {
       if (route.request().method() !== "POST") return route.fulfill({ status: 200, contentType: "application/json", body: '{"quote_sessions":[]}' });
@@ -203,9 +215,10 @@ async function runAdditionalCases() {
     });
     await page.reload();
     await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && !state.quoteSessionRestoreBusy && state.dashboardActiveSessionId === "quote-auth-ordinary-copy");
+    assert.equal(normalizePosts, 1);
     assert.equal(duplicatePosts, 1);
     assert.equal(await page.evaluate(() => localStorage.getItem(DASHBOARD_OPERATION_STORAGE_KEY)), null);
-    cases.push({ id: "ordinary-refresh-resumes-owned-duplicate-once", result: "PASS", duplicatePosts });
+    cases.push({ id: "ordinary-refresh-resumes-owned-duplicate-once", result: "PASS", duplicatePosts, normalizePosts });
     await context.close();
   }
   for (const fault of ["plain401", "403", "500", "network"]) {

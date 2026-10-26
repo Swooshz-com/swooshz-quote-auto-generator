@@ -910,6 +910,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
     const firstPostStarted = new Promise((resolve) => { firstPostStartedResolve = resolve; });
     const secondPostStarted = new Promise((resolve) => { secondPostStartedResolve = resolve; });
     const postedJobIds = [];
+    let generationInputRows = null;
     const postPattern = "**/api/jobs";
     const getPattern = "**/api/jobs/job-*";
     const savePattern = "**/api/quote-sessions";
@@ -923,6 +924,10 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       postCount += 1;
       const payload = route.request().postDataJSON();
       postedJobIds.push(payload.job_id || "");
+      if (!Array.isArray(payload.payload?.line_items) || !payload.payload.line_items.length) {
+        throw new Error("Synthetic current completion requires captured generation input rows.");
+      }
+      generationInputRows = structuredClone(payload.payload.line_items);
       if (postCount === 1) {
         firstPostStartedResolve();
         await new Promise((resolve) => { releaseFirstPost = resolve; });
@@ -974,6 +979,16 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
                 status: "completed",
                 files,
                 pricing_matches: [],
+                // Match the current server contract using the actual dispatched
+                // rows; this transport adapter never creates pricing grants.
+                output_rows: {
+                  schema: "swooshz.quote-output-rows.v1",
+                  rows: generationInputRows.map((row, index) => ({
+                    ...row,
+                    diagnostic_row_id: `row-${index}`,
+                    source_basis_line_id: String(row.source_basis_line_id || ""),
+                  })),
+                },
                 quote_session: {
                   session_id: quoteSessionId,
                   ...(testCase.viewPdf ? {
