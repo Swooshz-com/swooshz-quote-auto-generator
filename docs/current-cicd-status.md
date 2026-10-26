@@ -129,6 +129,13 @@ Source of truth: `.github/workflows/ci.yml`
 - CI never applies migrations against a configured production database. The
   real PostgreSQL migration tests create and remove only disposable databases
   inside the job-scoped service.
+- GitHub repository settings (free on a public repository): Dependabot security
+  updates, secret scanning with push protection, CodeQL default setup and private
+  vulnerability reporting are on.
+- Dependabot opens weekly version updates for pip, npm and GitHub Actions, with
+  patch and minor updates grouped and a short cooldown (seven days for GitHub
+  Actions, three for the rest). Nothing merges on its own: every update PR waits
+  for review.
 
 ## Deploy Runtime Gate
 
@@ -251,7 +258,6 @@ Source of truth: `.github/workflows/ci.yml`
 ## Not Configured
 
 - No deployment workflow is enabled.
-- CodeQL is not enabled.
 - Branch protection requirements are not documented as complete in this repo yet.
 
 ## Maintenance Rule
