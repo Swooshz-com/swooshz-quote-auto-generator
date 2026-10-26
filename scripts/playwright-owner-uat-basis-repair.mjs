@@ -19,6 +19,7 @@ const cpuProfile = args.includes("--cpu-profile");
 // m2: start a draft autosave that is still in flight (delayed by --latency-ms) when Confirm is clicked.
 const inflightSave = args.includes("--inflight-save");
 const freshAnalysis = args.includes("--fresh-analysis");
+const sourceProvenance = args.includes("--source-provenance");
 const cpuThrottle = Number((args.find((arg) => arg.startsWith("--cpu-throttle=")) || "--cpu-throttle=1").split("=")[1]);
 const profiledFunctions = (args.find((arg) => arg.startsWith("--profile=")) || "--profile=").split("=")[1].split(",").filter(Boolean);
 const extraCatalogItems = Number((args.find((arg) => arg.startsWith("--catalog-extra=")) || "--catalog-extra=0").split("=")[1]);
@@ -34,6 +35,18 @@ const profileId = "synthetic-exhibition-fixture-template";
 const quoteCurrency = (args.find((arg) => arg.startsWith("--currency=")) || "--currency=USD").split("=")[1];
 const fxRate = quoteCurrency === "SGD" ? 1 : 0.7391;
 const cents = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
+
+// Normalized basis quantities are canonical text; seeded saved rows may be numeric.
+const exactPositiveQuantity = (value, expected) => {
+  if (typeof value !== "number" && !(typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value))) return false;
+  const quantity = Number(value);
+  return Number.isFinite(quantity) && quantity > 0 && quantity === expected;
+};
+assert(exactPositiveQuantity(4, 4) && exactPositiveQuantity("4", 4), "quantity assertion rejected a canonical representation");
+for (const invalid of [null, undefined, true, false, "", "4 sqm", " 4 ", NaN, Infinity, 0, -4, 9]) {
+  assert(!exactPositiveQuantity(invalid, 4), "quantity assertion accepted an invalid or changed measurement");
+}
+
 
 // Synthetic catalogue with deliberately similar entries; no shared prefix token across sections.
 const slug = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -85,6 +98,11 @@ for (let index = 0; index < fillerLines; index++) {
   const noun = fillerNouns[index % fillerNouns.length];
   cases.push({ id: "filler-" + (index + 1), kind: "filler", section: catalog.find((item) => item.description.toLowerCase().includes(noun)).section, text: "Additional " + noun + " for zone " + (index + 1), quantity: (index % 4) + 1, unit: noun.includes("carpet") || noun.includes("graphic") || noun.includes("banner") || noun.includes("sticker") ? "sqm" : "nos" });
 }
+if (sourceProvenance) cases.push(
+  { id: "u1-provenance", kind: "select", section: "Flooring", text: "Provisional Grey carpet tile installation in the reception footprint", quantity: 12, unit: "sqm", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
+  { id: "u1-second-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile installation in the separate demonstration zone", quantity: 7, unit: "sqm", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
+  ...["a", "b"].map((suffix) => ({ id: "u1-ambiguous-" + suffix, kind: "ambiguous", section: "Flooring", text: "Grey carpet tile installation with ambiguous duplicate ownership", quantity: 3, unit: "sqm", proposal: true, missingSourceId: true })),
+);
 const sections = new Map();
 const lineItems = [];
 for (const entry of cases) {
@@ -93,7 +111,7 @@ for (const entry of cases) {
   if (claimed) line.pricing_keyword = claimed.id;
   if (!sections.has(entry.section)) sections.set(entry.section, { id: slug(entry.section), title: entry.section, lines: [] });
   sections.get(entry.section).lines.push(line);
-  lineItems.push({ section: entry.section, source_basis_line_id: entry.id, description: line.text, quantity: entry.quantity, unit: entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
+  lineItems.push({ section: entry.section, ...(entry.missingSourceId ? {} : { source_basis_line_id: entry.id }), description: line.text, quantity: entry.quantity, unit: entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
 }
 const scenarioPath = path.join(runRoot, "scenario.json");
 await fs.writeFile(scenarioPath, JSON.stringify({ raw: { analysis_findings: [], blocking_clarification_questions: [], quote_basis_sections: [...sections.values()], line_items: lineItems } }, null, 2));
@@ -308,6 +326,27 @@ try {
   });
   assert((result.countProposalBeforeConfirm.tag === "Custom" || result.countProposalBeforeConfirm.custom) && !["catalog", "manual", "included"].includes(result.countProposalBeforeConfirm.variant), "count selection must start as an unpriced AI proposal", result.countProposalBeforeConfirm);
 
+  if (sourceProvenance) {
+    result.sourceProvenance = await page.evaluate(() => {
+      const ids = ["u1-provenance", "u1-second-provenance"];
+      const lines = state.quoteBasisSections.flatMap((section) => section.lines || []);
+      const seal = state.originalAnalysisSnapshot.pricing_analysis_seal;
+      const evidence = ids.map((id) => ({ id, line: lines.find((line) => line.id === id),
+        row: state.lineItems.find((row) => row.source_basis_line_id === id),
+        sealed: seal.rows.find((row) => row.id === id) }));
+      const ambiguous = lines.filter((line) => ["u1-ambiguous-a", "u1-ambiguous-b"].includes(line.id));
+      return { evidence, ambiguous, ambiguousHasGrant: seal.rows.some((row) => ["u1-ambiguous-a", "u1-ambiguous-b"].includes(row.id) && row.catalog_item_id) };
+    });
+    assert(result.sourceProvenance.evidence.every(({ line, row, sealed }) => line?.tag === "Custom"
+      && line.possible_pricing_matches?.length > 0 && row?.pricing_authority?.variant === "none"
+      && sealed?.unit === "sqm" && !sealed.catalog_item_id), "missing raw IDs lost original measurement provenance", result.sourceProvenance);
+    assert(result.sourceProvenance.ambiguous.length > 0 && !result.sourceProvenance.ambiguousHasGrant
+      && result.sourceProvenance.ambiguous.every((line) => !line.possible_pricing_matches?.length), "ambiguous ownership offered an unactionable choice", result.sourceProvenance);
+    result.sourceProvenance.missingIdsRecovered = result.sourceProvenance.evidence.map((entry) => entry.id);
+    // Existing text-only basis merging can retain one note from two ambiguous raw rows.
+    result.sourceProvenance.ambiguityCounts = { rawRows: 2, authoredBasisIds: 2, retainedBasisRows: result.sourceProvenance.ambiguous.length };
+  }
+
   // Fresh proposals offer only choices Confirm can honour. Keep a synthetic old cached
   // candidate to prove that a pre-upgrade invalid choice is still refused at the real boundary.
   result.unitCandidateBeforeConfirm = await page.evaluate(() => {
@@ -399,7 +438,7 @@ try {
   assert(selectionBody.selections.some((entry) => entry.source_basis_line_id === "u1-count" && entry.status === "selected"), "count proposal was not admitted at Confirm", selectionBody.selections);
   assert(selectedCount?.pricing_authority?.variant === "catalog" && selectedCount.pricing_authority.catalog_item_id === byName("Bar Stool").id && selectedCount.pricing_authority.catalog_digest === pricingBasis.digest && selectedCount.pricing_reference_id === pricingBasis.id && selectedCount.pricing_authority.price === byName("Bar Stool").sale_unit_price, "server admission did not bind the selected row to the current reference", selectedCount);
   const selectedCountLine = selectionRequest.quote_basis_sections.flatMap((section) => section.lines || []).find((line) => line.id === "u1-count");
-  assert(selectedCount.quantity === 4 && selectedCountLine?.quantity === 4 && selectedCount.pricing_basis_amount === cents(4 * byName("Bar Stool").sale_unit_price),
+  assert(selectedCount.quantity === 4 && exactPositiveQuantity(selectedCountLine?.quantity, 4) && selectedCount.pricing_basis_amount === cents(4 * byName("Bar Stool").sale_unit_price),
     "Confirm failed to price the valid proposal at its saved basis quantity", { selectedCount, selectedCountLine });
   result.selectedCountBoundary = { section: selectedCount.section, quantity: selectedCount.quantity, basisQuantity: selectedCountLine.quantity, authority: selectedCount.pricing_authority, pricingBasis };
   result.confirm = {
@@ -429,6 +468,14 @@ try {
       const text = (selector) => cells?.querySelector(selector)?.innerText.trim() || "";
       return row ? { index, authority: outputPriceAuthority(row), quantity: row.quantity, rowAmount: row.amount, reference: text('.output-unit-price-cell:not([data-output-edit-field]) .output-cell-text'), quoted: text('[data-output-denomination="quote"] .output-cell-text'), amount: text('.amount-cell') } : null;
     }, id);
+    if (sourceProvenance) {
+      for (const id of ["u1-ambiguous-a", "u1-ambiguous-b"]) {
+        const row = await rowFor(id);
+        assert(!row || (!row.authority && row.quoted === "???" && row.amount === "???"),
+          "ambiguous source identity acquired a quoted price", { id, row });
+      }
+      result.sourceProvenance.ambiguousOutputUnpriced = true;
+    }
     const expectations = [...cases.filter((item) => ["select", "historical"].includes(item.kind)).map((item) => ({ id: item.id, item: byName(item.select), quantity: item.quantity })), { id: "u1-confirmed", item: byName("6 inch Spotlight"), quantity: 7 }];
     const pricing = [];
     for (const expected of expectations) {

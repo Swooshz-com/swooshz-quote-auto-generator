@@ -11171,10 +11171,10 @@ function basisQuantityLabel(line = {}) {
 
 function basisQuantityDisplayLabel(line = {}) {
   const quantityText = basisQuantityText(line.quantity);
-  if (!quantityText) return "1 lot";
+  if (!quantityText) return "Not measured";
   let unit = normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
   if (/^nos?\.?$/i.test(unit)) unit = "nos.";
-  return `${quantityText}${unit ? ` ${unit}` : ""}`;
+  return `${quantityText}${unit ? ` ${unit}` : " (unit needed)"}`;
 }
 
 function basisChatLineContext(line = {}) {
