@@ -15,6 +15,6 @@
     "playwright:owner-uat-basis": "node scripts/playwright-owner-uat-basis-repair.mjs --lines=24 --latency-ms=800"
   },
   "devDependencies": {
-    "playwright": "^1.60.0"
+    "playwright": "^1.64.1"
   }
 }
