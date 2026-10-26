@@ -41376,6 +41376,152 @@ main().catch((error) => {
         self.assertIn("xl/theme/theme1.xml", workbook_names)
         self.assertEqual(result["pricing_matches"][0]["keyword"], "synthetic-internal-graphics-row")
 
+    def test_exact_pricing_reference_catalog_preserves_selected_nested_and_default_path(self):
+        for source, filename in itertools.product(("local", "bundled"), ("pricing-catalog.json", "assets/catalog.json")):
+            with self.subTest(source=source, filename=filename), tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+                roots = {key: Path(tmp) / key for key in ("local", "bundled")}
+                pack_dir = roots[source] / "reserved-pack"
+                catalog_path = pack_dir / filename
+                catalog_path.parent.mkdir(parents=True)
+                catalog = {"items": [{"id": f"reserved-{source}-row"}]}
+                catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+                (pack_dir / "reference.json").write_text(json.dumps({"id": "reserved-pack", "pricing_catalog": filename}), encoding="utf-8")
+                with (
+                    mock.patch.object(webapp, "pricing_references_root", return_value=roots["local"]),
+                    mock.patch.object(webapp, "bundled_pricing_references_root", return_value=roots["bundled"]),
+                ):
+                    pack = webapp.PricingReferencePack.resolve_exact("reserved-pack", source)
+                    self.assertIsNotNone(pack)
+                    self.assertEqual(pack.source, source)
+                    self.assertEqual(pack.pricing_catalog_path, catalog_path.resolve())
+                    self.assertEqual(json.loads(pack.pricing_catalog_path.read_text(encoding="utf-8")), catalog)
+
+    def test_exact_pricing_reference_catalog_rejects_escape_and_absolute_before_read(self):
+        for source, kind in itertools.product(("local", "bundled"), ("relative", "absolute-outside", "absolute-inside")):
+            with self.subTest(source=source, kind=kind), tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+                roots = {key: Path(tmp) / key for key in ("local", "bundled")}
+                pack_dir = roots[source] / "reserved-pack"
+                pack_dir.mkdir(parents=True)
+                catalog = {"items": [{"id": "reserved-sentinel"}]}
+                outside = roots[source] / "reserved-outside.json"
+                outside.write_text(json.dumps(catalog), encoding="utf-8")
+                default = pack_dir / "pricing-catalog.json"
+                default.write_text(json.dumps(catalog), encoding="utf-8")
+                filename = {"relative": "../reserved-outside.json", "absolute-outside": str(outside.resolve()), "absolute-inside": str(default.resolve())}[kind]
+                (pack_dir / "reference.json").write_text(json.dumps({"id": "reserved-pack", "pricing_catalog": filename}), encoding="utf-8")
+                reads = []
+                original_read = Path.read_text
+                def read_selected_pack(path, *args, **kwargs):
+                    self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Catalogue read escaped selected pack")
+                    reads.append(path.resolve())
+                    return original_read(path, *args, **kwargs)
+                with (
+                    mock.patch.object(webapp, "pricing_references_root", return_value=roots["local"]),
+                    mock.patch.object(webapp, "bundled_pricing_references_root", return_value=roots["bundled"]),
+                    mock.patch.object(Path, "read_text", read_selected_pack),
+                ):
+                    self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", source))
+                self.assertNotIn(outside.resolve(), reads)
+                self.assertNotIn(default.resolve(), reads, "Rejected exact selection must not read its default catalogue")
+
+    @unittest.skipIf(os.name == "nt", "Windows native symlink remains held after WinError 1314; Linux CI covers real links")
+    def test_exact_pricing_reference_catalog_rejects_real_symlink_escape_before_read(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            pack_dir = root / "reserved-pack"
+            pack_dir.mkdir()
+            outside = root / "reserved-outside.json"
+            outside.write_text('{"items":[{"id":"reserved-sentinel"}]}', encoding="utf-8")
+            (pack_dir / "linked.json").symlink_to(outside)
+            (pack_dir / "reference.json").write_text('{"id":"reserved-pack","pricing_catalog":"linked.json"}', encoding="utf-8")
+            original_read = Path.read_text
+            def read_selected_pack(path, *args, **kwargs):
+                self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Native symlink catalogue escaped selected pack")
+                return original_read(path, *args, **kwargs)
+            with (
+                mock.patch.object(webapp, "pricing_references_root", return_value=root),
+                mock.patch.object(Path, "read_text", read_selected_pack),
+            ):
+                self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", "local"))
+
+    def test_exact_pricing_reference_catalog_rejects_resolved_escape_before_read(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            pack_dir = root / "reserved-pack"
+            pack_dir.mkdir()
+            catalog_path = pack_dir / "pricing-catalog.json"
+            outside = root / "reserved-outside.json"
+            outside.write_text(json.dumps({"items": [{"id": "reserved-sentinel"}]}), encoding="utf-8")
+            (pack_dir / "reference.json").write_text('{"id":"reserved-pack"}', encoding="utf-8")
+            original_resolve, original_read = Path.resolve, Path.read_text
+            def resolved_path(path, *args, **kwargs):
+                # Filesystem-effect adapter only. The real native symlink check
+                # remains separately held where Windows lacks link privileges.
+                return original_resolve(outside) if path == catalog_path else original_resolve(path, *args, **kwargs)
+            def read_selected_pack(path, *args, **kwargs):
+                self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Resolved catalogue escaped selected pack")
+                return original_read(path, *args, **kwargs)
+            with (
+                mock.patch.object(webapp, "pricing_references_root", return_value=root),
+                mock.patch.object(Path, "resolve", resolved_path),
+                mock.patch.object(Path, "read_text", read_selected_pack),
+            ):
+                self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", "local"))
+
+    def test_exact_pricing_reference_catalog_rejects_resolution_loop_without_fallback_read(self):
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            pack_dir = root / "reserved-pack"
+            pack_dir.mkdir()
+            catalog_path = pack_dir / "assets" / "loop.json"
+            (pack_dir / "pricing-catalog.json").write_text('{"items":[{"id":"reserved-default"}]}', encoding="utf-8")
+            config_path = pack_dir / "reference.json"
+            config_path.write_text('{"id":"reserved-pack","pricing_catalog":"assets/loop.json"}', encoding="utf-8")
+            original_resolve, original_read = Path.resolve, Path.read_text
+            reads = []
+            def resolve_catalog_loop(path, *args, **kwargs):
+                if path == catalog_path:
+                    # CPython 3.12 reports a resolution loop as RuntimeError.
+                    raise RuntimeError("Synthetic catalogue resolution loop")
+                return original_resolve(path, *args, **kwargs)
+            def observed_read(path, *args, **kwargs):
+                reads.append(path)
+                return original_read(path, *args, **kwargs)
+            with (
+                mock.patch.object(webapp, "pricing_references_root", return_value=root),
+                mock.patch.object(Path, "resolve", resolve_catalog_loop),
+                mock.patch.object(Path, "read_text", observed_read),
+            ):
+                self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", "local"))
+            self.assertEqual(reads, [config_path])
+
+    def test_exact_pricing_reference_catalog_rejects_missing_and_wrong_identity_without_fallback(self):
+        cases = ("missing-config", "missing-catalog", "wrong-config-id", "wrong-source", "missing-bundled", "invalid-id")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+                local, bundled = Path(tmp) / "local", Path(tmp) / "bundled"
+                pack_dir = local / "reserved-pack"
+                pack_dir.mkdir(parents=True)
+                (pack_dir / "pricing-catalog.json").write_text('{"items":[{"id":"reserved-default"}]}', encoding="utf-8")
+                if case != "missing-config":
+                    config = {"id": "different-pack" if case == "wrong-config-id" else "reserved-pack"}
+                    if case == "missing-catalog": config["pricing_catalog"] = "missing.json"
+                    (pack_dir / "reference.json").write_text(json.dumps(config), encoding="utf-8")
+                reads = []
+                original_read = Path.read_text
+                def observed_read(path, *args, **kwargs):
+                    reads.append(path)
+                    return original_read(path, *args, **kwargs)
+                with (
+                    mock.patch.object(webapp, "pricing_references_root", return_value=local),
+                    mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled),
+                    mock.patch.object(Path, "read_text", observed_read),
+                ):
+                    source = "company" if case == "wrong-source" else "bundled" if case == "missing-bundled" else "local"
+                    reference_id = "../reserved-pack" if case == "invalid-id" else "reserved-pack"
+                    self.assertIsNone(webapp.PricingReferencePack.resolve_exact(reference_id, source))
+                self.assertNotIn(pack_dir / "pricing-catalog.json", reads)
+
     def test_save_pricing_reference_pack_writes_local_reference_files_and_images(self):
         data_url = "data:image/png;base64,ZmFrZS1jaGFpcg=="
         with mock_pricing_metadata_enrichment():

@@ -18581,7 +18581,15 @@ class PricingReferencePack:
             or config.get("id") != reference_id
         ):
             return None
-        catalog = load_json_file(reference_dir / (clean_text(config.get("pricing_catalog")) or "pricing-catalog.json"))
+        catalog_filename = Path(clean_text(config.get("pricing_catalog")) or "pricing-catalog.json")
+        if catalog_filename.is_absolute() or catalog_filename.drive:
+            return None
+        try:
+            catalog_path = (reference_dir / catalog_filename).resolve()
+            catalog_path.relative_to(reference_dir.resolve())
+        except (OSError, RuntimeError, ValueError):
+            return None
+        catalog = load_json_file(catalog_path)
         if not isinstance(catalog, dict) or not isinstance(catalog.get("items"), list) or not catalog.get("items"):
             return None
         return cls(reference_id, reference_dir, dict(config), source)
