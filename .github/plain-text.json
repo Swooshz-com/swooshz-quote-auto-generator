@@ -1,0 +1,13 @@
+{
+  "schema": "toolkit-plain-text-config/v1",
+  "description": "Settings for the plain-text check. Add this repository's own shorthand codes to banned_terms, each with a reason and the plain wording to use instead.",
+  "rules": {
+    "github-link": true,
+    "number-reference": true,
+    "pr-number-label": true,
+    "codex-mode-name": false
+  },
+  "banned_terms": [],
+  "explained_terms": [],
+  "kept_terms": []
+}

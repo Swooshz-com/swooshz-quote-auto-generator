@@ -12,6 +12,7 @@ __pycache__/
 Thumbs.db
 .superpowers/
 .agent-toolkit-backups/
+_agent-toolkit-backups/
 node_modules/
 .venv/
 playwright-report/
