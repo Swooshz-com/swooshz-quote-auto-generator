@@ -2,7 +2,7 @@ pypdfium2==5.13.0
 pillow==13.0.0
 PyJWT[crypto]==2.15.1
 cryptography==50.0.2
-boto3==1.43.116
+boto3==1.43.118
 botocore==1.43.116
 jmespath==1.1.0
 psycopg[binary]==3.3.6
