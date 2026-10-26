@@ -14,6 +14,7 @@ from unittest import mock
 
 from webapp.forensics import ForensicStore, RetentionGraphHeld, iso_timestamp
 from webapp import server as webapp
+from tests.test_webapp import generation_diagnostic_manual_brief, write_generator_diagnostic_fixture
 from scripts import enforce_forensic_retention
 from tests.test_webapp import eligible_database_publication_fixture, expected_publication_url
 
@@ -1978,9 +1979,10 @@ class Pr140RegressionTest(unittest.TestCase):
             rules = root / "layout-rules.json"
             rules.write_text("{}", encoding="utf-8")
             pricing = root / "pricing.json"
-            pricing.write_text(json.dumps({"items": []}), encoding="utf-8")
+            pricing.write_text(json.dumps({"schema_version": 1, "currency": "SGD", "items": []}), encoding="utf-8")
 
             def fake_generator(command, **_kwargs):
+                write_generator_diagnostic_fixture(command)
                 output_dir = Path(command[command.index("--out") + 1])
                 output_dir.mkdir(parents=True, exist_ok=True)
                 (output_dir / "quotation.xlsx").write_bytes(storage.content)
@@ -2034,9 +2036,8 @@ class Pr140RegressionTest(unittest.TestCase):
                     webapp, "pricing_catalog_path_for_payload", return_value=pricing
                 ),
                 mock.patch.object(webapp, "save_uploaded_images", return_value=[]),
-                mock.patch.object(webapp, "payload_to_brief", return_value={}),
+                mock.patch.object(webapp, "payload_to_brief", side_effect=lambda *args, **kwargs: generation_diagnostic_manual_brief()),
                 mock.patch.object(webapp.subprocess, "run", side_effect=fake_generator),
-                mock.patch.object(webapp, "read_pricing_matches", return_value=[]),
                 mock.patch.object(webapp, "read_export_status", return_value=""),
                 mock.patch.object(
                     webapp, "embedded_layout_rules_from_xlsx_bytes", return_value={}

@@ -237,6 +237,8 @@ class QuoteLine:
     price_mode: str = "Priced"
     unit_price_override: float | None = None
     pricing_authority: dict[str, Any] | None = None
+    diagnostic_row_id: str = ""
+    source_basis_line_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -987,6 +989,8 @@ def prepare_lines(
                 match_status=status,
                 match_candidates=candidates,
                 pricing_authority=authority,
+                diagnostic_row_id=str(item.get("diagnostic_row_id") or ""),
+                source_basis_line_id=str(item.get("source_basis_line_id") or ""),
             )
         )
     return prepared
@@ -3885,7 +3889,7 @@ def write_styled_pdf_fallback(path: Path, brief: dict[str, Any], lines: list[Quo
 def write_match_csv(path: Path, lines: list[QuoteLine]) -> None:
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["status", "section", "description", "keyword", "pricing_id", "catalog_description", "quantity", "unit_price", "amount"])
+        writer.writerow(["status", "section", "description", "keyword", "pricing_id", "catalog_description", "quantity", "unit_price", "amount", "diagnostic_row_id", "source_basis_line_id"])
         for line in lines:
             match = line.matched_price
             writer.writerow([spreadsheet_safe_text(value) for value in [
@@ -3898,6 +3902,8 @@ def write_match_csv(path: Path, lines: list[QuoteLine]) -> None:
                 quantity_text(line),
                 f"{line.unit_price_override:.2f}" if line.unit_price_override is not None else (f"{match.sale_unit_price:.2f}" if match else ""),
                 money(amount_value(line)),
+                line.diagnostic_row_id,
+                line.source_basis_line_id,
             ]])
 
 

@@ -871,6 +871,8 @@ function normalizeActiveJob(job = {}, options = {}) {
   if (![...SERVER_JOB_TYPES, "confirm_basis"].includes(type) || !id) return null;
   if (SERVER_JOB_TYPES.has(type) && !/^job-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
   if (type === "confirm_basis" && !/^operation-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
+  if (["generate", "generate_pdf"].includes(type) && Object.prototype.hasOwnProperty.call(job, "outputRowsSchema")
+    && job.outputRowsSchema !== "swooshz.quote-output-rows.v1") return null;
   const phase = String(job.phase || "").trim();
   if (!["starting", "running"].includes(phase)) return null;
   const rawStartedAt = job.startedAt ?? job.created_at ?? job.createdAt;
@@ -4800,6 +4802,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       ...(draftCandidates[0] || {}),
       ...savedState,
     };
+  if (isPlainObject(restoredState.originalAnalysisSnapshot)
+    && Object.prototype.hasOwnProperty.call(restoredState.originalAnalysisSnapshot, "line_items")
+    && !Array.isArray(restoredState.originalAnalysisSnapshot.line_items)) return false;
   const canRestoreBrowserTransientAuthority = !containerMalformed
     && options.suppressAutomaticOperations !== true
     && !nestedSession
@@ -15103,6 +15108,15 @@ async function modifyDashboardQuote(sessionId, options = {}) {
   }
 }
 
+function copiedQuotePricingRow(row, normalizer = normalizeLineItem) {
+  if (row?.pricing_authority?.variant !== "catalog") return { ...row };
+  const unbound = { ...row, pricing_keyword: "", catalog_description: "", pricing_reference_description: "", status: "unmatched" };
+  delete unbound.pricing_authority;
+  // Reuse legacy recovery's price demotion. Source prices are evidence only;
+  // this quote's explicit confirmation must obtain its own server grants.
+  return normalizeRestoredPricingRow(unbound, normalizer);
+}
+
 async function duplicateDashboardQuote(sessionId, options = {}) {
   if (commitActiveOutputEditor() === "blocked") return false;
   const sourceSessionId = safeQuoteSessionId(sessionId || "");
@@ -15112,11 +15126,18 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
   const operation = isResume ? normalizeDashboardOperation(options.operation || state.dashboardOperation || {}) : saveDashboardOperation({ type: "duplicate", sourceSessionId, targetSessionId });
   if (!operation) return false;
   state.dashboardOperation = operation;
+  const recoveryEpoch = browserRecoveryEpoch;
+  const recoveryScope = currentBrowserRecoveryScope();
+  const operationIsCurrent = () => state.dashboardOperation === operation
+    && recoveryEpoch === browserRecoveryEpoch && recoveryScope === currentBrowserRecoveryScope()
+    && !state.isPageUnloading && !state.authenticationRecoveryRequested && !state.isSigningOut
+    && !state.isRecoveryScopeTransitioning;
   clearQuoteSessionDraftSaveTimer();
   state.quoteSessionRestoreBusy = true;
   setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(sourceSessionId);
+    if (!operationIsCurrent()) return false;
     if (!detailedSession) {
       finishDashboardOperation();
       return false;
@@ -15136,12 +15157,37 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
     }
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, sourceSessionId);
+    if (!operationIsCurrent()) return false;
+    draftState = {
+      ...draftState,
+      lineItems: Array.isArray(draftState.lineItems) ? draftState.lineItems.map((row) => copiedQuotePricingRow(row)) : draftState.lineItems,
+      outputRows: Array.isArray(draftState.outputRows) ? draftState.outputRows.map((row) => copiedQuotePricingRow(row, normalizeOutputRow)) : draftState.outputRows,
+      originalOutputRows: Array.isArray(draftState.originalOutputRows) ? draftState.originalOutputRows.map((row) => copiedQuotePricingRow(row, normalizeOutputRow)) : draftState.originalOutputRows,
+      originalAnalysisSnapshot: isPlainObject(draftState.originalAnalysisSnapshot)
+        ? { ...draftState.originalAnalysisSnapshot, pricing_analysis_seal: null,
+          ...(Array.isArray(draftState.originalAnalysisSnapshot.line_items)
+            ? { line_items: draftState.originalAnalysisSnapshot.line_items.map((row) => copiedQuotePricingRow(row)) } : {}) } : null,
+    };
     const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: operation.targetSessionId, quoteSessionDraftSaveStarted: true }, { sessionId: operation.targetSessionId, forceQuoteView: false });
     if (!restored) {
       finishDashboardOperation();
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
       return false;
     }
+    // Target normalisation demotes copied claims. Explicit Confirm/selection
+    // remains the only operation that can request new target pricing grants.
+    if (!operationIsCurrent() || safeQuoteSessionId(state.quoteSessionId) !== operation.targetSessionId) return false;
+    if (state.outputRows.length) state.lineItems = outputRowsToLineItems();
+    const normalizePayload = buildLineItemNormalizePayload();
+    const normalized = await postJson("/api/line-items/normalize", normalizePayload);
+    if (!operationIsCurrent() || safeQuoteSessionId(state.quoteSessionId) !== operation.targetSessionId) return false;
+    if (!normalized.ok || !sameLineItemSourceIdentities(normalized.data?.line_items, normalizePayload.line_items)) {
+      finishDashboardOperation();
+      dashboardRestoreError(genericFailureMessages(normalized.data || {})[0]);
+      return false;
+    }
+    state.lineItems = normalized.data.line_items.map(normalizeLineItem);
+    state.outputRows = state.lineItems.map(outputRowFromLineItem);
     state.quoteSessionDraftSaveStarted = true;
     state.quoteSessionRestoredSessionId = "";
     state.quoteSessionRestoredDraftKey = "";
@@ -15162,8 +15208,11 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
     scrollDashboardSessionIntoView(state.dashboardActiveSessionId);
     return true;
   } finally {
-    state.quoteSessionRestoreBusy = false;
-    setDashboardLoadingState(false);
+    if (recoveryEpoch === browserRecoveryEpoch && recoveryScope === currentBrowserRecoveryScope()
+      && (!state.dashboardOperation || state.dashboardOperation === operation)) {
+      state.quoteSessionRestoreBusy = false;
+      setDashboardLoadingState(false);
+    }
   }
 }
 function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "XLSX") {
@@ -16310,6 +16359,71 @@ async function confirmBasis(options = {}) {
   }
 }
 
+function sameLineItemSourceIdentities(rows, inputRows) {
+  if (!Array.isArray(rows) || !Array.isArray(inputRows) || rows.length !== inputRows.length) return false;
+  const counts = new Map();
+  for (const row of inputRows) {
+    if (!isPlainObject(row)) return false;
+    const id = String(row.source_basis_line_id || "");
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  for (const row of rows) {
+    if (!isPlainObject(row)) return false;
+    const id = String(row.source_basis_line_id || "");
+    if (!counts.get(id)) return false;
+    counts.set(id, counts.get(id) - 1);
+  }
+  return true;
+}
+
+function adoptGenerationOutputRows(data = {}, inputRows = state.lineItems, options = {}) {
+  const hasStructuredRows = Object.prototype.hasOwnProperty.call(data, "output_rows");
+  const existingRows = Array.isArray(state.outputRows) ? state.outputRows : [];
+  // Hard/pre-generator failures can legitimately omit diagnostics. Only the
+  // saved-job resume caller may retain usable rows for a legacy-format result;
+  // absence alone never identifies an old runtime or rebuilds CSV authority.
+  const usableExistingRows = existingRows.length > 0 && existingRows.every((row) => (
+    isPlainObject(row) && ["Priced", "Included"].includes(row.price_mode)
+    && typeof row.description === "string" && row.description.trim()
+    && row.quantity !== undefined && typeof row.unit === "string"
+    && isPlainObject(row.pricing_authority) && PRICING_AUTHORITY_VARIANTS.has(row.pricing_authority.variant)
+  ));
+  if (!hasStructuredRows && ["failed", "blocked"].includes(data.status)) return data;
+  if (!hasStructuredRows && options.allowLegacyRows === true && usableExistingRows) return data;
+  const envelope = data.output_rows;
+  const rows = isPlainObject(envelope) && envelope.schema === "swooshz.quote-output-rows.v1"
+    && Array.isArray(envelope.rows) ? envelope.rows : [];
+  const tokens = new Set();
+  const expectedIds = new Map();
+  const receivedIds = new Map();
+  const capturedRows = Array.isArray(inputRows) ? inputRows : [];
+  capturedRows.forEach((row) => {
+    const id = String(row?.source_basis_line_id || "");
+    expectedIds.set(id, (expectedIds.get(id) || 0) + 1);
+  });
+  const valid = hasStructuredRows && rows.length > 0 && rows.length === capturedRows.length && rows.every((row) => {
+    if (!isPlainObject(row) || !/^row-(0|[1-9][0-9]*)$/.test(row.diagnostic_row_id || "")
+      || tokens.has(row.diagnostic_row_id) || typeof row.source_basis_line_id !== "string"
+      || !isPlainObject(row.pricing_authority)
+      || !["catalog", "manual", "included", "none", "historical"].includes(row.pricing_authority.variant)) return false;
+    tokens.add(row.diagnostic_row_id);
+    const id = row.source_basis_line_id;
+    receivedIds.set(id, (receivedIds.get(id) || 0) + 1);
+    if (row.pricing_authority.variant === "catalog" && (!id || expectedIds.get(id) !== 1)) return false;
+    return expectedIds.has(id) && receivedIds.get(id) <= expectedIds.get(id);
+  });
+  if (!valid || (data.status === "completed"
+    && (!usableExistingRows || !sameLineItemSourceIdentities(existingRows, capturedRows)))) {
+    return { ...data, status: "failed", files: [], committed_files: [], errors: [GENERIC_FAILURE_MESSAGE] };
+  }
+  // Publication is bound to the exact saved Output representation. A completed
+  // job validates correspondence but keeps that representation; rewriting its
+  // statuses/formatting here would stale the just-committed workbook on save.
+  if (data.status === "completed") return data;
+  state.outputRows = rows.map(outputRowFromLineItem);
+  return data;
+}
+
 async function handleGenerate(options = {}) {
   if (commitActiveOutputEditor() === "blocked") return false;
   if (state.isGenerating) return;
@@ -16355,12 +16469,12 @@ async function handleGenerate(options = {}) {
     setWorkflowStage("basis_review");
     return;
   }
-  const hadSuccessfulExports = quoteSessionHasFreshOutputExports();
 
   const jobType = viewPdf ? "generate_pdf" : "generate";
   const operation = normalizeActiveJob({
     id: newClientJobId(),
     type: jobType,
+    outputRowsSchema: "swooshz.quote-output-rows.v1",
     phase: "starting",
     startedAt: new Date().toISOString(),
     viewPdf,
@@ -16389,7 +16503,9 @@ async function handleGenerate(options = {}) {
     syncControlStates();
     return;
   }
-  const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
+  const generationPayload = buildPayload({ viewPdf });
+  const generationInputRows = generationPayload.line_items.map((row) => ({ ...row }));
+  const started = await startJob(jobType, generationPayload, { jobId: operation.id });
   const startedContext = currentGenerationContext();
   transitionGenerationContext(startedContext.session_id, started.data?.generation_run_id || startedContext.run_id);
   if (!started.ok) {
@@ -16416,7 +16532,7 @@ async function handleGenerate(options = {}) {
   state.isGenerating = false;
   clearActiveJob();
 
-  const data = polled.data.result || polled.data || {};
+  const data = adoptGenerationOutputRows(polled.data.result || polled.data || {}, generationInputRows);
   const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
   const previousContext = currentGenerationContext();
   const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
@@ -16428,10 +16544,8 @@ async function handleGenerate(options = {}) {
     setResultStatus(data.status || "Failed", "is-bad");
     const blocked = polled.data.status === "blocked" || data.status === "blocked";
     renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
-    if (!hadSuccessfulExports && data.pricing_matches?.length) {
-      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    }
-    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
+    renderPricingMatches(state.outputRows);
+    renderMatchSummary({ pricing_matches: state.outputRows });
     syncControlStates();
     return;
   }
@@ -16444,10 +16558,8 @@ async function handleGenerate(options = {}) {
     renderMessages([]);
     clearPricingReviewMessages();
     setSidePanel("output", { force: true });
-    if (!hadSuccessfulExports && data.pricing_matches?.length) {
-      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    }
-    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
+    renderPricingMatches(state.outputRows);
+    renderMatchSummary({ pricing_matches: state.outputRows });
   } else {
     setWorkflowStage("completed");
     clearPricingReviewMessages();
@@ -16490,6 +16602,15 @@ async function ensureSavedServerJobStarted(activeJob) {
   if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
   const isDraft = activeJob.type === "draft";
   const viewPdf = activeJob.type === "generate_pdf" || activeJob.viewPdf === true;
+  if (["generate", "generate_pdf"].includes(activeJob.type)) {
+    if (Object.prototype.hasOwnProperty.call(activeJob, "outputRowsSchema")
+      && activeJob.outputRowsSchema !== "swooshz.quote-output-rows.v1") {
+      return { ok: false, data: { status: "failed", errors: [GENERIC_FAILURE_MESSAGE] } };
+    }
+    activeJob = { ...activeJob, outputRowsSchema: "swooshz.quote-output-rows.v1" };
+    state.activeJob = activeJob;
+    saveSessionState();
+  }
   const saveFailure = {};
   const synchronizedSessionId = await ensureQuoteSession({
     quoteGenerated: !isDraft,
@@ -16665,6 +16786,7 @@ async function resumeSavedJob() {
       return;
     }
     const resumedJob = state.activeJob || activeJob;
+    const generationInputRows = state.lineItems.map((row) => ({ ...row }));
 
     const polled = await pollJob(resumedJob.id);
     if (polled.aborted) return;
@@ -16674,7 +16796,8 @@ async function resumeSavedJob() {
       return;
     }
 
-    const data = polled.data.result || polled.data || {};
+    const data = adoptGenerationOutputRows(polled.data.result || polled.data || {}, generationInputRows, { allowLegacyRows: resumedJob.phase === "running"
+      && !Object.prototype.hasOwnProperty.call(resumedJob, "outputRowsSchema") });
     const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
     const previousContext = currentGenerationContext();
     const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
@@ -16689,8 +16812,8 @@ async function resumeSavedJob() {
       setResultStatus(data.status || "Failed", "is-bad");
       const blocked = polled.data.status === "blocked" || data.status === "blocked";
       renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
-      if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-      renderMatchSummary(data);
+      renderPricingMatches(state.outputRows);
+      renderMatchSummary({ pricing_matches: state.outputRows });
       syncControlStates();
       return;
     }
@@ -16729,8 +16852,8 @@ async function resumeSavedJob() {
       clearPricingReviewMessages();
       setSidePanel("output");
     }
-    if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    renderMatchSummary(data);
+    renderPricingMatches(state.outputRows);
+    renderMatchSummary({ pricing_matches: state.outputRows });
     if (postCommitProjectionWarning) {
       saveSessionState();
     } else {

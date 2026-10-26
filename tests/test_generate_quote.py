@@ -5164,3 +5164,23 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class GeneratorDiagnosticIdentityTest(unittest.TestCase):
+    def test_real_prepare_and_csv_preserve_cardinality_and_formula_safe_source_identity(self):
+        source_ids = ["basis-one", "", "same", "same", "=synthetic", " +synthetic", "-synthetic", "@synthetic"]
+        brief = {"_pricing_authority_enforced": True, "line_items": [
+            {"section": "Synthetic section", "description": "Same synthetic label", "quantity": 2,
+             "unit": "nos", "price_mode": "Priced", "diagnostic_row_id": f"row-{index}",
+             "source_basis_line_id": source_id, "pricing_authority": {"variant": "none"}}
+            for index, source_id in enumerate(source_ids)]}
+        before = copy.deepcopy(brief)
+        prepared = quote.prepare_lines(brief, [], False)
+        self.assertEqual(len(prepared), len(source_ids))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "diagnostics.csv"
+            quote.write_match_csv(path, prepared)
+            with path.open(encoding="utf-8", newline="") as handle: rows = list(csv.DictReader(handle))
+        self.assertEqual([row["diagnostic_row_id"] for row in rows], [f"row-{i}" for i in range(len(source_ids))])
+        self.assertEqual([row["source_basis_line_id"] for row in rows], [quote.spreadsheet_safe_text(value) for value in source_ids])
+        self.assertEqual([row["status"] for row in rows], ["unmatched"] * len(source_ids))
+        self.assertEqual(brief, before)

@@ -1058,6 +1058,30 @@ class JsonResponseMock:
         return False
 
 
+def generation_diagnostic_manual_brief():
+    """Admitted synthetic manual row for isolated publication/forensic fixtures."""
+    row = {"source_basis_line_id": "synthetic-manual-row", "section": "General", "description": "Synthetic manual service",
+           "quantity": 1, "unit": "nos", "price_mode": "Priced", "unit_price_override": 1}
+    row["pricing_authority"] = webapp.build_pricing_authority("manual", row, price=1,
+        reference_authority={"detail": {"currency": "SGD"}})
+    return {"currency": "SGD", "_pricing_authority_enforced": True,
+            "_pricing_reference_authority": {"id": "synthetic-pricing", "source": "local", "currency": "SGD", "digest": "sha256:" + "a" * 64},
+            "line_items": [row]}
+
+
+def write_generator_diagnostic_fixture(command):
+    """Keep transport/publication stubs on the real generator's diagnostic contract."""
+    from scripts import generate_quote as generator
+    brief = json.loads(Path(command[command.index("--brief") + 1]).read_text(encoding="utf-8"))
+    reference = brief.get("_pricing_reference_authority")
+    catalog = generator.extract_price_rows(Path(command[command.index("--template") + 1]), trusted_reference=reference)
+    lines = generator.prepare_lines(brief, catalog, "--allow-ambiguous" in command,
+        authority_required=brief.get("_pricing_authority_enforced") is True, trusted_pricing_reference=reference)
+    output = Path(command[command.index("--out") + 1])
+    output.mkdir(parents=True, exist_ok=True)
+    generator.write_match_csv(output / "pricing_matches.csv", lines)
+
+
 class WebappServerTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -3788,12 +3812,12 @@ class WebappServerTest(unittest.TestCase):
         resume_body = js.split("async function resumeSavedJob", 1)[1].split("async function checkHealth", 1)[0]
         resume_review_body = resume_body.split("if (needsPricingReview)", 1)[1].split("} else", 1)[0]
 
-        self.assertIn("const hadSuccessfulExports = quoteSessionHasFreshOutputExports();", generate_body)
+        self.assertIn("adoptGenerationOutputRows(polled.data.result || polled.data || {}, generationInputRows)", generate_body)
         self.assertNotIn("setDownloadFiles([])", failure_body)
         self.assertNotIn("setDownloadFiles([])", resume_review_body)
         self.assertNotIn("renderMatchSummary({});", failure_body)
-        self.assertIn("if (!hadSuccessfulExports && data.pricing_matches?.length)", failure_body)
-        self.assertIn("renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);", failure_body)
+        self.assertIn("renderPricingMatches(state.outputRows);", failure_body)
+        self.assertIn("renderMatchSummary({ pricing_matches: state.outputRows });", failure_body)
 
     def test_static_authority_profile_race_discards_late_request_completely(self):
         node = require_node(self)
@@ -8793,6 +8817,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             return JsonResponseMock(self.platform_consume_payload())
 
         def fake_generator_run(command, **kwargs):
+            write_generator_diagnostic_fixture(command)
             output_dir = Path(command[command.index("--out") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
@@ -15974,6 +15999,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         log_details = write_log.call_args.args[1]
         self.assertEqual(log_details["error_reference"], result["error_reference"])
         self.assertEqual(log_details["failure_kind"], "generator_failed")
+        self.assertEqual(result["return_code"], 1)
+        self.assertNotIn("output_rows", result)
+        self.assertFalse(result.get("files"))
         self.assertEqual(log_details["error_count"], 1)
         self.assertNotIn("Quote has too many rows", json.dumps(log_details))
 
@@ -16087,7 +16115,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
         self.assertIn("viewCurrentPdfFile", js)
         self.assertIn('const jobType = viewPdf ? "generate_pdf" : "generate";', js)
         self.assertIn(
-            "startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id })",
+            "startJob(jobType, generationPayload, { jobId: operation.id })",
             js,
         )
         self.assertIn("quotation.pdf", webapp.DOWNLOADABLE_FILES)
@@ -16560,6 +16588,7 @@ assert.strictEqual(referenceFileTypeLabel(stalePdf), "PDF");
     @staticmethod
     def _run466_fake_generator(outputs: dict[str, tuple[bytes, bytes | None]]):
         def fake_generator(command, **_kwargs):
+            write_generator_diagnostic_fixture(command)
             output_dir = Path(command[command.index("--out") + 1])
             xlsx_bytes, pdf_bytes = outputs[output_dir.name]
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -25838,7 +25867,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         generate_body = js.split("async function handleGenerate(options = {})", 1)[1].split("async function resumeSavedJob", 1)[0]
         review_generate_body = generate_body.split("if (needsPricingReview) {", 1)[1].split("} else {", 1)[0]
         completed_generate_body = generate_body.split("} else {", 1)[-1].split("syncControlStates();", 1)[0]
-        self.assertIn('renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });', review_generate_body)
+        self.assertIn("renderPricingMatches(state.outputRows);", review_generate_body)
         self.assertIn("renderPricingMatches(state.outputRows);", completed_generate_body)
         self.assertNotIn("fromPricingMatches", completed_generate_body)
         customer_panel = html.split('id="customerDetailsPanel"', 1)[1].split('id="quoteCompanyPanel"', 1)[0]
@@ -29099,6 +29128,7 @@ if (scenario.path === "duplicate") constantNames.push("QUOTE_SESSION_FILE_STORE_
   "DEFAULT_CURRENCY_LABEL");
 if (scenario.originalBoundary || scenario.path === "duplicate") constantNames.push("QUOTE_SESSION_STORAGE_KEY", "QUOTE_SESSION_STATE_VERSION",
   "MAX_REFERENCE_IMAGES");
+constantNames.push("PRICING_AUTHORITY_VARIANTS");
 const constantSource = constantNames.map(name => {
   const match = source.match(new RegExp(`const ${name} = [\\s\\S]*?;`));
   assert(match, name);
@@ -29193,12 +29223,12 @@ const syntheticApplySessionData = async data => { state.csrfToken = data.csrf_to
 const responseFor = (status, data) => ({ ok: status >= 200 && status < 300, status,
   json: async () => { if (scenario.malformed) throw new SyntaxError(CANARY); if (scenario.bodyAbort) throw new DOMException(CANARY, "AbortError"); return data; } });
 async function fetch(url, options) {
-  assert(["/api/quote-sessions", "/api/jobs", "/api/log", "/api/session", "/api/jobs/job-synthetic-stable"].includes(url), "Non-synthetic transport denied");
+  assert(["/api/quote-sessions", "/api/jobs", "/api/log", "/api/session", "/api/jobs/job-synthetic-stable", "/api/line-items/normalize"].includes(url), "Non-synthetic transport denied");
   if (url === "/api/quote-sessions" && !options) { calls.push({ url, method: "GET" }); return responseFor(200, { quote_sessions: persisted ? [persisted] : [] }); }
   if (url === "/api/jobs/job-synthetic-stable") {
     calls.push({ url, method: "GET" });
     return responseFor(200, scenario.excelFault === "poll" ? { status: "failed", result: { status: "failed", error_reference: "ERR-1234ABCD" } } :
-      { status: "completed", result: { status: "completed", files: [{ name: "quotation.xlsx", url: "/api/synthetic-current.xlsx" }] } });
+      { status: "completed", result: { status: "completed", output_rows: {schema:"swooshz.quote-output-rows.v1",rows:state.outputRows.map((row,index)=>({...row,diagnostic_row_id:`row-${index}`,source_basis_line_id:String(row.source_basis_line_id||"")}))}, files: [{ name: "quotation.xlsx", url: "/api/synthetic-current.xlsx" }] } });
   }
   if (url === "/api/session") {
     calls.push({ url, method: "GET" });
@@ -29212,6 +29242,7 @@ async function fetch(url, options) {
     return responseFor(200, { csrf_token: "refreshed", browser_recovery_scope: "a".repeat(64) });
   }
   const payload = JSON.parse(options.body);
+  if (url === "/api/line-items/normalize") return {ok:true,status:200,json:async()=>({line_items:payload.line_items})};
   if (url === "/api/log") { logs.push(payload); return responseFor(204, {}); }
   if (scenario.path === "duplicate") assert.strictEqual(state.quoteSessionLoadError, "", "Duplicate save did not reset its attempt error");
   calls.push({ url, payload });
@@ -29255,7 +29286,8 @@ const setSidePanel = value => { state.activeSidePanel = value; };
 const showAiFailureBanner = value => messages.push(value);
 const showAiBlockedBanner = value => messages.push(value);
 const showBlockedAction = value => messages.push(value);
-const buildPayload = () => ({ synthetic: true });
+const buildPayload = () => ({ synthetic: true, line_items: state.lineItems });
+const buildLineItemNormalizePayload = () => ({ line_items: state.lineItems });
 const applyDraftPricingReferenceReview = () => {};
 const safeGenerationRunId = value => String(value || "");
 const clearPricingReviewMessages = () => {};
@@ -29313,6 +29345,7 @@ const cloneQuoteBasis = value => structuredClone(value);
 const normalizeQuoteBasisSections = value => structuredClone(value);
 const normalizeLineItem = value => structuredClone(value);
 const normalizeOutputRow = value => structuredClone(value);
+const outputRowFromLineItem = value => normalizeOutputRow(value);
 const normalizeBoothDimensions = value => structuredClone(value);
 const syntheticRevisionNumber = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 const renderFiles = () => {};
@@ -29339,7 +29372,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
   "quoteSessionDraftSynchronizationFailureMessage", "handleDraftBasis", "handleGenerate",
-  "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote"];
+  "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
 if (scenario.tentativeBoundary) required.push("handleBeforeUnload");
@@ -29457,7 +29490,7 @@ async function act() {
 (async () => {
   if (scenario.kind === "excel") {
     state.activeSidePanel = "output";
-    state.outputRows = [{ quantity: 1, unit: "sqm", unit_price: 100 }];
+    state.outputRows = [{ quantity: 1, unit: "sqm", unit_price: 100, description: "Synthetic current row", price_mode: "Priced", pricing_authority:{variant:"manual"} }];
     state.outputRevision = 1; state.downloadFileRevision = 1;
     state.downloadFile = { name: "quotation.xlsx", url: "/api/synthetic-prior.xlsx", output_revision: 1 };
     state.outputRows[0].quantity = 2; markOutputRowsDirty();
@@ -33381,7 +33414,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 stdout="Wrote quotation.xlsx\nPDF export status: skipped\n",
                 stderr="",
             )
-            with mock.patch.object(webapp.subprocess, "run", return_value=completed) as run:
+            with mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run:
                 result = webapp.run_quote_job(
                     payload,
                     output_root=Path(tmp) / "out",
@@ -33407,7 +33440,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 stdout="Wrote quotation.xlsx\nWrote quotation.pdf\nPDF export status: excel_exported\n",
                 stderr="",
             )
-            with mock.patch.object(webapp.subprocess, "run", return_value=completed) as run:
+            with mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run:
                 result = webapp.run_quote_job(
                     payload,
                     output_root=Path(tmp) / "out",
@@ -33534,7 +33567,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             def synthetic_generator(command, **_kwargs):
                 output_dir = Path(command[command.index("--out") + 1])
                 (output_dir / "quotation.xlsx").write_bytes(b"synthetic-quote-output")
-                (output_dir / "pricing_matches.csv").write_text("", encoding="utf-8")
+                write_generator_diagnostic_fixture(command)
                 (output_dir / "export_status.txt").write_text(
                     "status=synthetic\n", encoding="utf-8"
                 )
@@ -35085,7 +35118,7 @@ main().catch((error) => {
             completed = webapp.subprocess.CompletedProcess(args=[], returncode=0, stdout="Wrote quotation.xlsx\n", stderr="")
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(webapp.subprocess, "run", return_value=completed) as run,
+                mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run,
             ):
                 webapp.apply_sqag_storage_migrations(database_url)
                 storage = webapp.app_storage_for_auth_session(platform_session)
@@ -35658,6 +35691,7 @@ main().catch((error) => {
         payload["client"]["name"] = private_customer
 
         def fake_generator_run(command, **kwargs):
+            write_generator_diagnostic_fixture(command)
             output_dir = Path(command[command.index("--out") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "quotation.xlsx").write_bytes(b"synthetic-private-object-quote")
@@ -35747,6 +35781,7 @@ main().catch((error) => {
         xlsx_bytes = b"synthetic-object-store-failure-xlsx"
 
         def fake_generator_run(command, **kwargs):
+            write_generator_diagnostic_fixture(command)
             output_dir = Path(command[command.index("--out") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
@@ -40616,6 +40651,7 @@ main().catch((error) => {
         xlsx_bytes = b"xlsx-async-platform-artifact"
 
         def fake_generator_run(command, **kwargs):
+            write_generator_diagnostic_fixture(command)
             output_dir = Path(command[command.index("--out") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes)
@@ -40765,6 +40801,9 @@ main().catch((error) => {
                     "sale_unit_price": 99,
                 })
             ])
+            catalog_path = reference_dir / "pricing-catalog.json"
+            catalog_path.write_text(json.dumps(webapp.pricing_reference_catalog_payload(
+                json.loads(catalog_path.read_text(encoding="utf-8")))), encoding="utf-8")
             payload = valid_payload()
             payload["profile_id"] = "runtime-layout"
             payload["pricing_reference_id"] = "runtime-pricing"
@@ -40780,7 +40819,7 @@ main().catch((error) => {
             with (
                 mock.patch.object(webapp, "profiles_root", return_value=profiles_root),
                 mock.patch.object(webapp, "pricing_references_root", return_value=pricing_root),
-                mock.patch.object(webapp.subprocess, "run", return_value=completed) as run,
+                mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run,
             ):
                 result = webapp.run_quote_job(payload, output_root=root / "out", tmp_root=root / "tmp")
 
@@ -41160,7 +41199,7 @@ main().catch((error) => {
             )
             with (
                 mock.patch.object(webapp, "company_config_store", return_value=store),
-                mock.patch.object(webapp.subprocess, "run", return_value=completed) as run,
+                mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run,
             ):
                 result = webapp.run_quote_job(
                     payload,
@@ -43642,6 +43681,7 @@ main().catch((error) => {
         payload["client"]["name"] = private_customer
 
         def fake_generator_run(command, **kwargs):
+            write_generator_diagnostic_fixture(command)
             output_dir = Path(command[command.index("--out") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "quotation.xlsx").write_bytes(b"synthetic-private-quote-content")
@@ -43701,6 +43741,7 @@ main().catch((error) => {
         payload["client"]["name"] = private_customer
 
         def fake_generator_run(command, **kwargs):
+            write_generator_diagnostic_fixture(command)
             output_dir = Path(command[command.index("--out") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "quotation.xlsx").write_bytes(b"synthetic-platform-quote-content")
@@ -48842,3 +48883,108 @@ class PricingDraftG3Regression(unittest.TestCase):
         self.assertNotIn("PRIVATE-PROMPT-MARKER", serialized)
         self.assertNotIn("PRIVATE-PROVIDER-MARKER", serialized)
         self.assertNotIn("987654.32", serialized)
+
+class GenerationOutputRowsRegression(unittest.TestCase):
+    """Current diagnostics bind to admitted rows; they never confer price authority."""
+
+    def rows_and_matches(self):
+        rows = []
+        matches = []
+        for index, (variant, status) in enumerate((("catalog", "matched"), ("manual", "manual-price"),
+                                                  ("included", "included"), ("historical", "unmatched"))):
+            row = {"diagnostic_row_id": f"row-{index}", "source_basis_line_id": f"basis-{index}",
+                   "section": "Synthetic", "description": "Synthetic row", "quantity": 2, "unit": "nos",
+                   "price_mode": "Included" if variant == "included" else "Priced",
+                   "pricing_keyword": "synthetic-item" if variant == "catalog" else "",
+                   "effective_unit_price": 1.23, "approved_quote_amount": 9.87,
+                   "pricing_basis_amount": 2.46, "pricing_basis_currency": "SGD",
+                   "pricing_authority": {"variant": variant, "catalog_item_id": "synthetic-item",
+                                         "price": 1.23, "denomination": "quote"}}
+            rows.append(row)
+            matches.append({"diagnostic_row_id": row["diagnostic_row_id"],
+                            "source_basis_line_id": row["source_basis_line_id"], "status": status,
+                            "pricing_id": "synthetic-item", "unit_price": "999999", "amount": "999999"})
+        return rows, matches
+
+    def test_projection_reorders_by_explicit_token_and_preserves_manual_fx_exactly(self):
+        rows, matches = self.rows_and_matches()
+        before = copy.deepcopy(rows)
+        result = webapp.generation_output_rows(rows, list(reversed(matches)))
+        self.assertEqual(result["schema"], webapp.GENERATION_OUTPUT_ROWS_SCHEMA)
+        for row, expected, match in zip(result["rows"], rows, matches):
+            self.assertEqual(row, {**expected, "status": match["status"]})
+        self.assertEqual(rows, before)
+
+    def test_projection_demotes_rejected_catalogue_without_losing_identity_or_manual(self):
+        for status in ("unmatched", "quantity-review"):
+            rows, matches = self.rows_and_matches()
+            matches[0]["status"] = status
+            result = webapp.generation_output_rows(rows, matches)["rows"]
+            self.assertNotEqual(result[0]["pricing_authority"]["variant"], "catalog")
+            self.assertEqual(result[0]["source_basis_line_id"], "basis-0")
+            self.assertFalse(result[0].get("catalog_unit_price"))
+            self.assertEqual(result[1], {**rows[1], "status": "manual-price"})
+
+    def test_projection_refuses_missing_duplicate_extra_changed_and_forged_correspondence(self):
+        for case in ("missing", "duplicate", "extra", "unknown", "source", "catalogue", "manual_status",
+                     "historical_status", "blank_catalogue_id", "duplicate_catalogue_id", "missing_token"):
+            with self.subTest(case=case):
+                rows, matches = self.rows_and_matches()
+                if case == "missing": matches.pop()
+                elif case == "duplicate": matches[1] = copy.deepcopy(matches[0])
+                elif case == "extra": matches.append(copy.deepcopy(matches[0]))
+                elif case == "unknown": matches[0]["diagnostic_row_id"] = "row-99"
+                elif case == "source": matches[0]["source_basis_line_id"] = "wrong-quote-row"
+                elif case == "catalogue": matches[0]["pricing_id"] = "wrong-catalogue"
+                elif case == "manual_status": matches[1]["status"] = "matched"
+                elif case == "historical_status": matches[3]["status"] = "matched"
+                elif case == "blank_catalogue_id": rows[0]["source_basis_line_id"] = matches[0]["source_basis_line_id"] = ""
+                elif case == "duplicate_catalogue_id": rows[1]["source_basis_line_id"] = matches[1]["source_basis_line_id"] = "basis-0"
+                elif case == "missing_token": rows[0].pop("diagnostic_row_id")
+                with self.assertRaises(ValueError): webapp.generation_output_rows(rows, matches)
+
+    def test_projection_keeps_unidentified_and_colliding_manual_rows_without_minting_ids(self):
+        for source_id in ("", "same-source", "=synthetic", "  +synthetic", "@synthetic", "-synthetic"):
+            rows, matches = self.rows_and_matches()
+            rows = [rows[1], copy.deepcopy(rows[1])]
+            matches = [matches[1], copy.deepcopy(matches[1])]
+            for index, (row, match) in enumerate(zip(rows, matches)):
+                row.update(diagnostic_row_id=f"row-{index}", source_basis_line_id=source_id)
+                match.update(diagnostic_row_id=f"row-{index}", source_basis_line_id=("'" + source_id if source_id.lstrip()[:1] in "=+-@" and source_id else source_id))
+            result = webapp.generation_output_rows(rows, matches)
+            self.assertEqual([row["source_basis_line_id"] for row in result["rows"]], [source_id, source_id])
+            self.assertEqual([row["pricing_authority"]["variant"] for row in result["rows"]], ["manual", "manual"])
+
+    def test_diagnostics_duplicate_csv_columns_are_rejected(self):
+        with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+            path = Path(tmp) / "diagnostics.csv"
+            path.write_text("status,status\nmatched,unmatched\n", encoding="utf-8")
+            with self.assertRaises(ValueError): webapp.read_pricing_matches(path)
+
+class GenerationDiagnosticReadFailureTest(unittest.TestCase):
+    def test_read_or_decode_failure_finishes_forensics_and_never_publishes(self):
+        fixture = WebappServerTest(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        for error in (OSError("synthetic inaccessible diagnostic"), UnicodeError("synthetic invalid diagnostic"),
+                      ValueError("synthetic invalid correspondence")):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
+                root = Path(tmp)
+                env = isolated_env(QUOTE_LOG_ROOT=str(ROOT / "_logs" / "server" / "alpha2-export-recovery" / "regression" / root.name))
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(webapp, "begin_generation_forensics", return_value=""), \
+                     mock.patch.object(webapp, "append_runtime_telemetry"), \
+                     mock.patch.object(webapp.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                     mock.patch.object(webapp, "read_pricing_matches", side_effect=error), \
+                     mock.patch.object(webapp, "finish_generation_forensics", side_effect=lambda run_id, result, *args, **kwargs: result) as finish, \
+                     mock.patch.object(webapp, "quote_session_storage_for_auth_session") as storage:
+                    result = webapp._run_quote_job(valid_payload(), output_root=root / "o", tmp_root=root / "t", job_id="job-synthetic-diag-read")
+                self.assertEqual(result["status"], "failed", result)
+                self.assertTrue(result["error_reference"])
+                self.assertFalse(result.get("files"))
+                self.assertEqual(finish.call_args.kwargs["error_category"], "generator_output_invalid")
+                manifest = finish.call_args.kwargs["canonical_manifest"]
+                self.assertIs(manifest["generator_executed"], True)
+                self.assertEqual(manifest["return_code"], 0)
+                self.assertEqual(result["return_code"], 0)
+                self.assertFalse(manifest["artifacts"])
+                storage.assert_not_called()

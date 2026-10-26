@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-10-23
+Last updated: 2026-10-25
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -79,11 +79,9 @@ Source of truth: `.github/workflows/ci.yml`
 
 ## Validate App Checks
 
-- Pins only the `Validate app` runner to `ubuntu-24.04` for the locked Playwright
-  1.60.0 browser/dependency support. The `ubuntu-latest` move to Ubuntu 26.04
-  fails browser installation before tests. Review this pin when the locked
-  Playwright version supports a newer runner and the full rendered gate passes.
-  Other jobs, dependencies, security gates and workflow triggers are unchanged.
+- Pins the `Validate app` runner to `ubuntu-24.04`, which supports the locked
+  Playwright 1.60.0 browser dependencies. Other jobs retain their existing
+  runners; checks, triggers, permissions and dependencies are unchanged.
 - Installs Python 3.12.13 (the exact patch shared with the retrospective job) and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
   This current application dependency set is used only by `Validate app`; the
@@ -257,5 +255,7 @@ Source of truth: `.github/workflows/ci.yml`
 - Branch protection requirements are not documented as complete in this repo yet.
 
 ## Maintenance Rule
+
+Review the `Validate app` Ubuntu 24.04 pin when the locked Playwright version supports a newer runner and the full rendered gate passes. The `ubuntu-latest` move to Ubuntu 26.04 currently fails browser installation before tests; remove the pin only after that compatibility is verified.
 
 Update this file whenever CI/CD jobs, triggers, required checks, branch protection, deployment behavior, secret requirements, or security gates change.

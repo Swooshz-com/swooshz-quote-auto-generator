@@ -36,6 +36,39 @@ npm run playwright:smoke
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
 - Pricing reference import, catalog matching, currency/tax metadata, or template parsing: add/update parser and normalization tests, then run the relevant `tests.test_webapp` and `tests.test_generate_quote` cases.
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
+  Export diagnostics carry a server-created row token and the original source row
+  ID. Test exact correspondence against the captured final brief, including
+  reordered, missing, extra, duplicate and formula-prefixed identities. CSV prices
+  cannot create authority. Structured results preserve manual/quote-currency FX
+  and demote rejected catalogue claims before direct/resumed failure, review or
+  completion adoption. Current malformed results must keep existing rows and
+  refuse new artifact adoption. A direct current completion/review missing its
+  structured contract must fail. Only saved-job resume may retain usable current
+  rows for a legacy-format result; an empty legacy resume must not invent readiness.
+  Current hard-generator/pre-generator failures may legitimately omit diagnostics:
+  preserve the original failure/reference/return code and rows, with no new files.
+  Missing diagnostics alone never identify an old runtime. New generation jobs
+  persist their output-row contract marker before dispatch; a restored starting
+  operation upgrades before its dispatch, while a present invalid marker rejects.
+  Only an already-running saved job with no marker uses legacy row retention.
+  Cover missing/valid/invalid marker across direct, starting and running/resumed
+  operations, completion/review/failure, and present/absent result contracts.
+  Run `tests.test_webapp.GenerationOutputRowsRegression`,
+  `tests.test_webapp.GenerationDiagnosticReadFailureTest`,
+  `tests.test_generate_quote.GeneratorDiagnosticIdentityTest`,
+  `tests.test_quote_flow_reliability` and `tests.test_owner_uat_contract`.
+  Duplicate must preserve current Output edits/subsets independently of its Reset
+  snapshot, strip source-bound seals/catalogue claims, and obtain target grants
+  only through explicit selection/Confirm. Cover save/reopen, manual FX,
+  exclusions, wrong scope/quote/digest/unit, stale revisions, asynchronous
+  operation/auth-scope changes, and genuine guarded XLSX bytes. Retain the
+  original quote unchanged. The rendered resume check is
+  `node scripts/playwright-owner-uat-basis-repair.mjs --resume-export --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD`.
+  It holds the accepted browser poll, lets the real worker commit, reloads into
+  ordinary resume, and verifies automatic save plus fresh protected bytes without
+  another generation, publication or provider call.
+  Local synthetic tests do not establish the cause or
+  job/artifact/counter outcome of a historical installed failure.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret

@@ -14,6 +14,7 @@ const { chromium, request } = createRequire(path.join(sourceRoot, "package.json"
 const args = process.argv.slice(2);
 const measureOnly = args.includes("--measure-only");
 const reliability = args.includes("--alpha2-reliability");
+const resumeExport = args.includes("--resume-export");
 const fillerLines = Number((args.find((arg) => arg.startsWith("--lines=")) || "--lines=60").split("=")[1]);
 const latencyMs = Number((args.find((arg) => arg.startsWith("--latency-ms=")) || "--latency-ms=1500").split("=")[1]);
 const cpuProfile = args.includes("--cpu-profile");
@@ -139,6 +140,8 @@ await fs.cp(path.join(sourceRoot, "tests/fixtures/quote-generator/profiles", pro
 let server, browser, serverErr = "";
 const network = [];
 let checkpointGate = null;
+let exportPollGate = null;
+let generationRequests = 0;
 let detailFailurePath = "";
 function startServer() {
   const child = spawn(python, [path.join(sourceRoot, "tests/alpha1_fresh_mock_harness.py"), sourceRoot, dirs.data, dirs.output, dirs.temp, dirs.logs, dirs.pricing, dirs.profiles, scenarioPath], {
@@ -235,6 +238,15 @@ try {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.origin !== baseUrl) return route.abort();
+    if (url.pathname === "/api/jobs" && route.request().method() === "POST"
+      && ["generate", "generate_pdf"].includes(route.request().postDataJSON()?.type)) generationRequests += 1;
+    if (exportPollGate && !exportPollGate.jobId && url.pathname.startsWith("/api/jobs/") && route.request().method() === "GET") {
+      const gate = exportPollGate;
+      gate.jobId = decodeURIComponent(url.pathname.split("/").pop());
+      gate.arrived();
+      await gate.wait;
+      return route.abort("aborted").catch(() => {});
+    }
     if (detailFailurePath && url.pathname === detailFailurePath && route.request().method() === "GET") {
       detailFailurePath = "";
       return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "failed", error_reference: "ERR-1234ABCD" }) });
@@ -655,8 +667,46 @@ try {
     const exportBlock = () => page.evaluate(() => ({ disabled: document.querySelector("#sideDownloadButton")?.getAttribute("aria-disabled"), title: document.querySelector("#sideDownloadButton")?.title, errors: outputRowsValid().errors }));
     await page.waitForFunction(() => document.querySelector("#sideDownloadButton")?.getAttribute("aria-disabled") !== "true", null, { timeout: 30000 }).catch(async () => assert(false, "export still blocked", await exportBlock()));
     // Protected XLSX: generated workbook carries the admitted amounts.
+    let resumeBefore;
+    if (resumeExport) {
+      let release, arrived;
+      exportPollGate = { arrived: () => arrived(), wait: new Promise((resolve) => { release = resolve; }) };
+      exportPollGate.release = release;
+      exportPollGate.arrival = new Promise((resolve) => { arrived = resolve; });
+    }
     const downloadPromise = page.waitForEvent("download", { timeout: 90000 });
     await page.locator("#sideDownloadButton").click();
+    if (resumeExport) {
+      const gate = exportPollGate;
+      let arrivalTimer;
+      try {
+        await Promise.race([gate.arrival, new Promise((_, reject) => { arrivalTimer = setTimeout(() => reject(new Error("Accepted export poll did not arrive")), 30000); })]);
+      } finally { clearTimeout(arrivalTimer); }
+      const accepted = await page.evaluate(() => ({ id: state.activeJob?.id, phase: state.activeJob?.phase, outputRowsSchema: state.activeJob?.outputRowsSchema }));
+      assert(accepted.id === gate.jobId && accepted.phase === "running" && accepted.outputRowsSchema === "swooshz.quote-output-rows.v1", "export was not accepted/persisted before reload", accepted);
+      // Hold only browser delivery. The real worker must finish and commit once.
+      const deadline = Date.now() + 60000;
+      let terminal;
+      while (Date.now() < deadline) {
+        terminal = await (await api.get(baseUrl + "/api/jobs/" + encodeURIComponent(accepted.id))).json();
+        if (["completed", "failed", "needs_review"].includes(terminal.status)) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert(terminal?.status === "completed" && terminal.result?.status === "completed", "real worker did not complete before resume", {status:terminal?.status,result:terminal?.result?.status});
+      const metadataPath = path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json");
+      const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+      resumeBefore = {
+        generationRequests, jobId: accepted.id, publicationId: metadata.publication?.active_publication_id,
+        outputDirectories: (await fs.readdir(dirs.output)).sort(),
+        provider: JSON.parse(await fs.readFile(path.join(runRoot, "mock-provider-count.json"), "utf8")),
+      };
+      assert(resumeBefore.publicationId && resumeBefore.generationRequests === 1, "export did not commit once before resume", resumeBefore);
+      exportPollGate = null;
+      await page.reload({ waitUntil: "domcontentloaded" });
+      gate.release();
+      await page.waitForFunction(() => !state.isBooting && !state.isGenerating && !state.activeJob && downloadFileIsFresh(state.downloadFile), null, { timeout: 60000 });
+      await page.locator('#excelGeneratingActionButton[data-export-action="excel"]').click();
+    }
     const download = await downloadPromise;
     const xlsxPath = path.join(dirs.downloads, "owner-uat.xlsx");
     await download.saveAs(xlsxPath);
@@ -664,6 +714,16 @@ try {
     assert(detail.quote_session?.exports?.xlsx?.exists === true && detail.quote_session.exports.xlsx.stale === false, "protected XLSX export not current", detail.quote_session?.exports);
     const protectedBytes = await (await api.get(new URL(detail.quote_session.exports.xlsx.url, baseUrl).toString())).body();
     assert(protectedBytes.equals(await fs.readFile(xlsxPath)), "protected XLSX differs from the UI download");
+    if (resumeExport) {
+      const metadata = JSON.parse(await fs.readFile(path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json"), "utf8"));
+      const provider = JSON.parse(await fs.readFile(path.join(runRoot, "mock-provider-count.json"), "utf8"));
+      assert(generationRequests === resumeBefore.generationRequests, "resume started another generation");
+      assert(metadata.publication?.active_publication_id === resumeBefore.publicationId, "resume changed committed publication");
+      assert(JSON.stringify((await fs.readdir(dirs.output)).sort()) === JSON.stringify(resumeBefore.outputDirectories), "resume created another output directory");
+      assert(JSON.stringify(provider) === JSON.stringify(resumeBefore.provider) && provider.real_provider_calls === 0, "resume changed provider counters", provider);
+      result.resumeExport = { status: "PASS", generationRequests, publicationUnchanged: true, outputDirectoriesUnchanged: true,
+        providerUnchanged: true, strictMarkerPreserved: true, realProviderCalls: 0, freshProtectedBytes: protectedBytes.length };
+    }
     // Bind each amount to its own workbook row (description + quantity) and check the totals block.
     const quantityText = (quantity, unit) => String(quantity) + " " + unit;
     const expectedRows = [
@@ -781,6 +841,7 @@ try {
   process.exitCode = 1;
 } finally {
   checkpointGate?.release?.();
+  exportPollGate?.release?.();
   if (browser) await browser.close().catch(() => {});
   if (server?.child && server.child.exitCode === null) server.child.kill();
 }

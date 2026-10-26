@@ -27249,7 +27249,74 @@ def read_pricing_matches(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f))
+        reader = csv.DictReader(f)
+        if reader.fieldnames and len(reader.fieldnames) != len(set(reader.fieldnames)):
+            raise ValueError("Generator diagnostics contain duplicate columns.")
+        return list(reader)
+
+
+GENERATION_OUTPUT_ROWS_SCHEMA = "swooshz.quote-output-rows.v1"
+
+
+def generation_output_rows(brief_rows: Any, matches: Any) -> dict[str, Any]:
+    """Project exact generator outcomes onto this job's admitted rows, never CSV prices.
+
+    prepare_lines emits one diagnostic per dictionary final-brief row. Worksheet
+    section/header expansion happens later and is not a diagnostic row. Explicit
+    per-export tokens bind even legacy manual rows with no unique basis ID.
+    """
+    if (not isinstance(brief_rows, list) or not brief_rows
+            or not isinstance(matches, list) or len(matches) != len(brief_rows)):
+        raise ValueError("Generator diagnostic correspondence is incomplete.")
+    expected: dict[str, dict[str, Any]] = {}
+    source_counts: dict[str, int] = {}
+    for row in brief_rows:
+        if not isinstance(row, dict):
+            raise ValueError("Generator brief row is invalid.")
+        token = row.get("diagnostic_row_id")
+        source_id = row.get("source_basis_line_id")
+        if (not isinstance(token, str) or not re.fullmatch(r"row-(?:0|[1-9][0-9]*)", token)
+                or token in expected or not isinstance(source_id, str)):
+            raise ValueError("Generator diagnostic identity is invalid.")
+        expected[token] = row
+        source_counts[source_id] = source_counts.get(source_id, 0) + 1
+    outcomes: dict[str, dict[str, Any]] = {}
+    for match in matches:
+        if not isinstance(match, dict):
+            raise ValueError("Generator diagnostic row is invalid.")
+        token = match.get("diagnostic_row_id")
+        if not isinstance(token, str) or token not in expected or token in outcomes:
+            raise ValueError("Generator diagnostic identity does not match this job.")
+        source_id = expected[token]["source_basis_line_id"]
+        # Compare the known value with the CSV writer's formula-safe encoding;
+        # never decode/evaluate spreadsheet text or derive identity from a label.
+        csv_source_id = "'" + source_id if source_id.lstrip()[:1] in {"=", "+", "-", "@"} else source_id
+        if match.get("source_basis_line_id") != csv_source_id:
+            raise ValueError("Generator source row identity changed.")
+        outcomes[token] = match
+    rows = []
+    for token, captured in expected.items():
+        outcome = outcomes[token]
+        status = outcome.get("status")
+        authority = captured.get("pricing_authority")
+        variant = authority.get("variant") if isinstance(authority, dict) else ""
+        row = copy.deepcopy(captured)
+        if variant == "catalog" and status in {"unmatched", "quantity-review"}:
+            row = reject_catalog_line_item_authority(row)
+        elif variant == "catalog" and status == "matched":
+            source_id = captured["source_basis_line_id"]
+            if (not source_id or source_counts[source_id] != 1
+                    or outcome.get("pricing_id") != authority.get("catalog_item_id")):
+                raise ValueError("Generator catalogue identity is ambiguous.")
+        elif ((variant == "manual" and status == "manual-price")
+                or (variant == "included" and status == "included")
+                or (variant in {"none", "historical"} and status in {"unmatched", "quantity-review"})):
+            pass
+        else:
+            raise ValueError("Generator outcome contradicts admitted pricing authority.")
+        row["status"] = status
+        rows.append(row)
+    return {"schema": GENERATION_OUTPUT_ROWS_SCHEMA, "rows": rows}
 
 
 def read_export_status(path: Path) -> dict[str, str]:
@@ -32718,6 +32785,11 @@ def _run_quote_job(
     pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp, auth_session=auth_session)
     uploaded_images = save_uploaded_images(image_entries(payload), job_tmp)
     brief = payload_to_brief(payload, auth_session=auth_session)
+    brief["line_items"] = [
+        {**row, "diagnostic_row_id": f"row-{index}",
+         "source_basis_line_id": row.get("source_basis_line_id", "")}
+        for index, row in enumerate(brief["line_items"])
+    ]
     brief["_webapp"] = {
         "job_id": job_id,
         "profile": profile_prompt_summary(profile),
@@ -32792,12 +32864,31 @@ def _run_quote_job(
             log_details,
         )
 
+    try:
+        pricing_matches = read_pricing_matches(output_dir / "pricing_matches.csv")
+        hard_failure_without_diagnostics = status == "failed" and not pricing_matches
+        output_rows = None if hard_failure_without_diagnostics else generation_output_rows(brief["line_items"], pricing_matches)
+    except (OSError, csv.Error, TypeError, ValueError) as exc:
+        projection_reference = new_error_reference()
+        write_local_log("generate_failed", unexpected_error_log_details(
+            projection_reference, exc, job_id=job_id, failure_kind="generator_output_invalid",
+        ))
+        invalid_output_manifest = terminal_manifest("failed", "generator_output_invalid", "generator_output")
+        invalid_output_manifest.update(generator_executed=True, return_code=completed.returncode)
+        return finish_generation_forensics(
+            generation_run_id,
+            {**failed_result_payload(projection_reference), "job_id": job_id, "return_code": completed.returncode},
+            auth_session, error_category="generator_output_invalid", validated_session_id=validated_session_id,
+            canonical_manifest=invalid_output_manifest,
+        )
+
     result = {
         "job_id": job_id,
         "status": status,
         "return_code": completed.returncode,
-        "files": output_files(job_id, output_dir),
-        "pricing_matches": read_pricing_matches(output_dir / "pricing_matches.csv"),
+        "files": [] if hard_failure_without_diagnostics else output_files(job_id, output_dir),
+        "pricing_matches": pricing_matches,
+        **({"output_rows": output_rows} if output_rows is not None else {}),
         "export_status": read_export_status(output_dir / "export_status.txt"),
         "pdf_mode": normalized_pdf_mode,
         "errors": errors_for_response,

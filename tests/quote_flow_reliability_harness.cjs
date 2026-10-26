@@ -9,11 +9,214 @@ function extract(name) {
   const end = rest.slice(1).search(/\n(?:async )?function /);
   return end < 0 ? rest : rest.slice(0, end + 1);
 }
+async function generationOutputCases() {
+  function productionContext() {
+    const names = [...source.matchAll(/^(?:async )?function ([A-Za-z_$][\w$]*)\(/gm)].map(match => match[1]);
+    const functions = names.map(name => {
+      const start = new RegExp('^(?:async )?function ' + name + '\\(', 'm').exec(source).index;
+      const rest = source.slice(start);
+      return rest.slice(0, /^\}/m.exec(rest).index + 1);
+    });
+    const constants = source.slice(0, source.indexOf('const state =')) + '\n' + source.match(/^const GENERIC_FAILURE_MESSAGE = .*;$/m)[0];
+    const c = vm.createContext({ console, Set, Map });
+    vm.runInContext(constants + '\n' + functions.join('\n'), c);
+    vm.runInContext(`var state = { quoteCommercialLifecycle:'RECOVERED', quoteCommercialSnapshot:{lifecycle:'RECOVERED'},
+      activeSidePanel:'output', activeAppView:'quote', basisConfirmed:true, aiFailed:false,
+      quoteBasisSections:[], pricingIssues:[], outputSortMode:'pricing_reference', outputRevision:0,
+      quoteSessionId:'quote-synthetic-target', outputRows:[], lineItems:[] };
+      var activeOutputEditor=null; var outputRowIdentities=new WeakMap();`, c);
+    c.currentPricingReference = () => ({id:'synthetic-reference',source:'local',currency:'SGD',digest_sha256:'sha256:'+'a'.repeat(64),items:[]});
+    c.collectQuoteCurrency = () => 'AUD'; c.collectQuoteExchangeRate = () => 1.37;
+    c.selectedPricingReferenceCurrency = () => 'SGD';
+    vm.runInContext(`var manual = {diagnostic_row_id:'row-0',source_basis_line_id:'manual-row',section:'General',description:'Synthetic handling',
+      quantity:3,unit:'nos',price_mode:'Priced',unit_price_override:1.01};
+      manual.pricing_authority=buildPricingAuthority('manual',manual,{price:1.01,priceCurrency:'AUD'});
+      var rejected = {diagnostic_row_id:'row-1',source_basis_line_id:'rejected-row',section:'General',description:'Synthetic review',
+      quantity:2,unit:'nos',price_mode:'Priced',pricing_keyword:''};
+      rejected.pricing_authority=buildPricingAuthority('historical',rejected);
+      var originals=[manual,rejected];`, c);
+    return c;
+  }
+  let count = 0;
+  for (const resumed of [false,true]) for (const terminal of ['failed','needs_confirmation','completed'])
+    for (const contract of ['current','legacy','invalid','empty-legacy']) for (const prior of [false,true]) {
+      const c = productionContext(); const st = c.state;
+      vm.runInContext('state.outputRows=originals.map(outputRowFromLineItem);state.lineItems=originals.map(normalizeLineItem);',c);
+      const before = JSON.stringify(st.outputRows);
+      const data = JSON.parse(JSON.stringify({status:terminal,return_code:terminal==='completed'?0:2,
+        pricing_matches:[{status:'matched',unit_price:'999999',amount:'999999'}],
+        files:[{name:'quotation.xlsx',url:'/api/synthetic-current.xlsx'}]}));
+      if (contract === 'current' || contract === 'invalid') {
+        data.output_rows = {schema:'swooshz.quote-output-rows.v1', rows:JSON.parse(vm.runInContext('JSON.stringify(originals)',c))};
+        data.output_rows.rows[0].status='manual-price';data.output_rows.rows[1].status='unmatched';
+        if (contract === 'invalid') data.output_rows.rows[1].diagnostic_row_id = 'row-0';
+      }
+      c.resultPacket=JSON.stringify(data);
+      vm.runInContext('var resultData=JSON.parse(resultPacket);',c);
+      if (prior) st.downloadFile = {name:'quotation.xlsx',url:'/api/synthetic-prior.xlsx'};
+      let downloads = 0; const statuses=[]; let polls=0;
+      const noop=()=>{};
+      Object.assign(c, {
+        commitActiveOutputEditor:()=> 'none',quoteCommercialReviewRequired:()=>false,outputRowsValid:()=>({valid:true,errors:[]}),
+        missingDetailFields:()=>[],quoteSessionHasFreshOutputExports:()=>prior,normalizeActiveJob:x=>x,
+        newClientJobId:()=> 'job-synthetic-output',saveSessionState:noop,setWorkflowStage:noop,
+        setResultStatus:label=>statuses.push(label),renderMessages:noop,clearPricingReviewMessages:noop,syncControlStates:noop,
+        ensureQuoteSession:async()=>st.quoteSessionId,buildPayload:()=>({line_items:st.lineItems}),startJob:async()=>{assert.equal(st.activeJob.outputRowsSchema,'swooshz.quote-output-rows.v1');return{ok:true,data:{job_id:'job-synthetic-output'}};},
+        currentGenerationContext:()=>({session_id:st.quoteSessionId,run_id:''}),transitionGenerationContext:noop,
+        pollJob:async()=>{polls++;return{ok:true,data:{status:terminal==='needs_confirmation'?'needs_review':terminal,result:c.resultData}};},
+        isInterruptedJobPoll:()=>false,clearActiveJob:()=>{st.activeJob=null;},
+        renderPricingMatches:rows=>{assert.equal(rows,st.outputRows);},renderMatchSummary:noop,
+        saveQuoteSessionDraftState:async()=>({session_id:st.quoteSessionId}),setSidePanel:noop,
+        showExcelGeneratingModal:noop,hideExcelGeneratingModal:noop,generationLoadingModalOptions:()=>({}),generationFinalizingModalOptions:()=>({}),
+        ensureSavedServerJobStarted:async()=>({ok:true}),showGeneratedExportReadyModal:()=>false,
+        setDownloadFiles:()=>{downloads++;},
+      });
+      // Empty legacy state is observed after request admission, as on a terminal resume.
+      if (contract === 'empty-legacy') c.pollJob = async()=>{polls++;st.outputRows=[];return {ok:true,data:{status:terminal,result:c.resultData}};};
+      if (resumed) {st.activeJob={id:'job-synthetic-output',type:'generate',phase:'running',...(['legacy','empty-legacy'].includes(contract)?{}:{outputRowsSchema:'swooshz.quote-output-rows.v1'})};await c.resumeSavedJob();}
+      else await c.handleGenerate();
+      assert.equal(polls,1);
+      if (contract !== 'empty-legacy') {
+        if(terminal==='completed'||contract!=='current')assert.equal(JSON.stringify(st.outputRows),before,`${resumed}/${terminal}/${contract}/${prior}`);
+        assert.equal(st.outputRows[0].source_basis_line_id,'manual-row');
+        assert.equal(st.outputRows[0].pricing_authority.variant,'manual');
+        assert.equal(st.outputRows[1].source_basis_line_id,'rejected-row');
+        assert.equal(st.outputRows[1].pricing_authority.variant,'historical');
+      }
+      else assert.equal(st.outputRows.length,0);
+      assert.equal(downloads, terminal==='completed' && (contract==='current'||(resumed&&contract==='legacy')) ? 1 : 0, `${resumed}/${terminal}/${contract}/${prior}`);
+      if (['invalid','empty-legacy'].includes(contract)||(!resumed&&contract==='legacy'&&terminal!=='failed')) assert(statuses.includes('failed'));
+      assert(!st.outputRows.some(row=>row.approved_quote_amount===999999));
+      count++;
+    }
+  // Direct strict reader controls: unknown schemas, missing IDs and source collisions.
+  for (const mutation of ['schema','source','authority','catalog-collision','truncated','extra','changed-id']) {
+    const c=productionContext();
+    vm.runInContext('var packet={status:"completed",output_rows:{schema:"swooshz.quote-output-rows.v1",rows:JSON.parse(JSON.stringify(originals))}};',c);
+    vm.runInContext('state.lineItems=originals.map(normalizeLineItem);state.outputRows=originals.map(outputRowFromLineItem);',c);
+    assert.equal(c.adoptGenerationOutputRows(c.packet).status,'completed','Positive control must validate before mutation');
+    if(mutation==='truncated')c.packet.output_rows.rows.pop();
+    if(mutation==='extra')c.packet.output_rows.rows.push({...c.packet.output_rows.rows[0],diagnostic_row_id:'row-2'});
+    if(mutation==='changed-id')c.packet.output_rows.rows[0].source_basis_line_id='wrong';
+    if(mutation==='schema')c.packet.output_rows.schema='unknown';
+    if(mutation==='source')delete c.packet.output_rows.rows[0].source_basis_line_id;
+    if(mutation==='authority')delete c.packet.output_rows.rows[0].pricing_authority;
+    if(mutation==='catalog-collision')c.packet.output_rows.rows.forEach(row=>{row.source_basis_line_id='same';row.pricing_authority.variant='catalog';});
+    assert.equal(c.adoptGenerationOutputRows(c.packet).status,'failed');
+  }
+  const emptyCurrent=productionContext();
+  vm.runInContext('state.lineItems=originals.map(normalizeLineItem);var emptyPacket={status:"completed",files:[{name:"quotation.xlsx"}],output_rows:{schema:"swooshz.quote-output-rows.v1",rows:originals}};',emptyCurrent);
+  const emptyRefusal=emptyCurrent.adoptGenerationOutputRows(emptyCurrent.emptyPacket);
+  assert.equal(emptyRefusal.status,'failed');assert.equal(emptyRefusal.files.length,0);assert.equal(emptyCurrent.state.outputRows.length,0);
+  let duplicateCases=0;
+  for(const outcome of ['success','different-reference','failure','malformed','malformed-snapshot','operation','scope','epoch','target','auth','departure']) {
+    const c=productionContext(); const st=c.state; let scope='scope-synthetic';
+    vm.runInContext(`var browserRecoveryEpoch=1;
+      var sourceDraft={lineItems:originals.map(row=>({...row,quantity:3})),outputRows:[{...manual,quantity:7}],
+        originalOutputRows:[{...manual,quantity:4},{...manual,source_basis_line_id:'reset-only',quantity:9,
+          pricing_authority:{variant:'catalog'},catalog_unit_price:99,unit_price_override:99}],
+        originalAnalysisSnapshot:{pricing_analysis_seal:{source:'bound-to-original'}}};`,c);
+    const actualApplySnapshot=c.applyQuoteSessionSnapshot;
+    if(outcome==='malformed-snapshot')vm.runInContext('sourceDraft.version=QUOTE_SESSION_STATE_VERSION;sourceDraft.originalAnalysisSnapshot.line_items={invalid:true};',c);
+    const sourceReference=c.currentPricingReference;
+    if(outcome==='different-reference'){c.currentPricingReference=()=>({...sourceReference(),currency:'EUR'});c.collectQuoteCurrency=()=> 'EUR';}
+    const sourceBefore=JSON.stringify(c.sourceDraft); let saved, sent, release, requests=0;
+    const gate=new Promise(resolve=>{release=resolve;}); const noop=()=>{};
+    Object.assign(c, {
+      currentBrowserRecoveryScope:()=>scope,commitActiveOutputEditor:()=> 'none',appIsBusy:()=>false,
+      safeQuoteSessionId:x=>x,newClientQuoteSessionId:()=> 'quote-target',
+      saveDashboardOperation:op=>op,clearQuoteSessionDraftSaveTimer:noop,setDashboardLoadingState:noop,dashboardOperationLoadingOptions:()=>({}),
+      loadQuoteSessionDetail:async()=>({session_id:'quote-original',draft_state:c.sourceDraft,draft_files:[]}),
+      mergeDashboardDraftSummaryDetails:d=>d,hydrateDashboardDraftImagePayloads:d=>d,
+      applyQuoteSessionSnapshot:async snapshot=>{Object.assign(st,snapshot);c.currentPricingReference=sourceReference;c.collectQuoteCurrency=()=> 'AUD';return true;},
+      buildLineItemNormalizePayload:()=>({line_items:st.lineItems,quote_session:{session_id:st.quoteSessionId},
+        pricing_analysis_seal:st.originalAnalysisSnapshot?.pricing_analysis_seal}),
+      postJson:async(path,payload)=>{assert.equal(path,'/api/line-items/normalize');requests++;sent=payload;await gate;
+        return outcome==='failure'?{ok:false,data:{status:'failed'}}:{ok:true,data:{line_items:outcome==='malformed'?[]:payload.line_items}};},
+      saveCurrentQuoteSession:async()=>{saved=JSON.stringify({lineItems:st.lineItems,outputRows:st.outputRows,originalOutputRows:st.originalOutputRows});return{session_id:'quote-target'};},
+      clearDashboardOperation:()=>{st.dashboardOperation=null;},finishDashboardOperation:()=>{st.dashboardOperation=null;},dashboardRestoreError:noop,
+      renderQuoteDashboard:noop,scrollDashboardSessionIntoView:noop,
+    });
+    if(outcome==='malformed-snapshot')c.applyQuoteSessionSnapshot=actualApplySnapshot;
+    const pending=c.duplicateDashboardQuote('quote-original');
+    if(outcome==='malformed-snapshot') {
+      assert.equal(await pending,false);assert.equal(requests,0);assert.equal(saved,undefined);
+      assert.equal(JSON.stringify(c.sourceDraft),sourceBefore);assert.equal(st.quoteSessionId,'quote-synthetic-target');
+      assert.equal(st.dashboardOperation,null);assert.equal(st.quoteSessionRestoreBusy,false);
+      duplicateCases++;continue;
+    }
+    await new Promise(setImmediate);assert.equal(requests,1,outcome);
+    assert.equal(sent.line_items.length,1,'Current Output subset is authoritative for copy');
+    assert.equal(sent.line_items[0].quantity,7,'Output edit survives stale analysis lineItems');
+    assert.equal(sent.pricing_analysis_seal,null);
+    assert.equal(sent.line_items[0].pricing_authority.variant,'manual');
+    assert.equal(sent.line_items[0].pricing_authority.price_currency,'AUD');
+    if(outcome==='operation')st.dashboardOperation={type:'different-operation'};
+    if(outcome==='scope')scope='scope-new';
+    if(outcome==='epoch')vm.runInContext('browserRecoveryEpoch++;',c);
+    if(outcome==='target')st.quoteSessionId='quote-unrelated';
+    if(outcome==='auth')st.authenticationRecoveryRequested=true;
+    if(outcome==='departure')st.isPageUnloading=true;
+    if(['operation','scope','epoch','target','auth','departure'].includes(outcome))st.outputRows=[{source_basis_line_id:'unrelated-sentinel'}];
+    release(); const ok=await pending;
+    assert.equal(ok,['success','different-reference'].includes(outcome),outcome);assert.equal(Boolean(saved),['success','different-reference'].includes(outcome));
+    assert.equal(JSON.stringify(c.sourceDraft),sourceBefore,'Source object must be unchanged');
+    if(['success','different-reference'].includes(outcome)) {
+      assert.equal(st.outputRows.length,1);assert.equal(st.outputRows[0].quantity,7);
+      assert.equal(st.originalOutputRows.length,2);assert.equal(st.originalOutputRows[0].quantity,4);
+      assert.equal(st.originalOutputRows[1].quantity,9);assert.notEqual(st.originalOutputRows[1].pricing_authority.variant,'catalog');
+      assert.equal(c.pricingAuthorityPrice(c.outputPriceAuthority(st.originalOutputRows[1])),null,'Reset cannot revive a source grant');
+      Object.assign(c,{markOutputRowsDirty:noop,renderPricingMatches:noop,renderMatchSummary:noop,renderOutputValidationMessages:noop,
+        outputRowsValid:()=>({errors:[]}),setResultStatus:noop,syncControlStates:noop});
+      st.quoteSessionRestoreBusy=false;await c.resetOutputDraft();
+      assert.equal(st.outputRows.length,2);assert.equal(st.outputRows[0].quantity,4);assert.equal(st.outputRows[1].quantity,9);
+      assert.equal(c.pricingAuthorityPrice(c.outputPriceAuthority(st.outputRows[1])),null);
+    } else if(['operation','scope','epoch','target','auth','departure'].includes(outcome))assert.equal(st.outputRows[0].source_basis_line_id,'unrelated-sentinel');
+    duplicateCases++;
+  }
+  console.log(JSON.stringify({generation_output_cases:count,negative_reader_cases:8,duplicate_cases:duplicateCases,provider_requests:0}));
+}
+
+async function generationContractCases() {
+  const schema='swooshz.quote-output-rows.v1';let cases=0;
+  for(const route of ['direct','starting','running']) for(const marker of ['missing','valid','invalid'])
+    for(const status of ['completed','needs_confirmation','failed']) for(const format of ['present','absent']) {
+      let effects=0,saves=0;
+      const c=vm.createContext({SERVER_JOB_TYPES:new Set(['generate','generate_pdf','draft']),ACTIVE_JOB_CLOCK_SKEW_MS:60000,
+        PRICING_AUTHORITY_VARIANTS:new Set(['manual','catalog','included','none','historical']),GENERIC_FAILURE_MESSAGE:'Synthetic generic failure',
+        currentBrowserRecoveryScope:()=> 'synthetic-scope',activeJobMaxAgeMs:()=>3600000,outputRowFromLineItem:row=>({...row})});
+      vm.runInContext(['isPlainObject','sameLineItemSourceIdentities','adoptGenerationOutputRows','normalizeActiveJob','ensureSavedServerJobStarted'].map(extract).join('\n'),c);
+      vm.runInContext(`var state={quoteSessionId:'quote-synthetic',outputRows:[{description:'Synthetic current row',quantity:1,unit:'nos',
+        source_basis_line_id:'same',price_mode:'Priced',pricing_authority:{variant:'manual'}}],lineItems:[{source_basis_line_id:'same'}]};
+        var operation={id:'job-synthetic-contract',type:'generate',phase:'${route==='running'?'running':'starting'}',startedAt:new Date().toISOString(),browserRecoveryScope:'synthetic-scope'};`,c);
+      if(marker!=='missing')c.operation.outputRowsSchema=marker==='valid'?schema:'unsupported';
+      const normalized=c.normalizeActiveJob(c.operation,{restoring:true});
+      if(marker==='invalid'){assert.equal(normalized,null);cases++;continue;}
+      c.state.activeJob=normalized;
+      Object.assign(c,{saveSessionState:()=>{saves++;assert.equal(c.state.activeJob.outputRowsSchema,schema);},
+        ensureQuoteSession:async()=>{effects++;assert.equal(c.state.activeJob.outputRowsSchema,schema,'Persist marker before save/dispatch');assert(saves>0);return 'quote-synthetic';},
+        buildPayload:()=>({line_items:c.state.lineItems}),startJob:async()=>{effects++;assert.equal(c.state.activeJob.outputRowsSchema,schema);return {ok:true,data:{job_id:c.operation.id}};}});
+      if(route!=='running')await c.ensureSavedServerJobStarted(normalized);
+      assert.equal(effects,route==='running'?0:2);
+      c.packetJson=JSON.stringify({status,files:status==='completed'?[{name:'quotation.xlsx'}]:[],
+        ...(format==='present'?{output_rows:{schema,rows:[{diagnostic_row_id:'row-0',source_basis_line_id:'same',description:'Synthetic current row',
+          quantity:1,unit:'nos',price_mode:'Priced',pricing_authority:{variant:'manual'}}]}}:{})});
+      vm.runInContext('var resultPacket=JSON.parse(packetJson);',c);
+      const allowLegacyRows=route==='running'&&marker==='missing';
+      const result=c.adoptGenerationOutputRows(c.resultPacket,c.state.lineItems,{allowLegacyRows});
+      const expected=status==='failed'?'failed':format==='absent'&&!allowLegacyRows?'failed':status;
+      assert.equal(result.status,expected,`${route}/${marker}/${status}/${format}`);
+      if(expected==='failed')assert.equal(result.files.length,0);
+      assert.equal(c.state.outputRows[0].source_basis_line_id,'same');cases++;
+    }
+  console.log(JSON.stringify({generation_contract_cases:cases,provider_requests:0}));
+}
+
 async function resumedPdfStatusCases() {
   const rows = [];
   for (const scenario of ['current_pdf', 'missing_pdf', 'download_without_view', 'stale_no_entry', 'postcommit_warning', 'pricing_review', 'excel', 'workbook_unavailable', 'no_files']) {
     const calls = { resumedStart: 0, poll: 0, persistentSave: 0, localSave: 0, updateDownload: 0, modalAttempt: 0, readyShown: 0, statuses: [], messages: [] };
-    const state = { activeJob: { id: 'job-synthetic-resume', type: scenario === 'excel' ? 'generate' : 'generate_pdf', phase: 'running', viewPdf: scenario !== 'excel' }, outputRevision: 5, outputRows: [], pdfFile: null };
+    const state = { activeJob: { id: 'job-synthetic-resume', type: scenario === 'excel' ? 'generate' : 'generate_pdf', phase: 'running', viewPdf: scenario !== 'excel' }, outputRevision: 5, outputRows: [{price_mode:'Priced',description:'Synthetic saved row',quantity:1,unit:'nos',pricing_authority:{variant:'manual'}}], lineItems:[], pdfFile: null };
     const xlsx = { name: 'quotation.xlsx', url: '/api/quote-sessions/quote-synthetic/download/xlsx' };
     const pdf = { name: 'quotation.pdf', url: '/api/quote-sessions/quote-synthetic/download/pdf' };
     const current = scenario === 'current_pdf';
@@ -34,7 +237,7 @@ async function resumedPdfStatusCases() {
       ensureSavedServerJobStarted: async () => { calls.resumedStart++; return { ok: true }; },
       pollJob: async () => { calls.poll++; return { ok: true, data: { status: 'completed', result: data } }; },
       isInterruptedJobPoll: () => false, currentGenerationContext: () => ({ session_id: 'quote-synthetic', run_id: 'run-synthetic' }),
-      safeQuoteSessionId: value => value, transitionGenerationContext() {},
+      safeQuoteSessionId: value => value, transitionGenerationContext() {}, PRICING_AUTHORITY_VARIANTS:new Set(['manual']), isPlainObject: value => !!value && typeof value === 'object' && !Array.isArray(value),
       setResultStatus: (label, tone) => calls.statuses.push({ label, tone }),
       renderMessages: (messages, tone) => calls.messages.push({ messages, tone }),
       clearPricingReviewMessages() {}, renderPricingMatches() {}, renderMatchSummary() {},
@@ -43,7 +246,7 @@ async function resumedPdfStatusCases() {
       updateDownloadButton: () => { calls.updateDownload++; },
       showGeneratedExportReadyModal: () => { calls.modalAttempt++; const ready = !!state.pdfFile; if (ready) calls.readyShown++; return ready; },
     });
-    vm.runInContext(['resumeSavedJob', 'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
+    vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
     await context.resumeSavedJob();
     assert.equal(calls.resumedStart, 1); assert.equal(calls.poll, 1);
     assert.equal(state.isGenerating, false); assert.equal(state.activeJob, null);
@@ -360,6 +563,11 @@ async function lifecycleCases() {
       assert(elements.excelGeneratingModal.hidden && !state.isPreparingOutput);
       assert.equal(requests, 2, "one retry must produce one save");
     }
+
+  } else if (mode === "generation-contract") {
+    await generationContractCases();
+  } else if (mode === "generation-output") {
+    await generationOutputCases();
   } else if (mode === "resume-status") {
     await resumedPdfStatusCases();
   } else if (mode === "checkpoint") {

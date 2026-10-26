@@ -47,6 +47,7 @@ class ObjectPdfCompletionTest(unittest.TestCase):
             output_dir, job_tmp = output_root / job_id, tmp_root / job_id
 
             def synthetic_generator(command, **kwargs):
+                existing.write_generator_diagnostic_fixture(command)
                 self.assertEqual(Path(command[1]), webapp.GENERATOR_PATH)
                 self.assertEqual(command[command.index("--pdf-mode") + 1], "workbook")
                 self.assertEqual(Path(command[command.index("--out") + 1]), output_dir)

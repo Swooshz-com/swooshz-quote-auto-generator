@@ -32,3 +32,9 @@ class QuoteFlowReliabilityTest(unittest.TestCase):
 
     def test_resumed_pdf_current_unavailable_warning_review_and_excel_status(self):
         self.run_contract("resume-status")
+
+    def test_structured_export_direct_resume_legacy_and_malformed_adoption(self):
+        self.run_contract("generation-output")
+
+    def test_generation_contract_marker_dispatch_and_legacy_resume_matrix(self):
+        self.run_contract("generation-contract")
