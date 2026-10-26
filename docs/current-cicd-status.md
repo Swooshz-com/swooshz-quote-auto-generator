@@ -1,8 +1,8 @@
 # Current CI/CD Status
 
-Last updated: 2026-10-25
+Last updated: 2026-10-26
 
-Source of truth: `.github/workflows/ci.yml`
+Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
 
 ## Active Workflow
 
@@ -16,6 +16,16 @@ Source of truth: `.github/workflows/ci.yml`
 - This remediation adds no deployment job
 - No production environment mutation is performed by CI
 - CI does not require OpenAI, DeepSeek, Gemini, Google OIDC, deployment, or production secrets
+
+## Plain-Text Check
+
+- Workflow: `.github/workflows/plain-text.yml`; runs on pull requests and pushes to every branch.
+- Uses read-only repository contents, pinned checkout and Node actions, no persisted checkout credentials, and a ten-minute timeout.
+- Checks the exact pull-request head or pushed commit with Node 22 and no additional dependencies or secrets.
+- Runs `.github/scripts/plain-text-check.cjs` using `.github/plain-text.json` with the default reference rules and no custom banned terms.
+- Existing documentation references are recorded once in `.github/plain-text-baseline.json`; new references fail and the baseline can only shrink.
+- Rewrite failures in plain English, then run `node .github/scripts/plain-text-check.cjs`; use `--prune-baseline` after removing old references.
+- The existing application workflow and its security gates are unchanged. No deployment job or required branch-protection check is added.
 
 ## Active Jobs
 
@@ -129,6 +139,13 @@ Source of truth: `.github/workflows/ci.yml`
 - CI never applies migrations against a configured production database. The
   real PostgreSQL migration tests create and remove only disposable databases
   inside the job-scoped service.
+- GitHub repository settings (free on a public repository): Dependabot security
+  updates, secret scanning with push protection, CodeQL default setup and private
+  vulnerability reporting are on.
+- Dependabot opens weekly version updates for pip, npm and GitHub Actions, with
+  patch and minor updates grouped and a short cooldown (seven days for GitHub
+  Actions, three for the rest). Nothing merges on its own: every update PR waits
+  for review.
 
 ## Deploy Runtime Gate
 
@@ -251,7 +268,6 @@ Source of truth: `.github/workflows/ci.yml`
 ## Not Configured
 
 - No deployment workflow is enabled.
-- CodeQL is not enabled.
 - Branch protection requirements are not documented as complete in this repo yet.
 
 ## Maintenance Rule

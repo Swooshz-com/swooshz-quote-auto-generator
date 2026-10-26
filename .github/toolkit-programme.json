@@ -1,0 +1,14 @@
+{
+  "schema": "toolkit.programme-binding.v1",
+  "repository": "Swooshz-com/swooshz-quote-auto-generator",
+  "parent_issue": 143,
+  "record_prefix": "INT-SQAG-",
+  "writer_prefix": "INT-SQAG-",
+  "store": {
+    "kind": "github",
+    "repository": "Swooshz-com/TRANSPORT-swooshz-quote-auto-generator",
+    "branch": "main",
+    "path": "state/Swooshz-com/swooshz-quote-auto-generator/"
+  },
+  "required_checks": []
+}

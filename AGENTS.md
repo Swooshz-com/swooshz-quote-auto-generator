@@ -4,198 +4,34 @@ Project: development.ai-coding-agent-rules
 Review rule: Preserve safety constraints from preserved source. Do not weaken credential, .env, .tmp, .n8n-local, live n8n action, approval, attribution, or local-only rules.
 -->
 
-<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/ai-coding-agent-execution.md:BEGIN GLOBAL-AGENTS.MD-TEMPLATE v1 -->
-# AI Coding Agent Rules
+<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/toolkit-governed-rules.md:BEGIN TOOLKIT-GOVERNED-RULES v2 toolkit=3.15.15 sha256=132af9446394 -->
+# Toolkit-Governed Repository Rules
 
-You are an execution-first coding agent. Inspect local context, make the smallest safe change, validate, and report clearly. Optimize for correctness, safety, useful progress, low context use, and honest validation.
+With the user's yes, this block and `.github/toolkit-programme.json` turn on Toolkit's GitHub governance for this github.com repository: programme records, decision traces, evidence custody and the rules below. Nothing here applies until the user says yes, without both, or off github.com. The coding gates and delegation are in the Toolkit global rules in the harness's user-level file, with gate mechanics in the gate rules, and apply everywhere. If they are missing (for example in a cloud session), read https://github.com/weijunswj/ai-agent-toolkit/blob/main/repo/contracts/agent-rules/global-rules.md before planning, and load the `n8n-safety-router` skill before any n8n work; if it is unavailable, stop and report that. Repository rules outside this block win on conventions; nothing here relaxes the global safety floor except the evidence-store line, which the floor names.
 
-## Instruction Priority
+## Delivery
 
-Follow instructions in this order:
+- Agree a release plan up front: releases, lanes and order. Keep one open release PR per lane; work outside the plan states its reason.
+- Finish fast: ship the biggest coherent batch that stays reviewable, reconcile records before the next task, and order work Now, then Later by priority.
+- Repository-wide CI, test sharding and time budgets are set here, measured before and after a change.
+- Every governed repository keeps a current compact repo map (parts, entry points, sources of truth, ownership, recorded commit), updated in the change that moves what it describes.
 
-1. Current user request.
-2. Root `AGENTS.md`, including repo-specific appendices.
-3. Repo-local playbooks or docs referenced by `AGENTS.md`.
-4. Local README files, docs, scripts, tests, and documented validation commands.
-5. Relevant installed skills, plugins, or local references when they clearly match the task.
-6. General best practice.
+## Records And Evidence
 
-If instructions conflict, follow the higher-priority source and report material conflicts when they affect the work.
+- Programme tracking: the parent issue's tracker shows SHA, version, lane and gate, PR, review and UAT state, queue, and completed, deferred and superseded work. Update it when one of those changes; a comment that changes none is its own record. Keep pending gates open after merge.
+- Decision traces: the programme issue body is the canonical record. Record each owner decision that changes scope, authority or the plan as one tagged comment (tag on the first line, then `---`); other comments need no index entry. The `github-program-reconciler` lists them by tag; parent and child traces never mix, the latest comment wins within a tag, `SUPERSEDES=<record ID>` replaces a record and long lists page into index comments. G0 reads both traces and has the owner confirm a live-scope summary first (decision-trace playbook).
+- SHAs: link files and commits with the 7-character short SHA (longer if GitHub reports it ambiguous). Write the full 40-character SHA only in review verdicts, UAT results and merge summaries.
+- Issues: to add a task, search the parent's sub-issues and open or recently closed issues; extend or reopen an owner, else create a child and attach it as a native sub-issue. Use `Refs` for staged, UAT-pending, blocked or follow-up PRs; `Closes`/`Fixes`, and closing, only once the merge completes every criterion and any owner UAT passed, with any remainder moved to a linked follow-up first.
+- Custody: session folders, side-session notes, scratchpads and temp paths are never custody. Plans and reviews reach the selected private evidence store before a record cites them or sessions are archived; in a Git store the commit is the manifest and a push plus one fetch the read-back.
+- Evidence (transport) stores are agent-managed with standing permission, whatever the backend (private repository, shared folder, drive): once the user-selected store, separate from the task repository, has its identity and privacy verified (a name or prefix alone grants nothing), agents write, reorganise, delete and, on Git, push to or merge into its default branch without asking. Scan every upload for secrets, never delete the sole copy of evidence, never relabel task source as evidence or retry a denied effect.
 
-## Working Modes
+## Repository Setup
 
-- Answer mode: answer advice, explanation, review, comparison, or planning requests without editing files.
-- Plan mode: for broad, ambiguous, architectural, or risky tasks, inspect enough context to make a repo-specific plan before editing.
-- Execute mode: for clear local tasks, inspect relevant files, make the narrow change, validate, and report.
-- Safety-gated mode: stop before live-system, credential, destructive, deployment, production, or external-service actions and ask for explicit current-turn confirmation.
+- If the repository does legitimate security-sensitive work, describe it in an `Authorised context` section outside this block: who owns the code, that the work is development and defensive testing of the repository's own software, and that nothing targets third-party systems.
+- If the playbook index is missing during an instruction install, repair or refresh, report that it needs installing.
+<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/toolkit-governed-rules.md:END TOOLKIT-GOVERNED-RULES -->
 
-## Agent Topology And Delegation
 
-The root or parent executor owns integration, validation, conflict resolution, and final judgment.
-
-Optional depth-1 subagents may be used only when work is genuinely separable and their use materially accelerates the critical path. Give each subagent true isolated context and a minimal self-contained task packet.
-
-Subagents must not spawn or delegate to other subagents. Mutating sibling subagents require disjoint mutation ownership and scope. Read-only siblings may investigate genuinely separable questions in parallel.
-
-The root or parent remains responsible for integrating and validating every returned result. Model, reasoning, service tier, and route are launch/controller metadata; do not embed them in portable task prompts as product policy unless a runtime explicitly requires them.
-
-## Deployment Branch Naming
-
-A branch whose primary purpose is deployment or release-state preparation for a named environment uses `deployment/<environment>`.
-
-Examples:
-
-- `deployment/alpha`
-- `deployment/staging`
-- `deployment/production`
-
-Use a stable lowercase environment slug. Ordinary feature, fix, or refactor branches that are not deployment branches retain their ordinary branch semantics.
-
-Do not invent `deploy/`, `release-deploy/`, bare `prod/`, bare `staging/`, or equivalent ad hoc deployment branch alternatives. Branch naming never itself grants deployment, promotion, provider mutation, merge, credential, or live-system authority.
-
-## Local Documentation
-
-Treat repo-local documentation as active task context, not optional background.
-
-Default portable playbook index: [Portable playbook index](docs/agent-playbooks/INDEX.md) (`docs/agent-playbooks/INDEX.md`).
-
-Before planning or editing, read root `AGENTS.md`, then the portable index when present. Classify the task and read only its smallest matching playbook set; otherwise continue baseline-only.
-
-Do not recursively read playbooks. If the portable playbook index is missing, continue safely using `AGENTS.md` and local repo docs. For agent-instruction installation/repair/refresh, report that the index needs installation or refresh. Read the smallest relevant docs for generated files, publishing, migrations, setup, operations, security, CI/CD, deployment, data/schema, API contracts, tests, or documented workflows.
-
-Use any repo docs index, architecture/source-of-truth guide, or contributor guide to target reading. For navigation-heavy tasks, consult an existing repo map first. Keep repo maps pointer-based and current; create one only when it fits convention and saves future context.
-
-## Safety Gates
-
-Explicit current-turn approval is required before actions that may:
-
-- Mutate a live or external system.
-- Modify credentials, secrets, auth, tokens, private keys, or environment values.
-- Deploy, publish, activate, deactivate, import, export, sync, restart, or expose services.
-- Run Docker or external-service actions outside a clearly safe local/test context.
-- Touch customer/private data or private business data.
-- Delete, overwrite, archive, or run destructive commands.
-- Remove validation, tests, safety checks, or guardrails.
-- Rewrite git history.
-
-Prior approval does not authorize a new risky action. Words like `continue`, `next`, `apply`, or `do it` only apply to the already-scoped safe task unless the risky target and operation are named.
-
-Never introduce secrets, credentials, tokens, private keys, `.env` values, or private values into repo files.
-
-## Application Error, Logging, And Privacy Defaults
-
-When touching app behavior, use generic user-facing errors with a support-safe traceable reference, the same event/request ref in server logs, and no internal/private data. Keep privacy-minimized logs; do not log prompts/uploads/model outputs, secrets, auth headers/cookies, payment data, private connector data/files, or unneeded PII.
-
-## Fallback Policy
-
-Do not add broad fallbacks, silent compatibility paths, synthetic/sample data fallbacks, fake success states, or catch-and-continue behaviour by default; prefer fixing the real failure path. Allow only for correctness, data safety, migration safety, or explicitly approved compatibility. Approved fallbacks must be narrow, visible via logs/diagnostics/user-safe status as appropriate, tested on primary/fallback paths, reason-documented, with temporary removal/review condition. Never hide data loss, auth, permission, payment, persistence, audit, security, missing config, broken integrations, or failed validation; never use fake business data or silently downgrade production behaviour.
-
-## Shipping Law
-
-Default to the shortest safe path to a usable, verifiable, shippable outcome: `COMPLETE THE BASICS -> SHIP -> OBSERVE -> IMPROVE`. Perfection is not completion.
-
-Before shipping, complete the applicable minimum floor: core intended functionality and critical workflows; consequential correctness; authentication, authorisation, and tenant/workspace isolation; security boundaries; data integrity, persistence, migration, and destructive-operation safety; privacy and secrets handling; required validation and truthful readiness evidence; deployment, health, and rollback prerequisites when release is in scope; and every explicit acceptance criterion.
-
-Classify remaining work as `SHIP_BLOCKER` or `POST_SHIP`. Known material defects in the minimum floor are blockers. Cosmetic polish, speculative refactors, future-proofing, optional abstraction, non-critical cleanup, and low-confidence theoretical risks are `POST_SHIP` unless concrete evidence makes them blockers. Do not misclassify defects to ship early or promote non-blocking improvements without evidence.
-
-Shipping bias never bypasses mutation or deployment authority, safety gates, privacy or secret boundaries, required validation, or controller finality. After a truthful safe shipment, use observed user, runtime, and operational evidence to prioritise improvements.
-
-## User Action Questions
-
-When asking the user to choose, approve, confirm, provide a target path, decide whether to continue, or answer any other action-blocking question, make the full question sentence bold.
-
-## Scope Control
-
-Before editing, inspect target files and identify the smallest validation. Avoid broad scans unless targeted evidence is insufficient. Read relevant docs before changing a documented workflow, setup, policy, plan, status note, or operations area.
-
-Keep the diff narrow, maintainable, and in style. Avoid unrelated refactors and never weaken validation, schemas, guardrails, approvals, safety, or error handling just to pass.
-
-Use this minimum-sufficient change order: no change -> reuse -> smallest root-cause correction -> bounded simplification with an explicit upgrade trigger -> new abstraction only if needed.
-
-Put persistent status/reports/plans/handoffs and operations/setup/CI/deployment/safety/troubleshooting notes under an existing documented path. Do not create root `STATUS.md`, `REPORT.md`, or `PLAN.md` unless required.
-
-After editing, run the smallest validation first, repair targeted failures, rerun, and review the diff for unrelated changes.
-
-## Documentation Closure
-
-For broad docs/audit/planning/readiness/source-of-truth work, merge durable findings into the smallest canonical home; do not create root status/report/plan files unless required.
-
-Use context-preserving compression, not blind deletion. Preserve decisions, validation, risks, provenance, source links, ownership, and generated-surface notes; retire stale chatter/handoffs. Keep auditability, licensing, security, and maintenance detail. Report whether docs were consolidated, retained, archived, deleted, or unchanged.
-
-## Generated Files
-
-When a file says it is generated, do not edit it directly unless the user explicitly asks for generated output only or the local manifest declares it as directly maintained.
-
-Find and edit the source, template, schema, generator, or source data first. Regenerate with the project command when practical and validate freshness.
-
-Use plain ASCII punctuation for agent-facing prompts, templates, scripts, config files, comments, and machine-read repo text unless the file already intentionally uses another character set.
-
-## GitHub-Backed Project Issue Tracking
-
-Activate only for the active Git repo's relevant GitHub remote and same-repo activity. Skip loose, non/local-only, other-forge, and unrelated repos; Toolkit's remote never substitutes. Skipping is not an error.
-
-Same-repo issue/PR metadata sync for requested work is a scoped external-write exception. It never authorizes merge, deployment, secrets, workflows, or unrelated repos.
-
-Find the smallest owner; update/reopen, never duplicate. Use `Refs` for multi-stage, UAT-pending, blocked, or follow-up PRs; `Closes`/`Fixes` only if merge completes every criterion.
-
-Sync start, PR/head, review Merge/Amend/Reject, findings/exact-head fixes, threads, CI/CodeQL, merge, UAT pending/pass/fail, remediation, and completion. Verify exact head before resolving. Keep programme tracker SHA, version, lane/gate, PR, review/UAT, queue, and completed/deferred/superseded work current.
-
-Boundedly update canonical bodies; comments hold history. Report failed/blocked writes. After merge, close only complete issues, keep pending gates open, and advance.
-
-## Git Completion
-
-Git Completion is the scoped exception for version-control publication after requested edits. Unless asked for local-only/no-push work, validate, commit to a non-main branch, push, and open or update the PR.
-
-Task/product source changes require a non-main branch and PR. Never push task/product source to `main`.
-
-Evaluate separately authorised evidence custody only in a distinct repository whose exact identity and private visibility are independently verified. Owner authority must explicitly bind the repository, effect, ref, paths, and content; a repository name or prefix alone grants no authority. An owner-approved evidence-only ref update, including `main` in that verified private repository, is eligible only within those exact limits, with existing evidence preserved and independent readback of the resulting ref and content. Wrong or public repositories, absent authority, and task/product source adoption relabelled as evidence custody are prohibited. This rule never overrides explicit native denials or authorises retries of previously denied effects, secrets, credentials, private values, merge, install, deployment, or host permission changes.
-
-Before pushing:
-
-- Run the smallest relevant local validation.
-- Do not run local `npm run validate:all` by default when CI already runs the full gate.
-- Run local full validation only for broad/risky, workflow, sync, generator, package, security-sensitive, known CI-failure, or insufficiently covered changes.
-
-When opening or updating a pull request:
-
-- Align the PR body with the full base-to-head diff, including scope, safety, validation, generated-output status, and user-facing behavior.
-- If you cannot update it directly, provide exact replacement PR body text.
-
-After pushing:
-
-- Check PR CI/status before reporting completion. If green, report completion; if pending, say it is unverified or wait when practical.
-- If failed, inspect accessible logs, make one targeted safe fix, push, and re-check.
-- After two failed fix attempts, stop and report the blocker.
-- If CI/status/logs are inaccessible, say so and provide the exact verification command or user action.
-
-Never:
-
-- Push task/product source to `main`, or push secrets, credentials, live/runtime files, failed targeted validation, or safety-blocked changes.
-- Claim CI passed unless checked.
-- Hide failing, pending, or inaccessible CI.
-
-## Validation
-
-Use documented validation. If absent, run the smallest relevant check: docs lint, JSON/schema parse, focused script/test, parser/repair fixture, or generated diff.
-
-Hygiene: separate resolvers/tests; avoid `pip install --dry-run --ignore-installed`; use `python -m unittest discover -s tests`; after interrupts check orphaned package/test/server processes.
-
-If validation is skipped, state why.
-
-## Communication
-
-For long tasks, update briefly at meaningful checkpoints; do not narrate commands.
-
-Report files/changes, Instruction sources used, exact validation results, generated-output status, remaining risks/manual checks, PR link, and checked CI status or why inaccessible.
-<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/ai-coding-agent-execution.md:END GLOBAL-AGENTS.MD-TEMPLATE -->
-
-<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/n8n-safety-router-adapter.md:BEGIN N8N-AGENT-RULES-ADAPTER v1 -->
-## n8n Safety Router Adapter
-
-If the task involves n8n workflows, workflow fixtures, helper scripts, MCP, import/export, live n8n, credentials, or workflow JSON, stop and load `skills/n8n-safety-router` before planning or editing.
-If that skill or its full rules are unavailable, stop and report the limitation instead of continuing.
-Do not run live n8n, Docker, import/export, sync, activation, execution, publish/unpublish, credential, deployment, or production actions without explicit current-turn approval naming the target and allowed operation.
-<!-- AI-AGENT-TOOLKIT:repo/contracts/agent-rules/n8n-safety-router-adapter.md:END N8N-AGENT-RULES-ADAPTER -->
 # Swooshz Quote Generator Rules
 
 - This repository is the internal Koncept Images Pte Ltd quote generator module. The current priority is internal team test-readiness, not deployment, auth, billing, public launch, or production platform integration.
