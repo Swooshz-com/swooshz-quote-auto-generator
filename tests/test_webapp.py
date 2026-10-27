@@ -3868,7 +3868,12 @@ const state = {
 function safeQuoteSessionId(value) { return String(value || "").trim(); }
 function normalizeCompanyProfile(value) { return value; }
 function mergePricingReferences(value) { return value; }
-function syncSelectedPricingReference() {}
+function syncSelectedPricingReference() {
+  if (!state.pricingReferenceId) {
+    state.pricingReferenceId = state.defaultPricingReferenceId;
+    state.pricingReferenceSource = "local";
+  }
+}
 function renderProfileOptions() {}
 function renderPresetOptions() {}
 async function hydrateProfileLogoFingerprints(options) {
@@ -3933,6 +3938,17 @@ function response(suffix) {
   assert.strictEqual(state.pricingReferences[0].id, "pricing-b");
   assert.strictEqual(state.defaultProfileId, "profile-b");
   assert.strictEqual(state.defaultPricingReferenceId, "pricing-b");
+  // First hydration owns the synchronous workspace/default-selection changes;
+  // they must not make its successful return look like a failed prerequisite.
+  state.workspace = null;
+  state.pricingReferenceId = "";
+  state.pricingReferenceSource = "";
+  const firstHydration = loadProfiles();
+  await Promise.resolve();
+  pending[2](response("b"));
+  assert.strictEqual(await firstHydration, true);
+  assert.strictEqual(state.workspace.id, "workspace-b");
+  assert.strictEqual(state.pricingReferenceId, "pricing-b");
 })();
 """
         completed = subprocess.run(

@@ -8858,7 +8858,10 @@ async function loadProfiles() {
   state.defaultPricingReferenceId = defaultPricingReferenceId;
   state.pricingReferences = pricingReferences;
   syncSelectedPricingReference();
-  if (!authorityProfileRequestIsFresh(refreshedContext)) return false;
+  // The checked response owns these synchronous workspace/default-selection
+  // changes. Rebind them without accepting a newer request sequence.
+  const committedContext = refreshAuthorityProfileRequestContext(refreshedContext);
+  if (!committedContext || !authorityProfileRequestIsFresh(committedContext)) return false;
   renderProfileOptions();
   renderPresetOptions();
   return true;
@@ -17995,6 +17998,7 @@ async function boot() {
   let dashboardOperation = null;
   let workspaceView = null;
   let sessionReady = false;
+  let profilesReady = false;
   setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
   wireEvents();
   clearLegacyLocalCompanyPresets();
@@ -18008,16 +18012,32 @@ async function boot() {
       if (workspaceView) workspaceView = { ...workspaceView, restorableOverlay: "" };
     } else dashboardOperation = restoredDashboardOperation();
     if (dashboardOperation) setDashboardLoadingState(true, dashboardOperationLoadingOptions(dashboardOperation));
-    await loadProfiles();
+    try {
+      profilesReady = await loadProfiles();
+    } catch {
+      // An unavailable prerequisite must not admit or rewrite saved authority.
+      profilesReady = false;
+    }
+    if (!profilesReady) {
+      setDashboardLoadingState(true, {
+        title: "Workspace unavailable",
+        message: "Pricing references could not be loaded. Refresh this page to try again. Your saved quote has not been changed.",
+      });
+      return;
+    }
     const quoteRestored = await setInitialValues();
     if (workspaceView) applyWorkspaceViewState(workspaceView, { quoteRestored });
     if (state.activeAppView === "quote") showQuoteFlow();
     else showDashboard({ load: false });
     checkHealth();
   } finally {
-    state.isBooting = false;
-    if (!sessionReady) setDashboardLoadingState(false);
-    syncControlStates();
+    if (profilesReady) {
+      state.isBooting = false;
+      syncControlStates();
+    } else if (!sessionReady) {
+      state.isBooting = false;
+      setDashboardLoadingState(false);
+    }
   }
   finishAuthenticationRecovery();
   if (state.activeJob) setDashboardLoadingState(false);

@@ -87,6 +87,14 @@ npm run playwright:smoke
   never rebuild all basis rows as a side effect of selecting one price. Run
   `python -m unittest tests.test_output_reference_selection` for the closure
   matrix and a rendered duplicate, target grant, reopen and protected XLSX check.
+  Startup must finish pricing-reference hydration before admitting saved quote
+  rows or releasing the boot persistence fence. An unavailable, malformed or
+  throwing reference load must preserve the exact browser recovery payload and
+  durable quote, retain the loading hold, and dispatch no saved operation.
+  Run `tests.test_startup_profile_recovery` for the prerequisite matrix. The
+  rendered Output-selection regression injects a local reference-list outage,
+  then reloads successfully and verifies retained catalogue/manual authority,
+  FX, edited subset and Reset snapshot before protected XLSX generation.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret

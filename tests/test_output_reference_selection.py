@@ -39,6 +39,6 @@ class OutputReferenceSelectionTest(unittest.TestCase):
         self.assertEqual(proof["status"], "PASS")
         self.assertEqual(proof["rows"], 2)
         self.assertEqual(proof["conditionalSelections"], 1)
-        for key in ("targetGrantPersisted", "saveReopen", "manualFxAndResetRetained", "originalUnchanged"):
+        for key in ("targetGrantPersisted", "saveReopen", "profileOutageRecovery", "manualFxAndResetRetained", "originalUnchanged"):
             self.assertIs(proof[key], True)
         self.assertGreater(proof["protectedXlsxBytes"], 1000)
