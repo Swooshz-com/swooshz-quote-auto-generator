@@ -29486,7 +29486,19 @@ def atomic_write_text(path: Path, content: str) -> None:
 def result_has_generated_quote(result: dict[str, Any] | None) -> bool:
     if not isinstance(result, dict):
         return False
-    return clean_text(result.get("status")) in {"completed", "needs_confirmation", "needs_review", "degraded"}
+    status = clean_text(result.get("status"))
+    if status not in {"completed", "needs_confirmation", "needs_review", "degraded"}:
+        return False
+    if status != "completed" and "files" in result:
+        # A pricing review can stop before a workbook exists. Completed results
+        # still reach storage's missing-artifact check rather than becoming drafts.
+        files = result["files"]
+        return isinstance(files, list) and any(
+            isinstance(item, dict) and clean_text(item.get("name")) == "quotation.xlsx"
+            for item in files
+        )
+    # Legacy results without declarations retain guarded output-dir discovery.
+    return True
 
 
 def quote_session_timestamp_sort_value(value: Any) -> float:

@@ -48051,6 +48051,55 @@ process.stdout.write("ok");
                         )
 
 
+class GeneratedQuoteResultStatusTest(unittest.TestCase):
+    def test_generated_quote_status_requires_a_declared_xlsx_where_expected(self):
+        cases = []
+        for status in ("needs_confirmation", "needs_review", "degraded"):
+            cases.extend(
+                (
+                    (f"{status} with empty files", {"status": status, "files": []}, False),
+                    (
+                        f"{status} with CSV only",
+                        {"status": status, "files": [{"name": "quotation.csv"}]},
+                        False,
+                    ),
+                    (
+                        f"{status} with XLSX and malformed entries",
+                        {
+                            "status": status,
+                            "files": [None, "malformed", {"name": "quotation.xlsx"}],
+                        },
+                        True,
+                    ),
+                )
+            )
+
+        cases.extend(
+            (
+                ("completed without files", {"status": "completed"}, True),
+                ("completed with empty files", {"status": "completed", "files": []}, True),
+                ("completed with CSV only", {"status": "completed", "files": [{"name": "pricing_matches.csv"}]}, True),
+                ("malformed review files", {"status": "needs_confirmation", "files": None}, False),
+                ("invalid result", None, False),
+                (
+                    "failed with declared XLSX",
+                    {"status": "failed", "files": [{"name": "quotation.xlsx"}]},
+                    False,
+                ),
+                (
+                    "blocked with declared XLSX",
+                    {"status": "blocked", "files": [{"name": "quotation.xlsx"}]},
+                    False,
+                ),
+                ("legacy review without files", {"status": "needs_review"}, True),
+            )
+        )
+
+        for label, result, expected in cases:
+            with self.subTest(case=label):
+                self.assertIs(webapp.result_has_generated_quote(result), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
 

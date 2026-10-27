@@ -36,6 +36,14 @@ npm run playwright:smoke
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
 - Pricing reference import, catalog matching, currency/tax metadata, or template parsing: add/update parser and normalization tests, then run the relevant `tests.test_webapp` and `tests.test_generate_quote` cases.
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
+  A review result with an explicit empty or diagnostic-only file list must save
+  as review without entering atomic workbook publication. Test this with the real
+  generator, migrated database and synthetic object backend, then resolve pricing
+  explicitly and verify a real durable XLSX after owned scratch cleanup. Completed
+  results with missing artifacts must still fail storage validation; partial review
+  results declaring XLSX retain artifact validation. Legacy results without file
+  declarations retain guarded output-directory discovery only until the saved-result
+  contract is migrated; the publication owner must preserve that consumer meanwhile.
   Export diagnostics carry a server-created row token and the original source row
   ID. Test exact correspondence against the captured final brief, including
   reordered, missing, extra, duplicate and formula-prefixed identities. CSV prices
