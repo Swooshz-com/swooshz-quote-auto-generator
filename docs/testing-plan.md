@@ -98,6 +98,10 @@ npm run playwright:smoke
   Include successful responses with malformed reference entries, duplicate
   identities and missing saved references. Hold current-scope priced recovery
   unchanged, while allowing a genuinely empty new workspace to open Settings.
+  Matching reference headers also need the catalogue content used by saved
+  claims. Exercise missing, malformed, duplicate and inconsistent items under
+  an unchanged reference basis across saved rows and Reset. Keep legitimate
+  changed-basis commercial review and supported nested snapshot restoration.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret

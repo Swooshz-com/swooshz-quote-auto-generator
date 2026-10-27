@@ -28297,6 +28297,7 @@ eval([
   "quoteCommercialRestorationReviewReason",
 ].map((name) => extractFunction(name)).join("\n"));
 eval(extractFunction("setQuoteCommercialReview"));
+eval(extractFunction("quoteSessionSnapshotForRestoration"));
 eval(extractFunction("applyQuoteSessionSnapshot", true));
 
 const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
@@ -28586,6 +28587,7 @@ eval([
   "setQuoteCommercialReview",
   "syncSelectedPricingReference",
   "renderProfileOptions",
+  "quoteSessionSnapshotForRestoration",
   "applyQuoteSessionSnapshot",
   "applyPendingPricingReferenceSelection",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28834,6 +28836,7 @@ eval([
   "quoteCommercialStrictDataEqual",
   "quoteCommercialRestorationReviewReason",
   "setQuoteCommercialReview",
+  "quoteSessionSnapshotForRestoration",
   "applyQuoteSessionSnapshot",
   "mergeDashboardDraftSummaryDetails",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -29471,6 +29474,7 @@ required.push("normalizeActiveJob", "activeJobMaxAgeMs");
 if (scenario.originalBoundary) required.push("clearActiveJob", "activeJobBrowserSnapshot");
 if (scenario.originalBoundary || scenario.path === "duplicate") required.push("saveSessionState", "buildSessionSnapshot");
 if (scenario.path === "duplicate") required.push(
+  "quoteSessionSnapshotForRestoration",
   "applyQuoteSessionSnapshot", "activeJobBrowserSnapshot", "mergeDashboardDraftImagesWithAvailablePayloads",
   "dashboardDraftPayloadIsReferenceFile", "dashboardDraftLogoSessionFileKey",
   "dashboardDraftImagePayloadMatches", "dashboardDraftImageFileFieldsMatch", "quoteCommercialSnapshotRawValues", "normalizeQuoteCommercialSnapshot",

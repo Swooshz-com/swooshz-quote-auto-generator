@@ -812,7 +812,10 @@ try {
         "selection was not persisted in the target ledger");
       // A transient reference outage must not admit saved rows against an empty
       // catalogue and persist demoted catalogue/manual authority over recovery.
-      for (const fault of ["unavailable", "empty", "invalid"]) {
+      const profileRecoveryFaults = ["unavailable", "empty", "invalid", "missing-authority-items",
+        "malformed-authority-items", "missing-selected-item", "duplicate-selected-item",
+        "invalid-item-price", "changed-item-price", "changed-item-unit", "changed-item-description", "changed-item-section"];
+      for (const fault of profileRecoveryFaults) {
         const storageBeforeOutage = await page.evaluate(() => ({
           quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
           workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
@@ -826,7 +829,26 @@ try {
           } else {
             const response = await route.fetch();
             const body = await response.json();
-            await route.fulfill({ response, json: { ...body, pricing_references: fault === "empty" ? [] : [{}] } });
+            const references = fault === "empty" ? [] : fault === "invalid" ? [{}]
+              : body.pricing_references.map((reference) => {
+                const selected = reference.authority_items?.find((item) => item.id === byName("Bar Stool").id);
+                if (!selected) return reference;
+                let items = reference.authority_items.map((item) => ({ ...item }));
+                if (fault === "missing-authority-items") items = [];
+                else if (fault === "malformed-authority-items") items = [null];
+                else if (fault === "missing-selected-item") items = items.filter((item) => item.id !== selected.id);
+                else if (fault === "duplicate-selected-item") items.push({ ...selected });
+                else items = items.map((item) => {
+                  if (item.id !== selected.id) return item;
+                  if (fault === "invalid-item-price") return { ...item, sale_unit_price: "invalid" };
+                  if (fault === "changed-item-price") return { ...item, sale_unit_price: item.sale_unit_price + 1 };
+                  if (fault === "changed-item-unit") return { ...item, unit_hint: "lot" };
+                  if (fault === "changed-item-description") return { ...item, description: "Different synthetic item" };
+                  return { ...item, section: "Different synthetic section" };
+                });
+                return { ...reference, items: [], authority_items: items };
+              });
+            await route.fulfill({ response, json: { ...body, pricing_references: references } });
           }
         };
         await page.route("**/api/profiles", rejectProfiles);
@@ -865,7 +887,7 @@ try {
         "target protected XLSX differs from the downloaded workbook");
       assert(await fs.readFile(originalPath, "utf8") === originalMetadata, "target selection/export changed the original quote");
       result.outputReferenceSelection = { status: "PASS", rows: 2, targetGrantPersisted: true, conditionalSelections: 1,
-        saveReopen: true, profileOutageRecovery: true, profileOutageRecoveryCases: 3, manualFxAndResetRetained: true, originalUnchanged: true, protectedXlsxBytes: bytes.length };
+        saveReopen: true, profileOutageRecovery: true, profileOutageRecoveryCases: profileRecoveryFaults.length, manualFxAndResetRetained: true, originalUnchanged: true, protectedXlsxBytes: bytes.length };
     }
     if (reliability) {
       await page.locator("#backToDashboardButton").click();

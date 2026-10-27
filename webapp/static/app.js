@@ -4765,12 +4765,7 @@ function quoteCommercialRestorationReviewReason(saved = {}, normalizedSnapshot =
   return "";
 }
 
-async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
-  if (commitActiveOutputEditor() === "blocked") return false;
-  if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION) {
-    return false;
-  }
-  const savedState = saved;
+function quoteSessionSnapshotForRestoration(savedState = {}) {
   const containers = [savedState];
   const draftCandidates = [];
   let containerMalformed = false;
@@ -4803,6 +4798,16 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       ...(draftCandidates[0] || {}),
       ...savedState,
     };
+  return { containers, draftCandidates, containerMalformed, nestedSession, restoredState };
+}
+
+async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
+  if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION) {
+    return false;
+  }
+  const savedState = saved;
+  const { containers, draftCandidates, containerMalformed, nestedSession, restoredState } = quoteSessionSnapshotForRestoration(savedState);
   if (isPlainObject(restoredState.originalAnalysisSnapshot)
     && Object.prototype.hasOwnProperty.call(restoredState.originalAnalysisSnapshot, "line_items")
     && !Array.isArray(restoredState.originalAnalysisSnapshot.line_items)) return false;
@@ -18007,15 +18012,32 @@ function startupPricingReferenceIsAvailable() {
   const saved = safeSessionJson();
   if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION
     || saved.browserRecoveryScope !== currentBrowserRecoveryScope()) return true;
-  const hasSavedPricing = saved.basisConfirmed === true
-    || [saved.lineItems, saved.outputRows, saved.originalOutputRows].some((rows) => Array.isArray(rows) && rows.length);
+  const { containers, restoredState } = quoteSessionSnapshotForRestoration(saved);
+  const rowSets = [restoredState.lineItems, restoredState.outputRows, restoredState.originalOutputRows];
+  const hasSavedPricing = restoredState.basisConfirmed === true
+    || rowSets.some((rows) => Array.isArray(rows) && rows.length);
   if (!hasSavedPricing) return true;
-  const id = typeof saved.pricingReferenceId === "string" ? saved.pricingReferenceId.trim() : "";
-  const source = typeof saved.pricingReferenceSource === "string" ? saved.pricingReferenceSource.trim() : "";
-  return (Array.isArray(state.pricingReferences) ? state.pricingReferences : []).filter((reference) => {
+  const identity = (keys) => containers.flatMap((container) => keys
+    .filter((key) => Object.prototype.hasOwnProperty.call(container, key))
+    .map((key) => container[key])).find((value) => typeof value === "string") || "";
+  const id = identity(["pricingReferenceId", "pricing_reference_id"]).trim();
+  const source = identity(["pricingReferenceSource", "pricing_reference_source"]).trim();
+  const references = (Array.isArray(state.pricingReferences) ? state.pricingReferences : []).filter((reference) => {
     const basis = pricingReferenceAuthorityBasis(reference);
     return basis && basis.id === id && basis.source === source;
-  }).length === 1;
+  });
+  if (references.length !== 1) return false;
+  const reference = references[0];
+  const basis = pricingReferenceAuthorityBasis(reference);
+  return rowSets.flatMap((rows) => Array.isArray(rows) ? rows : []).every((row) => {
+    const authority = row?.pricing_authority;
+    if (authority?.variant !== "catalog") return true;
+    // Changed bases retain the commercial-review path. An unchanged basis must
+    // supply the catalogue content that the restoration validator will consume.
+    if (authority.catalog_digest !== basis.digest || authority.catalog_source !== basis.source
+      || authority.currency !== basis.currency) return true;
+    return normalizeOutputPricingAuthority(authority, row, { reference })?.variant === "catalog";
+  });
 }
 
 async function boot() {

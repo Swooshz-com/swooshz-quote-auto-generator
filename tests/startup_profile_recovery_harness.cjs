@@ -4,7 +4,20 @@ const vm = require('vm');
 const assert = require('assert');
 const source = fs.readFileSync('webapp/static/app.js', 'utf8');
 const boot = source.slice(source.lastIndexOf('async function boot() {'), source.lastIndexOf('\nboot();'));
-const readiness = source.slice(source.indexOf('function startupPricingReferenceIsAvailable() {'), source.lastIndexOf('async function boot() {'));
+const snapshotParser = source.slice(source.indexOf('function quoteSessionSnapshotForRestoration('), source.indexOf('async function applyQuoteSessionSnapshot('));
+const readiness = snapshotParser + source.slice(source.indexOf('function startupPricingReferenceIsAvailable() {'), source.lastIndexOf('async function boot() {'));
+function extract(name) {
+  const start = source.indexOf('function ' + name + '(');
+  assert.ok(start >= 0, name);
+  const body = source.indexOf(') {', start) + 2;
+  let depth = 0;
+  for (let i = body; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1);
+  }
+  throw Error('Unclosed ' + name);
+}
+
 assert.ok(boot.startsWith('async function boot() {'));
 
 async function check(mode) {
@@ -86,5 +99,49 @@ async function check(mode) {
     assert.strictEqual(c.startupPricingReferenceIsAvailable(),expected);
     assert.strictEqual(JSON.stringify({snapshot,references}),before);
   }
-  process.stdout.write(JSON.stringify({status:'PASS', cases:5, referenceCases:cases.length})+'\n');
+  const authorityCode = source.slice(source.indexOf('const PRICING_REFERENCE_SOURCES ='), source.indexOf('const QUOTE_COMMERCIAL_REVIEW_SCHEMA ='))
+    + ['canonicalPricingAuthorityText','canonicalPricingAuthorityUnit','pricingAuthorityVersionIsValid',
+      'pricingAuthorityContext','pricingAuthorityContextMatches','pricingAuthorityNumber','pricingReferenceAuthorityBasis',
+      'pricingReferenceCatalogItem','pricingAuthorityCatalogDescription','normalizePricingAuthority',
+      'pricingAuthorityPresentationRow','normalizeOutputPricingAuthority','bracketedCatalogReferenceParts',
+      'quoteCommercialStrictDataEqual','isPlainObject'].map(extract).join('\n');
+  const item = {id:'synthetic-item',section:'Synthetic',description:'Synthetic panel',unit_hint:'sqm',sale_unit_price:9.5};
+  const catalogReference = {...reference,authority_items:[item]};
+  const row = {source_basis_line_id:'row-a',section:item.section,description:item.description,unit:'sqm',pricing_keyword:item.id};
+  row.pricing_authority = {schema:'swooshz.pricing-authority.v1',version:1,variant:'catalog',context:{...row},currency:'SGD',price:9.5,
+    catalog_item_id:item.id,catalog_source:reference.source,catalog_digest:reference.digest_sha256,
+    catalog_section:item.section,catalog_description:item.description,catalog_unit:'sqm'};
+  const contentCases = [];
+  const faults = [[],[null],[{...item,id:'missing'}],[item,item],
+    [{...item,sale_unit_price:'invalid'}],[{...item,sale_unit_price:-1}],
+    [{...item,sale_unit_price:10.5}],[{...item,unit_hint:'lot'}],
+    [{...item,description:'Different synthetic panel'}],[{...item,section:'Other synthetic section'}]];
+  for (const field of ['lineItems','outputRows','originalOutputRows']) {
+    const snapshot = {...saved,outputRows:[],[field]:[row]};
+    contentCases.push([snapshot,[catalogReference],true]);
+    for (const items of faults) contentCases.push([snapshot,[{...catalogReference,authority_items:items}],false]);
+    for (const value of [null,{},'invalid']) contentCases.push([snapshot,[{...catalogReference,authority_items:value}],false]);
+  }
+  const priced = {...saved,outputRows:[row]};
+  contentCases.push(
+    [priced,[{...catalogReference,authority_items:undefined,items:[item]}],true],
+    [priced,[{...catalogReference,authority_items:[null,item]}],true],
+    [priced,[{...catalogReference,digest_sha256:'sha256:'+'b'.repeat(64),authority_items:[]}],true],
+    [priced,[{...catalogReference,currency:'USD',authority_items:[]}],true],
+    [{...saved,outputRows:[{...row,pricing_authority:{variant:'manual'}}]},[{...catalogReference,authority_items:[]}],true],
+    [{version:1,browserRecoveryScope:'current',draft_state:{pricingReferenceId:reference.id,pricingReferenceSource:reference.source,outputRows:[row]}},[catalogReference],true],
+    [{version:1,browserRecoveryScope:'current',quote_session:{draft_state:{pricingReferenceId:reference.id,pricingReferenceSource:reference.source,outputRows:[row]}}},[{...catalogReference,authority_items:[]}],false]
+  );
+  for (const [snapshot,references,expected] of contentCases) {
+    const c = {state:{pricingReferences:references},safeSessionJson:()=>snapshot,QUOTE_SESSION_STATE_VERSION:1,currentBrowserRecoveryScope:()=> 'current',
+      roundCommercialCents:value=>Math.round(value*100)/100,
+      snapshotText:JSON.stringify(snapshot),referenceText:JSON.stringify(references)};
+    const before=JSON.stringify({snapshot,references});vm.createContext(c);vm.runInContext(authorityCode+readiness,c);
+    // Production plain-object checks must see objects from the same VM realm.
+    vm.runInContext('const snapshot = JSON.parse(snapshotText); state.pricingReferences = JSON.parse(referenceText); safeSessionJson = () => snapshot;',c);
+    assert.strictEqual(c.startupPricingReferenceIsAvailable(),expected,JSON.stringify({snapshot,references}));
+    assert.strictEqual(vm.runInContext('JSON.stringify({snapshot,references:state.pricingReferences})',c),before);
+    assert.strictEqual(JSON.stringify({snapshot,references}),before);
+  }
+  process.stdout.write(JSON.stringify({status:'PASS', cases:5, referenceCases:cases.length, contentCases:contentCases.length})+'\n');
 })().catch(e => { console.error(e); process.exitCode=1; });
