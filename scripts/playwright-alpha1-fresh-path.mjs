@@ -727,6 +727,7 @@ try {
   assert(await restore.isEnabled(), "Verified catalogue restore must be enabled.");
   assert((await includedRow.locator('.output-unit-price-editor button').allTextContents()).map(text => text.trim()).join('|') === 'Included|Use reference price', "RIGHT editor button order changed.");
   await restore.click();
+  await page.waitForFunction(() => !appIsBusy());
   await requireCatalogueReference();
   const restored = await includedRow.evaluate(element => {
     const row = state.outputRows[Number(element.dataset.outputRow)];
