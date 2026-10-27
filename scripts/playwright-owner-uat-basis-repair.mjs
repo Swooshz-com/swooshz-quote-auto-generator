@@ -15,6 +15,7 @@ const args = process.argv.slice(2);
 const measureOnly = args.includes("--measure-only");
 const reliability = args.includes("--alpha2-reliability");
 const resumeExport = args.includes("--resume-export");
+const outputReferenceSelection = args.includes("--output-reference-selection");
 const fillerLines = Number((args.find((arg) => arg.startsWith("--lines=")) || "--lines=60").split("=")[1]);
 const latencyMs = Number((args.find((arg) => arg.startsWith("--latency-ms=")) || "--latency-ms=1500").split("=")[1]);
 const cpuProfile = args.includes("--cpu-profile");
@@ -623,6 +624,7 @@ try {
     assert(edited.authority?.variant === "included" && edited.quoted === "Included" && Number(edited.amount) === 0, "Included action", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
     await page.locator("[data-output-reference-action]").click();
+    await page.waitForFunction(() => !appIsBusy());
     edited = await editedRow();
     assert(edited.authority?.variant === "catalog" && Number(edited.quoted.replace(/,/g, "")) === cents(editedItem.sale_unit_price * fxRate), "Use reference price", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
@@ -762,6 +764,74 @@ try {
     const exitCode = await new Promise((resolve) => check.once("close", resolve));
     assert(exitCode === 0, "XLSX amounts", checkOut);
     result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };
+    if (outputReferenceSelection) {
+      // A normal duplicated quote has no source-bound grants. Keep the edited
+      // Output subset and its manual price; select one compatible row directly
+      // in Output without Confirm rebuilding rows from the complete basis.
+      const keep = ["u1-count", "u1-graphic"];
+      while (true) {
+        const index = await page.evaluate((ids) => state.outputRows.findIndex((row) => !ids.includes(row.source_basis_line_id)), keep);
+        if (index < 0) break;
+        await page.locator('[data-output-delete-row="' + index + '"]').click();
+        await page.locator("#confirmOutputDeleteButton").click();
+      }
+      await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+      const originalPath = path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json");
+      const originalMetadata = await fs.readFile(originalPath, "utf8");
+      await page.locator("#backToDashboardButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard");
+      await page.locator('[data-quote-session-id="' + sessionId + '"]').first().click();
+      await page.locator('[data-dashboard-panel-action="duplicate-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.dashboardActiveSessionId && state.dashboardActiveSessionId !== id, sessionId);
+      const targetId = await page.evaluate(() => state.dashboardActiveSessionId);
+      await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, targetId);
+      await page.locator("#sideNextButton").click();
+      await page.waitForFunction(() => !appIsBusy());
+      await page.locator('button[data-side-panel="output"]').click();
+      const before = await page.evaluate(() => ({ rows: state.outputRows, reset: state.originalOutputRows, fx: collectQuoteExchangeRate() }));
+      const targetPath = path.join(dirs.data, "quote-sessions", targetId, "quote-session.json");
+      const ungranted = JSON.parse(await fs.readFile(targetPath, "utf8"));
+      assert(before.rows.length === 2 && !ungranted.pricing_ledger?.rows?.["u1-count"]?.grant,
+        "duplicate did not retain the subset without a target grant");
+      assert(before.rows.find((row) => row.source_basis_line_id === "u1-count")?.pricing_authority?.variant !== "catalog",
+        "duplicate retained source catalogue authority");
+      const selectionsBefore = result.selectionStatuses.length;
+      const index = await page.evaluate(() => state.outputRows.findIndex((row) => row.source_basis_line_id === "u1-count"));
+      await page.locator('[data-output-row="' + index + '"][data-output-edit-field="unit_price_override"][data-output-denomination="quote"]').first().click();
+      await page.locator("[data-output-reference-action]").click();
+      await page.waitForFunction(() => !appIsBusy());
+      const selected = await rowFor("u1-count");
+      assert(selected?.authority?.variant === "catalog" && selected.authority.price === byName("Bar Stool").sale_unit_price,
+        "Output reference selection did not obtain target pricing authority", selected);
+      assert(result.selectionStatuses.length === selectionsBefore + 1 && result.selectionStatuses.at(-1) === 200,
+        "Output action did not make one successful conditional selection", result.selectionStatuses);
+      await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+      const granted = JSON.parse(await fs.readFile(targetPath, "utf8"));
+      assert(granted.pricing_ledger?.rows?.["u1-count"]?.grant?.catalog_item_id === byName("Bar Stool").id,
+        "selection was not persisted in the target ledger");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0 && !appIsBusy());
+      await page.locator('button[data-side-panel="output"]').click();
+      const after = await page.evaluate(() => ({ rows: state.outputRows, reset: state.originalOutputRows, fx: collectQuoteExchangeRate() }));
+      assert(after.rows.length === 2 && JSON.stringify(after.rows.map((row) => row.source_basis_line_id)) === JSON.stringify(before.rows.map((row) => row.source_basis_line_id)),
+        "Output selection/reopen rebuilt the basis or reordered the subset");
+      assert(JSON.stringify(after.reset) === JSON.stringify(before.reset) && after.fx === before.fx
+        && JSON.stringify(after.rows.find((row) => row.source_basis_line_id === "u1-graphic")) === JSON.stringify(before.rows.find((row) => row.source_basis_line_id === "u1-graphic")),
+        "Output selection changed reset rows, manual pricing or FX");
+      const copiedDownload = page.waitForEvent("download", { timeout: 90000 });
+      await page.locator("#sideDownloadButton").click();
+      const copiedPath = path.join(dirs.downloads, "output-reference-selection.xlsx");
+      await (await copiedDownload).saveAs(copiedPath);
+      const saved = await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(targetId))).json();
+      assert(saved.quote_session?.exports?.xlsx?.exists && saved.quote_session.exports.xlsx.stale === false, "target XLSX not current");
+      const bytes = await (await api.get(new URL(saved.quote_session.exports.xlsx.url, baseUrl).toString())).body();
+      assert(bytes.length > 1000 && bytes.subarray(0, 2).toString() === "PK" && bytes.equals(await fs.readFile(copiedPath)),
+        "target protected XLSX differs from the downloaded workbook");
+      assert(await fs.readFile(originalPath, "utf8") === originalMetadata, "target selection/export changed the original quote");
+      result.outputReferenceSelection = { status: "PASS", rows: 2, targetGrantPersisted: true, conditionalSelections: 1,
+        saveReopen: true, manualFxAndResetRetained: true, originalUnchanged: true, protectedXlsxBytes: bytes.length };
+    }
     if (reliability) {
       await page.locator("#backToDashboardButton").click();
       await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard");

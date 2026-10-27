@@ -299,6 +299,7 @@ const state = {
   isAnalysisRunning: false,
   isGenerating: false,
   isPreparingOutput: false,
+  outputReferenceSelection: null,
   aiFailed: false,
   draftSource: "",
   lastAnalysisMode: ANALYSIS_MODE_STANDARD,
@@ -9348,14 +9349,14 @@ function quoteSessionHasFreshOutputExports() {
 }
 
 function appIsBusy() {
-  return state.isAnalysisRunning || state.isGenerating || state.isPreparingOutput || state.quoteSessionRestoreBusy || state.quoteSessionDashboardBusy;
+  return state.isAnalysisRunning || state.isGenerating || state.isPreparingOutput || Boolean(state.outputReferenceSelection) || state.quoteSessionRestoreBusy || state.quoteSessionDashboardBusy;
 }
 
 function appBusyTitle() {
   if (state.quoteSessionDashboardBusy) return "Dashboard is loading.";
   if (state.quoteSessionRestoreBusy) return "Quote session is loading.";
   if (state.isAnalysisRunning) return "Analysis is running.";
-  if (state.isPreparingOutput) return "Output is being prepared.";
+  if (state.isPreparingOutput || state.outputReferenceSelection) return "Output is being prepared.";
   if (state.isGenerating) return "Quotation generation is running.";
   return "";
 }
@@ -10392,6 +10393,20 @@ function renderOutputEditCell(row = {}, index = 0, field = "", extraClass = "") 
   `;
 }
 
+function outputReferenceCatalogItem(row = {}, reference = currentPricingReference()) {
+  const keyword = String(row.pricing_keyword || "").trim();
+  if (keyword) return pricingReferenceCatalogItem(reference, keyword);
+  // Duplicates strip source-bound catalogue claims. Their unique, explicitly
+  // included basis selection can still identify the display-only reference;
+  // it supplies no grant until the operator selects it on the target quote.
+  const rowId = String(row.source_basis_line_id || "");
+  if (!rowId) return null;
+  const lines = (state.quoteBasisSections || []).flatMap((section) => section?.lines || [])
+    .filter((line) => line && [line.id, line.source_line_item_id].includes(rowId));
+  if (lines.length !== 1 || normalizeBasisTag(lines[0].tag) !== "Include" || lines[0].custom_pricing) return null;
+  return pricingReferenceCatalogItem(reference, String(lines[0].pricing_keyword || "").trim());
+}
+
 // Display-only catalogue lookup: never promote a cached row price or manual authority.
 function outputCatalogueBaseline(row = {}) {
   const admitted = quoteCommercialSnapshotPricingBasis();
@@ -10410,7 +10425,7 @@ function outputCatalogueBaseline(row = {}) {
   if (Object.entries(rowBasisFields).some(([field, key]) => (
     Object.hasOwn(row, field) && row[field] !== admitted[key]
   ))) return null;
-  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  const item = outputReferenceCatalogItem(row, reference);
   if (!item) return null;
   const context = pricingAuthorityContext(row);
   const description = pricingAuthorityCatalogDescription(item);
@@ -10918,7 +10933,7 @@ function applyOutputIncludedAction(button) {
   return "committed";
 }
 
-function applyOutputReferencePricing(button) {
+async function applyOutputReferencePricing(button) {
   if (appIsBusy() || !button?.isConnected || !elements.pricingMatchesBody.contains(button)) return "unchanged";
   const pending = activeOutputEditor;
   const index = state.outputRows.indexOf(pending?.row);
@@ -10927,28 +10942,105 @@ function applyOutputReferencePricing(button) {
   const row = state.outputRows[index];
   const price = outputCatalogueBaseline(row);
   const reference = currentPricingReference();
-  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  const item = outputReferenceCatalogItem(row, reference);
   if (price === null || !item) return "unchanged";
-  const next = { ...row, price_mode: "Priced" };
+  const rowId = String(row.source_basis_line_id || "");
+  if (!rowId || state.outputRows.filter((entry) => entry.source_basis_line_id === rowId).length !== 1) return "unchanged";
+  const next = { ...row, pricing_keyword: item.id, price_mode: "Priced" };
   delete next.display_price;
   const authority = normalizeOutputPricingAuthority(
     buildPricingAuthority("catalog", next, { price, reference, catalogItem: item }), next, { reference, catalogItem: item },
   );
   if (!authority) return "unchanged";
-  const unchanged = outputPriceAuthority(row)?.variant === "catalog";
   revokeOutputEditor();
-  if (unchanged) { renderPricingMatches(state.outputRows); resumeBlockedOutputDraftSave(); return "unchanged"; }
   next.pricing_authority = authority;
-  state.outputRows[index] = preserveOutputRowIdentity(row, recalculateOutputRow(applyPricingAuthorityProjection(next, authority)));
-  state.lineItems = outputRowsToLineItems();
-  markOutputRowsDirty();
-  const validation = outputRowsValid();
-  renderOutputValidationMessages(validation.valid ? [] : validation.errors);
-  renderPricingMatches(state.outputRows);
-  renderMatchSummary({ pricing_matches: state.outputRows });
+  const scope = currentBrowserRecoveryScope();
+  const recoveryEpoch = browserRecoveryEpoch;
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const revision = state.outputRevision;
+  const context = () => JSON.stringify({
+    reference: currentPricingReference(), basis: state.quoteBasisSections,
+    commercials: state.quoteCommercialSnapshot, rows: state.outputRows, lineItems: state.lineItems,
+  });
+  const captured = context();
+  // This token owns the busy lifetime. A replaced quote/authentication context
+  // cannot dispatch or adopt an old selection, even if its HTTP request succeeds.
+  const operation = { current: () => state.outputReferenceSelection === operation
+    && !state.isPageUnloading && !state.authenticationRecoveryRequested && !state.isSigningOut && !state.isRecoveryScopeTransitioning
+    && browserRecoveryEpoch === recoveryEpoch && currentBrowserRecoveryScope() === scope && safeQuoteSessionId(state.quoteSessionId || "") === sessionId
+    && state.outputRevision === revision && state.outputRows[index] === row && context() === captured };
+  state.outputReferenceSelection = operation;
   syncControlStates();
-  queueQuoteSessionDraftStateSave({ quoteGenerated: true });
-  return "committed";
+  try {
+    const saveFailure = {};
+    const savedId = await ensureQuoteSession({ quoteGenerated: true, synchronizeDraft: true, saveFailure });
+    if (!operation.current()) return "blocked";
+    if (!savedId || savedId !== sessionId) {
+      renderOutputValidationMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)]);
+      return "blocked";
+    }
+    // A draft save never grants pricing. Submit only this explicit selection,
+    // using the revision acknowledged by the preceding save. Keep the candidate
+    // off the visible rows until the conditional server operation accepts it.
+    const candidate = recalculateOutputRow(applyPricingAuthorityProjection(next, authority));
+    const rows = state.outputRows.map((entry) => entry === row ? candidate : entry);
+    const payload = buildLineItemNormalizePayload();
+    payload.line_items = outputRowsToLineItems(rows);
+    payload.quote_session.draft_state.lineItems = payload.line_items;
+    payload.quote_session.draft_state.outputRows = rows;
+    const expected = state.pricingLedgerRevisions?.[sessionId]?.[rowId];
+    // An existing grant can restore reference pricing after a manual/Included
+    // override, including edited quantities. Verify that grant through normal
+    // normalisation before requesting a new one; new selections still require
+    // the server's stricter basis-quantity and semantic admission.
+    const requestOptions = { persistSession: false, sessionId };
+    let result = await postJson("/api/line-items/normalize", payload, requestOptions);
+    if (!operation.current()) return "blocked";
+    const normalized = Array.isArray(result.data?.line_items)
+      ? result.data.line_items.filter((entry) => entry?.source_basis_line_id === rowId) : [];
+    const restored = result.ok && result.data?.status === "normalized" && normalized.length === 1
+      && normalized[0]?.pricing_authority?.variant === "catalog" && normalized[0].pricing_authority.catalog_item_id === item.id;
+    if (result.ok && result.data?.status === "normalized" && normalized.length === 1 && !restored) {
+      result = await postJson("/api/quote-sessions/pricing-selections", {
+        ...payload,
+        pricing_selections: [{ source_basis_line_id: rowId, catalog_item_id: item.id,
+          expected_revision: Number.isInteger(expected) && expected >= 0 ? expected : 0 }],
+      }, requestOptions);
+    }
+    if (!operation.current()) return "blocked";
+    const data = result.data || {};
+    const outcomes = Array.isArray(data.selections) ? data.selections : [];
+    const selectedRows = Array.isArray(data.line_items) ? data.line_items.filter((entry) => entry?.source_basis_line_id === rowId) : [];
+    const selected = selectedRows.length === 1 ? normalizeOutputRow(selectedRows[0]) : null;
+    if (!result.ok || data.status !== "normalized" || (!restored && (data.quote_session?.session_id !== sessionId
+      || !isPlainObject(data.quote_session?.pricing_ledger?.rows)
+      || outcomes.length !== 1 || outcomes[0]?.source_basis_line_id !== rowId || outcomes[0]?.status !== "selected"))
+      || selected?.pricing_authority?.variant !== "catalog" || selected.pricing_authority.catalog_item_id !== item.id) {
+      renderOutputValidationMessages([data.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE
+        : "Reference price could not be confirmed. Review this row before exporting."]);
+      return "blocked";
+    }
+    if (!restored) state.pricingLedgerRevisions = { [sessionId]: data.quote_session.pricing_ledger.rows };
+    if (restored && outputPriceAuthority(row)?.variant === "catalog"
+      && JSON.stringify(outputPriceAuthority(row)) === JSON.stringify(selected.pricing_authority)) return "unchanged";
+    state.outputRows[index] = preserveOutputRowIdentity(row, selected);
+    state.lineItems = outputRowsToLineItems();
+    markOutputRowsDirty();
+    const validation = outputRowsValid();
+    renderOutputValidationMessages(validation.valid ? [] : validation.errors);
+    queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+    return "committed";
+  } catch {
+    if (operation.current()) renderOutputValidationMessages(["Reference price could not be confirmed. Review this row before exporting."]);
+    return "blocked";
+  } finally {
+    if (state.outputReferenceSelection === operation) {
+      state.outputReferenceSelection = null;
+      renderPricingMatches(state.outputRows);
+      renderMatchSummary({ pricing_matches: state.outputRows });
+      syncControlStates();
+    }
+  }
 }
 
 function openOutputCellEditor(cell, options = {}) {

@@ -77,6 +77,14 @@ npm run playwright:smoke
   another generation, publication or provider call.
   Local synthetic tests do not establish the cause or
   job/artifact/counter outcome of a historical installed failure.
+  Output's Use reference price action must synchronise the draft, verify any
+  existing server grant, and request a new grant only through conditional pricing
+  selection. Test missing/copied catalogue keywords against uniquely included
+  basis identities, current reference checks, refusal and stale/authentication
+  responses. Keep the edited Output subset, manual FX prices and Reset snapshot;
+  never rebuild all basis rows as a side effect of selecting one price. Run
+  `python -m unittest tests.test_output_reference_selection` for the closure
+  matrix and a rendered duplicate, target grant, reopen and protected XLSX check.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret
