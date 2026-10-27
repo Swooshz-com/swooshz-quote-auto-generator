@@ -73,12 +73,17 @@ async function run(test = {}) {
         return {ok:!test.normalizeFailure,data:{status:'normalized',line_items:test.badNormalization?[]:[selected]}};
       }
       if(test.changeAt==='selection') change();
-      const data = clone(input.response || {status:'normalized',selections:[{source_basis_line_id:row.source_basis_line_id,status:'selected'}],line_items:[selected,{source_basis_line_id:'removed-row'}],quote_session:{session_id:'quote-selection',pricing_ledger:{rows:{'selected-row':8}}}});
+      const data = clone(input.response || {status:'normalized',selections:[{source_basis_line_id:row.source_basis_line_id,status:'selected'}],line_items:[selected,{source_basis_line_id:'removed-row'}],quote_session:{session_id:'quote-selection',pricing_ledger:{revision:8,rows:{'selected-row':8}}}});
       if(test.refused) data.selections[0]={source_basis_line_id:row.source_basis_line_id,status:'refused',reason:test.refused};
       if(test.malformed==='session') data.quote_session.session_id='quote-other';
       if(test.malformed==='rows') data.line_items.push(clone(data.line_items[0]));
       if(test.malformed==='outcome') data.selections=[];
       if(test.malformed==='authority') data.line_items[0].pricing_authority.variant='historical';
+      const malformedRevisions={'ledger-string':'invalid','ledger-negative':-1,'ledger-fraction':1.5,'ledger-boolean':true,'ledger-unsafe':Number.MAX_SAFE_INTEGER+1,'ledger-stale':7};
+      if(Object.hasOwn(malformedRevisions,test.malformed)) data.quote_session.pricing_ledger.rows['selected-row']=malformedRevisions[test.malformed];
+      if(test.malformed==='ledger-empty') data.quote_session.pricing_ledger.rows={};
+      if(test.malformed==='ledger-other') data.quote_session.pricing_ledger.rows={'other-row':8};
+      if(test.malformed==='ledger-global') delete data.quote_session.pricing_ledger.revision;
       return {ok:!test.httpFailure,status:test.httpFailure || 200,data};
     },
   };
@@ -97,11 +102,27 @@ async function run(test = {}) {
   if(test.noEditor) c.activeOutputEditor=null;
   if(test.detached) button.isConnected=false;
   if(test.duplicate) state.outputRows.push({...row});
-  vm.createContext(c);vm.runInContext(extract('applyOutputReferencePricing'),c);
+  vm.createContext(c);
+  if(test.productionRetry) {
+    const transport=c.postJson;let selectionSends=0;
+    c.fetchPostJsonResponse=async(url,payload)=>{
+      if(url==='/api/quote-sessions/pricing-selections'&&selectionSends++===0) {
+        calls.push({url,payload:clone(payload)});
+        return {ok:false,status:403,json:async()=>({status:'forbidden'})};
+      }
+      const result=await transport(url,payload);
+      return {ok:result.ok,status:result.status || 200,json:async()=>result.data};
+    };
+    c.refreshSessionToken=async()=>{if(test.changeAt==='refresh')change();return true;};
+    c.adoptServerQuoteCommercialReview=async()=>{};
+    c.logClientEvent=()=>{};
+    vm.runInContext(extract('jsonFromResponse')+'\n'+extract('postJson'),c);
+  }
+  vm.runInContext(extract('applyOutputReferencePricing'),c);
   const result=await c.applyOutputReferencePricing(button);
   const requests=calls.filter(value=>typeof value==='object'&&value.url==='/api/quote-sessions/pricing-selections');
   const shouldSelect=!test.noReference&&!test.noEditor&&!test.detached&&!test.duplicate&&!test.saveFailure&&test.changeAt!=='save'&&test.changeAt!=='request'&&!test.existingGrant&&!test.normalizeFailure&&!test.badNormalization&&!test.throwRequest;
-  assert.equal(requests.length,shouldSelect?1:0,'Exactly one conditional selection for an eligible explicit action');
+  assert.equal(requests.length,shouldSelect?(test.productionRetry&&!test.changeAt?2:1):0,'No stale conditional retry; one explicit selection, plus only a current CSRF retry');
   if(requests.length) {
     assert.equal(requests[0].url,'/api/quote-sessions/pricing-selections');
     assert.deepEqual(requests[0].payload.pricing_selections,[{source_basis_line_id:row.source_basis_line_id,catalog_item_id:row.pricing_keyword,expected_revision:7}]);
@@ -117,6 +138,8 @@ async function run(test = {}) {
     assert.equal(state.outputRows[1].pricing_authority.variant,'catalog');
     assert.equal(state.pricingLedgerRevisions['quote-selection']['selected-row'],test.existingGrant?7:8);
   } else if(!test.changeAt) assert.equal(state.outputRows[1],row,'No adoption on refusal or failure');
+  if(!success) assert(!calls.includes('save'),'A failed selection must not queue a promoted draft');
+  if(test.malformed) assert.equal(state.pricingLedgerRevisions['quote-selection']['selected-row'],7,'Malformed acknowledgement must not replace the revision cache');
   assert.equal(state.outputReferenceSelection,null);
   return {result,requests,messages};
 }
@@ -140,8 +163,10 @@ async function run(test = {}) {
   cases.push({concurrentClick:true},{existingGrant:true},{normalizeFailure:true},{badNormalization:true},{noReference:true},{noEditor:true},{detached:true},{duplicate:true},{saveFailure:true},{throwRequest:true});
   for(const httpFailure of [401,403,409,500]) cases.push({httpFailure});
   for(const refused of ['unit_review_required','contradiction','not_in_catalogue','reference_changed','ineligible']) cases.push({refused});
-  for(const malformed of ['session','rows','outcome','authority']) cases.push({malformed});
+  for(const malformed of ['session','rows','outcome','authority','ledger-empty','ledger-string','ledger-other','ledger-negative','ledger-fraction','ledger-boolean','ledger-unsafe','ledger-stale','ledger-global']) cases.push({malformed});
   for(const changeAt of ['save','request','selection']) for(const change of ['scope','epoch','session','revision','row','basis','reference','commercials','unload','auth']) cases.push({changeAt,change});
+  cases.push({productionRetry:true});
+  for(const change of ['scope','epoch','session','revision','row','basis','reference','commercials','unload','auth']) cases.push({productionRetry:true,changeAt:'refresh',change});
   for(const test of cases) {try {await run(test);} catch(error) {error.message=JSON.stringify(test)+': '+error.message;throw error;}}
   console.log(JSON.stringify({status:'PASS',cases:cases.length,bindingCases:bindingCases.length}));
 })().catch(error=>{console.error(error);process.exitCode=1;});

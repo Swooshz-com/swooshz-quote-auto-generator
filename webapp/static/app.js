@@ -10993,7 +10993,7 @@ async function applyOutputReferencePricing(button) {
     // override, including edited quantities. Verify that grant through normal
     // normalisation before requesting a new one; new selections still require
     // the server's stricter basis-quantity and semantic admission.
-    const requestOptions = { persistSession: false, sessionId };
+    const requestOptions = { persistSession: false, sessionId, isCurrent: operation.current };
     let result = await postJson("/api/line-items/normalize", payload, requestOptions);
     if (!operation.current()) return "blocked";
     const normalized = Array.isArray(result.data?.line_items)
@@ -11012,8 +11012,12 @@ async function applyOutputReferencePricing(button) {
     const outcomes = Array.isArray(data.selections) ? data.selections : [];
     const selectedRows = Array.isArray(data.line_items) ? data.line_items.filter((entry) => entry?.source_basis_line_id === rowId) : [];
     const selected = selectedRows.length === 1 ? normalizeOutputRow(selectedRows[0]) : null;
+    const ledger = data.quote_session?.pricing_ledger;
+    const ledgerValid = isPlainObject(ledger) && Number.isSafeInteger(ledger.revision) && ledger.revision >= 0
+      && isPlainObject(ledger.rows) && Object.values(ledger.rows).every((value) => Number.isSafeInteger(value) && value >= 0)
+      && Number.isSafeInteger(ledger.rows[rowId]) && ledger.rows[rowId] > (Number.isSafeInteger(expected) && expected >= 0 ? expected : 0);
     if (!result.ok || data.status !== "normalized" || (!restored && (data.quote_session?.session_id !== sessionId
-      || !isPlainObject(data.quote_session?.pricing_ledger?.rows)
+      || !ledgerValid
       || outcomes.length !== 1 || outcomes[0]?.source_basis_line_id !== rowId || outcomes[0]?.status !== "selected"))
       || selected?.pricing_authority?.variant !== "catalog" || selected.pricing_authority.catalog_item_id !== item.id) {
       renderOutputValidationMessages([data.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE
@@ -13745,32 +13749,46 @@ async function recoverRequiredAuthentication(status, data = {}) {
 }
 
 async function postJson(url, payload, options = {}) {
+  const requestIsCurrent = () => options.isCurrent === undefined
+    || (typeof options.isCurrent === "function" && options.isCurrent());
+  const superseded = () => ({ ok: false, status: 409, data: { status: "conflict", request_superseded: true } });
+  if (!requestIsCurrent()) return superseded();
   if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return { ok: false, status: 401, data: { status: "auth_required" } };
   let response;
   try {
     response = await fetchPostJsonResponse(url, payload);
   } catch (error) {
+    if (!requestIsCurrent()) return superseded();
     return postJsonFetchFailure(url, error);
   }
 
+  if (!requestIsCurrent()) return superseded();
   let data = await jsonFromResponse(response, options);
+  if (!requestIsCurrent()) return superseded();
   if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
+  if (!requestIsCurrent()) return superseded();
   const refreshFailure = {};
   if (response.status === 403 && await refreshSessionToken({ ...options, refreshFailure })
     && !state.authenticationRecoveryRequested && !state.isSigningOut && !state.isPageUnloading) {
+    if (!requestIsCurrent()) return superseded();
     try {
       response = await fetchPostJsonResponse(url, payload);
+      if (!requestIsCurrent()) return superseded();
       data = await jsonFromResponse(response, options);
     } catch (error) {
+      if (!requestIsCurrent()) return superseded();
       return postJsonFetchFailure(url, error);
     }
   }
+  if (!requestIsCurrent()) return superseded();
   if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
+  if (!requestIsCurrent()) return superseded();
   // Keep the original safe status/reference while carrying this save's actual refresh interruption.
   if (options.persistSession === false && refreshFailure.failure?.fetch_failed === true) {
     data = { ...data, fetch_failed: true, page_unloading: refreshFailure.failure.page_unloading === true };
   }
   await adoptServerQuoteCommercialReview(data, options);
+  if (!requestIsCurrent()) return superseded();
   if (!response.ok) {
     const failure = options.persistSession === false
       ? quoteSessionSaveFailureFrom({ data, status: response.status }) : null;

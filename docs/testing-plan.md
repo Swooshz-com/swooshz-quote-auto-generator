@@ -81,7 +81,9 @@ npm run playwright:smoke
   existing server grant, and request a new grant only through conditional pricing
   selection. Test missing/copied catalogue keywords against uniquely included
   basis identities, current reference checks, refusal and stale/authentication
-  responses. Keep the edited Output subset, manual FX prices and Reset snapshot;
+  responses, including context changes inside the production HTTP helper's CSRF
+  refresh and valid advancing selected-row ledger acknowledgements. Keep the
+  edited Output subset, manual FX prices and Reset snapshot;
   never rebuild all basis rows as a side effect of selecting one price. Run
   `python -m unittest tests.test_output_reference_selection` for the closure
   matrix and a rendered duplicate, target grant, reopen and protected XLSX check.

@@ -16,7 +16,7 @@ class OutputReferenceSelectionTest(unittest.TestCase):
             cwd=ROOT, input="{}", text=True, capture_output=True, timeout=30,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(json.loads(completed.stdout), {"status": "PASS", "cases": 58, "bindingCases": 12})
+        self.assertEqual(json.loads(completed.stdout), {"status": "PASS", "cases": 78, "bindingCases": 12})
 
     def test_rendered_duplicate_output_selection_reopen_and_protected_xlsx(self):
         if not (ROOT / "node_modules/playwright/package.json").exists():
