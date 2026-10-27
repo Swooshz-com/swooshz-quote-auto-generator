@@ -13,4 +13,4 @@ class StartupProfileRecoveryTest(unittest.TestCase):
             cwd=ROOT, text=True, capture_output=True, timeout=15,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(json.loads(completed.stdout), {"status": "PASS", "cases": 5})
+        self.assertEqual(json.loads(completed.stdout), {"status": "PASS", "cases": 5, "referenceCases": 13})

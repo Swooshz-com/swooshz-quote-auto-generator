@@ -812,33 +812,41 @@ try {
         "selection was not persisted in the target ledger");
       // A transient reference outage must not admit saved rows against an empty
       // catalogue and persist demoted catalogue/manual authority over recovery.
-      const storageBeforeOutage = await page.evaluate(() => ({
-        quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
-        workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
-      }));
-      const metadataBeforeOutage = await fs.readFile(targetPath, "utf8");
-      let profilesRejected = false;
-      const rejectProfiles = async (route) => {
-        profilesRejected = true;
-        await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "unavailable" }) });
-      };
-      await page.route("**/api/profiles", rejectProfiles);
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await page.waitForFunction(() => typeof state !== "undefined" && state.authenticated !== false);
-      await page.waitForTimeout(900); // Exceeds the normal 650ms draft-save debounce.
-      const outage = await page.evaluate(() => ({
-        quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
-        workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
-        restoredRows: state.outputRows.length,
-      }));
-      assert(profilesRejected && outage.quote === storageBeforeOutage.quote
-        && outage.workspace === storageBeforeOutage.workspace && outage.restoredRows === 0,
-      "reference outage rewrote saved pricing or admitted rows without the catalogue");
-      assert(await fs.readFile(targetPath, "utf8") === metadataBeforeOutage,
-        "reference outage overwrote the durable quote");
-      await page.unroute("**/api/profiles", rejectProfiles);
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0 && !appIsBusy());
+      for (const fault of ["unavailable", "empty", "invalid"]) {
+        const storageBeforeOutage = await page.evaluate(() => ({
+          quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
+          workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
+        }));
+        const metadataBeforeOutage = await fs.readFile(targetPath, "utf8");
+        let profilesRejected = false;
+        const rejectProfiles = async (route) => {
+          profilesRejected = true;
+          if (fault === "unavailable") {
+            await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "unavailable" }) });
+          } else {
+            const response = await route.fetch();
+            const body = await response.json();
+            await route.fulfill({ response, json: { ...body, pricing_references: fault === "empty" ? [] : [{}] } });
+          }
+        };
+        await page.route("**/api/profiles", rejectProfiles);
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => typeof state !== "undefined" && state.authenticated !== false);
+        await page.waitForTimeout(900); // Exceeds the normal 650ms draft-save debounce.
+        const outage = await page.evaluate(() => ({
+          quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
+          workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
+          restoredRows: state.outputRows.length,
+        }));
+        assert(profilesRejected && outage.quote === storageBeforeOutage.quote
+          && outage.workspace === storageBeforeOutage.workspace && outage.restoredRows === 0,
+        "reference outage rewrote saved pricing or admitted rows without the catalogue: " + fault);
+        assert(await fs.readFile(targetPath, "utf8") === metadataBeforeOutage,
+          "reference outage overwrote the durable quote");
+        await page.unroute("**/api/profiles", rejectProfiles);
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0 && !appIsBusy());
+      }
       await page.locator('button[data-side-panel="output"]').click();
       const after = await page.evaluate(() => ({ rows: state.outputRows, reset: state.originalOutputRows, fx: collectQuoteExchangeRate() }));
       assert(after.rows.length === 2 && JSON.stringify(after.rows.map((row) => row.source_basis_line_id)) === JSON.stringify(before.rows.map((row) => row.source_basis_line_id)),
@@ -857,7 +865,7 @@ try {
         "target protected XLSX differs from the downloaded workbook");
       assert(await fs.readFile(originalPath, "utf8") === originalMetadata, "target selection/export changed the original quote");
       result.outputReferenceSelection = { status: "PASS", rows: 2, targetGrantPersisted: true, conditionalSelections: 1,
-        saveReopen: true, profileOutageRecovery: true, manualFxAndResetRetained: true, originalUnchanged: true, protectedXlsxBytes: bytes.length };
+        saveReopen: true, profileOutageRecovery: true, profileOutageRecoveryCases: 3, manualFxAndResetRetained: true, originalUnchanged: true, protectedXlsxBytes: bytes.length };
     }
     if (reliability) {
       await page.locator("#backToDashboardButton").click();

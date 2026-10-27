@@ -4,6 +4,7 @@ const vm = require('vm');
 const assert = require('assert');
 const source = fs.readFileSync('webapp/static/app.js', 'utf8');
 const boot = source.slice(source.lastIndexOf('async function boot() {'), source.lastIndexOf('\nboot();'));
+const readiness = source.slice(source.indexOf('function startupPricingReferenceIsAvailable() {'), source.lastIndexOf('async function boot() {'));
 assert.ok(boot.startsWith('async function boot() {'));
 
 async function check(mode) {
@@ -12,6 +13,10 @@ async function check(mode) {
   const pending = new Promise(resolve => { release = resolve; });
   const c = {
     state: { isBooting: true, activeAppView: 'quote', activeJob: null },
+    safeSessionJson: () => null,
+    isPlainObject: value => value && typeof value === 'object' && !Array.isArray(value),
+    QUOTE_SESSION_STATE_VERSION: 1,
+    currentBrowserRecoveryScope: () => 'current',
     setDashboardLoadingState: (busy, text) => calls.push(['loading', busy, text]),
     wireEvents() {}, clearLegacyLocalCompanyPresets() {},
     initializeSession: async () => mode !== 'session-failed',
@@ -35,7 +40,7 @@ async function check(mode) {
     restoreRestorableOverlay: () => calls.push(['overlay']),
   };
   vm.createContext(c);
-  vm.runInContext(boot, c);
+  vm.runInContext(readiness + boot, c);
   const result = c.boot();
   if (mode === 'pending') {
     await new Promise(setImmediate);
@@ -59,5 +64,27 @@ async function check(mode) {
 }
 (async () => {
   for (const mode of ['session-failed','false','throw','pending','ready']) await check(mode);
-  process.stdout.write(JSON.stringify({status:'PASS', cases:5})+'\n');
+  const reference = {id:'reference-a',source:'local',currency:'SGD',digest_sha256:'sha256:'+'a'.repeat(64)};
+  const saved = {version:1,browserRecoveryScope:'current',pricingReferenceId:'reference-a',pricingReferenceSource:'local',outputRows:[{source_basis_line_id:'row-a'}]};
+  const cases = [
+    [saved, [reference], true], [saved, [], false],
+    [saved, [{}], false], [saved, [null], false],
+    [saved, [{...reference,id:'other'}], false],
+    [saved, [{...reference,source:'company'}], false],
+    [saved, [reference,reference], false],
+    [{...saved,pricingReferenceId:''}, [reference], false],
+    [{...saved,browserRecoveryScope:'other'}, [], true],
+    [{...saved,version:2}, [], true],
+    [{...saved,outputRows:[]}, [], true], [null, [], true],
+    [{...saved,outputRows:[],originalOutputRows:[{}]}, [], false],
+  ];
+  for (const [snapshot,references,expected] of cases) {
+    const c = {state:{pricingReferences:references},safeSessionJson:()=>snapshot,QUOTE_SESSION_STATE_VERSION:1,currentBrowserRecoveryScope:()=> 'current',
+      isPlainObject:v=>v && typeof v==='object' && !Array.isArray(v),
+      pricingReferenceAuthorityBasis:r=>r && r.id && r.source && r.currency && r.digest_sha256 ? r : null};
+    const before=JSON.stringify({snapshot,references});vm.createContext(c);vm.runInContext(readiness,c);
+    assert.strictEqual(c.startupPricingReferenceIsAvailable(),expected);
+    assert.strictEqual(JSON.stringify({snapshot,references}),before);
+  }
+  process.stdout.write(JSON.stringify({status:'PASS', cases:5, referenceCases:cases.length})+'\n');
 })().catch(e => { console.error(e); process.exitCode=1; });

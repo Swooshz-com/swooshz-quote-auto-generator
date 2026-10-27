@@ -3846,6 +3846,7 @@ function extractFunction(name, prefix = "function") {
 const COMPANY_PROFILE_PRESET_PREFIX = "company:";
 const DEFAULT_PROFILE_ID = "default";
 const DEFAULT_PRICING_REFERENCE_ID = "default-pricing";
+const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 let authorityProfileRequestSequence = 0;
 let activeAuthorityProfileRequestContext = null;
 const elements = { presetSelect: { value: "company:company-a" } };
@@ -3890,6 +3891,8 @@ eval([
   "beginAuthorityProfileRequest",
   "refreshAuthorityProfileRequestContext",
   "authorityProfileRequestIsFresh",
+  "isPlainObject",
+  "pricingReferenceAuthorityBasis",
   "loadProfiles",
 ].map((name) => extractFunction(name, name === "loadProfiles" ? "async function" : "function")).join("\n"));
 
@@ -3899,7 +3902,7 @@ function response(suffix) {
     data: {
       profiles: [{ id: `profile-${suffix}` }],
       company_profiles: [{ id: `company-${suffix}` }],
-      pricing_references: [{ id: `pricing-${suffix}`, source: "local" }],
+      pricing_references: [{ id: `pricing-${suffix}`, source: "local", currency: "SGD", digest_sha256: "sha256:" + "a".repeat(64) }],
       workspace: { id: `workspace-${suffix}`, company: { id: `company-${suffix}` }, workspace: { id: `workspace-${suffix}` } },
       default_profile_id: `profile-${suffix}`,
       default_pricing_reference_id: `pricing-${suffix}`,
@@ -3949,6 +3952,27 @@ function response(suffix) {
   assert.strictEqual(await firstHydration, true);
   assert.strictEqual(state.workspace.id, "workspace-b");
   assert.strictEqual(state.pricingReferenceId, "pricing-b");
+  const malformed = [
+    data => { data.profiles = [{}]; },
+    data => { data.pricing_references = [{}]; },
+    data => { data.pricing_references = [null]; },
+    data => { data.pricing_references = [[]]; },
+    data => { data.pricing_references[0].id = 123; },
+    data => { data.pricing_references[0].source = "unknown"; },
+    data => { data.pricing_references[0].currency = ""; },
+    data => { data.pricing_references[0].digest_sha256 = "invalid"; },
+    data => { data.pricing_references.push({...data.pricing_references[0]}); },
+  ];
+  for (const mutate of malformed) {
+    const before = JSON.stringify(state);
+    const result = loadProfiles();
+    await Promise.resolve();
+    const reply = response("b");
+    mutate(reply.data);
+    pending.at(-1)(reply);
+    assert.strictEqual(await result, false, "malformed hydration accepted");
+    assert.strictEqual(JSON.stringify(state), before, "malformed hydration committed state");
+  }
 })();
 """
         completed = subprocess.run(

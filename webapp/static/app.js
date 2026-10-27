@@ -8829,7 +8829,16 @@ async function loadProfiles() {
   const context = beginAuthorityProfileRequest();
   const { ok, data } = await getJson("/api/profiles");
   if (!authorityProfileRequestIsFresh(context)) return false;
-  if (!ok || !Array.isArray(data.profiles) || !Array.isArray(data.pricing_references)) return false;
+  if (!ok || !isPlainObject(data) || !Array.isArray(data.profiles) || !Array.isArray(data.pricing_references)) return false;
+  if (!data.profiles.every((profile) => isPlainObject(profile)
+    && typeof profile.id === "string" && profile.id.trim())) return false;
+  const referenceBases = data.pricing_references.map((reference) => (
+    isPlainObject(reference) && typeof reference.id === "string"
+      && typeof reference.source === "string" && typeof reference.currency === "string"
+      ? pricingReferenceAuthorityBasis(reference) : null
+  ));
+  if (referenceBases.some((basis) => !basis)
+    || new Set(referenceBases.map((basis) => `${basis.source}::${basis.id}`)).size !== referenceBases.length) return false;
   const profiles = data.profiles;
   const workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
   const defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
@@ -17994,6 +18003,21 @@ async function setInitialValues() {
   return false;
 }
 
+function startupPricingReferenceIsAvailable() {
+  const saved = safeSessionJson();
+  if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION
+    || saved.browserRecoveryScope !== currentBrowserRecoveryScope()) return true;
+  const hasSavedPricing = saved.basisConfirmed === true
+    || [saved.lineItems, saved.outputRows, saved.originalOutputRows].some((rows) => Array.isArray(rows) && rows.length);
+  if (!hasSavedPricing) return true;
+  const id = typeof saved.pricingReferenceId === "string" ? saved.pricingReferenceId.trim() : "";
+  const source = typeof saved.pricingReferenceSource === "string" ? saved.pricingReferenceSource.trim() : "";
+  return (Array.isArray(state.pricingReferences) ? state.pricingReferences : []).filter((reference) => {
+    const basis = pricingReferenceAuthorityBasis(reference);
+    return basis && basis.id === id && basis.source === source;
+  }).length === 1;
+}
+
 async function boot() {
   let dashboardOperation = null;
   let workspaceView = null;
@@ -18014,6 +18038,7 @@ async function boot() {
     if (dashboardOperation) setDashboardLoadingState(true, dashboardOperationLoadingOptions(dashboardOperation));
     try {
       profilesReady = await loadProfiles();
+      if (profilesReady) profilesReady = startupPricingReferenceIsAvailable();
     } catch {
       // An unavailable prerequisite must not admit or rewrite saved authority.
       profilesReady = false;

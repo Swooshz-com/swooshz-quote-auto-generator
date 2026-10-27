@@ -37,6 +37,7 @@ class OutputReferenceSelectionTest(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         proof = result["outputReferenceSelection"]
         self.assertEqual(proof["status"], "PASS")
+        self.assertEqual(proof["profileOutageRecoveryCases"], 3)
         self.assertEqual(proof["rows"], 2)
         self.assertEqual(proof["conditionalSelections"], 1)
         for key in ("targetGrantPersisted", "saveReopen", "profileOutageRecovery", "manualFxAndResetRetained", "originalUnchanged"):

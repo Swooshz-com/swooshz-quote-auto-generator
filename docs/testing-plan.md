@@ -95,6 +95,9 @@ npm run playwright:smoke
   rendered Output-selection regression injects a local reference-list outage,
   then reloads successfully and verifies retained catalogue/manual authority,
   FX, edited subset and Reset snapshot before protected XLSX generation.
+  Include successful responses with malformed reference entries, duplicate
+  identities and missing saved references. Hold current-scope priced recovery
+  unchanged, while allowing a genuinely empty new workspace to open Settings.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret
