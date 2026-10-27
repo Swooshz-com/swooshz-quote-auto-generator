@@ -331,7 +331,12 @@ class ProviderAdmissionTest(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(s.OpenAIAnalysisError): s.parse_json_object(text)
 
     def test_unclosed_whitespace_fences_reject_with_a_bounded_child(self):
+        import queue
+        import threading
+
         code = "from tests.test_webapp import webapp as s\n" + (
+            "print('FENCE_READY', flush=True)\n"
+            "if input() != 'RUN': raise AssertionError('parser handshake refused')\n"
             "for width in (1000, 4000, 16000):\n"
             " for prefix in (chr(96) * 3, chr(96) * 3 + 'json'):\n"
             "  try: s.parse_json_object(prefix + ' ' * width + 'x')\n"
@@ -339,11 +344,29 @@ class ProviderAdmissionTest(unittest.TestCase):
             "  else: raise AssertionError('unclosed fence admitted')\n"
             "print('FENCE_BOUND_PASS')\n"
         )
-        result = subprocess.run([sys.executable, "-c", code],
+        process = subprocess.Popen([sys.executable, "-c", code],
             cwd=Path(__file__).resolve().parents[1], env={**os.environ, "SQAG_DISABLE_DOTENV": "1"},
-            capture_output=True, text=True, timeout=5, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "FENCE_BOUND_PASS")
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ready = queue.Queue(maxsize=1)
+        reader = threading.Thread(target=lambda: ready.put(process.stdout.readline()), daemon=True)
+        reader.start()
+        try:
+            # Import has its own bound. The child waits for RUN so startup cost
+            # cannot consume or evade the separate hard parser deadline.
+            try:
+                marker = ready.get(timeout=30)
+            except queue.Empty:
+                self.fail("Parser child startup exceeded thirty seconds")
+            reader.join(timeout=1)
+            self.assertTrue(marker == "FENCE_READY\n", "Parser child did not finish startup")
+            stdout, stderr = process.communicate("RUN\n", timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "FENCE_BOUND_PASS")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+            reader.join(timeout=1)
 
     def test_openai_shared_envelope_rejects_partial_refused_or_conflicting_text(self):
         for status in ("incomplete", "failed", "queued", "in_progress", "cancelled", "unknown"):
