@@ -45,6 +45,9 @@ npm run playwright:smoke
   the same fence. Unsafe entries cannot disclose their manifest or substitute a
   default catalogue; safe listing peers remain available, unrelated errors stay
   visible and valid Windows directory aliases retain their public spelling.
+  Canonical string-prefix admission must include the directory separator, retain
+  Unicode path spelling and keep the resolved-path checks. Cover sibling names
+  sharing a prefix, nested Unicode catalogue filenames and resolution failures.
 - Diagnostic JSON privacy: Run `tests.test_codeql_diagnostic_privacy` with mocked
   providers and configuration. Live-smoke results expose fixed outcome metadata
   while keeping model and provider exception text internal. Readiness output may

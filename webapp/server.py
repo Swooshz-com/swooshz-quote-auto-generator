@@ -18551,8 +18551,21 @@ class PricingReferencePack:
             if relative.is_absolute() or relative.drive:
                 raise ValueError
             resolved_root = root.resolve()
-            resolved_directory = directory.resolve()
-            resolved_path = (directory / relative).resolve()
+            root_text = str(resolved_root)
+            # Admit canonical strings before Path access; retain the resolved-path fence below.
+            directory_text = os.path.realpath(directory)
+            if directory_text == root_text:
+                directory_text = root_text
+            elif not directory_text.startswith(os.path.join(root_text, "")):
+                raise ValueError
+            resolved_directory = Path(directory_text).resolve()
+            directory_text = str(resolved_directory)
+            path_text = os.path.realpath(resolved_directory / relative)
+            if path_text == directory_text:
+                path_text = directory_text
+            elif not path_text.startswith(os.path.join(directory_text, "")):
+                raise ValueError
+            resolved_path = Path(path_text).resolve()
             if not resolved_directory.is_relative_to(resolved_root) or not resolved_path.is_relative_to(resolved_directory):
                 raise ValueError
         except (OSError, RuntimeError, ValueError):

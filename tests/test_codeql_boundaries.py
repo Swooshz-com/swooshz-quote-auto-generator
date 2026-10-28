@@ -14,6 +14,36 @@ webapp = support.webapp
 
 
 class CodeqlBoundaryTest(unittest.TestCase):
+    def test_pack_normalisation_preserves_unicode_and_rejects_prefix_siblings(self):
+        for source in ('local', 'bundled'):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / 'Synthetic-İ-Å-根'
+                pack = root / 'synthetic-pack'
+                sibling = root / 'synthetic-pack-extra'
+                (pack / 'assets').mkdir(parents=True)
+                sibling.mkdir()
+                catalogue = pack / 'assets' / 'İ-catalogue.json'
+                catalogue.write_text('{"items":[{"id":"synthetic-row","description":"Synthetic row","sale_unit_price":1}]}', encoding='utf-8')
+                manifest = pack / 'reference.json'
+                manifest.write_text(json.dumps({'id': 'synthetic-pack', 'pricing_catalog': 'assets/İ-catalogue.json'}), encoding='utf-8')
+                outside = sibling / 'catalogue.json'
+                outside.write_text('{"items":[{"id":"synthetic-outside"}]}', encoding='utf-8')
+                with mock.patch.object(webapp, 'pricing_references_root', return_value=root), \
+                     mock.patch.object(webapp, 'bundled_pricing_references_root', return_value=root):
+                    resolved = webapp.PricingReferencePack.resolve_exact('synthetic-pack', source)
+                    self.assertIsNotNone(resolved)
+                    self.assertEqual(resolved.pricing_catalog_path, catalogue.resolve())
+                    self.assertEqual(resolved.public_detail()['items'][0]['id'], 'synthetic-row')
+                    manifest.write_text(json.dumps({'id': 'synthetic-pack', 'pricing_catalog': '../synthetic-pack-extra/catalogue.json'}), encoding='utf-8')
+                    original_read = Path.read_text
+                    def read_inside_selected(path, *args, **kwargs):
+                        self.assertNotEqual(path.resolve(), outside.resolve(), 'Prefix sibling was read')
+                        return original_read(path, *args, **kwargs)
+                    with mock.patch.object(Path, 'read_text', read_inside_selected):
+                        self.assertIsNone(webapp.PricingReferencePack.resolve_exact('synthetic-pack', source))
+                        with self.assertRaises(webapp.PricingReferencePathError):
+                            webapp.PricingReferencePack.resolve('synthetic-pack', source)
+
     def test_pack_asset_paths_reject_escape_without_substituting_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / 'synthetic-pack'
