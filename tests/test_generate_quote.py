@@ -1487,13 +1487,18 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
     def test_pdf_conversion_resolves_drawing_theme_fonts_without_changing_master(self):
         drawing = (
-            f'<xdr:wsDr xmlns:xdr="{NS_DRAWING[1:-1]}" xmlns:a="{NS_A[1:-1]}">'
-            '<a:r><a:rPr sz="900" b="1"><a:latin typeface="+mn-lt"/></a:rPr>'
-            '<a:t>Example company</a:t></a:r>'
+            f'<xdr:wsDr xmlns:xdr="{NS_DRAWING[1:-1]}" xmlns:a="{NS_A[1:-1]}" '
+            f'xmlns:mc="{quote.XMLNS_MC}" xmlns:a14="urn:example:drawing-extension" mc:Ignorable="a14">'
+            '<mc:AlternateContent><mc:Choice Requires="a14">'
+            '<!-- Preserve drawing metadata -->'
+            '<a:r xmlns:a14="urn:example:nested-extension" mc:ProcessContent="a14:item">'
+            '<a:rPr sz="900" b="1"><a:latin typeface="+mn-lt"/></a:rPr>'
+            '<a:t><![CDATA[Example company]]></a:t></a:r>'
             '<a:r><a:rPr sz="1100"><a:latin typeface="+mj-lt"/></a:rPr>'
             '<a:t>Example heading</a:t></a:r>'
             '<a:r><a:rPr><a:latin typeface="Explicit Sans"/></a:rPr>'
-            '<a:t>Explicit font</a:t></a:r></xdr:wsDr>'
+            '<a:t>Explicit font</a:t></a:r>'
+            '</mc:Choice><mc:Fallback/></mc:AlternateContent></xdr:wsDr>'
         ).encode()
         theme = (
             f'<a:theme xmlns:a="{NS_A[1:-1]}"><a:themeElements><a:fontScheme name="Example">'
@@ -1523,7 +1528,16 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 conversion_inputs.append(conversion_input)
                 self.assertNotEqual(conversion_input, master)
                 with zipfile.ZipFile(conversion_input) as archive:
-                    converted_drawing = ET.fromstring(archive.read("xl/drawings/drawing1.xml"))
+                    converted_xml = archive.read("xl/drawings/drawing1.xml")
+                    converted_drawing = ET.fromstring(converted_xml)
+                    namespaces = [value for _, value in ET.iterparse(io.BytesIO(converted_xml), events=["start-ns"])]
+                    self.assertIn(("a14", "urn:example:drawing-extension"), namespaces)
+                    self.assertIn(("a14", "urn:example:nested-extension"), namespaces)
+                    self.assertEqual(converted_drawing.attrib[f"{{{quote.XMLNS_MC}}}Ignorable"], "a14")
+                    self.assertEqual(converted_drawing.find(f"{{{quote.XMLNS_MC}}}AlternateContent/{{{quote.XMLNS_MC}}}Choice").attrib["Requires"], "a14")
+                    self.assertEqual(next(converted_drawing.iter(f"{NS_A}r")).attrib[f"{{{quote.XMLNS_MC}}}ProcessContent"], "a14:item")
+                    self.assertIn(b"<!-- Preserve drawing metadata -->", converted_xml)
+                    self.assertIn(b"<![CDATA[Example company]]>", converted_xml)
                     self.assertEqual(
                         [node.attrib["typeface"] for node in converted_drawing.iter(f"{NS_A}latin")],
                         ["Example Body", "Example Heading", "Explicit Sans"],

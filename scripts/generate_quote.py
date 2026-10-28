@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from xml.dom import minidom
 from xml.etree import ElementTree as ET
 
 
@@ -3646,18 +3647,19 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
         names = [entry.filename for entry in entries]
         if len(entries) > MAX_XLSX_ENTRIES or len(names) != len(set(names)):
             raise ValueError("PDF workbook package has too many or duplicate parts.")
-        drawings: dict[str, ET.Element] = {}
+        drawings: dict[str, bytes] = {}
         aliases: set[str] = set()
         for name in names:
             if not name.startswith("xl/drawings/") or not name.endswith(".xml"):
                 continue
-            drawing = ET.fromstring(read_bounded_xlsx_part(source, name))
+            drawing_xml = read_bounded_xlsx_part(source, name)
+            drawing = ET.fromstring(drawing_xml)
             referenced = {
                 node.attrib.get("typeface", "")
                 for node in drawing.iter(f"{NS_A}latin")
             } & {"+mn-lt", "+mj-lt"}
             if referenced:
-                drawings[name] = drawing
+                drawings[name] = drawing_xml
                 aliases.update(referenced)
         fonts: dict[str, str] = {}
         if aliases:
@@ -3684,12 +3686,15 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
                     raise ValueError("PDF workbook theme font is unavailable.")
                 fonts[alias] = typeface
         replacements: dict[str, bytes] = {}
-        for name, drawing in drawings.items():
-            for node in drawing.iter(f"{NS_A}latin"):
-                alias = node.attrib.get("typeface", "")
-                if alias in fonts:
-                    node.attrib["typeface"] = fonts[alias]
-            replacements[name] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
+        for name, drawing_xml in drawings.items():
+            # Compatibility attributes contain namespace prefixes as text.
+            # Preserve their declarations, including nested scopes, when writing.
+            with minidom.parseString(drawing_xml) as drawing:
+                for node in drawing.getElementsByTagNameNS(NS_A[1:-1], "latin"):
+                    alias = node.getAttribute("typeface")
+                    if alias in fonts:
+                        node.setAttribute("typeface", fonts[alias])
+                replacements[name] = drawing.toxml(encoding="utf-8")
         with zipfile.ZipFile(conversion_path, "w") as converted:
             for entry in entries:
                 if entry.filename in replacements:
