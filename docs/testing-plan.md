@@ -35,6 +35,13 @@ npm run playwright:smoke
 - Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
 - Pricing reference import, catalog matching, currency/tax metadata, or template parsing: add/update parser and normalization tests, then run the relevant `tests.test_webapp` and `tests.test_generate_quote` cases.
+- Reusable company-profile import/export: Run `tests.test_profile_roundtrip` and
+  the existing profile import, overwrite and export endpoint cases. Applying an
+  imported profile must preserve quotation analysis, reviewed rows and workflow,
+  while invalidating existing downloads even when only the layout changes.
+  Database and object-storage exports must carry the exact owning profile's
+  workbook, survive reimport, respect workspace isolation and refuse an unavailable
+  required layout. A normal profile save must retain its existing behaviour.
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
   PDF conversion must preserve the XLSX master bytes. Resolve DrawingML Latin
   theme-font references from that workbook's internal theme in a temporary

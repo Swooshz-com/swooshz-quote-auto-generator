@@ -5688,10 +5688,11 @@ async function confirmProfileOverwriteSave(event) {
 
 function applySavedCompanyProfileProfile(profile = {}) {
   const defaults = profile.defaults && typeof profile.defaults === "object" ? profile.defaults : {};
-  if (!Object.keys(defaults).length) return;
-  applyQuoteDetails(defaults, { includeLogo: true, clearLogo: true, partial: true });
-  clearGeneratedQuoteState();
-  setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
+  if (Object.keys(defaults).length) {
+    applyQuoteDetails(defaults, { includeLogo: true, clearLogo: true, partial: true });
+  }
+  // A replaced layout also invalidates exports when its company defaults are unchanged.
+  invalidateGeneratedExportsForPresentationChange();
 }
 
 async function saveNamedCompanyProfile(label = "", options = {}) {

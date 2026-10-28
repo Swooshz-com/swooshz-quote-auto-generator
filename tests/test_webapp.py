@@ -23726,6 +23726,7 @@ function fileToText(file) { return Promise.resolve(file.text); }
 function applyQuoteDetails(defaults) { appliedDefaults = defaults; }
 function renderPresetStatus(message = "") { statuses.push(message); }
 function clearGeneratedQuoteState() { clearedGeneratedState = true; }
+function invalidateGeneratedExportsForPresentationChange() {}
 function setWorkflowStage(stage) { workflowStage = stage; }
 function updatePresetButtons() { buttonUpdates += 1; }
 function syncControlStates() { syncedControls += 1; }
@@ -23792,8 +23793,8 @@ eval([
   assert.strictEqual(posted[0].payload.defaults.company.name, "Imported Layout Co");
   assert.strictEqual(posted[0].payload.pack.quotation_layout.filename, "quotation-layout.xlsx");
   assert.deepStrictEqual(appliedDefaults.quote_text.payment_terms, ["Imported terms."]);
-  assert.strictEqual(clearedGeneratedState, true);
-  assert.strictEqual(workflowStage, "needs_images");
+  assert.strictEqual(clearedGeneratedState, false);
+  assert.strictEqual(workflowStage, "");
   assert.strictEqual(state.companyProfiles.length, 1);
   assert.strictEqual(state.companyProfiles[0].id, "imported-layout");
   assert.strictEqual(state.selectedPresetValue, "company:imported-layout");
@@ -40591,6 +40592,9 @@ main().catch((error) => {
             }))
             backend._objects.clear()
             artifact = storage.profile_layout_artifact("missing-object-layout")
+            with self.assertRaises(webapp.SqagStorageAccessError) as missing_export:
+                storage.company_profile_export_payload("missing-object-layout")
+            self.assertEqual(missing_export.exception.reason, "profile_layout_unavailable")
 
         self.assertIsNone(artifact)
 

@@ -13368,7 +13368,16 @@ class DatabaseSqagStorage:
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
         if profile is None or self._is_deleted_profile_payload(profile):
             return None
-        return {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
+        payload = {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
+        layout = self.profile_layout_artifact(safe_id)
+        if layout is None and configured_artifact_storage_mode() in {"database", "object"}:
+            raise SqagStorageAccessError("Saved profile layout is unavailable.", status=409, reason="profile_layout_unavailable")
+        if layout is not None:
+            payload["pack"] = {"quotation_layout": {
+                "filename": layout["filename"],
+                "data_url": f"data:{layout['content_type']};base64,{base64.b64encode(layout['content']).decode('ascii')}",
+            }}
+        return payload
 
     def list_pricing_references(self) -> list[dict[str, Any]]:
         company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("sqag_pricing_references", "reference_id")]
