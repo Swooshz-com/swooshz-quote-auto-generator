@@ -41479,26 +41479,45 @@ main().catch((error) => {
 
     @unittest.skipIf(os.name == "nt", "Windows native symlink remains held after WinError 1314; Linux CI covers real links")
     def test_exact_pricing_reference_catalog_rejects_real_symlink_escape_before_read(self):
-        for source, linked_file in itertools.product(("local", "bundled"), ("reference.json", "linked.json")):
-            with self.subTest(source=source, linked_file=linked_file), tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
-                root = Path(tmp)
+        for source, linked_file, route in itertools.product(("local", "bundled"), ("directory", "reference.json", "linked.json"), ("exact", "resolve", "summary", "detail", "list")):
+            with self.subTest(source=source, linked_file=linked_file, route=route), tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+                root = Path(tmp) / "packs"
+                root.mkdir()
                 pack_dir = root / "reserved-pack"
-                pack_dir.mkdir()
-                outside = root / "reserved-outside.json"
+                outside = Path(tmp) / "reserved-outside.json"
                 outside.write_text('{"id":"reserved-pack","items":[{"id":"reserved-sentinel"}]}', encoding="utf-8")
-                (pack_dir / linked_file).symlink_to(outside)
-                if linked_file != "reference.json":
-                    (pack_dir / "reference.json").write_text('{"id":"reserved-pack","pricing_catalog":"linked.json"}', encoding="utf-8")
+                if linked_file == "directory":
+                    outside_dir = Path(tmp) / "outside-pack"
+                    outside_dir.mkdir()
+                    (outside_dir / "reference.json").write_text('{"id":"reserved-pack"}', encoding="utf-8")
+                    pack_dir.symlink_to(outside_dir, target_is_directory=True)
+                else:
+                    pack_dir.mkdir()
+                    (pack_dir / linked_file).symlink_to(outside)
+                    if linked_file != "reference.json":
+                        (pack_dir / "reference.json").write_text('{"id":"reserved-pack","pricing_catalog":"linked.json"}', encoding="utf-8")
                 original_read = Path.read_text
                 def read_selected_pack(path, *args, **kwargs):
                     self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Native symlink file escaped selected pack")
+                    self.assertTrue(path.resolve().is_relative_to(root.resolve()), "Native symlink directory escaped pack root")
                     return original_read(path, *args, **kwargs)
                 with (
                     mock.patch.object(webapp, "pricing_references_root", return_value=root),
                     mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root),
+                    mock.patch.object(webapp, "DEFAULT_PRICING_REFERENCE_ID", "reserved-pack"),
+                    mock.patch.object(webapp, "BUNDLED_DEFAULT_PRICING_REFERENCE_ID", "reserved-pack"),
                     mock.patch.object(Path, "read_text", read_selected_pack),
                 ):
-                    self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", source))
+                    if route == "exact":
+                        self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", source))
+                    elif route == "list":
+                        listing = webapp.list_local_pricing_references if source == "local" else webapp.list_bundled_pricing_references
+                        self.assertEqual(listing(), [])
+                    else:
+                        with self.assertRaises(webapp.PricingReferencePathError):
+                            pack = webapp.PricingReferencePack.resolve("reserved-pack", source)
+                            if route == "summary": pack.public_summary()
+                            if route == "detail": pack.public_detail()
 
     def test_exact_pricing_reference_catalog_rejects_resolved_escape_before_read(self):
         with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:

@@ -18531,6 +18531,10 @@ def load_template_profile_pack(profile_id: str | None = None) -> ProfilePack | N
     return profile
 
 
+class PricingReferencePathError(ValueError):
+    """A selected pricing pack resolves outside its permitted directory."""
+
+
 @dataclass(frozen=True)
 class PricingReferencePack:
     """Resolved pricing catalog package independent from quotation profiles."""
@@ -18540,6 +18544,27 @@ class PricingReferencePack:
     config: dict[str, Any]
     source: str = "bundled"
 
+    @staticmethod
+    def _contained_path(root: Path, directory: Path, filename: str) -> Path:
+        try:
+            relative = Path(filename)
+            if relative.is_absolute() or relative.drive:
+                raise ValueError
+            resolved_root = root.resolve()
+            resolved_directory = directory.resolve()
+            resolved_path = (directory / relative).resolve()
+            if not resolved_directory.is_relative_to(resolved_root) or not resolved_path.is_relative_to(resolved_directory):
+                raise ValueError
+        except (OSError, RuntimeError, ValueError):
+            raise PricingReferencePathError("Pricing reference files are unavailable.") from None
+        return resolved_path
+
+    @classmethod
+    def _read_config(cls, root: Path, directory: Path) -> tuple[dict[str, Any], Path]:
+        config = load_json_file(cls._contained_path(root, directory, "reference.json"))
+        catalog_path = cls._contained_path(root, directory, clean_text(config.get("pricing_catalog")) or "pricing-catalog.json")
+        return config, catalog_path
+
     @classmethod
     def resolve(cls, reference_id: str | None = None, source: str = "") -> "PricingReferencePack":
         resolved_id = safe_resource_id(reference_id, DEFAULT_PRICING_REFERENCE_ID)
@@ -18548,24 +18573,14 @@ class PricingReferencePack:
         if requested_source in {"", "local"}:
             local_root = pricing_references_root()
             local_dir = local_root / resolved_id
-            try:
-                local_dir.resolve().relative_to(local_root.resolve())
-            except ValueError:
-                local_dir = local_root / DEFAULT_PRICING_REFERENCE_ID
-            local_config = load_json_file(local_dir / "reference.json")
+            local_config, _ = cls._read_config(local_root, local_dir)
             if local_config or requested_source == "local":
                 reference_id_from_config = safe_resource_id(local_config.get("id"), resolved_id)
                 return cls(reference_id_from_config, local_dir, dict(local_config), "local")
 
         bundled_root = bundled_pricing_references_root()
         reference_dir = bundled_root / resolved_id
-        try:
-            reference_dir.resolve().relative_to(bundled_root.resolve())
-        except ValueError:
-            resolved_id = DEFAULT_PRICING_REFERENCE_ID
-            reference_dir = bundled_root / resolved_id
-
-        config = load_json_file(reference_dir / "reference.json")
+        config, _ = cls._read_config(bundled_root, reference_dir)
         if not config and resolved_id != DEFAULT_PRICING_REFERENCE_ID and requested_source != "local":
             return cls.resolve(DEFAULT_PRICING_REFERENCE_ID, source=requested_source)
         reference_id_from_config = safe_resource_id(config.get("id"), resolved_id)
@@ -18577,31 +18592,17 @@ class PricingReferencePack:
             return None
         if not isinstance(source, str) or source not in {"local", "bundled"}:
             return None
+        root = pricing_references_root() if source == "local" else bundled_pricing_references_root()
+        reference_dir = root / reference_id
         try:
-            root = (pricing_references_root() if source == "local" else bundled_pricing_references_root()).resolve()
-            reference_dir = (root / reference_id).resolve()
-            if not reference_dir.is_relative_to(root):
-                return None
-            manifest_path = (reference_dir / "reference.json").resolve()
-            if not manifest_path.is_relative_to(reference_dir):
-                return None
-        except (OSError, RuntimeError, ValueError):
+            config, catalog_path = cls._read_config(root, reference_dir)
+        except PricingReferencePathError:
             return None
-        config = load_json_file(manifest_path)
         if (
             not isinstance(config, dict)
             or not isinstance(config.get("id"), str)
             or config.get("id") != reference_id
         ):
-            return None
-        catalog_filename = Path(clean_text(config.get("pricing_catalog")) or "pricing-catalog.json")
-        if catalog_filename.is_absolute() or catalog_filename.drive:
-            return None
-        try:
-            catalog_path = (reference_dir / catalog_filename).resolve()
-            if not catalog_path.is_relative_to(reference_dir):
-                return None
-        except (OSError, RuntimeError, ValueError):
             return None
         catalog = load_json_file(catalog_path)
         if not isinstance(catalog, dict) or not isinstance(catalog.get("items"), list) or not catalog.get("items"):
@@ -18610,13 +18611,7 @@ class PricingReferencePack:
 
     def asset_path(self, key: str, fallback_filename: str) -> Path:
         filename = clean_text(self.config.get(key)) or fallback_filename
-        path = self.directory / filename
-        try:
-            resolved = path.resolve()
-            resolved.relative_to(self.directory.resolve())
-        except ValueError:
-            return (self.directory / fallback_filename).resolve()
-        return resolved
+        return self._contained_path(self.directory, self.directory, filename)
 
     @property
     def pricing_catalog_path(self) -> Path:
@@ -18767,9 +18762,12 @@ def list_local_pricing_references() -> list[dict[str, Any]]:
                 continue
             if not (path / "reference.json").is_file():
                 continue
-            reference = load_pricing_reference_pack(path.name, source="local")
-            if reference.config:
-                references.append(reference.public_summary())
+            try:
+                reference = load_pricing_reference_pack(path.name, source="local")
+                if reference.config:
+                    references.append(reference.public_summary())
+            except PricingReferencePathError:
+                continue
     if references:
         return sorted(
             references,
@@ -18790,9 +18788,12 @@ def list_bundled_pricing_references() -> list[dict[str, Any]]:
                 continue
             if not (path / "reference.json").is_file():
                 continue
-            reference = load_pricing_reference_pack(path.name, source="bundled")
-            if reference.config:
-                references.append(reference.public_summary())
+            try:
+                reference = load_pricing_reference_pack(path.name, source="bundled")
+                if reference.config:
+                    references.append(reference.public_summary())
+            except PricingReferencePathError:
+                continue
     if references:
         return sorted(
             references,
@@ -18801,8 +18802,11 @@ def list_bundled_pricing_references() -> list[dict[str, Any]]:
                 clean_text(item.get("id")).casefold(),
             ),
         )
-    reference = load_pricing_reference_pack(BUNDLED_DEFAULT_PRICING_REFERENCE_ID, source="bundled")
-    return [reference.public_summary()] if reference.config and reference.source == "bundled" else []
+    try:
+        reference = load_pricing_reference_pack(BUNDLED_DEFAULT_PRICING_REFERENCE_ID, source="bundled")
+        return [reference.public_summary()] if reference.config and reference.source == "bundled" else []
+    except PricingReferencePathError:
+        return []
 
 
 def public_company_pricing_reference(reference: dict[str, Any]) -> dict[str, Any]:

@@ -14,6 +14,64 @@ webapp = support.webapp
 
 
 class CodeqlBoundaryTest(unittest.TestCase):
+    def test_pack_asset_paths_reject_escape_without_substituting_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / 'synthetic-pack'
+            directory.mkdir()
+            for key in ('pricing_catalog', 'pricing_reference'):
+                for filename in ('../outside.json', str((directory / 'inside.json').resolve())):
+                    with self.subTest(key=key, filename_kind='absolute' if Path(filename).is_absolute() else 'relative'):
+                        pack = webapp.PricingReferencePack('synthetic-pack', directory, {key: filename})
+                        with self.assertRaises(webapp.PricingReferencePathError), \
+                             mock.patch.object(Path, 'read_text') as reader:
+                            pack.asset_path(key, 'synthetic-default.json')
+                        reader.assert_not_called()
+
+    def test_all_pack_read_entrypoints_reject_unsafe_paths_without_fallback(self):
+        for source in ('local', 'bundled'):
+            for target in ('manifest', 'catalogue'):
+                for route in ('resolve', 'summary', 'detail', 'list'):
+                    with self.subTest(source=source, target=target, route=route), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        pack_dir = root / 'synthetic-pack'
+                        pack_dir.mkdir()
+                        manifest = pack_dir / 'reference.json'
+                        catalog = pack_dir / 'pricing-catalog.json'
+                        outside = root / 'outside.json'
+                        manifest.write_text(json.dumps({'id': 'synthetic-pack', 'pricing_catalog':
+                            '../outside.json' if target == 'catalogue' else 'pricing-catalog.json'}), encoding='utf-8')
+                        catalog.write_text('{"items":[{"id":"synthetic-default"}]}', encoding='utf-8')
+                        outside.write_text('{"id":"synthetic-pack","label":"Synthetic outside sentinel","items":[]}', encoding='utf-8')
+                        original_resolve, original_read = Path.resolve, Path.read_text
+                        reads = []
+
+                        def resolved(path, *args, **kwargs):
+                            if target == 'manifest' and path.name == 'reference.json' and original_resolve(path.parent) == original_resolve(pack_dir):
+                                return original_resolve(outside)
+                            return original_resolve(path, *args, **kwargs)
+
+                        def contained_read(path, *args, **kwargs):
+                            actual = path.resolve()
+                            self.assertTrue(actual.is_relative_to(original_resolve(pack_dir)), 'Pack read escaped its selected directory')
+                            reads.append(actual)
+                            return original_read(path, *args, **kwargs)
+
+                        with mock.patch.object(webapp, 'pricing_references_root', return_value=root), \
+                             mock.patch.object(webapp, 'bundled_pricing_references_root', return_value=root), \
+                             mock.patch.object(webapp, 'DEFAULT_PRICING_REFERENCE_ID', 'synthetic-pack'), \
+                             mock.patch.object(webapp, 'BUNDLED_DEFAULT_PRICING_REFERENCE_ID', 'synthetic-pack'), \
+                             mock.patch.object(Path, 'resolve', resolved), \
+                             mock.patch.object(Path, 'read_text', contained_read):
+                            if route == 'list':
+                                listing = webapp.list_local_pricing_references if source == 'local' else webapp.list_bundled_pricing_references
+                                self.assertEqual(listing(), [])
+                            else:
+                                with self.assertRaises(ValueError):
+                                    pack = webapp.PricingReferencePack.resolve('synthetic-pack', source)
+                                    if route == 'summary': pack.public_summary()
+                                    if route == 'detail': pack.public_detail()
+                        self.assertNotIn(original_resolve(catalog), reads, 'Unsafe selection must not substitute its default catalogue')
+
     def test_linear_number_and_key_admission_matches_predecessor(self):
         rng = random.Random(882)
         alphabet = '  \t\r\n\u2003-+,.0123456789abc\u0661\u0968'
@@ -85,4 +143,24 @@ class CodeqlBoundaryTest(unittest.TestCase):
                  mock.patch.object(Path, 'resolve', side_effect=failure), \
                  mock.patch.object(Path, 'read_text') as reader:
                 self.assertIsNone(webapp.PricingReferencePack.resolve_exact('synthetic-pack', 'local'))
+                with self.assertRaises(webapp.PricingReferencePathError):
+                    webapp.PricingReferencePack.resolve('synthetic-pack', 'local')
                 reader.assert_not_called()
+
+    def test_listings_keep_safe_peers_and_do_not_hide_unrelated_failures(self):
+        for source in ('local', 'bundled'):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for name in ('safe-pack', 'unsafe-pack'):
+                    directory = root / name
+                    directory.mkdir()
+                    (directory / 'reference.json').write_text(json.dumps({'id': name,
+                        'pricing_catalog': '../outside.json' if name == 'unsafe-pack' else 'pricing-catalog.json'}), encoding='utf-8')
+                    (directory / 'pricing-catalog.json').write_text('{"items":[]}', encoding='utf-8')
+                with mock.patch.object(webapp, 'pricing_references_root', return_value=root), \
+                     mock.patch.object(webapp, 'bundled_pricing_references_root', return_value=root):
+                    listing = webapp.list_local_pricing_references if source == 'local' else webapp.list_bundled_pricing_references
+                    self.assertEqual([item['id'] for item in listing()], ['safe-pack'])
+                    with mock.patch.object(webapp, 'load_pricing_reference_pack', side_effect=RuntimeError('Synthetic unrelated error')):
+                        with self.assertRaises(RuntimeError):
+                            listing()
