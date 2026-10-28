@@ -1567,6 +1567,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                     '<a:latin typeface="Explicit Sans"/></a:rPr>'
                 ).encode(),
                 "xl/worksheets/sheet1.xml": b"<sheet/>",
+                "xl/sharedStrings.xml": (
+                    f'<sst xmlns="{NS_MAIN[1:-1]}"><si><r><rPr>'
+                    '<rFont val="Explicit Sans"/><sz val="12"/>'
+                    '</rPr><t>Explicit text</t></r></si></sst>'
+                ).encode(),
             }
             with zipfile.ZipFile(source, "w") as archive:
                 for name, content in parts.items():
@@ -1574,6 +1579,86 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             quote.write_pdf_conversion_workbook(source, converted)
             with zipfile.ZipFile(converted) as archive:
                 self.assertEqual({name: archive.read(name) for name in archive.namelist()}, parts)
+
+    def test_pdf_conversion_materialises_partial_rich_text_font_defaults(self):
+        for part, container in (("xl/worksheets/sheet1.xml", "is"), ("xl/sharedStrings.xml", "si")):
+            with self.subTest(part=part), tempfile.TemporaryDirectory() as tmp:
+                master = Path(tmp) / "master.xlsx"
+                converted = Path(tmp) / "converted.xlsx"
+                text = (
+                    f'<root xmlns="{NS_MAIN[1:-1]}" xmlns:mc="{quote.XMLNS_MC}" '
+                    'xmlns:ext="urn:example:extension" mc:Ignorable="ext">'
+                    f'<{container}><r><rPr><b val="0"/></rPr><t>Partial</t></r>'
+                    '<r><rPr><rFont val="Explicit Sans"/><sz val="17"/><i/></rPr><t>Explicit</t></r>'
+                    f'<r><t>Inherited</t></r></{container}></root>'
+                ).encode()
+                styles = (
+                    f'<styleSheet xmlns="{NS_MAIN[1:-1]}"><fonts count="2">'
+                    '<font><sz val="10.5"/><name val="Example Default"/></font>'
+                    '<font><sz val="19"/><name val="Different Cell Font"/></font>'
+                    '</fonts></styleSheet>'
+                ).encode()
+                with zipfile.ZipFile(master, "w") as archive:
+                    archive.writestr(part, text)
+                    archive.writestr("xl/styles.xml", styles)
+                    archive.writestr("unchanged.bin", b"unchanged")
+                before = master.read_bytes()
+                quote.write_pdf_conversion_workbook(master, converted)
+                with zipfile.ZipFile(converted) as archive:
+                    result = ET.fromstring(archive.read(part))
+                    props = list(result.iter(f"{NS_MAIN}rPr"))
+                    self.assertEqual(props[0].find(f"{NS_MAIN}rFont").attrib, {"val": "Example Default"})
+                    self.assertEqual(props[0].find(f"{NS_MAIN}sz").attrib, {"val": "10.5"})
+                    self.assertEqual(props[0].find(f"{NS_MAIN}b").attrib, {"val": "0"})
+                    self.assertEqual(props[1].find(f"{NS_MAIN}rFont").attrib, {"val": "Explicit Sans"})
+                    self.assertEqual(props[1].find(f"{NS_MAIN}sz").attrib, {"val": "17"})
+                    self.assertEqual(len(list(result.iter(f"{NS_MAIN}rPr"))), 2)
+                    self.assertIn(b'xmlns:ext="urn:example:extension"', archive.read(part))
+                    self.assertEqual(archive.read("xl/styles.xml"), styles)
+                    self.assertEqual(archive.read("unchanged.bin"), b"unchanged")
+                self.assertEqual(master.read_bytes(), before)
+
+    def test_pdf_conversion_resolves_rich_text_schemes_and_keeps_explicit_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            master, converted = Path(tmp) / "master.xlsx", Path(tmp) / "converted.xlsx"
+            with zipfile.ZipFile(master, "w") as archive:
+                archive.writestr("xl/styles.xml", f'<styleSheet xmlns="{NS_MAIN[1:-1]}"><fonts><font><name val="Default"/><sz val="9"/></font></fonts></styleSheet>')
+                archive.writestr("xl/sharedStrings.xml", (
+                    f'<sst xmlns="{NS_MAIN[1:-1]}"><si>'
+                    '<r><rPr><scheme val="major"/></rPr><t>Heading</t></r>'
+                    '<r><rPr><scheme val="minor"/></rPr><t>Body</t></r>'
+                    '<r><rPr><rFont val="Explicit"/><sz val="14"/><scheme val="major"/></rPr><t>Explicit</t></r>'
+                    '<r><rPr><rFont val="Explicit"/></rPr><t>Missing size</t></r>'
+                    '</si></sst>'
+                ))
+                archive.writestr("xl/_rels/workbook.xml.rels", f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}"><Relationship Id="theme" Type="{NS_REL[1:-1]}/theme" Target="theme/theme1.xml"/></Relationships>')
+                archive.writestr("xl/theme/theme1.xml", f'<a:theme xmlns:a="{NS_A[1:-1]}"><a:themeElements><a:fontScheme name="Example"><a:majorFont><a:latin typeface="Example Heading"/></a:majorFont><a:minorFont><a:latin typeface="Example Body"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>')
+            quote.write_pdf_conversion_workbook(master, converted)
+            with zipfile.ZipFile(converted) as archive:
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                props = list(root.iter(f"{NS_MAIN}rPr"))
+                self.assertEqual([p.find(f"{NS_MAIN}rFont").attrib["val"] for p in props], ["Example Heading", "Example Body", "Explicit", "Explicit"])
+                self.assertEqual([p.find(f"{NS_MAIN}sz").attrib["val"] for p in props], ["9", "9", "14", "9"])
+
+    def test_pdf_conversion_refuses_unavailable_rich_text_defaults(self):
+        for styles in (None, b"<styleSheet/>", (
+            f'<styleSheet xmlns="{NS_MAIN[1:-1]}"><fonts>'
+            '<font><name val="Example"/><sz val="NaN"/></font></fonts></styleSheet>'
+        ).encode()):
+            with self.subTest(styles=styles), tempfile.TemporaryDirectory() as tmp:
+                master = Path(tmp) / "master.xlsx"
+                converted = Path(tmp) / "converted.xlsx"
+                with zipfile.ZipFile(master, "w") as archive:
+                    archive.writestr("xl/sharedStrings.xml", (
+                        f'<sst xmlns="{NS_MAIN[1:-1]}"><si><r><rPr><b/></rPr><t>Partial</t></r></si></sst>'
+                    ))
+                    if styles is not None:
+                        archive.writestr("xl/styles.xml", styles)
+                before = master.read_bytes()
+                with self.assertRaises(ValueError):
+                    quote.write_pdf_conversion_workbook(master, converted)
+                self.assertEqual(master.read_bytes(), before)
+                self.assertFalse(converted.exists())
 
     def test_pdf_conversion_refuses_unresolved_or_ambiguous_theme_fonts(self):
         relationship = (
@@ -1782,6 +1867,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                             "logo_bbox": synthetic_logo_bbox(image),
                             "header_bbox": pdf_text_bbox(textpage, "Rendered Fidelity Co") if "Rendered Fidelity Co" in text else None,
                             "header_fonts": pdf_phrase_font_names(textpage, "Rendered Fidelity Co") if "Rendered Fidelity Co" in text else [],
+                            "client_fonts": pdf_phrase_font_names(textpage, "Saved Client") if "Saved Client" in text else [],
                             "quantity_bbox": pdf_text_bbox(textpage, "Quantity") if "Quantity" in text else None,
                             "quantity_weights": pdf_phrase_font_weights(textpage, "Quantity") if "Quantity" in text else [],
                         })
@@ -1816,6 +1902,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 for name in first_page["header_fonts"]
             ), first_page["header_fonts"])
             self.assertIsNotNone(first_page["quantity_bbox"])
+            self.assertTrue(first_page["client_fonts"])
+            self.assertTrue(all(
+                name.split("+")[-1] in {"Arial", "ArialMT", "LiberationSans", "LiberationSans-Regular"}
+                for name in first_page["client_fonts"]
+            ), first_page["client_fonts"])
 
             logo_bbox = first_page["logo_bbox"]
             logo_width_px = logo_bbox[2] - logo_bbox[0]

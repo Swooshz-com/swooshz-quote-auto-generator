@@ -46,6 +46,11 @@ npm run playwright:smoke
   A Calibri-compatible Linux font still does not prove exact Excel typography
   or pagination; native Excel and installed PDF comparisons remain required
   before claiming that fidelity.
+  Partially formatted SpreadsheetML text runs must also materialise their
+  workbook-default font and size in the conversion copy. Cover inline and
+  shared strings, explicit run overrides, theme schemes and missing defaults;
+  preserve plain cell inheritance and the XLSX master. The real renderer check
+  must reject a monospace font for the client text, independently of the header.
   A review result with an explicit empty or diagnostic-only file list must save
   as review without entering atomic workbook publication. Test this with the real
   generator, migrated database and synthetic object backend, then resolve pricing

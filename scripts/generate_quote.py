@@ -3641,7 +3641,7 @@ def libreoffice_candidates() -> list[str]:
 
 
 def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> None:
-    """Make DrawingML theme fonts explicit for Calc without changing the master."""
+    """Make ambiguous PDF font defaults explicit without changing the master."""
     with zipfile.ZipFile(xlsx_path) as source:
         entries = source.infolist()
         names = [entry.filename for entry in entries]
@@ -3661,6 +3661,47 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
             if referenced:
                 drawings[name] = drawing_xml
                 aliases.update(referenced)
+        rich_text: dict[str, bytes] = {}
+        default_font: dict[str, str] = {}
+        for name in names:
+            if name != "xl/sharedStrings.xml" and not (name.startswith("xl/worksheets/") and name.endswith(".xml")):
+                continue
+            part_xml = read_bounded_xlsx_part(source, name)
+            part = ET.fromstring(part_xml)
+            partial = [
+                props for container in part.iter()
+                if container.tag in {f"{NS_MAIN}is", f"{NS_MAIN}si"}
+                for run in container.findall(f"{NS_MAIN}r")
+                if (props := run.find(f"{NS_MAIN}rPr")) is not None
+                and (props.find(f"{NS_MAIN}rFont") is None or props.find(f"{NS_MAIN}sz") is None)
+            ]
+            if not partial:
+                continue
+            rich_text[name] = part_xml
+            for props in partial:
+                scheme = props.find(f"{NS_MAIN}scheme")
+                if props.find(f"{NS_MAIN}rFont") is None and scheme is not None:
+                    alias = {"minor": "+mn-lt", "major": "+mj-lt", "none": ""}.get(scheme.attrib.get("val"))
+                    if alias is None:
+                        raise ValueError("PDF rich text font scheme is unavailable.")
+                    if alias:
+                        aliases.add(alias)
+        if rich_text:
+            if "xl/styles.xml" not in names:
+                raise ValueError("PDF rich text requires workbook font defaults.")
+            styles = ET.fromstring(read_bounded_xlsx_part(source, "xl/styles.xml"))
+            first_font = styles.find(f"{NS_MAIN}fonts/{NS_MAIN}font")
+            if first_font is None:
+                raise ValueError("PDF rich text requires workbook font defaults.")
+            default_font = {node.tag.removeprefix(NS_MAIN): node.attrib.get("val", "") for node in first_font}
+            try:
+                size = float(default_font.get("sz", ""))
+            except ValueError:
+                size = math.nan
+            if not default_font.get("name", "").strip() or not math.isfinite(size) or size <= 0:
+                raise ValueError("PDF rich text font defaults are unavailable.")
+            if default_font.get("scheme") in {"minor", "major"}:
+                aliases.add("+mn-lt" if default_font["scheme"] == "minor" else "+mj-lt")
         fonts: dict[str, str] = {}
         if aliases:
             relationships = ET.fromstring(read_bounded_xlsx_part(source, "xl/_rels/workbook.xml.rels"))
@@ -3695,6 +3736,33 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
                     if alias in fonts:
                         node.setAttribute("typeface", fonts[alias])
                 replacements[name] = drawing.toxml(encoding="utf-8")
+        for name, part_xml in rich_text.items():
+            with minidom.parseString(part_xml) as part:
+                for container in part.getElementsByTagNameNS(NS_MAIN[1:-1], "is") + part.getElementsByTagNameNS(NS_MAIN[1:-1], "si"):
+                    for run in container.childNodes:
+                        if run.namespaceURI != NS_MAIN[1:-1] or run.localName != "r":
+                            continue
+                        props = next((node for node in run.childNodes if node.namespaceURI == NS_MAIN[1:-1] and node.localName == "rPr"), None)
+                        if props is None:
+                            continue
+                        existing = {node.localName: node for node in props.childNodes if node.namespaceURI == NS_MAIN[1:-1]}
+                        if "rFont" in existing and "sz" in existing:
+                            continue
+                        # A partial rich-text rPr uses workbook font zero defaults
+                        # in Excel. Calc otherwise substitutes its application font.
+                        scheme = existing["scheme"].getAttribute("val") if "scheme" in existing else default_font.get("scheme")
+                        alias = {"minor": "+mn-lt", "major": "+mj-lt"}.get(scheme)
+                        if "rFont" in existing:
+                            typeface = existing["rFont"].getAttribute("val")
+                        else:
+                            typeface = fonts[alias] if alias else default_font["name"]
+                        for tag, value in (("rFont", typeface), ("sz", default_font["sz"])):
+                            if tag in existing:
+                                continue
+                            node = part.createElementNS(NS_MAIN[1:-1], f"{props.prefix}:{tag}" if props.prefix else tag)
+                            node.setAttribute("val", value)
+                            props.appendChild(node)
+                replacements[name] = part.toxml(encoding="utf-8")
         with zipfile.ZipFile(conversion_path, "w") as converted:
             for entry in entries:
                 if entry.filename in replacements:
