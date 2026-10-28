@@ -16072,6 +16072,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertIn("quotation.xlsx", [item["name"] for item in result["files"]])
             self.assertEqual(result["pricing_matches"][0]["status"], "matched")
             self.assertEqual(result["export_status"]["pdf_status"], "skipped")
+            brief_path = tmp_path / "tmp" / result["job_id"] / "brief.json"
+            self.assertEqual(set(json.loads(brief_path.read_text(encoding="utf-8"))["_pricing_reference_authority"]),
+                             {"id", "source", "currency", "digest"})
+            if os.name == "posix":
+                self.assertEqual(brief_path.stat().st_mode & 0o777, 0o600)
 
     def test_static_upload_dropzone_supports_drag_and_drop_reference_files(self):
         static_dir = ROOT / "webapp" / "static"
@@ -41474,23 +41479,26 @@ main().catch((error) => {
 
     @unittest.skipIf(os.name == "nt", "Windows native symlink remains held after WinError 1314; Linux CI covers real links")
     def test_exact_pricing_reference_catalog_rejects_real_symlink_escape_before_read(self):
-        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
-            root = Path(tmp)
-            pack_dir = root / "reserved-pack"
-            pack_dir.mkdir()
-            outside = root / "reserved-outside.json"
-            outside.write_text('{"items":[{"id":"reserved-sentinel"}]}', encoding="utf-8")
-            (pack_dir / "linked.json").symlink_to(outside)
-            (pack_dir / "reference.json").write_text('{"id":"reserved-pack","pricing_catalog":"linked.json"}', encoding="utf-8")
-            original_read = Path.read_text
-            def read_selected_pack(path, *args, **kwargs):
-                self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Native symlink catalogue escaped selected pack")
-                return original_read(path, *args, **kwargs)
-            with (
-                mock.patch.object(webapp, "pricing_references_root", return_value=root),
-                mock.patch.object(Path, "read_text", read_selected_pack),
-            ):
-                self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", "local"))
+        for source, linked_file in itertools.product(("local", "bundled"), ("reference.json", "linked.json")):
+            with self.subTest(source=source, linked_file=linked_file), tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+                root = Path(tmp)
+                pack_dir = root / "reserved-pack"
+                pack_dir.mkdir()
+                outside = root / "reserved-outside.json"
+                outside.write_text('{"id":"reserved-pack","items":[{"id":"reserved-sentinel"}]}', encoding="utf-8")
+                (pack_dir / linked_file).symlink_to(outside)
+                if linked_file != "reference.json":
+                    (pack_dir / "reference.json").write_text('{"id":"reserved-pack","pricing_catalog":"linked.json"}', encoding="utf-8")
+                original_read = Path.read_text
+                def read_selected_pack(path, *args, **kwargs):
+                    self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Native symlink file escaped selected pack")
+                    return original_read(path, *args, **kwargs)
+                with (
+                    mock.patch.object(webapp, "pricing_references_root", return_value=root),
+                    mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root),
+                    mock.patch.object(Path, "read_text", read_selected_pack),
+                ):
+                    self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", source))
 
     def test_exact_pricing_reference_catalog_rejects_resolved_escape_before_read(self):
         with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:

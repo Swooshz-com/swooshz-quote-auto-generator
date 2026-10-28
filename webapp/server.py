@@ -5678,7 +5678,7 @@ def clean_customer_quote_line_text(value: Any) -> str:
 
 
 def leading_number(value: Any) -> float | None:
-    match = re.match(r"\s*(-?\d[\d,]*(?:\.\d+)?)", str(value or ""))
+    match = re.match(r"(-?\d[\d,]*(?:\.\d+)?)", str(value or "").lstrip())
     if not match:
         return None
     try:
@@ -18577,13 +18577,17 @@ class PricingReferencePack:
             return None
         if not isinstance(source, str) or source not in {"local", "bundled"}:
             return None
-        root = pricing_references_root() if source == "local" else bundled_pricing_references_root()
-        reference_dir = root / reference_id
         try:
-            reference_dir.resolve().relative_to(root.resolve())
-        except ValueError:
+            root = (pricing_references_root() if source == "local" else bundled_pricing_references_root()).resolve()
+            reference_dir = (root / reference_id).resolve()
+            if not reference_dir.is_relative_to(root):
+                return None
+            manifest_path = (reference_dir / "reference.json").resolve()
+            if not manifest_path.is_relative_to(reference_dir):
+                return None
+        except (OSError, RuntimeError, ValueError):
             return None
-        config = load_json_file(reference_dir / "reference.json")
+        config = load_json_file(manifest_path)
         if (
             not isinstance(config, dict)
             or not isinstance(config.get("id"), str)
@@ -18595,7 +18599,8 @@ class PricingReferencePack:
             return None
         try:
             catalog_path = (reference_dir / catalog_filename).resolve()
-            catalog_path.relative_to(reference_dir.resolve())
+            if not catalog_path.is_relative_to(reference_dir):
+                return None
         except (OSError, RuntimeError, ValueError):
             return None
         catalog = load_json_file(catalog_path)
@@ -28225,13 +28230,11 @@ QUOTE_BASIS_LEGACY_ORDER = (
     "furniture",
     "electrical",
 )
-QUOTE_BASIS_KEY_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 QUOTE_BASIS_UNSAFE_KEYS = {"__proto__", "constructor", "prototype"}
 PRIMARY_ORDER_FIELDS = ("basis_order", "category_order", "item_order")
 QUOTE_BASIS_SECTION_ORDER_FIELDS = (*PRIMARY_ORDER_FIELDS, "section_order")
 PRIMARY_ORDER_MAX = 9007199254740991
 PRIMARY_ORDER_MAX_TEXT = str(PRIMARY_ORDER_MAX)
-PRIMARY_ORDER_ASCII_DIGITS_RE = re.compile(r"[0-9]+\Z")
 
 
 def canonical_quote_basis(value: Any) -> dict[str, str]:
@@ -28244,7 +28247,7 @@ def canonical_quote_basis(value: Any) -> dict[str, str]:
         if (
             not isinstance(key, str)
             or not 1 <= len(key) <= 80
-            or QUOTE_BASIS_KEY_RE.fullmatch(key) is None
+            or not all(part and part.isascii() and part.isalnum() and part == part.lower() for part in key.split("-"))
             or key in QUOTE_BASIS_UNSAFE_KEYS
         ):
             raise ValueError("Quote basis contains an invalid key.")
@@ -28271,7 +28274,7 @@ def canonical_primary_order_value(value: Any) -> int | None:
     if not isinstance(value, str):
         return None
     text = value.strip(" \t\r\n")
-    if not text or PRIMARY_ORDER_ASCII_DIGITS_RE.fullmatch(text) is None:
+    if not text or not text.isascii() or not text.isdecimal():
         return None
     significant = text.lstrip("0")
     if not significant:
@@ -32832,7 +32835,7 @@ def _run_quote_job(
         "uploaded_images": uploaded_images,
     }
     brief_path = job_tmp / "brief.json"
-    brief_path.write_text(json.dumps(brief, indent=2), encoding="utf-8")
+    atomic_write_text(brief_path, json.dumps(brief, indent=2))
 
     command = [
         sys.executable,

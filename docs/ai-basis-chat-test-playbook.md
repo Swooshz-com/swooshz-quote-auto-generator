@@ -304,6 +304,10 @@ Suggested split:
 
 Current repo command:
 
+The command reports case names, outcome types, timing and fixed failure codes.
+Model answers and provider exception text stay out of its JSON output. The
+forbidden-output check still inspects the response internally.
+
 ```powershell
 python scripts\live_ai_basis_chat_smoke.py --include-injection
 ```

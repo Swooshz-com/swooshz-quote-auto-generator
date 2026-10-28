@@ -35,6 +35,17 @@ npm run playwright:smoke
 - Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
 - Pricing reference import, catalog matching, currency/tax metadata, or template parsing: add/update parser and normalization tests, then run the relevant `tests.test_webapp` and `tests.test_generate_quote` cases.
+- Exact pricing-pack reads and numeric admission: Run `tests.test_codeql_boundaries`
+  and the exact-pack, quote-basis and primary-order cases in `tests.test_webapp`.
+  Preserve valid nested catalogues and reject escaped manifests/catalogues before
+  reading them. Linux CI covers real links; Windows controlled resolution tests
+  retain the existing native-link qualification limit. Generator brief writes
+  must use the private atomic writer, with mode 0600 checked on POSIX.
+- Diagnostic JSON privacy: Run `tests.test_codeql_diagnostic_privacy` with mocked
+  providers and configuration. Live-smoke results expose fixed outcome metadata
+  while keeping model and provider exception text internal. Readiness output may
+  name required environment keys but must not echo their values. These tests make
+  no paid provider calls or live network probes.
 - Reusable company-profile import/export: Run `tests.test_profile_roundtrip` and
   the existing profile import, overwrite and export endpoint cases. Applying an
   imported profile must preserve quotation analysis, reviewed rows and workflow,
