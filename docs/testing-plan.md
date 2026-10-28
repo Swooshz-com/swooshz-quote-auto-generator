@@ -171,7 +171,14 @@ npm run playwright:smoke
   supersede a grant after a saved Exclude, Custom, removed row, other catalogue
   item, other pricing reference or incompatible unit. Manual and Included stay
   operator overrides; Use Reference Price restores only a live grant. The
-  `test_ledger_*` cases cover forged authority (variant flip, deleted authority,
+  selected catalogue label is reference evidence, not additional independent
+  row detail. Run `test_selected_reference_label_is_not_independent_detail`
+  and `test_ledger_reference_only_label_selects_saves_and_reopens` in
+  `tests.test_webapp` for canonical and leading-unit labels whose words also
+  name another catalogue family, real server selection, save/reopen and final
+  brief pricing. Additional conflicting detail, ambiguous identities, quantity
+  divergence, incompatible units and non-Include basis lines stay refused.
+  The `test_ledger_*` cases cover forged authority (variant flip, deleted authority,
   self-built catalogue authority), replay after a saved exclusion or
   replacement, stale revisions and concurrent tabs, an interrupted commit,
   legacy quotes (persisted catalogue prices kept, `HISTORICAL` rows never

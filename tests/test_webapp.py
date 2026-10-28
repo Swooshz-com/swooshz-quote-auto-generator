@@ -42618,6 +42618,111 @@ main().catch((error) => {
                         {"line": selected, "row": row}, unit, item, catalog)
                     self.assertEqual(reason, "", (match, reason))
 
+    @staticmethod
+    def _reference_label_catalogue_items():
+        return [
+            {"id": "synthetic-counter-height-seat", "section": "Seating", "description": "Counter-height stool",
+             "unit_hint": "nos", "sale_unit_price": 10, "object_families": ["stool"]},
+            {"id": "synthetic-counter-unit", "section": "Seating", "description": "Counter unit",
+             "unit_hint": "nos", "sale_unit_price": 20, "object_families": ["counter"]},
+        ]
+
+    def test_selected_reference_label_is_not_independent_detail(self):
+        cases = [
+            ("reference-only", "Counter-height stool", {}, ""),
+            ("leading-unit", "nos. Counter-height stool", {}, ""),
+            ("canonical-spacing", "COUNTER HEIGHT STOOL", {}, ""),
+            ("already-bracketed", "[ Counter-height stool ]", {}, ""),
+            ("unclaimed-spatial", "Stool behind counter", {}, ""),
+            ("unclaimed-neutral", "Seating for the approved position", {}, ""),
+            ("other-object", "Counter unit", {}, "contradiction"),
+            ("additional-conflict", "Counter-height stool with Counter unit", {}, "contradiction"),
+            ("negated-label", "Not a Counter-height stool", {}, "contradiction"),
+            ("basis-conflict", "Counter-height stool", {"basis_detail": "Counter unit"}, "contradiction"),
+            ("quantity-divergence", "Counter-height stool", {"basis_quantity": 3}, "ineligible"),
+            ("zero-quantity", "Counter-height stool", {"quantity": 0}, "ineligible"),
+            ("incompatible-unit", "Counter-height stool", {"unit": "sets"}, "unit_review_required"),
+            ("excluded", "Counter-height stool", {"tag": "Exclude"}, "ineligible"),
+            ("custom", "Counter-height stool", {"custom_pricing": True}, "ineligible"),
+            ("different-keyword", "Counter-height stool", {"keyword": "synthetic-counter-unit"}, "ineligible"),
+            ("ambiguous-reference", "Counter-height stool", {"ambiguous": True}, "contradiction"),
+            ("conflicting-colour", "Black stool", {"colour": True}, "contradiction"),
+        ]
+        for label, description, options, expected in cases:
+            with self.subTest(case=label):
+                selected, other = self._reference_label_catalogue_items()
+                if options.get("colour"):
+                    selected["description"] = "White counter-height stool"
+                catalog = {item["id"]: item for item in (selected, other)}
+                if options.get("ambiguous"):
+                    catalog["synthetic-duplicate-seat"] = {**selected, "id": "synthetic-duplicate-seat"}
+                row = {"source_basis_line_id": "selected-row", "description": description,
+                       "quantity": options.get("quantity", 2), "unit": options.get("unit", "nos"), "price_mode": "Priced"}
+                line = {"id": "selected-row", "tag": options.get("tag", "Include"),
+                        "custom_pricing": options.get("custom_pricing", False), "quantity": options.get("basis_quantity", 2),
+                        "unit": "nos", "pricing_keyword": options.get("keyword", selected["id"]),
+                        "text": "[ " + selected["description"] + " ] - " + options.get("basis_detail", "Seating for the approved position")}
+                view = {"row": row, "line": line}
+                before = copy.deepcopy((view, catalog))
+                self.assertEqual(webapp.pricing_selection_refusal({"catalog_item_id": selected["id"]},
+                    view, None, selected, catalog), expected)
+                self.assertEqual((view, catalog), before)
+
+    def test_ledger_reference_only_label_selects_saves_and_reopens(self):
+        catalog_items = self._reference_label_catalogue_items()
+        catalog_payload = {"schema_version": 1, "currency": "SGD", "items": catalog_items}
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            reference_root = Path(tmp)
+            pack = reference_root / webapp.DEFAULT_PRICING_REFERENCE_ID
+            pack.mkdir()
+            (pack / "reference.json").write_text(json.dumps({
+                "id": webapp.DEFAULT_PRICING_REFERENCE_ID, "label": "Synthetic reference-label fixture", "currency": "SGD",
+                "pricing_catalog": "pricing-catalog.json", "pricing_reference": "pricing-catalog.ai-reference.md",
+            }), encoding="utf-8")
+            (pack / "pricing-catalog.json").write_text(json.dumps(catalog_payload), encoding="utf-8")
+            with mock.patch.object(webapp, "pricing_references_root", return_value=reference_root), \
+                    mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+                headers = self._ledger_runner_headers(runner)
+                for index, (description, allowed) in enumerate((("Counter-height stool", True),
+                        ("nos. Counter-height stool", True), ("Counter unit", False))):
+                    with self.subTest(description=description):
+                        request = valid_payload()
+                        request.update(pricing_reference_source="local", pricing_reference={
+                            "id": request["pricing_reference_id"], "source": "local", "currency": "SGD"})
+                        request["quote_session"] = {"session_id": "quote-reference-label-" + str(index)}
+                        row = {"source_basis_line_id": "selected-row", "section": "Seating", "description": description,
+                               "quantity": 2, "unit": "nos", "price_mode": "Priced", "pricing_keyword": ""}
+                        row["pricing_authority"] = webapp.build_pricing_authority("none", row)
+                        request["line_items"] = [row]
+                        request["quote_basis_sections"] = [{"id": "seating", "title": "Seating", "lines": [{
+                            "id": "selected-row", "tag": "Include", "quantity": 2, "unit": "nos",
+                            "pricing_keyword": catalog_items[0]["id"],
+                            "text": "[ Counter-height stool ] - Seating for the approved position.",
+                        }]}]
+                        self._ledger_sync(request, pricing_basis={"currency": "SGD", "source": "local",
+                            "id": request["pricing_reference_id"], "digest": webapp.pricing_reference_catalog_digest(catalog_payload)})
+                        self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "selected-row"))
+                        selected = self._ledger_select(runner, headers, request, "selected-row", catalog_items[0]["id"], 0)
+                        self.assertEqual(selected["status"], 200, selected["text"][-800:])
+                        self.assertEqual(selected["body"]["selections"], [{"source_basis_line_id": "selected-row",
+                            "status": "selected"} if allowed else {"source_basis_line_id": "selected-row",
+                            "status": "refused", "reason": "contradiction"}])
+                        self.assertEqual(self._ledger_price(selected["body"]["line_items"], "selected-row"), 10 if allowed else None)
+                        if allowed:
+                            request["line_items"] = selected["body"]["line_items"]
+                            self._ledger_sync(request)
+                            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+                            reopened = self.http_json(runner, "GET", "/api/quote-sessions/" + request["quote_session"]["session_id"])
+                            self.assertGreater(reopened["body"]["quote_session"]["pricing_ledger"]["rows"]["selected-row"], 0)
+                            restored = copy.deepcopy(request)
+                            restored["quote_session"] = reopened["body"]["quote_session"]
+                            saved_draft = restored["quote_session"]["draft_state"]
+                            restored["line_items"] = saved_draft["lineItems"]
+                            restored["quote_basis_sections"] = saved_draft["quoteBasisSections"]
+                            restored["quote_basis"] = saved_draft["quoteBasis"]
+                            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, restored), "selected-row"), 10)
+                            self.assertEqual(self._ledger_price(self._ledger_brief_rows(restored), "selected-row"), 10)
+
     def test_proposal_candidates_keep_neutral_detail_selection_waiver(self):
         item = {"id": "neutral-catalogue-item", "description": "sqm Plain woven modular reusable textile floor covering supply",
                 "unit_hint": "sqm", "section": "Synthetic Floors", "sale_unit_price": 14.4,

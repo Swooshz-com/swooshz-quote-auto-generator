@@ -20084,7 +20084,14 @@ def unresolved_detail_contradicts_selected_reference(
     if bracketed and not bracketed_catalog_reference_parts(detail):
         _tokens, established, mismatch, _detail = catalog_family_evidence_tokens(line_text, item, catalog_items)
         if established and not mismatch:
-            detail = f"[ {bracketed[0]} ] - {clean_text(detail)}"
+            detail_key = comparable_catalog_description_key_without_leading_unit(detail)
+            reference_only = bool(detail_key) and any(
+                comparable_catalog_description_key_without_leading_unit(reference) == detail_key
+                for reference in catalog_reference_values(item)
+            )
+            # A reference-only label supplies identity, not a second independent
+            # description whose words can contradict that same catalogue item.
+            detail = f"[ {bracketed[0]} ]" if reference_only else f"[ {bracketed[0]} ] - {clean_text(detail)}"
     return catalog_line_contradicts_item(detail, item, catalog_items=catalog_items)
 
 
