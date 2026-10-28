@@ -22,6 +22,7 @@ import json
 import hashlib
 import math
 import os
+import posixpath
 import re
 import shutil
 import tempfile
@@ -3638,11 +3639,75 @@ def libreoffice_candidates() -> list[str]:
     return result
 
 
+def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> None:
+    """Make DrawingML theme fonts explicit for Calc without changing the master."""
+    with zipfile.ZipFile(xlsx_path) as source:
+        entries = source.infolist()
+        names = [entry.filename for entry in entries]
+        if len(entries) > MAX_XLSX_ENTRIES or len(names) != len(set(names)):
+            raise ValueError("PDF workbook package has too many or duplicate parts.")
+        drawings: dict[str, ET.Element] = {}
+        aliases: set[str] = set()
+        for name in names:
+            if not name.startswith("xl/drawings/") or not name.endswith(".xml"):
+                continue
+            drawing = ET.fromstring(read_bounded_xlsx_part(source, name))
+            referenced = {
+                node.attrib.get("typeface", "")
+                for node in drawing.iter(f"{NS_A}latin")
+            } & {"+mn-lt", "+mj-lt"}
+            if referenced:
+                drawings[name] = drawing
+                aliases.update(referenced)
+        fonts: dict[str, str] = {}
+        if aliases:
+            relationships = ET.fromstring(read_bounded_xlsx_part(source, "xl/_rels/workbook.xml.rels"))
+            themes = [
+                relationship for relationship in relationships
+                if relationship.attrib.get("Type") == f"{NS_REL[1:-1]}/theme"
+            ]
+            if len(themes) != 1 or themes[0].attrib.get("TargetMode", "Internal") != "Internal":
+                raise ValueError("PDF workbook requires one internal theme.")
+            target = themes[0].attrib.get("Target", "")
+            if not target or "\\" in target:
+                raise ValueError("PDF workbook theme target is invalid.")
+            theme_part = posixpath.normpath(target.lstrip("/") if target.startswith("/") else f"xl/{target}")
+            if theme_part.startswith("../") or theme_part not in names:
+                raise ValueError("PDF workbook theme part is unavailable.")
+            theme = ET.fromstring(read_bounded_xlsx_part(source, theme_part))
+            for alias, family in (("+mn-lt", "minorFont"), ("+mj-lt", "majorFont")):
+                if alias not in aliases:
+                    continue
+                font = theme.find(f"{NS_A}themeElements/{NS_A}fontScheme/{NS_A}{family}/{NS_A}latin")
+                typeface = font.attrib.get("typeface", "").strip() if font is not None else ""
+                if not typeface or typeface.startswith("+"):
+                    raise ValueError("PDF workbook theme font is unavailable.")
+                fonts[alias] = typeface
+        replacements: dict[str, bytes] = {}
+        for name, drawing in drawings.items():
+            for node in drawing.iter(f"{NS_A}latin"):
+                alias = node.attrib.get("typeface", "")
+                if alias in fonts:
+                    node.attrib["typeface"] = fonts[alias]
+            replacements[name] = ET.tostring(drawing, encoding="utf-8", xml_declaration=True)
+        with zipfile.ZipFile(conversion_path, "w") as converted:
+            for entry in entries:
+                if entry.filename in replacements:
+                    converted.writestr(copy.copy(entry), replacements[entry.filename])
+                else:
+                    with source.open(entry) as incoming, converted.open(copy.copy(entry), "w") as outgoing:
+                        shutil.copyfileobj(incoming, outgoing)
+
+
 def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
     executables = libreoffice_candidates()
     if not executables:
         return None
     with tempfile.TemporaryDirectory(prefix="sqag-libreoffice-") as profile_dir:
+        conversion_dir = Path(profile_dir) / "input"
+        conversion_dir.mkdir()
+        conversion_path = conversion_dir / xlsx_path.name
+        write_pdf_conversion_workbook(xlsx_path, conversion_path)
         result = subprocess.run(
             [
                 executables[0],
@@ -3652,7 +3717,7 @@ def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
                 "pdf:calc_pdf_Export",
                 "--outdir",
                 str(pdf_path.parent),
-                str(xlsx_path),
+                str(conversion_path),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

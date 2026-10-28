@@ -1485,6 +1485,113 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertIn("pdf_mode=workbook", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
             self.assertIn("pdf_status=excel_exported", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
 
+    def test_pdf_conversion_resolves_drawing_theme_fonts_without_changing_master(self):
+        drawing = (
+            f'<xdr:wsDr xmlns:xdr="{NS_DRAWING[1:-1]}" xmlns:a="{NS_A[1:-1]}">'
+            '<a:r><a:rPr sz="900" b="1"><a:latin typeface="+mn-lt"/></a:rPr>'
+            '<a:t>Example company</a:t></a:r>'
+            '<a:r><a:rPr sz="1100"><a:latin typeface="+mj-lt"/></a:rPr>'
+            '<a:t>Example heading</a:t></a:r>'
+            '<a:r><a:rPr><a:latin typeface="Explicit Sans"/></a:rPr>'
+            '<a:t>Explicit font</a:t></a:r></xdr:wsDr>'
+        ).encode()
+        theme = (
+            f'<a:theme xmlns:a="{NS_A[1:-1]}"><a:themeElements><a:fontScheme name="Example">'
+            '<a:majorFont><a:latin typeface="Example Heading"/></a:majorFont>'
+            '<a:minorFont><a:latin typeface="Example Body"/></a:minorFont>'
+            '</a:fontScheme></a:themeElements></a:theme>'
+        ).encode()
+        relationships = (
+            f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}">'
+            f'<Relationship Id="rTheme" Type="{NS_REL[1:-1]}/theme" Target="theme/custom.xml"/>'
+            '</Relationships>'
+        ).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            master = root / "quotation.xlsx"
+            destination = root / "export.pdf"
+            with zipfile.ZipFile(master, "w") as archive:
+                archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+                archive.writestr("xl/theme/custom.xml", theme)
+                archive.writestr("xl/drawings/drawing1.xml", drawing)
+                archive.writestr("xl/worksheets/sheet1.xml", b"<sheet/>")
+            before = master.read_bytes()
+            conversion_inputs = []
+
+            def convert(argv, **kwargs):
+                conversion_input = Path(argv[-1])
+                conversion_inputs.append(conversion_input)
+                self.assertNotEqual(conversion_input, master)
+                with zipfile.ZipFile(conversion_input) as archive:
+                    converted_drawing = ET.fromstring(archive.read("xl/drawings/drawing1.xml"))
+                    self.assertEqual(
+                        [node.attrib["typeface"] for node in converted_drawing.iter(f"{NS_A}latin")],
+                        ["Example Body", "Example Heading", "Explicit Sans"],
+                    )
+                    self.assertEqual(next(converted_drawing.iter(f"{NS_A}rPr")).attrib, {"sz": "900", "b": "1"})
+                    self.assertEqual(archive.read("xl/worksheets/sheet1.xml"), b"<sheet/>")
+                    self.assertEqual(archive.read("xl/theme/custom.xml"), theme)
+                (Path(argv[argv.index("--outdir") + 1]) / "quotation.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            with mock.patch.object(quote, "libreoffice_candidates", return_value=["soffice"]), mock.patch.object(
+                quote.subprocess, "run", side_effect=convert,
+            ):
+                self.assertEqual(quote.libreoffice_pdf_export(master, destination), "libreoffice_exported")
+            self.assertEqual(master.read_bytes(), before)
+            self.assertTrue(destination.read_bytes().startswith(b"%PDF-"))
+            self.assertEqual(len(conversion_inputs), 1)
+            self.assertFalse(conversion_inputs[0].exists())
+
+    def test_pdf_conversion_copy_keeps_explicit_fonts_without_a_theme(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.xlsx"
+            converted = Path(tmp) / "conversion.xlsx"
+            parts = {
+                "xl/drawings/drawing1.xml": (
+                    f'<a:rPr xmlns:a="{NS_A[1:-1]}" sz="900">'
+                    '<a:latin typeface="Explicit Sans"/></a:rPr>'
+                ).encode(),
+                "xl/worksheets/sheet1.xml": b"<sheet/>",
+            }
+            with zipfile.ZipFile(source, "w") as archive:
+                for name, content in parts.items():
+                    archive.writestr(name, content)
+            quote.write_pdf_conversion_workbook(source, converted)
+            with zipfile.ZipFile(converted) as archive:
+                self.assertEqual({name: archive.read(name) for name in archive.namelist()}, parts)
+
+    def test_pdf_conversion_refuses_unresolved_or_ambiguous_theme_fonts(self):
+        relationship = (
+            f'<Relationship Id="rTheme" Type="{NS_REL[1:-1]}/theme" '
+            'Target="theme/custom.xml" {mode}/>'
+        )
+        drawing = (
+            f'<a:rPr xmlns:a="{NS_A[1:-1]}"><a:latin typeface="+mn-lt"/></a:rPr>'
+        ).encode()
+        for label, relationships, theme in (
+            ("external", relationship.format(mode='TargetMode="External"'), b"<theme/>"),
+            ("duplicate", relationship.format(mode="") * 2, b"<theme/>"),
+            ("missing_font", relationship.format(mode=""), b"<theme/>"),
+            ("missing_part", relationship.format(mode=""), None),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / "source.xlsx"
+                converted = Path(tmp) / "conversion.xlsx"
+                with zipfile.ZipFile(source, "w") as archive:
+                    archive.writestr("xl/drawings/drawing1.xml", drawing)
+                    archive.writestr(
+                        "xl/_rels/workbook.xml.rels",
+                        f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}">{relationships}</Relationships>',
+                    )
+                    if theme is not None:
+                        archive.writestr("xl/theme/custom.xml", theme)
+                before = source.read_bytes()
+                with self.assertRaises(ValueError):
+                    quote.write_pdf_conversion_workbook(source, converted)
+                self.assertEqual(source.read_bytes(), before)
+                self.assertFalse(converted.exists())
+
     def test_real_libreoffice_pdf_render_preserves_template_fidelity(self):
         running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
         executables = quote.libreoffice_candidates()
@@ -1660,6 +1767,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                             "ink_bbox": dark_mask.getbbox(),
                             "logo_bbox": synthetic_logo_bbox(image),
                             "header_bbox": pdf_text_bbox(textpage, "Rendered Fidelity Co") if "Rendered Fidelity Co" in text else None,
+                            "header_fonts": pdf_phrase_font_names(textpage, "Rendered Fidelity Co") if "Rendered Fidelity Co" in text else [],
                             "quantity_bbox": pdf_text_bbox(textpage, "Quantity") if "Quantity" in text else None,
                             "quantity_weights": pdf_phrase_font_weights(textpage, "Quantity") if "Quantity" in text else [],
                         })
@@ -1688,6 +1796,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 self.assertIn(expected, first_page["text"])
             self.assertIsNotNone(first_page["logo_bbox"])
             self.assertIsNotNone(first_page["header_bbox"])
+            self.assertTrue(first_page["header_fonts"])
+            self.assertTrue(all(
+                name.split("+")[-1] in {"Calibri", "Calibri-Bold", "Carlito", "Carlito-Regular", "Carlito-Bold"}
+                for name in first_page["header_fonts"]
+            ), first_page["header_fonts"])
             self.assertIsNotNone(first_page["quantity_bbox"])
 
             logo_bbox = first_page["logo_bbox"]
@@ -5123,6 +5236,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual([row for row, _ in rows], list(range(rows[0][0], rows[0][0] + 3)))
 
     def test_real_libreoffice_original_106_character_footer_reflow_proof(self):
+        if not quote.libreoffice_candidates():
+            message = "LibreOffice is unavailable locally; hosted CI must run this rendered regression."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
         import pypdfium2 as pdfium
         brief, lines, _, _ = optional_text_capacity_case("standard_notes", 1)
         original = "BOLDITALICUNDERLINE" + "x" * 87
