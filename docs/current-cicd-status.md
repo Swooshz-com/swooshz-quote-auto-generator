@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-09-30
+Last updated: 2026-10-28
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -78,6 +78,12 @@ Source of truth: `.github/workflows/ci.yml`
 - `Validate app`: runs after retrospective fixture integrity/result and security gates pass.
 
 ## Validate App Checks
+
+- Pins `Validate app` to `ubuntu-24.04`, supported by the locked Playwright
+  1.60.0 browser dependencies. The moving `ubuntu-latest` runner selected
+  unsupported Ubuntu 26.04 and failed before application checks. Other jobs,
+  checks, triggers, permissions and dependencies remain unchanged. Review the
+  pin when the locked browser tooling supports a newer runner.
 
 - Installs Python 3.12.13 (the exact patch shared with the retrospective job) and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
