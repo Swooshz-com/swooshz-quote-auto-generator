@@ -46,8 +46,10 @@ npm run playwright:smoke
   default catalogue; safe listing peers remain available, unrelated errors stay
   visible and valid Windows directory aliases retain their public spelling.
   Canonical string-prefix admission must include the directory separator, retain
-  Unicode path spelling and keep the resolved-path checks. Cover sibling names
-  sharing a prefix, nested Unicode catalogue filenames and resolution failures.
+  Unicode path spelling and keep the resolved-path checks. Exact-parent and nested
+  paths must pass the same unconditional prefix admission. Cover both directory
+  and asset siblings sharing a prefix before Path resolution, nested Unicode
+  catalogue filenames and resolution failures.
 - Diagnostic JSON privacy: Run `tests.test_codeql_diagnostic_privacy` with mocked
   providers and configuration. Live-smoke results expose fixed outcome metadata
   while keeping model and provider exception text internal. Readiness output may

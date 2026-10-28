@@ -14,6 +14,36 @@ webapp = support.webapp
 
 
 class CodeqlBoundaryTest(unittest.TestCase):
+    def test_pack_containment_preserves_exact_parent_and_nested_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'synthetic-root'
+            for directory in (root, root / 'synthetic-pack'):
+                (directory / 'assets').mkdir(parents=True, exist_ok=True)
+                for filename in ('.', 'assets/catalogue.json'):
+                    with self.subTest(nested_directory=directory != root, filename=filename):
+                        actual = webapp.PricingReferencePack._contained_path(root, directory, filename)
+                        self.assertEqual(actual, (directory / filename).resolve())
+
+    def test_pack_containment_rejects_directory_and_asset_prefix_siblings_before_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'synthetic-root'
+            sibling = Path(tmp) / 'synthetic-root-extra'
+            root.mkdir()
+            sibling.mkdir()
+            original_resolve = Path.resolve
+            resolved_root = root.resolve()
+            for directory, filename in ((sibling, 'catalogue.json'), (root, '../synthetic-root-extra/catalogue.json')):
+                with self.subTest(directory_sibling=directory == sibling):
+                    resolved = []
+                    def observed_resolve(path, *args, **kwargs):
+                        resolved.append(path)
+                        return original_resolve(path, *args, **kwargs)
+                    with mock.patch.object(Path, 'resolve', observed_resolve):
+                        with self.assertRaises(webapp.PricingReferencePathError):
+                            webapp.PricingReferencePack._contained_path(root, directory, filename)
+                    self.assertTrue(all(original_resolve(path).is_relative_to(resolved_root) for path in resolved),
+                                    'Prefix sibling reached Path resolution before rejection')
+
     def test_pack_normalisation_preserves_unicode_and_rejects_prefix_siblings(self):
         for source in ('local', 'bundled'):
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
