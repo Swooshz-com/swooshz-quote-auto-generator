@@ -4759,6 +4759,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                     optional_style = cell_style(sheet, ref) in {
                         cell_style(sheet, find_cell_ref(sheet, "Commercial Terms")),
                         cell_style(sheet, find_cell_ref(sheet, "50% deposit")),
+                        cell_style(sheet, find_cell_ref(sheet, "Accepted by customer")),
+                        cell_style(sheet, find_cell_ref(sheet, "Authorised signer")),
                     }
                     self.assertEqual(run_font_name, font_name(font) if optional_style else "", expected_text)
                     self.assertEqual(run_font_size, font_size(font) if optional_style else "", expected_text)
@@ -5450,6 +5452,128 @@ class AcceptanceSignatureLayoutTest(unittest.TestCase):
                 for c in sorted(cells, key=lambda c: quote.parse_cell_ref(c.attrib["r"])[0])
                 if cell_value(sheet, c.attrib["r"])]
 
+    def test_actual_web_mapper_preserves_acceptance_and_signature_paragraphs(self):
+        from tests import test_webapp as web_tests
+        fields = {
+            "acceptance": ("company_name", "text", "person_label", "stamp_label", "date_label"),
+            "signature": ("company_signatory", "company_title", "company_date_label"),
+        }
+        with mock.patch.dict(os.environ, {"APP_MODE": "local", "SQAG_STORAGE_MODE": "local"}, clear=True), \
+             mock.patch.object(web_tests.webapp, "read_dotenv_value", return_value=""):
+            fixture = web_tests.WebappServerTest("test_payload_to_brief_maps_confirmed_form_fields")
+            fixture.setUp()
+            try:
+                for nested in (False, True):
+                    with self.subTest(nested=nested):
+                        payload = web_tests.valid_payload()
+                        payload["rich_text"] = {}
+                        expected = {}
+                        for group, keys in fields.items():
+                            expected[group] = {}
+                            for index, key in enumerate(keys):
+                                prefix = ("A" if group == "acceptance" else "S") + str(index)
+                                value = prefix + " first\r\n\r\n" + prefix + " second"
+                                expected[group][key] = value.replace("\r\n", "\n")
+                                if group == "signature":
+                                    payload[group][key] = value
+                                elif nested or key == "company_name":
+                                    payload["quote_text"].setdefault("acceptance", {})[key] = value
+                                else:
+                                    payload["quote_text"]["acceptance_text" if key == "text" else key] = value
+                        mapped = web_tests.webapp.payload_to_brief(payload)
+                        for group in fields:
+                            self.assertEqual(mapped[group], expected[group])
+                        tmp, path = generate_layout_workbook(mapped)
+                        self.addCleanup(tmp.cleanup)
+                        with zipfile.ZipFile(path) as archive:
+                            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                        for group in fields:
+                            for value in expected[group].values():
+                                first, _, second = value.split("\n")
+                                first_ref, second_ref = find_cell_ref(sheet, first), find_cell_ref(sheet, second)
+                                self.assertTrue(first_ref, first)
+                                self.assertTrue(second_ref, second)
+                                self.assertEqual(quote.parse_cell_ref(second_ref)[0] -
+                                                 quote.parse_cell_ref(first_ref)[0], 2)
+                payload = web_tests.valid_payload()
+                payload["rich_text"] = {}
+                literal = "=SUM(1,2)\n+literal\n-literal\n@literal\nA<br>B"
+                payload["quote_text"]["acceptance_text"] = literal
+                mapped = web_tests.webapp.payload_to_brief(payload)
+                self.assertEqual(mapped["acceptance"]["text"], literal)
+                tmp, path = generate_layout_workbook(mapped)
+                self.addCleanup(tmp.cleanup)
+                with zipfile.ZipFile(path) as archive:
+                    sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                for text in literal.split("\n"):
+                    ref = find_cell_ref(sheet, text)
+                    self.assertTrue(ref, text)
+                    cell = next(c for c in sheet.iter(f"{NS_MAIN}c") if c.get("r") == ref)
+                    self.assertEqual(cell.get("t"), "inlineStr")
+                    self.assertIsNone(cell.find(f"{NS_MAIN}f"))
+            finally:
+                fixture.doCleanups()
+
+    def test_acceptance_selected_font_survives_pdf_conversion_without_master_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "layout.xlsx"
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                parts = {name: source.read(name) for name in source.namelist()}
+            styles = ET.fromstring(parts["xl/styles.xml"])
+            for style in (2, 33):
+                font = font_for_style(styles, style)
+                font.find(f"{NS_MAIN}name").set("val", "Times New Roman")
+                font.find(f"{NS_MAIN}sz").set("val", "28")
+            parts["xl/styles.xml"] = ET.tostring(styles)
+            with zipfile.ZipFile(template, "w") as target:
+                for name, data in parts.items():
+                    target.writestr(name, data)
+            path, _, _ = self.workbook("Font test", "<strong>Font</strong> <em>test</em>", template=template)
+            before = path.read_bytes()
+            converted = path.with_name("conversion.xlsx")
+            quote.write_pdf_conversion_workbook(path, converted)
+            self.assertEqual(path.read_bytes(), before)
+            for workbook in (path, converted):
+                with self.subTest(workbook=workbook.name), zipfile.ZipFile(workbook) as archive:
+                    root = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                    style_parts = {"xl/styles.xml": archive.read("xl/styles.xml")}
+                    ref = find_cell_ref(root, "Font test")
+                    self.assertTrue(ref)
+                    first_row = quote.parse_cell_ref(ref)[0]
+                    checked = 0
+                    for cell in root.iter(f"{NS_MAIN}c"):
+                        row, column = quote.parse_cell_ref(cell.get("r"))
+                        if row < first_row or column not in (2, 5) or not cell_value(root, cell.get("r")):
+                            continue
+                        selected = quote.ooxml_style_text_font(style_parts, cell.get("s"))
+                        self.assertEqual(selected, {"font_name": "Times New Roman", "font_size": "28"})
+                        for fragment, name, size in cell_inline_run_fonts(root, cell.get("r")):
+                            if fragment:
+                                checked += 1
+                                self.assertEqual((name, size), ("Times New Roman", "28"))
+                    self.assertGreater(checked, 8)
+                    runs = cell_inline_runs(root, ref)
+                    self.assertTrue(any(run[1] for run in runs))
+                    self.assertTrue(any(run[2] for run in runs))
+
+    def test_acceptance_unicode_marks_stay_with_base_across_run_boundaries(self):
+        for mark in ("\u0301", "\u20dd", "\ufe0f", "\u0903"):
+            with self.subTest(mark=repr(mark)):
+                runs = [quote.RichTextRun("W" * 25), quote.RichTextRun(mark, bold=True),
+                        quote.RichTextRun("W" * 3)]
+                wrapped = quote.wrap_rich_text_runs(runs, max_width=255.75, font_size=10)
+                text_lines = ["".join(r.text for r in line) for line in wrapped]
+                self.assertEqual("".join(text_lines), "W" * 25 + mark + "W" * 3)
+                self.assertFalse(any(unicodedata.category(line[0]).startswith("M") for line in text_lines))
+                self.assertTrue(any(r.text == mark and r.bold for line in wrapped for r in line))
+                if unicodedata.category(mark) in {"Mn", "Me"}:
+                    self.assertEqual(quote.optional_text_character_width(mark), 0)
+                _, sheet, _ = self.workbook("W" * 25 + mark + "W" * 3)
+                fragments = [value for _, value in self.column_values(sheet, "E")
+                             if value and set(value).issubset({"W", mark})]
+                self.assertEqual("".join(fragments), "W" * 25 + mark + "W" * 3)
+                self.assertFalse(any(unicodedata.category(value[0]).startswith("M") for value in fragments))
+
     def test_acceptance_plain_and_rich_keep_every_paragraph_and_emphasis(self):
         expected = ["First acceptance", "Second acceptance", "Third acceptance"]
         _, plain, _ = self.workbook("\n".join(expected))
@@ -5654,9 +5778,27 @@ class AcceptanceSignatureLayoutTest(unittest.TestCase):
              "<div><em>Third acceptance</em></div>",
              ["First acceptance", "Second acceptance", "Third acceptance"]),
         ]
+        cases.append(("selected-font-28", "Large font", "<strong>Large</strong> <em>font</em>", ["Large font"]))
         for case, plain, rich, expected in cases:
             with self.subTest(case=case):
-                path, sheet, _ = self.workbook(plain, rich)
+                template = KONCEPT_LAYOUT
+                selected_size = 28 if case == "selected-font-28" else None
+                if selected_size is not None:
+                    temporary = tempfile.TemporaryDirectory()
+                    self.addCleanup(temporary.cleanup)
+                    template = Path(temporary.name) / "layout.xlsx"
+                    with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                        parts = {name: source.read(name) for name in source.namelist()}
+                    styles = ET.fromstring(parts["xl/styles.xml"])
+                    for style in (2, 33):
+                        font = font_for_style(styles, style)
+                        font.find(f"{NS_MAIN}name").set("val", "Arial")
+                        font.find(f"{NS_MAIN}sz").set("val", str(selected_size))
+                    parts["xl/styles.xml"] = ET.tostring(styles)
+                    with zipfile.ZipFile(template, "w") as target:
+                        for name, data in parts.items():
+                            target.writestr(name, data)
+                path, sheet, _ = self.workbook(plain, rich, template=template)
                 width = quote.visible_column_width_points(sheet, 5, 9)
                 scale = float(sheet.find(f"{NS_MAIN}pageSetup").get("scale", "100")) / 100
                 pdf_path = path.with_suffix(".pdf")
@@ -5684,6 +5826,10 @@ class AcceptanceSignatureLayoutTest(unittest.TestCase):
                             for i, character in enumerate(phrase):
                                 if character.isspace():
                                     continue
+                                if selected_size is not None:
+                                    actual_size = pdfium.raw.FPDFText_GetFontSize(text.raw, indices[offset + i])
+                                    self.assertAlmostEqual(actual_size, selected_size * scale, delta=0.2,
+                                                           msg="PDF changed the selected acceptance/signature font size.")
                                 bounds = text.get_charbox(indices[offset + i])
                                 left, bottom, right, top = bounds
                                 crop = image.crop((math.floor(left * 4),

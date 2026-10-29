@@ -21291,6 +21291,10 @@ def payload_to_brief(
     )
     canonical_basis_sections = canonical_quote_basis_sections(payload)
 
+    def paragraph_text(value: Any) -> str:
+        # Plain display text retains paragraph boundaries; rich HTML has its own mapper.
+        return "\n".join(multiline_list(str(value or ""), preserve_blank=True)).strip("\n")
+
     return {
         "_pricing_authority_enforced": True,
         "_pricing_reference_authority": trusted_pricing_reference,
@@ -21325,16 +21329,16 @@ def payload_to_brief(
         "notes_heading": clean_text(quote_text.get("notes_heading")),
         "standard_notes": multiline_list(quote_text.get("standard_notes")),
         "acceptance": {
-            "company_name": clean_text(acceptance.get("company_name")) or quote_company_name,
-            "text": clean_text(acceptance.get("text") or quote_text.get("acceptance_text")),
-            "person_label": clean_text(acceptance.get("person_label") or quote_text.get("person_label")),
-            "stamp_label": clean_text(acceptance.get("stamp_label") or quote_text.get("stamp_label")),
-            "date_label": clean_text(acceptance.get("date_label") or quote_text.get("date_label")),
+            "company_name": paragraph_text(acceptance.get("company_name")) or quote_company_name,
+            "text": paragraph_text(acceptance.get("text") or quote_text.get("acceptance_text")),
+            "person_label": paragraph_text(acceptance.get("person_label") or quote_text.get("person_label")),
+            "stamp_label": paragraph_text(acceptance.get("stamp_label") or quote_text.get("stamp_label")),
+            "date_label": paragraph_text(acceptance.get("date_label") or quote_text.get("date_label")),
         },
         "signature": {
-            "company_signatory": clean_text(signature.get("company_signatory")),
-            "company_title": clean_text(signature.get("company_title")),
-            "company_date_label": clean_text(signature.get("company_date_label")),
+            "company_signatory": paragraph_text(signature.get("company_signatory")),
+            "company_title": paragraph_text(signature.get("company_title")),
+            "company_date_label": paragraph_text(signature.get("company_date_label")),
         },
         "rich_text": quote_detail_rich_text(payload),
         "quote_basis_sections": canonical_basis_sections,

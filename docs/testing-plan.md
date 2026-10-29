@@ -72,6 +72,13 @@ npm run playwright:smoke
   LibreOffice test must run in CI and checks actual glyph-box paint plus signature
   clearance. Text extraction alone cannot detect the retained clipping failure.
   Local renderer skips remain explicit gaps until native rendered proof exists.
+  Exercise the actual web payload mapper into the workbook, using nested and flat
+  plain acceptance/signature fields, CRLF/internal blank lines, literal HTML-like
+  text and formula prefixes. Selected acceptance/signature style fonts must remain
+  explicit in the master and conversion copy, with emphasis and master bytes intact.
+  Keep base/Unicode-mark sequences together across rich-run boundaries, including
+  nonspacing/enclosing marks with combining class zero and spacing marks. Native
+  rendering must also check a larger selected font's actual PDF size and paint.
   PDF conversion must preserve the XLSX master bytes. Resolve DrawingML Latin
   theme-font references from that workbook's internal theme in a temporary
   conversion copy; retain explicit fonts, run sizes/emphasis and every other

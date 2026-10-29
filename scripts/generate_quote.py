@@ -2916,7 +2916,7 @@ def optional_text_chunk_start_row(row_number: int, chunk: LayoutChunk) -> tuple[
 def optional_text_character_width(character: str) -> int:
     if character == "\t":
         return 4
-    if unicodedata.combining(character):
+    if unicodedata.combining(character) or unicodedata.category(character) in {"Mn", "Me"}:
         return 0
     if unicodedata.east_asian_width(character) in {"F", "W"}:
         return 2
@@ -2955,6 +2955,19 @@ def rich_text_line_runs(characters: list[tuple[str, tuple[bool, bool, bool]]]) -
     return runs
 
 
+def combining_text_clusters(
+    characters: list[tuple[str, tuple[bool, bool, bool]]],
+) -> list[list[tuple[str, tuple[bool, bool, bool]]]]:
+    """Keep a base and its following Unicode marks together, including split rich runs."""
+    clusters: list[list[tuple[str, tuple[bool, bool, bool]]]] = []
+    for item in characters:
+        if clusters and unicodedata.category(item[0]).startswith("M"):
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+    return clusters
+
+
 def wrap_optional_text_segment(
     characters: list[tuple[str, tuple[bool, bool, bool]]],
     *,
@@ -2969,26 +2982,28 @@ def wrap_optional_text_segment(
     def refresh_line_metrics() -> tuple[float, int | None]:
         width = 0
         break_after = None
-        for index, (character, formatting) in enumerate(current, start=1):
-            width += rich_text_character_width(character, formatting, font_size)
-            if character.isspace():
-                break_after = index
+        length = 0
+        for cluster in combining_text_clusters(current):
+            width += sum(rich_text_character_width(c, f, font_size) for c, f in cluster)
+            length += len(cluster)
+            if cluster[0][0].isspace():
+                break_after = length
         return width, break_after
 
-    for item in characters:
-        character_width = rich_text_character_width(item[0], item[1], font_size)
-        if character_width > max_width:
+    for cluster in combining_text_clusters(characters):
+        cluster_width = sum(rich_text_character_width(c, f, font_size) for c, f in cluster)
+        if cluster_width > max_width:
             raise ValueError("A quotation text glyph exceeds the available column width.")
-        while current and current_width + character_width > max_width:
+        while current and current_width + cluster_width > max_width:
             cut = last_break_after if last_break_after is not None else len(current)
             if cut <= 0:
                 cut = len(current)
             lines.append(rich_text_line_runs(current[:cut]))
             current = current[cut:]
             current_width, last_break_after = refresh_line_metrics()
-        current.append(item)
-        current_width += character_width
-        if item[0].isspace():
+        current.extend(cluster)
+        current_width += cluster_width
+        if cluster[0][0].isspace():
             last_break_after = len(current)
 
     if current or not lines:
@@ -3132,7 +3147,7 @@ def write_acceptance_signature(
                         merges.remove(merge)
                 merges.set("count", str(len(merges)))
             for column, runs, columns in ((2, left, "B:D"), (5, right, "E:I")):
-                set_ooxml_rich_text_cell(root, row_number, column, runs, styles[style])
+                set_ooxml_rich_text_cell(root, row_number, column, runs, styles[style], **font)
                 first, last = columns.split(":")
                 ensure_merge_ref(root, f"{first}{row_number}:{last}{row_number + span - 1}")
             # Count larger fonts as physical row slots, rather than growing an
