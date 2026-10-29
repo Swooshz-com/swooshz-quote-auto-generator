@@ -2923,6 +2923,28 @@ def optional_text_character_width(character: str) -> int:
     return 1
 
 
+def rich_text_character_width(
+    character: str, formatting: tuple[bool, bool, bool], font_size: float | None,
+) -> float:
+    """Keep the existing body budget; use conservative point advances for narrow blocks."""
+    width = optional_text_character_width(character)
+    if font_size is None or width == 0:
+        return width
+    if width == 2 or ord(character) > 127:
+        advance = 1.2
+    elif character in "MWmw@%&":
+        advance = 1.0
+    elif character.isspace():
+        advance = 0.4 * width
+    elif character in "ilI.,:;'!|":
+        advance = 0.45
+    elif character.isupper():
+        advance = 0.9
+    else:
+        advance = 0.8
+    return advance * font_size * (1.12 if formatting[0] else 1.0) * (1.05 if formatting[1] else 1.0)
+
+
 def rich_text_line_runs(characters: list[tuple[str, tuple[bool, bool, bool]]]) -> list[RichTextRun]:
     runs: list[RichTextRun] = []
     for character, formatting in characters:
@@ -2935,24 +2957,29 @@ def rich_text_line_runs(characters: list[tuple[str, tuple[bool, bool, bool]]]) -
 
 def wrap_optional_text_segment(
     characters: list[tuple[str, tuple[bool, bool, bool]]],
+    *,
+    max_width: float = OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
+    font_size: float | None = None,
 ) -> list[list[RichTextRun]]:
     lines: list[list[RichTextRun]] = []
     current: list[tuple[str, tuple[bool, bool, bool]]] = []
     current_width = 0
     last_break_after: int | None = None
 
-    def refresh_line_metrics() -> tuple[int, int | None]:
+    def refresh_line_metrics() -> tuple[float, int | None]:
         width = 0
         break_after = None
-        for index, (character, _) in enumerate(current, start=1):
-            width += optional_text_character_width(character)
+        for index, (character, formatting) in enumerate(current, start=1):
+            width += rich_text_character_width(character, formatting, font_size)
             if character.isspace():
                 break_after = index
         return width, break_after
 
     for item in characters:
-        character_width = optional_text_character_width(item[0])
-        while current and current_width + character_width > OPTIONAL_TEXT_LINE_MAX_WIDTH_EM:
+        character_width = rich_text_character_width(item[0], item[1], font_size)
+        if character_width > max_width:
+            raise ValueError("A quotation text glyph exceeds the available column width.")
+        while current and current_width + character_width > max_width:
             cut = last_break_after if last_break_after is not None else len(current)
             if cut <= 0:
                 cut = len(current)
@@ -2969,8 +2996,15 @@ def wrap_optional_text_segment(
     return lines
 
 
-def wrap_rich_text_runs(runs: list[Any]) -> list[list[RichTextRun]]:
+def wrap_rich_text_runs(
+    runs: list[Any], *, max_width: float = OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
+    font_size: float | None = None,
+) -> list[list[RichTextRun]]:
     """Reflow rich text into printable-width rows without losing run emphasis."""
+    if not math.isfinite(max_width) or max_width <= 0:
+        raise ValueError("Invalid rich-text width.")
+    if font_size is not None and (not math.isfinite(font_size) or font_size <= 0):
+        raise ValueError("Invalid rich-text font size.")
     segments: list[list[tuple[str, tuple[bool, bool, bool]]]] = [[]]
     for value in runs:
         run = normalize_ooxml_text_run(value)
@@ -2980,7 +3014,138 @@ def wrap_rich_text_runs(runs: list[Any]) -> list[list[RichTextRun]]:
                 segments.append([])
             else:
                 segments[-1].append((character, formatting))
-    return [line for segment in segments for line in wrap_optional_text_segment(segment)]
+    return [line for segment in segments for line in wrap_optional_text_segment(
+        segment, max_width=max_width, font_size=font_size,
+    )]
+
+
+def visible_column_width_points(root: ET.Element, first: int, last: int) -> float:
+    """Measure the visible worksheet columns, excluding hidden columns and cell padding."""
+    sheet_format = root.find(f"{NS_MAIN}sheetFormatPr")
+    default_width = float(sheet_format.get("defaultColWidth", "8.43")) if sheet_format is not None else 8.43
+    cols = root.find(f"{NS_MAIN}cols")
+    width = 0.0
+    for number in range(first, last + 1):
+        attributes = {"width": str(default_width)}
+        if cols is not None:
+            for col in cols:
+                if int(col.get("min", "0")) <= number <= int(col.get("max", "0")):
+                    attributes.update(col.attrib)
+        if attributes.get("hidden", "").lower() in {"1", "true"}:
+            continue
+        column_width = float(attributes["width"])
+        if not math.isfinite(column_width) or column_width < 0:
+            raise ValueError("Invalid quotation layout column width.")
+        # Excel width units use the default digit advance. Dropping padding is conservative.
+        width += math.floor(column_width * 7) * 72 / 96
+    if width <= 6:
+        raise ValueError("Quotation acceptance block has no usable visible width.")
+    return width - 6
+
+
+def acceptance_text_lines(
+    brief: dict[str, Any], key: str, fallback: Any, width: float, font_size: float,
+) -> list[list[RichTextRun]]:
+    lines = brief_rich_text_lines(brief, key, [str(fallback or "")])
+    return [
+        wrapped
+        for runs in lines
+        for wrapped in wrap_rich_text_runs(runs, max_width=width, font_size=font_size)
+    ] or [[]]
+
+
+def write_acceptance_signature(
+    root: ET.Element, row_number: int, brief: dict[str, Any],
+    acceptance: dict[str, Any], signature: dict[str, Any], company_name: str,
+    styles: dict[str, str], parts: dict[str, bytes],
+) -> tuple[int, bool]:
+    """Own both acceptance columns, their signature offsets and continuation admission."""
+    text_font = ooxml_style_text_font(parts, styles["signature_text"])
+    label_font = ooxml_style_text_font(parts, styles["signature_line"])
+    text_size = float(text_font["font_size"] or 11)
+    label_size = float(label_font["font_size"] or 11)
+    if not all(math.isfinite(size) and size > 0 for size in (text_size, label_size)):
+        raise ValueError("Invalid quotation acceptance font size.")
+    widths = (visible_column_width_points(root, 2, 4), visible_column_width_points(root, 5, 9))
+
+    def pair(left_key: str, left: Any, right_key: str, right: Any, size: float):
+        left_lines = acceptance_text_lines(brief, left_key, left, widths[0], size)
+        right_lines = acceptance_text_lines(brief, right_key, right, widths[1], size)
+        return [
+            (left_lines[i] if i < len(left_lines) else [],
+             right_lines[i] if i < len(right_lines) else [])
+            for i in range(max(len(left_lines), len(right_lines)))
+        ]
+
+    text_rows = pair("quoteCompanyName", acceptance.get("company_name") or company_name,
+                     "acceptanceText", acceptance.get("text"), text_size)
+    # The three blank rows preserve the existing short-text signature placement.
+    gap_rows = [([], []) for _ in range(3)]
+    line_rows = [(
+        [RichTextRun("_" * max(1, min(29, int(widths[0] / (label_size * 0.6)))))],
+        [RichTextRun("_" * max(1, min(37, int(widths[1] / (label_size * 0.6)))))],
+    )]
+    groups = [
+        (text_rows, "signature_text", text_font),
+        (gap_rows, "signature_text", text_font),
+        (line_rows, "signature_line", label_font),
+        (pair("companySignatory", signature.get("company_signatory"),
+              "personLabel", acceptance.get("person_label"), label_size), "signature_line", label_font),
+        (pair("companyTitle", signature.get("company_title"),
+              "stampLabel", acceptance.get("stamp_label"), label_size), "signature_line", label_font),
+        (pair("companyDateLabel", signature.get("company_date_label"),
+              "dateLabel", acceptance.get("date_label"), label_size), "signature_line", label_font),
+    ]
+    groups = [
+        (rows, style, font, 1 if index == 1 else max(
+            1, math.ceil(float(font["font_size"] or 11) * 1.4 / float(QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT)),
+        ))
+        for index, (rows, style, font) in enumerate(groups)
+    ]
+    total_height = max(SIGNATURE_BLOCK_HEIGHT, sum(len(rows) * span for rows, _, _, span in groups))
+    capacity = CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET - OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS
+    if any(span > capacity for _, _, _, span in groups):
+        raise ValueError("Quotation acceptance font is too large for a printable page.")
+    row_number, moved = optional_text_chunk_start_row(
+        row_number, LayoutChunk("acceptance_signature", total_height),
+    )
+    oversized = total_height > capacity
+    last_row = row_number - 1
+    for group_index, (rows, style, font, span) in enumerate(groups):
+        if oversized:
+            remaining = sum(len(group[0]) * group[3] for group in groups[group_index:])
+            keep = remaining if group_index > 0 and remaining <= capacity else len(rows) * span
+            row_number, group_moved = optional_text_chunk_start_row(row_number, LayoutChunk("acceptance_part", keep))
+            moved = moved or group_moved
+        for left, right in rows:
+            if oversized:
+                row_number, line_moved = optional_text_chunk_start_row(row_number, LayoutChunk("acceptance_line", span))
+                moved = moved or line_moved
+            # Replace stale template merges only in the newly owned acceptance row.
+            merges = root.find(f"{NS_MAIN}mergeCells")
+            if merges is not None:
+                for merge in list(merges):
+                    ends = merge.get("ref", "").split(":")
+                    start_row, start_col = parse_cell_ref(ends[0])
+                    end_row, end_col = parse_cell_ref(ends[-1])
+                    if start_row <= row_number + span - 1 and end_row >= row_number and start_col <= 9 and end_col >= 2:
+                        merges.remove(merge)
+                merges.set("count", str(len(merges)))
+            for column, runs, columns in ((2, left, "B:D"), (5, right, "E:I")):
+                set_ooxml_rich_text_cell(root, row_number, column, runs, styles[style])
+                first, last = columns.split(":")
+                ensure_merge_ref(root, f"{first}{row_number}:{last}{row_number + span - 1}")
+            # Count larger fonts as physical row slots, rather than growing an
+            # uncounted row beyond the manual page's capacity.
+            sheet_data = root.find(f"{NS_MAIN}sheetData")
+            for slot in range(row_number, row_number + span):
+                row = get_or_create_row(sheet_data, slot)
+                row.set("ht", QUOTE_LAYOUT_DEFAULT_ROW_HEIGHT)
+                row.set("customHeight", "1")
+                row.attrib.pop("hidden", None)
+            last_row = row_number + span - 1
+            row_number += span
+    return last_row + 1, moved
 
 
 def write_optional_text_block(
@@ -3521,28 +3686,17 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
 
     manual_pagination_enabled = manual_pagination_enabled or optional_text_moved
     acceptance_candidate_row = last_optional_row + 3 if last_optional_row else next_text_row
-    acceptance_row, acceptance_moved = layout_chunk_start_row(
-        acceptance_candidate_row,
-        LayoutChunk("acceptance_signature", SIGNATURE_BLOCK_HEIGHT),
+    last_content_row, acceptance_moved = write_acceptance_signature(
+        root, acceptance_candidate_row, brief, acceptance, signature, company_name,
+        layout_styles, parts,
     )
     manual_pagination_enabled = manual_pagination_enabled or acceptance_moved
-    set_ooxml_rich_text_cell(root, acceptance_row, 2, brief_rich_text_cell_runs(brief, "quoteCompanyName", clean_text(acceptance.get("company_name")) or company_name), layout_styles["signature_text"])
-    set_ooxml_rich_text_cell(root, acceptance_row, 5, brief_rich_text_cell_runs(brief, "acceptanceText", clean_text(acceptance.get("text"))), layout_styles["signature_text"])
-    set_ooxml_cell(root, acceptance_row + 4, 2, "_____________________________", layout_styles["signature_line"])
-    set_ooxml_cell(root, acceptance_row + 4, 5, "_____________________________________", layout_styles["signature_line"])
-    set_ooxml_rich_text_cell(root, acceptance_row + 5, 2, brief_rich_text_cell_runs(brief, "companySignatory", clean_text(signature.get("company_signatory"))), layout_styles["signature_line"])
-    set_ooxml_rich_text_cell(root, acceptance_row + 5, 5, brief_rich_text_cell_runs(brief, "personLabel", clean_text(acceptance.get("person_label"))), layout_styles["signature_line"])
-    set_ooxml_rich_text_cell(root, acceptance_row + 6, 2, brief_rich_text_cell_runs(brief, "companyTitle", clean_text(signature.get("company_title"))), layout_styles["signature_line"])
-    set_ooxml_rich_text_cell(root, acceptance_row + 6, 5, brief_rich_text_cell_runs(brief, "stampLabel", clean_text(acceptance.get("stamp_label"))), layout_styles["signature_line"])
-    set_ooxml_rich_text_cell(root, acceptance_row + 7, 2, brief_rich_text_cell_runs(brief, "companyDateLabel", clean_text(signature.get("company_date_label"))), layout_styles["signature_line"])
-    set_ooxml_rich_text_cell(root, acceptance_row + 7, 5, brief_rich_text_cell_runs(brief, "dateLabel", clean_text(acceptance.get("date_label"))), layout_styles["signature_line"])
 
-    last_content_row = acceptance_row + SIGNATURE_CONTENT_HEIGHT
     manual_pagination_enabled = manual_pagination_enabled or last_content_row > FIRST_PRINT_PAGE_END_ROW
     last_print_row = printable_last_row(root, last_content_row, manual_pagination_enabled)
     trim_layout_worksheet(root, last_print_row)
     complete_quote_layout_worksheet(root, last_print_row, existing_row_numbers)
-    if manual_pagination_enabled and last_optional_row:
+    if manual_pagination_enabled and (last_optional_row or acceptance_moved):
         hide_empty_continuation_guard_rows(root, last_print_row)
     set_manual_page_breaks(root, last_print_row, manual_pagination_enabled)
     parts["xl/worksheets/sheet1.xml"] = serialize_excel_worksheet(root)

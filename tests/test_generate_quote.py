@@ -12,6 +12,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+import unicodedata
 from unittest import mock
 import zipfile
 from pathlib import Path
@@ -69,6 +70,23 @@ def find_cell_ref(root, expected):
     for cell in root.iter(f"{NS_MAIN}c"):
         if cell_value(root, cell.attrib.get("r", "")) == expected:
             return cell.attrib.get("r", "")
+    return ""
+
+
+def find_acceptance_sequence_ref(root, expected):
+    """Find complete acceptance text across its explicitly reflowed right-column rows."""
+    cells = sorted(
+        [(quote.parse_cell_ref(c.attrib["r"])[0], c.attrib["r"])
+         for c in root.iter(f"{NS_MAIN}c") if re.fullmatch(r"E\d+", c.attrib.get("r", ""))],
+    )
+    for index, (_, ref) in enumerate(cells):
+        text = ""
+        for _, next_ref in cells[index:]:
+            text += cell_value(root, next_ref)
+            if text == expected:
+                return ref
+            if not expected.startswith(text):
+                break
     return ""
 
 
@@ -1311,7 +1329,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(cell_value(sheet, "D28"), "GST 9%")
         self.assertEqual(cell_value(sheet, "D29"), "Total including GST")
         self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
-        self.assertEqual(cell_value(sheet, "B38"), "Director")
+        self.assertEqual(cell_value(sheet, "B39"), "Director")
 
     def test_generated_workbook_preserves_template_style_fonts(self):
         tmp, path = generate_layout_workbook()
@@ -2929,16 +2947,16 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         row_breaks = sheet.find(f"{NS_MAIN}rowBreaks")
         sheet_view = sheet.find(f"{NS_MAIN}sheetViews/{NS_MAIN}sheetView")
 
-        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), "Quotation!$A$1:$I$40")
-        self.assertEqual(dimension.attrib.get("ref"), "A1:I40")
+        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), "Quotation!$A$1:$I$41")
+        self.assertEqual(dimension.attrib.get("ref"), "A1:I41")
         self.assertIsNone(row_breaks)
         self.assertNotEqual(sheet_view.attrib.get("view"), "pageBreakPreview")
-        self.assertEqual(cell_value(sheet, "B38"), "Director")
-        self.assertEqual(cell_value(sheet, "B40"), "")
+        self.assertEqual(cell_value(sheet, "B39"), "Director")
+        self.assertEqual(cell_value(sheet, "B41"), "")
         self.assertFalse([
             item.attrib.get("r")
             for item in sheet.iter(f"{NS_MAIN}c")
-            if quote.parse_cell_ref(item.attrib.get("r", "A1"))[0] > 40 and quote.parse_cell_ref(item.attrib.get("r", "A1"))[1] <= 9
+            if quote.parse_cell_ref(item.attrib.get("r", "A1"))[0] > 41 and quote.parse_cell_ref(item.attrib.get("r", "A1"))[1] <= 9
         ])
 
     def test_layout_print_area_trims_trailing_blank_manual_page(self):
@@ -3033,9 +3051,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         brief, lines = continuation_acceptance_fidelity_case()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "quotation.xlsx"
-            with mock.patch.object(quote, "layout_chunk_start_row", wraps=quote.layout_chunk_start_row) as place_chunk:
-                quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
-            self.assertGreater(place_chunk.call_args.args[0], quote.FIRST_PRINT_PAGE_END_ROW)
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
             with zipfile.ZipFile(path) as zf:
                 self.assertIsNone(zf.testzip())
                 sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
@@ -3046,7 +3062,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT - 1,
         ])
         self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         page_start = quote.continuation_page_start_for_row(acceptance_row)
         self.assertEqual(page_start, quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT)
         self.assertGreaterEqual(acceptance_row, page_start + quote.CONTINUATION_BODY_OFFSET)
@@ -3127,7 +3143,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         )
 
         heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Notes"))[0]
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         self.assertEqual(heading_row, 122)
         numbered_rows = {}
         for row_number in range(heading_row + 1, acceptance_row):
@@ -3201,7 +3217,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         terms_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Payment Terms"))[0]
         notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Standard Notes"))[0]
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         terms_rows = [
             row_number
             for row_number in range(terms_heading_row + 1, notes_heading_row)
@@ -3281,7 +3297,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         )
         self.assertEqual(quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS, 3)
 
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         content_rows = [
             row_number
             for row_number in range(quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_BODY_OFFSET, acceptance_row)
@@ -3759,7 +3775,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual(breaks, [55, 116])
             self.assertEqual(planned_pages, 3)
             self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
-            acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+            acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
             entry_rows = [
                 row_number
                 for row_number in range(61, acceptance_row)
@@ -4136,7 +4152,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         acceptance_refs = [
             find_cell_ref(sheet, "Koncept Image Pte Ltd"),
-            find_cell_ref(sheet, "We accept the quotation amount and the terms"),
+            find_acceptance_sequence_ref(sheet, "We accept the quotation amount and the terms"),
             find_cell_ref(sheet, "Francies Cheng"),
             find_cell_ref(sheet, "Director"),
             find_cell_ref(sheet, "Person in charge"),
@@ -4284,14 +4300,14 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         acceptance_rows = [
             quote.parse_cell_ref(find_cell_ref(sheet, "Koncept Images Pte. Ltd."))[0],
-            quote.parse_cell_ref(find_cell_ref(sheet, "We accept the quotation amount and the terms"))[0],
+            quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, "We accept the quotation amount and the terms"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "_____________________________"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Francies Cheng"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Director"))[0],
         ]
 
         notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["notes_heading"]))[0]
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         rendered_note = " ".join(
             cell_value(sheet, f"B{row_number}")
             for row_number in range(notes_heading_row + 1, acceptance_row)
@@ -4374,7 +4390,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         acceptance_rows = [
             quote.parse_cell_ref(find_cell_ref(sheet, "Koncept Images Pte. Ltd."))[0],
-            quote.parse_cell_ref(find_cell_ref(sheet, "We accept the quotation amount and the terms"))[0],
+            quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, "We accept the quotation amount and the terms"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "_____________________________"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Francies Cheng"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Director"))[0],
@@ -4401,7 +4417,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             "",
         )
         self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
-        self.assertEqual(cell_value(sheet, "E32"), "We accept the quotation amount and the terms")
+        self.assertEqual(cell_value(sheet, "E32") + cell_value(sheet, "E33"), "We accept the quotation amount and the terms")
 
     def test_company_detail_drawing_preserves_template_geometry_and_top_alignment(self):
         tmp, path = generate_layout_workbook()
@@ -4631,7 +4647,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertIsNone(font_for_style(styles, cell_style(sheet, "A33")).find(f"{NS_MAIN}i"))
         self.assertIsNone(font_for_style(styles, cell_style(sheet, "A34")).find(f"{NS_MAIN}i"))
         self.assertEqual(cell_value(sheet, "E35"), "")
-        self.assertEqual(cell_value(sheet, "E37"), "We accept the quotation amount and the terms")
+        self.assertEqual(cell_value(sheet, "E37") + cell_value(sheet, "E38"), "We accept the quotation amount and the terms")
 
     def test_brief_can_override_terms_notes_and_company_text(self):
         tmp = tempfile.TemporaryDirectory()
@@ -5407,3 +5423,291 @@ class GeneratorDiagnosticIdentityTest(unittest.TestCase):
         self.assertEqual([row["source_basis_line_id"] for row in rows], [quote.spreadsheet_safe_text(value) for value in source_ids])
         self.assertEqual([row["status"] for row in rows], ["unmatched"] * len(source_ids))
         self.assertEqual(brief, before)
+
+
+class AcceptanceSignatureLayoutTest(unittest.TestCase):
+    def workbook(self, text, rich=None, *, template=KONCEPT_LAYOUT, extra_acceptance=None):
+        acceptance = {"company_name": "Synthetic left", "text": text,
+                      "person_label": "Synthetic person", "stamp_label": "Synthetic stamp",
+                      "date_label": "Synthetic date"}
+        acceptance.update(extra_acceptance or {})
+        updates = {"acceptance": acceptance, "signature": {
+            "company_signatory": "Synthetic signer", "company_title": "Synthetic title",
+            "company_date_label": "Synthetic date"}}
+        if rich is not None:
+            updates["rich_text"] = {"acceptanceText": rich}
+        tmp, path = generate_layout_workbook(updates, layout_template=template)
+        self.addCleanup(tmp.cleanup)
+        with zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        return path, sheet, workbook
+
+    def column_values(self, sheet, column):
+        cells = [c for c in sheet.iter(f"{NS_MAIN}c")
+                 if re.fullmatch(column + r"\d+", c.attrib.get("r", ""))]
+        return [(quote.parse_cell_ref(c.attrib["r"])[0], cell_value(sheet, c.attrib["r"]))
+                for c in sorted(cells, key=lambda c: quote.parse_cell_ref(c.attrib["r"])[0])
+                if cell_value(sheet, c.attrib["r"])]
+
+    def test_acceptance_plain_and_rich_keep_every_paragraph_and_emphasis(self):
+        expected = ["First acceptance", "Second acceptance", "Third acceptance"]
+        _, plain, _ = self.workbook("\n".join(expected))
+        _, rich, _ = self.workbook("\n".join(expected),
+            "<div>First acceptance</div><p><strong>Second acceptance</strong></p>"
+            "<div><em>Third acceptance</em></div>")
+        for sheet in (plain, rich):
+            values = [(row, value) for row, value in self.column_values(sheet, "E") if value in expected]
+            self.assertEqual([value for _, value in values], expected)
+            self.assertEqual([row for row, _ in values], [32, 33, 34])
+            self.assertEqual(find_cell_ref(sheet, "Synthetic signer"), "B39")
+            self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E39")
+        self.assertTrue(cell_inline_runs(rich, "E33")[0][1])
+        self.assertTrue(cell_inline_runs(rich, "E34")[0][2])
+
+    def test_acceptance_short_single_line_keeps_original_signature_offsets(self):
+        _, sheet, _ = self.workbook("Short acceptance")
+        self.assertEqual(find_cell_ref(sheet, "Short acceptance"), "E32")
+        self.assertEqual(find_cell_ref(sheet, "_____________________________________"), "E36")
+        self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E37")
+        self.assertEqual(find_cell_ref(sheet, "Synthetic stamp"), "E38")
+        self.assertEqual(find_cell_refs(sheet, "Synthetic date"), ["B39", "E39"])
+
+    def test_acceptance_wrap_boundaries_keep_combining_runs_and_literal_prefixes(self):
+        for count, expected_lines in ((1, 1), (2, 1), (3, 2)):
+            with self.subTest(count=count):
+                wrapped = quote.wrap_rich_text_runs(
+                    [quote.RichTextRun("W" * count)], max_width=20, font_size=10)
+                self.assertEqual(len(wrapped), expected_lines)
+                self.assertEqual("".join(r.text for line in wrapped for r in line), "W" * count)
+        with self.assertRaisesRegex(ValueError, "glyph exceeds"):
+            quote.wrap_rich_text_runs([quote.RichTextRun("W")], max_width=5, font_size=10)
+        combined = "W\u0301" * 3
+        wrapped = quote.wrap_rich_text_runs(
+            [quote.RichTextRun(combined, bold=True)], max_width=23, font_size=10)
+        self.assertEqual("".join(r.text for line in wrapped for r in line), combined)
+        self.assertTrue(all(r.bold for line in wrapped for r in line))
+        self.assertTrue(all(not unicodedata.combining(line[0].text[0]) for line in wrapped))
+        expected = ["=SUM(1,2)", "+literal", "-literal", "@literal"]
+        _, sheet, _ = self.workbook("\n".join(expected),
+            "".join("<div>" + html.escape(value) + "</div>" for value in expected))
+        self.assertEqual([value for _, value in self.column_values(sheet, "E") if value in expected], expected)
+        for value in expected:
+            cell = next(c for c in sheet.iter(f"{NS_MAIN}c") if c.attrib["r"] == find_cell_ref(sheet, value))
+            self.assertEqual(cell.get("t"), "inlineStr")
+            self.assertIsNone(cell.find(f"{NS_MAIN}f"))
+
+    def test_acceptance_width_uses_visible_template_columns_without_mutating_template(self):
+        original = KONCEPT_LAYOUT.read_bytes()
+        counts = []
+        for width in (3, 15.5, 40):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "layout.xlsx"
+                with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                    parts = {name: source.read(name) for name in source.namelist()}
+                sheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+                for col in sheet.findall(f"{NS_MAIN}cols/{NS_MAIN}col"):
+                    if int(col.get("min")) in (5, 6, 9):
+                        col.set("width", str(width))
+                parts["xl/worksheets/sheet1.xml"] = ET.tostring(sheet)
+                with zipfile.ZipFile(path, "w") as target:
+                    for name, data in parts.items():
+                        target.writestr(name, data)
+                _, output, _ = self.workbook("W" * 80, template=path)
+                fragments = [value for _, value in self.column_values(output, "E") if set(value) == {"W"}]
+                self.assertEqual("".join(fragments), "W" * 80)
+                counts.append(len(fragments))
+        self.assertGreater(counts[0], counts[1])
+        self.assertGreater(counts[1], counts[2])
+        self.assertEqual(KONCEPT_LAYOUT.read_bytes(), original)
+
+    def test_acceptance_oversized_block_uses_remaining_body_and_keeps_final_labels(self):
+        expected = [f"Acceptance line {i:03d}" for i in range(140)]
+        _, sheet, workbook = self.workbook("\n".join(expected))
+        found = [(row, value) for row, value in self.column_values(sheet, "E")
+                 if value.startswith("Acceptance line ")]
+        self.assertEqual([value for _, value in found], expected)
+        self.assertEqual(found[0][0], 32, "Oversized block must use available first-page body.")
+        self.assertIn(55, [row for row, _ in found])
+        for row, _ in found:
+            start = quote.continuation_page_start_for_row(row)
+            if start is not None:
+                self.assertGreaterEqual(row, start + quote.CONTINUATION_BODY_OFFSET)
+                self.assertLessEqual(row, quote.manual_page_end_for_row(row) -
+                                     quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS)
+        last_text = found[-1][0]
+        self.assertGreater(quote.parse_cell_ref(find_cell_ref(sheet, "Synthetic person"))[0], last_text)
+        date_rows = [quote.parse_cell_ref(ref)[0] for ref in find_cell_refs(sheet, "Synthetic date")]
+        self.assertEqual(len(date_rows), 2)
+        print_last = int(defined_name_text(workbook, "_xlnm.Print_Area").rsplit("$", 1)[1])
+        self.assertGreaterEqual(print_last, max(date_rows))
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+
+    def test_acceptance_whole_block_fitting_and_one_row_over_admission(self):
+        with zipfile.ZipFile(KONCEPT_LAYOUT) as archive:
+            original_parts = {name: archive.read(name) for name in archive.namelist()}
+        for candidate, expected in ((48, 48), (49, 61)):
+            with self.subTest(candidate=candidate):
+                parts = dict(original_parts)
+                styles = quote.add_quote_layout_styles(parts)
+                root = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+                quote.clear_ooxml_range(root, 1, 1000, 1, 100)
+                last, moved = quote.write_acceptance_signature(root, candidate, {},
+                    {"text": "Short acceptance", "company_name": "Synthetic left"},
+                    {}, "Synthetic left", styles, parts)
+                self.assertEqual(find_cell_ref(root, "Short acceptance"), f"E{expected}")
+                self.assertEqual(last, expected + 8)
+                self.assertEqual(moved, candidate != expected)
+
+    def test_acceptance_hidden_columns_reduce_both_independent_text_widths(self):
+        original = KONCEPT_LAYOUT.read_bytes()
+        counts = []
+        for hidden in (False, True):
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "layout.xlsx"
+                with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                    parts = {name: source.read(name) for name in source.namelist()}
+                root = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+                for col in root.findall(f"{NS_MAIN}cols/{NS_MAIN}col"):
+                    if int(col.get("min")) in (3, 9):
+                        col.set("hidden", "1" if hidden else "0")
+                parts["xl/worksheets/sheet1.xml"] = ET.tostring(root)
+                with zipfile.ZipFile(path, "w") as target:
+                    for name, data in parts.items():
+                        target.writestr(name, data)
+                _, sheet, _ = self.workbook("W" * 80, template=path,
+                    extra_acceptance={"company_name": "M" * 80})
+                lengths = []
+                for column, glyph in (("B", "M"), ("E", "W")):
+                    fragments = [value for _, value in self.column_values(sheet, column)
+                                 if set(value) == {glyph}]
+                    self.assertEqual("".join(fragments), glyph * 80)
+                    lengths.append(len(fragments))
+                counts.append(lengths)
+        self.assertTrue(all(after > before for before, after in zip(*counts)))
+        self.assertEqual(KONCEPT_LAYOUT.read_bytes(), original)
+
+    def test_acceptance_long_rich_signature_labels_continue_without_loss(self):
+        left, right = "LEFTLABEL" * 170, "RIGHTLABEL" * 150
+        extra = {"person_label": right, "stamp_label": "Final stamp", "date_label": "Final date"}
+        tmp, path = generate_layout_workbook({
+            "acceptance": {"company_name": "Synthetic left", "text": "Short acceptance", **extra},
+            "signature": {"company_signatory": left, "company_title": "Final title",
+                          "company_date_label": "Final date"},
+            "rich_text": {"companySignatory": "<div><strong>" + left + "</strong></div>",
+                          "personLabel": "<div><em>" + right + "</em></div>"},
+        })
+        self.addCleanup(tmp.cleanup)
+        with zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        for column, expected, alphabet, attribute in (
+            ("B", left, set("LEFTLABEL"), 1), ("E", right, set("RIGHTLABEL"), 2),
+        ):
+            fragments = [(row, value) for row, value in self.column_values(sheet, column)
+                         if value and set(value).issubset(alphabet)]
+            self.assertEqual("".join(value for _, value in fragments), expected)
+            for row, _ in fragments:
+                self.assertTrue(all(run[attribute] for run in cell_inline_runs(sheet, f"{column}{row}")))
+            final_row = quote.parse_cell_ref(find_cell_ref(sheet, "Final title"))[0]
+            self.assertGreater(final_row, fragments[-1][0])
+        dates = find_cell_refs(sheet, "Final date")
+        self.assertEqual(len(dates), 2)
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+
+    def test_acceptance_large_font_uses_counted_row_slots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "layout.xlsx"
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                parts = {name: source.read(name) for name in source.namelist()}
+            styles = ET.fromstring(parts["xl/styles.xml"])
+            font = font_for_style(styles, 2)
+            font.find(f"{NS_MAIN}sz").set("val", "36")
+            parts["xl/styles.xml"] = ET.tostring(styles)
+            with zipfile.ZipFile(path, "w") as target:
+                for name, data in parts.items():
+                    target.writestr(name, data)
+            _, sheet, _ = self.workbook("Wide", template=path)
+            ref = find_cell_ref(sheet, "Wide")
+            row, _ = quote.parse_cell_ref(ref)
+            merges = [m.get("ref") for m in sheet.findall(f"{NS_MAIN}mergeCells/{NS_MAIN}mergeCell")]
+            self.assertIn(f"E{row}:I{row + 2}", merges)
+            self.assertEqual([sheet.find(f"{NS_MAIN}sheetData/{NS_MAIN}row[@r='{r}']").get("ht")
+                              for r in range(row, row + 3)], ["18.7"] * 3)
+
+    def test_real_libreoffice_acceptance_multiline_paint_and_signature_clearance(self):
+        if not quote.libreoffice_candidates():
+            message = "LibreOffice required for acceptance text paint/clearance proof."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
+        import pypdfium2 as pdfium
+        import math
+        cases = [
+            ("default", "We accept the quotation amount and the terms", None,
+             ["We accept the quotation amount and the terms"]),
+            ("wide-uppercase", "DDDDDD " * 16, None, [("DDDDDD " * 16).strip()]),
+            ("plain", "First acceptance\nSecond acceptance\nThird acceptance", None,
+             ["First acceptance", "Second acceptance", "Third acceptance"]),
+            ("rich", "First acceptance\nSecond acceptance\nThird acceptance",
+             "<div>First acceptance</div><div><strong>Second acceptance</strong></div>"
+             "<div><em>Third acceptance</em></div>",
+             ["First acceptance", "Second acceptance", "Third acceptance"]),
+        ]
+        for case, plain, rich, expected in cases:
+            with self.subTest(case=case):
+                path, sheet, _ = self.workbook(plain, rich)
+                width = quote.visible_column_width_points(sheet, 5, 9)
+                scale = float(sheet.find(f"{NS_MAIN}pageSetup").get("scale", "100")) / 100
+                pdf_path = path.with_suffix(".pdf")
+                self.assertEqual(quote.libreoffice_pdf_export(path, pdf_path), "libreoffice_exported")
+                found = {}
+                with pdfium.PdfDocument(str(pdf_path)) as document:
+                    for page_number, page in enumerate(document):
+                        text = page.get_textpage()
+                        characters = [(text.get_text_range(i, 1), i) for i in range(text.count_chars())]
+                        normal, indices = [], []
+                        for fragment, index in characters:
+                            for character in fragment:
+                                if character.isspace():
+                                    if normal and normal[-1] != " ":
+                                        normal.append(" "); indices.append(index)
+                                else:
+                                    normal.append(character); indices.append(index)
+                        normal = "".join(normal)
+                        image = page.render(scale=4).to_pil().convert("L")
+                        for phrase in expected + ["Synthetic person"]:
+                            offset = normal.find(phrase)
+                            if offset < 0:
+                                continue
+                            boxes = []
+                            for i, character in enumerate(phrase):
+                                if character.isspace():
+                                    continue
+                                bounds = text.get_charbox(indices[offset + i])
+                                left, bottom, right, top = bounds
+                                crop = image.crop((math.floor(left * 4),
+                                    math.floor((page.get_height() - top) * 4),
+                                    math.ceil(right * 4),
+                                    math.ceil((page.get_height() - bottom) * 4)))
+                                self.assertTrue(any(value < 180 for value in crop.getdata()),
+                                                f"{case}: unpainted acceptance glyph at {i}")
+                                crop.close()
+                                boxes.append(bounds)
+                            self.assertLessEqual(max(b[2] for b in boxes) - min(b[0] for b in boxes),
+                                                 width * scale + 1, "Acceptance exceeds its visible block.")
+                            found[phrase] = (page_number, min(b[1] for b in boxes),
+                                             max(b[3] for b in boxes))
+                        image.close()
+                        text.close()
+                        page.close()
+                self.assertEqual(set(found), set(expected + ["Synthetic person"]))
+                person_page, _, person_top = found["Synthetic person"]
+                for phrase in expected:
+                    page, bottom, _ = found[phrase]
+                    self.assertEqual(page, person_page)
+                    self.assertGreater(bottom, person_top, "Acceptance overlaps signature name.")
+                print("Acceptance paint case: " + json.dumps({
+                    "case": case, "xlsx_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "pdf_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+                    "all_expected_glyph_boxes_have_ink": True, "signature_clearance": True}))

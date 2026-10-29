@@ -63,6 +63,15 @@ npm run playwright:smoke
   workbook, survive reimport, respect workspace isolation and refuse an unavailable
   required layout. A normal profile save must retain its existing behaviour.
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
+  Acceptance and signature text must preserve every plain or rich paragraph and its
+  emphasis. Test visible left/right template widths, narrow and wide unbroken text,
+  combining marks, literal formula prefixes, larger fonts, dynamic signature
+  offsets, exact fitting/one-row-over admission and oversized continuation. Keep
+  the existing short-text positions, optional-text capacity, final labels, logos,
+  print-area and font controls. Run AcceptanceSignatureLayoutTest; its native
+  LibreOffice test must run in CI and checks actual glyph-box paint plus signature
+  clearance. Text extraction alone cannot detect the retained clipping failure.
+  Local renderer skips remain explicit gaps until native rendered proof exists.
   PDF conversion must preserve the XLSX master bytes. Resolve DrawingML Latin
   theme-font references from that workbook's internal theme in a temporary
   conversion copy; retain explicit fonts, run sizes/emphasis and every other
