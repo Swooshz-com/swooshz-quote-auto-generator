@@ -34,7 +34,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from xml.dom import minidom
 from xml.etree import ElementTree as ET
 
@@ -2826,7 +2826,7 @@ def write_continuation_quote_header(
 def quote_entry_height(entry: dict[str, Any]) -> int:
     if entry["kind"] == "section":
         return 1
-    return max(1, len(entry["description_lines"]))
+    return max(1, len(entry["description_lines"]), len(entry.get("quantity_lines") or []))
 
 
 def quote_entry_keep_height(entries: list[dict[str, Any]], index: int) -> int:
@@ -2945,6 +2945,30 @@ def rich_text_character_width(
     return advance * font_size * (1.12 if formatting[0] else 1.0) * (1.05 if formatting[1] else 1.0)
 
 
+def quantity_character_width(
+    character: str, formatting: tuple[bool, bool, bool], font_size: float | None,
+) -> float:
+    """Budget numeric cells in points without shrinking their selected font."""
+    width = optional_text_character_width(character)
+    if width == 0:
+        return 0.0
+    if width == 2 or ord(character) > 127:
+        advance = 1.2
+    elif character in "MWmw@%&":
+        advance = 1.0
+    elif character.isspace():
+        advance = 0.35 * width
+    elif character in "ilI.,:;'!|":
+        advance = 0.4
+    elif character.isdigit():
+        advance = 0.55
+    elif character.isupper():
+        advance = 0.9
+    else:
+        advance = 0.6
+    return advance * (font_size or 1.0)
+
+
 def rich_text_line_runs(characters: list[tuple[str, tuple[bool, bool, bool]]]) -> list[RichTextRun]:
     runs: list[RichTextRun] = []
     for character, formatting in characters:
@@ -2973,7 +2997,9 @@ def wrap_optional_text_segment(
     *,
     max_width: float = OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
     font_size: float | None = None,
+    measure_character: Callable[[str, tuple[bool, bool, bool], float | None], float] | None = None,
 ) -> list[list[RichTextRun]]:
+    measure = measure_character or rich_text_character_width
     lines: list[list[RichTextRun]] = []
     current: list[tuple[str, tuple[bool, bool, bool]]] = []
     current_width = 0
@@ -2984,14 +3010,14 @@ def wrap_optional_text_segment(
         break_after = None
         length = 0
         for cluster in combining_text_clusters(current):
-            width += sum(rich_text_character_width(c, f, font_size) for c, f in cluster)
+            width += sum(measure(c, f, font_size) for c, f in cluster)
             length += len(cluster)
             if cluster[0][0].isspace():
                 break_after = length
         return width, break_after
 
     for cluster in combining_text_clusters(characters):
-        cluster_width = sum(rich_text_character_width(c, f, font_size) for c, f in cluster)
+        cluster_width = sum(measure(c, f, font_size) for c, f in cluster)
         if cluster_width > max_width:
             raise ValueError("A quotation text glyph exceeds the available column width.")
         while current and current_width + cluster_width > max_width:
@@ -3014,6 +3040,7 @@ def wrap_optional_text_segment(
 def wrap_rich_text_runs(
     runs: list[Any], *, max_width: float = OPTIONAL_TEXT_LINE_MAX_WIDTH_EM,
     font_size: float | None = None,
+    measure_character: Callable[[str, tuple[bool, bool, bool], float | None], float] | None = None,
 ) -> list[list[RichTextRun]]:
     """Reflow rich text into printable-width rows without losing run emphasis."""
     if not math.isfinite(max_width) or max_width <= 0:
@@ -3030,7 +3057,7 @@ def wrap_rich_text_runs(
             else:
                 segments[-1].append((character, formatting))
     return [line for segment in segments for line in wrap_optional_text_segment(
-        segment, max_width=max_width, font_size=font_size,
+        segment, max_width=max_width, font_size=font_size, measure_character=measure_character,
     )]
 
 
@@ -3054,8 +3081,36 @@ def visible_column_width_points(root: ET.Element, first: int, last: int) -> floa
         # Excel width units use the default digit advance. Dropping padding is conservative.
         width += math.floor(column_width * 7) * 72 / 96
     if width <= 6:
-        raise ValueError("Quotation acceptance block has no usable visible width.")
+        raise ValueError("Quotation text block has no usable visible width.")
     return width - 6
+
+
+def prepare_quantity_lines(
+    entries: list[dict[str, Any]], root: ET.Element, parts: dict[str, bytes],
+) -> None:
+    """Give quantity and description one shared row budget before page admission."""
+    width = visible_column_width_points(root, 2, 2)
+    selected_font = ooxml_style_text_font(parts, "13")
+    if not selected_font["font_size"]:
+        raise ValueError("Quotation quantity font size is unavailable.")
+    font_size = float(selected_font["font_size"])
+    for entry in entries:
+        if entry["kind"] != "item":
+            continue
+        text = entry["quantity"]
+        number = text.split(maxsplit=1)[0] if text else ""
+        if sum(quantity_character_width(c, (False, False, False), font_size) for c in number) > width:
+            raise ValueError("A quotation quantity number exceeds the available column width.")
+        entry["quantity_lines"] = [
+            "".join(run.text for run in runs).strip()
+            for runs in wrap_rich_text_runs(
+                [RichTextRun(text)], max_width=width, font_size=font_size,
+                measure_character=quantity_character_width,
+            )
+        ]
+    capacity = CONTINUATION_PAGE_HEIGHT - CONTINUATION_BODY_OFFSET
+    if any(quote_entry_keep_height(entries, index) > capacity for index in range(len(entries))):
+        raise ValueError("A quotation line item exceeds the available page height.")
 
 
 def acceptance_text_lines(
@@ -3527,6 +3582,7 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     set_ooxml_cell(root, 21, 5, currency, layout_styles["header_currency"])
 
     entries = render_quote_entries(lines, brief)
+    prepare_quantity_lines(entries, root, parts)
     continuation_pages: set[int] = set()
     row_number = 22
     for index, entry in enumerate(entries):
@@ -3556,14 +3612,15 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
             continue
 
         description_lines = entry["description_lines"]
+        quantity_lines = entry["quantity_lines"]
         set_ooxml_cell(root, row_number, 1, entry["number"], "70")
-        set_ooxml_cell(root, row_number, 2, entry["quantity"], "13")
-        set_ooxml_cell(root, row_number, 3, description_lines[0], "5")
         set_ooxml_cell(root, row_number, 5, entry["amount"], price_style)
-        for extra in description_lines[1:]:
-            row_number += 1
-            set_ooxml_cell(root, row_number, 3, extra, "5")
-        row_number += 2
+        for offset in range(quote_entry_height(entry)):
+            if offset < len(quantity_lines):
+                set_ooxml_cell(root, row_number + offset, 2, quantity_lines[offset], "13")
+            if offset < len(description_lines):
+                set_ooxml_cell(root, row_number + offset, 3, description_lines[offset], "5")
+        row_number += quote_entry_height(entry) + 1
 
     total_candidate_row = row_number + 1
     total_row = summary_block_start_row(total_candidate_row, TOTAL_BLOCK_HEIGHT)

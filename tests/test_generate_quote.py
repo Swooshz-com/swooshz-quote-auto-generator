@@ -938,7 +938,7 @@ def generate_layout_workbook(brief_updates=None, layout_template=KONCEPT_LAYOUT)
     line = quote.QuoteLine(
         section="Graphics",
         quantity=24,
-        unit="m length",
+        unit="sqm",
         description="Vinyl printed graphics for a long booth fascia",
         pricing_keyword="vinyl printed graphics",
         display_price="",
@@ -5857,3 +5857,207 @@ class AcceptanceSignatureLayoutTest(unittest.TestCase):
                     "case": case, "xlsx_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                     "pdf_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
                     "all_expected_glyph_boxes_have_ink": True, "signature_clearance": True}))
+
+
+class QuantityLayoutTest(unittest.TestCase):
+    def line(self, description, quantity, unit, amount):
+        price = quote.PriceRow(
+            row_number=1,
+            section="Synthetic quantities",
+            description=description,
+            unit_hint=unit,
+            cost=100,
+            gst_multiplier=1,
+            markup=1,
+            remark="",
+        )
+        line = quote.QuoteLine(
+            section="Synthetic quantities",
+            quantity=quantity,
+            unit=unit,
+            description=description,
+            pricing_keyword=description.lower(),
+            display_price="",
+            matched_price=price,
+            amount=amount,
+            match_status="matched",
+            match_candidates=[],
+        )
+        line.pricing_authority = {"variant": "manual", "price_currency": "SGD"}
+        return line
+
+    def workbook(self, lines, *, template=KONCEPT_LAYOUT):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "quotation.xlsx"
+        quote.write_quote_layout_xlsx(template, path, commercial_test_brief(), lines)
+        with zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            styles = ET.fromstring(archive.read("xl/styles.xml"))
+        return path, sheet, workbook, styles
+
+    def description_row(self, sheet, description):
+        ref = find_cell_ref(sheet, description)
+        self.assertTrue(ref, f"Description was not written: {description}")
+        row, _ = quote.parse_cell_ref(ref)
+        return row
+
+    def quantity_fragments(self, sheet, start_row, stop_row):
+        values = []
+        for cell_node in sheet.iter(f"{NS_MAIN}c"):
+            ref = cell_node.attrib.get("r", "")
+            if not re.fullmatch(r"B\d+", ref):
+                continue
+            row, _ = quote.parse_cell_ref(ref)
+            value = cell_value(sheet, ref)
+            if start_row <= row < stop_row and value:
+                values.append((row, value))
+        return sorted(values)
+
+    def assert_quantity_text_preserved(self, fragments, expected, numeric_token):
+        actual = "".join(value for _, value in fragments)
+        self.assertEqual(re.sub(r"\s+", "", actual), re.sub(r"\s+", "", expected))
+        self.assertTrue(
+            any(numeric_token in value for _, value in fragments),
+            f"Numeric token must stay intact in one quantity row: {numeric_token}",
+        )
+
+    def assert_quantity_style_preserved(self, sheet, styles, ref):
+        style_id = cell_style(sheet, ref)
+        self.assertEqual(font_size(font_for_style(styles, style_id)), "13")
+        alignment = alignment_for_style(styles, style_id)
+        self.assertIsNotNone(alignment)
+        self.assertEqual(alignment.attrib.get("horizontal"), "center")
+
+    def test_short_quantity_keeps_original_position_and_style(self):
+        _, sheet, _, styles = self.workbook([
+            self.line("Short synthetic item", 1, "sqm", 37.5),
+        ])
+
+        self.assertEqual(find_cell_ref(sheet, "1 sqm"), "B24")
+        self.assertEqual(cell_value(sheet, "B25"), "")
+        self.assertEqual(cell_value(sheet, "E24"), "37.5")
+        self.assert_quantity_style_preserved(sheet, styles, "B24")
+
+    def test_decimal_integer_and_large_quantities_wrap_without_losing_tokens_or_amounts(self):
+        cases = [
+            ("Decimal quantity item", 11.5, "m length", 41.25, "11.5 m length"),
+            ("Integer quantity item", 24, "square metre panels", 240.5, "24 square metre panels"),
+            ("Large quantity item", 123456, "linear display metres", 1234560.75,
+             "123456 linear display metres"),
+        ]
+        lines = [self.line(description, quantity, unit, amount)
+                 for description, quantity, unit, amount, _ in cases]
+        _, sheet, _, styles = self.workbook(lines)
+        description_rows = [self.description_row(sheet, case[0]) for case in cases]
+        self.assertTrue(any(right > left for left, right in zip(description_rows, description_rows[1:])))
+
+        wrapped_counts = []
+        for index, (description, _, _, amount, expected) in enumerate(cases):
+            row = description_rows[index]
+            stop_row = description_rows[index + 1] if index + 1 < len(cases) else row + 8
+            fragments = self.quantity_fragments(sheet, row, stop_row)
+            self.assert_quantity_text_preserved(fragments, expected, str(cases[index][1]))
+            self.assertEqual(cell_value(sheet, f"E{row}"), str(amount))
+            self.assertTrue(fragments)
+            wrapped_counts.append(len(fragments))
+            for fragment_row, _ in fragments:
+                self.assert_quantity_style_preserved(sheet, styles, f"B{fragment_row}")
+            if index + 1 < len(cases):
+                self.assertGreaterEqual(
+                    description_rows[index + 1] - row,
+                    len(fragments) + 1,
+                    f"Rows were not reserved for all quantity fragments: {description}",
+                )
+
+        self.assertGreater(max(wrapped_counts), 1, "At least one multiword quantity must wrap in the template width.")
+
+    def test_multiline_quantity_moves_as_one_block_at_a_page_boundary(self):
+        preceding = [self.line(
+            "Boundary positioning predecessor " + "detail " * 5, 1, "sqm", 10.25,
+        )]
+        preceding.extend(
+            self.line(f"Boundary predecessor {index:02d}", 1, "sqm", 10.25)
+            for index in range(1, 12)
+        )
+        boundary_line = self.line(
+            "Boundary quantity item", 11.5, "linear metres per display section", 123.75,
+        )
+        _, sheet, _, _ = self.workbook(preceding + [boundary_line])
+        row = self.description_row(sheet, "Boundary quantity item")
+        fragments = self.quantity_fragments(sheet, row, row + 12)
+        self.assert_quantity_text_preserved(
+            fragments, "11.5 linear metres per display section", "11.5",
+        )
+        self.assertGreaterEqual(len(fragments), 2)
+        page_start = quote.continuation_page_start_for_row(row)
+        self.assertIsNotNone(page_start)
+        self.assertEqual(page_start, quote.next_continuation_page_start(quote.FIRST_PRINT_PAGE_END_ROW))
+        self.assertEqual(row, page_start + quote.CONTINUATION_BODY_OFFSET)
+        self.assertEqual(quote.continuation_page_start_for_row(fragments[-1][0]), page_start)
+        self.assertLessEqual(fragments[-1][0], quote.manual_page_end_for_row(row))
+        self.assertEqual(cell_value(sheet, f"E{row}"), "123.75")
+
+    def test_unrepresentable_numeric_quantity_token_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.workbook([
+                self.line("Oversized numeric token", 10 ** 40, "sqm", 1.0),
+            ])
+
+    def test_real_libreoffice_quantity_digits_are_painted_not_only_extractable(self):
+        if not quote.libreoffice_candidates():
+            message = "LibreOffice required for quantity glyph paint proof; hosted CI must run this regression."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
+
+        import math
+        import pypdfium2 as pdfium
+
+        path, _, _, _ = self.workbook([
+            self.line("Rendered decimal quantity item", 11.5, "m length", 125.75),
+        ])
+        pdf_path = path.with_suffix(".pdf")
+        self.assertEqual(quote.libreoffice_pdf_export(path, pdf_path), "libreoffice_exported")
+        found = False
+        with pdfium.PdfDocument(str(pdf_path)) as document:
+            for page in document:
+                text = page.get_textpage()
+                characters = [(text.get_text_range(index, 1), index)
+                              for index in range(text.count_chars())]
+                normalized, indices = [], []
+                for fragment, index in characters:
+                    for character in fragment:
+                        if character.isspace():
+                            if normalized and normalized[-1] != " ":
+                                normalized.append(" ")
+                                indices.append(index)
+                        else:
+                            normalized.append(character)
+                            indices.append(index)
+                normalized_text = "".join(normalized)
+                offset = normalized_text.find("11.5")
+                if offset < 0:
+                    text.close()
+                    page.close()
+                    continue
+
+                image = page.render(scale=4).to_pil().convert("L")
+                for character_index, digit in enumerate("11.5"):
+                    bounds = text.get_charbox(indices[offset + character_index])
+                    left, bottom, right, top = bounds
+                    crop = image.crop((math.floor(left * 4),
+                                       math.floor((page.get_height() - top) * 4),
+                                       math.ceil(right * 4),
+                                       math.ceil((page.get_height() - bottom) * 4)))
+                    self.assertTrue(any(pixel < 180 for pixel in crop.getdata()),
+                                    f"PDF text contains quantity digit {digit!r} without visible ink.")
+                    crop.close()
+                image.close()
+                text.close()
+                page.close()
+                found = True
+                break
+
+        self.assertTrue(found, "PDF text extraction did not contain the complete 11.5 quantity token.")

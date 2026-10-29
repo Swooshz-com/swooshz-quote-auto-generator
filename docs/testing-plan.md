@@ -63,6 +63,13 @@ npm run playwright:smoke
   workbook, survive reimport, respect workspace isolation and refuse an unavailable
   required layout. A normal profile save must retain its existing behaviour.
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
+  Run QuantityLayoutTest for quantity/unit output: decimal and integer tokens,
+  longer units, complete centred text at the selected font size, unchanged amounts,
+  shared quantity/description row budgets and page-boundary admission. Reject a
+  numeric token or complete line-item block that cannot fit the selected layout.
+  Its native LibreOffice regression checks rendered digit ink, since complete PDF
+  text extraction can conceal a clipped leading digit. Keep the short quantities,
+  selected profile column widths, print area and existing fonts unchanged.
   Acceptance and signature text must preserve every plain or rich paragraph and its
   emphasis. Test visible left/right template widths, narrow and wide unbroken text,
   combining marks, literal formula prefixes, larger fonts, dynamic signature
