@@ -30,9 +30,15 @@ const page = await browser.newPage();
 const anonymousApi = await request.newContext();
 let authenticatedApi;
 const consoleProblems = [];
+let expectedDocumentAuthFailures = 0;
 page.on("console", (message) => {
   if (["error", "warning"].includes(message.type())) {
     const location = message.location().url;
+    if (message.text() === "Failed to load resource: the server responded with a status of 401 (Unauthorized)"
+        && location === baseUrl + "/") {
+      expectedDocumentAuthFailures++;
+      return;
+    }
     consoleProblems.push(location ? `${message.text()} (${location})` : message.text());
   }
 });
@@ -109,22 +115,45 @@ try {
   const unsafeLogout = await authenticatedApi.get(`${baseUrl}/logout`);
   if (unsafeLogout.status() !== 405) throw new Error("GET logout was not rejected.");
 
-  const logout = await page.evaluate(async ({ header, token }) => {
-    const response = await fetch("/logout", {
-      method: "POST",
-      headers: { [header]: token },
-    });
-    return {
-      status: response.status,
-      location: response.headers.get("X-SQAG-Logout-Location"),
-    };
-  }, { header: session.body.csrf_header, token: session.body.csrf_token });
-  if (logout.status !== 204 || logout.location !== "/signed-out") {
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+  const logoutResponse = page.waitForResponse(response =>
+    new URL(response.url()).pathname === "/logout" && response.request().method() === "POST");
+  await page.locator("#topbarLogoutLink").click();
+  const logout = await logoutResponse;
+  if (logout.status() !== 204 || logout.headers()["x-sqag-logout-location"] !== "/signed-out") {
     throw new Error("CSRF-safe logout did not revoke the local session.");
   }
-
-  const revoked = await authenticatedApi.get(`${baseUrl}/api/session`);
+  await page.waitForURL(baseUrl + "/signed-out");
+  if ((await page.context().cookies(baseUrl)).some(cookie => cookie.name === "swooshz_quote_session")) {
+    throw new Error("Logout retained the application session cookie.");
+  }
+  const revoked = await authenticatedApi.get(baseUrl + "/api/session");
   if (revoked.status() !== 401) throw new Error("Logged-out session remained usable.");
+
+  const interactive = await anonymousApi.get(baseUrl + "/__synthetic_oidc/case?value=approved-account-choice");
+  if (interactive.status() !== 200) throw new Error("Could not select interactive synthetic provider.");
+  const providerRequests = [];
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.pathname === "/__synthetic_oidc/authorize") providerRequests.push(url);
+  });
+  for (let revisit = 0; revisit < 2; revisit++) {
+    const response = await page.goto(baseUrl + "/", { waitUntil: "domcontentloaded" });
+    if (response.status() !== 401 || new URL(page.url()).pathname !== "/") throw new Error("Domain revisit silently signed back in.");
+    if (providerRequests.length !== 0) throw new Error("Domain revisit started provider sign-in without user action.");
+    if (await page.locator("#topbarLogoutLink").count()) throw new Error("Workspace rendered after logout.");
+    if ((await page.request.get(baseUrl + "/api/session")).status() !== 401) throw new Error("Domain revisit created a session.");
+  }
+  await page.getByRole("link", { name: "Sign in", exact: true }).click();
+  await page.getByRole("link", { name: "Choose synthetic account" }).waitFor();
+  if (providerRequests.length !== 1) throw new Error("Explicit sign-in did not start exactly one provider flow.");
+  if (providerRequests[0].searchParams.get("prompt") !== "select_account") throw new Error("Google account selection was not requested.");
+  if ((await page.request.get(baseUrl + "/api/session")).status() !== 401) throw new Error("Account-choice screen already had an application session.");
+  await page.getByRole("link", { name: "Choose synthetic account" }).click();
+  await page.waitForURL(baseUrl + "/");
+  if ((await page.request.get(baseUrl + "/api/session")).status() !== 200) throw new Error("Explicit account choice did not restore access.");
+  if ((await authenticatedApi.get(baseUrl + "/api/session")).status() !== 401) throw new Error("New login reactivated the revoked old session.");
+  if (expectedDocumentAuthFailures !== 2) throw new Error("Expected exactly two explicit domain-visit denials.");
   if (consoleProblems.length) throw new Error(`Browser console problems: ${consoleProblems.join(" | ")}`);
   console.log("Internal Google synthetic Playwright flow passed.");
 } finally {

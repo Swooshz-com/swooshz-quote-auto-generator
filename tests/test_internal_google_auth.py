@@ -721,6 +721,7 @@ class GoogleOidcVerifierTest(unittest.TestCase):
         parsed = urllib.parse.urlparse(redirect)
         params = urllib.parse.parse_qs(parsed.query)
         self.assertEqual(parsed.geturl().split("?", 1)[0], self.config().authorize_url)
+        self.assertEqual(params["prompt"], ["select_account"])
         self.assertEqual(params["redirect_uri"], [self.config().redirect_uri])
         self.assertEqual(params["state"], [transaction.state])
         self.assertEqual(params["nonce"], [transaction.nonce])

@@ -650,6 +650,21 @@ class InternalGoogleAuthWebappTest(unittest.TestCase):
                     "/api/session",
                     headers={"Cookie": cookie},
                 )
+                for path in ["/", "/another-document"]:
+                    revisit_status, revisit_headers, revisit_body = self.http(
+                        runner, "GET", path, headers={"Cookie": cookie},
+                    )
+                    self.assertEqual(revisit_status, 401)
+                    self.assertIsNone(revisit_headers.get("Location"))
+                    self.assertIsNone(revisit_headers.get("Set-Cookie"))
+                    self.assertIn(b'href="/login"', revisit_body)
+                    self.assertIn(b"Sign in", revisit_body)
+                new_location, _new_cookie = self.start_login(runner)
+                self.assertNotEqual(new_location, location)
+                self.assertEqual(
+                    urllib.parse.parse_qs(urllib.parse.urlparse(new_location).query)["prompt"],
+                    ["select_account"],
+                )
         self.assertEqual(unsafe_status, 405)
         self.assertEqual(rejected_status, 403)
         self.assertEqual(revoked_status, 401)

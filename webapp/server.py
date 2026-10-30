@@ -662,7 +662,6 @@ OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
 AI_PROVIDER_OPENAI = "openai"
 AI_PROVIDER_DEEPSEEK = "deepseek"
 SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
-AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
 QUOTE_SESSION_RETIRED_MESSAGE = "This quote session is no longer available. Please start a new quote. Contact support if this keeps happening."
@@ -5679,7 +5678,7 @@ def clean_customer_quote_line_text(value: Any) -> str:
 
 
 def leading_number(value: Any) -> float | None:
-    match = re.match(r"\s*(-?\d[\d,]*(?:\.\d+)?)", str(value or ""))
+    match = re.match(r"(-?\d[\d,]*(?:\.\d+)?)", str(value or "").lstrip())
     if not match:
         return None
     try:
@@ -5696,7 +5695,7 @@ LEADING_QUANTITY_PREFIX_RE = re.compile(
     r"(?P<unit>"
     r"m\s+(?:length|run)"
     r"|sq\.?\s*m\.?"
-    r"|m\s*(?:2|\^2)"
+    r"|m\s*(?:2|\^2|\u00b2)"
     r"|sqm"
     r"|nos?\.?"
     r"|no\.?"
@@ -5720,7 +5719,7 @@ def format_quantity_number(value: float) -> int | float:
 def normalize_quantity_prefix_unit(value: Any) -> str:
     unit = clean_text(value).lower()
     unit = re.sub(r"\s+", " ", unit).strip(". ")
-    if unit in {"sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."}:
+    if unit in {"sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."}:
         return "sqm"
     if unit in {"nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"}:
         return "nos"
@@ -5761,7 +5760,7 @@ def quantity_unit_aliases(unit: Any) -> list[str]:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     aliases = {normalized} if normalized else set()
     if normalized == "sqm":
-        aliases.update({"sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."})
+        aliases.update({"sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."})
     if re.fullmatch(r"nos?\.?", normalized):
         aliases.update({"nos", "nos.", "no", "no.", "pcs", "pieces", "units"})
     if normalized == "m length":
@@ -6303,27 +6302,68 @@ def quote_basis_sections_with_default_dimension_confirmation(
     sections: list[dict[str, Any]],
     dimensions: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    legacy = quote_basis_from_sections(sections)
-    adjusted = quote_basis_with_default_dimension_confirmation(legacy, dimensions)
-    if adjusted == legacy:
-        return copy.deepcopy(sections)
-    adjusted_sections = normalize_quote_basis_sections({"quote_basis": adjusted})
-    confidence_by_text = {
-        clean_text(line.get("text")).lower(): normalize_confidence_percent(line.get("confidence", line.get("confidence_pct")))
-        for section in sections
-        for line in (section.get("lines") or [])
-        if isinstance(line, dict) and clean_text(line.get("text"))
-    }
+    # Keep the structured rows authoritative. A legacy text round-trip loses their
+    # identities, measurements and catalogue bindings before final reconciliation.
+    quote_basis_from_sections(sections)  # Retain the section-identity validation.
+    adjusted_sections = copy.deepcopy(sections)
+    if clean_text(dimensions.get("dimension_source")) != "default":
+        return adjusted_sections
+
+    confirmation_text = default_booth_dimension_confirmation_line(dimensions).removeprefix("Confirm: ")
+    found_default_line = False
+    retained_sections = []
     for section in adjusted_sections:
+        next_lines = []
         for line in section.get("lines") or []:
             if not isinstance(line, dict):
+                next_lines.append(line)
                 continue
-            if normalize_confidence_percent(line.get("confidence", line.get("confidence_pct"))) is not None:
+            # A billable item's usage detail may mention the default footprint.
+            # Only rewrite unowned, unmeasured, unpriced informational reminders.
+            # An identified row can carry its measurements on a linked item instead.
+            has_row_identity = bool(
+                safe_resource_id(line.get("id"), "") or safe_resource_id(line.get("source_line_item_id"), "")
+            )
+            has_measurement_or_pricing = any(line.get(key) not in (None, "") for key in (
+                "quantity", "unit", "pricing_keyword", "catalog_description", "pricing_reference_description",
+                "catalog_unit_price", "effective_unit_price", "unit_price_override", "pricing_basis_amount",
+                "approved_quote_amount", "price_mode", "display_price",
+            ))
+            authority = line.get("pricing_authority")
+            has_pricing_authority = isinstance(authority, dict) and authority.get("variant") not in (None, "", "none")
+            informational = is_informational_dimension_basis_line(line) or clean_text(line.get("text")).lower().startswith("default booth size")
+            if (
+                has_row_identity or has_measurement_or_pricing or has_pricing_authority or line.get("custom_pricing")
+                or normalize_basis_tag(line.get("tag")) == "Custom" or not informational
+                or not line_references_default_booth_dimensions(line.get("text"), dimensions)
+            ):
+                next_lines.append(line)
                 continue
-            text = clean_text(line.get("text"))
-            inherited = confidence_by_text.get(text.lower())
-            line["confidence"] = inherited if inherited is not None else 50
-    return adjusted_sections
+            if found_default_line:
+                continue
+            line["tag"] = "Confirm"
+            line["text"] = confirmation_text
+            confidence = normalize_confidence_percent(line.get("confidence", line.get("confidence_pct")))
+            line["confidence"] = confidence if confidence is not None else 50
+            next_lines.append(line)
+            found_default_line = True
+        section["lines"] = next_lines
+        if next_lines:
+            retained_sections.append(section)
+
+    if not found_default_line:
+        target = next((section for section in retained_sections
+                       if "platform" in safe_section_id(section.get("id"))
+                       or "floor" in safe_section_id(section.get("id"))), None)
+        if target is None:
+            target = {
+                "id": DEFAULT_DIMENSION_BASIS_FIELD,
+                "title": quote_basis_title_from_key(DEFAULT_DIMENSION_BASIS_FIELD),
+                "lines": [],
+            }
+            retained_sections.append(target)
+        target["lines"].append({"tag": "Confirm", "text": confirmation_text, "confidence": 50})
+    return retained_sections
 
 
 def nested_value(payload: dict[str, Any], group: str, key: str, flat_key: str) -> Any:
@@ -6341,7 +6381,7 @@ def safe_segment(value: str, fallback: str = "file") -> str:
 def normalize_pricing_unit(value: Any) -> str:
     unit = clean_text(value)
     normalized = re.sub(r"\s+", " ", unit.lower()).strip(". ")
-    if normalized in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+    if normalized in {"m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
         return "sqm"
     if normalized in {"m run", "m. run"}:
         return "m run"
@@ -6367,7 +6407,7 @@ def canonical_pricing_authority_text(value: Any) -> str:
 def canonical_pricing_authority_unit(value: Any) -> str:
     text = canonical_pricing_authority_text(value)
     lower = text.lower().strip(". ")
-    if lower in {"m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
+    if lower in {"m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"}:
         return "sqm"
     if lower in {"m run", "m. run"}:
         return "m run"
@@ -12314,8 +12354,8 @@ class LocalSqagStorage:
     def pricing_reference_export_xlsx(self, reference_id: str, source: str = "") -> tuple[str, bytes] | None:
         return pricing_reference_export_xlsx(reference_id, source=source)
 
-    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None) -> dict[str, Any]:
-        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id, storage=self)
+    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, committed_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id, storage=self, committed_metadata=committed_metadata)
 
     def list_quote_sessions(self) -> list[dict[str, Any]]:
         return list_quote_sessions()
@@ -12326,9 +12366,67 @@ class LocalSqagStorage:
     def delete_quote_session(self, session_id: str) -> bool:
         return delete_quote_session(session_id)
 
-    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None) -> dict[str, Any] | None:
-        _ = session_id, kind, require_current_proof
-        return None
+    def quote_session_export_artifact(
+        self, session_id: str, kind: str, *, require_current_proof: bool | None = None,
+        expected_projection_identity: tuple[Any, ...] | None = None,
+        expected_publication: str | None = None,
+    ) -> dict[str, Any] | None:
+        safe_id = safe_quote_session_id(session_id, "")
+        safe_kind = clean_text(kind).lower()
+        expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
+        if not safe_id or not expected_filename:
+            return None
+        metadata = read_quote_session_metadata(safe_id)
+        authority = local_current_publication_authority(quote_session_authority_payload(metadata))
+        proof = quote_session_current_v2_publication_proof(
+            metadata, metadata, workspace_id="local-workspace", owner_id="local-user",
+            authority=authority,
+        )
+        if proof is None:
+            return None
+        identity = quote_publication_projection_identity(metadata, self, safe_kind)
+        if (
+            identity is None
+            or (expected_projection_identity is not None and identity != expected_projection_identity)
+            or (expected_publication is not None and quote_publication_binding(identity) != expected_publication)
+        ):
+            return None
+        expected_artifact = proof["artifacts"].get(safe_kind)
+        if not isinstance(expected_artifact, dict):
+            return None
+        # Preserve the existing filesystem capability, retirement, owner and path gates.
+        capability = _quote_session_filesystem_capability()
+        if _quote_session_retirement_state(safe_id, capability)[0]:
+            return None
+        state = _read_local_quote_session_state(safe_id, capability)
+        if state["owner"] != safe_id or quote_publication_projection_identity(state["metadata"], self, safe_kind) != identity:
+            return None
+        path = quote_session_recorded_export_path(safe_id, safe_kind, state["metadata"])
+        if not path.exists() or not path.is_file():
+            return None
+        content = path.read_bytes()
+        artifact = {
+            "filename": path.name, "content_type": QUOTE_SESSION_EXPORT_CONTENT_TYPES[safe_kind],
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(), "content": content,
+        }
+        publication = proof["publication"]
+        return artifact if quote_artifact_matches_publication_proof(
+            artifact, expected_artifact, session_id=safe_id,
+            publication_id=publication["id"], run_id=publication["run_id"],
+        ) else None
+
+    def quote_session_export_metadata(self, session_id: str, kind: str, *, expected_projection_identity: tuple[Any, ...]) -> dict[str, Any] | None:
+        """Current local path/metadata projection; byte admission remains at delivery."""
+        metadata = read_quote_session_metadata(session_id)
+        if quote_publication_projection_identity(metadata, self, kind) != expected_projection_identity:
+            return None
+        if not quote_session_has_current_v2_publication(metadata, storage=self):
+            return None
+        path = quote_session_recorded_export_path(session_id, kind, metadata)
+        export = metadata["exports"][kind]
+        if not path.is_file() or path.stat().st_size != export["size_bytes"]:
+            return None
+        return {"filename": export["filename"], "sha256": export["sha256"], "size_bytes": export["size_bytes"]}
 
     def quote_session_export_file_path(self, session_id: str, kind: str) -> Path | None:
         safe_id = safe_quote_session_id(session_id, "")
@@ -13270,7 +13368,16 @@ class DatabaseSqagStorage:
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
         if profile is None or self._is_deleted_profile_payload(profile):
             return None
-        return {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
+        payload = {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
+        layout = self.profile_layout_artifact(safe_id)
+        if layout is None and configured_artifact_storage_mode() in {"database", "object"}:
+            raise SqagStorageAccessError("Saved profile layout is unavailable.", status=409, reason="profile_layout_unavailable")
+        if layout is not None:
+            payload["pack"] = {"quotation_layout": {
+                "filename": layout["filename"],
+                "data_url": f"data:{layout['content_type']};base64,{base64.b64encode(layout['content']).decode('ascii')}",
+            }}
+        return payload
 
     def list_pricing_references(self) -> list[dict[str, Any]]:
         company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("sqag_pricing_references", "reference_id")]
@@ -14750,13 +14857,15 @@ class DatabaseSqagStorage:
         stored["items"] = items
         return stored, pending_artifacts, retained_kinds
 
-    def _quote_artifact_metadata(self, session_id: str, kind: str) -> dict[str, Any] | None:
+    def _quote_artifact_metadata(self, session_id: str, kind: str, *, expected_projection_identity: tuple[Any, ...] | None = None) -> dict[str, Any] | None:
         safe_id = safe_quote_session_id(session_id, "")
         safe_kind = clean_text(kind).lower()
         expected_filename = QUOTE_SESSION_EXPORT_KINDS.get(safe_kind)
         if not safe_id or not expected_filename:
             return None
         metadata, _draft_files = self._read_quote_session_metadata_for_workspace(safe_id)
+        if expected_projection_identity is not None and quote_publication_projection_identity(metadata, self, safe_kind) != expected_projection_identity:
+            return None
         publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
         current_run_id = safe_reference(publication.get("run_id"), "run-")
         if current_run_id and self._publication_version_row(current_run_id) is not None:
@@ -15311,7 +15420,7 @@ class DatabaseSqagStorage:
             "content": content,
         }
 
-    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None) -> dict[str, Any] | None:
+    def quote_session_export_artifact(self, session_id: str, kind: str, *, require_current_proof: bool | None = None, expected_projection_identity: tuple[Any, ...] | None = None, expected_publication: str | None = None) -> dict[str, Any] | None:
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode not in {"database", "object"}:
             return None
@@ -15340,6 +15449,14 @@ class DatabaseSqagStorage:
                 authority=current_authority,
             )
             if publication_proof is None:
+                return None
+        if expected_projection_identity is not None or expected_publication is not None:
+            identity = quote_publication_projection_identity(metadata, self, safe_kind)
+            if (
+                identity is None
+                or (expected_projection_identity is not None and identity != expected_projection_identity)
+                or (expected_publication is not None and quote_publication_binding(identity) != expected_publication)
+            ):
                 return None
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
@@ -15414,55 +15531,9 @@ class DatabaseSqagStorage:
         )
 
     def _public_quote_session(self, metadata: dict[str, Any], *, include_draft_state: bool = False, draft_files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        public = public_quote_session(metadata, include_draft_state=False)
-        if not public:
-            return {}
-        published = quote_session_is_published(metadata)
-        if include_draft_state:
-            public["draft_state"] = copy.deepcopy(metadata.get("draft_state")) if isinstance(metadata.get("draft_state"), dict) else {}
-            public["draft_files"] = copy.deepcopy(draft_files or [])
-        has_stale_export = False
-        has_available_export = False
-        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
-            export = public.get("exports", {}).get(kind) if isinstance(public.get("exports"), dict) else None
-            if not isinstance(export, dict):
-                continue
-            metadata_export = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
-            raw_export = metadata_export if isinstance(metadata_export, dict) else export
-            recorded_filename = clean_text(raw_export.get("filename"))
-            safe_recorded = recorded_filename if recorded_filename == filename else ""
-            artifact = self._quote_artifact_metadata(public["session_id"], kind) if published and configured_artifact_storage_mode() in {"database", "object"} and safe_recorded else None
-            artifact_exists = bool(artifact)
-            stale = bool(artifact_exists and quote_session_export_is_stale(metadata, raw_export))
-            exists = artifact_exists
-            has_stale_export = has_stale_export or stale
-            has_available_export = has_available_export or (exists and not stale)
-            export["filename"] = safe_recorded or None
-            export["exists"] = exists
-            export["missing"] = bool(safe_recorded and not artifact_exists)
-            export["stale"] = stale
-            export["url"] = f"/api/quote-sessions/{public['session_id']}/download/{kind}" if exists else None
-            export["view_url"] = (
-                f"/api/quote-sessions/{public['session_id']}/view/pdf"
-                if kind == "pdf" and exists and not stale
-                else None
-            )
-            if artifact:
-                export["sha256"] = artifact["sha256"]
-                export["size_bytes"] = artifact["size_bytes"]
-            public["exports"][kind] = export
-        public["status"]["draft_modified"] = bool(has_stale_export and not has_available_export)
-        if has_stale_export and not has_available_export:
-            source_status = metadata.get("status") if isinstance(metadata.get("status"), dict) else {}
-            public["status"]["quote_generated"] = bool(
-                source_status.get("quote_generated") is True
-                and not quote_session_has_current_v2_publication(metadata, storage=self)
-            )
-        elif has_available_export:
-            public["status"]["quote_generated"] = True
-        else:
-            public["status"]["quote_generated"] = False
-        return public
+        return QuotePublicationReadView(self, metadata=metadata).project_saved(
+            include_draft_state=include_draft_state, draft_files=draft_files,
+        )
 
     def can_view_other_user_quote_sessions(self) -> bool:
         return self.role == "admin"
@@ -16707,13 +16778,13 @@ class DatabaseSqagStorage:
             if stored_generated_quote and self._expected_storage_failure(exc):
                 raise self._storage_unavailable_error(exc) from exc
             raise
-        committed_metadata = copy.deepcopy(normalized) if publish and stored_generated_quote else None
+        committed = copy.deepcopy(normalized) if publish and stored_generated_quote else None
         try:
             return self._public_quote_session(normalized)
         except Exception as exc:
-            if committed_metadata is None:
+            if committed is None:
                 raise
-            raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
+            raise PostCommitQuoteSessionProjectionError(committed) from exc
 
     def quote_session_evidence_files(self, session_id: str, run_id: str = "") -> list[dict[str, Any]]:
         safe_id = safe_quote_session_id(session_id, "")
@@ -16765,7 +16836,7 @@ class DatabaseSqagStorage:
         session_id: str,
         run_id: str,
         expected_files: list[dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         safe_id = safe_quote_session_id(session_id, "")
         safe_run_id = safe_reference(run_id, "run-")
         if not safe_id or not safe_run_id:
@@ -16803,7 +16874,7 @@ class DatabaseSqagStorage:
             clean_text(current_publication.get("state")).lower() == "published"
             and current_run_id == safe_run_id
         ):
-            return
+            return current_metadata
         if safe_reference(current_publication.get("pending_run_id"), "run-") != safe_run_id:
             raise ValueError("Staged quote session belongs to another generation run.")
 
@@ -16951,6 +17022,7 @@ class DatabaseSqagStorage:
             purpose="quote_publication",
             commit=False,
         )
+        return normalized
 
     def mark_quote_session_publication_failed(self, session_id: str, run_id: str, error_code: str) -> bool:
         safe_id = safe_quote_session_id(session_id, "")
@@ -18459,6 +18531,10 @@ def load_template_profile_pack(profile_id: str | None = None) -> ProfilePack | N
     return profile
 
 
+class PricingReferencePathError(ValueError):
+    """A selected pricing pack resolves outside its permitted directory."""
+
+
 @dataclass(frozen=True)
 class PricingReferencePack:
     """Resolved pricing catalog package independent from quotation profiles."""
@@ -18468,6 +18544,36 @@ class PricingReferencePack:
     config: dict[str, Any]
     source: str = "bundled"
 
+    @staticmethod
+    def _contained_path(root: Path, directory: Path, filename: str) -> Path:
+        try:
+            relative = Path(filename)
+            if relative.is_absolute() or relative.drive:
+                raise ValueError
+            resolved_root = root.resolve()
+            root_text = str(resolved_root)
+            # Admit canonical strings before Path access; retain the resolved-path fence below.
+            directory_text = os.path.join(os.path.realpath(directory), "")
+            if not directory_text.startswith(os.path.join(root_text, "")):
+                raise ValueError
+            resolved_directory = Path(directory_text).resolve()
+            directory_text = str(resolved_directory)
+            path_text = os.path.join(os.path.realpath(resolved_directory / relative), "")
+            if not path_text.startswith(os.path.join(directory_text, "")):
+                raise ValueError
+            resolved_path = Path(path_text).resolve()
+            if not resolved_directory.is_relative_to(resolved_root) or not resolved_path.is_relative_to(resolved_directory):
+                raise ValueError
+        except (OSError, RuntimeError, ValueError):
+            raise PricingReferencePathError("Pricing reference files are unavailable.") from None
+        return resolved_path
+
+    @classmethod
+    def _read_config(cls, root: Path, directory: Path) -> tuple[dict[str, Any], Path]:
+        config = load_json_file(cls._contained_path(root, directory, "reference.json"))
+        catalog_path = cls._contained_path(root, directory, clean_text(config.get("pricing_catalog")) or "pricing-catalog.json")
+        return config, catalog_path
+
     @classmethod
     def resolve(cls, reference_id: str | None = None, source: str = "") -> "PricingReferencePack":
         resolved_id = safe_resource_id(reference_id, DEFAULT_PRICING_REFERENCE_ID)
@@ -18476,24 +18582,14 @@ class PricingReferencePack:
         if requested_source in {"", "local"}:
             local_root = pricing_references_root()
             local_dir = local_root / resolved_id
-            try:
-                local_dir.resolve().relative_to(local_root.resolve())
-            except ValueError:
-                local_dir = local_root / DEFAULT_PRICING_REFERENCE_ID
-            local_config = load_json_file(local_dir / "reference.json")
+            local_config, _ = cls._read_config(local_root, local_dir)
             if local_config or requested_source == "local":
                 reference_id_from_config = safe_resource_id(local_config.get("id"), resolved_id)
                 return cls(reference_id_from_config, local_dir, dict(local_config), "local")
 
         bundled_root = bundled_pricing_references_root()
         reference_dir = bundled_root / resolved_id
-        try:
-            reference_dir.resolve().relative_to(bundled_root.resolve())
-        except ValueError:
-            resolved_id = DEFAULT_PRICING_REFERENCE_ID
-            reference_dir = bundled_root / resolved_id
-
-        config = load_json_file(reference_dir / "reference.json")
+        config, _ = cls._read_config(bundled_root, reference_dir)
         if not config and resolved_id != DEFAULT_PRICING_REFERENCE_ID and requested_source != "local":
             return cls.resolve(DEFAULT_PRICING_REFERENCE_ID, source=requested_source)
         reference_id_from_config = safe_resource_id(config.get("id"), resolved_id)
@@ -18508,30 +18604,23 @@ class PricingReferencePack:
         root = pricing_references_root() if source == "local" else bundled_pricing_references_root()
         reference_dir = root / reference_id
         try:
-            reference_dir.resolve().relative_to(root.resolve())
-        except ValueError:
+            config, catalog_path = cls._read_config(root, reference_dir)
+        except PricingReferencePathError:
             return None
-        config = load_json_file(reference_dir / "reference.json")
         if (
             not isinstance(config, dict)
             or not isinstance(config.get("id"), str)
             or config.get("id") != reference_id
         ):
             return None
-        catalog = load_json_file(reference_dir / (clean_text(config.get("pricing_catalog")) or "pricing-catalog.json"))
+        catalog = load_json_file(catalog_path)
         if not isinstance(catalog, dict) or not isinstance(catalog.get("items"), list) or not catalog.get("items"):
             return None
         return cls(reference_id, reference_dir, dict(config), source)
 
     def asset_path(self, key: str, fallback_filename: str) -> Path:
         filename = clean_text(self.config.get(key)) or fallback_filename
-        path = self.directory / filename
-        try:
-            resolved = path.resolve()
-            resolved.relative_to(self.directory.resolve())
-        except ValueError:
-            return (self.directory / fallback_filename).resolve()
-        return resolved
+        return self._contained_path(self.directory, self.directory, filename)
 
     @property
     def pricing_catalog_path(self) -> Path:
@@ -18682,9 +18771,12 @@ def list_local_pricing_references() -> list[dict[str, Any]]:
                 continue
             if not (path / "reference.json").is_file():
                 continue
-            reference = load_pricing_reference_pack(path.name, source="local")
-            if reference.config:
-                references.append(reference.public_summary())
+            try:
+                reference = load_pricing_reference_pack(path.name, source="local")
+                if reference.config:
+                    references.append(reference.public_summary())
+            except PricingReferencePathError:
+                continue
     if references:
         return sorted(
             references,
@@ -18705,9 +18797,12 @@ def list_bundled_pricing_references() -> list[dict[str, Any]]:
                 continue
             if not (path / "reference.json").is_file():
                 continue
-            reference = load_pricing_reference_pack(path.name, source="bundled")
-            if reference.config:
-                references.append(reference.public_summary())
+            try:
+                reference = load_pricing_reference_pack(path.name, source="bundled")
+                if reference.config:
+                    references.append(reference.public_summary())
+            except PricingReferencePathError:
+                continue
     if references:
         return sorted(
             references,
@@ -18716,8 +18811,11 @@ def list_bundled_pricing_references() -> list[dict[str, Any]]:
                 clean_text(item.get("id")).casefold(),
             ),
         )
-    reference = load_pricing_reference_pack(BUNDLED_DEFAULT_PRICING_REFERENCE_ID, source="bundled")
-    return [reference.public_summary()] if reference.config and reference.source == "bundled" else []
+    try:
+        reference = load_pricing_reference_pack(BUNDLED_DEFAULT_PRICING_REFERENCE_ID, source="bundled")
+        return [reference.public_summary()] if reference.config and reference.source == "bundled" else []
+    except PricingReferencePathError:
+        return []
 
 
 def public_company_pricing_reference(reference: dict[str, Any]) -> dict[str, Any]:
@@ -20013,7 +20111,14 @@ def unresolved_detail_contradicts_selected_reference(
     if bracketed and not bracketed_catalog_reference_parts(detail):
         _tokens, established, mismatch, _detail = catalog_family_evidence_tokens(line_text, item, catalog_items)
         if established and not mismatch:
-            detail = f"[ {bracketed[0]} ] - {clean_text(detail)}"
+            detail_key = comparable_catalog_description_key_without_leading_unit(detail)
+            reference_only = bool(detail_key) and any(
+                comparable_catalog_description_key_without_leading_unit(reference) == detail_key
+                for reference in catalog_reference_values(item)
+            )
+            # A reference-only label supplies identity, not a second independent
+            # description whose words can contradict that same catalogue item.
+            detail = f"[ {bracketed[0]} ]" if reference_only else f"[ {bracketed[0]} ] - {clean_text(detail)}"
     return catalog_line_contradicts_item(detail, item, catalog_items=catalog_items)
 
 
@@ -21186,6 +21291,10 @@ def payload_to_brief(
     )
     canonical_basis_sections = canonical_quote_basis_sections(payload)
 
+    def paragraph_text(value: Any) -> str:
+        # Plain display text retains paragraph boundaries; rich HTML has its own mapper.
+        return "\n".join(multiline_list(str(value or ""), preserve_blank=True)).strip("\n")
+
     return {
         "_pricing_authority_enforced": True,
         "_pricing_reference_authority": trusted_pricing_reference,
@@ -21220,16 +21329,16 @@ def payload_to_brief(
         "notes_heading": clean_text(quote_text.get("notes_heading")),
         "standard_notes": multiline_list(quote_text.get("standard_notes")),
         "acceptance": {
-            "company_name": clean_text(acceptance.get("company_name")) or quote_company_name,
-            "text": clean_text(acceptance.get("text") or quote_text.get("acceptance_text")),
-            "person_label": clean_text(acceptance.get("person_label") or quote_text.get("person_label")),
-            "stamp_label": clean_text(acceptance.get("stamp_label") or quote_text.get("stamp_label")),
-            "date_label": clean_text(acceptance.get("date_label") or quote_text.get("date_label")),
+            "company_name": paragraph_text(acceptance.get("company_name")) or quote_company_name,
+            "text": paragraph_text(acceptance.get("text") or quote_text.get("acceptance_text")),
+            "person_label": paragraph_text(acceptance.get("person_label") or quote_text.get("person_label")),
+            "stamp_label": paragraph_text(acceptance.get("stamp_label") or quote_text.get("stamp_label")),
+            "date_label": paragraph_text(acceptance.get("date_label") or quote_text.get("date_label")),
         },
         "signature": {
-            "company_signatory": clean_text(signature.get("company_signatory")),
-            "company_title": clean_text(signature.get("company_title")),
-            "company_date_label": clean_text(signature.get("company_date_label")),
+            "company_signatory": paragraph_text(signature.get("company_signatory")),
+            "company_title": paragraph_text(signature.get("company_title")),
+            "company_date_label": paragraph_text(signature.get("company_date_label")),
         },
         "rich_text": quote_detail_rich_text(payload),
         "quote_basis_sections": canonical_basis_sections,
@@ -21426,33 +21535,61 @@ def provider_connection_error_message(provider: str, exc: BaseException) -> str:
 
 
 def response_output_text(data: dict[str, Any]) -> str:
-    if isinstance(data.get("output_text"), str):
-        return data["output_text"]
+    diagnostics = openai_response_failure_diagnostics(data)
+    if diagnostics.get("failure_boundary") == "provider_response_shape":
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics=diagnostics)
+    if diagnostics.get("responses_status") not in {"completed", "failed", "incomplete", "in_progress", "queued", "cancelled"}:
+        diagnostics.pop("responses_status", None)
+    if diagnostics.get("incomplete_reason") not in {"max_output_tokens", "content_filter"}:
+        diagnostics.pop("incomplete_reason", None)
+    diagnostics.pop("provider_error_code", None)
+    diagnostics.pop("provider_error_class", None)
+    diagnostics.update(draft_provider_error_diagnostics(data))
+    status = data.get("status")
+    if status == "failed":
+        raise OpenAIAnalysisError("AI response failed.", diagnostics={**diagnostics, "failure_boundary": "provider_response_contract"})
+    if status is not None and status != "completed":
+        raise AIModelOutputError("AI response was not completed.", diagnostics={**diagnostics, "failure_boundary": "provider_response_contract"})
+    if diagnostics.get("refusal_present") or data.get("error") is not None or data.get("incomplete_details"):
+        raise AIModelOutputError("AI response was incomplete or refused.", diagnostics={**diagnostics, "failure_boundary": "provider_response_contract"})
     chunks: list[str] = []
     for item in data.get("output") or []:
-        if not isinstance(item, dict):
-            continue
+        if item.get("status") is not None and item["status"] != "completed":
+            raise AIModelOutputError("AI response was not completed.", diagnostics={"failure_boundary": "provider_response_contract"})
         for content in item.get("content") or []:
-            if isinstance(content, dict) and isinstance(content.get("text"), str):
+            if "text" in content and not isinstance(content["text"], str):
+                raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+            if isinstance(content.get("text"), str):
                 chunks.append(content["text"])
-    return "\n".join(chunks).strip()
+    nested = "\n".join(chunks).strip()
+    shortcut = (data.get("output_text") or "").strip()
+    if shortcut and nested and shortcut != nested:
+        raise AIModelOutputError("AI response contained conflicting text.", diagnostics={"failure_boundary": "provider_response_contract"})
+    return shortcut or nested
 
 
 def chat_completions_output_text(data: dict[str, Any]) -> str:
-    chunks: list[str] = []
-    for choice in data.get("choices") or []:
-        if not isinstance(choice, dict):
-            continue
-        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
-        content = message.get("content")
-        if isinstance(content, str):
-            chunks.append(content)
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and isinstance(item.get("text"), str):
-                    chunks.append(item["text"])
-                elif isinstance(item, str):
-                    chunks.append(item)
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or len(data["choices"]) != 1:
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+    choice = data["choices"][0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+    message = choice["message"]
+    if (choice.get("finish_reason") is not None and choice["finish_reason"] != "stop") or message.get("refusal") is not None or data.get("error") is not None:
+        raise AIModelOutputError("AI response was incomplete or refused.", diagnostics={"failure_boundary": "provider_response_contract"})
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        raise OpenAIAnalysisError("AI response shape was invalid.", diagnostics={"failure_boundary": "provider_response_shape"})
+    chunks = []
+    for item in content:
+        if isinstance(item, str):
+            chunks.append(item)
+        elif isinstance(item, dict) and item.get("type") != "refusal" and "refusal" not in item and isinstance(item.get("text"), str):
+            chunks.append(item["text"])
+        else:
+            raise AIModelOutputError("AI response content was invalid or refused.", diagnostics={"failure_boundary": "provider_response_contract"})
     return "\n".join(chunks).strip()
 
 
@@ -21474,6 +21611,7 @@ SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
     "provider_error_param",
     "request_shape_sha256",
     "failure_boundary",
+    "response_contract_reason",
     "http_status",
     "http_status_class",
     "provider_error_class",
@@ -21609,18 +21747,48 @@ def chat_completions_output_diagnostics(data: dict[str, Any], output_text: str) 
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
+    """One object, optionally fenced or surrounded by harmless explanatory prose.
+
+    Never extract an object from an array, discard another object, accept duplicate
+    keys, or turn non-JSON numeric constants into trusted model data.
+    """
+    if not isinstance(text, str) or len(text) > MAX_JOB_REQUEST_BYTES:
+        raise OpenAIAnalysisError("AI analysis returned invalid JSON.")
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
+    if cleaned.startswith("\x60\x60\x60"):
+        content_start = 7 if cleaned[3:7].lower() == "json" else 3
+        fence_end = cleaned.find("\x60\x60\x60", content_start)
+        if fence_end < 0 or any(char in cleaned[fence_end + 3:] for char in "[]{}\x60"):
+            raise OpenAIAnalysisError("AI analysis returned invalid JSON.")
+        cleaned = cleaned[content_start:fence_end].strip()
     start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise OpenAIAnalysisError("AI analysis did not return JSON.")
+    if start < 0 or any(char in cleaned[:start] for char in "[]{}"):
+        raise OpenAIAnalysisError("AI analysis JSON was not an object.")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_key")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value: str) -> None:
+        raise ValueError("non_json_number")
+
+    def finite_float(value: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non_finite_number")
+        return number
+
     try:
-        parsed = json.loads(cleaned[start:end + 1])
-    except json.JSONDecodeError as exc:
-        raise OpenAIAnalysisError("AI analysis returned invalid JSON.") from exc
+        decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_constant=invalid_constant, parse_float=finite_float)
+        parsed, end = decoder.raw_decode(cleaned[start:])
+        if any(char in cleaned[start + end:] for char in "[]{}"):
+            raise ValueError("trailing_structure")
+    except (ValueError, RecursionError) as exc:
+        raise OpenAIAnalysisError("AI analysis returned invalid JSON.") from None
     if not isinstance(parsed, dict):
         raise OpenAIAnalysisError("AI analysis JSON was not an object.")
     return parsed
@@ -22039,6 +22207,8 @@ def build_quote_draft_prompt(
         "credentials, file paths, or environment variables. "
         "Return only JSON. Do not write a confirmation message. "
         "First-pass JSON may include analysis_findings, but do not include blocking_clarification_questions in first-pass analysis. "
+        "If supplied, analysis_findings must be an array of objects, never strings. Each finding must contain text as a nonblank JSON string. "
+        "Omit analysis_findings or use [] when there are no findings; do not output null, blank rows, or objects without text. A finding may omit confidence; any supplied confidence_pct or confidence must be an integer from 0 to 100, and supplied aliases must agree. "
         "If the uploaded PDFs, extracted PDF pages, images, and quote context do not provide usable booth scope, return empty quote_basis_sections and line_items so the app can show an analysis failure. "
         "Populate editable draft content directly from the visible evidence and quote context. "
         "If quote context JSON includes user_feedback, treat it as the user's requested revision to the "
@@ -22052,7 +22222,7 @@ def build_quote_draft_prompt(
         "and line count should follow the actual booth evidence. Use pricing_reference_sections from Quote context JSON as the fixed section list to match against first. "
         "Only create a new section when a line genuinely does not fit any provided pricing_reference_sections entry. "
         "Sort quote_basis_sections and line_items by pricing reference category_order, then item_order; keep source order for unresolved custom rows. "
-        "Each section must include id, title, and lines. Each line must include tag, text, confidence_pct, quantity, unit, and source_line_item_id when available. "
+        "Each section must include id, title, and lines. Each physical line must have one unique stable id, tag, text, confidence_pct, quantity and unit. All section id, physical line id, and linked source_basis_line_id values must be JSON strings. Use unique section ids matching ^[a-z0-9]+(?:-[a-z0-9]+)*$ (lowercase ASCII letters and digits, separated by single hyphens). Physical line id and linked source_basis_line_id values must match ^[A-Za-z0-9_-]+$ (ASCII letters, digits, underscores, and hyphens only). Use the same id in its linked line_items source_basis_line_id; never reuse an identity for separate physical scope. Pure informational notes may omit measurements and need no output item. "
         "quote_basis_sections line text and line_items.description are customer-facing quotation text. Do not include provenance, reasoning, analysis, or source phrases such as taken from quotation title, visible in image, as seen in render, AI detected, assumed from, likely, appears to be, from reference image, or suggested by image. Put analysis reasons only in analysis_findings or internal notes. "
         "Use quote_basis_sections as the operator review surface for the same pricing sentences that will become output rows. "
         "Every line_items row must correspond to a quote_basis_sections line, and every customer-visible priced or manual-pricing quote_basis_sections line must have a matching line_items row. Do not add output-only rows or hidden catalog variants. "
@@ -22089,7 +22259,7 @@ def build_quote_draft_prompt(
         "Do not collapse a full section into a single subtotal unless that item is genuinely sold as one lump-sum service. "
         "Do not put clarification questions into line_items. Do not put generic review questions into quote_basis_sections. "
         "Quote Basis lines represent included, excluded, confirm, or custom scope; unresolved but quoteable uncertainty belongs in Confirm lines, while missing usable evidence belongs in empty quote_basis_sections and line_items. "
-        "Each line item must include section, quantity, unit, description, pricing_keyword, and source_basis_line_id where possible. Use sqm for square-metre quantities. Do not create ordinary quotation rows with missing quantity or unit. Keep pure informational booth-size lines in Quote Basis only unless they are explicitly included as 1 lot with display_price Included. "
+        "Each line item must include section, quantity, unit, description, pricing_keyword, and source_basis_line_id linked to exactly one physical basis line. Quantities must be positive JSON numbers, not locale-formatted or percent strings. Repeated measurements in text, structured fields and linked rows must agree; never choose one contradictory value. Use sqm for square-metre quantities. Do not create ordinary quotation rows with missing quantity or unit. Keep pure informational booth-size lines in Quote Basis only unless they are explicitly included as 1 lot with display_price Included. "
         "Use the pricing_catalog choices in Quote context JSON. When a catalog item applies, set "
         "pricing_keyword exactly to that catalog id from pricing_catalog, not an invented keyword. "
         "Do not include pricing amounts or internal costs. If no catalog item fits and the item should be customer-visible, keep pricing_keyword empty and let the Custom basis line flag it for manual pricing. "
@@ -22674,7 +22844,21 @@ def quote_basis_sections_with_catalog_exact_lines(
         return bool(clean_text(item.get("pricing_reference_description")) or clean_text(item.get("catalog_description")))
 
     def is_default_dimension_basis_line(line: dict[str, Any]) -> bool:
-        return is_informational_dimension_basis_line(line)
+        # A uniquely linked physical row can keep its measurements on its item.
+        # Dimension-like wording must not suppress that exact row's reconciliation.
+        if not is_informational_dimension_basis_line(line):
+            return False
+        line_ids = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
+        if len(line_ids) == 1:
+            source_id = next(iter(line_ids))
+            item_count = sum(safe_resource_id(item.get("source_basis_line_id"), "") == source_id for item in line_items)
+            basis_count = sum(
+                source_id in {safe_resource_id(candidate.get(key), "") for key in ("id", "source_line_item_id")}
+                for section in sections for candidate in section.get("lines") or [] if isinstance(candidate, dict)
+            )
+            if item_count == 1 and basis_count == 1:
+                return False
+        return True
 
     def mark_line_custom_for_manual_pricing(line: dict[str, Any]) -> None:
         bracketed = bracketed_catalog_reference_parts(line.get("text"))
@@ -22689,6 +22873,10 @@ def quote_basis_sections_with_catalog_exact_lines(
         line.pop("catalog_unit_price", None)
 
     def line_signature(line: dict[str, Any]) -> str:
+        # Identified physical scope never deduplicates by wording or even a
+        # repeated ID: retaining a collision lets ownership checks refuse it.
+        if any(safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")):
+            return ""
         pricing_keyword = clean_text(line.get("pricing_keyword"))
         if pricing_keyword:
             bracketed = bracketed_catalog_reference_parts(line.get("text"))
@@ -23088,7 +23276,8 @@ def quote_basis_sections_with_catalog_exact_lines(
             return "ineligible"
         row = next(iter(rows.values())) if rows else {"description": line.get("text"), "unit": line.get("unit")}
         measured_units = {source_units[row_id] for row_id in ids if source_units and row_id in source_units}
-        if len(measured_units) > 1:
+        if len(measured_units) > 1 or (source_units is not None and (
+                len(measured_units) != 1 or not next(iter(measured_units)))):
             return "unit_review_required"
         selected = {**line, "text": f"[ {clean_text(item.get('description'))} ] - {clean_text(line.get('text'))}"}
         return pricing_selection_compatibility_refusal(
@@ -23873,6 +24062,34 @@ def line_items_with_resolved_basis_catalog(
     return resolved_items
 
 
+def provider_basis_description_key(value: Any, *, catalog_reference_only: bool = True) -> str:
+    bracketed = bracketed_catalog_reference_parts(value)
+    text = bracketed[0] if bracketed and catalog_reference_only else value
+    text = clean_customer_quote_line_text(text).casefold()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def provider_basis_measurements_match(
+    line: dict[str, Any], item: dict[str, Any], *, require_explicit: bool = False,
+) -> bool:
+    line_quantity = parse_float_or_none(line.get("quantity"))
+    item_quantity = parse_float_or_none(item.get("quantity"))
+    line_unit = normalize_pricing_unit(line.get("unit"))
+    item_unit = normalize_pricing_unit(item.get("unit"))
+    if require_explicit:
+        return bool(
+            line_quantity is not None and item_quantity is not None
+            and math.isfinite(line_quantity) and math.isfinite(item_quantity)
+            and not isinstance(line.get("quantity"), bool) and not isinstance(item.get("quantity"), bool)
+            and line_quantity > 0 and item_quantity > 0 and line_quantity == item_quantity
+            and line_unit and item_unit and line_unit == item_unit
+        )
+    if (line_quantity is not None and item_quantity is not None
+            and abs(line_quantity - item_quantity) > 0.001):
+        return False
+    return not (line_unit and item_unit and line_unit != item_unit)
+
+
 def line_items_aligned_to_quote_basis(
     line_items: list[dict[str, Any]],
     sections: list[dict[str, Any]],
@@ -23891,11 +24108,7 @@ def line_items_aligned_to_quote_basis(
     by_pricing_keyword: dict[str, list[int]] = {}
     by_description: dict[str, list[int]] = {}
 
-    def comparable_description(value: Any) -> str:
-        bracketed = bracketed_catalog_reference_parts(value)
-        text = bracketed[0] if bracketed else value
-        text = clean_customer_quote_line_text(text).casefold()
-        return re.sub(r"[^a-z0-9]+", " ", text).strip()
+    comparable_description = provider_basis_description_key
 
     non_output_source_ids: set[str] = set()
     non_output_description_keys: set[str] = set()
@@ -23978,18 +24191,7 @@ def line_items_aligned_to_quote_basis(
                 ids.append(source_id)
         return ids
 
-    def basis_line_dimensions_match_item(line: dict[str, Any], item: dict[str, Any]) -> bool:
-        line_quantity = parse_float_or_none(line.get("quantity"))
-        item_quantity = parse_float_or_none(item.get("quantity"))
-        if (
-            line_quantity is not None
-            and item_quantity is not None
-            and abs(line_quantity - item_quantity) > 0.001
-        ):
-            return False
-        line_unit = normalize_pricing_unit(line.get("unit"))
-        item_unit = normalize_pricing_unit(item.get("unit"))
-        return not (line_unit and item_unit and line_unit != item_unit)
+    basis_line_dimensions_match_item = provider_basis_measurements_match
 
     def existing_item_for_basis_line(line: dict[str, Any]) -> dict[str, Any] | None:
         line_ids = basis_line_ids(line)
@@ -24335,6 +24537,72 @@ def pricing_analysis_seal_mac(key: bytes, scope: str, body: dict[str, Any]) -> s
 def pricing_ledger_quantity(value: Any) -> float | None:
     quantity = parse_float_or_none(value)
     return quantity if quantity is not None and math.isfinite(quantity) and quantity > 0 else None
+
+
+def provider_rows_with_unique_basis_ids(
+    raw_rows: list[Any], sections: list[dict[str, Any]],
+) -> list[Any]:
+    """Bind only unambiguous raw measurements before pricing can rewrite their context.
+
+    The ID is the only copied field. Missing measurement provenance stays missing; a
+    catalogue unit or a later normalised row can never establish a provider unit.
+    """
+    rows = copy.deepcopy(raw_rows)
+    lines = [line for section in sections for line in section.get("lines") or [] if isinstance(line, dict)]
+    basis_id_counts: dict[str, int] = {}
+    for line in lines:
+        for row_id in {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}:
+            basis_id_counts[row_id] = basis_id_counts.get(row_id, 0) + 1
+    explicit_row_ids = {
+        safe_resource_id(row.get(key), "")
+        for row in rows if isinstance(row, dict)
+        for key in ("source_basis_line_id", "id", "source_line_item_id")
+    } - {""}
+    measurements = []
+    for row in rows:
+        if not isinstance(row, dict):
+            measurements.append({})
+            continue
+        unit = normalize_pricing_unit(row.get("unit"))
+        parts = normalized_line_text_quantity_parts(row.get("description"), row.get("quantity"), unit)
+        if parts.get("from_text_prefix") and (
+                (row.get("quantity") not in (None, "") and not provider_basis_measurements_match(
+                    {"quantity": parts["quantity"], "unit": parts["unit"]},
+                    {"quantity": row.get("quantity"), "unit": unit or parts["unit"]},
+                    require_explicit=True,
+                )) or (unit and unit != normalize_pricing_unit(parts["unit"]))):
+            measurements.append({})
+            continue
+        measurements.append({
+            "description": parts["text"],
+            "quantity": parts["quantity"] if parts.get("from_text_prefix") else row.get("quantity"),
+            "unit": parts["unit"] if parts.get("from_text_prefix") else unit,
+        })
+
+    def matches(line: dict[str, Any], measurement: dict[str, Any]) -> bool:
+        key = provider_basis_description_key(line.get("text"), catalog_reference_only=False)
+        return bool(key and key == provider_basis_description_key(
+            measurement.get("description"), catalog_reference_only=False,
+        ) and provider_basis_measurements_match(line, measurement, require_explicit=True))
+
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or any(clean_text(row.get(key)) for key in (
+                "source_basis_line_id", "id", "source_line_item_id")):
+            continue
+        owners = [line for line in lines if matches(line, measurements[index])]
+        if len(owners) != 1:
+            continue
+        line = owners[0]
+        row_ids = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
+        if len(row_ids) != 1:
+            continue
+        row_id = next(iter(row_ids))
+        if basis_id_counts.get(row_id) != 1 or row_id in explicit_row_ids:
+            continue
+        if sum(matches(line, measurement) for measurement in measurements) != 1:
+            continue
+        row["source_basis_line_id"] = row_id
+    return rows
 
 
 def pricing_analysis_source_units(raw_rows: Any) -> dict[str, str]:
@@ -25295,6 +25563,8 @@ def normalize_basis_chat_result(
             raise OpenAIAnalysisError("AI basis chat returned an expanded proposal payload.")
         if set(replacement_value) - {"text", "tag", "confidence", "confidence_pct", "quantity", "unit"}:
             raise OpenAIAnalysisError("AI basis chat returned unsupported replacement-line fields.")
+        provider_row_confidence(replacement_value)
+        provider_row_measurement(replacement_value, replacement_value.get("text", ""))
         message = clean_multiline(raw_proposal.get("message") or parsed.get("message"))
         line_items = normalized_basis_chat_line_items(None, payload, auth_session=auth_session)
         sections = replacement_line_sections(
@@ -25414,12 +25684,225 @@ def pricing_authority_variant_counts(items: list[dict[str, Any]]) -> dict[str, i
     return counts
 
 
+def provider_quote_response_invalid(reason: str) -> None:
+    # Fixed codes only: no provider text, row IDs, measurements or catalogue values.
+    raise AIModelOutputError("AI analysis returned an inconsistent quote response.", diagnostics={
+        "failure_boundary": "model_output_contract", "response_contract_reason": reason,
+    })
+
+
+def provider_quantity(value: Any) -> Decimal | None:
+    """Fresh model measurements only; saved data/currency parsing stays unchanged."""
+    if value is None or value == "":
+        return None
+    if type(value) not in (int, float, str) or isinstance(value, bool):
+        provider_quote_response_invalid("quantity_type")
+    if isinstance(value, str) and not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value.strip()):
+        provider_quote_response_invalid("quantity_format")
+    try:
+        number = Decimal(str(value).strip())
+    except InvalidOperation:
+        provider_quote_response_invalid("quantity_format")
+    if not number.is_finite() or number <= 0 or not math.isfinite(float(number)) or float(number) <= 0:
+        provider_quote_response_invalid("quantity_range")
+    return number
+
+
+def provider_row_measurement(row: dict[str, Any], text: str) -> tuple[Decimal | None, str]:
+    quantity = provider_quantity(row.get("quantity"))
+    raw_unit = row.get("unit")
+    if raw_unit is not None and not isinstance(raw_unit, str):
+        provider_quote_response_invalid("unit_type")
+    unit = normalize_pricing_unit(raw_unit)
+    # Use the existing prefix grammar, but inspect its original numeric token before
+    # legacy parsing can strip punctuation or choose it over contradictory fields.
+    pattern = LEADING_QUANTITY_PREFIX_RE.pattern.replace(
+        r"(?P<quantity>\d[\d,]*(?:\.\d+)?)",
+        r"(?P<quantity>[-+]?(?:\d[\d,.]*(?:[eE][-+]?\d+)?|NaN|Infinity)%?)",
+    )
+    match = re.match(pattern, clean_text(text), flags=re.IGNORECASE)
+    if match:
+        prefix_quantity = provider_quantity(match.group("quantity"))
+        prefix_unit = normalize_quantity_prefix_unit(match.group("unit"))
+        if quantity is not None and quantity != prefix_quantity:
+            provider_quote_response_invalid("quantity_conflict")
+        if unit and not pricing_units_share_quantity_basis(unit, prefix_unit):
+            provider_quote_response_invalid("unit_conflict")
+        quantity, unit = prefix_quantity, unit or prefix_unit
+    return quantity, unit
+
+
+def provider_row_identity(row: dict[str, Any], keys: tuple[str, ...]) -> str:
+    values = []
+    for key in keys:
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        if not isinstance(value, str) or safe_resource_id(value, "") != value.strip():
+            provider_quote_response_invalid("row_identity_shape")
+        values.append(value.strip())
+    if len(set(values)) > 1:
+        provider_quote_response_invalid("row_identity_conflict")
+    return values[0] if values else ""
+
+
+def provider_row_confidence(row: dict[str, Any], *, required: bool = False) -> None:
+    values = [row[key] for key in ("confidence_pct", "confidence") if key in row]
+    if not values and required:
+        provider_quote_response_invalid("confidence_missing")
+    if any(type(value) is not int or not 0 <= value <= 100 for value in values):
+        provider_quote_response_invalid("confidence_scale")
+    if len(set(values)) > 1:
+        provider_quote_response_invalid("confidence_conflict")
+
+
+def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool) -> dict[str, Any]:
+    """Validate fresh response scope before normalisation, pricing or seal creation.
+
+    Missing optional fields remain supported. A supplied structured field must be
+    complete enough to preserve every row. Identity/measurement data is never
+    repaired from a catalogue or from a saved, already-normalised draft.
+    """
+    if not isinstance(parsed, dict):
+        provider_quote_response_invalid("draft_shape")
+    result = copy.deepcopy(parsed)
+    for key in ("line_items", "quote_basis_sections", "analysis_findings", "blocking_clarification_questions"):
+        if key in result and not isinstance(result[key], list):
+            provider_quote_response_invalid("draft_field_shape")
+    if "project" in result and not isinstance(result["project"], dict):
+        provider_quote_response_invalid("project_shape")
+    for key in ("booth_width", "booth_depth"):
+        if key in result.get("project", {}):
+            provider_quantity(result["project"][key])
+    if "quote_basis" in result and (not isinstance(result["quote_basis"], dict) or any(
+            not isinstance(value, str) for value in result["quote_basis"].values())):
+        provider_quote_response_invalid("legacy_basis_shape")
+    for field, text_key in (("analysis_findings", "text"), ("blocking_clarification_questions", "question")):
+        for row in result.get(field, []):
+            if not isinstance(row, dict) or not isinstance(row.get(text_key), str) or not row[text_key].strip():
+                provider_quote_response_invalid("supplementary_row_shape")
+            provider_row_confidence(row)
+    basis_rows = []
+    section_ids = set()
+    for section in result.get("quote_basis_sections", []):
+        if not isinstance(section, dict):
+            provider_quote_response_invalid("section_shape")
+        if "title" in section and not isinstance(section["title"], str):
+            provider_quote_response_invalid("section_shape")
+        section_id = safe_section_id(section.get("id") or section.get("title"), "")
+        if section_id and section_id in section_ids:
+            provider_quote_response_invalid("section_identity_collision")
+        section_ids.add(section_id)
+        if "lines" in section:
+            if not isinstance(section["lines"], list):
+                provider_quote_response_invalid("basis_rows_shape")
+            lines = section["lines"]
+        elif any(isinstance(section.get(key), str) and clean_text(section[key]) for key in ("text", "body")):
+            lines = multiline_list(section.get("text") or section.get("body"))
+        else:
+            provider_quote_response_invalid("basis_rows_shape")
+        for line in lines:
+            if isinstance(line, str) and line.strip():
+                if require_confidence:
+                    provider_quote_response_invalid("confidence_missing")
+                continue
+            if not isinstance(line, dict):
+                provider_quote_response_invalid("basis_row_shape")
+            texts = [line[key] for key in ("text", "line", "description") if key in line and line[key] not in (None, "")]
+            if not texts or any(not isinstance(text, str) or not text.strip() for text in texts):
+                provider_quote_response_invalid("basis_row_text")
+            if len({clean_text(text) for text in texts}) != 1:
+                provider_quote_response_invalid("basis_row_text_conflict")
+            if len(split_basis_decision_text(texts[0], line.get("tag"))) != 1:
+                provider_quote_response_invalid("basis_row_scope_split")
+            row_id = provider_row_identity(line, ("id", "source_line_item_id", "source_basis_line_id"))
+            if row_id:
+                line["id"] = row_id
+            provider_row_confidence(line, required=require_confidence)
+            basis_rows.append((row_id, provider_row_measurement(line, texts[0])))
+    raw_rows = result.get("line_items", [])
+    item_rows = []
+    for row in raw_rows:
+        if not isinstance(row, dict) or not isinstance(row.get("description"), str) or not row["description"].strip():
+            provider_quote_response_invalid("item_row_shape")
+        row_id = provider_row_identity(row, ("source_basis_line_id", "id", "source_line_item_id"))
+        if row_id:
+            row["source_basis_line_id"] = row_id
+        item_rows.append((row_id, provider_row_measurement(row, row["description"])))
+    for rows in (basis_rows, item_rows):
+        ids = [row_id for row_id, _ in rows if row_id]
+        if len(ids) != len(set(ids)):
+            provider_quote_response_invalid("row_identity_collision")
+    items_by_id = {row_id: measurement for row_id, measurement in item_rows if row_id}
+    for row_id, (quantity, unit) in basis_rows:
+        if not row_id or row_id not in items_by_id:
+            continue
+        item_quantity, item_unit = items_by_id[row_id]
+        if quantity is not None and item_quantity is not None and quantity != item_quantity:
+            provider_quote_response_invalid("linked_quantity_conflict")
+        if unit and item_unit and not pricing_units_share_quantity_basis(unit, item_unit):
+            provider_quote_response_invalid("linked_unit_conflict")
+    if raw_rows:
+        sections = normalize_quote_basis_sections(result)
+        bound_rows = provider_rows_with_unique_basis_ids(raw_rows, sections)
+        basis_ids = {row_id for row_id, _ in basis_rows if row_id}
+        for row in bound_rows:
+            row_id = safe_resource_id(row.get("source_basis_line_id"), "")
+            if not row_id or (result.get("quote_basis_sections") and row_id not in basis_ids):
+                provider_quote_response_invalid("item_identity_unresolved")
+        result["line_items"] = bound_rows
+    return result
+
+
+def require_provider_row_coverage(
+    raw_items: list[dict[str, Any]], raw_sections: list[dict[str, Any]],
+    items: list[dict[str, Any]], sections: list[dict[str, Any]],
+) -> None:
+    """Material provider identities must not disappear during derived assembly."""
+    original_basis_ids = {
+        safe_resource_id(line.get("id") or line.get("source_line_item_id"), "")
+        for section in raw_sections for line in section.get("lines", []) if isinstance(line, dict)
+    } - {""}
+    original_item_ids = {safe_resource_id(row.get("source_basis_line_id"), "") for row in raw_items} - {""}
+    basis_ids = [safe_resource_id(line.get("id") or line.get("source_line_item_id"), "")
+                 for section in sections for line in section.get("lines", []) if isinstance(line, dict)]
+    item_ids = [safe_resource_id(row.get("source_basis_line_id"), "") for row in items]
+    if any(basis_ids.count(row_id) != 1 for row_id in original_basis_ids | original_item_ids):
+        provider_quote_response_invalid("basis_row_coverage")
+    if any(item_ids.count(row_id) != 1 for row_id in original_item_ids):
+        provider_quote_response_invalid("item_row_coverage")
+
+
+def require_provider_amount_representable(
+    raw_rows: list[dict[str, Any]], catalog_lookup: dict[str, dict[str, Any]], exchange_rate: float | None,
+) -> None:
+    """Check trusted candidate arithmetic before normalisation can calculate a price."""
+    for row in raw_rows:
+        item = catalog_lookup.get(clean_text(row.get("pricing_keyword")))
+        if not item:
+            continue
+        quantity, _unit = provider_row_measurement(row, row["description"])
+        price = item.get("catalog_unit_price", item.get("sale_unit_price"))
+        if quantity is None or price in (None, ""):
+            continue
+        try:
+            amount = quantity * Decimal(str(price))
+            amounts = [amount]
+            if exchange_rate is not None:
+                amounts.append(amount * Decimal(str(exchange_rate)))
+            if any(not value.is_finite() or round_commercial_cents(float(value)) is None for value in amounts):
+                provider_quote_response_invalid("amount_range")
+        except (InvalidOperation, OverflowError, ValueError):
+            provider_quote_response_invalid("amount_range")
+
+
 def normalize_ai_draft(
     parsed: dict[str, Any],
     payload: dict[str, Any] | None = None,
     require_confidence: bool = False,
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    parsed = admit_provider_quote_draft(parsed, require_confidence=require_confidence)
     has_payload_context = payload is not None
     payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if has_payload_context and pricing_reference_snapshot_for_payload(payload) is None:
@@ -25427,7 +25910,6 @@ def normalize_ai_draft(
         if snapshot is not None:
             payload["_pricing_reference_snapshot"] = snapshot
     raw_line_items = parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []
-    source_units = pricing_analysis_source_units(raw_line_items)
     raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
     dimensions = booth_dimensions_from_payload({"project": raw_project}) if raw_project else {}
     pricing_reference_sections = (
@@ -25435,6 +25917,9 @@ def normalize_ai_draft(
         if has_payload_context
         else []
     )
+    raw_sections = confirm_only_basis_sections(normalize_quote_basis_sections(parsed, pricing_reference_sections))
+    raw_line_items = provider_rows_with_unique_basis_ids(raw_line_items, raw_sections)
+    source_units = pricing_analysis_source_units(raw_line_items)
     trusted_input_authorities: dict[str, dict[str, Any]] = {}
     if has_payload_context and isinstance(payload.get("line_items"), list):
         trusted_input_items = normalize_line_items(
@@ -25443,13 +25928,6 @@ def normalize_ai_draft(
             auth_session=auth_session,
         )
         trusted_input_authorities = trusted_manual_included_input_authorities(trusted_input_items)
-    line_items = normalize_line_items(
-        {**payload, "line_items": raw_line_items},
-        use_catalog=has_payload_context,
-        auth_session=auth_session,
-        provider_result=has_payload_context,
-        trusted_input_authorities=trusted_input_authorities,
-    )
     catalog_lookup = (
         pricing_catalog_runtime_lookup_for_payload(
             payload,
@@ -25459,8 +25937,16 @@ def normalize_ai_draft(
         if has_payload_context
         else {}
     )
+    require_provider_amount_representable(raw_line_items, catalog_lookup, quote_exchange_rate_from_payload(payload))
+    line_items = normalize_line_items(
+        {**payload, "line_items": raw_line_items},
+        use_catalog=has_payload_context,
+        auth_session=auth_session,
+        provider_result=has_payload_context,
+        trusted_input_authorities=trusted_input_authorities,
+    )
     sections = quote_basis_sections_with_catalog_exact_lines(
-        confirm_only_basis_sections(normalize_quote_basis_sections(parsed, pricing_reference_sections)),
+        raw_sections,
         line_items,
         list(catalog_lookup.values()),
         mark_unmatched_confirm_custom=has_payload_context,
@@ -25482,6 +25968,7 @@ def normalize_ai_draft(
         exchange_rate=quote_exchange_rate_from_payload(payload),
         quote_currency=quote_currency_from_payload(payload),
     )
+    require_provider_row_coverage(raw_line_items, raw_sections, line_items, sections)
     legacy_basis = quote_basis_from_sections(sections)
     blockers = normalize_blocking_clarification_questions(parsed.get("blocking_clarification_questions"))
     if blockers:
@@ -25845,39 +26332,12 @@ def request_openai_quote_basis(
         response_diagnostics.pop("incomplete_reason", None)
     response_diagnostics["request_shape_sha256"] = shape_fingerprint
     response_diagnostics["attempt_number"] = 1
-    if (
-        not isinstance(data, dict)
-        or response_diagnostics.get("failure_boundary") == "provider_response_shape"
-    ):
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response shape was invalid.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
-        )
-    if (
-        ("output" in data and data.get("output") is not None and not isinstance(data.get("output"), list))
-        or ("output_text" in data and data.get("output_text") is not None and not isinstance(data.get("output_text"), str))
-    ):
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response shape was invalid.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
-        )
-    if response_diagnostics.get("responses_status") == "failed":
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response failed.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_contract"},
-        )
-    if response_diagnostics.get("responses_status") == "incomplete" or response_diagnostics.get("refusal_present"):
-        raise AIModelOutputError(
-            "OpenAI analysis response was incomplete or refused.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_contract"},
-        )
     try:
         output_text = response_output_text(data)
-    except (AttributeError, TypeError) as exc:
-        raise OpenAIAnalysisError(
-            "OpenAI analysis response shape was invalid.",
-            diagnostics={**response_diagnostics, "failure_boundary": "provider_response_shape"},
-        ) from exc
+    except OpenAIAnalysisError as exc:
+        raise type(exc)(str(exc), diagnostics={
+            **response_diagnostics, **exc.diagnostics,
+        }) from None
     try:
         parsed = parse_json_object(output_text)
     except OpenAIAnalysisError as exc:
@@ -25893,9 +26353,10 @@ def request_openai_quote_basis(
             auth_session=auth_session,
         )
     except OpenAIAnalysisError as exc:
-        raise OpenAIAnalysisError(
+        raise type(exc)(
             str(exc),
-            diagnostics={**response_diagnostics, "failure_boundary": "application_normalization"},
+            diagnostics={**response_diagnostics, **safe_ai_output_diagnostics(exc.diagnostics),
+                         "failure_boundary": exc.diagnostics.get("failure_boundary", "application_normalization")},
         ) from exc
     except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
         raise OpenAIAnalysisError(
@@ -26377,6 +26838,9 @@ def finalized_remote_draft_result(
                 line["tag"] = "Custom"
                 line["custom_pricing"] = True
                 line.pop("pricing_keyword", None)
+    if source.strip().lower() != "local":
+        require_provider_row_coverage(ai_basis.get("line_items", []), ai_basis.get("quote_basis_sections", []),
+                                      line_items, adjusted_sections)
     adjusted_basis = quote_basis_from_sections(adjusted_sections)
     final_line_items = line_items or fallback_line_items
     # The seal attests provider-derived rows only, in the units the provider measured them in.
@@ -26422,7 +26886,7 @@ def protected_ai_draft_mode_enabled(auth_session: dict[str, Any] | None = None) 
 def protected_ai_draft_blocked_result(error_reference: str) -> dict[str, Any]:
     return {
         "status": "blocked",
-        "errors": [AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE],
+        "errors": generic_referenced_errors(error_reference),
         "error_reference": clean_text(error_reference),
     }
 
@@ -26662,7 +27126,16 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 error_reference=error_reference,
                 details=provider_failure_details,
             )
-            if protected_mode:
+            write_local_log(
+                "openai_draft_failed",
+                {
+                    "error_reference": error_reference,
+                    **provider_failure_details,
+                },
+            )
+            if protected_mode or exc.diagnostics.get("failure_boundary") in {
+                "model_output_contract", "model_output_json", "provider_response_shape", "provider_response_contract", "application_normalization",
+            } or exc.diagnostics.get("response_contract_reason"):
                 log_protected_ai_draft_block(
                     error_reference=error_reference,
                     reason="remote_ai_failed",
@@ -26671,13 +27144,6 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                     exc=exc,
                 )
                 return protected_ai_draft_blocked_result(error_reference)
-            write_local_log(
-                "openai_draft_failed",
-                {
-                    "error_reference": error_reference,
-                    **provider_failure_details,
-                },
-            )
 
     if remote_errors:
         try:
@@ -26829,7 +27295,74 @@ def read_pricing_matches(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f))
+        reader = csv.DictReader(f)
+        if reader.fieldnames and len(reader.fieldnames) != len(set(reader.fieldnames)):
+            raise ValueError("Generator diagnostics contain duplicate columns.")
+        return list(reader)
+
+
+GENERATION_OUTPUT_ROWS_SCHEMA = "swooshz.quote-output-rows.v1"
+
+
+def generation_output_rows(brief_rows: Any, matches: Any) -> dict[str, Any]:
+    """Project exact generator outcomes onto this job's admitted rows, never CSV prices.
+
+    prepare_lines emits one diagnostic per dictionary final-brief row. Worksheet
+    section/header expansion happens later and is not a diagnostic row. Explicit
+    per-export tokens bind even legacy manual rows with no unique basis ID.
+    """
+    if (not isinstance(brief_rows, list) or not brief_rows
+            or not isinstance(matches, list) or len(matches) != len(brief_rows)):
+        raise ValueError("Generator diagnostic correspondence is incomplete.")
+    expected: dict[str, dict[str, Any]] = {}
+    source_counts: dict[str, int] = {}
+    for row in brief_rows:
+        if not isinstance(row, dict):
+            raise ValueError("Generator brief row is invalid.")
+        token = row.get("diagnostic_row_id")
+        source_id = row.get("source_basis_line_id")
+        if (not isinstance(token, str) or not re.fullmatch(r"row-(?:0|[1-9][0-9]*)", token)
+                or token in expected or not isinstance(source_id, str)):
+            raise ValueError("Generator diagnostic identity is invalid.")
+        expected[token] = row
+        source_counts[source_id] = source_counts.get(source_id, 0) + 1
+    outcomes: dict[str, dict[str, Any]] = {}
+    for match in matches:
+        if not isinstance(match, dict):
+            raise ValueError("Generator diagnostic row is invalid.")
+        token = match.get("diagnostic_row_id")
+        if not isinstance(token, str) or token not in expected or token in outcomes:
+            raise ValueError("Generator diagnostic identity does not match this job.")
+        source_id = expected[token]["source_basis_line_id"]
+        # Compare the known value with the CSV writer's formula-safe encoding;
+        # never decode/evaluate spreadsheet text or derive identity from a label.
+        csv_source_id = "'" + source_id if source_id.lstrip()[:1] in {"=", "+", "-", "@"} else source_id
+        if match.get("source_basis_line_id") != csv_source_id:
+            raise ValueError("Generator source row identity changed.")
+        outcomes[token] = match
+    rows = []
+    for token, captured in expected.items():
+        outcome = outcomes[token]
+        status = outcome.get("status")
+        authority = captured.get("pricing_authority")
+        variant = authority.get("variant") if isinstance(authority, dict) else ""
+        row = copy.deepcopy(captured)
+        if variant == "catalog" and status in {"unmatched", "quantity-review"}:
+            row = reject_catalog_line_item_authority(row)
+        elif variant == "catalog" and status == "matched":
+            source_id = captured["source_basis_line_id"]
+            if (not source_id or source_counts[source_id] != 1
+                    or outcome.get("pricing_id") != authority.get("catalog_item_id")):
+                raise ValueError("Generator catalogue identity is ambiguous.")
+        elif ((variant == "manual" and status == "manual-price")
+                or (variant == "included" and status == "included")
+                or (variant in {"none", "historical"} and status in {"unmatched", "quantity-review"})):
+            pass
+        else:
+            raise ValueError("Generator outcome contradicts admitted pricing authority.")
+        row["status"] = status
+        rows.append(row)
+    return {"schema": GENERATION_OUTPUT_ROWS_SCHEMA, "rows": rows}
 
 
 def read_export_status(path: Path) -> dict[str, str]:
@@ -26867,6 +27400,8 @@ def quote_session_result_files(session: dict[str, Any] | None) -> list[dict[str,
         url = clean_text(export.get("url"))
         if export.get("exists") is True and export.get("stale") is not True and url.startswith("/api/quote-sessions/"):
             item = {"name": filename, "url": url}
+            if kind == "pdf" and clean_text(export.get("view_url")):
+                item["view_url"] = export["view_url"]
             size = int(export.get("size_bytes") or 0)
             if size > 0:
                 item["bytes"] = str(size)
@@ -27712,13 +28247,11 @@ QUOTE_BASIS_LEGACY_ORDER = (
     "furniture",
     "electrical",
 )
-QUOTE_BASIS_KEY_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 QUOTE_BASIS_UNSAFE_KEYS = {"__proto__", "constructor", "prototype"}
 PRIMARY_ORDER_FIELDS = ("basis_order", "category_order", "item_order")
 QUOTE_BASIS_SECTION_ORDER_FIELDS = (*PRIMARY_ORDER_FIELDS, "section_order")
 PRIMARY_ORDER_MAX = 9007199254740991
 PRIMARY_ORDER_MAX_TEXT = str(PRIMARY_ORDER_MAX)
-PRIMARY_ORDER_ASCII_DIGITS_RE = re.compile(r"[0-9]+\Z")
 
 
 def canonical_quote_basis(value: Any) -> dict[str, str]:
@@ -27731,7 +28264,7 @@ def canonical_quote_basis(value: Any) -> dict[str, str]:
         if (
             not isinstance(key, str)
             or not 1 <= len(key) <= 80
-            or QUOTE_BASIS_KEY_RE.fullmatch(key) is None
+            or not all(part and part.isascii() and part.isalnum() and part == part.lower() for part in key.split("-"))
             or key in QUOTE_BASIS_UNSAFE_KEYS
         ):
             raise ValueError("Quote basis contains an invalid key.")
@@ -27758,7 +28291,7 @@ def canonical_primary_order_value(value: Any) -> int | None:
     if not isinstance(value, str):
         return None
     text = value.strip(" \t\r\n")
-    if not text or PRIMARY_ORDER_ASCII_DIGITS_RE.fullmatch(text) is None:
+    if not text or not text.isascii() or not text.isdecimal():
         return None
     significant = text.lstrip("0")
     if not significant:
@@ -28281,6 +28814,65 @@ def quote_session_current_v2_publication_proof(
         if not quote_session_publication_authority_matches(metadata, authority):
             return None
     return proof
+
+
+def quote_publication_projection_identity(
+    metadata: dict[str, Any],
+    storage: LocalSqagStorage | DatabaseSqagStorage,
+    kind: str,
+) -> tuple[Any, ...] | None:
+    """Immutable committed identity; current requester credentials are excluded."""
+    if kind not in QUOTE_SESSION_EXPORT_KINDS or not isinstance(metadata, dict):
+        return None
+    database = isinstance(storage, DatabaseSqagStorage)
+    workspace_id = storage.workspace_id if database else "local-workspace"
+    owner_id = storage._quote_session_owner_id(metadata) if database else "local-user"
+    proof = quote_session_current_v2_publication_proof(
+        metadata, metadata, workspace_id=workspace_id, owner_id=owner_id,
+        authority=None, require_authority=False,
+    )
+    if proof is None:
+        return None
+    publication = proof["publication"]
+    artifact = proof["artifacts"].get(kind)
+    if not isinstance(artifact, dict):
+        return None
+    # Fixed field order and exact types form the versioned canonical JSON array.
+    return (
+        "quote-publication-comparison-v1", "workspace" if database else "local",
+        proof["subject"]["workspace_id"], proof["subject"]["owner_id"],
+        proof["subject"]["session_id"], publication["id"],
+        publication["run_id"], publication["job_id"], proof["output_revision"],
+        proof["commercial_state_schema"], proof["commercial_state_digest"], kind,
+        artifact["filename"], artifact["publication_id"], artifact["run_id"],
+        artifact["sha256"], artifact["size_bytes"],
+    )
+
+
+def quote_publication_binding(identity: tuple[Any, ...] | None) -> str | None:
+    if identity is None:
+        return None
+    return hashlib.sha256(json.dumps(
+        identity, ensure_ascii=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def quote_publication_url(session_id: str, kind: str, identity: tuple[Any, ...] | None, *, inline: bool = False) -> str | None:
+    binding = quote_publication_binding(identity)
+    if binding is None:
+        return None
+    route = "view/pdf" if inline and kind == "pdf" else f"download/{kind}"
+    return f"/api/quote-sessions/{session_id}/{route}?publication={binding}"
+
+
+def quote_publication_query(query: str) -> tuple[bool, str | None]:
+    """Only absence selects CURRENT; an invalid supplied comparison denies."""
+    values = parse_qs(query, keep_blank_values=True).get("publication")
+    if values is None:
+        return True, None
+    if len(values) != 1 or re.fullmatch(r"[0-9a-f]{64}", values[0]) is None:
+        return False, None
+    return True, values[0]
 
 
 def quote_artifact_matches_publication_proof(
@@ -28930,7 +29522,19 @@ def atomic_write_text(path: Path, content: str) -> None:
 def result_has_generated_quote(result: dict[str, Any] | None) -> bool:
     if not isinstance(result, dict):
         return False
-    return clean_text(result.get("status")) in {"completed", "needs_confirmation", "needs_review", "degraded"}
+    status = clean_text(result.get("status"))
+    if status not in {"completed", "needs_confirmation", "needs_review", "degraded"}:
+        return False
+    if status != "completed" and "files" in result:
+        # A pricing review can stop before a workbook exists. Completed results
+        # still reach storage's missing-artifact check rather than becoming drafts.
+        files = result["files"]
+        return isinstance(files, list) and any(
+            isinstance(item, dict) and clean_text(item.get("name")) == "quotation.xlsx"
+            for item in files
+        )
+    # Legacy results without declarations retain guarded output-dir discovery.
+    return True
 
 
 def quote_session_timestamp_sort_value(value: Any) -> float:
@@ -29464,6 +30068,7 @@ def create_or_update_quote_session(
     session_id: str | None = None,
     *,
     storage: LocalSqagStorage | None = None,
+    committed_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     persistence_review = quote_commercial_persistence_preflight(payload)
     if persistence_review:
@@ -29562,6 +30167,8 @@ def create_or_update_quote_session(
             raise
     finally:
         QUOTE_SESSION_TRANSACTION_CONTEXT.reset(transaction_token)
+    if committed_publication is not None and committed_metadata is not None:
+        committed_metadata.update(copy.deepcopy(metadata))
     try:
         return public_quote_session(metadata)
     except Exception as exc:
@@ -29621,64 +30228,173 @@ def quote_session_draft_progress(draft_state: dict[str, Any]) -> dict[str, str]:
     }
 
 
+class QuotePublicationReadView:
+    """One response owns admitted scope, a copied snapshot and verified facts."""
+
+    def __init__(
+        self, storage: LocalSqagStorage | DatabaseSqagStorage, *,
+        metadata: dict[str, Any] | None = None,
+        job_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        self.storage = storage
+        self.metadata = copy.deepcopy(metadata) if isinstance(metadata, dict) else None
+        self.job = job_snapshot
+        self.facts: dict[str, dict[str, Any]] = {}
+        self.resolved = False
+
+    def _resolve(self) -> None:
+        if self.resolved:
+            return
+        self.resolved = True
+        if self.metadata is None:
+            result = self.job.get("result") if isinstance(self.job, dict) else None
+            session = result.get("quote_session") if isinstance(result, dict) else None
+            session_id = safe_quote_session_id(session.get("session_id"), "") if isinstance(session, dict) else ""
+            if not session_id:
+                self.metadata = {}
+                return
+            if isinstance(self.storage, DatabaseSqagStorage):
+                self.metadata, _draft_files = self.storage._read_quote_session_metadata(session_id)
+            else:
+                self.metadata = read_quote_session_metadata(session_id)
+        metadata = self.metadata or {}
+        expected = self.job.get("_quote_publication_identity") if isinstance(self.job, dict) else None
+        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+            raw = metadata.get("exports", {}).get(kind) if isinstance(metadata.get("exports"), dict) else None
+            recorded = isinstance(raw, dict) and raw.get("filename") == filename
+            identity = quote_publication_projection_identity(metadata, self.storage, kind)
+            fact: dict[str, Any] = {"eligible": False, "identity": identity, "recorded": recorded}
+            self.facts[kind] = fact
+            if identity is None or (self.job is not None and (not isinstance(expected, dict) or expected.get(kind) != identity)):
+                continue
+            if kind == "pdf":
+                artifact = self.storage.quote_session_export_artifact(
+                    metadata["session_id"], kind, require_current_proof=True,
+                    expected_projection_identity=identity,
+                )
+            elif isinstance(self.storage, LocalSqagStorage):
+                artifact = self.storage.quote_session_export_metadata(metadata["session_id"], kind, expected_projection_identity=identity)
+            else:
+                # XLSX retains its metadata projection; delivery verifies the actual bytes.
+                artifact = self.storage._quote_artifact_metadata(metadata["session_id"], kind, expected_projection_identity=identity)
+                if artifact and (
+                    artifact.get("sha256") != raw.get("sha256")
+                    or artifact.get("size_bytes") != raw.get("size_bytes")
+                ):
+                    artifact = None
+                if artifact and not quote_session_has_current_v2_publication(metadata, storage=self.storage):
+                    artifact = None
+            if artifact is None:
+                continue
+            # Body bytes never enter the public facts.
+            fact.update({
+                "eligible": True, "sha256": artifact["sha256"], "size_bytes": artifact["size_bytes"],
+                "url": quote_publication_url(metadata["session_id"], kind, identity),
+                "view_url": quote_publication_url(metadata["session_id"], kind, identity, inline=True) if kind == "pdf" else None,
+            })
+
+    def project_saved(self, *, include_draft_state: bool = False, draft_files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        self._resolve()
+        normalized = normalized_quote_session_metadata(self.metadata or {})
+        if not normalized:
+            return {}
+        public = copy.deepcopy(normalized)
+        public.pop("publication", None)
+        public.pop("owner", None)
+        public["pricing_ledger"] = public_pricing_ledger(normalized)
+        draft = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
+        public["has_draft_state"] = bool(draft)
+        progress = quote_session_draft_progress(draft)
+        if progress:
+            public["draft_progress"] = progress
+        if include_draft_state:
+            public["draft_files"] = copy.deepcopy(draft_files or []) if isinstance(self.storage, DatabaseSqagStorage) else read_quote_session_draft_files(normalized["session_id"], normalized)
+        else:
+            public.pop("draft_state", None)
+            public.pop("draft_files", None)
+        has_stale = False
+        has_available = False
+        for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
+            export = public["exports"].get(kind)
+            export = export if isinstance(export, dict) else {}
+            fact = self.facts.get(kind, {})
+            recorded = export.get("filename") == filename
+            eligible = fact.get("eligible") is True
+            stale = bool(recorded and quote_session_export_is_stale(normalized, export))
+            export.update({
+                "filename": filename if recorded else None,
+                "exists": True if eligible else None if recorded else False,
+                "missing": None if recorded and not eligible else False,
+                "stale": stale, "verified": eligible,
+                "availability": "available" if eligible else "unverified" if recorded else "not_recorded",
+                "url": fact.get("url") if eligible else None,
+                "view_url": fact.get("view_url") if eligible else None,
+            })
+            if eligible:
+                export.update({"sha256": fact["sha256"], "size_bytes": fact["size_bytes"]})
+            public["exports"][kind] = export
+            has_stale = has_stale or stale
+            has_available = has_available or eligible
+        public["status"]["draft_modified"] = bool(has_stale and not has_available)
+        public["status"]["quote_generated"] = has_available
+        return public
+
+    def project_job(self) -> dict[str, Any]:
+        snapshot = self.job or {}
+        public = public_job(snapshot)
+        result = public.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("quote_session"), dict):
+            return public
+        if snapshot.get("type") not in {"generate", "generate_pdf"} or snapshot.get("status") != "completed" or result.get("status") != "completed":
+            return public
+        if result.get("post_commit_projection"):
+            return public
+        self._resolve()
+        session = result["quote_session"]
+        exports = session.get("exports") if isinstance(session.get("exports"), dict) else {}
+        files = []
+        by_name = {filename: kind for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items()}
+        for item in result.get("files", []) if isinstance(result.get("files"), list) else []:
+            kind = by_name.get(item.get("name")) if isinstance(item, dict) else None
+            if kind is None:
+                files.append(item)
+                continue
+            fact = self.facts.get(kind, {})
+            if fact.get("eligible"):
+                files.append({**item, "url": fact["url"], **({"view_url": fact["view_url"]} if kind == "pdf" else {})})
+        for kind in QUOTE_SESSION_EXPORT_KINDS:
+            export = exports.get(kind)
+            if not isinstance(export, dict):
+                continue
+            fact = self.facts.get(kind, {})
+            eligible = fact.get("eligible") is True
+            export.update({
+                "url": fact.get("url") if eligible else None,
+                "view_url": fact.get("view_url") if eligible else None,
+                "exists": True if eligible else None, "missing": False if eligible else None,
+                "verified": eligible, "availability": "available" if eligible else "unverified",
+            })
+        result["files"] = files
+        return public
+
+
 def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool = False) -> dict[str, Any]:
-    normalized = normalized_quote_session_metadata(metadata)
-    if not normalized:
-        return {}
-    session_id = normalized["session_id"]
-    public = copy.deepcopy(normalized)
-    published = quote_session_is_published(normalized)
-    public.pop("publication", None)
-    public.pop("owner", None)
-    public["pricing_ledger"] = public_pricing_ledger(normalized)
-    draft_state = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
-    public["has_draft_state"] = bool(draft_state)
-    draft_progress = quote_session_draft_progress(draft_state)
-    if draft_progress:
-        public["draft_progress"] = draft_progress
-    if not include_draft_state:
-        public.pop("draft_state", None)
-        public.pop("draft_files", None)
-    else:
-        public["draft_files"] = read_quote_session_draft_files(session_id, normalized)
-    has_stale_export = False
-    has_available_export = False
-    for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
-        raw_export = public["exports"].get(kind) if isinstance(public["exports"].get(kind), dict) else {}
-        recorded_filename = clean_text(raw_export.get("filename"))
-        safe_recorded = recorded_filename if recorded_filename == filename else ""
-        export_path = (
-            quote_session_recorded_export_path(session_id, kind, normalized)
-            if safe_recorded
-            else None
-        )
-        file_exists = bool(published and export_path and export_path.exists() and export_path.is_file())
-        stale = bool(file_exists and quote_session_export_is_stale(normalized, raw_export))
-        exists = file_exists
-        has_stale_export = has_stale_export or stale
-        has_available_export = has_available_export or (exists and not stale)
-        raw_export["filename"] = safe_recorded or None
-        raw_export["exists"] = exists
-        raw_export["missing"] = bool(safe_recorded and not file_exists)
-        raw_export["stale"] = stale
-        raw_export["url"] = f"/api/quote-sessions/{session_id}/download/{kind}" if exists else None
-        raw_export["view_url"] = (
-            f"/api/quote-sessions/{session_id}/view/pdf"
-            if kind == "pdf" and exists and not stale
-            else None
-        )
-        if file_exists and export_path is not None:
-            raw_export["sha256"] = hashlib.sha256(export_path.read_bytes()).hexdigest()
-            raw_export["size_bytes"] = export_path.stat().st_size
-        public["exports"][kind] = raw_export
-    public["status"]["draft_modified"] = bool(has_stale_export and not has_available_export)
-    if has_stale_export and not has_available_export:
-        public["status"]["quote_generated"] = False
-    elif has_available_export:
-        public["status"]["quote_generated"] = True
-    else:
-        public["status"]["quote_generated"] = False
-    return public
+    return QuotePublicationReadView(LocalSqagStorage(), metadata=metadata).project_saved(include_draft_state=include_draft_state)
+
+
+def projected_public_job(snapshot: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = snapshot.get("result")
+    if (
+        snapshot.get("status") != "completed"
+        or snapshot.get("type") not in {"generate", "generate_pdf"}
+        or not isinstance(result, dict)
+        or not isinstance(result.get("quote_session"), dict)
+        or result.get("status") != "completed"
+        or result.get("post_commit_projection")
+    ):
+        return public_job(snapshot)
+    storage = quote_session_storage_for_auth_session(auth_session)
+    return QuotePublicationReadView(storage, job_snapshot=snapshot).project_job()
 
 
 def committed_quote_session_artifacts(metadata: dict[str, Any]) -> list[dict[str, str]]:
@@ -29753,6 +30469,7 @@ def committed_quote_session_projection(
         export["missing"] = None if has_recorded_export else False
         export["stale"] = None if has_recorded_export else False
         export["url"] = None
+        export["view_url"] = None
         exports[kind] = export
     public["exports"] = exports
     public.setdefault("status", {})["quote_generated"] = True
@@ -29765,6 +30482,7 @@ def committed_quote_session_projection(
 def committed_quote_session_downloads(
     metadata: dict[str, Any],
     artifacts: list[dict[str, str]],
+    *, storage: LocalSqagStorage | DatabaseSqagStorage,
 ) -> list[dict[str, str]]:
     session_id = safe_quote_session_id(metadata.get("session_id"), "")
     if not session_id:
@@ -29779,10 +30497,13 @@ def committed_quote_session_downloads(
         artifact = by_name.get(filename)
         if not artifact:
             continue
-        item = {
-            "name": filename,
-            "url": f"/api/quote-sessions/{session_id}/download/{kind}",
-        }
+        identity = quote_publication_projection_identity(metadata, storage, kind)
+        url = quote_publication_url(session_id, kind, identity)
+        if url is None:
+            continue
+        item = {"name": filename, "url": url}
+        if kind == "pdf":
+            item["view_url"] = quote_publication_url(session_id, kind, identity, inline=True)
         if clean_text(artifact.get("bytes")):
             item["bytes"] = clean_text(artifact.get("bytes"))
         digest = clean_text(artifact.get("sha256")).lower()
@@ -30108,7 +30829,7 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
     if clean_text(job.get("generation_run_id")):
         payload["generation_run_id"] = clean_text(job.get("generation_run_id"))
     if isinstance(job.get("result"), dict):
-        payload["result"] = job["result"]
+        payload["result"] = copy.deepcopy(job["result"])
     if isinstance(job.get("errors"), list) and job["errors"]:
         payload["errors"] = job["errors"]
     if clean_text(job.get("error_reference")):
@@ -30167,11 +30888,16 @@ def job_owner_context_from_auth_session(session: dict[str, Any] | None) -> dict[
     return owner
 
 
-def job_visible_to_auth_session(job: dict[str, Any], session: dict[str, Any] | None) -> bool:
-    if not protected_job_routes_enabled(session):
+def job_visibility_context(session: dict[str, Any] | None) -> tuple[bool, dict[str, str]]:
+    # Configuration and requester admission can read files; capture before JOBS_LOCK.
+    return protected_job_routes_enabled(session), job_owner_context_from_auth_session(session)
+
+
+def job_visible_to_context(job: dict[str, Any], context: tuple[bool, dict[str, str]]) -> bool:
+    protected, requester = context
+    if not protected:
         return True
     owner = job.get("owner") if isinstance(job.get("owner"), dict) else {}
-    requester = job_owner_context_from_auth_session(session)
     owner_user_id = clean_text(owner.get("user_id"))
     requester_user_id = clean_text(requester.get("user_id"))
     if not owner_user_id or not requester_user_id or owner_user_id != requester_user_id:
@@ -30181,6 +30907,10 @@ def job_visible_to_auth_session(job: dict[str, Any], session: dict[str, Any] | N
     if owner_workspace_id and owner_workspace_id != requester_workspace_id:
         return False
     return True
+
+
+def job_visible_to_auth_session(job: dict[str, Any], session: dict[str, Any] | None) -> bool:
+    return job_visible_to_context(job, job_visibility_context(session))
 
 
 def legacy_job_artifact_download_allowed(session: dict[str, Any] | None) -> bool:
@@ -30301,12 +31031,13 @@ def finish_draft_job(job_id: str, payload: dict[str, Any], auth_session: dict[st
 
 
 def finish_generate_job(job_id: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> None:
+    publication_identity: dict[str, tuple[Any, ...]] = {}
     try:
         pdf_mode = "workbook" if payload_requests_pdf_view(payload) else "none"
-        result = run_quote_job(payload, job_id=job_id, pdf_mode=pdf_mode, auth_session=safe_auth_session_for_async(auth_session))
+        result = run_quote_job(payload, job_id=job_id, pdf_mode=pdf_mode, auth_session=safe_auth_session_for_async(auth_session), publication_identity_capture=publication_identity)
         status_map = {"needs_confirmation": "needs_review"}
         status = status_map.get(clean_text(result.get("status")), clean_text(result.get("status")) or "failed")
-        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [])
+        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [], _quote_publication_identity=publication_identity)
     except Exception as exc:  # pragma: no cover - defensive worker boundary
         error_reference = new_error_reference()
         result = failed_result_payload(error_reference)
@@ -30322,11 +31053,12 @@ def payload_requests_pdf_view(payload: dict[str, Any]) -> bool:
 
 
 def finish_generate_pdf_job(job_id: str, payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> None:
+    publication_identity: dict[str, tuple[Any, ...]] = {}
     try:
-        result = run_quote_job(payload, job_id=job_id, pdf_mode="workbook", auth_session=safe_auth_session_for_async(auth_session))
+        result = run_quote_job(payload, job_id=job_id, pdf_mode="workbook", auth_session=safe_auth_session_for_async(auth_session), publication_identity_capture=publication_identity)
         status_map = {"needs_confirmation": "needs_review"}
         status = status_map.get(clean_text(result.get("status")), clean_text(result.get("status")) or "failed")
-        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [])
+        set_job_state(job_id, status=status, result=result, errors=result.get("errors") or [], _quote_publication_identity=publication_identity)
     except Exception as exc:  # pragma: no cover - defensive worker boundary
         errors = safe_error_messages([str(exc)])
         error_reference = new_error_reference()
@@ -31250,13 +31982,14 @@ def finish_generation_forensics(
                         commit=False,
                     )
                 if atomic_publication and publication_storage is not None:
-                    publication_storage.publish_quote_session_forensic_transaction(
+                    committed_metadata = publication_storage.publish_quote_session_forensic_transaction(
                         store.connection,
                         publication_session_id,
                         run_id,
                         publication_files or [],
                     )
                     store.connection.commit()
+                    enriched["_committed_quote_metadata"] = committed_metadata
                 elif has_post_commit_projection_failure:
                     store.connection.commit()
             except Exception:
@@ -31659,6 +32392,7 @@ def create_job(
                 if generation_run_id else None
             ),
         )
+    visibility_context = job_visibility_context(auth_session)
     requested_job_id = clean_text(requested_job_id)
     if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
         return blocked(["Job request could not be resumed."], "job_resume_invalid")
@@ -31666,9 +32400,11 @@ def create_job(
         with JOBS_LOCK:
             existing = JOBS.get(requested_job_id)
             if existing:
-                if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
+                if existing.get("type") != normalized_type or not job_visible_to_context(existing, visibility_context):
                     return {"status": "blocked", "errors": ["Job request could not be resumed."]}
-                return public_job(existing)
+                existing = copy.deepcopy(existing)
+        if existing:
+            return projected_public_job(existing, auth_session)
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
     if normalized_type in {"draft", "generate", "generate_pdf"}:
         validated_session_id = validated_generation_session_id(payload, auth_session)
@@ -31817,11 +32553,14 @@ def create_job(
     }
     with JOBS_LOCK:
         existing = JOBS.get(job_id)
-        if existing:
-            if existing.get("type") != normalized_type or not job_visible_to_auth_session(existing, auth_session):
-                return blocked(["Job request could not be resumed."], "job_resume_invalid")
-            return public_job(existing)
-        JOBS[job_id] = job
+        rejected_resume = bool(existing and (existing.get("type") != normalized_type or not job_visible_to_context(existing, visibility_context)))
+        existing = copy.deepcopy(existing) if existing and not rejected_resume else None
+        if not existing and not rejected_resume:
+            JOBS[job_id] = job
+    if rejected_resume:
+        return blocked(["Job request could not be resumed."], "job_resume_invalid")
+    if existing:
+        return projected_public_job(existing, auth_session)
 
     worker = {
         "draft": finish_draft_job,
@@ -31837,15 +32576,18 @@ def create_job(
     set_job_state(job_id, status="running")
     thread.start()
     with JOBS_LOCK:
-        return public_job(JOBS[job_id])
+        snapshot = copy.deepcopy(JOBS[job_id])
+    return projected_public_job(snapshot, auth_session)
 
 
 def get_job(job_id: str, auth_session: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    visibility_context = job_visibility_context(auth_session)
     with JOBS_LOCK:
         job = JOBS.get(safe_resource_id(job_id, ""))
-        if job and not job_visible_to_auth_session(job, auth_session):
+        if job and not job_visible_to_context(job, visibility_context):
             return None
-        return public_job(job) if job else None
+        snapshot = copy.deepcopy(job) if job else None
+    return projected_public_job(snapshot, auth_session) if snapshot else None
 
 
 def _run_quote_job(
@@ -31856,6 +32598,7 @@ def _run_quote_job(
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
     scratch_ownership: dict[str, bool] | None = None,
+    publication_identity_capture: dict[str, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
     generation_run_id = clean_text(payload.get("_generation_run_id"))
     job_id = safe_resource_id(job_id, f"job-{secrets.token_hex(6)}")
@@ -32098,13 +32841,18 @@ def _run_quote_job(
     pricing_catalog_path = pricing_catalog_path_for_payload(payload, job_tmp, auth_session=auth_session)
     uploaded_images = save_uploaded_images(image_entries(payload), job_tmp)
     brief = payload_to_brief(payload, auth_session=auth_session)
+    brief["line_items"] = [
+        {**row, "diagnostic_row_id": f"row-{index}",
+         "source_basis_line_id": row.get("source_basis_line_id", "")}
+        for index, row in enumerate(brief["line_items"])
+    ]
     brief["_webapp"] = {
         "job_id": job_id,
         "profile": profile_prompt_summary(profile),
         "uploaded_images": uploaded_images,
     }
     brief_path = job_tmp / "brief.json"
-    brief_path.write_text(json.dumps(brief, indent=2), encoding="utf-8")
+    atomic_write_text(brief_path, json.dumps(brief, indent=2))
 
     command = [
         sys.executable,
@@ -32172,12 +32920,31 @@ def _run_quote_job(
             log_details,
         )
 
+    try:
+        pricing_matches = read_pricing_matches(output_dir / "pricing_matches.csv")
+        hard_failure_without_diagnostics = status == "failed" and not pricing_matches
+        output_rows = None if hard_failure_without_diagnostics else generation_output_rows(brief["line_items"], pricing_matches)
+    except (OSError, csv.Error, TypeError, ValueError) as exc:
+        projection_reference = new_error_reference()
+        write_local_log("generate_failed", unexpected_error_log_details(
+            projection_reference, exc, job_id=job_id, failure_kind="generator_output_invalid",
+        ))
+        invalid_output_manifest = terminal_manifest("failed", "generator_output_invalid", "generator_output")
+        invalid_output_manifest.update(generator_executed=True, return_code=completed.returncode)
+        return finish_generation_forensics(
+            generation_run_id,
+            {**failed_result_payload(projection_reference), "job_id": job_id, "return_code": completed.returncode},
+            auth_session, error_category="generator_output_invalid", validated_session_id=validated_session_id,
+            canonical_manifest=invalid_output_manifest,
+        )
+
     result = {
         "job_id": job_id,
         "status": status,
         "return_code": completed.returncode,
-        "files": output_files(job_id, output_dir),
-        "pricing_matches": read_pricing_matches(output_dir / "pricing_matches.csv"),
+        "files": [] if hard_failure_without_diagnostics else output_files(job_id, output_dir),
+        "pricing_matches": pricing_matches,
+        **({"output_rows": output_rows} if output_rows is not None else {}),
         "export_status": read_export_status(output_dir / "export_status.txt"),
         "pdf_mode": normalized_pdf_mode,
         "errors": errors_for_response,
@@ -32229,6 +32996,7 @@ def _run_quote_job(
     publication_storage: DatabaseSqagStorage | None = None
     publication_session_id = ""
     publication_files: list[dict[str, Any]] = []
+    committed_metadata: dict[str, Any] = {}
     if isinstance(payload.get("quote_session"), dict):
         try:
             storage = quote_session_storage or quote_session_storage_for_auth_session(auth_session)
@@ -32249,15 +33017,23 @@ def _run_quote_job(
                 )
             else:
                 result["quote_session"] = storage.create_or_update_quote_session(
-                    payload, result=result, output_dir=output_dir
+                    payload, result=result, output_dir=output_dir,
+                    **({"committed_metadata": committed_metadata} if isinstance(storage, LocalSqagStorage) else {}),
                 )
             if atomic_publication:
                 publication_storage = storage
                 publication_session_id = safe_quote_session_id(result["quote_session"].get("session_id"), "")
                 publication_files = storage.quote_session_evidence_files(publication_session_id, generation_run_id)
                 result["files"] = publication_files
-            elif artifact_mode in {"database", "object"}:
+            elif result_has_generated_quote(result) and (artifact_mode in {"database", "object"} or committed_metadata):
                 result["files"] = quote_session_result_files(result.get("quote_session"))
+            elif not result_has_generated_quote(result):
+                result.pop("files", None)
+                session = result.get("quote_session")
+                exports = session.get("exports") if isinstance(session, dict) and isinstance(session.get("exports"), dict) else {}
+                for export in exports.values():
+                    if isinstance(export, dict):
+                        export.update({"url": None, "view_url": None, "exists": None, "missing": None, "verified": False, "availability": "unverified"})
         except PostCommitQuoteSessionProjectionError as exc:
             projection_reference = new_error_reference()
             committed_metadata = exc.committed_metadata
@@ -32281,6 +33057,7 @@ def _run_quote_job(
             result["committed_files"] = committed_quote_session_downloads(
                 committed_metadata,
                 committed_artifacts,
+                storage=storage,
             )
             result["_committed_publication_artifacts"] = committed_artifacts
             result["_post_commit_projection_failure"] = warning
@@ -32425,6 +33202,17 @@ def _run_quote_job(
         publication_session_id=publication_session_id,
         publication_files=publication_files,
     )
+    atomic_committed_metadata = finalized.pop("_committed_quote_metadata", None)
+    if isinstance(atomic_committed_metadata, dict):
+        committed_metadata = atomic_committed_metadata
+    committed_identities = {}
+    if committed_metadata and clean_text(finalized.get("status")) == "completed":
+        committed_identities = {
+            kind: identity for kind in QUOTE_SESSION_EXPORT_KINDS
+            if (identity := quote_publication_projection_identity(committed_metadata, storage, kind)) is not None
+        }
+        if publication_identity_capture is not None:
+            publication_identity_capture.update(committed_identities)
     if publication_storage is not None and publication_session_id:
         if clean_text(finalized.get("status")) == clean_text(result.get("status")):
             published_session = copy.deepcopy(result.get("quote_session"))
@@ -32439,13 +33227,18 @@ def _run_quote_job(
                 }
                 exports = published_session.get("exports") if isinstance(published_session.get("exports"), dict) else {}
                 for kind, filename in QUOTE_SESSION_EXPORT_KINDS.items():
-                    export = exports.get(kind) if isinstance(exports.get(kind), dict) else {}
+                    raw_export = committed_metadata.get("exports", {}).get(kind)
+                    export = copy.deepcopy(raw_export) if isinstance(raw_export, dict) else {}
                     available = available_names.get(filename)
-                    exists = bool(available)
+                    identity = committed_identities.get(kind)
+                    exists = bool(available and identity is not None and available.get("sha256") == export.get("sha256") and int(available.get("bytes") or 0) == export.get("size_bytes"))
                     export["exists"] = exists
+                    export["verified"] = exists
+                    export["availability"] = "available" if exists else "not_recorded"
                     export["missing"] = False
                     export["stale"] = False
-                    export["url"] = f"/api/quote-sessions/{publication_session_id}/download/{kind}" if exists else None
+                    export["url"] = quote_publication_url(publication_session_id, kind, identity) if exists else None
+                    export["view_url"] = quote_publication_url(publication_session_id, kind, identity, inline=True) if exists and kind == "pdf" else None
                     if available:
                         export["sha256"] = clean_text(available.get("sha256"))
                         export["size_bytes"] = int(available.get("bytes") or 0)
@@ -32524,7 +33317,10 @@ def run_quote_job(
     job_id: str | None = None,
     pdf_mode: str = "none",
     auth_session: dict[str, Any] | None = None,
+    *, publication_identity_capture: dict[str, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
+    if publication_identity_capture is not None:
+        publication_identity_capture.clear()
     commercial_review_block = quote_commercial_review_preflight(
         payload,
         auth_session=auth_session,
@@ -32557,6 +33353,7 @@ def run_quote_job(
             pdf_mode=pdf_mode,
             auth_session=auth_session,
             scratch_ownership=scratch_ownership,
+            publication_identity_capture=publication_identity_capture,
         )
     except BaseException:
         try:
@@ -32735,21 +33532,39 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_quote_session_storage()
             if storage is None:
                 return
-            self.send_json({"quote_sessions": storage.list_quote_sessions()})
+            try:
+                sessions = storage.list_quote_sessions()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:
+                error_reference = new_error_reference()
+                write_local_log("quote_publication_projection_failed", unexpected_error_log_details(error_reference, exc))
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
+            self.send_json({"quote_sessions": sessions})
             return
         quote_session_download_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)/download/([A-Za-z0-9_-]+)", path)
         if quote_session_download_match:
             storage = self.current_quote_session_storage()
             if storage is None:
                 return
-            self.send_quote_session_download(quote_session_download_match.group(1), quote_session_download_match.group(2), storage)
+            valid_comparison, comparison = quote_publication_query(parsed.query)
+            if not valid_comparison:
+                self.send_json({"error": "Not found"}, status=404)
+                return
+            self.send_quote_session_download(quote_session_download_match.group(1), quote_session_download_match.group(2), storage, expected_publication=comparison)
             return
         quote_session_pdf_view_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)/view/pdf", path)
         if quote_session_pdf_view_match:
             storage = self.current_quote_session_storage()
             if storage is None:
                 return
-            self.send_quote_session_download(quote_session_pdf_view_match.group(1), "pdf", storage, inline=True)
+            valid_comparison, comparison = quote_publication_query(parsed.query)
+            if not valid_comparison:
+                self.send_json({"error": "Not found"}, status=404)
+                return
+            self.send_quote_session_download(quote_session_pdf_view_match.group(1), "pdf", storage, inline=True, expected_publication=comparison)
             return
         quote_session_detail_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", path)
         if quote_session_detail_match:
@@ -32966,7 +33781,16 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         job_match = re.fullmatch(r"/api/jobs/([A-Za-z0-9_-]+)", path)
         if job_match:
             auth_session = self.current_auth_session()
-            job = get_job(job_match.group(1), auth_session=auth_session)
+            try:
+                job = get_job(job_match.group(1), auth_session=auth_session)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            except Exception as exc:
+                error_reference = new_error_reference()
+                write_local_log("quote_publication_projection_failed", unexpected_error_log_details(error_reference, exc))
+                self.send_json(failed_result_payload(error_reference), status=500)
+                return
             if not job:
                 if protected_job_routes_enabled(auth_session):
                     log_legacy_job_route_block("job_status_not_visible", route="status")
@@ -34052,7 +34876,18 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if self.current_auth_session():
             return False
         if self.command == "GET" and not path.startswith("/api/"):
-            self.send_redirect("/login")
+            if internal_google_mode_enabled():
+                # A domain revisit must not let provider SSO undo app logout.
+                # Only the explicit sign-in action starts a new OIDC transaction.
+                self.send_auth_page(
+                    "Sign in required",
+                    "Sign in to open the internal UAT quote runner.",
+                    action_href="/login",
+                    action_label="Sign in",
+                    status=401,
+                )
+            else:
+                self.send_redirect("/login")
             return True
         self.send_json({
             "status": "auth_required",
@@ -34622,6 +35457,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         storage: LocalSqagStorage | DatabaseSqagStorage,
         *,
         inline: bool = False,
+        expected_publication: str | None = None,
     ) -> None:
         safe_id = safe_quote_session_id(session_id, "")
         normalized_kind = clean_text(kind).lower()
@@ -34629,62 +35465,25 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if not safe_id or not expected_filename:
             self.send_json({"error": "Not found"}, status=404)
             return
-        artifact = storage.quote_session_export_artifact(safe_id, normalized_kind, require_current_proof=True)
-        if artifact is not None:
-            content_type = clean_text(artifact.get("content_type")) or QUOTE_SESSION_EXPORT_CONTENT_TYPES.get(normalized_kind, "application/octet-stream")
-            body = bytes(artifact.get("content") or b"")
-            safe_filename = safe_segment(artifact.get("filename"), expected_filename)
-        else:
-            if isinstance(storage, DatabaseSqagStorage):
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            metadata = read_quote_session_metadata(safe_id)
-            authority = local_current_publication_authority(
-                quote_session_authority_payload(metadata)
+        try:
+            artifact = storage.quote_session_export_artifact(
+                safe_id, normalized_kind, require_current_proof=True,
+                expected_publication=expected_publication,
             )
-            proof = quote_session_current_v2_publication_proof(
-                metadata,
-                {
-                    "status": copy.deepcopy(metadata.get("status")) if isinstance(metadata.get("status"), dict) else {},
-                    "draft_state": copy.deepcopy(metadata.get("draft_state")) if isinstance(metadata.get("draft_state"), dict) else {},
-                },
-                workspace_id="local-workspace",
-                owner_id="local-user",
-                authority=authority,
-            )
-            expected_artifact = (
-                proof.get("artifacts", {}).get(normalized_kind)
-                if isinstance(proof, dict) and isinstance(proof.get("artifacts"), dict)
-                else None
-            )
-            if not isinstance(expected_artifact, dict):
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            file_path = storage.quote_session_export_file_path(safe_id, normalized_kind)
-            if file_path is None:
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            body = file_path.read_bytes()
-            local_artifact = {
-                "filename": file_path.name,
-                "content_type": QUOTE_SESSION_EXPORT_CONTENT_TYPES[normalized_kind],
-                "size_bytes": len(body),
-                "sha256": hashlib.sha256(body).hexdigest(),
-                "content": body,
-            }
-            publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
-            publication_id = safe_quote_publication_id(publication.get("active_publication_id"), "")
-            if not quote_artifact_matches_publication_proof(
-                local_artifact,
-                expected_artifact,
-                session_id=safe_id,
-                publication_id=publication_id,
-                run_id="",
-            ):
-                self.send_json({"error": "Not found"}, status=404)
-                return
-            content_type = local_artifact["content_type"]
-            safe_filename = expected_filename
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
+            return
+        except Exception as exc:
+            error_reference = new_error_reference()
+            write_local_log("quote_publication_read_failed", unexpected_error_log_details(error_reference, exc))
+            self.send_json(failed_result_payload(error_reference), status=500)
+            return
+        if artifact is None:
+            self.send_json({"error": "Not found"}, status=404)
+            return
+        content_type = clean_text(artifact.get("content_type")) or QUOTE_SESSION_EXPORT_CONTENT_TYPES.get(normalized_kind, "application/octet-stream")
+        body = bytes(artifact.get("content") or b"")
+        safe_filename = safe_segment(artifact.get("filename"), expected_filename)
         if not body:
             self.send_json({"error": "Not found"}, status=404)
             return

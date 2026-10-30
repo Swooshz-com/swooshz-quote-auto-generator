@@ -72,6 +72,7 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   assert.deepEqual(await rowSnapshot(),catalogueBefore,'Escape must preserve catalogue authority');
   // A catalogue restore already at the verified baseline is a true no-op.
   await cell.click();await page.locator('[data-output-reference-action]').click();
+  await page.waitForFunction(()=>!appIsBusy());
   assert.deepEqual(await rowSnapshot(),catalogueBefore);
   // R05/R06: right-side editing stages empty, retains invalid text and blocks effects.
   await cell.click();assert.equal(await editor.inputValue(),'');
@@ -178,6 +179,7 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   assert.equal(await cell.locator('.output-cell-text').innerText(),'1.00');
   // Resolve through reference mode, then exercise positive and incomplete-Q admission.
   await cell.click();await page.locator('[data-output-reference-action]').click();
+  await page.waitForFunction(()=>!appIsBusy());
   assert.equal(JSON.parse((await rowSnapshot()).row).pricing_authority.variant,'catalog');
   const prospective=await page.evaluate(async()=>{
     elements.quoteCurrency.value='USD';handleQuoteDetailFieldChange({target:elements.quoteCurrency});
@@ -320,7 +322,29 @@ async function verifyDelayedGenerationAdmission(page,cell,editor,index,outputDir
 // Native activation and delegated handlers run in the real loaded application.
 // Synthetic row seeding and save-queue counts are isolated here; the surrounding
 // owner flow separately verifies real HTTP persistence and protected XLSX output.
+async function installOutputReferenceTestGrant(page) {
+  // These table/keyboard fixtures deliberately alter in-memory catalogue data.
+  // Isolate their existing-grant response; real HTTP admission and persistence
+  // are covered by the surrounding owner flow and duplicate selection test.
+  await page.evaluate(()=>{
+    globalThis.outputReferenceTestGrant={synchronise:ensureQuoteSession,post:postJson};
+    ensureQuoteSession=async()=>state.quoteSessionId;
+    postJson=async(url,payload)=>{
+      if(url!=='/api/line-items/normalize')throw new Error('Unexpected selection in display/keyboard fixture');
+      return {ok:true,data:{status:'normalized',line_items:payload.line_items}};
+    };
+  });
+}
+
+async function removeOutputReferenceTestGrant(page) {
+  await page.evaluate(()=>{
+    ensureQuoteSession=outputReferenceTestGrant.synchronise;postJson=outputReferenceTestGrant.post;
+    delete globalThis.outputReferenceTestGrant;
+  });
+}
+
 async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
+  await installOutputReferenceTestGrant(page);
   await page.evaluate(i=>{
     clearQuoteSessionDraftSaveTimer();
     globalThis.fxModeTest={prior:{...state},fx:elements.quoteExchangeRate.value,
@@ -343,7 +367,7 @@ async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
   const snapshot=()=>page.evaluate(()=>({rows:JSON.stringify(state.outputRows),lineItems:JSON.stringify(state.lineItems),revision:state.outputRevision,
     draft:JSON.parse(quoteSessionDraftComparisonKey(currentQuoteSessionDraftState())),file:state.downloadFile,fileRevision:state.downloadFileRevision,
     pdf:state.pdfFile,pdfRevision:state.pdfFileRevision,saves:fxModeTest.saves}));
-  const activate=async(selector,action)=>{const button=row.locator(selector);if(action==='pointer')await button.click();else {await button.focus();await page.keyboard.press(action);}};
+  const activate=async(selector,action)=>{const button=row.locator(selector);if(action==='pointer')await button.click();else {await button.focus();await page.keyboard.press(action);}await page.waitForFunction(()=>!appIsBusy());};
   const effects=[],outcomes=[];const observe=request=>{if(request.method()!=='GET')effects.push(request.url());};page.on('request',observe);
   try {
     for(const mode of ['catalog','reference','quote'])for(const key of ['Enter','F2','pointer']){
@@ -380,6 +404,7 @@ async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
     }
     assert.deepEqual(effects,[]);
   } finally {
+    await removeOutputReferenceTestGrant(page);
     await fs.writeFile(path.join(outputDir,'fxui-native-mode-activation.json'),JSON.stringify({outcomes,effects},null,2));page.off('request',observe);
     await page.evaluate(()=>{revokeOutputEditor();clearQuoteSessionDraftSaveTimer();Object.assign(state,fxModeTest.prior);
       elements.quoteExchangeRate.value=fxModeTest.fx;queueQuoteSessionDraftStateSave=fxModeTest.queue;blockedOutputDraftSaveOptions=fxModeTest.blocked;
@@ -392,6 +417,7 @@ async function verifyOutputModeKeyboardActivation(page,index,outputDir) {
 // Render the real production price cells into the live owner table. Only source
 // fixtures change: no price authority, draft, save, revision or export mutation.
 async function verifyCatalogueBaselineDisplay(page,index,fixture,outputDir) {
+  await installOutputReferenceTestGrant(page);
   await page.evaluate(()=>{clearQuoteSessionDraftSaveTimer();globalThis.baselineTestPrior={...state};globalThis.baselineTestCurrency=collectQuoteCurrency();globalThis.baselineTestFx=elements.quoteExchangeRate.value;globalThis.baselineTestQueue=queueQuoteSessionDraftStateSave;globalThis.baselineTestBlocked=blockedOutputDraftSaveOptions;globalThis.baselineTestSaves=0;queueQuoteSessionDraftStateSave=()=>baselineTestSaves++;blockedOutputDraftSaveOptions=null;});
   const effects=[],outcomes=[],fullTableOutcomes=[];
   const observe=request=>{if(request.method()!=='GET')effects.push(request.url());};page.on('request',observe);
@@ -437,7 +463,7 @@ async function verifyCatalogueBaselineDisplay(page,index,fixture,outputDir) {
       }
       if(unavailable){
         await quoted.click();const restore=tr.locator('[data-output-reference-action]');assert.equal(await restore.isDisabled(),true);
-        const blocked=await restore.evaluate(button=>{const before=JSON.stringify(state),saves=baselineTestSaves,result=applyOutputReferencePricing(button);return {before,after:JSON.stringify(state),saves,afterSaves:baselineTestSaves,result};});
+        const blocked=await restore.evaluate(async button=>{const before=JSON.stringify(state),saves=baselineTestSaves,result=await applyOutputReferencePricing(button);return {before,after:JSON.stringify(state),saves,afterSaves:baselineTestSaves,result};});
         assert.equal(blocked.result,'unchanged');assert.equal(blocked.after,blocked.before);assert.equal(blocked.afterSaves,blocked.saves);
         await page.locator('[data-output-editor-field]').press('Escape');
       }
@@ -491,7 +517,7 @@ async function verifyCatalogueBaselineDisplay(page,index,fixture,outputDir) {
       // Missing reference metadata invalidates existing authority too; preserve those guards.
       if(!['missing-digest','missing-reference','changed-source','missing-currency'].includes(name))assert.deepEqual({mode:result.mode,price:result.price,tag:result.tag,amount:result.amount},{mode:'quote',price:1,tag:name==='same-currency'?'SGD':'AUD',amount:'2.00'},name+' must not apply FX or replace the quote price');
       const tr=page.locator('tr[data-output-row="'+index+'"]'),reference=tr.locator('td:nth-child(5)');
-      const expected=['valid','same-currency','bracketed-description','explicit-General'].includes(name)?fixture.catalogPrice.toFixed(2):name==='zero'?'0.00':'Unavailable';
+      const expected=['valid','same-currency','missing-key','bracketed-description','explicit-General'].includes(name)?fixture.catalogPrice.toFixed(2):name==='zero'?'0.00':'Unavailable';
       assert.equal(await reference.locator('.output-cell-text').innerText(),expected,name);
       assert.equal(await reference.locator('input,button,[tabindex],[contenteditable]').count(),0,name+' reference must remain read-only during a valid override');
       {
@@ -508,12 +534,13 @@ async function verifyCatalogueBaselineDisplay(page,index,fixture,outputDir) {
       assert.equal(await quoted.locator('small').count(),0,name+' must omit redundant right-column captions');
       if(expected==='Unavailable'){
         await quoted.click();const restore=tr.locator('[data-output-reference-action]');assert.equal(await restore.isDisabled(),true,name);
-        const rejected=await restore.evaluate(button=>{const before=JSON.stringify(state),saves=baselineTestSaves;const result=applyOutputReferencePricing(button);return {before,after:JSON.stringify(state),saves,beyond:baselineTestSaves,result};});
+        const rejected=await restore.evaluate(async button=>{const before=JSON.stringify(state),saves=baselineTestSaves;const result=await applyOutputReferencePricing(button);return {before,after:JSON.stringify(state),saves,beyond:baselineTestSaves,result};});
         assert.equal(rejected.result,'unchanged',name);assert.equal(rejected.after,rejected.before,name+' disabled handler must reject');assert.equal(rejected.beyond,rejected.saves);
         await page.locator('[data-output-editor-field]').press('Escape');
       }
       if(['valid','zero'].includes(name)){
         await quoted.click();await tr.locator('[data-output-reference-action]').click();
+        await page.waitForFunction(()=>!appIsBusy());
         assert.equal(await page.evaluate(i=>outputPriceAuthority(state.outputRows[i]).variant,index),'catalog');
         assert.equal(await quoted.locator('.output-cell-text').innerText(),name==='zero'?'0.00':(fixture.catalogPrice*3).toFixed(2));
       }
@@ -527,8 +554,9 @@ async function verifyCatalogueBaselineDisplay(page,index,fixture,outputDir) {
       }
       outcomes.push({name,reference:expected,mode:result.mode,amount:result.amount,commercialStateUnchanged:result.before===result.after});
     }
-    assert.equal(effects.length,0,'Source display must not send mutable HTTP requests');
+    assert.equal(effects.length,0,'Source display fixtures must not send mutable HTTP requests');
   } finally {
+    await removeOutputReferenceTestGrant(page);
     page.off('request',observe);
     await page.setViewportSize({width:1440,height:1000});
     await page.evaluate(()=>{Object.assign(state,baselineTestPrior);setQuoteCurrencyControls(baselineTestCurrency);queueQuoteSessionDraftStateSave=baselineTestQueue;blockedOutputDraftSaveOptions=baselineTestBlocked;elements.quoteExchangeRate.value=baselineTestFx;delete globalThis.baselineTestFx;delete globalThis.baselineTestQueue;delete globalThis.baselineTestBlocked;delete globalThis.baselineTestSaves;delete globalThis.baselineTestCurrency;delete globalThis.baselineTestPrior;renderPricingMatches(state.outputRows);});

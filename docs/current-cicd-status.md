@@ -272,4 +272,6 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 
 ## Maintenance Rule
 
+Review the `Validate app` Ubuntu 24.04 pin when the locked Playwright version supports a newer runner and the full rendered gate passes. The `ubuntu-latest` move to Ubuntu 26.04 currently fails browser installation before tests; remove the pin only after that compatibility is verified.
+
 Update this file whenever CI/CD jobs, triggers, required checks, branch protection, deployment behavior, secret requirements, or security gates change.
