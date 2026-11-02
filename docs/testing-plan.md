@@ -174,6 +174,16 @@ npm run playwright:smoke
   rendered Output-selection regression injects a local reference-list outage,
   then reloads successfully and verifies retained catalogue/manual authority,
   FX, edited subset and Reset snapshot before protected XLSX generation.
+  This original rendered test alone enables `SQAG_DIAG_REFERENCE_OUTAGE` for its
+  Node invocation. It emits the closed metadata trace to stdout before checking
+  the Node result, retaining document/write attribution, hashes, field names and
+  flags when CI fails. Missing, unreadable or unsafe traces emit fixed diagnostic
+  statuses without payloads and fail a passing Node result; observer errors also
+  remain diagnostic failures. Valid metadata before a read/validation error is
+  retained, while the original Node failure and timeout remain failures. No raw
+  recovery data, identity, cookie or credential values are printed. These diagnostics are evidence, not a fix for
+  the unresolved CI preservation failure; all original assertions, the 900 ms
+  observation, 180-second subprocess limit and synthetic audit controls remain.
   Include successful responses with malformed reference entries, duplicate
   identities and missing saved references. Hold current-scope priced recovery
   unchanged, while allowing a genuinely empty new workspace to open Settings.
