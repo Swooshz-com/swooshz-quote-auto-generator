@@ -6,14 +6,15 @@ const source = fs.readFileSync('webapp/static/app.js', 'utf8');
 const boot = source.slice(source.lastIndexOf('async function boot() {'), source.lastIndexOf('\nboot();'));
 const snapshotParser = source.slice(source.indexOf('function quoteSessionSnapshotForRestoration('), source.indexOf('async function applyQuoteSessionSnapshot('));
 const readiness = snapshotParser + source.slice(source.indexOf('function startupPricingReferenceIsAvailable() {'), source.lastIndexOf('async function boot() {'));
-function extract(name) {
-  const start = source.indexOf('function ' + name + '(');
+function extract(name, text = source) {
+  let start = text.indexOf('function ' + name + '(');
   assert.ok(start >= 0, name);
-  const body = source.indexOf(') {', start) + 2;
+  if (text.slice(start - 6, start) === 'async ') start -= 6;
+  const body = text.indexOf(') {', start) + 2;
   let depth = 0;
-  for (let i = body; i < source.length; i++) {
-    if (source[i] === '{') depth++;
-    if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1);
+  for (let i = body; i < text.length; i++) {
+    if (text[i] === '{') depth++;
+    if (text[i] === '}' && --depth === 0) return text.slice(start, i + 1);
   }
   throw Error('Unclosed ' + name);
 }
@@ -75,6 +76,97 @@ async function check(mode) {
     }
   }
 }
+// Run the maintained driver's actual baseline prefix with the production save
+// owner and explicitly released acknowledgements, without browser timing.
+async function checkSaveCompletionBoundary() {
+  const driver = fs.readFileSync('scripts/playwright-owner-uat-basis-repair.mjs', 'utf8');
+  const loop = '      for (const fault of profileRecoveryFaults) {';
+  const begin = driver.indexOf(loop) + loop.length;
+  const end = driver.indexOf('        const metadataBeforeOutage =', begin);
+  assert.ok(begin >= loop.length && end > begin);
+  const boundary = driver.slice(begin, end);
+  const completion = /^        await finishPendingQuoteSaves\(page, targetId\);\r?\n/m;
+  assert.strictEqual(boundary.split(completion).length, 2);
+  const priorBoundary = boundary.replace(completion, '');
+  const helper = extract('finishPendingQuoteSaves', driver);
+  const owner = ['clearQuoteSessionDraftSaveTimer', 'ensureQuoteSession', 'saveQuoteSessionDraftState'].map(name => extract(name)).join('\n');
+  let cases = 0;
+  const turn = () => new Promise(setImmediate);
+  async function run(mode, corrected = true) {
+    const storage = new Map(), requests = [], pending = [];
+    let revision = 0, confirmed = mode === 'timer-confirmed', captured = null, cleared = 0;
+    const c = {
+      state: { quoteSessionId: 'synthetic-session', authenticated: true, isBooting: false,
+        isSigningOut: false, authenticationRecoveryRequested: false, isRecoveryScopeTransitioning: false,
+        basisConfirmed: true, outputRows: [] },
+      targetId: 'synthetic-session', scope: 'synthetic-scope', fault: 'unavailable',
+      QUOTE_SESSION_STORAGE_KEY: 'quote', WORKSPACE_VIEW_STORAGE_KEY: 'workspace',
+      performance: { now: () => 0 }, window: { clearTimeout: () => { cleared++; } },
+      localStorage: { getItem: key => storage.get(key) || null },
+      currentBrowserRecoveryScope: () => c.scope,
+      commitActiveOutputEditor: () => null, quoteSessionDraftStateCanSave: () => true,
+      currentQuoteSessionDraftState: () => ({ rows: ['synthetic-row'] }), sessionFileRecordsFromDraft: () => [],
+      quoteSessionDraftComparisonKey: () => 'draft', quoteSessionDraftFileComparisonKey: () => 'files',
+      safeQuoteSessionId: value => value || '', ensureClientQuoteSessionId: () => c.state.quoteSessionId,
+      quoteSessionDraftIsConfirmed: () => confirmed, quoteSessionDraftFilesAreConfirmed: () => confirmed,
+      saveSessionState: () => {
+        storage.set('quote', JSON.stringify({ savedAt: ++revision, rows: ['synthetic-row'] }));
+        storage.set('workspace', JSON.stringify({ savedAt: revision, menu: 'output' }));
+      },
+      saveCurrentQuoteSession: () => {
+        requests.push(true);
+        return new Promise(resolve => pending.push(success => {
+          confirmed = success;
+          resolve(success ? { session_id: c.state.quoteSessionId } : null);
+        }));
+      },
+    };
+    c.saveSessionState();
+    c.page = { evaluate: async (callback, argument) => {
+      const result = await callback(argument);
+      if (result && Object.prototype.hasOwnProperty.call(result, 'quote') && Object.prototype.hasOwnProperty.call(result, 'workspace')) captured = result;
+      return result;
+    } };
+    vm.createContext(c);
+    vm.runInContext('let quoteSessionDraftSaveTimer = null, quoteSessionDraftSavePromise = null;\n' + owner + '\n' + helper, c);
+    const saves = [];
+    if (['pending', 'queued', 'failed', 'scope-changed'].includes(mode)) {
+      saves.push(vm.runInContext('saveQuoteSessionDraftState({quoteGenerated:true})', c));
+      if (mode === 'queued') saves.push(vm.runInContext('saveQuoteSessionDraftState({quoteGenerated:true})', c));
+    }
+    if (mode.startsWith('timer-')) vm.runInContext('quoteSessionDraftSaveTimer = 7;', c);
+    if (mode === 'wrong-target') c.state.quoteSessionId = 'different-session';
+    const completionResult = vm.runInContext('(async () => {' + (corrected ? boundary : priorBoundary) + '\n return storageBeforeOutage; })()', c)
+      .then(value => ({ value }), error => ({ error }));
+    await turn();
+    const beforeRelease = captured !== null;
+    if (['pending', 'queued', 'failed', 'scope-changed', 'timer-pending'].includes(mode)) {
+      assert.strictEqual(pending.length, 1, mode + ': controlled acknowledgement not pending');
+      if (mode === 'scope-changed') c.scope = 'changed-synthetic-scope';
+      pending.shift()(mode !== 'failed');
+    }
+    const outcome = await completionResult;
+    await Promise.all(saves);
+    if (['failed', 'scope-changed', 'wrong-target'].includes(mode)) {
+      assert.ok(outcome.error, mode + ': invalid completion admitted a baseline');
+      assert.strictEqual(captured, null, mode + ': captured a baseline after failure/context change');
+    } else {
+      assert.ok(!outcome.error, mode);
+      assert.ok(captured, mode + ': baseline missing');
+      const unchanged = captured.quote === storage.get('quote') && captured.workspace === storage.get('workspace');
+      assert.strictEqual(unchanged, corrected, mode + ': save completion/baseline ordering');
+      if (mode === 'pending' || mode === 'queued' || mode === 'timer-pending') assert.strictEqual(beforeRelease, !corrected, mode + ': baseline did not wait for owner');
+      assert.strictEqual(vm.runInContext('quoteSessionDraftSavePromise === null && quoteSessionDraftSaveTimer === null', c), true);
+      if (mode.startsWith('timer-')) assert.strictEqual(cleared, 1, mode);
+      if (mode === 'settled' || mode === 'timer-confirmed') assert.strictEqual(requests.length, 0, mode + ': unnecessary save');
+    }
+    cases++;
+  }
+  await run('pending', false); // Former prefix observes the old owner's savedAt rewrite after baseline.
+  for (const mode of ['settled', 'pending', 'timer-pending', 'timer-confirmed', 'queued', 'failed', 'scope-changed', 'wrong-target']) await run(mode);
+  return cases;
+}
+
 (async () => {
   for (const mode of ['session-failed','false','throw','pending','ready']) await check(mode);
   const reference = {id:'reference-a',source:'local',currency:'SGD',digest_sha256:'sha256:'+'a'.repeat(64)};
@@ -104,7 +196,7 @@ async function check(mode) {
       'pricingAuthorityContext','pricingAuthorityContextMatches','pricingAuthorityNumber','pricingReferenceAuthorityBasis',
       'pricingReferenceCatalogItem','pricingAuthorityCatalogDescription','normalizePricingAuthority',
       'pricingAuthorityPresentationRow','normalizeOutputPricingAuthority','bracketedCatalogReferenceParts',
-      'quoteCommercialStrictDataEqual','isPlainObject'].map(extract).join('\n');
+      'quoteCommercialStrictDataEqual','isPlainObject'].map(name => extract(name)).join('\n');
   const item = {id:'synthetic-item',section:'Synthetic',description:'Synthetic panel',unit_hint:'sqm',sale_unit_price:9.5};
   const catalogReference = {...reference,authority_items:[item]};
   const row = {source_basis_line_id:'row-a',section:item.section,description:item.description,unit:'sqm',pricing_keyword:item.id};
@@ -143,5 +235,6 @@ async function check(mode) {
     assert.strictEqual(vm.runInContext('JSON.stringify({snapshot,references:state.pricingReferences})',c),before);
     assert.strictEqual(JSON.stringify({snapshot,references}),before);
   }
-  process.stdout.write(JSON.stringify({status:'PASS', cases:5, referenceCases:cases.length, contentCases:contentCases.length})+'\n');
+  const completionCases = await checkSaveCompletionBoundary();
+  process.stdout.write(JSON.stringify({status:'PASS', cases:5, referenceCases:cases.length, contentCases:contentCases.length, completionCases, baseCompletionRed:true, headCompletionGreen:true})+'\n');
 })().catch(e => { console.error(e); process.exitCode=1; });

@@ -2,7 +2,6 @@ import { signIn } from "./internal-password-browser-test.mjs";
 import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthetic-browser-boundary.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
-import { appendFileSync } from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -19,7 +18,6 @@ const measureOnly = args.includes("--measure-only");
 const reliability = args.includes("--alpha2-reliability");
 const resumeExport = args.includes("--resume-export");
 const outputReferenceSelection = args.includes("--output-reference-selection");
-const diagnoseReferenceOutage = outputReferenceSelection && process.env.SQAG_DIAG_REFERENCE_OUTAGE === "1";
 const fillerLines = Number((args.find((arg) => arg.startsWith("--lines=")) || "--lines=60").split("=")[1]);
 const latencyMs = Number((args.find((arg) => arg.startsWith("--latency-ms=")) || "--latency-ms=1500").split("=")[1]);
 const cpuProfile = args.includes("--cpu-profile");
@@ -226,136 +224,28 @@ const summarize = (samples) => {
 };
 
 const result = { runRoot, fillerLines, latencyMs, cpuThrottle, inflightSave, freshAnalysis, catalogItems: catalog.length, cases: cases.length, selectionStatuses: [] };
-// Opt-in synthetic diagnostics: only closed metadata crosses the browser binding.
-class ReferenceOutageDiagnostics {
-  constructor(page, cdp, file) {
-    this.page = page; this.cdp = cdp; this.file = file;
-    this.sequence = 0; this.stage = "setup"; this.document = null; this.requestDocuments = new WeakMap();
-    this.writers = ["saveSessionState", "saveWorkspaceViewState", "applyQuoteSessionSnapshot",
-      "purgeBrowserRecoveryState", "clearSessionState", "clearWorkspaceViewState",
-      "restoredWorkspaceViewState", "recoverRequiredAuthentication", "saveQuoteSessionDraftState",
-      "queueQuoteSessionDraftStateSave", "setSidePanel", "applySessionData"];
-    this.fields = ["version", "savedAt", "browserRecoveryScope", "quoteSessionId", "activeAppView", "activeSidePanel",
-      "restorableOverlay", "pricingReferenceSettingsMode", "profileId", "pricingReferenceId", "pricingReferenceSource",
-      "lineItems", "outputRows", "originalOutputRows", "pricingMatches", "pricingIssues", "pricingLedgerRevisions",
-      "basisConfirmed", "quoteBasis", "quoteBasisSections", "originalAnalysisSnapshot", "quoteDetails", "activeJob",
-      "outputRevision", "downloadFileRevision", "pdfFileRevision", "dashboardActiveSessionId", "images", "basisChat"];
-  }
-  record(input = {}, contextId = null) {
-    const kind = ["document", "write", "hashes", "snapshot", "lifecycle", "observer_error", "marker", "response"].includes(input.kind) ? input.kind : "observer_error";
-    const hash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value) ? value : null;
-    const storageHash = value => typeof value === "string" && /^fnv1a32-utf16-pair:[a-f0-9]{16}$/.test(value) ? value : null;
-    const number = value => typeof value === "number" && Number.isFinite(value) ? value : null;
-    const flag = value => typeof value === "boolean" ? value : null;
-    const row = { sequence: ++this.sequence, stage: this.stage, kind, document: number(contextId), nodeMs: performance.now(),
-      event: number(input.event), browserMs: number(input.browserMs),
-      lifecycle: ["DOMContentLoaded", "beforeunload", "pagehide"].includes(input.lifecycle) ? input.lifecycle : null,
-      beforeStorageHash: storageHash(input.beforeStorageHash), afterStorageHash: storageHash(input.afterStorageHash), scopeStorageHash: storageHash(input.scopeStorageHash),
-      key: ["quote", "workspace"].includes(input.key) ? input.key : null,
-      operation: ["set", "remove"].includes(input.operation) ? input.operation : null,
-      writers: (Array.isArray(input.writers) ? input.writers : []).filter(value => this.writers.includes(value)),
-      appLine: number(input.appLine), beforeLength: number(input.beforeLength), afterLength: number(input.afterLength),
-      changedFields: (Array.isArray(input.changedFields) ? input.changedFields : []).filter(value => this.fields.includes(value)),
-      otherFieldsChanged: flag(input.otherFieldsChanged), beforeSha256: hash(input.beforeSha256), afterSha256: hash(input.afterSha256), scopeSha256: hash(input.scopeSha256),
-      flags: Object.fromEntries(["isBooting", "authenticated", "isPageUnloading", "isSigningOut", "authenticationRecoveryRequested", "isRecoveryScopeTransitioning", "quoteSessionRestoreBusy"].map(key => [key, flag(input.flags?.[key])])),
-      path: ["/api/session", "/api/profiles"].includes(input.path) ? input.path : null, status: number(input.status) };
-    appendFileSync(this.file, JSON.stringify(row) + "\n", "utf8");
-  }
-  async install() {
-    await fs.writeFile(this.file, "");
-    this.cdp.on("Runtime.bindingCalled", event => {
-      if (event.name !== "__sqagOutageMetadata") return;
-      try {
-        const input = JSON.parse(event.payload);
-        if (input.kind === "document") this.document = event.executionContextId;
-        this.record(input, event.executionContextId);
+// Finish the outgoing document's save owner before capturing an outage baseline.
+async function finishPendingQuoteSaves(page, expectedSessionId) {
+  await page.evaluate(async (expectedSessionId) => {
+    const scope = currentBrowserRecoveryScope();
+    const sameContext = () => scope && currentBrowserRecoveryScope() === scope
+      && state.quoteSessionId === expectedSessionId && state.authenticated === true
+      && !state.isBooting && !state.isSigningOut && !state.authenticationRecoveryRequested
+      && !state.isRecoveryScopeTransitioning;
+    if (!sameContext()) throw new Error("Quote save checkpoint has no stable authenticated target.");
+    while (quoteSessionDraftSaveTimer || quoteSessionDraftSavePromise) {
+      if (quoteSessionDraftSaveTimer) {
+        const savedId = await ensureQuoteSession({ quoteGenerated: true, synchronizeDraft: true });
+        if (savedId !== expectedSessionId || !sameContext()) throw new Error("Quote save checkpoint was not confirmed.");
       }
-      catch { this.record({ kind: "observer_error" }); }
-    });
-    this.page.on("request", request => {
-      if (["/api/session", "/api/profiles"].includes(new URL(request.url()).pathname)) this.requestDocuments.set(request, this.document);
-    });
-    await this.cdp.send("Runtime.enable");
-    await this.cdp.send("Runtime.addBinding", { name: "__sqagOutageMetadata" });
-    await this.page.addInitScript(({ writers, fields }) => {
-      let sequence = 0;
-      const pending = new Set();
-      const keys = { swooshz_quote_session_v1: "quote", swooshz_workspace_view_v1: "workspace" };
-      const send = value => {
-        try { globalThis.__sqagOutageMetadata(JSON.stringify({ ...value, browserMs: performance.now() })); }
-        catch { /* Observer delivery cannot alter the application operation. */ }
-      };
-      const flags = () => {
-        try { return Object.fromEntries(["isBooting", "authenticated", "isPageUnloading", "isSigningOut", "authenticationRecoveryRequested", "isRecoveryScopeTransitioning", "quoteSessionRestoreBusy"].map(key => [key, typeof state[key] === "boolean" ? state[key] : null])); }
-        catch { return {}; }
-      };
-      // Synchronous full-text correlation survives old-document navigation. These
-      // non-cryptographic hashes never replace the original exact-byte assertions;
-      // supplemental SHA-256 records are delivered separately when available.
-      const storageHash = value => {
-        const text = value === null ? "\u0000" : "\u0001" + value;
-        let left = 0x811c9dc5, right = 0x9e3779b9;
-        for (let index = 0; index < text.length; index++) {
-          const unit = text.charCodeAt(index);
-          left = Math.imul(left ^ (unit & 255), 0x01000193); right = Math.imul(right ^ (unit & 255), 0x01000193);
-          left = Math.imul(left ^ (unit >>> 8), 0x01000193); right = Math.imul(right ^ (unit >>> 8), 0x01000193);
-        }
-        return "fnv1a32-utf16-pair:" + (left >>> 0).toString(16).padStart(8, "0") + (right >>> 0).toString(16).padStart(8, "0");
-      };
-      const scopeHash = () => { try { return storageHash(state.browserRecoveryScope || null); } catch { return storageHash(null); } };
-      const digest = async text => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text === null ? "<absent>" : text)))].map(byte => byte.toString(16).padStart(2, "0")).join("");
-      const hashes = (event, before, after) => {
-        let scope = null;
-        try { scope = state.browserRecoveryScope || null; } catch { /* State is not initialised on sign-in documents. */ }
-        const task = Promise.all([digest(before), digest(after), digest(scope)]).then(([beforeSha256, afterSha256, scopeSha256]) => send({ kind: "hashes", event, beforeSha256, afterSha256, scopeSha256, flags: flags() })).catch(() => send({ kind: "observer_error", event }));
-        pending.add(task); task.finally(() => pending.delete(task));
-      };
-      const changed = (before, after) => {
-        try {
-          const left = JSON.parse(before) || {}, right = JSON.parse(after) || {};
-          const names = [...new Set([...Object.keys(left), ...Object.keys(right)])].filter(key => JSON.stringify(left[key]) !== JSON.stringify(right[key]));
-          return { changedFields: names.filter(key => fields.includes(key)), otherFieldsChanged: names.some(key => !fields.includes(key)) };
-        } catch { return { changedFields: [], otherFieldsChanged: true }; }
-      };
-      const nativeGet = Storage.prototype.getItem;
-      for (const [method, operation] of [["setItem", "set"], ["removeItem", "remove"]]) {
-        const native = Storage.prototype[method];
-        Storage.prototype[method] = function (...args) {
-          const relevant = this === localStorage && Object.prototype.hasOwnProperty.call(keys, args[0]);
-          let before = null;
-          if (relevant) try { before = nativeGet.call(this, args[0]); } catch { send({ kind: "observer_error" }); }
-          const returned = Reflect.apply(native, this, args);
-          if (relevant) try {
-            const after = nativeGet.call(this, args[0]), event = ++sequence, stack = new Error().stack || "";
-            const appLine = Number(stack.match(/app\.js:(\d+):\d+/)?.[1]) || null;
-            send({ kind: "write", event, key: keys[args[0]], operation, writers: writers.filter(name => stack.includes("at " + name + " ") || stack.includes("at " + name + "(")), appLine,
-              beforeLength: before?.length ?? null, afterLength: after?.length ?? null, beforeStorageHash: storageHash(before), afterStorageHash: storageHash(after), scopeStorageHash: scopeHash(), ...changed(before, after), flags: flags() });
-            hashes(event, before, after);
-          } catch { send({ kind: "observer_error" }); }
-          return returned;
-        };
-      }
-      globalThis.__sqagOutageSnapshot = () => {
-        for (const [key, label] of Object.entries(keys)) {
-          const after = nativeGet.call(localStorage, key), event = ++sequence;
-          send({ kind: "snapshot", event, key: label, afterLength: after?.length ?? null, afterStorageHash: storageHash(after), scopeStorageHash: scopeHash(), flags: flags() });
-          hashes(event, after, after);
-        }
-      };
-      globalThis.__sqagOutageFlush = () => Promise.all([...pending]);
-      for (const lifecycle of ["DOMContentLoaded", "beforeunload", "pagehide"]) addEventListener(lifecycle, () => {
-        send({ kind: "lifecycle", lifecycle, flags: flags() });
-        globalThis.__sqagOutageSnapshot();
-      });
-      send({ kind: "document", flags: flags() });
-    }, { writers: this.writers, fields: this.fields });
-  }
-  mark(stage) { this.stage = stage; this.record({ kind: "marker" }); }
-  async flush() { await this.page.evaluate(() => globalThis.__sqagOutageFlush?.()); }
+      const pending = quoteSessionDraftSavePromise;
+      if (pending && !await pending) throw new Error("Quote save checkpoint was not confirmed.");
+      if (!sameContext()) throw new Error("Quote save checkpoint changed authenticated context.");
+    }
+  }, expectedSessionId);
 }
 
 const timings = [];
-let outageDiagnostics = null;
 try {
   server = startServer();
   const baseUrl = await server.ready;
@@ -364,16 +254,10 @@ try {
   const context = await browserBoundary.newContext(browser, { acceptDownloads: true });
   const page = await context.newPage();
   const cdp = await context.newCDPSession(page);
-  if (diagnoseReferenceOutage) {
-    outageDiagnostics = new ReferenceOutageDiagnostics(page, cdp, path.join(runRoot, "reference-outage-writes.jsonl"));
-    await outageDiagnostics.install();
-  }
   if (cpuThrottle > 1) await cdp.send("Emulation.setCPUThrottlingRate", { rate: cpuThrottle });
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("response", (response) => {
-    const diagnosticPath = new URL(response.url()).pathname;
-    if (outageDiagnostics && ["/api/session", "/api/profiles"].includes(diagnosticPath)) outageDiagnostics.record({ kind: "response", path: diagnosticPath, status: response.status() }, outageDiagnostics.requestDocuments.get(response.request()));
     if (new URL(response.url()).pathname === "/api/quote-sessions/pricing-selections") result.selectionStatuses.push(response.status());
   });
   await page.route("**/*", async (route) => {
@@ -956,9 +840,9 @@ try {
         "malformed-authority-items", "missing-selected-item", "duplicate-selected-item",
         "invalid-item-price", "changed-item-price", "changed-item-unit", "changed-item-description", "changed-item-section"];
       for (const fault of profileRecoveryFaults) {
+        await finishPendingQuoteSaves(page, targetId);
         const outageDiagnosticStarted = performance.now();
-        outageDiagnostics?.mark("baseline-" + fault);
-        const storageBeforeOutage = await page.evaluate(() => (globalThis.__sqagOutageSnapshot?.(), {
+        const storageBeforeOutage = await page.evaluate(() => ({
           quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
           workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
         }));
@@ -966,7 +850,6 @@ try {
         let profilesRejected = false;
         const rejectProfiles = async (route) => {
           profilesRejected = true;
-          outageDiagnostics?.mark("profiles-rejected-" + fault);
           if (fault === "unavailable") {
             await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "unavailable" }) });
           } else {
@@ -995,22 +878,14 @@ try {
           }
         };
         await page.route("**/api/profiles", rejectProfiles);
-        outageDiagnostics?.mark("reload-request-" + fault);
         await page.reload({ waitUntil: "domcontentloaded" });
-        outageDiagnostics?.mark("dom-ready-" + fault);
-        await page.waitForFunction(() => {
-          const ready = typeof state !== "undefined" && state.authenticated !== false;
-          if (ready) globalThis.__sqagOutageSnapshot?.();
-          return ready;
-        });
+        await page.waitForFunction(() => typeof state !== "undefined" && state.authenticated !== false);
         await page.waitForTimeout(900); // Exceeds the normal 650ms draft-save debounce.
-        outageDiagnostics?.mark("observation-" + fault);
-        const outage = await page.evaluate(() => (globalThis.__sqagOutageSnapshot?.(), {
+        const outage = await page.evaluate(() => ({
           quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
           workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
           restoredRows: state.outputRows.length,
         }));
-        if (outageDiagnostics) await outageDiagnostics.flush();
         (result.profileOutageDiagnostics ||= []).push({
           fault, stage: "before-recovery-assertions", profilesRejected,
           quoteStorageUnchanged: outage.quote === storageBeforeOutage.quote,
@@ -1128,7 +1003,6 @@ try {
   console.error(JSON.stringify(result, null, 2));
   process.exitCode = 1;
 } finally {
-  if (outageDiagnostics) await outageDiagnostics.flush().catch(() => {});
   checkpointGate?.release?.();
   exportPollGate?.release?.();
   if (browser) await browser.close().catch(() => {});
