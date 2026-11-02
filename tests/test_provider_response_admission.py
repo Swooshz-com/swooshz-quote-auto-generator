@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest import mock
 
 from tests import test_webapp as existing
+from tests.gateway_test_support import (install_mock_responses_transport, json_response,
+    FixtureHttpResponse, responses_envelope, synthetic_configuration)
 from tests.test_basis_source_provenance import CATALOG
 from tests.test_openai_draft_request_contract import synthetic_image
 
@@ -29,6 +31,7 @@ def draft():
 
 class ProviderAdmissionTest(unittest.TestCase):
     def setUp(self):
+        install_mock_responses_transport(self)
         self.enterContext(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(socket, "create_connection", side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(s.urllib.request, "urlopen", side_effect=AssertionError("NETWORK_DENIED")))
@@ -37,7 +40,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         return s.admit_provider_quote_draft(value, require_confidence=True)
 
     def test_full_draft_prompt_declares_the_admitted_physical_row_contract(self):
-        with mock.patch.dict(os.environ, existing.isolated_env(), clear=True), \
+        with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
              mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"):
@@ -53,9 +56,8 @@ class ProviderAdmissionTest(unittest.TestCase):
     def test_actual_draft_request_declares_string_ids_and_existing_alphabet(self):
         payload = existing.valid_payload()
         payload["images"] = [{"name": "synthetic.png", "data_url": synthetic_image()}]
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b'{"output_text":"{}"}'
-        with mock.patch.dict(os.environ, existing.isolated_env(), clear=True), \
+        response = json_response(existing.SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], {})
+        with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
              mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
@@ -65,7 +67,7 @@ class ProviderAdmissionTest(unittest.TestCase):
             s.request_openai_quote_basis(payload, "synthetic-mocked-key")
         self.assertEqual(send.call_count, 1)
         body = json.loads(send.call_args.args[0].data)
-        self.assertEqual(set(body), {"model", "input", "reasoning"})
+        self.assertEqual(set(body), {"model", "input", "reasoning", "provider", "store"})
         self.assertEqual(len(body["input"]), 1)
         self.assertEqual(body["input"][0]["role"], "user")
         prompt = body["input"][0]["content"][0]["text"]
@@ -78,9 +80,8 @@ class ProviderAdmissionTest(unittest.TestCase):
     def supplementary_request(self, raw, *, capture_only=False):
         payload = existing.valid_payload()
         payload["images"] = [{"name": "synthetic.png", "data_url": synthetic_image()}]
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({"output_text": json.dumps(raw)}).encode()
-        with mock.patch.dict(os.environ, existing.isolated_env(), clear=True), \
+        response = json_response(existing.SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], raw)
+        with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
              mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
@@ -95,7 +96,7 @@ class ProviderAdmissionTest(unittest.TestCase):
             finally:
                 self.assertEqual(send.call_count, 1)
             body = json.loads(send.call_args.args[0].data)
-            self.assertEqual(set(body), {"model", "input", "reasoning"})
+            self.assertEqual(set(body), {"model", "input", "reasoning", "provider", "store"})
             return body["input"][0]["content"][0]["text"]
 
     def test_actual_request_declares_optional_finding_object_shape(self):
@@ -391,9 +392,10 @@ class ProviderAdmissionTest(unittest.TestCase):
 
 class ProviderAdapterContractTest(unittest.TestCase):
     def setUp(self):
+        install_mock_responses_transport(self)
         self.enterContext(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(socket, "create_connection", side_effect=AssertionError("NETWORK_DENIED")))
-        self.enterContext(mock.patch.dict(os.environ, existing.isolated_env(), clear=True))
+        self.enterContext(mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True))
         self.enterContext(mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value))
         self.enterContext(mock.patch.object(s, "write_local_log", return_value=True))
         for name in ("build_basis_chat_prompt", "build_pricing_catalog_import_prompt", "build_pricing_catalog_metadata_prompt", "build_quote_draft_prompt"):
@@ -404,25 +406,45 @@ class ProviderAdapterContractTest(unittest.TestCase):
         self.snapshot = s.PricingReferenceSnapshot(source="local", reference_id=self.detail["id"],
             digest=self.detail["digest_sha256"], currency="SGD", detail_json=json.dumps(self.detail))
 
-    def test_all_openai_routes_share_completion_admission_after_one_mock_send(self):
-        for route in ("draft", "chat", "import", "metadata"):
-            for mode in ("completed", "incomplete", "refusal"):
-                parsed = {"intent": "answer", "answer": "Synthetic answer"} if route == "chat" else {"items": []} if route in ("import", "metadata") else draft()
-                envelope = {"status": "incomplete" if mode == "incomplete" else "completed", "output_text": json.dumps(parsed)}
-                if mode == "refusal": envelope["refusal"] = "Synthetic refusal"
-                response = mock.MagicMock(); response.__enter__.return_value.read.return_value = json.dumps(envelope).encode()
-                with self.subTest(route=route, mode=mode), mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
+    def test_all_gateway_callers_share_completion_admission_after_one_send(self):
+        configs=existing.SYNTHETIC_DRAFT_CONFIG
+        cases=(("draft","DRAFT"),("high_quality","DRAFT_HIGH_QUALITY"),("line","BASIS_LINE"),
+               ("answer","BASIS_ANSWER"),("import","PRICING_IMPORT"),("metadata","PRICING_METADATA"))
+        for route,suffix in cases:
+            for mode in ("completed","incomplete","refusal"):
+                parsed={"items":[]} if route in {"import","metadata"} else draft()
+                payload={"images":[{"name":"synthetic.png","data_url":synthetic_image()}],
+                    "pricing_reference_id":self.detail["id"],"pricing_reference_source":"local",
+                    "pricing_reference":self.detail,"_pricing_reference_snapshot":self.snapshot}
+                if route=="high_quality": payload["analysis_mode"]="high_quality"
+                if route in {"line","answer"}:
+                    payload["quote_basis_sections"]=[{"id":"platform","title":"Platform","lines":[{"tag":"Confirm","text":"100mm raised platform with needle punch carpet."}]}]
+                    payload["quote_basis"]=s.quote_basis_from_sections(payload["quote_basis_sections"])
+                    payload["basis_chat"]={"question":"change 100mm to 150mm" if route=="line" else "What is this?",
+                        "scope":"line" if route=="line" else "quote","field":"platform","line_index":0,
+                        "line":"Confirm: 100mm raised platform with needle punch carpet." if route=="line" else ""}
+                    parsed={"intent":"proposal","proposal":{"message":"Change the platform height?","replacement_line":{"tag":"Confirm","text":"150mm raised platform with needle punch carpet.","confidence_pct":90}}} if route=="line" else {"intent":"answer","answer":"Synthetic answer"}
+                envelope=responses_envelope(configs["OPENROUTER_"+suffix+"_MODEL"],json.dumps(parsed),status="incomplete" if mode=="incomplete" else "completed")
+                if mode=="refusal": envelope["refusal"]="Synthetic refusal"
+                response=FixtureHttpResponse(envelope)
+                with self.subTest(route=route,mode=mode), mock.patch.object(s.urllib.request,"urlopen",return_value=response) as send, mock.patch.object(s,"normalize_basis_chat_result",wraps=s.normalize_basis_chat_result) as normalize:
                     def call():
-                        if route == "draft": return s.request_openai_quote_basis({"images": [{"name": "synthetic.png", "data_url": synthetic_image()}],
-                            "pricing_reference_id": self.detail["id"], "pricing_reference_source": "local",
-                            "pricing_reference": self.detail, "_pricing_reference_snapshot": self.snapshot}, "synthetic-key")
-                        if route == "chat": return s.request_openai_basis_chat_with_model({"basis_chat": {"question": "What is this?"}}, "synthetic-key", "gpt-6-luna")
-                        if route == "import": return s.request_openai_pricing_catalog_import("synthetic", {}, {}, "synthetic-key")
-                        return s.request_openai_pricing_catalog_metadata("synthetic", [], "synthetic-key")
-                    if mode == "completed": self.assertIsInstance(call(), dict)
+                        if route in {"draft","high_quality"}: return s.request_openai_quote_basis(payload,"synthetic-key")
+                        if route in {"line","answer"}: return s.request_configured_basis_chat(payload)
+                        if route=="import": return s.request_openai_pricing_catalog_import("synthetic",{},{},"synthetic-key")
+                        return s.request_openai_pricing_catalog_metadata("synthetic",[],"synthetic-key")
+                    if mode=="completed":
+                        result=call();self.assertIsInstance(result,dict)
+                        if route=="answer":self.assertEqual(result["answer"],"Synthetic answer")
+                        if route=="line":self.assertEqual(result["type"],"proposal")
                     else:
                         with self.assertRaises(s.OpenAIAnalysisError): call()
-                    self.assertEqual(send.call_count, 1)
+                        normalize.assert_not_called()
+                    self.assertEqual(send.call_count,1)
+                    sent=json.loads(send.call_args.args[0].data)
+                    self.assertEqual(sent["model"],configs["OPENROUTER_"+suffix+"_MODEL"])
+                    self.assertEqual(sent["reasoning"],{"effort":configs["OPENROUTER_"+suffix+"_REASONING_EFFORT"]})
+
 
     def test_unrepresentable_derived_amount_rejects_before_pricing_or_seal(self):
         raw = draft()
@@ -434,28 +456,34 @@ class ProviderAdapterContractTest(unittest.TestCase):
              self.assertRaises(s.AIModelOutputError):
             s.normalize_ai_draft(raw, payload, require_confidence=True)
 
-    def test_deepseek_adapters_reach_mock_transport_and_refuse_truncation(self):
-        for route in ("json", "chat", "import", "metadata"):
-            for finish in ("stop", "length"):
-                parsed = {"intent": "answer", "answer": "Synthetic answer"} if route == "chat" else {"items": []}
-                envelope = {"choices": [{"finish_reason": finish, "message": {"content": json.dumps(parsed)}}]}
-                response = mock.MagicMock(); response.__enter__.return_value.read.return_value = json.dumps(envelope).encode()
-                with self.subTest(route=route, finish=finish), mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
-                    def call():
-                        if route == "json": return s.request_deepseek_json_object("Synthetic prompt", "synthetic-key", s.configured_deepseek_pricing_import_model(), 1200, "pricing import")
-                        if route == "chat": return s.request_deepseek_basis_chat_with_model({"basis_chat": {"question": "What is this?"}}, "synthetic-key", s.configured_deepseek_basis_answer_model())
-                        if route == "import": return s.request_deepseek_pricing_catalog_import("synthetic", {}, {}, "synthetic-key")
-                        return s.request_deepseek_pricing_catalog_metadata("synthetic", [], "synthetic-key")
-                    if finish == "stop": self.assertIsInstance(call(), dict)
+    def test_gateway_support_callers_reach_transport_and_refuse_truncation(self):
+        # Retains each former support-adapter success/truncation control on its maintained protocol.
+        configs=existing.SYNTHETIC_DRAFT_CONFIG
+        for operation,suffix in (("basis_line","BASIS_LINE"),("basis_answer","BASIS_ANSWER"),("pricing_import","PRICING_IMPORT"),("pricing_metadata","PRICING_METADATA")):
+            for status in ("completed","incomplete"):
+                model=configs["OPENROUTER_"+suffix+"_MODEL"]
+                envelope=responses_envelope(model,json.dumps({"items":[]}),status=status)
+                response=FixtureHttpResponse(envelope)
+                gateway=s.configured_ai_gateway()
+                route=gateway.configuration.route(operation)
+                with self.subTest(operation=operation,status=status),mock.patch.object(s.urllib.request,"urlopen",return_value=response) as send:
+                    # Recreate the gateway while the exact opener is injected.
+                    gateway=s.configured_ai_gateway()
+                    body={"model":route.model,"reasoning":{"effort":route.effort},"input":[{"role":"user","content":[{"type":"input_text","text":"Synthetic request"}]}]}
+                    if status=="completed":
+                        result=s.gateway_request(gateway,operation,body)
+                        self.assertEqual(s.parse_json_object(s.response_output_text(result)),{"items":[]})
                     else:
-                        with self.assertRaises(s.OpenAIAnalysisError): call()
-                    self.assertEqual(send.call_count, 1)
+                        with self.assertRaises(s.OpenAIAnalysisError):s.gateway_request(gateway,operation,body)
+                    self.assertEqual(send.call_count,1)
+
 
 
 
 
 class ProviderHTTPContractTest(unittest.TestCase):
     def setUp(self):
+        install_mock_responses_transport(self)
         self.fixture = existing.WebappServerTest()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
@@ -470,10 +498,9 @@ class ProviderHTTPContractTest(unittest.TestCase):
                 pricing_reference_id=reference_id, pricing_reference_source="local",
                 pricing_reference={"id": reference_id, "source": "local", "currency": "SGD"},
                 quote_session={"session_id": "quote-response-contract"})
-            env = existing.isolated_env(OPENAI_API_KEY="synthetic-mocked-only", AUTH_REQUIRED="false",
+            env = existing.isolated_env(OPENROUTER_API_KEY="synthetic-mocked-only", AUTH_REQUIRED="false",
                                        QUOTE_DATA_ROOT=str(self.fixture._test_data_root))
-            envelope = {"status": "completed", "output_text": json.dumps(raw)}
-            response = mock.MagicMock(); response.__enter__.return_value.read.return_value = json.dumps(envelope).encode()
+            response = json_response(existing.SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], raw)
             with mock.patch.dict(os.environ, env, clear=True), \
                  mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
                  mock.patch.object(s, "pricing_references_root", return_value=Path(temp)), \

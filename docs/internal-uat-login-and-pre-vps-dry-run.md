@@ -8,21 +8,22 @@ with synthetic values only.
 
 This is not an account system, public SaaS launch, customer portal, billing
 flow, database-backed user model, or production deployment plan. The temporary
-private-alpha lane uses `SQAG_AUTH_MODE=internal_google`; the final hosted
+private-alpha lane uses `SQAG_AUTH_MODE=internal_password`; the final hosted
 architecture remains Platform launch/finalization/validation. See
-`docs/internal-google-auth-mode.md`.
+`docs/internal-password-auth-mode.md`.
 
-## Approved Temporary Google Flow
+## Staff login flow
 
-In the temporary lane, `/login` creates one-time state, nonce, and S256 PKCE
-transaction data and redirects to the exact configured Google endpoint.
-`/callback` verifies the signed ID token, then requires one exact configured
-subject/email/role identity record before creating a bounded server-revocable
-session for one fixed internal workspace.
-Logout is a CSRF-checked POST. No self-registration or domain admission exists.
-The identity JSON is server-only. Obtaining real Google subjects is separate,
-explicitly authorised provider enrolment; local evidence uses synthetic
-subjects only.
+Open `/login`, enter an allowed staff email alias and the shared password, then
+select Sign in. Shared-password holders may choose any allowed alias and its
+configured role. Unknown aliases and incorrect passwords stay outside. The
+server retains each alias's stable ownership ID and fixed workspace. Logout is
+an authenticated CSRF-checked POST with immediate server-side revocation.
+
+[The staff access contract](internal-password-auth-mode.md) is the source of
+truth for limits, cookies, policy invalidation and server-only configuration.
+[The gateway contract](ai-gateway.md) covers explicit per-operation inference
+configuration and the separate installed qualification holds.
 
 The following Platform flow remains the final mode and is tested separately.
 
@@ -69,7 +70,7 @@ python -m unittest tests.test_webapp.WebappServerTest.test_internal_uat_coolify_
 
 These checks verify:
 
-- The Coolify env template has the required Platform launch keys.
+- The Coolify env template has the required staff access, storage and gateway keys.
 - Template secret/provider-specific fields remain placeholders.
 - Runtime roots remain placeholders in committed templates and must be
   host-managed housekeeping paths, not durable quote-session or artifact
@@ -80,9 +81,8 @@ These checks verify:
 - Deploy preflight can reach `ready` with synthetic env and temporary runtime
   roots outside the repo.
 - Missing deploy-auth config blocks without printing secret values.
-- `/api/health` returns HTTP 200 only after the required generator, database
-  schemas, and object-storage bucket probe pass; dependency failure returns
-  metadata-only HTTP 503.
+- `/api/health` is process-only liveness. Startup checks the required dependencies
+  before binding; liveness does not perform dependency or inference calls.
 - Unauthenticated browser requests redirect to login.
 - Unauthenticated API requests return `auth_required`.
 - `/login` redirects to the configured synthetic Platform URL.

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { deflateSync } from "node:zlib";
 import { chromium } from "playwright";
+import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthetic-browser-boundary.mjs";
 import { TEST_REFERENCE_FILE_NAME, seedQuoteDraftFromTestFixture } from "./playwright-test-seeded-setup.mjs";
 import { verifyOwnerUatChecks } from "./playwright-owner-uat-checks.mjs";
 
@@ -98,9 +99,10 @@ async function healthOk() {
   }
 }
 
-async function waitForHealth(timeoutMs = 15000) {
+async function waitForHealth(timeoutMs = 15000, child = null) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) return false;
     if (await healthOk()) return true;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
@@ -189,36 +191,28 @@ def g3_mock_provider(payload, api_key, auth_session=None, *, draft_configuration
     }
     return server.normalize_ai_draft(parsed, payload, require_confidence=True, auth_session=auth_session)
 
-_real_reader = server.read_dotenv_value
-def _mock_provider_key_reader(name):
-    if name == server.OPENAI_API_KEY_ENV_NAME:
-        return "synthetic-playwright-provider-key"
-    return _real_reader(name)
-
-server.read_dotenv_value = _mock_provider_key_reader
-server.text_ai_provider_api_key = lambda provider: ""
+from tests.g3_gateway_fixture import G3GatewayFixture
 server.request_openai_quote_basis = g3_mock_provider
-raise SystemExit(server.main())
+# Only source-backed synthetic pricing metadata is admitted; external access and
+# every unexpected gateway operation remain fixture failures.
+with G3GatewayFixture():
+    raise SystemExit(server.main())
 `;
 }
 
-function startServer({ mockProvider = false, dataRoot = quoteDataRoot } = {}) {
+function startServer({ mockProvider = false, dataRoot = quoteDataRoot, logRoot } = {}) {
+  if (mockProvider && !logRoot) throw new Error("Synthetic G3 server requires an owned log directory.");
   const serverArgs = mockProvider
     ? ["-c", g3MockProviderBootstrap(), "--host", options.host, "--port", String(options.port)]
     : ["webapp/server.py", "--host", options.host, "--port", String(options.port)];
-  const runtimeEnv = { ...process.env, APP_MODE: "local" };
-  if (mockProvider) {
-    Object.assign(runtimeEnv, {
-      OPENAI_DRAFT_MODEL: "gpt-6.1-sol",
-      OPENAI_DRAFT_REASONING_EFFORT: "high",
-      OPENAI_DRAFT_HIGH_QUALITY_MODEL: "gpt-6.1-sol",
-      OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT: "max",
-    });
-    runtimeEnv.QUOTE_DATA_ROOT = dataRoot;
-    runtimeEnv.SQAG_LOCAL_PRICING_REFERENCES_ROOT = path.join(dataRoot, "pricing-references");
-  } else {
-    runtimeEnv.QUOTE_DATA_ROOT = process.env.QUOTE_DATA_ROOT || quoteDataRoot;
-  }
+  const runtimeEnv = mockProvider
+    ? isolatedLoadedAppEnvironment(dataRoot, {
+        OPENROUTER_API_KEY: "synthetic-playwright-provider-key",
+        QUOTE_DATA_ROOT: dataRoot,
+        SQAG_LOCAL_PRICING_REFERENCES_ROOT: path.join(dataRoot, "pricing-references"),
+        QUOTE_LOG_ROOT: logRoot,
+      })
+    : { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot };
   const server = spawn(
     pythonCommand(),
     serverArgs,
@@ -275,9 +269,13 @@ async function unusedLoopbackPort() {
 
 async function stopServer(serverInfo) {
   if (!serverInfo || options.keepServer) return;
-  if (serverInfo.server.killed) return;
-  serverInfo.server.kill();
-  await new Promise((resolve) => serverInfo.server.once("exit", resolve));
+  const child = serverInfo.server;
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve, reject) => {
+    child.once("exit", resolve);
+    child.once("error", reject);
+    if (!child.killed) child.kill();
+  });
 }
 
 async function screenshot(page, name) {
@@ -2091,7 +2089,7 @@ async function verifyPricingReferenceImmediateRefresh(page) {
   return { savedDigest: updated.digest, recreatedDigest: refreshed.digest, deletedReview: deleted.review };
 }
 
-async function inspectG3ForensicEvidence(jobId, dataRoot = quoteDataRoot) {
+async function inspectG3ForensicEvidence(jobId, dataRoot = quoteDataRoot, evidenceDir = outputDir) {
   const code = String.raw`
 import json, sys
 from webapp import server
@@ -2112,6 +2110,7 @@ with server.forensic_store_for_auth_session(None) as store:
       ...process.env,
       APP_MODE: "local",
       QUOTE_DATA_ROOT: dataRoot,
+      QUOTE_LOG_ROOT: path.join(evidenceDir, "server"),
       SQAG_LOCAL_PRICING_REFERENCES_ROOT: path.join(dataRoot, "pricing-references"),
     },
     timeout: 10000,
@@ -2121,7 +2120,7 @@ with server.forensic_store_for_auth_session(None) as store:
   return JSON.parse(inspected.stdout.trim());
 }
 
-async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot) {
+async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot, evidenceDir = outputDir) {
   const id = "synthetic-g3-pricing-binding-042";
   const label = "Synthetic G3 Pricing Binding";
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -2142,28 +2141,32 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot) {
   const newQuoteButton = page.locator("#dashboardEmptyNewQuoteButton:not([disabled])");
   if (await newQuoteButton.isVisible()) await newQuoteButton.click();
   else await page.locator("#newQuoteButton:not([disabled])").click();
-  await seedQuoteDraftFromTestFixture(page, { fileName: "synthetic-g3-booth-render.png" });
-  await page.evaluate(async ({ dataUrl, size }) => {
-    state.images = [await ensureContentFingerprint({
+  await seedQuoteDraftFromTestFixture(page, {
+    reference: {
       name: "synthetic-g3-booth-render.png",
-      type: "image/png",
-      size,
-      data_url: dataUrl,
-    })];
-    await persistSessionFiles(sessionFileRecordsFromDraft()).catch(() => {});
-    renderFiles();
+      data_url: G3_SYNTHETIC_PNG_DATA_URL,
+    },
+  });
+  await page.evaluate(async () => {
     setImageUploadStatus("1 synthetic booth render loaded.");
-    saveSessionState();
     const reference = state.pricingReferences.find((item) => item.id === "synthetic-g3-pricing-binding-042" && item.source === "local");
     if (!reference || !selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference))) {
       throw new Error("Synthetic Analyse reference was lost before request start.");
     }
-  }, { dataUrl: G3_SYNTHETIC_PNG_DATA_URL, size: G3_SYNTHETIC_PNG_SIZE });
+  });
 
   const acceptedJobs = [];
+  const submittedMediaMatches = [];
   const onJobResponse = async (response) => {
     if (new URL(response.url()).pathname !== "/api/jobs" || response.request().method() !== "POST") return;
-    try { acceptedJobs.push(await response.json()); } catch { /* retain no response body */ }
+    try {
+      const images = response.request().postDataJSON()?.payload?.images;
+      submittedMediaMatches.push(Array.isArray(images) && images.length === 1
+        && images[0].name === "synthetic-g3-booth-render.png"
+        && images[0].type === "image/png" && images[0].size === G3_SYNTHETIC_PNG_SIZE
+        && images[0].data_url === G3_SYNTHETIC_PNG_DATA_URL);
+      acceptedJobs.push(await response.json());
+    } catch { /* retain no response body */ }
   };
   page.on("response", onJobResponse);
   try {
@@ -2251,6 +2254,9 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot) {
   }));
   const accepted = acceptedJobs.find((job) => job?.job_id && job?.generation_run_id);
   if (!accepted) throw new Error(`Analyse did not return durable job/run linkage: ${JSON.stringify(acceptedJobs)}.`);
+  if (submittedMediaMatches.length !== 1 || !submittedMediaMatches[0]) {
+    throw new Error("Synthetic Analyse did not submit the seeded PNG unchanged.");
+  }
   if (
     browserResult.selected.id !== id
     || browserResult.selected.source !== "local"
@@ -2337,7 +2343,7 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot) {
     throw new Error(`Persisted draft lost the selected pricing authority: ${JSON.stringify({ persistedStatus: persisted.status, draftDigest: draftState.quoteDetails?.commercial_snapshot?.pricing_basis?.digest, lineCount: persistedLines.length, pricing: persistedPricing })}.`);
   }
 
-  const forensic = await inspectG3ForensicEvidence(accepted.job_id, dataRoot);
+  const forensic = await inspectG3ForensicEvidence(accepted.job_id, dataRoot, evidenceDir);
   const request = forensic.evidence?.request_manifest || {};
   const result = forensic.evidence?.result_summary || {};
   const counts = result.pricing_draft_counts || {};
@@ -2357,7 +2363,7 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot) {
   ) {
     throw new Error(`Analyse forensic linkage or safe count evidence is incomplete: ${JSON.stringify({ run: forensic.run, request, counts })}.`);
   }
-  const ownerUat = await verifyOwnerUatChecks(page, browserResult.quoteSessionId, outputDir);
+  const ownerUat = await verifyOwnerUatChecks(page, browserResult.quoteSessionId, evidenceDir);
   await page.evaluate(async (sessionId) => deleteQuoteSessionRecord(sessionId), browserResult.quoteSessionId);
   await page.evaluate(() => clearSessionState());
   return { jobId: accepted.job_id, runId: accepted.generation_run_id, rows: browserResult.rows.length, digest: browserResult.commercialBasis.digest, ownerUat };
@@ -2836,11 +2842,11 @@ async function verifyRun639PricingAuthorityRestorationAndPresentation(page) {
       }
       if (
         pricingAuthorityVersionIsValid(true)
-        || pricingAuthorityNumber("1٢") !== null
+        || pricingAuthorityNumber("1Ù¢") !== null
         || pricingAuthorityNumber("77%") !== null
         || canonicalPricingAuthorityText("a\u001cb") !== "a b"
         || canonicalPricingAuthorityText("a\ufeffb") !== "a b"
-        || canonicalPricingAuthorityText("e\u0301  item") !== "é item"
+        || canonicalPricingAuthorityText("e\u0301  item") !== "Ã© item"
       ) {
         throw new Error("Browser authority schema, decimal, or whitespace contract diverged.");
       }
@@ -3725,7 +3731,7 @@ async function verifyDashboardClearsStaleSessionsBeforeRefresh(page) {
   }
 }
 
-async function startSyntheticDeepSeekProvider() {
+async function startSyntheticGatewayProvider() {
   const requests = [];
   const replacements = new Map([
     ["make the selected panel blue", "Selected panel painted blue"],
@@ -3738,9 +3744,9 @@ async function startSyntheticDeepSeekProvider() {
     request.on("end", () => {
       try {
         const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        const prompt = (payload.messages || []).map((message) => String(message?.content || "")).join("\n");
+        const prompt = (payload.input || []).flatMap((message) => message.content || []).map((part) => String(part.text || "")).join("\n");
         const editRequest = [...replacements.keys()].find((candidate) => prompt.includes(candidate));
-        if (request.method !== "POST" || request.url !== "/chat/completions" || !editRequest) {
+        if (request.method !== "POST" || request.url !== "/responses" || !editRequest) {
           response.writeHead(400, { "content-type": "application/json" });
           response.end(JSON.stringify({ error: { message: "Unexpected synthetic provider request." } }));
           return;
@@ -3758,7 +3764,8 @@ async function startSyntheticDeepSeekProvider() {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
           id: `synthetic-${requests.length}`,
-          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+          model: payload.model, status: "completed",
+          output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: content }] }],
         }));
       } catch (error) {
         response.writeHead(500, { "content-type": "application/json" });
@@ -3771,7 +3778,7 @@ async function startSyntheticDeepSeekProvider() {
     server.listen(0, "127.0.0.1", resolve);
   });
   const address = server.address();
-  if (!address || typeof address === "string") throw new Error("Synthetic DeepSeek provider did not bind to loopback.");
+  if (!address || typeof address === "string") throw new Error("Synthetic gateway fixture did not bind to loopback.");
   return {
     endpoint: `http://127.0.0.1:${address.port}`,
     requests,
@@ -3793,12 +3800,17 @@ function isolatedLoadedAppEnvironment(runRoot, overrides = {}) {
     SQAG_DISABLE_DOTENV: "true",
     SQAG_STORAGE_MODE: "local",
     SQAG_ARTIFACT_STORAGE_MODE: "local",
-    AI_PROVIDER: "none",
-    AI_BASIS_LINE_PROVIDER: "none",
-    AI_BASIS_ANSWER_PROVIDER: "none",
-    AI_PRICING_IMPORT_PROVIDER: "none",
-    OPENAI_API_KEY: "",
-    DEEPSEEK_API_KEY: "",
+    ...Object.fromEntries(["DRAFT", "DRAFT_HIGH_QUALITY", "BASIS_LINE", "BASIS_ANSWER", "PRICING_IMPORT", "PRICING_METADATA"].flatMap((suffix) => [
+      [`OPENROUTER_${suffix}_MODEL`, `synthetic/${suffix.toLowerCase()}`],
+      [`OPENROUTER_${suffix}_REASONING_EFFORT`, "high"],
+      [`OPENROUTER_${suffix}_PROVIDER_ONLY`, '["synthetic-fixture"]'],
+    ])),
+    OPENROUTER_API_KEY: "",
+    OPENROUTER_REQUIRE_PARAMETERS: "true",
+    OPENROUTER_ALLOW_FALLBACKS: "false",
+    OPENROUTER_DATA_COLLECTION: "deny",
+    OPENROUTER_ZDR: "true",
+    OPENROUTER_REQUEST_TIMEOUT_SECONDS: "180",
     QUOTE_DATA_ROOT: path.join(runRoot, "quote-data"),
     QUOTE_OUTPUT_ROOT: path.join(runRoot, "output"),
     QUOTE_TMP_ROOT: path.join(runRoot, "tmp"),
@@ -3816,7 +3828,8 @@ async function startIsolatedLoadedAppServer(runRoot, environmentOverrides = {}) 
     fs.mkdir(env.TEMP, { recursive: true }),
     fs.mkdir(path.join(runRoot, "browser-log"), { recursive: true }),
   ]);
-  const child = spawn(pythonCommand(), ["webapp/server.py", "--host", "127.0.0.1", "--port", "0"], {
+  const entry = env.SQAG_TEST_GATEWAY_ENDPOINT ? "tests/gateway_browser_harness.py" : "webapp/server.py";
+  const child = spawn(pythonCommand(), [entry, "--host", "127.0.0.1", "--port", "0"], {
     cwd: root,
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -3881,17 +3894,17 @@ async function stopIsolatedLoadedAppServer(serverInfo) {
 }
 
 async function run573LoadedAppOnce(runIndex) {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), `sqag-run573-loaded-${runIndex}-`));
+  const browserLogRoot = path.join(root, "_logs", "browser");
+  await fs.mkdir(browserLogRoot, { recursive: true });
+  const parent = await fs.mkdtemp(path.join(browserLogRoot, `sqag-loaded-${runIndex}-`));
   let serverInfo = null;
   let providerInfo = null;
   let browser = null;
   try {
-    providerInfo = await startSyntheticDeepSeekProvider();
+    providerInfo = await startSyntheticGatewayProvider();
     serverInfo = await startIsolatedLoadedAppServer(parent, {
-      AI_BASIS_LINE_PROVIDER: "deepseek",
-      DEEPSEEK_API_KEY: "synthetic-loopback-provider-key",
-      DEEPSEEK_BASE_URL: providerInfo.endpoint,
-      DEEPSEEK_BASIS_LINE_MODEL: "synthetic-basis-line-model",
+      OPENROUTER_API_KEY: "synthetic-loopback-provider-key",
+      SQAG_TEST_GATEWAY_ENDPOINT: providerInfo.endpoint,
     });
     baseUrl = serverInfo.endpoint;
     browser = await chromium.launch({ headless: !options.headed });
@@ -4628,19 +4641,22 @@ async function run573LoadedAppTwice() {
 async function runG3PricingScope() {
   const originalPort=options.port,originalBaseUrl=baseUrl;
   try {
+    const runRoot = await freshBrowserRun(process.env.SQAG_OWNER_UAT_EVIDENCE_ROOT || path.join(root, "_logs", "browser"), "g3-");
     const temporaryQuoteDataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-g3-pricing-"));
+    await fs.mkdir(path.join(temporaryQuoteDataRoot, "process-temp"), { recursive: true });
     options.port = await unusedLoopbackPort();
     baseUrl = `http://${options.host}:${options.port}`;
     let serverInfo = null;
     let browser = null;
+    const browserBoundary = new SyntheticBrowserBoundary(baseUrl);
     try {
-      serverInfo = startServer({ mockProvider: true, dataRoot: temporaryQuoteDataRoot });
-      if (!(await waitForHealth())) {
+      serverInfo = startServer({ mockProvider: true, dataRoot: temporaryQuoteDataRoot, logRoot: path.join(runRoot, "server") });
+      if (!(await waitForHealth(15000, serverInfo.server))) {
         const serverOutput = serverInfo.output.join("").trim();
         throw new Error(`Could not start isolated G3 webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
       }
-      browser = await chromium.launch({ headless: !options.headed });
-      const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+      browser = await chromium.launch({ headless: !options.headed, ...(process.env.CI ? {} : { channel: "chrome" }) });
+      const context = await browserBoundary.newContext(browser, { viewport: { width: 1365, height: 768 } });
       const page = await context.newPage();
       const consoleProblems = [];
       const networkProblems = [];
@@ -4654,7 +4670,7 @@ async function runG3PricingScope() {
       const refresh = await verifyPricingReferenceImmediateRefresh(page);
       let analysis;
       try {
-        analysis = await verifyRun030DraftBoundary(page, temporaryQuoteDataRoot);
+        analysis = await verifyRun030DraftBoundary(page, temporaryQuoteDataRoot, runRoot);
       } catch (error) {
         const serverOutput = serverInfo.output.join("").slice(-10000);
         throw new Error(`${error.stack || error.message}\nIsolated server output:\n${serverOutput}`);
@@ -4662,11 +4678,13 @@ async function runG3PricingScope() {
       if (consoleProblems.length || networkProblems.length) {
         throw new Error(`G3 browser diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);
       }
-      console.log(JSON.stringify({ status: "ok", mode: "g3-pricing", refresh, analysis }, null, 2));
+      browserBoundary.assertClean();
+      console.log(JSON.stringify({ status: "ok", mode: "g3-pricing", runRoot, refresh, analysis }, null, 2));
     } finally {
       if (browser) await browser.close();
       await stopServer(serverInfo);
       if (!alpha1Scope) await fs.rm(temporaryQuoteDataRoot, { recursive: true, force: true });
+      browserBoundary.assertClean();
     }
 
   } finally {options.port=originalPort;baseUrl=originalBaseUrl;}

@@ -41,13 +41,7 @@ REQUIRED_ENV_NAMES = [
     "SQAG_PLATFORM_LAUNCH_MODE",
     "SQAG_PUBLIC_BASE_URL",
     "SQAG_INTERNAL_WORKSPACE_ID",
-    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
-    "OIDC_ISSUER_URL",
-    "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
-    "OIDC_REDIRECT_URI",
-    "OIDC_AUTHORIZE_URL",
-    "OIDC_TOKEN_URL",
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON",
     'SQAG_TRUSTED_PROXY_CIDRS',
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
@@ -60,10 +54,8 @@ HOST_SECRET_MANAGER_ONLY_ENV_NAMES = [
     "SESSION_SECRET",
     "SQAG_TRACKING_HMAC_KEY",
     "SQAG_DATABASE_URL",
-    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
-    "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
-    "OPENAI_API_KEY",
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON",
+    "OPENROUTER_API_KEY",
     "DEEPSEEK_API_KEY",
 ]
 
@@ -155,7 +147,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     readiness_env = {
         "APP_MODE": "deploy",
         "AUTH_REQUIRED": "true",
-        "SQAG_AUTH_MODE": "internal_google",
+        "SQAG_AUTH_MODE": "internal_password",
         "SESSION_SECRET": "synthetic-session-secret-with-enough-entropy",
         "SQAG_TRACKING_HMAC_KEY": "synthetic-tracking-key",
         "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
@@ -163,22 +155,18 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
         "SQAG_PUBLIC_BASE_URL": SYNTHETIC_INTERNAL_ALPHA_ORIGIN,
         "SQAG_INTERNAL_WORKSPACE_ID": "workspace-synthetic-alpha",
-        "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
+        "SQAG_INTERNAL_ALLOWED_EMAILS": "synthetic.tester"+"@"+"example.test",
+        "SQAG_INTERNAL_LOGIN_PASSWORD": "synthetic-group-password-value",
+        "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON": json.dumps(
             [
                 {
-                    "sub": "synthetic-hosted-subject",
+                    "user_id": "synthetic-hosted-subject",
                     "email": "synthetic.tester@example.test",
                     "role": "admin",
                 }
             ],
             separators=(",", ":"),
         ),
-        "OIDC_ISSUER_URL": "https://accounts.google.com",
-        "OIDC_CLIENT_ID": "synthetic-client-id",
-        "OIDC_CLIENT_SECRET": "synthetic-client-secret",
-        "OIDC_REDIRECT_URI": f"{SYNTHETIC_INTERNAL_ALPHA_ORIGIN}/callback",
-        "OIDC_AUTHORIZE_URL": "https://accounts.google.com/o/oauth2/v2/auth",
-        "OIDC_TOKEN_URL": "https://oauth2.googleapis.com/token",
         "SQAG_STORAGE_MODE": "database",
         "SQAG_ARTIFACT_STORAGE_MODE": "database",
         "SQAG_DATABASE_URL": f"sqlite:///{(run_root / 'readiness.sqlite3').as_posix()}",

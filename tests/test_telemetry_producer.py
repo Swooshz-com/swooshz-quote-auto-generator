@@ -984,13 +984,13 @@ class TelemetryProducerTest(unittest.TestCase):
         with server.ai_log_tracking_scope({}, auth_session=auth_session):
             operation = server.begin_ai_transport_operation(
                 "basis_chat",
-                server.AI_PROVIDER_OPENAI,
-                server.OPENAI_BASIS_LINE_MODEL,
+                server.AI_PROVIDER_OPENROUTER,
+                "synthetic/basis-line",
             )
             attempt_number = server.next_ai_transport_send_number(
                 "basis_chat",
-                server.AI_PROVIDER_OPENAI,
-                server.OPENAI_BASIS_LINE_MODEL,
+                server.AI_PROVIDER_OPENROUTER,
+                "synthetic/basis-line",
             )
             with mock.patch.object(server, "write_local_log", return_value=True), mock.patch.object(
                 server,
@@ -1000,8 +1000,8 @@ class TelemetryProducerTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "telemetry persistence failed"):
                     server.log_ai_call_attempt(
                         feature="basis_chat",
-                        provider=server.AI_PROVIDER_OPENAI,
-                        model=server.OPENAI_BASIS_LINE_MODEL,
+                        provider=server.AI_PROVIDER_OPENROUTER,
+                        model="synthetic/basis-line",
                         status="failed",
                         retry_lineage_id=operation["retry_lineage_id"],
                         attempt_number=attempt_number,
@@ -1038,80 +1038,30 @@ class TelemetryProducerTest(unittest.TestCase):
         self.assertNotIn("customer confidential note", encoded)
         self.assertNotIn("!!!", encoded)
 
-    def test_later_invalid_model_preserves_prior_actual_send_and_stops_fallback(self):
-        auth_session = {
-            "auth_mode": server.INTERNAL_AUTH_MODE,
-            "user": {
-                "subject": "telemetry-test",
-                "account": "workspace-alpha",
-                "internal_role": "owner",
-            },
-        }
-        candidates = [
-            {"provider": "deepseek", "model": server.DEEPSEEK_PRO_MODEL},
-            {"provider": "deepseek", "model": "deepseek-v4-pro\nPRIVATE_CANARY"},
-        ]
+    def test_new_invalid_configuration_preserves_prior_send_and_zero_send_rejection(self):
+        from tests.gateway_test_support import synthetic_configuration, install_mock_responses_transport
+        install_mock_responses_transport(self)
+        values=synthetic_configuration(credential="synthetic-key")
+        auth_session={"auth_mode":server.INTERNAL_AUTH_MODE,"user":{"subject":"telemetry-test","account":"workspace-alpha","internal_role":"admin"}}
+        failure=server.urllib.error.HTTPError("https://openrouter.ai/api/v1/responses",400,"private message",{},io.BytesIO(b'{}'))
+        with mock.patch.object(server,"read_dotenv_value",side_effect=values.get), mock.patch.dict(os.environ,{"APP_MODE":"local"}), mock.patch.object(server.urllib.request,"urlopen",side_effect=failure) as send, mock.patch.object(server,"write_local_log") as logs, mock.patch.object(server,"forensic_store_for_auth_session",return_value=contextlib.nullcontext(self.store)), server.ai_log_tracking_scope({},auth_session=auth_session):
+            with self.assertRaises(server.OpenAIAnalysisError) as first:
+                server.request_configured_basis_chat({"basis_chat":{"question":"What does this mean?","scope":"quote","line":""}})
+            self.assertEqual(first.exception.diagnostics["attempt_number"],1)
+            values["OPENROUTER_BASIS_ANSWER_MODEL"]="PRIVATE_CANARY/model\ninvalid"
+            with self.assertRaises(server.OpenAIAnalysisError) as second:
+                server.request_configured_basis_chat({"basis_chat":{"question":"What does this mean?","scope":"quote","line":""}})
+            self.assertEqual(second.exception.diagnostics["failure_boundary"],"request_validation")
+            self.assertEqual(second.exception.diagnostics["attempt_number"],0)
+        self.assertEqual(send.call_count,1)
+        rows=[dict(row) for row in self.connection.execute("select event_type,event_status,attempt_number,retry_lineage_id,provider,model,usage_available,cost_available from sqag_telemetry_events order by source_sequence")]
+        self.assertEqual([(r["event_type"],r["event_status"],r["attempt_number"]) for r in rows],[("ai_provider_attempt","failed",1),("validation","blocked",0)])
+        self.assertNotEqual(rows[0]["retry_lineage_id"],rows[1]["retry_lineage_id"])
+        # Arbitrary gateway model configuration stays private; the historical public-label test is unchanged.
+        self.assertIsNone(rows[0]["model"]);self.assertIsNone(rows[1]["model"])
+        self.assertEqual((rows[1]["usage_available"],rows[1]["cost_available"]),(0,0))
+        self.assertNotIn("PRIVATE_CANARY",json.dumps([call.args for call in logs.call_args_list],default=str)+str(second.exception))
 
-        def env_value(name: str) -> str:
-            return "sk-test-redacted" if name == server.DEEPSEEK_API_KEY_ENV_NAME else ""
-
-        def fail_with_http_error(request, **kwargs):
-            raise server.urllib.error.HTTPError(
-                "https://api.deepseek.com/chat/completions",
-                400,
-                "bad request",
-                {},
-                io.BytesIO(b"{}"),
-            )
-
-        with (
-            mock.patch.object(server, "read_dotenv_value", side_effect=env_value),
-            mock.patch.object(server, "basis_chat_provider_model_candidates", return_value=candidates),
-            mock.patch.object(server.urllib.request, "urlopen", side_effect=fail_with_http_error) as urlopen,
-            mock.patch.object(server, "write_local_log") as write_local_log,
-            mock.patch.object(
-                server,
-                "forensic_store_for_auth_session",
-                return_value=contextlib.nullcontext(self.store),
-            ),
-            server.ai_log_tracking_scope({}, auth_session=auth_session),
-        ):
-            with self.assertRaises(server.OpenAIAnalysisError) as raised:
-                server.request_configured_basis_chat({
-                    "basis_chat": {
-                        "question": "what does this mean?",
-                        "scope": "quote",
-                        "field": "",
-                        "line_index": -1,
-                        "line": "",
-                    }
-                })
-
-        self.assertEqual(urlopen.call_count, 1)
-        self.assertEqual(raised.exception.diagnostics["failure_boundary"], "request_validation")
-        self.assertNotIn("PRIVATE_CANARY", str(raised.exception) + json.dumps(raised.exception.diagnostics))
-        rows = [
-            dict(row)
-            for row in self.connection.execute(
-                "select event_type, event_status, attempt_number, retry_lineage_id, provider, model, "
-                "usage_available, cost_available from sqag_telemetry_events order by source_sequence"
-            )
-        ]
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(
-            [(row["event_type"], row["event_status"], row["attempt_number"]) for row in rows],
-            [("ai_provider_attempt", "failed", 1), ("validation", "blocked", 0)],
-        )
-        self.assertEqual(rows[0]["model"], server.DEEPSEEK_PRO_MODEL)
-        self.assertIsNone(rows[1]["model"])
-        self.assertNotEqual(rows[0]["retry_lineage_id"], rows[1]["retry_lineage_id"])
-        self.assertEqual((rows[1]["usage_available"], rows[1]["cost_available"]), (0, 0))
-        retry_details = [
-            server.project_provider_model_fields(call.args[1])
-            for call in write_local_log.call_args_list
-            if len(call.args) > 1 and isinstance(call.args[1], dict)
-        ]
-        self.assertNotIn("PRIVATE_CANARY", json.dumps(retry_details, sort_keys=True))
 
     def test_sqlite_010_rebuild_preserves_existing_rows_and_rejects_unbounded_zero(self):
         connection = sqlite3.connect(":memory:")

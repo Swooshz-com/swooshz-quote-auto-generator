@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from tests.rendered_browser_support import owned_browser_evidence_directory
 from pathlib import Path
 from unittest import mock
 
@@ -159,7 +160,7 @@ class ProviderSourceSelectionTest(unittest.TestCase):
                            quote_session={"session_id": "quote-source-unit-" + str(int(missing_unit))})
             raw = self.raw_draft(missing_unit=missing_unit)
             before_raw = copy.deepcopy(raw)
-            env = existing.isolated_env(OPENAI_API_KEY="ordinary-mock-only-no-network", AUTH_REQUIRED="false",
+            env = existing.isolated_env(OPENROUTER_API_KEY="ordinary-mock-only-no-network", AUTH_REQUIRED="false",
                                         QUOTE_DATA_ROOT=str(self.fixture._test_data_root))
             def provider(request, _key, auth_session=None, **_kwargs):
                 return webapp.normalize_ai_draft(copy.deepcopy(raw), request, require_confidence=True, auth_session=auth_session)
@@ -225,7 +226,7 @@ class ProviderSourceSelectionTest(unittest.TestCase):
     def test_post_draft_ambiguous_raw_ownership_does_not_offer_a_candidate(self):
         raw = self.raw_draft(ambiguous=True)
         payload = self.fixture.sqag_212_payload(CATALOG)
-        env = existing.isolated_env(OPENAI_API_KEY="ordinary-mock-only-no-network", AUTH_REQUIRED="false",
+        env = existing.isolated_env(OPENROUTER_API_KEY="ordinary-mock-only-no-network", AUTH_REQUIRED="false",
                                     QUOTE_DATA_ROOT=str(self.fixture._test_data_root))
         def provider(request, _key, auth_session=None, **_kwargs):
             return webapp.normalize_ai_draft(copy.deepcopy(raw), request, require_confidence=True, auth_session=auth_session)
@@ -245,7 +246,7 @@ class ProviderSourceSelectionTest(unittest.TestCase):
         if not (existing.ROOT / "node_modules" / "playwright" / "package.json").exists():
             if os.environ.get("CI"): self.fail("Playwright is required for source-provenance regression.")
             self.skipTest("Playwright is not installed.")
-        with tempfile.TemporaryDirectory() as temp:
+        with owned_browser_evidence_directory() as temp:
             completed = subprocess.run([node, "scripts/playwright-owner-uat-basis-repair.mjs", "--lines=0",
                 "--latency-ms=0", "--fresh-analysis", "--source-provenance", "--currency=SGD"],
                 cwd=existing.ROOT, env={**os.environ, "SQAG_OWNER_UAT_EVIDENCE_ROOT": temp, "PYTHON": os.sys.executable},

@@ -1,5 +1,6 @@
 """Current publication projections use verified bytes and immutable comparisons."""
 import copy
+import hashlib
 import http.client
 import json
 import os
@@ -22,6 +23,255 @@ class PublicationProjectionTest(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
 
+    def test_atomic_text_short_temp_names_survive_path_growth(self):
+        # Retain the previous helper as the real-filesystem comparison control.
+        QUOTE_SESSION_TRANSACTION_CONTEXT = s.QUOTE_SESSION_TRANSACTION_CONTEXT
+
+        def retained_old_helper(path: Path, content: str) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=str(path.parent),
+            )
+            temporary_path = Path(temporary_name)
+            transaction = QUOTE_SESSION_TRANSACTION_CONTEXT.get()
+            if transaction is not None:
+                transaction.track_temporary_file(temporary_path)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, path)
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+
+        with tempfile.TemporaryDirectory(prefix="atomic-text-", dir=existing.test_temp_root()) as temporary:
+            root = Path(temporary)
+            if os.name == "nt":
+                # Match the observed staging-directory geometry, without a path alias.
+                padding = 230 - len(str(root)) - 1
+                self.assertGreater(padding, 0)
+                self.assertLessEqual(padding, 255)
+                parent = root / ("p" * padding)
+                parent.mkdir()
+                target = parent / "draft-files.json"
+            else:
+                # Exercise the same basename growth against the actual component limit.
+                component_limit = os.pathconf(root, "PC_NAME_MAX")
+                self.assertGreaterEqual(component_limit, 64)
+                parent = root
+                target = parent / (("d" * (component_limit - 12)) + ".json")
+            original = b"synthetic original bytes\n"
+            replacement = "synthetic replacement \u03a9\n"
+            target.write_bytes(original)
+            created = []
+            real_mkstemp = tempfile.mkstemp
+
+            def observe_mkstemp(*args, **kwargs):
+                descriptor, name = real_mkstemp(*args, **kwargs)
+                created.append(Path(name))
+                return descriptor, name
+
+            old_failure = None
+            with mock.patch.object(tempfile, "mkstemp", side_effect=observe_mkstemp):
+                try:
+                    retained_old_helper(target, replacement)
+                except OSError as error:
+                    old_failure = error
+                    self.assertEqual(target.read_bytes(), original)
+                    self.assertEqual(created, [])
+                else:
+                    # Long-path-capable hosts may legitimately support the old name.
+                    self.assertEqual(target.read_bytes(), replacement.encode("utf-8"))
+                    self.assertEqual(len(created), 1)
+                    self.assertEqual(created[0].parent, parent)
+                    self.assertFalse(created[0].exists())
+                self.assertEqual(list(parent.iterdir()), [target])
+                target.write_bytes(original)
+                created.clear()
+                s.atomic_write_text(target, replacement)
+            self.assertEqual(target.read_bytes(), replacement.encode("utf-8"))
+            self.assertEqual(len(created), 1)
+            self.assertEqual(created[0].parent, parent)
+            self.assertFalse(created[0].exists())
+            self.assertLessEqual(len(created[0].name), 32)
+            self.assertEqual(list(parent.iterdir()), [target])
+            print(json.dumps({
+                "event": "atomic_temp_name_comparison", "old_failed": old_failure is not None,
+                "old_error_class": type(old_failure).__name__ if old_failure is not None else None,
+                "old_errno": old_failure.errno if old_failure is not None else None,
+                "old_filename_characters": len(old_failure.filename) if old_failure is not None and isinstance(old_failure.filename, str) else None,
+                "new_succeeded": True, "same_parent": True,
+                "new_filename_characters": len(str(created[0])),
+                "destination_characters": len(str(target)),
+            }))
+
+    def test_atomic_text_replace_failure_preserves_target_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory(prefix="atomic-replace-", dir=existing.test_temp_root()) as temporary:
+            root = Path(temporary)
+            target = root / "state.json"
+            original = b"synthetic existing state\n"
+            replacement = "synthetic updated state \u03a9\n"
+            target.write_bytes(original)
+            transaction = s.LocalQuoteSessionTransaction(
+                session_id="quote-atomic-replace", session_directory=root, initial_owner=True,
+            )
+            token = s.QUOTE_SESSION_TRANSACTION_CONTEXT.set(transaction)
+            failure = OSError("synthetic replacement failure")
+            temporary_paths = []
+
+            def fail_replace(source, destination):
+                source = Path(source)
+                temporary_paths.append(source)
+                self.assertEqual(source.parent, target.parent)
+                self.assertEqual(Path(destination), target)
+                self.assertEqual(source.read_bytes(), replacement.encode("utf-8"))
+                if os.name == "posix":
+                    self.assertEqual(source.stat().st_mode & 0o777, 0o600)
+                raise failure
+
+            try:
+                with mock.patch.object(s.os, "replace", side_effect=fail_replace) as replace:
+                    with self.assertRaises(OSError) as caught:
+                        s.atomic_write_text(target, replacement)
+                    replace.assert_called_once()
+                self.assertIs(caught.exception, failure)
+            finally:
+                s.QUOTE_SESSION_TRANSACTION_CONTEXT.reset(token)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(len(temporary_paths), 1)
+            self.assertFalse(temporary_paths[0].exists())
+            self.assertIn(transaction._path_key(temporary_paths[0]), transaction.owned_files)
+            self.assertFalse(transaction.metadata_committed)
+            self.assertEqual(list(root.iterdir()), [target])
+
+    def test_local_staging_name_is_bounded_and_binds_exports_and_draft_files(self):
+        with self.case("local"):
+            metadata_before = copy.deepcopy(self.metadata())
+            output = self.root / "staging-source"
+            output.mkdir()
+            contents = {"quotation.xlsx": b"PK synthetic staged workbook", "quotation.pdf": b"%PDF-1.4\n% synthetic staged PDF\n"}
+            for filename, content in contents.items():
+                (output / filename).write_bytes(content)
+            result = {"status": "completed", "files": [{"name": name} for name in contents]}
+            records = s.quote_session_draft_files({"draft_files": [{
+                "session_file_key": "synthetic-render-key", "name": "synthetic-render.png", "type": "image/png", "data_url": existing.synthetic_image(),
+            }]})
+            self.assertEqual(len(records), 1)
+            transaction = s.LocalQuoteSessionTransaction(
+                session_id=self.session_id, session_directory=s.quote_session_dir(self.session_id), initial_owner=False,
+            )
+            created = []
+            real_mkdir = Path.mkdir
+
+            def observe_mkdir(path, *args, **kwargs):
+                answer = real_mkdir(path, *args, **kwargs)
+                if path.name.endswith(".staging") and not kwargs.get("exist_ok", False):
+                    created.append((path, args, kwargs, path.stat().st_mode & 0o777))
+                return answer
+
+            token = s.QUOTE_SESSION_TRANSACTION_CONTEXT.set(transaction)
+            try:
+                with mock.patch.object(Path, "mkdir", new=observe_mkdir), mock.patch.object(
+                    s.secrets, "token_urlsafe", wraps=s.secrets.token_urlsafe,
+                ) as entropy:
+                    staged = s.stage_local_quote_publication(
+                        self.session_id, result, output, draft_file_records=records, transaction=transaction,
+                    )
+                entropy.assert_called_once_with(16)
+            finally:
+                s.QUOTE_SESSION_TRANSACTION_CONTEXT.reset(token)
+            self.assertEqual(len(created), 1)
+            staging, arguments, keywords, permissions = created[0]
+            self.assertRegex(staging.name, r"^\.[A-Za-z0-9_-]{22}\.staging$")
+            self.assertEqual(len(staging.name), 31)
+            self.assertEqual(arguments, ())
+            self.assertEqual(keywords, {"parents": False, "exist_ok": False})
+            self.assertEqual(staging.parent, s.quote_session_publications_dir(self.session_id))
+            final = staged["final_dir"]
+            self.assertEqual(final.parent, staging.parent)
+            self.assertEqual(final.name, staged["publication_id"])
+            self.assertRegex(staged["publication_id"], r"^pub-[0-9a-f]{32}$")
+            self.assertFalse(staging.exists())
+            self.assertTrue(staged["draft_files_bound"])
+            self.assertEqual(final.stat().st_mode & 0o777, permissions)
+            self.assertIn(transaction._path_key(final), transaction.created_directories)
+            self.assertNotIn(transaction._path_key(staging), transaction.created_directories)
+            for kind, filename in s.QUOTE_SESSION_EXPORT_KINDS.items():
+                self.assertEqual((final / filename).read_bytes(), contents[filename])
+                self.assertEqual(staged["exports"][kind]["publication_id"], staged["publication_id"])
+                self.assertEqual(staged["exports"][kind]["size_bytes"], len(contents[filename]))
+                self.assertEqual(staged["exports"][kind]["sha256"], hashlib.sha256(contents[filename]).hexdigest())
+                self.assertIn(transaction._path_key(final / filename), transaction.owned_files)
+            draft_path = final / s.QUOTE_SESSION_DRAFT_FILES_FILENAME
+            self.assertEqual(json.loads(draft_path.read_text(encoding="utf-8")), records)
+            self.assertIn(transaction._path_key(draft_path), transaction.owned_files)
+            self.assertFalse(any(path.name.endswith(".tmp") for path in final.iterdir()))
+            self.assertEqual(self.metadata(), metadata_before)
+            self.assertFalse(transaction.metadata_committed)
+
+    def test_local_staging_collision_and_copy_failure_preserve_prior_publication(self):
+        with self.case("local"):
+            _job_id, prior, content = self.publish("prior-staging")
+            metadata_before = copy.deepcopy(self.metadata())
+            directory = s.quote_session_dir(self.session_id)
+            publications = s.quote_session_publications_dir(self.session_id)
+            output = self.root / "replacement-source"
+            output.mkdir()
+            for filename, value in {"quotation.xlsx": b"PK synthetic replacement", "quotation.pdf": b"%PDF-1.4 synthetic replacement"}.items():
+                (output / filename).write_bytes(value)
+            result = {"status": "completed", "files": [{"name": name} for name in s.QUOTE_SESSION_EXPORT_KINDS.values()]}
+            collision = publications / ("." + "C" * 22 + ".staging")
+            collision.mkdir()
+            (collision / "sentinel.bin").write_bytes(b"synthetic existing staging bytes")
+            real_copy = s.shutil.copy2
+            for failure_mode, short_name in (("collision", "C" * 22), ("copy_failure", "F" * 22)):
+                with self.subTest(failure_mode=failure_mode):
+                    before = {path.relative_to(directory).as_posix(): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+                    before_directories = {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_dir()}
+                    transaction = s.LocalQuoteSessionTransaction(
+                        session_id=self.session_id, session_directory=directory, initial_owner=False,
+                    )
+                    failure = OSError("synthetic copy failure")
+                    copied = []
+
+                    def fail_copy(source, destination, *args, **kwargs):
+                        real_copy(source, destination, *args, **kwargs)
+                        copied.append(Path(destination))
+                        raise failure
+
+                    token = s.QUOTE_SESSION_TRANSACTION_CONTEXT.set(transaction)
+                    try:
+                        with mock.patch.object(s.secrets, "token_urlsafe", return_value=short_name) as entropy:
+                            if failure_mode == "collision":
+                                with self.assertRaises(FileExistsError):
+                                    s.stage_local_quote_publication(self.session_id, result, output, draft_file_records=[], transaction=transaction)
+                            else:
+                                with mock.patch.object(s.shutil, "copy2", side_effect=fail_copy) as copy_file:
+                                    with self.assertRaises(OSError) as caught:
+                                        s.stage_local_quote_publication(self.session_id, result, output, draft_file_records=[], transaction=transaction)
+                                    self.assertIs(caught.exception, failure)
+                                    copy_file.assert_called_once()
+                            entropy.assert_called_once_with(16)
+                    finally:
+                        try:
+                            s._remove_uncommitted_quote_session_transaction(transaction)
+                        finally:
+                            s.QUOTE_SESSION_TRANSACTION_CONTEXT.reset(token)
+                    self.assertEqual({path.relative_to(directory).as_posix(): path.read_bytes() for path in directory.rglob("*") if path.is_file()}, before)
+                    self.assertEqual({path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_dir()}, before_directories)
+                    self.assertEqual(self.metadata(), metadata_before)
+                    self.assertFalse(transaction.metadata_committed)
+                    if failure_mode == "copy_failure":
+                        self.assertEqual(len(copied), 1)
+                        self.assertFalse(copied[0].exists())
+                        self.assertFalse((publications / ("." + short_name + ".staging")).exists())
+            self.assertEqual((collision / "sentinel.bin").read_bytes(), b"synthetic existing staging bytes")
+            for url, kind in zip(self.links(prior), ("xlsx", "pdf", "pdf")):
+                self.assertEqual(self.request(url), (200, content[kind]))
     @contextmanager
     def case(self, mode):
         with tempfile.TemporaryDirectory(prefix="qp-", dir=existing.test_temp_root()) as temporary, ExitStack() as stack:

@@ -1,5 +1,9 @@
 # SQAG Production-Readiness Audit
 
+The dated audit records below describe their historical candidates. Current
+internal login and inference contracts are in [staff password access](internal-password-auth-mode.md)
+and [the AI gateway contract](ai-gateway.md); these records do not qualify the current installation.
+
 ## 2026-07-24 Temporary Internal Google Authentication Audit
 
 Base SHA: `a8055aeb9bd31084ecf509e5c5ffb73303b5553a`
@@ -42,7 +46,7 @@ P1 RED at exact starting head `85cab033c3ec8c15f8b6351eb94d5c97a0f74fd5`:
 the existing test accepted two subjects for one admin email, and a direct
 characterisation accepted one subject first as admin and then as operator.
 
-Canonical design: `docs/internal-google-auth-mode.md`.
+Historical design: `docs/internal-google-auth-mode.md` at the recorded audit candidate. The maintained replacement is [staff password access](internal-password-auth-mode.md).
 
 Validation record:
 

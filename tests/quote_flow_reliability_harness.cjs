@@ -10,16 +10,17 @@ function extract(name) {
   return end < 0 ? rest : rest.slice(0, end + 1);
 }
 async function generationOutputCases() {
+  const names = [...source.matchAll(/^(?:async )?function ([A-Za-z_$][\w$]*)\(/gm)].map(match => match[1]);
+  const functions = names.map(name => {
+    const start = new RegExp('^(?:async )?function ' + name + '\\(', 'm').exec(source).index;
+    const rest = source.slice(start);
+    return rest.slice(0, /^\}/m.exec(rest).index + 1);
+  });
+  const constants = source.slice(0, source.indexOf('const state =')) + '\n' + source.match(/^const GENERIC_FAILURE_MESSAGE = .*;$/m)[0];
+  const productionSource = constants + '\n' + functions.join('\n');
   function productionContext() {
-    const names = [...source.matchAll(/^(?:async )?function ([A-Za-z_$][\w$]*)\(/gm)].map(match => match[1]);
-    const functions = names.map(name => {
-      const start = new RegExp('^(?:async )?function ' + name + '\\(', 'm').exec(source).index;
-      const rest = source.slice(start);
-      return rest.slice(0, /^\}/m.exec(rest).index + 1);
-    });
-    const constants = source.slice(0, source.indexOf('const state =')) + '\n' + source.match(/^const GENERIC_FAILURE_MESSAGE = .*;$/m)[0];
     const c = vm.createContext({ console, Set, Map });
-    vm.runInContext(constants + '\n' + functions.join('\n'), c);
+    vm.runInContext(productionSource, c);
     vm.runInContext(`var state = { quoteCommercialLifecycle:'RECOVERED', quoteCommercialSnapshot:{lifecycle:'RECOVERED'},
       activeSidePanel:'output', activeAppView:'quote', basisConfirmed:true, aiFailed:false,
       quoteBasisSections:[], pricingIssues:[], outputSortMode:'pricing_reference', outputRevision:0,

@@ -275,12 +275,16 @@ class BasisDimensionContractTest(unittest.TestCase):
                 mock.patch.object(webapp, "pricing_references_root", return_value=root),
                 mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root / "empty"),
                 mock.patch.object(webapp, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"),
-                mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda key: "synthetic-key" if key == "OPENAI_API_KEY" else existing.synthetic_draft_dotenv_value(key)),
-                mock.patch.object(webapp, "write_local_log"),
-                mock.patch.object(webapp, "log_ai_call_attempt"),
+                mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda key: "synthetic-key" if key == "OPENROUTER_API_KEY" else existing.synthetic_draft_dotenv_value(key)),
+                mock.patch.object(webapp, "write_local_log", return_value=True) as local_log,
+                mock.patch.object(webapp, "append_ai_attempt_telemetry", return_value={}) as telemetry,
+                mock.patch.object(webapp, "log_ai_call_attempt", wraps=webapp.log_ai_call_attempt) as log_attempt,
+                mock.patch.object(webapp.urllib.request, "urlopen", side_effect=AssertionError("NETWORK_DENIED")) as send,
+                webapp.ai_log_tracking_scope({}),
             ):
                 for reference_id, currency in (("synthetic-original", "SGD"), ("synthetic-fresh-import", "USD")):
                     with self.subTest(reference_id=reference_id):
+                        local_log.reset_mock(); telemetry.reset_mock(); log_attempt.reset_mock(); send.reset_mock()
                         payload = fixture.sqag_212_payload()
                         payload.pop("pricing_reference", None)
                         payload["pricing_reference_id"] = reference_id
@@ -299,6 +303,12 @@ class BasisDimensionContractTest(unittest.TestCase):
                             result = webapp.draft_quote_basis(payload)
                         self.assertEqual(result["status"], "drafted")
                         self.assertEqual(request.call_count, 1)
+                        send.assert_not_called()
+                        log_attempt.assert_called_once()
+                        self.assertEqual([call for call in local_log.call_args_list if call.args[0] == "ai_call_attempt"], [])
+                        telemetry.assert_not_called()
+                        self.assertIsNone(getattr(webapp.AI_LOG_TRACKING_CONTEXT, "transport_operation", None))
+                        self.assertIsNone(webapp.current_ai_transport_owner())
                         self.assertEqual(request.call_args.kwargs["draft_configuration"].analysis_mode, "standard")
                         self.assertEqual(result["project"]["dimension_source"], "default")
                         self.assertEqual(result["pricing_reference_basis"]["id"], reference_id)

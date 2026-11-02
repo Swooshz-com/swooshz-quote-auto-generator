@@ -1,3 +1,4 @@
+import { signIn } from "./internal-password-browser-test.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -475,9 +476,9 @@ try {
   anonymousApi = await request.newContext();
   const anonymousStatus=(await anonymousApi.get(baseUrl + "/api/quote-sessions")).status(); assert(anonymousStatus === 401, "Anonymous quote-session access was not denied.");
   phase='synthetic_auth_and_fresh_customer'; await writeJson('progress.json',{phase,completedChecks});
-  await page.goto(baseUrl + "/login", { waitUntil: "domcontentloaded" });
+  await signIn(page, baseUrl);
   const auth = await waitFor(async () => page.evaluate(async () => { const r=await fetch("/api/session"); return {status:r.status,body:await r.json()}; }).then((x) => x.status === 200 && x.body.authenticated ? x : false), "synthetic local auth");
-  assert(auth.body.user?.subject === "synthetic-browser-subject" && auth.body.user?.account === "workspace-internal-alpha", "Unexpected synthetic identity/workspace.");
+  assert(auth.body.user === null && auth.body.authenticated === true && Boolean(auth.body.browser_recovery_scope), "Unexpected synthetic identity/workspace.");
   assert(auth.body.permissions?.canGenerateQuote === true, "Synthetic user cannot generate quotes.");
   api = await request.newContext({ storageState: await context.storageState() });
   const profileResponse = await api.get(baseUrl + "/api/profiles");

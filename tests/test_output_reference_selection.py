@@ -2,8 +2,8 @@
 import json
 import os
 import subprocess
-import tempfile
 import unittest
+from tests.rendered_browser_support import owned_browser_evidence_directory
 from pathlib import Path
 
 from tests.test_webapp import ROOT, require_node
@@ -23,7 +23,7 @@ class OutputReferenceSelectionTest(unittest.TestCase):
             if os.environ.get("CI"):
                 self.fail("Playwright is required for Output selection regression.")
             self.skipTest("Playwright is unavailable.")
-        with tempfile.TemporaryDirectory() as tmp:
+        with owned_browser_evidence_directory() as tmp:
             completed = subprocess.run(
                 [require_node(self), "scripts/playwright-owner-uat-basis-repair.mjs",
                  "--lines=0", "--latency-ms=0", "--fresh-analysis",

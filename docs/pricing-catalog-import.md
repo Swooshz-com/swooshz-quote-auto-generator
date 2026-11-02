@@ -25,6 +25,8 @@ Pricing catalog import lets Settings create a reviewed company pricing reference
 
 Normalized `.xlsx` and `.csv` templates can be parsed deterministically for row data, but every user-facing import preview must complete AI metadata enrichment before Save Reference is enabled. Messy workbook, CSV, and Markdown layouts use AI normalization first, then the same mandatory metadata enrichment step.
 
+Missing AI configuration keeps the preview unsaved and Save Reference disabled. The response retains a configuration-required review state and a support reference that matches the server log. Transport failures, refusals and invalid model output remain failed imports; they do not become successful empty previews.
+
 ## Messy import regression coverage
 
 Messy workbook import coverage uses synthetic generated workbooks in automated tests. Do not commit ad hoc pricing-reference workbooks under `docs/` for manual import testing; keep raw pricing uploads in ignored local/runtime storage and delete generated pricing-reference packs after any manual test.
@@ -56,19 +58,16 @@ After save, the pricing reference text is authoritative. Later quote-basis and o
 
 AI provider routing:
 
-- Pricing import normalization and metadata enrichment use `AI_PRICING_IMPORT_PROVIDER` when set.
-- When `DEEPSEEK_API_KEY` is present and no explicit provider override is set, DeepSeek is tried first.
-- DeepSeek pricing import normalization uses `DEEPSEEK_PRICING_IMPORT_MODEL`, defaulting to `deepseek-v4-pro`.
-- DeepSeek pricing metadata enrichment uses `DEEPSEEK_PRICING_METADATA_MODEL`, defaulting to `deepseek-v4-flash`.
-- `DEEPSEEK_MODEL` remains the legacy/global DeepSeek fallback model, defaulting to `deepseek-v4-pro`. A custom non-Pro value still acts as a global override, but `DEEPSEEK_MODEL=deepseek-v4-pro` does not suppress Flash route defaults.
-- OpenAI remains the fallback provider and uses `OPENAI_BASIS_LINE_MODEL`, defaulting to `gpt-6-luna` with explicit `high` reasoning, for both messy-import normalization and pricing metadata enrichment. Defaults apply only when the setting is absent or blank; any explicit unsupported model fails request validation before OpenAI transport.
-- DeepSeek pricing import normalization uses a dedicated failover timeout, `DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS` (default 120 seconds), so messy imports give DeepSeek a full bounded attempt before malformed or stalled responses fall back to OpenAI. Other DeepSeek routes continue to use `DEEPSEEK_REQUEST_TIMEOUT_SECONDS`.
+- Import normalisation uses the explicit `PRICING_IMPORT` route; matching metadata before and after save uses `PRICING_METADATA`.
+- Both use the fixed OpenRouter Responses transport and the complete configuration in [the gateway contract](ai-gateway.md), with no source model defaults or alternate-provider fallback.
+- Each operation captures one immutable model/effort/endpoint configuration. Metadata batches share that snapshot. Missing or unsupported configuration fails before transport.
+- Each pricing call has one send and an explicit configured timeout. A failure remains visible through the pricing review flow with a safe support reference.
 
 AI normalization and metadata responses share strict JSON-object and provider
 completion admission with the other AI routes. Refusal or incomplete status cannot
 be accepted merely because a partial response contains valid JSON. Duplicate keys,
-array wrappers and nonfinite numbers reject. Existing provider failover stays in
-place; an invalid response never becomes a successful import preview by itself.
+array wrappers and nonfinite numbers reject. An invalid response never becomes
+a successful import preview or triggers an alternate provider.
 Saved pricing values, selected currency/tax and source-backed matching metadata
 remain authoritative and are not inferred from response formatting.
 

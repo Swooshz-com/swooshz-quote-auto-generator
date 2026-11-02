@@ -22,7 +22,7 @@ class DiagnosticPrivacyTest(unittest.TestCase):
             self.assertEqual(smoke.main(), 2)
         result = json.loads(output.getvalue())
         self.assertEqual(result['status'], 'blocked')
-        self.assertEqual(result['error'], 'Configure DEEPSEEK_API_KEY or OPENAI_API_KEY in the local environment.')
+        self.assertEqual(result['error'], 'Configure all six OpenRouter operation routes and OPENROUTER_API_KEY in the local environment.')
         provider.assert_not_called()
 
     def test_readiness_prints_configuration_names_without_values(self):

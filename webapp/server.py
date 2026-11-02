@@ -47,7 +47,7 @@ import unicodedata
 import warnings
 import zipfile
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urlparse
@@ -103,20 +103,14 @@ from webapp.object_storage import (
     object_storage_provider_status,
 )
 from webapp.postgres_migrations import EXPECTED_TRIGGER_ROUTINE_LINKS
-from webapp.internal_google_auth import (
-    GOOGLE_ISSUER,
-    INTERNAL_AUTH_MODE,
-    INTERNAL_SESSION_TTL_SECONDS,
-    OIDC_TRANSACTION_TTL_SECONDS,
-    InternalAuthConfigError,
-    InternalAuthPolicy,
-    InternalAuthState,
-    InternalAuthStateError,
-    GoogleOidcVerifier,
-    OidcProtocolError,
-    OidcRuntimeConfig,
-    canonical_email,
+from webapp.ai_gateway import (AiGateway, GatewayConfiguration, GatewayError,
+    safe_draft_error_param, draft_provider_error_diagnostics, SUPPORTED_REASONING_EFFORTS)
+from webapp.internal_password_auth import (
+    INTERNAL_AUTH_MODE, INTERNAL_SESSION_TTL_SECONDS, LOGIN_NONCE_TTL_SECONDS,
+    InternalAuthConfigError, InternalAuthPolicy, InternalAuthState,
+    InternalAuthStateError, canonical_email,
 )
+
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 GENERATOR_PATH = PROJECT_ROOT / "scripts" / "generate_quote.py"
@@ -429,7 +423,8 @@ AUTH_ALLOWED_DOMAINS_ENV_NAME = "AUTH_ALLOWED_DOMAINS"
 AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME = "AUTH_ALLOW_ANY_AUTHENTICATED_USER"
 AUTH_APPROVED_TESTER_ROLE_ENV_NAME = "AUTH_APPROVED_TESTER_ROLE"
 INTERNAL_WORKSPACE_ID_ENV_NAME = "SQAG_INTERNAL_WORKSPACE_ID"
-INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME = "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON"
+INTERNAL_IDENTITY_BINDINGS_ENV_NAME = "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON"
+INTERNAL_LOGIN_PASSWORD_ENV_NAME = "SQAG_INTERNAL_LOGIN_PASSWORD"
 INTERNAL_ALLOWED_EMAILS_ENV_NAME = "SQAG_INTERNAL_ALLOWED_EMAILS"
 INTERNAL_ADMIN_EMAILS_ENV_NAME = "SQAG_INTERNAL_ADMIN_EMAILS"
 INTERNAL_OPERATOR_EMAILS_ENV_NAME = "SQAG_INTERNAL_OPERATOR_EMAILS"
@@ -512,6 +507,8 @@ RATE_LIMIT_PRUNE_INTERVAL_SECONDS = 15
 # windows; saturation uses the bounded per-route overflow state below.
 MAX_RATE_LIMIT_BUCKETS = 4096
 POST_RATE_LIMITS = {
+    "/login": 10,
+    "/login/nonce": 10,  # Separate GET form issuance budget; no public route.
     PLATFORM_LAUNCH_ENDPOINT: 20,
     PLATFORM_FINALIZATION_ENDPOINT: 30,
     TELEMETRY_FEED_ENDPOINT: 60,
@@ -543,7 +540,12 @@ RATE_LIMIT_BUCKETS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_OVERFLOW_BUCKETS: dict[str, list[float]] = {}
 RATE_LIMIT_LAST_PRUNE_AT = 0.0
 RATE_LIMIT_LOCK = threading.Lock()
-INTERNAL_AUTH_STATE = InternalAuthState()
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    """Own authentication state for exactly this running HTTP instance."""
+    def __init__(self, *args, internal_auth=None, **kwargs):
+        self.internal_auth = internal_auth if internal_auth is not None else InternalAuthState()
+        super().__init__(*args, **kwargs)
+
 AI_LOG_TRACKING_CONTEXT = threading.local()
 ALLOWED_LOG_EVENTS = {
     "abuse_signal",
@@ -647,39 +649,19 @@ RICH_TEXT_DETAIL_KEYS = {
 }
 DRAFT_ANALYSIS_MODE_STANDARD = "standard"
 DRAFT_ANALYSIS_MODE_HIGH_QUALITY = "high_quality"
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-OPENAI_BASIS_LINE_MODEL = "gpt-6-luna"
-OPENAI_BASIS_ANSWER_MODEL = "gpt-6-luna"
-OPENAI_SMALL_REASONING_EFFORT = "high"
-OPENAI_API_KEY_ENV_NAME = "OPENAI_API_KEY"
-OPENAI_DRAFT_MODEL_ENV_NAME = "OPENAI_DRAFT_MODEL"
-OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_MODEL"
-OPENAI_BASIS_LINE_MODEL_ENV_NAME = "OPENAI_BASIS_LINE_MODEL"
-OPENAI_BASIS_ANSWER_MODEL_ENV_NAME = "OPENAI_BASIS_ANSWER_MODEL"
-OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_REASONING_EFFORT"
-OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
-OPENAI_REQUEST_TIMEOUT_ENV_NAME = "OPENAI_REQUEST_TIMEOUT_SECONDS"
-AI_PROVIDER_OPENAI = "openai"
+OPENROUTER_API_KEY_ENV_NAME = "OPENROUTER_API_KEY"
+OPENROUTER_DRAFT_MODEL_ENV_NAME = "OPENROUTER_DRAFT_MODEL"
+OPENROUTER_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME = "OPENROUTER_DRAFT_HIGH_QUALITY_MODEL"
+OPENROUTER_DRAFT_REASONING_EFFORT_ENV_NAME = "OPENROUTER_DRAFT_REASONING_EFFORT"
+OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME = "OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT"
+AI_PROVIDER_OPENROUTER = "openrouter"
 AI_PROVIDER_DEEPSEEK = "deepseek"
-SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENAI, AI_PROVIDER_DEEPSEEK}
+SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENROUTER, "openai", AI_PROVIDER_DEEPSEEK}
 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
 QUOTE_SESSION_RETIRED_MESSAGE = "This quote session is no longer available. Please start a new quote. Contact support if this keeps happening."
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
-DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
 DEEPSEEK_API_KEY_ENV_NAME = "DEEPSEEK_API_KEY"
-DEEPSEEK_MODEL_ENV_NAME = "DEEPSEEK_MODEL"
-DEEPSEEK_BASIS_LINE_MODEL_ENV_NAME = "DEEPSEEK_BASIS_LINE_MODEL"
-DEEPSEEK_BASIS_ANSWER_MODEL_ENV_NAME = "DEEPSEEK_BASIS_ANSWER_MODEL"
-DEEPSEEK_PRICING_IMPORT_MODEL_ENV_NAME = "DEEPSEEK_PRICING_IMPORT_MODEL"
-DEEPSEEK_PRICING_METADATA_MODEL_ENV_NAME = "DEEPSEEK_PRICING_METADATA_MODEL"
-DEEPSEEK_BASE_URL_ENV_NAME = "DEEPSEEK_BASE_URL"
-DEEPSEEK_REQUEST_TIMEOUT_ENV_NAME = "DEEPSEEK_REQUEST_TIMEOUT_SECONDS"
-DEEPSEEK_PRICING_IMPORT_TIMEOUT_ENV_NAME = "DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS"
-AI_BASIS_LINE_PROVIDER_ENV_NAME = "AI_BASIS_LINE_PROVIDER"
-AI_BASIS_ANSWER_PROVIDER_ENV_NAME = "AI_BASIS_ANSWER_PROVIDER"
-AI_PRICING_IMPORT_PROVIDER_ENV_NAME = "AI_PRICING_IMPORT_PROVIDER"
 DEFAULT_BOOTH_WIDTH_METRES = 6.0
 DEFAULT_BOOTH_DEPTH_METRES = 6.0
 QUOTE_BASIS_KEYS = ("surfaces", "counters", "platform", "graphics", "furniture", "electrical")
@@ -697,6 +679,9 @@ SECRET_REDACTION = "sk-..."
 LOCAL_SECRET_REDACTION = "[local-runner-key]"
 QUERY_REDACTION = "redacted"
 SENSITIVE_LOG_QUERY_KEYS = {
+    "password",
+    "email",
+    "nonce",
     "access_token",
     "app_launch_token",
     "applaunchtoken",
@@ -713,12 +698,8 @@ SENSITIVE_LOG_QUERY_KEYS = {
     "state",
     "token",
 }
-OPENAI_REQUEST_TIMEOUT_SECONDS = 1800
 DEEPSEEK_REQUEST_TIMEOUT_SECONDS = 1800
 DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS = 120
-DEEPSEEK_PRICING_IMPORT_MAX_OUTPUT_TOKENS = 8000
-DEEPSEEK_PRICING_METADATA_MAX_OUTPUT_TOKENS = 12000
-OPENAI_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 TRANSIENT_OPENAI_HTTP_CODES = {408, 500, 502, 503, 504}
 PROVIDER_CONNECTION_EXCEPTIONS = (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected)
 MAX_PROMPT_CATALOG_ROWS = 180
@@ -824,7 +805,7 @@ def scrub_sensitive_text(text: str) -> str:
         scrubbed,
     )
     for env_name, redaction in (
-        (OPENAI_API_KEY_ENV_NAME, SECRET_REDACTION),
+        (OPENROUTER_API_KEY_ENV_NAME, SECRET_REDACTION),
         (DEEPSEEK_API_KEY_ENV_NAME, SECRET_REDACTION),
         (CSRF_TOKEN_ENV_NAME, LOCAL_SECRET_REDACTION),
     ):
@@ -872,9 +853,15 @@ def scrub_sensitive_text(text: str) -> str:
 
 
 def redact_request_target_for_log(target: str) -> str:
-    parsed = urlparse(str(target or ""))
+    submitted = str(target or "")
+    # BaseHTTPRequestHandler collapses initial double slashes before routing.
+    effective = "/" + submitted.lstrip("/") if submitted.startswith("//") else submitted
+    if urlparse(effective).path == "/login":
+        # Preserve no submitted authority, userinfo, query names/values or fragment.
+        return "/login"
+    parsed = urlparse(submitted)
     if not parsed.query:
-        return str(target or "")
+        return submitted
     redact_all_callback_values = parsed.path == "/callback"
     safe_pairs: list[tuple[str, str]] = []
     changed = False
@@ -984,15 +971,11 @@ def first_exception_of_type(exc: BaseException, expected_type: type[BaseExceptio
 
 
 def ai_provider_timeout_seconds(provider: str, feature: str = "") -> int | None:
-    provider_key = clean_text(provider).lower()
-    feature_key = log_event_name(feature)
-    if provider_key == AI_PROVIDER_DEEPSEEK and feature_key == "pricing_reference_import":
-        return configured_deepseek_pricing_import_timeout_seconds()
-    if provider_key == AI_PROVIDER_DEEPSEEK:
-        return configured_deepseek_timeout_seconds()
-    if provider_key == AI_PROVIDER_OPENAI:
-        return configured_openai_timeout_seconds()
-    return None
+    try:
+        return GatewayConfiguration.capture(os.environ.get if configured_app_mode() == "deploy" else read_dotenv_value).timeout_seconds
+    except GatewayError:
+        return None
+
 
 
 def ai_failure_metadata(
@@ -1014,9 +997,12 @@ def ai_failure_metadata(
         diagnostics.update(safe_ai_output_diagnostics(getattr(item, "diagnostics", {})))
         diagnostics.update(provider_error_diagnostics(getattr(item, "_sqag_provider_error_diagnostics", {})))
 
+    if http_status is None:
+        http_status = diagnostics.get("http_status")
+    boundary = diagnostics.get("failure_boundary")
     if "missing:" in combined_text:
         failure_kind = "missing_api_key"
-    elif any(is_timeout_exception(item) for item in chain):
+    elif diagnostics.get("transport_timeout") is True or any(is_timeout_exception(item) for item in chain):
         failure_kind = "timeout"
     elif http_status == 429:
         failure_kind = "rate_limited"
@@ -1024,9 +1010,9 @@ def ai_failure_metadata(
         failure_kind = "upstream_unavailable"
     elif http_status:
         failure_kind = "http_error"
-    elif url_error:
+    elif url_error or boundary == "provider_transport":
         failure_kind = "network_error"
-    elif json_error or "invalid json" in combined_text:
+    elif json_error or boundary == "provider_response_json" or "invalid json" in combined_text:
         failure_kind = "invalid_json"
     elif (
         "omitted pricing rows" in combined_text
@@ -1172,6 +1158,7 @@ def ai_log_tracking_scope(
     previous = getattr(AI_LOG_TRACKING_CONTEXT, "metadata", None)
     previous_session = getattr(AI_LOG_TRACKING_CONTEXT, "auth_session", None)
     previous_transport_operation = getattr(AI_LOG_TRACKING_CONTEXT, "transport_operation", None)
+    previous_transport_owner = getattr(AI_LOG_TRACKING_CONTEXT, "transport_owner", None)
     AI_LOG_TRACKING_CONTEXT.metadata = normalized_ai_log_tracking_metadata(metadata)
     AI_LOG_TRACKING_CONTEXT.auth_session = (
         safe_auth_session_for_async(auth_session)
@@ -1179,6 +1166,7 @@ def ai_log_tracking_scope(
         else None
     )
     AI_LOG_TRACKING_CONTEXT.transport_operation = None
+    AI_LOG_TRACKING_CONTEXT.transport_owner = None
     try:
         yield
     finally:
@@ -1203,6 +1191,112 @@ def ai_log_tracking_scope(
                 pass
         else:
             AI_LOG_TRACKING_CONTEXT.transport_operation = previous_transport_operation
+        AI_LOG_TRACKING_CONTEXT.transport_owner = previous_transport_owner
+
+
+class AiTransportOperationScope:
+    """Own one correlation lifetime and restore its exact enclosing operation."""
+    def __init__(self, tracking_context, feature: str):
+        self.context = tracking_context
+        self.feature = feature
+        self.active = False
+        self.pending = None
+        self.validation_recorded = False
+        self.pre_send_failure = False
+        self.rejected_result = False
+        self.error_reference = ""
+        self.attempt_metadata = {}
+
+    def __enter__(self):
+        self.previous_operation = getattr(self.context, "transport_operation", None)
+        self.previous_owner = getattr(self.context, "transport_owner", None)
+        self.active = True
+        self.operation = self.new_operation("")
+        self.context.transport_owner = self
+        self.context.transport_operation = self.operation
+        return self
+
+    def new_operation(self, model):
+        return {"feature": self.feature, "provider": AI_PROVIDER_OPENROUTER, "model": model,
+                "retry_lineage_id": new_ai_run_id(), "attempt_number": 0, "request_validation": False}
+
+    def begin(self, feature, provider, model):
+        if feature != self.feature or provider != AI_PROVIDER_OPENROUTER:
+            raise RuntimeError("AI operation owner does not match the requested operation.")
+        if self.pending is not None:
+            raise RuntimeError("AI attempt must be recorded before starting another operation.")
+        if self.operation["attempt_number"] or self.validation_recorded:
+            self.operation = self.new_operation(model)
+            self.validation_recorded = False
+            self.pre_send_failure = False
+        else:
+            self.operation["model"] = model
+        self.context.transport_operation = self.operation
+        return self.operation
+
+    def observe_send(self, status, duration, details):
+        if self.pending is not None:
+            raise RuntimeError("AI transport attempt has an unrecorded terminal event.")
+        self.pending = {"status": status, "duration_ms": max(0, int(duration * 1000)), "details": details}
+
+    def accept_result(self, result):
+        if isinstance(result, dict):
+            self.rejected_result = result.get("status") in {"blocked", "failed"}
+            self.error_reference = clean_text(result.get("error_reference"))
+        return result
+
+    def recorded(self, record):
+        if record.get("attempt_number") == 0:
+            self.validation_recorded = True
+        elif self.pending is not None:
+            self.pending = None
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            if self.pending is not None:
+                failed = exc_type is not None or self.rejected_result
+                details = {key: value for key, value in self.pending["details"].items()
+                           if key not in {"usage", "retry_pending", "attempt_number"}}
+                if failed and self.pending["status"] == "success":
+                    boundary = getattr(exc, "diagnostics", {}).get("failure_boundary") if exc is not None else ""
+                    details["failure_boundary"] = boundary if boundary in {"model_output_json", "model_output_contract", "application_normalization"} else "application_normalization"
+                log_ai_call_attempt(feature=self.feature, provider=AI_PROVIDER_OPENROUTER,
+                    model=self.operation["model"], status="failed" if failed else self.pending["status"],
+                    duration_ms=self.pending["duration_ms"], error_reference=self.error_reference,
+                    **self.attempt_metadata, **details)
+            elif self.operation["attempt_number"] == 0 and not self.validation_recorded and (exc_type is not None or self.pre_send_failure):
+                log_ai_call_attempt(feature=self.feature, provider=AI_PROVIDER_OPENROUTER, model="", status="failed",
+                    attempt_number=0, failure_boundary="request_validation", failure_kind="configuration",
+                    retry_lineage_id=self.operation["retry_lineage_id"], error_reference=self.error_reference,
+                    **self.attempt_metadata)
+        finally:
+            self.active = False
+            self.context.transport_operation = self.previous_operation
+            self.context.transport_owner = self.previous_owner
+        return False
+
+
+def current_ai_transport_owner():
+    owner = getattr(AI_LOG_TRACKING_CONTEXT, "transport_owner", None)
+    return owner if isinstance(owner, AiTransportOperationScope) and owner.active else None
+
+
+def scoped_ai_transport_operation(feature):
+    def decorate(function):
+        @functools.wraps(function)
+        def invoke(*args, **kwargs):
+            gateway = kwargs.get("gateway")
+            configuration = kwargs.get("draft_configuration")
+            if gateway is None and configuration is not None:
+                gateway = configuration.gateway
+            supplied_owner = getattr(gateway, "operation_owner", None)
+            if supplied_owner is not None and supplied_owner is current_ai_transport_owner() and supplied_owner.feature == feature:
+                # Explicitly supplied gateways keep the caller's business logging window.
+                return function(*args, **kwargs)
+            with AiTransportOperationScope(AI_LOG_TRACKING_CONTEXT, feature) as owner:
+                return owner.accept_result(function(*args, **kwargs))
+        return invoke
+    return decorate
 
 
 def log_ai_call_attempt(
@@ -1265,6 +1359,13 @@ def log_ai_call_attempt(
         if safe_details:
             record["details"] = safe_details
     operation = getattr(AI_LOG_TRACKING_CONTEXT, "transport_operation", None)
+    owner = current_ai_transport_owner()
+    owned = owner is not None and operation is owner.operation and owner.feature == record["feature"] and provider_label == AI_PROVIDER_OPENROUTER
+    if owned and operation["attempt_number"] == 0:
+        if record["status"] == "success" or owner.validation_recorded:
+            return True  # No actual send, or this operation's validation was already recorded.
+        record.update(model="", attempt_number=0, failure_boundary="request_validation", failure_kind="configuration",
+                      retry_lineage_id=operation["retry_lineage_id"])
     failure_boundary = clean_text(record.get("failure_boundary")).lower()
     operation_matches = (
         isinstance(operation, dict)
@@ -1277,6 +1378,11 @@ def log_ai_call_attempt(
         )
     )
     if operation_matches:
+        usage = operation.get("usage")
+        if isinstance(usage, dict):
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                if key in usage:
+                    record.setdefault(key, usage[key])
         if failure_boundary == "request_validation" and operation.get("attempt_number", 0) == 0:
             operation["request_validation"] = True
             record.setdefault("attempt_number", 0)
@@ -1294,6 +1400,8 @@ def log_ai_call_attempt(
             append_ai_attempt_telemetry(auth_session, record)
         return local_result
     finally:
+        if owned:
+            owner.recorded(record)
         if operation_matches and not preserve_transport_operation:
             AI_LOG_TRACKING_CONTEXT.transport_operation = None
 
@@ -1892,39 +2000,20 @@ def platform_launch_mode_enabled() -> bool:
     )
 
 
-def internal_google_mode_enabled() -> bool:
+def internal_password_mode_enabled() -> bool:
     return configured_auth_mode() == INTERNAL_AUTH_MODE
 
 
 def internal_auth_policy() -> InternalAuthPolicy:
     return InternalAuthPolicy.from_values(
         workspace_id=read_dotenv_value(INTERNAL_WORKSPACE_ID_ENV_NAME),
-        identities_json=read_dotenv_value(INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME),
-        legacy_allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
-        legacy_admin_emails=read_dotenv_value(INTERNAL_ADMIN_EMAILS_ENV_NAME),
-        legacy_operator_emails=read_dotenv_value(INTERNAL_OPERATOR_EMAILS_ENV_NAME),
+        allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
+        bindings_json=read_dotenv_value(INTERNAL_IDENTITY_BINDINGS_ENV_NAME),
+        password=read_dotenv_value(INTERNAL_LOGIN_PASSWORD_ENV_NAME),
     )
 
 
 def internal_auth_policy_config_complete() -> bool:
-    legacy_names = {
-        INTERNAL_ALLOWED_EMAILS_ENV_NAME,
-        INTERNAL_ADMIN_EMAILS_ENV_NAME,
-        INTERNAL_OPERATOR_EMAILS_ENV_NAME,
-    }
-    if any(clean_text(read_dotenv_value(name)) for name in legacy_names):
-        return False
-    for name, value in os.environ.items():
-        if (
-            name.startswith("SQAG_INTERNAL_")
-            and (
-                name.endswith("_EMAILS")
-                or name.endswith("_IDENTITIES_JSON")
-            )
-            and name != INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME
-            and clean_text(value)
-        ):
-            return False
     try:
         internal_auth_policy()
     except InternalAuthConfigError:
@@ -1932,46 +2021,22 @@ def internal_auth_policy_config_complete() -> bool:
     return True
 
 
-def internal_google_runtime_config() -> OidcRuntimeConfig:
-    config = oidc_config()
-    return OidcRuntimeConfig(
-        issuer_url=config["issuer_url"],
-        client_id=config["client_id"],
-        client_secret=config["client_secret"],
-        redirect_uri=config["redirect_uri"],
-        authorize_url=config["authorize_url"],
-        token_url=config["token_url"],
-    )
-
-
-def internal_google_config_complete() -> bool:
-    config = oidc_config()
-    public_origin = configured_sqag_public_base_url()
-    expected_redirect = f"{public_origin}/callback" if public_origin else ""
-    legacy_escape_hatch_present = bool(
-        clean_text(read_dotenv_value(AUTH_ALLOWED_DOMAINS_ENV_NAME))
-        or clean_text(read_dotenv_value(AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME))
-        or clean_text(read_dotenv_value(AUTH_ALLOWED_EMAILS_ENV_NAME))
-        or clean_text(read_dotenv_value(AUTH_APPROVED_TESTER_ROLE_ENV_NAME))
-    )
-    platform_config_present = bool(
-        configured_platform_launch_mode() == "platform"
-        or clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME))
-        or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))
+def internal_password_config_complete() -> bool:
+    incompatible_keys = (
+        "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON", INTERNAL_ADMIN_EMAILS_ENV_NAME,
+        INTERNAL_OPERATOR_EMAILS_ENV_NAME, AUTH_ALLOWED_EMAILS_ENV_NAME,
+        AUTH_ALLOWED_DOMAINS_ENV_NAME, AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME,
+        AUTH_APPROVED_TESTER_ROLE_ENV_NAME, PLATFORM_BASE_URL_ENV_NAME,
+        PLATFORM_SERVICE_SECRET_ENV_NAME, OIDC_ISSUER_URL_ENV_NAME,
+        OIDC_CLIENT_ID_ENV_NAME, OIDC_CLIENT_SECRET_ENV_NAME,
+        OIDC_REDIRECT_URI_ENV_NAME, OIDC_AUTHORIZE_URL_ENV_NAME,
+        OIDC_TOKEN_URL_ENV_NAME, OIDC_USERINFO_URL_ENV_NAME, OIDC_LOGOUT_URL_ENV_NAME,
     )
     return bool(
-        internal_google_mode_enabled()
-        and deploy_session_secret_ready()
+        internal_password_mode_enabled() and deploy_session_secret_ready()
+        and configured_sqag_public_base_url() and trusted_proxy_config_complete()
         and internal_auth_policy_config_complete()
-        and not legacy_escape_hatch_present
-        and not platform_config_present
-        and config["issuer_url"] == GOOGLE_ISSUER
-        and config["client_id"]
-        and config["client_secret"]
-        and config["redirect_uri"] == expected_redirect
-        and config["authorize_url"]
-        and config["token_url"]
-        and oidc_config_urls_secure(config, require_userinfo=False)
+        and not any(read_dotenv_value(name) for name in incompatible_keys)
     )
 
 
@@ -2030,7 +2095,7 @@ def configured_sqag_public_base_url() -> str:
             if launch_mode != "platform" or base_url != PRODUCTION_SQAG_ORIGIN:
                 return ""
         elif auth_mode == INTERNAL_AUTH_MODE:
-            # Internal Google owns one host-configured alpha origin. It must
+            # Internal password access owns one host-configured alpha origin. It must
             # remain separate from the production SQAG origin and cannot use
             # loopback HTTP or an explicit public port in deploy mode.
             try:
@@ -2096,7 +2161,9 @@ def platform_launch_config_complete() -> bool:
         clean_text(read_dotenv_value(name))
         for name in (
             INTERNAL_WORKSPACE_ID_ENV_NAME,
-            INTERNAL_GOOGLE_IDENTITIES_JSON_ENV_NAME,
+            INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
+            INTERNAL_LOGIN_PASSWORD_ENV_NAME,
+            "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
             INTERNAL_ALLOWED_EMAILS_ENV_NAME,
             INTERNAL_ADMIN_EMAILS_ENV_NAME,
             INTERNAL_OPERATOR_EMAILS_ENV_NAME,
@@ -2171,7 +2238,7 @@ def deploy_requires_auth_guard() -> bool:
         return True
     if mode == "platform":
         return not platform_launch_config_complete()
-    return not internal_google_config_complete()
+    return not internal_password_config_complete()
 
 
 def deploy_requires_platform_workspace_guard() -> bool:
@@ -2528,48 +2595,34 @@ def cookies_from_header(cookie_header: str) -> dict[str, str]:
     return {key: morsel.value for key, morsel in cookie.items()}
 
 
-def session_from_cookie_header(cookie_header: str) -> dict[str, Any] | None:
+def session_from_cookie_header(cookie_header: str, *, auth_state: InternalAuthState | None = None) -> dict[str, Any] | None:
     cookies = cookies_from_header(cookie_header)
     mode = configured_auth_mode()
-    payload = verified_cookie_payload(
-        cookies.get(SESSION_COOKIE_NAME, ""),
-        allow_expired=mode == INTERNAL_AUTH_MODE,
-    )
-    if not payload or not isinstance(payload.get("user"), dict):
+    payload = verified_cookie_payload(cookies.get(SESSION_COOKIE_NAME, ""), allow_expired=mode == INTERNAL_AUTH_MODE)
+    if not payload:
         return None
     if mode == INTERNAL_AUTH_MODE:
+        if auth_state is None or not internal_password_config_complete():
+            return None
         try:
-            payload = INTERNAL_AUTH_STATE.validate_session(
-                payload,
-                policy=internal_auth_policy(),
-                current_mode=mode,
-            )
-        except (InternalAuthConfigError, InternalAuthStateError) as exc:
-            reason = getattr(exc, "reason", "internal_session_policy_invalid")
-            write_local_log(
-                "security_event",
-                {
-                    "reason": reason,
-                    "path": "protected_request",
-                    "status": 401,
-                    "user_id": privacy_safe_audit_tracking_id_or_unavailable(
-                        payload.get("google_sub"),
-                        "unknown",
-                    ),
-                },
-            )
+            return auth_state.validate_session(payload, policy=internal_auth_policy(), current_mode=mode)
+        except (InternalAuthConfigError, InternalAuthStateError):
             return None
-    elif configured_app_mode() == "deploy":
-        if mode != "platform" or payload.get("auth_mode") != "platform" or not platform_auth_session_complete(payload):
-            return None
+    if not isinstance(payload.get("user"), dict):
+        return None
+    if configured_app_mode() == "deploy" and (mode != "platform" or payload.get("auth_mode") != "platform" or not platform_auth_session_complete(payload)):
+        return None
+    # Local mode must not accept a former protected-mode cookie.
+    if payload.get("auth_mode") in {"internal_google", INTERNAL_AUTH_MODE}:
+        return None
     return payload
 
 
-def csrf_token_for_cookie_header(cookie_header: str) -> str:
+def csrf_token_for_cookie_header(cookie_header: str, *, auth_state: InternalAuthState | None = None) -> str:
     base_token = configured_csrf_token()
     cookies = cookies_from_header(cookie_header)
     raw_session_cookie = clean_text(cookies.get(SESSION_COOKIE_NAME))
-    if not raw_session_cookie or session_from_cookie_header(cookie_header) is None:
+    if not raw_session_cookie or session_from_cookie_header(cookie_header, auth_state=auth_state) is None:
         return base_token
     csrf_key = session_secret()
     if not csrf_key:
@@ -2615,81 +2668,10 @@ def oidc_state_from_cookie(cookie_header: str) -> str:
     return clean_text(payload.get("state")) if payload else ""
 
 
-def oidc_transaction_binding_from_cookie(cookie_header: str) -> str:
-    cookies = cookies_from_header(cookie_header)
-    payload = verified_cookie_payload(cookies.get(OIDC_STATE_COOKIE_NAME, ""))
-    if not payload or payload.get("auth_mode") != INTERNAL_AUTH_MODE:
-        return ""
-    return clean_text(payload.get("transaction_id"))
-
-
-def internal_google_authorize_url(transaction: Any) -> str:
-    return internal_google_runtime_config().authorize_redirect(transaction)
-
-
-def google_oidc_verifier() -> GoogleOidcVerifier:
-    return GoogleOidcVerifier(internal_google_runtime_config())
-
-
-def parse_internal_google_callback_query(query: str) -> dict[str, str]:
-    if len((query or "").encode("utf-8")) > OIDC_CALLBACK_MAX_QUERY_BYTES:
-        raise OidcAuthError(
-            "Authentication could not be completed.",
-            reason="oidc_callback_query_too_large",
-        )
-    try:
-        pairs = parse_qsl(
-            query,
-            keep_blank_values=True,
-            strict_parsing=True,
-            max_num_fields=OIDC_CALLBACK_MAX_FIELDS,
-        )
-    except ValueError as exc:
-        raise OidcAuthError(
-            "Authentication could not be completed.",
-            reason="oidc_callback_malformed",
-        ) from exc
-    allowed_names = {
-        "state",
-        "code",
-        "error",
-        "error_description",
-        "error_uri",
-        "scope",
-        "authuser",
-        "prompt",
-        "hd",
-        "iss",
-    }
-    params: dict[str, str] = {}
-    for name, value in pairs:
-        if (
-            name not in allowed_names
-            or name in params
-            or len(name) > 64
-            or len(value) > 4096
-        ):
-            raise OidcAuthError(
-                "Authentication could not be completed.",
-                reason="oidc_callback_parameter_invalid",
-            )
-        params[name] = value
-    if not clean_text(params.get("state")):
-        raise OidcAuthError(
-            "Authentication could not be completed.",
-            reason="oidc_callback_state_missing",
-        )
-    has_code = bool(clean_text(params.get("code")))
-    has_error = bool(clean_text(params.get("error")))
-    if has_code == has_error:
-        raise OidcAuthError(
-            "Authentication could not be completed.",
-            reason="oidc_callback_result_invalid",
-        )
-    return params
 
 
 def user_from_oidc_claims(claims: dict[str, Any]) -> dict[str, str]:
+    # Retained independent local OIDC component; internal staff login does not use claims.
     subject = clean_text(claims.get("sub"))
     return {
         "subject": subject,
@@ -3118,12 +3100,12 @@ def platform_auth_session_complete(session: dict[str, Any] | None) -> bool:
 
 
 def permissions_for_auth_session(session: dict[str, Any] | None) -> dict[str, bool]:
+    if configured_auth_mode() == INTERNAL_AUTH_MODE:
+        user = session.get("user") if isinstance(session, dict) and session.get("auth_mode") == INTERNAL_AUTH_MODE else {}
+        role = user.get("internal_role") if isinstance(user, dict) else ""
+        return role_permissions(role) if role in {"admin", "operator"} else blocked_platform_permissions()
     if configured_app_mode() == "deploy":
         mode = configured_auth_mode()
-        if mode == INTERNAL_AUTH_MODE:
-            user = session.get("user") if isinstance(session, dict) else {}
-            role = clean_text(user.get("internal_role")).lower() if isinstance(user, dict) else ""
-            return role_permissions(role) if role in {"admin", "operator"} else blocked_platform_permissions()
         if not platform_auth_session_complete(session):
             return blocked_platform_permissions()
     user = session.get("user") if isinstance(session, dict) else None
@@ -3210,7 +3192,7 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
     add(
         AUTH_MODE_ENV_NAME,
         auth_mode_explicit() and auth_mode in {"platform", INTERNAL_AUTH_MODE},
-        "must explicitly select platform or internal_google in deploy mode",
+        "must explicitly select platform or internal_password in deploy mode",
     )
     add(SQAG_PUBLIC_BASE_URL_ENV_NAME, bool(configured_sqag_public_base_url()), "must be the exact canonical SQAG origin")
     add(
@@ -3226,30 +3208,15 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
             platform_service_secret_ready(),
             f"must be supplied by the host secret manager and contain at least {MIN_PLATFORM_SERVICE_SECRET_CHARS} characters",
         )
-        add("platform auth contract", platform_launch_config_complete(), "must be complete and must not include internal-Google configuration")
+        add("platform auth contract", platform_launch_config_complete(), "must be complete and must not include internal-password configuration")
     elif auth_mode == INTERNAL_AUTH_MODE:
         add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "disabled", "must be disabled")
-        add("platform auth configuration absent", not bool(clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME)) or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))), "must not be mixed with internal_google")
-        for name in (
-            OIDC_ISSUER_URL_ENV_NAME,
-            OIDC_CLIENT_ID_ENV_NAME,
-            OIDC_CLIENT_SECRET_ENV_NAME,
-            OIDC_REDIRECT_URI_ENV_NAME,
-            OIDC_AUTHORIZE_URL_ENV_NAME,
-            OIDC_TOKEN_URL_ENV_NAME,
-        ):
-            add(name, bool(clean_text(read_dotenv_value(name))), "must be present")
-        for name in (
-            OIDC_ISSUER_URL_ENV_NAME,
-            OIDC_REDIRECT_URI_ENV_NAME,
-            OIDC_AUTHORIZE_URL_ENV_NAME,
-            OIDC_TOKEN_URL_ENV_NAME,
-        ):
-            add(name, url_uses_https_or_loopback_http(read_dotenv_value(name)), "must use HTTPS")
-        add(OIDC_ISSUER_URL_ENV_NAME + " exact Google issuer", clean_text(read_dotenv_value(OIDC_ISSUER_URL_ENV_NAME)) == GOOGLE_ISSUER, "must be the exact Google issuer")
+        add("platform auth configuration absent", not bool(clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME)) or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))), "must not be mixed with internal_password")
+        for name in (INTERNAL_WORKSPACE_ID_ENV_NAME, INTERNAL_ALLOWED_EMAILS_ENV_NAME, INTERNAL_IDENTITY_BINDINGS_ENV_NAME, INTERNAL_LOGIN_PASSWORD_ENV_NAME):
+            add(name, bool(read_dotenv_value(name)), "must be present in server configuration")
         add("internal allowlist and role policy", internal_auth_policy_config_complete(), "must be exact, complete, and conflict-free")
         add("legacy auth escape hatches absent", not bool(clean_text(read_dotenv_value(AUTH_ALLOWED_EMAILS_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_ALLOWED_DOMAINS_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_APPROVED_TESTER_ROLE_ENV_NAME))), "must not be configured")
-        add("internal Google auth contract", internal_google_config_complete(), "must be complete and fail closed")
+        add("internal password auth contract", internal_password_config_complete(), "must be complete and fail closed")
     add(SQAG_STORAGE_MODE_ENV_NAME, configured_storage_mode() == "database", "must be database for hosted/deploy validation")
     add(SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME, configured_artifact_storage_mode() == "object", "must be object for hosted/deploy validation")
     add(SQAG_DATABASE_URL_ENV_NAME, bool(clean_text(read_dotenv_value(SQAG_DATABASE_URL_ENV_NAME))), "must be present")
@@ -3957,9 +3924,9 @@ def production_readiness_status(
                 "Platform authentication is selected but its launch, finalization, session, or revocation contract is incomplete.",
             ))
     elif auth_mode == INTERNAL_AUTH_MODE:
-        if not internal_google_config_complete():
+        if not internal_password_config_complete():
             blockers.append(readiness_blocker(
-                "internal_google_auth_contract_incomplete",
+                "internal_password_auth_contract_incomplete",
                 "P1",
                 "Temporary internal Google authentication is selected but its exact allowlist, role, OIDC, or session contract is incomplete.",
             ))
@@ -9308,15 +9275,17 @@ def save_pricing_reference_pack(reference: dict[str, Any]) -> dict[str, Any]:
 
 
 def pricing_reference_ai_metadata_enrichment_provider_order() -> list[str]:
-    provider = configured_text_ai_provider(AI_PRICING_IMPORT_PROVIDER_ENV_NAME)
-    provider_order = [provider]
-    if provider != AI_PROVIDER_OPENAI:
-        provider_order.append(AI_PROVIDER_OPENAI)
-    return provider_order
+    return [AI_PROVIDER_OPENROUTER]
+
 
 
 def pricing_reference_ai_metadata_enrichment_configured() -> bool:
-    return any(text_ai_provider_api_key(provider) for provider in pricing_reference_ai_metadata_enrichment_provider_order())
+    try:
+        configured_ai_gateway()
+        return bool(read_dotenv_value(OPENROUTER_API_KEY_ENV_NAME))
+    except OpenAIAnalysisError:
+        return False
+
 
 
 def pricing_reference_with_ai_metadata_before_save(reference: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -9525,7 +9494,7 @@ def require_permission(permission: str) -> tuple[bool, dict[str, Any]]:
     return False, {"status": "blocked", "errors": ["You do not have permission to perform this action."], "permissions": permissions}
 
 
-AI_PRICING_IMPORT_NOT_CONFIGURED = "AI pricing catalog import is not configured for the selected AI provider. Configure the selected provider API key, then upload the messy pricing file again. The template remains optional for clean manual entry."
+AI_PRICING_IMPORT_NOT_CONFIGURED = "AI pricing import is not configured. Ask your administrator to check the service configuration."
 AI_PRICING_METADATA_NOT_CONFIGURED = "AI pricing reference metadata enrichment is not configured. Configure the selected AI provider API key to enable optional matching metadata enrichment."
 
 
@@ -9865,210 +9834,39 @@ def build_pricing_catalog_metadata_prompt(source_name: str, items: list[dict[str
     )
 
 
-def deepseek_json_system_prompt(error_context: str = "") -> str:
-    context = clean_text(error_context).lower()
-    if "metadata" in context:
-        example = {
-            "items": [
-                {
-                    "id": "example-row-id",
-                    "match_terms": ["example exact service name"],
-                    "object_families": ["example_service_family"],
-                }
-            ]
-        }
-    elif "pricing import" in context:
-        example = {
-            "currency": "SGD",
-            "items": [
-                {
-                    "section": "Example Section",
-                    "description": "lot example catalog service",
-                    "unit_hint": "lot",
-                    "internal_cost": "100",
-                    "markup_multiplier": "1.5",
-                    "remarks": "example source remark",
-                    "aliases": ["example catalog service"],
-                    "category_order": 1,
-                    "item_order": 1,
-                }
-            ],
-        }
-    else:
-        example = {"result": "example"}
-    return (
-        "Return exactly one valid JSON object. Do not include markdown, code fences, commentary, or any text outside the JSON object. "
-        "Use double-quoted JSON keys and strings. Use arrays where the schema shows arrays. "
-        "If a value is unknown, use an empty string or empty array instead of prose. "
-        f"EXAMPLE JSON OUTPUT: {json.dumps(example, ensure_ascii=True)}"
-    )
 
 
-def request_deepseek_chat_completion_json_data(
-    prompt: str,
-    api_key: str,
-    model: str,
-    max_tokens: int,
-    error_context: str,
-    timeout_seconds: int | None = None,
-) -> dict[str, Any]:
-    feature = {
-        "pricing import": "pricing_reference_import",
-        "pricing metadata enrichment": "pricing_reference_metadata_enrichment",
-    }.get(clean_text(error_context).lower(), "basis_chat")
-    operation = begin_ai_transport_operation(feature, AI_PROVIDER_DEEPSEEK, model)
-    body = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": deepseek_json_system_prompt(error_context),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "stream": False,
-    }
-    request = urllib.request.Request(
-        configured_deepseek_chat_completions_url(),
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    request_timeout = timeout_seconds if timeout_seconds is not None else configured_deepseek_timeout_seconds()
-    retry_delays = list(OPENAI_RETRY_DELAYS_SECONDS)
-    for attempt in range(len(retry_delays) + 1):
-        send_number = next_ai_transport_send_number(feature, AI_PROVIDER_DEEPSEEK, model)
-        send_started_at = time.perf_counter()
-        try:
-            with urllib.request.urlopen(request, timeout=request_timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as exc:
-            if attempt < len(retry_delays) and is_transient_openai_error(exc):
-                failure_message = provider_http_error_message("DeepSeek", exc)
-                log_ai_call_attempt(
-                    feature=feature,
-                    provider=AI_PROVIDER_DEEPSEEK,
-                    model=model,
-                    status="failed",
-                    duration_ms=elapsed_milliseconds(send_started_at),
-                    details={"errors": [failure_message]},
-                    retry_lineage_id=operation["retry_lineage_id"],
-                    attempt_number=send_number,
-                    **ai_failure_metadata(exc, provider=AI_PROVIDER_DEEPSEEK, timeout_seconds=request_timeout),
-                    preserve_transport_operation=True,
-                )
-                time.sleep(retry_delays[attempt])
-                continue
-            raise OpenAIAnalysisError(provider_http_error_message("DeepSeek", exc)) from exc
-        except PROVIDER_CONNECTION_EXCEPTIONS as exc:
-            if attempt < len(retry_delays) and is_transient_openai_error(exc):
-                failure_message = provider_connection_error_message("DeepSeek", exc)
-                log_ai_call_attempt(
-                    feature=feature,
-                    provider=AI_PROVIDER_DEEPSEEK,
-                    model=model,
-                    status="failed",
-                    duration_ms=elapsed_milliseconds(send_started_at),
-                    details={"errors": [failure_message]},
-                    retry_lineage_id=operation["retry_lineage_id"],
-                    attempt_number=send_number,
-                    **ai_failure_metadata(exc, provider=AI_PROVIDER_DEEPSEEK, timeout_seconds=request_timeout),
-                    preserve_transport_operation=True,
-                )
-                time.sleep(retry_delays[attempt])
-                continue
-            raise OpenAIAnalysisError(provider_connection_error_message("DeepSeek", exc)) from exc
-        except json.JSONDecodeError as exc:
-            raise OpenAIAnalysisError(f"DeepSeek {error_context} returned invalid JSON.") from exc
-    return data
 
 
-def request_deepseek_json_object(
-    prompt: str,
-    api_key: str,
-    model: str,
-    max_tokens: int,
-    error_context: str,
-    timeout_seconds: int | None = None,
-) -> dict[str, Any]:
-    data = request_deepseek_chat_completion_json_data(prompt, api_key, model, max_tokens, error_context, timeout_seconds)
-    output_text = chat_completions_output_text(data)
-    diagnostics = chat_completions_output_diagnostics(data, output_text)
-    try:
-        return parse_json_object(output_text)
-    except OpenAIAnalysisError as exc:
-        raise AIModelOutputError(str(exc), diagnostics=diagnostics) from exc
 
 
-def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: dict[str, Any], api_key: str) -> dict[str, Any]:
-    model = configured_openai_basis_line_model()
-    begin_openai_small_transport_operation("pricing_reference_import", model)
-    body = {
-        "model": model,
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": build_pricing_catalog_import_prompt(source_name, content, tax)}]}],
-        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
-        "max_output_tokens": 4000,
-    }
-    request = urllib.request.Request(OPENAI_RESPONSES_URL, data=json.dumps(body).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
-    try:
-        next_ai_transport_send_number("pricing_reference_import", AI_PROVIDER_OPENAI, model)
-        with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise OpenAIAnalysisError(openai_http_error_message(exc)) from exc
-    except PROVIDER_CONNECTION_EXCEPTIONS as exc:
-        raise OpenAIAnalysisError(provider_connection_error_message("OpenAI", exc)) from exc
+
+
+
+@scoped_ai_transport_operation("pricing_reference_import")
+def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: dict[str, Any], api_key: str = "", *, gateway: AiGateway | None = None) -> dict[str, Any]:
+    gateway = gateway if gateway is not None else configured_ai_gateway("pricing_reference_import", operation_owner=current_ai_transport_owner())
+    route = gateway.configuration.route("pricing_import")
+    begin_ai_transport_operation("pricing_reference_import", AI_PROVIDER_OPENROUTER, route.model)
+    data = gateway_request(gateway, "pricing_import", {"model":route.model, "input":[{"role":"user", "content":[{"type":"input_text", "text":build_pricing_catalog_import_prompt(source_name, content, tax)}]}], "reasoning":{"effort":route.effort}, "max_output_tokens":4000})
     return parse_json_object(response_output_text(data))
 
 
-def request_openai_pricing_catalog_metadata(source_name: str, items: list[dict[str, Any]], api_key: str) -> dict[str, Any]:
-    model = configured_openai_basis_line_model()
-    begin_openai_small_transport_operation("pricing_reference_metadata_enrichment", model)
-    body = {
-        "model": model,
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": build_pricing_catalog_metadata_prompt(source_name, items)}]}],
-        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
-        "max_output_tokens": 12000,
-    }
-    request = urllib.request.Request(OPENAI_RESPONSES_URL, data=json.dumps(body).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
-    try:
-        next_ai_transport_send_number("pricing_reference_metadata_enrichment", AI_PROVIDER_OPENAI, model)
-        with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise OpenAIAnalysisError(openai_http_error_message(exc)) from exc
-    except PROVIDER_CONNECTION_EXCEPTIONS as exc:
-        raise OpenAIAnalysisError(provider_connection_error_message("OpenAI", exc)) from exc
+
+@scoped_ai_transport_operation("pricing_reference_metadata_enrichment")
+def request_openai_pricing_catalog_metadata(source_name: str, items: list[dict[str, Any]], api_key: str = "", *, gateway: AiGateway | None = None) -> dict[str, Any]:
+    gateway = gateway if gateway is not None else configured_ai_gateway("pricing_reference_metadata_enrichment", operation_owner=current_ai_transport_owner())
+    route = gateway.configuration.route("pricing_metadata")
+    begin_ai_transport_operation("pricing_reference_metadata_enrichment", AI_PROVIDER_OPENROUTER, route.model)
+    data = gateway_request(gateway, "pricing_metadata", {"model":route.model, "input":[{"role":"user", "content":[{"type":"input_text", "text":build_pricing_catalog_metadata_prompt(source_name, items)}]}], "reasoning":{"effort":route.effort}, "max_output_tokens":12000})
     return parse_json_object(response_output_text(data))
 
 
-def request_deepseek_pricing_catalog_import(source_name: str, content: Any, tax: dict[str, Any], api_key: str) -> dict[str, Any]:
-    return request_deepseek_json_object(
-        build_pricing_catalog_import_prompt(source_name, content, tax),
-        api_key,
-        configured_deepseek_pricing_import_model(),
-        DEEPSEEK_PRICING_IMPORT_MAX_OUTPUT_TOKENS,
-        "pricing import",
-        configured_deepseek_pricing_import_timeout_seconds(),
-    )
 
 
-def request_deepseek_pricing_catalog_metadata(source_name: str, items: list[dict[str, Any]], api_key: str) -> dict[str, Any]:
-    return request_deepseek_json_object(
-        build_pricing_catalog_metadata_prompt(source_name, items),
-        api_key,
-        configured_deepseek_pricing_metadata_model(),
-        DEEPSEEK_PRICING_METADATA_MAX_OUTPUT_TOKENS,
-        "pricing metadata enrichment",
-    )
+
+
+
 
 
 def pricing_reference_metadata_batches(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -10112,396 +9910,136 @@ def merge_pricing_reference_ai_metadata(
     return enriched, []
 
 
-def ai_pricing_reference_metadata_enrichment(
-    filename: str,
-    items: list[dict[str, Any]],
-    *,
-    reference_id: str = "",
-    ai_run_id: str = "",
-    operator_stage: str = "post_save_matching_metadata",
-) -> tuple[list[dict[str, Any]], list[str]]:
+@scoped_ai_transport_operation("pricing_reference_metadata_enrichment")
+def ai_pricing_reference_metadata_enrichment(filename: str, items: list[dict[str, Any]], *, reference_id: str = "", ai_run_id: str = "", operator_stage: str = "post_save_matching_metadata") -> tuple[list[dict[str, Any]], list[str]]:
     if not items:
         return items, []
     started_at = time.perf_counter()
     ai_run_id = clean_text(ai_run_id) or new_ai_run_id()
-    safe_reference_id = safe_resource_id(reference_id, "")
-    safe_operator_stage = clean_text(operator_stage) or "post_save_matching_metadata"
-    source_metadata = source_file_log_metadata(filename)
-    provider = configured_text_ai_provider(AI_PRICING_IMPORT_PROVIDER_ENV_NAME)
-    provider_order = [provider]
-    if provider != AI_PROVIDER_OPENAI:
-        provider_order.append(AI_PROVIDER_OPENAI)
-    errors: list[str] = []
-    provider_attempts: list[dict[str, Any]] = []
-    completed_provider = ""
-    rows_enriched = 0
-    rollup_status = "failed"
+    reference_id = safe_resource_id(reference_id, "")
+    operator_stage = log_event_name(operator_stage)
     batches = pricing_reference_metadata_batches(items)
+    attempts = []
     try:
-        for provider_index, candidate_provider in enumerate(provider_order, start=1):
-            api_key = text_ai_provider_api_key(candidate_provider)
-            candidate_model = text_ai_provider_model_for_feature(candidate_provider, "pricing_reference_metadata_enrichment")
-            timeout_seconds = ai_provider_timeout_seconds(candidate_provider, "pricing_reference_metadata_enrichment")
-            if not api_key:
-                missing_error = f"Selected provider: {candidate_provider}. Missing: {text_ai_provider_key_env_name(candidate_provider)}."
-                errors.append(missing_error)
-                failure_metadata = ai_failure_metadata(
-                    missing_error,
-                    provider=candidate_provider,
-                    timeout_seconds=timeout_seconds,
-                )
-                provider_attempts.append({
-                    "provider": candidate_provider,
-                    "model": candidate_model,
-                    "status": "missing_api_key",
-                    "duration_ms": 0,
-                    "attempt_index": provider_index,
-                    "attempt_count": len(provider_order),
-                    **failure_metadata,
-                })
-                log_ai_call_attempt(
-                    feature="pricing_reference_metadata_enrichment",
-                    provider=candidate_provider,
-                    model=candidate_model,
-                    status="missing_api_key",
-                    duration_ms=0,
-                    ai_run_id=ai_run_id,
-                    operator_stage=safe_operator_stage,
-                    reference_id=safe_reference_id,
-                    row_count=len(items),
-                    batch_count=len(batches),
-                    attempt_index=provider_index,
-                    attempt_count=len(provider_order),
-                    **source_metadata,
-                    **failure_metadata,
-                )
-                continue
-            raw_metadata_items: list[dict[str, Any]] = []
+        gateway = configured_ai_gateway("pricing_reference_metadata_enrichment", operation_owner=current_ai_transport_owner())
+        route = gateway.configuration.route("pricing_metadata")
+        raw_metadata = []
+        for index, batch in enumerate(batches, start=1):
+            batch_name = filename if len(batches) == 1 else f"{filename} (batch {index} of {len(batches)})"
+            metadata = {"ai_run_id":ai_run_id, "reference_id":reference_id, "operator_stage":operator_stage,
+                        "batch_index":index, "batch_count":len(batches), "row_count":len(batch)}
+            batch_started = time.perf_counter()
             try:
-                for batch_index, batch in enumerate(batches, start=1):
-                    batch_name = f"{filename} metadata batch {batch_index}/{len(batches)}" if len(batches) > 1 else filename
-                    attempt_started_at = time.perf_counter()
-                    try:
-                        if candidate_provider == AI_PROVIDER_DEEPSEEK:
-                            parsed = request_deepseek_pricing_catalog_metadata(batch_name, batch, api_key)
-                        else:
-                            parsed = request_openai_pricing_catalog_metadata(batch_name, batch, api_key)
-                    except OpenAIAnalysisError as exc:
-                        duration_ms = elapsed_milliseconds(attempt_started_at)
-                        failure_metadata = ai_failure_metadata(
-                            exc,
-                            provider=candidate_provider,
-                            timeout_seconds=timeout_seconds,
-                        )
-                        provider_attempts.append({
-                            "provider": candidate_provider,
-                            "model": candidate_model,
-                            "status": "failed",
-                            "duration_ms": duration_ms,
-                            "row_count": len(batch),
-                            "batch_index": batch_index,
-                            "batch_count": len(batches),
-                            "attempt_index": provider_index,
-                            "attempt_count": len(provider_order),
-                            **failure_metadata,
-                        })
-                        log_ai_call_attempt(
-                            feature="pricing_reference_metadata_enrichment",
-                            provider=candidate_provider,
-                            model=candidate_model,
-                            status="failed",
-                            duration_ms=duration_ms,
-                            ai_run_id=ai_run_id,
-                            operator_stage=safe_operator_stage,
-                            reference_id=safe_reference_id,
-                            row_count=len(batch),
-                            batch_index=batch_index,
-                            batch_count=len(batches),
-                            attempt_index=provider_index,
-                            attempt_count=len(provider_order),
-                            **source_metadata,
-                            **failure_metadata,
-                        )
-                        raise
-                    duration_ms = elapsed_milliseconds(attempt_started_at)
-                    provider_attempts.append({
-                        "provider": candidate_provider,
-                        "model": candidate_model,
-                        "status": "success",
-                        "duration_ms": duration_ms,
-                        "row_count": len(batch),
-                        "batch_index": batch_index,
-                        "batch_count": len(batches),
-                        "attempt_index": provider_index,
-                        "attempt_count": len(provider_order),
-                    })
-                    log_ai_call_attempt(
-                        feature="pricing_reference_metadata_enrichment",
-                        provider=candidate_provider,
-                        model=candidate_model,
-                        status="success",
-                        duration_ms=duration_ms,
-                        ai_run_id=ai_run_id,
-                        operator_stage=safe_operator_stage,
-                        reference_id=safe_reference_id,
-                        row_count=len(batch),
-                        batch_index=batch_index,
-                        batch_count=len(batches),
-                        attempt_index=provider_index,
-                        attempt_count=len(provider_order),
-                        **source_metadata,
-                    )
-                    parsed_items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
-                    raw_metadata_items.extend([item for item in parsed_items if isinstance(item, dict)])
+                parsed = request_openai_pricing_catalog_metadata(batch_name, batch, gateway=gateway)
+                rows = parsed.get("items")
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise AIModelOutputError("AI matching metadata was not accepted.")
             except OpenAIAnalysisError as exc:
-                errors.append(str(exc))
-                if exc.diagnostics.get("failure_boundary") == "request_validation":
-                    raise
-                continue
-            enriched, merge_errors = merge_pricing_reference_ai_metadata(items, raw_metadata_items)
-            if not merge_errors:
-                completed_provider = candidate_provider
-                rows_enriched = len(enriched)
-                rollup_status = "success"
-                return enriched, []
-            failure_metadata = ai_failure_metadata(
-                OpenAIAnalysisError("AI metadata enrichment failed validation."),
-                provider=candidate_provider,
-                timeout_seconds=timeout_seconds,
-            )
-            provider_attempts.append({
-                "provider": candidate_provider,
-                "model": candidate_model,
-                "status": "failed",
-                "duration_ms": 0,
-                "attempt_index": provider_index,
-                "attempt_count": len(provider_order),
-                **failure_metadata,
-            })
-            errors.extend(merge_errors)
-        missing_key_errors = [error for error in errors if "Missing:" in error]
-        if missing_key_errors and len(missing_key_errors) == len(errors):
-            return [], [AI_PRICING_METADATA_NOT_CONFIGURED, *safe_error_messages(missing_key_errors)]
-        return [], safe_error_messages(errors or [AI_PRICING_METADATA_NOT_CONFIGURED])
-    finally:
-        write_local_log(
-            "ai_pricing_reference_metadata_enrichment_completed",
-            {
-                "source": "pricing_reference_metadata_enrichment",
-                "ai_run_id": ai_run_id,
-                "operator_stage": safe_operator_stage,
-                "reference_id": safe_reference_id,
-                "selected_provider": provider,
-                "completed_provider": completed_provider,
-                "status": rollup_status,
-                "duration_ms": elapsed_milliseconds(started_at),
-                "row_count": len(items),
-                "rows_enriched": rows_enriched,
-                "batch_count": len(batches),
-                "provider_attempts": provider_attempts,
-                "error_count": len(errors),
-                **source_metadata,
-            },
-        )
+                failure = ai_failure_metadata(exc, provider=AI_PROVIDER_OPENROUTER)
+                log_ai_call_attempt(feature="pricing_reference_metadata_enrichment", provider=AI_PROVIDER_OPENROUTER,
+                                    model=route.model, status="failed", duration_ms=elapsed_milliseconds(batch_started),
+                                    **metadata, **failure)
+                attempts.append({"status":"failed", "batch_index":index, **failure})
+                raise
+            raw_metadata.extend(rows)
+            log_ai_call_attempt(feature="pricing_reference_metadata_enrichment", provider=AI_PROVIDER_OPENROUTER,
+                                model=route.model, status="success", duration_ms=elapsed_milliseconds(batch_started), **metadata)
+            attempts.append({"status":"success", "batch_index":index})
+        enriched, errors = merge_pricing_reference_ai_metadata(items, raw_metadata)
+        if errors:
+            raise AIModelOutputError("AI matching metadata was not accepted.")
+        write_local_log("ai_pricing_reference_metadata_enrichment_completed", {
+            "source":"pricing_reference_metadata_enrichment", "ai_run_id":ai_run_id, "reference_id":reference_id,
+            "operator_stage":operator_stage, "status":"success", "row_count":len(items),
+            "rows_enriched":len(enriched), "batch_count":len(batches), "duration_ms":elapsed_milliseconds(started_at),
+            "selected_provider":AI_PROVIDER_OPENROUTER, "completed_provider":AI_PROVIDER_OPENROUTER, "provider_attempts":attempts})
+        return enriched, []
+    except OpenAIAnalysisError as exc:
+        ref = new_error_reference()
+        write_local_log("ai_pricing_reference_metadata_enrichment_completed", {
+            "source":"pricing_reference_metadata_enrichment", "ai_run_id":ai_run_id, "reference_id":reference_id,
+            "operator_stage":operator_stage, "status":"failed", "row_count":len(items), "batch_count":len(batches),
+            "error_reference":ref, "provider_attempts":attempts, **ai_failure_metadata(exc, provider=AI_PROVIDER_OPENROUTER)})
+        return [], generic_referenced_errors(ref)
 
 
+@scoped_ai_transport_operation("pricing_reference_import")
 def ai_pricing_reference_import_preview(filename: str, content: Any, tax: dict[str, Any]) -> dict[str, Any]:
     started_at = time.perf_counter()
     ai_run_id = new_ai_run_id()
-    source_metadata = source_file_log_metadata(filename)
-    provider = configured_text_ai_provider(AI_PRICING_IMPORT_PROVIDER_ENV_NAME)
-    parsed: dict[str, Any] | None = None
-    errors: list[str] = []
-    provider_attempts: list[dict[str, Any]] = []
-    selected_provider = ""
-    result: dict[str, Any] | None = None
-    validate_rows_ms = 0
+    source_metadata = {key:value for key,value in source_file_log_metadata(filename).items()
+                       if key == "source_file_extension"}
+    context = {"ai_run_id":ai_run_id, "operator_stage":"import_cleanup",
+               "attempt_index":1, "attempt_count":1, **source_metadata}
+    attempts: list[dict[str, Any]] = []
+    timings_ms = {"configuration":0, "provider_request":0, "validate_rows":0}
     raw_item_count = 0
-    provider_order = [provider]
-    if provider != AI_PROVIDER_OPENAI:
-        provider_order.append(AI_PROVIDER_OPENAI)
+    result: dict[str, Any] | None = None
+    completed_provider = ""
+    status = "failed"
+    failure: dict[str, Any] = {}
+
+    def observe_attempt(operation, attempt, send_status, duration, details):
+        # AiGateway remains the sole actual-send terminal-event owner. This is a
+        # safe rollup projection, never another terminal event or provider body.
+        usage = details.get("usage")
+        numeric_usage = {key:value for key,value in usage.items() if key in {"input_tokens","output_tokens","total_tokens"}} if isinstance(usage,dict) else {}
+        attempts.append({"provider":AI_PROVIDER_OPENROUTER, "status":send_status,
+                         "duration_ms":max(0,int(duration*1000)), "attempt_number":attempt,
+                         "attempt_index":1, "attempt_count":1,
+                         "usage_available":isinstance(usage,dict), **numeric_usage,
+                         **safe_ai_output_diagnostics(details)})
+
     try:
-        previous_provider = ""
-        for provider_index, candidate_provider in enumerate(provider_order, start=1):
-            api_key = text_ai_provider_api_key(candidate_provider)
-            candidate_model = text_ai_provider_model_for_feature(candidate_provider, "pricing_reference_import")
-            timeout_seconds = ai_provider_timeout_seconds(candidate_provider, "pricing_reference_import")
-            if not api_key:
-                missing_error = f"Selected provider: {candidate_provider}. Missing: {text_ai_provider_key_env_name(candidate_provider)}."
-                errors.append(missing_error)
-                failure_metadata = ai_failure_metadata(
-                    missing_error,
-                    provider=candidate_provider,
-                    timeout_seconds=timeout_seconds,
-                )
-                provider_attempts.append({
-                    "provider": candidate_provider,
-                    "model": candidate_model,
-                    "status": "missing_api_key",
-                    "duration_ms": 0,
-                    "attempt_index": provider_index,
-                    "attempt_count": len(provider_order),
-                    **failure_metadata,
-                })
-                log_ai_call_attempt(
-                    feature="pricing_reference_import",
-                    provider=candidate_provider,
-                    model=candidate_model,
-                    status="missing_api_key",
-                    duration_ms=0,
-                    ai_run_id=ai_run_id,
-                    operator_stage="import_cleanup",
-                    attempt_index=provider_index,
-                    attempt_count=len(provider_order),
-                    **source_metadata,
-                    **failure_metadata,
-                )
-                previous_provider = candidate_provider
-                continue
-            attempt_started_at = time.perf_counter()
-            try:
-                if candidate_provider == AI_PROVIDER_DEEPSEEK:
-                    parsed = request_deepseek_pricing_catalog_import(filename, content, tax, api_key)
-                else:
-                    parsed = request_openai_pricing_catalog_import(filename, content, tax, api_key)
-            except OpenAIAnalysisError as exc:
-                duration_ms = elapsed_milliseconds(attempt_started_at)
-                request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
-                failure_metadata = ai_failure_metadata(
-                    exc,
-                    provider=candidate_provider,
-                    timeout_seconds=timeout_seconds,
-                )
-                errors.append(str(exc))
-                provider_attempts.append({
-                    "provider": candidate_provider,
-                    "model": candidate_model,
-                    "status": "failed",
-                    "duration_ms": duration_ms,
-                    "attempt_index": provider_index,
-                    "attempt_count": len(provider_order),
-                    **(
-                        {"fallback_to": provider_order[provider_index]}
-                        if not request_validation and provider_index < len(provider_order)
-                        else {}
-                    ),
-                    **failure_metadata,
-                })
-                log_ai_call_attempt(
-                    feature="pricing_reference_import",
-                    provider=candidate_provider,
-                    model=candidate_model,
-                    status="failed",
-                    duration_ms=duration_ms,
-                    ai_run_id=ai_run_id,
-                    operator_stage="import_cleanup",
-                    attempt_index=provider_index,
-                    attempt_count=len(provider_order),
-                    **(
-                        {"fallback_to": provider_order[provider_index]}
-                        if not request_validation and provider_index < len(provider_order)
-                        else {}
-                    ),
-                    **source_metadata,
-                    **failure_metadata,
-                )
-                if request_validation:
-                    raise
-                previous_provider = candidate_provider
-                continue
-            duration_ms = elapsed_milliseconds(attempt_started_at)
-            success_attempt = {
-                "provider": candidate_provider,
-                "model": candidate_model,
-                "status": "success",
-                "duration_ms": duration_ms,
-                "attempt_index": provider_index,
-                "attempt_count": len(provider_order),
-            }
-            if previous_provider:
-                success_attempt["fallback_from"] = previous_provider
-            provider_attempts.append({
-                **success_attempt,
-            })
-            success_metadata = {
-                "ai_run_id": ai_run_id,
-                "operator_stage": "import_cleanup",
-                "attempt_index": provider_index,
-                "attempt_count": len(provider_order),
-                **source_metadata,
-            }
-            if previous_provider:
-                success_metadata["fallback_from"] = previous_provider
-            log_ai_call_attempt(
-                feature="pricing_reference_import",
-                provider=candidate_provider,
-                model=candidate_model,
-                status="success",
-                duration_ms=duration_ms,
-                **success_metadata,
-            )
-            selected_provider = candidate_provider
-            if parsed is not None:
-                break
-        if parsed is None:
-            error_reference = new_error_reference()
-            if errors:
-                write_local_log(
-                    "server_error",
-                    {
-                        "source": "pricing_reference_import",
-                        "error_reference": error_reference,
-                        "selected_provider": provider,
-                        "errors": safe_error_messages(errors),
-                    },
-                )
-            missing_key_errors = [error for error in errors if "Missing:" in error]
-            missing_keys_only = bool(missing_key_errors) and len(missing_key_errors) == len(errors)
-            friendly_errors = (
-                [AI_PRICING_IMPORT_NOT_CONFIGURED, *safe_error_messages(missing_key_errors)]
-                if missing_keys_only
-                else safe_error_messages(errors)
-            )
-            result = pricing_reference_validation_result([], [], 0, filename) | {
-                "layout": "ai-normalization-required" if not errors or missing_keys_only else "ai-normalization-failed",
-                "errors": [AI_PRICING_IMPORT_NOT_CONFIGURED, f"Selected provider: {provider}. Missing: {text_ai_provider_key_env_name(provider)}."] if not errors else friendly_errors,
-                "error_reference": error_reference,
-            }
-            return result
-        raw_items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
-        raw_items = repair_ai_pricing_import_source_placement(raw_items, content)
-        raw_item_count = len(raw_items)
-        validate_started_at = time.perf_counter()
-        result = validate_pricing_reference_rows([item for item in raw_items if isinstance(item, dict)], list(PRICING_REFERENCE_TEMPLATE_COLUMNS), filename)
-        validate_rows_ms = elapsed_milliseconds(validate_started_at)
-        result["layout"] = "ai-normalized-pricing-reference"
-        result["currency"] = detected_currency_label(json.dumps(parsed, ensure_ascii=True))
-        if not raw_items:
-            result["errors"] = ["AI did not detect editable pricing rows in this upload. Check that the workbook includes item descriptions, units, costs, and markups, or add rows manually in Review Rows."]
-            result["warnings"] = []
-            result["canSave"] = False
+        configuration_started = time.perf_counter()
+        try:
+            gateway = configured_ai_gateway("pricing_reference_import", attempt_metadata=context,
+                                            attempt_observer=observe_attempt, operation_owner=current_ai_transport_owner())
+        finally:
+            timings_ms["configuration"] = elapsed_milliseconds(configuration_started)
+        request_started = time.perf_counter()
+        try:
+            parsed = request_openai_pricing_catalog_import(filename, content, tax, gateway=gateway)
+        finally:
+            timings_ms["provider_request"] = elapsed_milliseconds(request_started)
+        validation_started = time.perf_counter()
+        try:
+            raw_items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
+            raw_item_count = len(raw_items)
+            raw_items = repair_ai_pricing_import_source_placement(raw_items, content)
+            result = validate_pricing_reference_rows([item for item in raw_items if isinstance(item, dict)], list(PRICING_REFERENCE_TEMPLATE_COLUMNS), filename)
+            result["layout"] = "ai-normalized-pricing-reference"
+            result["currency"] = detected_currency_label(json.dumps(parsed, ensure_ascii=True))
+            if not raw_items:
+                result["errors"] = ["AI did not detect editable pricing rows in this upload. Check that the workbook includes item descriptions, units, costs, and markups, or add rows manually in Review Rows."]
+                result["warnings"] = []
+                result["canSave"] = False
+        finally:
+            timings_ms["validate_rows"] = elapsed_milliseconds(validation_started)
+        completed_provider = AI_PROVIDER_OPENROUTER
+        status = "success"
+        return result
+    except OpenAIAnalysisError as exc:
+        ref = new_error_reference()
+        failure = {"error_reference":ref, **ai_failure_metadata(exc, provider=AI_PROVIDER_OPENROUTER)}
+        configuration_required = isinstance(exc, AIConfigurationError)
+        result = pricing_reference_validation_result([], [], 0, filename) | {
+            "layout":"ai-normalization-required" if configuration_required else "ai-normalization-failed",
+            "errors":([AI_PRICING_IMPORT_NOT_CONFIGURED] if configuration_required else []) + generic_referenced_errors(ref),
+            "error_reference":ref}
         return result
     finally:
-        write_local_log(
-            "ai_pricing_reference_import_timing",
-            {
-                "source": "pricing_reference_import",
-                "ai_run_id": ai_run_id,
-                "operator_stage": "import_cleanup",
-                "selected_provider": provider,
-                "completed_provider": selected_provider,
-                "provider_attempts": provider_attempts,
-                "raw_item_count": raw_item_count,
-                "row_count": result.get("rowCount") if isinstance(result, dict) else 0,
-                "layout": result.get("layout") if isinstance(result, dict) else "",
-                "can_save": result.get("canSave") if isinstance(result, dict) else False,
-                **source_metadata,
-                "timings_ms": {
-                    "total": elapsed_milliseconds(started_at),
-                    "validate_rows": validate_rows_ms,
-                },
-            },
-        )
+        duration_ms = elapsed_milliseconds(started_at)
+        timings_ms["total"] = duration_ms
+        write_local_log("ai_pricing_reference_import_timing", {
+            "source":"pricing_reference_import", "status":status, "duration_ms":duration_ms,
+            "ai_run_id":ai_run_id, "operator_stage":"import_cleanup", **source_metadata,
+            "selected_provider":AI_PROVIDER_OPENROUTER, "completed_provider":completed_provider,
+            "provider_attempts":attempts, "raw_item_count":raw_item_count,
+            "row_count":result.get("rowCount",0) if isinstance(result,dict) else 0,
+            "can_save":result.get("canSave",False) if isinstance(result,dict) else False,
+            "timings_ms":timings_ms, **failure})
+
 
 
 def pricing_reference_import_preview(payload: dict[str, Any]) -> dict[str, Any]:
@@ -18931,9 +18469,7 @@ def draft_analysis_mode(payload: dict[str, Any] | None = None) -> str:
     return DRAFT_ANALYSIS_MODE_STANDARD
 
 
-def configured_openai_route_model(env_name: str, fallback: str) -> str:
-    raw = read_dotenv_value(env_name)
-    return raw if raw != "" else fallback
+
 
 
 def valid_openai_model_identifier(value: Any) -> bool:
@@ -18942,7 +18478,7 @@ def valid_openai_model_identifier(value: Any) -> bool:
 
 
 def valid_openai_reasoning_effort(value: Any) -> bool:
-    return isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is not None
+    return isinstance(value, str) and value in SUPPORTED_REASONING_EFFORTS
 
 
 @dataclass(frozen=True, repr=False)
@@ -18950,42 +18486,96 @@ class OpenAIDraftConfiguration:
     analysis_mode: str
     model: str
     reasoning_effort: str
+    gateway: AiGateway | None = None
 
 
-def capture_openai_draft_configuration(analysis_mode: str) -> OpenAIDraftConfiguration:
-    if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY:
-        model_name = OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME
-        effort_name = OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME
-    else:
-        model_name = OPENAI_DRAFT_MODEL_ENV_NAME
-        effort_name = OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME
-    # Deployed Analyse settings belong to the process environment (Coolify).
-    # Only local development reads .env; neither path supplies a source default.
-    read_setting = os.environ.get if configured_app_mode() == "deploy" else read_dotenv_value
-    return OpenAIDraftConfiguration(
-        analysis_mode=analysis_mode,
-        model=read_setting(model_name) or "",
-        reasoning_effort=clean_text(read_setting(effort_name)).lower(),
-    )
+def configured_ai_gateway(feature: str = "", *, attempt_metadata: Mapping[str, Any] | None = None, attempt_observer=None, operation_owner=None) -> AiGateway:
+    # Operation context is captured separately from provider diagnostics. Only these
+    # correlation fields may reach logs; filenames, prompts and content may not.
+    context = {key:value for key,value in (attempt_metadata or {}).items()
+               if key in {"ai_run_id", "operator_stage", "source_file_extension", "attempt_index", "attempt_count"}}
+    if operation_owner is not None and operation_owner is current_ai_transport_owner():
+        operation_owner.attempt_metadata.update(context)
+    reader = os.environ.get if configured_app_mode() == "deploy" else read_dotenv_value
+    try:
+        configuration = GatewayConfiguration.capture(reader)
+    except GatewayError as exc:
+        if feature:
+            scope = contextlib.nullcontext(operation_owner) if operation_owner is current_ai_transport_owner() and operation_owner is not None else AiTransportOperationScope(AI_LOG_TRACKING_CONTEXT, feature)
+            with scope:
+                log_ai_call_attempt(feature=feature, provider=AI_PROVIDER_OPENROUTER, model="", status="failed",
+                                    attempt_number=0, failure_boundary="request_validation", **context)
+        raise AIConfigurationError("AI request configuration is invalid.", diagnostics=exc.diagnostics) from None
+    def record_attempt(operation, attempt, status, duration, details):
+        gateway_attempt(configuration, operation, attempt, status, duration, details, attempt_metadata=context)
+        if attempt_observer is not None:
+            attempt_observer(operation, attempt, status, duration, details)
+    return AiGateway(configuration, credential_reader=lambda: reader(OPENROUTER_API_KEY_ENV_NAME),
+                     telemetry=record_attempt, operation_owner=operation_owner)
+
+
+def gateway_attempt(configuration, operation, attempt, status, duration, details, *, attempt_metadata=None):
+    feature = {"draft":"draft_quote_basis", "draft_high_quality":"draft_quote_basis", "basis_line":"basis_chat", "basis_answer":"basis_chat", "pricing_import":"pricing_reference_import", "pricing_metadata":"pricing_reference_metadata_enrichment"}[operation]
+    route = configuration.route(operation)
+    next_ai_transport_send_number(feature, AI_PROVIDER_OPENROUTER, route.model)
+    usage = details.get("usage")
+    state = getattr(AI_LOG_TRACKING_CONTEXT, "transport_operation", None)
+    if isinstance(state, dict):
+        state["usage"] = usage
+    owner = current_ai_transport_owner()
+    if owner is not None:
+        owner.observe_send(status, duration, details)
+    # These existing business owners record their terminal send after admission.
+    if operation in {"draft", "draft_high_quality", "pricing_metadata"}:
+        return
+    usage_fields = dict(usage) if isinstance(usage, dict) else {}
+    usage_fields.pop("output_tokens_details", None)
+    log_ai_call_attempt(feature=feature, provider=AI_PROVIDER_OPENROUTER, model=route.model, status=status,
+                        duration_ms=max(0, int(duration * 1000)), attempt_number=attempt,
+                        reasoning_level=route.effort, usage_available=isinstance(usage, dict),
+                        preserve_transport_operation=details.get("retry_pending") is True,
+                        **(attempt_metadata or {}), **usage_fields,
+                        **{key:value for key,value in details.items() if key not in {"attempt_number", "usage", "retry_pending", *usage_fields}})
+
+
+def gateway_request(gateway: AiGateway, operation: str, body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return gateway.request(operation, body)
+    except GatewayError as exc:
+        owner = current_ai_transport_owner()
+        if owner is not None and exc.diagnostics.get("attempt_number", 0) == 0:
+            owner.pre_send_failure = True
+        if exc.reason == "credential_missing":
+            error_type = AIConfigurationError
+        else:
+            error_type = AIModelOutputError if exc.diagnostics.get("failure_boundary") == "provider_response_contract" and exc.diagnostics.get("responses_status") != "failed" else OpenAIAnalysisError
+        raise error_type("AI request could not be completed.", diagnostics=exc.diagnostics) from None
+
+
+def capture_openai_draft_configuration(analysis_mode: str, *, operation_owner=None) -> OpenAIDraftConfiguration:
+    gateway = configured_ai_gateway("draft_quote_basis", operation_owner=operation_owner)
+    route = gateway.configuration.route("draft_high_quality" if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY else "draft")
+    return OpenAIDraftConfiguration(analysis_mode, route.model, route.effort, gateway)
+
 
 
 def validated_provider_model_label(provider: str, value: Any) -> str:
+    # Closed historical public labels remain readable in telemetry and evidence.
+    # This list does not select inference routes or accept arbitrary configured IDs.
     if not isinstance(value, str):
         return ""
-    provider_value = clean_text(provider).lower()
-    # Syntax admission is not permission to persist arbitrary operator settings.
-    # Only the fixed support-route model has a source-owned public label.
-    if provider_value == AI_PROVIDER_OPENAI and value == OPENAI_BASIS_LINE_MODEL:
+    if provider == "openai" and value == "gpt-6-luna":
         return value
-    if provider_value == AI_PROVIDER_DEEPSEEK and value in {DEEPSEEK_PRO_MODEL, DEEPSEEK_FLASH_MODEL}:
+    if provider == "deepseek" and value in {"deepseek-v4-pro", "deepseek-v4-flash"}:
         return value
+    # New gateway labels require separately verified public metadata before exposure.
     return ""
 
 
 def project_generation_configuration_evidence(
     value: Any,
     *,
-    model_source_provider: str = AI_PROVIDER_OPENAI,
+    model_source_provider: str = AI_PROVIDER_OPENROUTER,
 ) -> Any:
     """Copy evidence and project only generation-configuration provider/model fields."""
     model_fields = {
@@ -19129,12 +18719,7 @@ def openai_request_configuration_invalid() -> None:
     )
 
 
-def validate_openai_small_route_model(model: str, effort: str = OPENAI_SMALL_REASONING_EFFORT) -> None:
-    if (
-        model != OPENAI_BASIS_LINE_MODEL
-        or effort != OPENAI_SMALL_REASONING_EFFORT
-    ):
-        openai_request_configuration_invalid()
+
 
 
 def begin_ai_transport_operation(feature: str, provider: str, model: str) -> dict[str, Any]:
@@ -19147,10 +18732,14 @@ def begin_ai_transport_operation(feature: str, provider: str, model: str) -> dic
         "attempt_number": 0,
         "request_validation": False,
     }
-    AI_LOG_TRACKING_CONTEXT.transport_operation = operation
+    owner = current_ai_transport_owner()
+    if owner is not None:
+        operation = owner.begin(log_event_name(feature), provider_value, model)
+    else:
+        AI_LOG_TRACKING_CONTEXT.transport_operation = operation
     if not (
         valid_openai_model_identifier(model)
-        if provider_value == AI_PROVIDER_OPENAI
+        if provider_value == AI_PROVIDER_OPENROUTER
         else validated_provider_model_label(provider_value, model)
     ):
         operation["request_validation"] = True
@@ -19158,14 +18747,7 @@ def begin_ai_transport_operation(feature: str, provider: str, model: str) -> dic
     return operation
 
 
-def begin_openai_small_transport_operation(feature: str, model: str) -> dict[str, Any]:
-    operation = begin_ai_transport_operation(feature, AI_PROVIDER_OPENAI, model)
-    try:
-        validate_openai_small_route_model(model)
-    except OpenAIAnalysisError:
-        operation["request_validation"] = True
-        raise
-    return operation
+
 
 
 def next_ai_transport_send_number(feature: str, provider: str, model: str) -> int:
@@ -19181,7 +18763,7 @@ def next_ai_transport_send_number(feature: str, provider: str, model: str) -> in
         openai_request_configuration_invalid()
     if not (
         valid_openai_model_identifier(model)
-        if clean_text(provider).lower() == AI_PROVIDER_OPENAI
+        if clean_text(provider).lower() == AI_PROVIDER_OPENROUTER
         else validated_provider_model_label(provider, model)
     ):
         operation["request_validation"] = True
@@ -19190,107 +18772,55 @@ def next_ai_transport_send_number(feature: str, provider: str, model: str) -> in
     return operation["attempt_number"]
 
 
-def configured_openai_basis_line_model() -> str:
-    return configured_openai_route_model(OPENAI_BASIS_LINE_MODEL_ENV_NAME, OPENAI_BASIS_LINE_MODEL)
 
 
-def configured_openai_basis_answer_model() -> str:
-    return configured_openai_route_model(OPENAI_BASIS_ANSWER_MODEL_ENV_NAME, OPENAI_BASIS_ANSWER_MODEL)
 
 
-def configured_text_ai_provider(env_name: str, fallback: str = AI_PROVIDER_OPENAI) -> str:
-    raw = clean_text(read_dotenv_value(env_name)).lower()
-    if raw in SUPPORTED_TEXT_AI_PROVIDERS:
-        return raw
-    if text_ai_route_uses_deepseek_by_default(env_name):
-        return AI_PROVIDER_DEEPSEEK
-    return fallback
 
 
-def text_ai_route_uses_deepseek_by_default(env_name: str) -> bool:
-    return (
-        env_name in {
-            AI_BASIS_LINE_PROVIDER_ENV_NAME,
-            AI_BASIS_ANSWER_PROVIDER_ENV_NAME,
-            AI_PRICING_IMPORT_PROVIDER_ENV_NAME,
-        }
-        and bool(clean_text(read_dotenv_value(DEEPSEEK_API_KEY_ENV_NAME)))
-    )
 
 
-def text_ai_provider_label(provider: str) -> str:
-    if provider == AI_PROVIDER_DEEPSEEK:
-        return "DeepSeek"
-    return "OpenAI"
 
 
-def text_ai_provider_key_env_name(provider: str) -> str:
-    if provider == AI_PROVIDER_DEEPSEEK:
-        return DEEPSEEK_API_KEY_ENV_NAME
-    return OPENAI_API_KEY_ENV_NAME
 
 
-def text_ai_provider_api_key(provider: str) -> str:
-    return clean_text(read_dotenv_value(text_ai_provider_key_env_name(provider)))
 
 
-def text_ai_provider_default_model(provider: str) -> str:
-    if provider == AI_PROVIDER_DEEPSEEK:
-        return configured_deepseek_model()
-    return configured_openai_basis_line_model()
 
 
-def text_ai_provider_model_for_feature(provider: str, feature: str) -> str:
-    if provider == AI_PROVIDER_DEEPSEEK:
-        feature_key = log_event_name(feature)
-        if feature_key == "pricing_reference_import":
-            return configured_deepseek_pricing_import_model()
-        if feature_key == "pricing_reference_metadata_enrichment":
-            return configured_deepseek_pricing_metadata_model()
-        return configured_deepseek_model()
-    return text_ai_provider_default_model(provider)
 
 
-def configured_deepseek_base_url() -> str:
-    raw = clean_text(read_dotenv_value(DEEPSEEK_BASE_URL_ENV_NAME)) or DEEPSEEK_BASE_URL
-    if not re.match(r"^https?://", raw, flags=re.IGNORECASE):
-        return DEEPSEEK_BASE_URL
-    return raw.rstrip("/")
 
 
-def configured_deepseek_chat_completions_url() -> str:
-    return f"{configured_deepseek_base_url()}/chat/completions"
 
 
-def configured_deepseek_model() -> str:
-    raw = read_dotenv_value(DEEPSEEK_MODEL_ENV_NAME)
-    return raw if raw != "" else DEEPSEEK_PRO_MODEL
 
 
-def configured_deepseek_route_model(env_name: str, fallback: str) -> str:
-    route_model = read_dotenv_value(env_name)
-    if route_model != "":
-        return route_model
-    global_model = read_dotenv_value(DEEPSEEK_MODEL_ENV_NAME)
-    if global_model and global_model != DEEPSEEK_PRO_MODEL:
-        return global_model
-    return fallback
 
 
-def configured_deepseek_basis_answer_model() -> str:
-    return configured_deepseek_route_model(DEEPSEEK_BASIS_ANSWER_MODEL_ENV_NAME, DEEPSEEK_FLASH_MODEL)
 
 
-def configured_deepseek_basis_line_model() -> str:
-    return configured_deepseek_route_model(DEEPSEEK_BASIS_LINE_MODEL_ENV_NAME, DEEPSEEK_FLASH_MODEL)
 
 
-def configured_deepseek_pricing_import_model() -> str:
-    return configured_deepseek_route_model(DEEPSEEK_PRICING_IMPORT_MODEL_ENV_NAME, DEEPSEEK_PRO_MODEL)
 
 
-def configured_deepseek_pricing_metadata_model() -> str:
-    return configured_deepseek_route_model(DEEPSEEK_PRICING_METADATA_MODEL_ENV_NAME, DEEPSEEK_FLASH_MODEL)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def basis_chat_has_selected_line(payload: dict[str, Any]) -> bool:
@@ -19298,60 +18828,19 @@ def basis_chat_has_selected_line(payload: dict[str, Any]) -> bool:
     return bool(clean_multiline(basis_chat.get("line")))
 
 
-def unique_model_sequence(*models: str) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for model in models:
-        cleaned = model if isinstance(model, str) else ""
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            result.append(cleaned)
-    return result
 
 
-def openai_basis_chat_models(payload: dict[str, Any]) -> list[str]:
-    if basis_chat_required_intent(payload) == "answer":
-        return unique_model_sequence(
-            configured_openai_basis_answer_model(),
-            configured_openai_basis_line_model(),
-        )
-    if basis_chat_has_selected_line(payload):
-        return unique_model_sequence(configured_openai_basis_line_model())
-    return unique_model_sequence(configured_openai_basis_answer_model(), configured_openai_basis_line_model())
 
 
-def deepseek_basis_chat_models(payload: dict[str, Any]) -> list[str]:
-    if basis_chat_required_intent(payload) == "answer":
-        return unique_model_sequence(configured_deepseek_basis_answer_model(), configured_deepseek_model(), DEEPSEEK_PRO_MODEL)
-    if basis_chat_has_selected_line(payload):
-        return unique_model_sequence(configured_deepseek_basis_line_model(), configured_deepseek_model(), DEEPSEEK_PRO_MODEL)
-    return unique_model_sequence(configured_deepseek_basis_answer_model(), configured_deepseek_model(), DEEPSEEK_PRO_MODEL)
 
 
-def basis_chat_provider_env_name(payload: dict[str, Any]) -> str:
-    if basis_chat_required_intent(payload) == "answer":
-        return AI_BASIS_ANSWER_PROVIDER_ENV_NAME
-    if basis_chat_has_selected_line(payload):
-        return AI_BASIS_LINE_PROVIDER_ENV_NAME
-    return AI_BASIS_ANSWER_PROVIDER_ENV_NAME
 
 
-def basis_chat_provider_model_candidates(payload: dict[str, Any]) -> list[dict[str, str]]:
-    primary_provider = configured_text_ai_provider(basis_chat_provider_env_name(payload))
-    provider_order = [primary_provider]
-    if primary_provider != AI_PROVIDER_OPENAI:
-        provider_order.append(AI_PROVIDER_OPENAI)
-    candidates: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for provider in provider_order:
-        models = deepseek_basis_chat_models(payload) if provider == AI_PROVIDER_DEEPSEEK else openai_basis_chat_models(payload)
-        for model in models:
-            key = (provider, model)
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append({"provider": provider, "model": model})
-    return candidates
+
+
+
+
+
 
 
 def configured_timeout_seconds(env_name: str, fallback: int) -> int:
@@ -19366,15 +18855,14 @@ def configured_timeout_seconds(env_name: str, fallback: int) -> int:
 
 
 def configured_openai_timeout_seconds() -> int:
-    return configured_timeout_seconds(OPENAI_REQUEST_TIMEOUT_ENV_NAME, OPENAI_REQUEST_TIMEOUT_SECONDS)
+    return GatewayConfiguration.capture(os.environ.get if configured_app_mode() == "deploy" else read_dotenv_value).timeout_seconds
 
 
-def configured_deepseek_timeout_seconds() -> int:
-    return configured_timeout_seconds(DEEPSEEK_REQUEST_TIMEOUT_ENV_NAME, DEEPSEEK_REQUEST_TIMEOUT_SECONDS)
 
 
-def configured_deepseek_pricing_import_timeout_seconds() -> int:
-    return configured_timeout_seconds(DEEPSEEK_PRICING_IMPORT_TIMEOUT_ENV_NAME, DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS)
+
+
+
 
 
 def image_entries(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -21447,6 +20935,10 @@ class OpenAIAnalysisError(RuntimeError):
         self.diagnostics = diagnostics or {}
 
 
+class AIConfigurationError(OpenAIAnalysisError):
+    """A zero-send configuration failure, distinct from transport and model output."""
+
+
 class AIModelOutputError(OpenAIAnalysisError):
     def __init__(self, message: str, diagnostics: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -21608,10 +21100,12 @@ SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS = {
 
 
 SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
+    "provider_error_type",
     "provider_error_param",
     "request_shape_sha256",
     "failure_boundary",
     "response_contract_reason",
+    "transport_timeout",
     "http_status",
     "http_status_class",
     "provider_error_class",
@@ -26192,33 +25686,7 @@ def validate_draft_responses_envelope(
     return encoded, fingerprint
 
 
-def safe_draft_error_param(value: Any) -> str:
-    if not isinstance(value, str) or len(value) > 100:
-        return ""
-    if value in {"model", "input", "reasoning", "reasoning.effort"}:
-        return value
-    if re.fullmatch(r"input(?:\[0\]|\.0)(?:\.(?:role|content)(?:(?:\[[0-9]{1,2}\]|\.[0-9]{1,2})(?:\.(?:type|text|image_url|detail|filename|file_data))?)?)?", value):
-        return value
-    return ""
-
-
-def draft_provider_error_diagnostics(value: Any) -> dict[str, str]:
-    error = value.get("error") if isinstance(value, dict) else None
-    if not isinstance(error, dict):
-        return {}
-    result = {}
-    for key, allowed in {
-        "type": {"invalid_request_error", "server_error", "rate_limit_error", "authentication_error", "permission_error"},
-        "code": {"invalid_value", "invalid_parameter", "invalid_type", "invalid_image", "invalid_file", "unsupported_value", "context_length_exceeded", "rate_limit_exceeded", "insufficient_quota"},
-    }.items():
-        if isinstance(error.get(key), str) and error[key] in allowed:
-            result["provider_error_class" if key == "type" else "provider_error_code"] = error[key]
-    param = safe_draft_error_param(error.get("param"))
-    if param:
-        result["provider_error_param"] = param
-    return result
-
-
+@scoped_ai_transport_operation("draft_quote_basis")
 def request_openai_quote_basis(
     payload: dict[str, Any],
     api_key: str,
@@ -26227,9 +25695,9 @@ def request_openai_quote_basis(
     draft_configuration: OpenAIDraftConfiguration | None = None,
 ) -> dict[str, Any]:
     analysis_mode = draft_analysis_mode(payload)
-    configuration = draft_configuration or capture_openai_draft_configuration(analysis_mode)
+    configuration = draft_configuration or capture_openai_draft_configuration(analysis_mode, operation_owner=current_ai_transport_owner())
     model = configuration.model
-    begin_ai_transport_operation("draft_quote_basis", AI_PROVIDER_OPENAI, model)
+    begin_ai_transport_operation("draft_quote_basis", AI_PROVIDER_OPENROUTER, model)
     references = validate_draft_references(payload)
     prompt = build_quote_draft_prompt(payload, auth_session=auth_session)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
@@ -26285,42 +25753,11 @@ def request_openai_quote_basis(
     encoded_body, shape_fingerprint = validate_draft_responses_envelope(
         body, analysis_mode, draft_configuration=configuration,
     )
-    request = urllib.request.Request(
-        OPENAI_RESPONSES_URL,
-        data=encoded_body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    send_diagnostics = {"request_shape_sha256": shape_fingerprint}
+    gateway = configuration.gateway if configuration.gateway is not None else configured_ai_gateway()
     try:
-        send_diagnostics["attempt_number"] = next_ai_transport_send_number(
-            "draft_quote_basis", AI_PROVIDER_OPENAI, model
-        )
-        with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            error_body = json.loads(exc.read(128 * 1024).decode("utf-8"))
-        except (OSError, ValueError, UnicodeError):
-            error_body = None
-        diagnostics = {**send_diagnostics, "failure_boundary": "provider_http"}
-        if isinstance(exc.code, int) and 100 <= exc.code <= 599:
-            diagnostics.update({"http_status": exc.code, "http_status_class": f"{exc.code // 100}xx"})
-        diagnostics.update(draft_provider_error_diagnostics(error_body))
-        raise OpenAIAnalysisError(f"OpenAI analysis failed with HTTP {exc.code}.", diagnostics=diagnostics) from None
-    except PROVIDER_CONNECTION_EXCEPTIONS as exc:
-        raise OpenAIAnalysisError(
-            "OpenAI analysis failed due to network timeout." if is_timeout_exception(exc) else "OpenAI analysis failed due to connection error.",
-            diagnostics={**send_diagnostics, "failure_boundary": "provider_transport"},
-        ) from None
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise OpenAIAnalysisError(
-            "OpenAI analysis returned invalid JSON.",
-            diagnostics={**send_diagnostics, "failure_boundary": "provider_response_json"},
-        ) from None
+        data = gateway_request(gateway, "draft_high_quality" if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY else "draft", body)
+    except OpenAIAnalysisError as exc:
+        raise type(exc)(str(exc), diagnostics={**exc.diagnostics, "request_shape_sha256":shape_fingerprint}) from None
 
     response_diagnostics = openai_response_failure_diagnostics(data)
     for key in ("provider_error_class", "provider_error_code"):
@@ -26365,286 +25802,31 @@ def request_openai_quote_basis(
         ) from exc
 
 
-def request_openai_basis_chat_with_model(
-    payload: dict[str, Any],
-    api_key: str,
-    model: str,
-    auth_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    operation = begin_openai_small_transport_operation("basis_chat", model)
-    body = {
-        "model": model,
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": build_basis_chat_prompt(payload, auth_session=auth_session)}]}],
-        "reasoning": {"effort": OPENAI_SMALL_REASONING_EFFORT},
-        "max_output_tokens": 1200,
-    }
-    request = urllib.request.Request(
-        OPENAI_RESPONSES_URL,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    retry_delays = list(OPENAI_RETRY_DELAYS_SECONDS)
-    for attempt in range(len(retry_delays) + 1):
-        send_number = next_ai_transport_send_number("basis_chat", AI_PROVIDER_OPENAI, model)
-        send_started_at = time.perf_counter()
-        try:
-            with urllib.request.urlopen(request, timeout=configured_openai_timeout_seconds()) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as exc:
-            if attempt < len(retry_delays) and is_transient_openai_error(exc):
-                failure_message = openai_http_error_message(exc)
-                log_ai_call_attempt(
-                    feature="basis_chat",
-                    provider=AI_PROVIDER_OPENAI,
-                    model=model,
-                    status="failed",
-                    duration_ms=elapsed_milliseconds(send_started_at),
-                    details={"errors": [failure_message]},
-                    retry_lineage_id=operation["retry_lineage_id"],
-                    attempt_number=send_number,
-                    **ai_failure_metadata(exc, provider=AI_PROVIDER_OPENAI, timeout_seconds=configured_openai_timeout_seconds()),
-                    preserve_transport_operation=True,
-                )
-                time.sleep(retry_delays[attempt])
-                continue
-            raise OpenAIAnalysisError(openai_http_error_message(exc)) from exc
-        except PROVIDER_CONNECTION_EXCEPTIONS as exc:
-            if attempt < len(retry_delays) and is_transient_openai_error(exc):
-                failure_message = provider_connection_error_message("OpenAI", exc)
-                log_ai_call_attempt(
-                    feature="basis_chat",
-                    provider=AI_PROVIDER_OPENAI,
-                    model=model,
-                    status="failed",
-                    duration_ms=elapsed_milliseconds(send_started_at),
-                    details={"errors": [failure_message]},
-                    retry_lineage_id=operation["retry_lineage_id"],
-                    attempt_number=send_number,
-                    **ai_failure_metadata(exc, provider=AI_PROVIDER_OPENAI, timeout_seconds=configured_openai_timeout_seconds()),
-                    preserve_transport_operation=True,
-                )
-                time.sleep(retry_delays[attempt])
-                continue
-            raise OpenAIAnalysisError(provider_connection_error_message("OpenAI", exc)) from exc
-        except json.JSONDecodeError as exc:
-            raise OpenAIAnalysisError("OpenAI chat returned invalid JSON.") from exc
+
+
+
+
+
+
+
+
+
+
+
+
+@scoped_ai_transport_operation("basis_chat")
+def request_configured_basis_chat(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
+    gateway = configured_ai_gateway("basis_chat", operation_owner=current_ai_transport_owner())
+    operation = "basis_answer" if basis_chat_required_intent(payload) == "answer" or not basis_chat_has_selected_line(payload) else "basis_line"
+    route = gateway.configuration.route(operation)
+    begin_ai_transport_operation("basis_chat", AI_PROVIDER_OPENROUTER, route.model)
+    body = {"model":route.model, "input":[{"role":"user", "content":[{"type":"input_text", "text":build_basis_chat_prompt(payload, auth_session=auth_session)}]}], "reasoning":{"effort":route.effort}, "max_output_tokens":1200}
+    data = gateway_request(gateway, operation, body)
     try:
-        return normalize_basis_chat_result(
-            parse_json_object(response_output_text(data)),
-            payload,
-            "openai",
-            auth_session=auth_session,
-        )
+        return normalize_basis_chat_result(parse_json_object(response_output_text(data)), payload, "openrouter", auth_session=auth_session)
     except OpenAIAnalysisError as exc:
-        raise AIModelOutputError(str(exc)) from exc
+        raise AIModelOutputError(str(exc), diagnostics=exc.diagnostics) from None
 
-
-def request_deepseek_basis_chat_with_model(
-    payload: dict[str, Any],
-    api_key: str,
-    model: str,
-    auth_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    data = request_deepseek_chat_completion_json_data(
-        build_basis_chat_prompt(payload, auth_session=auth_session),
-        api_key,
-        model,
-        1200,
-        "chat",
-    )
-    try:
-        return normalize_basis_chat_result(
-            parse_json_object(chat_completions_output_text(data)),
-            payload,
-            "deepseek",
-            auth_session=auth_session,
-        )
-    except OpenAIAnalysisError as exc:
-        raise AIModelOutputError(str(exc)) from exc
-
-
-def request_openai_basis_chat(
-    payload: dict[str, Any],
-    api_key: str,
-    auth_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    models = openai_basis_chat_models(payload)
-    errors: list[str] = []
-    for index, model in enumerate(models):
-        attempt_started_at = time.perf_counter()
-        try:
-            result = request_openai_basis_chat_with_model(
-                payload,
-                api_key,
-                model,
-                auth_session=auth_session,
-            )
-            log_ai_call_attempt(
-                feature="basis_chat",
-                provider=AI_PROVIDER_OPENAI,
-                model=model,
-                status="success",
-                duration_ms=elapsed_milliseconds(attempt_started_at),
-            )
-            return result
-        except OpenAIAnalysisError as exc:
-            request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
-            log_ai_call_attempt(
-                feature="basis_chat",
-                provider=AI_PROVIDER_OPENAI,
-                model="" if request_validation else model,
-                status="failed",
-                duration_ms=elapsed_milliseconds(attempt_started_at),
-                details={"errors": safe_error_messages([str(exc)])},
-                **(
-                    {"failure_boundary": "request_validation", "attempt_number": 0}
-                    if request_validation
-                    else {}
-                ),
-            )
-            if request_validation:
-                raise
-            if not isinstance(exc, AIModelOutputError):
-                raise
-            errors.append(str(exc))
-            if index + 1 < len(models):
-                write_local_log("openai_basis_chat_model_retry", {
-                    "from_model": model,
-                    "to_model": models[index + 1],
-                    "errors": safe_error_messages([str(exc)]),
-                })
-                continue
-            raise
-    raise OpenAIAnalysisError(" ".join(safe_error_messages(errors)))
-
-
-def request_deepseek_basis_chat(
-    payload: dict[str, Any],
-    api_key: str,
-    auth_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    models = deepseek_basis_chat_models(payload)
-    errors: list[str] = []
-    for index, model in enumerate(models):
-        attempt_started_at = time.perf_counter()
-        try:
-            result = request_deepseek_basis_chat_with_model(
-                payload,
-                api_key,
-                model,
-                auth_session=auth_session,
-            )
-            log_ai_call_attempt(
-                feature="basis_chat",
-                provider=AI_PROVIDER_DEEPSEEK,
-                model=model,
-                status="success",
-                duration_ms=elapsed_milliseconds(attempt_started_at),
-            )
-            return result
-        except OpenAIAnalysisError as exc:
-            log_ai_call_attempt(
-                feature="basis_chat",
-                provider=AI_PROVIDER_DEEPSEEK,
-                model=model,
-                status="failed",
-                duration_ms=elapsed_milliseconds(attempt_started_at),
-                details={"errors": safe_error_messages([str(exc)])},
-            )
-            if not isinstance(exc, AIModelOutputError):
-                raise
-            errors.append(str(exc))
-            if index + 1 < len(models):
-                write_local_log("deepseek_basis_chat_model_retry", {
-                    "from_model": model,
-                    "to_model": models[index + 1],
-                    "errors": safe_error_messages([str(exc)]),
-                })
-                continue
-            raise
-    raise OpenAIAnalysisError(" ".join(safe_error_messages(errors)))
-
-
-def request_configured_basis_chat(
-    payload: dict[str, Any],
-    auth_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    candidates = basis_chat_provider_model_candidates(payload)
-    errors: list[str] = []
-    for index, candidate in enumerate(candidates):
-        provider = candidate["provider"]
-        model = candidate["model"]
-        api_key = text_ai_provider_api_key(provider)
-        if not api_key:
-            missing_error = f"Selected provider: {provider}. Missing: {text_ai_provider_key_env_name(provider)}."
-            errors.append(missing_error)
-            log_ai_call_attempt(
-                feature="basis_chat",
-                provider=provider,
-                model=model,
-                status="missing_api_key",
-                duration_ms=0,
-                details={"errors": safe_error_messages([missing_error])},
-            )
-            continue
-        attempt_started_at = time.perf_counter()
-        try:
-            if provider == AI_PROVIDER_DEEPSEEK:
-                result = request_deepseek_basis_chat_with_model(
-                    payload,
-                    api_key,
-                    model,
-                    auth_session=auth_session,
-                )
-            else:
-                result = request_openai_basis_chat_with_model(
-                    payload,
-                    api_key,
-                    model,
-                    auth_session=auth_session,
-                )
-            log_ai_call_attempt(
-                feature="basis_chat",
-                provider=provider,
-                model=model,
-                status="success",
-                duration_ms=elapsed_milliseconds(attempt_started_at),
-            )
-            return result
-        except OpenAIAnalysisError as exc:
-            errors.append(str(exc))
-            request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
-            log_ai_call_attempt(
-                feature="basis_chat",
-                provider=provider,
-                model="" if request_validation else model,
-                status="failed",
-                duration_ms=elapsed_milliseconds(attempt_started_at),
-                details={"errors": safe_error_messages([str(exc)])},
-                **(
-                    {"failure_boundary": "request_validation", "attempt_number": 0}
-                    if request_validation
-                    else {}
-                ),
-            )
-            if request_validation:
-                raise
-            if index + 1 < len(candidates):
-                write_local_log("basis_chat_model_retry", {
-                    "from_provider": provider,
-                    "from_model": model,
-                    "to_provider": candidates[index + 1]["provider"],
-                    "to_model": candidates[index + 1]["model"],
-                    "errors": safe_error_messages([str(exc)]),
-                })
-                continue
-            raise
-    raise OpenAIAnalysisError(" ".join(safe_error_messages(errors)))
 
 
 def data_url_inline_image(data_url: str) -> dict[str, str] | None:
@@ -26903,7 +26085,7 @@ def log_protected_ai_draft_block(
     details: dict[str, Any] = {
         "reason": safe_resource_id(reason, "remote_ai_unavailable"),
         "error_reference": clean_text(error_reference),
-        "selected_provider": clean_text(provider) or AI_PROVIDER_OPENAI,
+        "selected_provider": clean_text(provider) or AI_PROVIDER_OPENROUTER,
         "app_mode": configured_app_mode(),
         "storage_mode": configured_storage_mode(),
         "artifact_storage_mode": configured_artifact_storage_mode(),
@@ -26951,6 +26133,7 @@ def completed_draft_with_pricing_reference_snapshot(
     return completed
 
 
+@scoped_ai_transport_operation("draft_quote_basis")
 def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if pricing_reference_snapshot_for_payload(payload) is None:
@@ -26977,9 +26160,9 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             auth_session=auth_session,
         )
     protected_mode = protected_ai_draft_mode_enabled(auth_session)
-    provider = "openai"
-    provider_label = "OpenAI"
-    missing_env = OPENAI_API_KEY_ENV_NAME
+    provider = "openrouter"
+    provider_label = "OpenRouter"
+    missing_env = OPENROUTER_API_KEY_ENV_NAME
     remote_errors: list[str] = []
     error_reference = ""
 
@@ -26990,16 +26173,16 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             log_database_profile_resolution_block(payload)
             return profile_defaults_blocked_result()
 
-    openai_key = read_dotenv_value(OPENAI_API_KEY_ENV_NAME)
+    openai_key = read_dotenv_value(OPENROUTER_API_KEY_ENV_NAME)
     image_count, pdf_count = ai_payload_media_counts(payload)
     analysis_mode = draft_analysis_mode(payload)
-    draft_configuration = capture_openai_draft_configuration(analysis_mode)
+    draft_configuration = capture_openai_draft_configuration(analysis_mode, operation_owner=current_ai_transport_owner())
     draft_model = draft_configuration.model
     if protected_mode and not openai_key:
         error_reference = new_error_reference()
         log_ai_call_attempt(
             feature="draft_quote_basis",
-            provider=AI_PROVIDER_OPENAI,
+            provider=AI_PROVIDER_OPENROUTER,
             model=draft_model,
             status="missing_api_key",
             duration_ms=0,
@@ -27012,7 +26195,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
         log_protected_ai_draft_block(
             error_reference=error_reference,
             reason="remote_ai_unconfigured",
-            provider=AI_PROVIDER_OPENAI,
+            provider=AI_PROVIDER_OPENROUTER,
             model=draft_model,
             missing_env=[missing_env],
         )
@@ -27042,7 +26225,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                     fallback_project,
                     fallback_line_items,
                     {
-                        "provider": AI_PROVIDER_OPENAI,
+                        "provider": AI_PROVIDER_OPENROUTER,
                         "model": draft_model,
                         "analysis_mode": analysis_mode,
                         "image_count": image_count,
@@ -27070,7 +26253,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 return result
             log_ai_call_attempt(
                 feature="draft_quote_basis",
-                provider=AI_PROVIDER_OPENAI,
+                provider=AI_PROVIDER_OPENROUTER,
                 model=draft_model,
                 status="success",
                 duration_ms=elapsed_milliseconds(attempt_started_at),
@@ -27086,8 +26269,8 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             if exc.diagnostics.get("failure_boundary") == "request_validation":
                 validation_metadata = ai_failure_metadata(
                     exc,
-                    provider=AI_PROVIDER_OPENAI,
-                    timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENAI, "draft_quote_basis"),
+                    provider=AI_PROVIDER_OPENROUTER,
+                    timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENROUTER, "draft_quote_basis"),
                 )
                 validation_metadata.update({
                     "failure_boundary": "request_validation",
@@ -27095,7 +26278,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 })
                 log_ai_call_attempt(
                     feature="draft_quote_basis",
-                    provider=AI_PROVIDER_OPENAI,
+                    provider=AI_PROVIDER_OPENROUTER,
                     model="",
                     status="failed",
                     duration_ms=elapsed_milliseconds(attempt_started_at),
@@ -27110,13 +26293,13 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             error_reference = new_error_reference()
             provider_failure_details = ai_failure_metadata(
                 exc,
-                provider=AI_PROVIDER_OPENAI,
-                timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENAI, "draft_quote_basis"),
+                provider=AI_PROVIDER_OPENROUTER,
+                timeout_seconds=ai_provider_timeout_seconds(AI_PROVIDER_OPENROUTER, "draft_quote_basis"),
                 error_reference=error_reference,
             )
             log_ai_call_attempt(
                 feature="draft_quote_basis",
-                provider=AI_PROVIDER_OPENAI,
+                provider=AI_PROVIDER_OPENROUTER,
                 model=draft_model,
                 status="failed",
                 duration_ms=elapsed_milliseconds(attempt_started_at),
@@ -27139,7 +26322,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                 log_protected_ai_draft_block(
                     error_reference=error_reference,
                     reason="remote_ai_failed",
-                    provider=AI_PROVIDER_OPENAI,
+                    provider=AI_PROVIDER_OPENROUTER,
                     model=draft_model,
                     exc=exc,
                 )
@@ -27196,7 +26379,7 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     ])
     log_ai_call_attempt(
         feature="draft_quote_basis",
-        provider=AI_PROVIDER_OPENAI,
+        provider=AI_PROVIDER_OPENROUTER,
         model=draft_model,
         status="missing_api_key",
         duration_ms=0,
@@ -27231,34 +26414,14 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
     }, auth_session=auth_session)
 
 
-def answer_basis_chat(
-    payload: dict[str, Any],
-    auth_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def answer_basis_chat(payload: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         return request_configured_basis_chat(payload, auth_session=auth_session)
     except OpenAIAnalysisError as exc:
-        error = str(exc)
-        request_validation = exc.diagnostics.get("failure_boundary") == "request_validation"
-        provider = configured_text_ai_provider(basis_chat_provider_env_name(payload))
-        write_local_log("basis_chat_failed", {
-            "selected_provider": provider,
-            "errors": safe_error_messages([error]),
-        })
-        fallback_note = "OpenAI fallback is enabled for DeepSeek routes when OPENAI_API_KEY is configured."
-        message = (
-            f"AI basis chat is not configured or failed. Selected provider is {text_ai_provider_label(provider)}. "
-            f"Add {text_ai_provider_key_env_name(provider)}, or configure OPENAI_API_KEY for fallback. {fallback_note} {error}"
-        )
-        diagnostics = (
-            {"failure_boundary": "request_validation", "attempt_number": 0}
-            if request_validation
-            else {}
-        )
-        raise OpenAIAnalysisError(
-            " ".join(safe_error_messages([message])),
-            diagnostics=diagnostics,
-        ) from exc
+        ref = new_error_reference()
+        write_local_log("basis_chat_failed", {"selected_provider":AI_PROVIDER_OPENROUTER,
+            "error_reference":ref, **ai_failure_metadata(exc, provider=AI_PROVIDER_OPENROUTER)})
+        raise OpenAIAnalysisError(" ".join(generic_referenced_errors(ref)), diagnostics=exc.diagnostics) from None
 
 
 def save_uploaded_images(images: list[dict[str, Any]], job_dir: Path) -> list[dict[str, Any]]:
@@ -29500,7 +28663,7 @@ def write_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
+        prefix=".tmp-",
         suffix=".tmp",
         dir=str(path.parent),
     )
@@ -29870,7 +29033,7 @@ def stage_local_quote_publication(
     publication_id = new_quote_publication_id()
     publications_dir = quote_session_publications_dir(session_id)
     transaction.ensure_directory(publications_dir)
-    staging_dir = publications_dir / f".{publication_id}.staging"
+    staging_dir = publications_dir / f".{secrets.token_urlsafe(16)}.staging"
     final_dir = quote_session_publication_dir(session_id, publication_id)
     staging_dir.mkdir(parents=False, exist_ok=False)
     transaction.created_directories.add(transaction._path_key(staging_dir))
@@ -33136,8 +32299,8 @@ def _run_quote_job(
     generation_configuration = project_generation_configuration_evidence({
         "generation_configuration": {
             "pdf_mode": normalized_pdf_mode,
-            "provider": read_dotenv_value("AI_PROVIDER"),
-            "model": read_dotenv_value("OPENAI_MODEL"),
+            "provider": AI_PROVIDER_OPENROUTER,
+            "model": "",
             "app_revision": clean_text(os.getenv("GIT_REVISION") or os.getenv("COMMIT_SHA")),
         }
     })["generation_configuration"]
@@ -33454,11 +32617,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             session = self.current_auth_session()
             self.send_json({
                 "csrf_header": configured_csrf_header_name(),
-                "csrf_token": csrf_token_for_cookie_header(self.headers.get("Cookie", "")),
+                "csrf_token": csrf_token_for_cookie_header(self.headers.get("Cookie", ""), auth_state=self.server.internal_auth),
                 "auth_required": auth_required(),
                 "authenticated": bool(session),
                 "permissions": self.current_permissions(),
-                "user": session.get("user") if session else None,
+                "user": None if internal_password_mode_enabled() else (session.get("user") if session else None),
                 "browser_recovery_scope": browser_recovery_scope(session),
             })
             return
@@ -33809,6 +32972,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == PLATFORM_FINALIZATION_ENDPOINT:
             self.handle_platform_finalization()
+            return
+        if parsed.path == "/login":
+            self.handle_password_login()
             return
         if parsed.path == "/logout":
             if self.block_unauthenticated_request(parsed.path):
@@ -34347,7 +33513,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     def current_auth_session(self) -> dict[str, Any] | None:
         if hasattr(self, "_validated_auth_session"):
             return self._validated_auth_session
-        session = session_from_cookie_header(self.headers.get("Cookie", ""))
+        session = session_from_cookie_header(self.headers.get("Cookie", ""), auth_state=self.server.internal_auth)
         path = urlparse(self.path).path
         if (
             session
@@ -34876,7 +34042,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if self.current_auth_session():
             return False
         if self.command == "GET" and not path.startswith("/api/"):
-            if internal_google_mode_enabled():
+            if internal_password_mode_enabled():
                 # A domain revisit must not let provider SSO undo app logout.
                 # Only the explicit sign-in action starts a new OIDC transaction.
                 self.send_auth_page(
@@ -34897,252 +34063,128 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         return True
 
     def handle_login(self) -> None:
-        if deploy_requires_auth_guard():
-            self.send_json({
-                "status": "blocked",
-                "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
-            }, status=503)
+        if deploy_requires_trusted_proxy_guard() or deploy_requires_auth_guard():
+            self.send_json({"status": "blocked", "errors": ["Authentication is not configured."]}, status=503)
             return
         if not auth_required():
             self.send_redirect("/")
             return
         if platform_launch_mode_enabled():
-            self.send_auth_page(
-                "Platform launch required",
-                "Open this quote runner from an approved Swooshz Platform workspace.",
-                action_href=configured_platform_home_url() or "/signed-out",
-                action_label="Back",
-                status=401,
-            )
+            self.send_auth_page("Platform launch required", "Open this quote runner from an approved workspace.",
+                                action_href=configured_platform_home_url() or "/signed-out", action_label="Back", status=401)
             return
-        if (
-            configured_app_mode() == "local"
-            and configured_auth_mode() == "local"
-            and oidc_config_complete()
-        ):
+        if configured_app_mode() == "local" and configured_auth_mode() == "local" and oidc_config_complete():
             state = secrets.token_urlsafe(24)
-            state_cookie = cookie_header_value(
-                OIDC_STATE_COOKIE_NAME,
-                signed_cookie_value(
-                    {"state": state},
-                    max_age_seconds=OIDC_TRANSACTION_TTL_SECONDS,
-                ),
-                max_age=OIDC_TRANSACTION_TTL_SECONDS,
-            )
-            self.send_redirect(
-                oidc_authorize_url(state),
-                extra_headers=[("Set-Cookie", state_cookie)],
-            )
+            self.send_redirect(oidc_authorize_url(state), extra_headers=[("Set-Cookie", cookie_header_value(
+                OIDC_STATE_COOKIE_NAME, signed_cookie_value({"state": state}, max_age_seconds=LOGIN_NONCE_TTL_SECONDS),
+                max_age=LOGIN_NONCE_TTL_SECONDS))])
             return
-        if not internal_google_mode_enabled():
+        if not internal_password_mode_enabled():
             self.send_json({"error": "Not found"}, status=404)
             return
-        if not internal_google_config_complete():
-            self.send_json({
-                "status": "blocked",
-                "errors": ["Internal authentication is not configured for deploy mode."],
-            }, status=503)
+        if urlparse(self.path).query:
+            self.send_json({"error": "Invalid login request."}, status=400)
+            return
+        if is_rate_limited(effective_rate_limit_client_id(self.client_address[0], single_forwarded_for_header_value(self.headers)), "/login/nonce"):
+            self.send_password_failure(429, "login_rate_limit")
             return
         try:
-            transaction = INTERNAL_AUTH_STATE.begin_transaction()
-        except InternalAuthStateError as exc:
-            write_local_log(
-                "security_event",
-                {"reason": exc.reason, "path": "/login", "status": 503},
-            )
-            self.send_json(
-                {
-                    "status": "blocked",
-                    "errors": ["Authentication could not be started."],
-                },
-                status=503,
-            )
+            nonce, binding = self.server.internal_auth.begin_login()
+        except InternalAuthStateError:
+            self.send_json({"error": "Sign in is temporarily unavailable."}, status=503)
             return
-        state_cookie = cookie_header_value(
-            OIDC_STATE_COOKIE_NAME,
-            signed_cookie_value(
-                {
-                    "auth_mode": INTERNAL_AUTH_MODE,
-                    "transaction_id": transaction.browser_binding,
-                },
-                max_age_seconds=OIDC_TRANSACTION_TTL_SECONDS,
-            ),
-            max_age=OIDC_TRANSACTION_TTL_SECONDS,
-        )
-        write_local_log(
-            "security_event",
-            {
-                "reason": "internal_google_login_initiated",
-                "path": "/login",
-                "status": 302,
-            },
-        )
-        self.send_redirect(
-            internal_google_authorize_url(transaction),
-            extra_headers=[("Set-Cookie", state_cookie)],
-        )
+        body = ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                "<title>Staff sign in</title></head><body><main><h1>Staff sign in</h1>"
+                "<p>Choose an approved staff email and enter the shared team password.</p>"
+                "<form action=\"/login\" method=\"post\">"
+                f"<input type=\"hidden\" name=\"nonce\" value=\"{html.escape(nonce)}\">"
+                "<p><label>Email <input name=\"email\" type=\"email\" autocomplete=\"username\" maxlength=\"254\" required></label></p>"
+                "<p><label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" maxlength=\"1024\" required></label></p>"
+                "<button type=\"submit\">Sign in</button></form></main></body></html>").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie", cookie_header_value("sqag_login_binding", binding, max_age=LOGIN_NONCE_TTL_SECONDS))
+        self.send_security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_password_login(self) -> None:
+        if not internal_password_mode_enabled():
+            self.send_json({"error": "Not found"}, status=404)
+            return
+        if deploy_requires_trusted_proxy_guard() or deploy_requires_auth_guard() or not internal_password_config_complete():
+            self.send_password_failure(503, "login_configuration")
+            return
+        # Unlike authenticated POSTs, this entry uses an atomically consumed browser nonce.
+        origin, single_origin = singleton_http_header(self.headers, "Origin")
+        expected_origin = request_sqag_origin(self.headers.get("Host", ""))
+        if not single_origin or not expected_origin or origin != expected_origin or urlparse(self.path).query:
+            self.send_password_failure(403, "login_origin")
+            return
+        referer = self.headers.get("Referer", "")
+        if referer and not is_same_origin_request(referer, self.headers.get("Host", "")):
+            self.send_password_failure(403, "login_origin")
+            return
+        if is_rate_limited(effective_rate_limit_client_id(self.client_address[0], single_forwarded_for_header_value(self.headers)), "/login"):
+            self.send_password_failure(429, "login_rate_limit")
+            return
+        try:
+            mime, mime_single = singleton_http_header(self.headers, "Content-Type")
+            length_text, length_single = singleton_http_header(self.headers, "Content-Length")
+            if not mime_single or mime.split(";", 1)[0].lower() != "application/x-www-form-urlencoded":
+                raise InternalAuthStateError("login_form_invalid")
+            if not length_single or not re.fullmatch(r"[0-9]{1,5}", length_text) or not 0 < int(length_text) <= 8192 or self.headers.get("Transfer-Encoding"):
+                raise InternalAuthStateError("login_form_invalid")
+            self.connection.settimeout(5)
+            raw = self.rfile.read(int(length_text))
+            self._password_body_consumed = True
+            if len(raw) != int(length_text):
+                raise InternalAuthStateError("login_form_invalid")
+            text = raw.decode("ascii")
+            if re.search(r"%(?![0-9a-fA-F]{2})", text):
+                raise InternalAuthStateError("login_form_invalid")
+            pairs = parse_qsl(text, keep_blank_values=True, strict_parsing=True, max_num_fields=3, encoding="utf-8", errors="strict")
+            values = dict(pairs)
+            if len(pairs) != 3 or set(values) != {"email", "password", "nonce"}:
+                raise InternalAuthStateError("login_form_invalid")
+            self.server.internal_auth.consume_login(values["nonce"], cookies_from_header(self.headers.get("Cookie", "")).get("sqag_login_binding", ""))
+            previous = verified_cookie_payload(cookies_from_header(self.headers.get("Cookie", "")).get(SESSION_COOKIE_NAME, ""), allow_expired=True) or {}
+            record = self.server.internal_auth.authenticate(email=values["email"], password=values["password"], policy=internal_auth_policy(), previous_session_id=previous.get("session_id", ""))
+        except (InternalAuthConfigError, InternalAuthStateError, ValueError, UnicodeError, OSError):
+            self.send_password_failure(403, "login_denied")
+            return
+        self.send_redirect("/", extra_headers=[
+            ("Set-Cookie", cookie_header_value(SESSION_COOKIE_NAME, signed_cookie_value(record, max_age_seconds=INTERNAL_SESSION_TTL_SECONDS), max_age=INTERNAL_SESSION_TTL_SECONDS)),
+            ("Set-Cookie", clear_cookie_header_value("sqag_login_binding")),
+        ])
+
+    def send_password_failure(self, status: int, reason: str) -> None:
+        # Drain only an already bounded form body so a Windows TCP close cannot
+        # discard the denial response; slow/incomplete input has a short bound.
+        length = self.headers.get("Content-Length", "")
+        if not getattr(self, "_password_body_consumed", False) and re.fullmatch(r"[0-9]{1,5}", length) and 0 < int(length) <= 8192 and not self.headers.get("Transfer-Encoding"):
+            try:
+                self.connection.settimeout(0.25)
+                self.rfile.read(int(length))
+            except OSError:
+                pass
+        self.close_connection = True
+        reference = new_error_reference()
+        write_local_log("security_event", {"reason":reason, "path":"/login", "status":status, "error_reference":reference})
+        self.send_auth_page("Sign in was not completed", "Sign in could not be completed. Start a new sign-in attempt. Reference: "+reference,
+                            status=status, extra_headers=[("Set-Cookie", clear_cookie_header_value("sqag_login_binding"))])
 
     def handle_oidc_callback(self, query: str) -> None:
-        if deploy_requires_auth_guard():
-            self.send_json({
-                "status": "blocked",
-                "errors": ["Deploy mode requires a complete auth boundary before serving the app."],
-            }, status=503)
+        if deploy_requires_trusted_proxy_guard() or deploy_requires_auth_guard():
+            self.send_json({"status": "blocked", "errors": ["Authentication is not configured."]}, status=503)
             return
-        if (
-            configured_app_mode() == "local"
-            and configured_auth_mode() == "local"
-            and oidc_config_complete()
-        ):
+        # Independent local-component contract only; no internal provider callback remains.
+        if configured_app_mode() == "local" and configured_auth_mode() == "local" and oidc_config_complete():
             self.handle_local_component_oidc_callback(query)
             return
-        if not internal_google_mode_enabled():
-            self.send_json({"error": "Not found"}, status=404)
-            return
-        if not internal_google_config_complete():
-            self.send_json({
-                "status": "blocked",
-                "errors": ["Internal authentication is not configured for deploy mode."],
-            }, status=503)
-            return
-        clear_transaction_cookie = (
-            "Set-Cookie",
-            clear_cookie_header_value(OIDC_STATE_COOKIE_NAME),
-        )
-        try:
-            params = parse_internal_google_callback_query(query)
-            transaction = INTERNAL_AUTH_STATE.consume_transaction(
-                params["state"],
-                oidc_transaction_binding_from_cookie(
-                    self.headers.get("Cookie", "")
-                ),
-            )
-        except (OidcAuthError, InternalAuthStateError) as exc:
-            reason = getattr(exc, "reason", "oidc_callback_failed")
-            write_local_log(
-                "security_event",
-                {"reason": reason, "path": "/callback", "status": 400},
-            )
-            self.send_auth_page(
-                "Sign in was not completed",
-                "Authentication could not be completed. Start a new sign-in attempt.",
-                status=400,
-                extra_headers=[clear_transaction_cookie],
-            )
-            return
-        if params.get("error"):
-            write_local_log(
-                "security_event",
-                {
-                    "reason": "oidc_authorization_denied",
-                    "path": "/callback",
-                    "status": 400,
-                },
-            )
-            self.send_auth_page(
-                "Sign in was not completed",
-                "Authentication was not completed. Start a new sign-in attempt.",
-                status=400,
-                extra_headers=[clear_transaction_cookie],
-            )
-            return
-        try:
-            claims = google_oidc_verifier().exchange_and_verify(
-                code=params["code"],
-                code_verifier=transaction.code_verifier,
-                nonce=transaction.nonce,
-            )
-        except OidcProtocolError as exc:
-            write_local_log(
-                "security_event",
-                {"reason": exc.reason, "path": "/callback", "status": exc.status},
-            )
-            self.send_auth_page(
-                "Sign in was not completed",
-                "Authentication could not be completed. Start a new sign-in attempt.",
-                status=exc.status,
-                extra_headers=[clear_transaction_cookie],
-            )
-            return
-        try:
-            policy = internal_auth_policy()
-            previous_payload = verified_cookie_payload(
-                cookies_from_header(self.headers.get("Cookie", "")).get(
-                    SESSION_COOKIE_NAME,
-                    "",
-                ),
-                allow_expired=True,
-            ) or {}
-            session_record = INTERNAL_AUTH_STATE.create_session(
-                google_sub=claims.get("sub"),
-                email=claims.get("email"),
-                policy=policy,
-                previous_session_id=previous_payload.get("session_id"),
-            )
-        except InternalAuthConfigError:
-            write_local_log(
-                "security_event",
-                {
-                    "reason": "internal_identity_policy_invalid",
-                    "path": "/callback",
-                    "status": 503,
-                },
-            )
-            self.send_auth_page(
-                "Sign in was not completed",
-                "Authentication could not be completed. Start a new sign-in attempt.",
-                status=503,
-                extra_headers=[clear_transaction_cookie],
-            )
-            return
-        except InternalAuthStateError as exc:
-            reason = getattr(exc, "reason", "internal_session_creation_failed")
-            write_local_log(
-                "security_event",
-                {
-                    "reason": reason,
-                    "path": "/callback",
-                    "status": 403,
-                    "user_id": privacy_safe_audit_tracking_id_or_unavailable(
-                        claims.get("sub"),
-                        "unknown",
-                    ),
-                },
-            )
-            self.send_auth_page(
-                "Approved tester access required",
-                "Authenticated user is not approved for this internal UAT app.",
-                status=403,
-                extra_headers=[clear_transaction_cookie],
-            )
-            return
-        session_cookie = cookie_header_value(
-            SESSION_COOKIE_NAME,
-            signed_cookie_value(
-                session_record,
-                max_age_seconds=INTERNAL_SESSION_TTL_SECONDS,
-            ),
-            max_age=INTERNAL_SESSION_TTL_SECONDS,
-        )
-        write_local_log(
-            "security_event",
-            {
-                "reason": "internal_google_authentication_succeeded",
-                "path": "/callback",
-                "status": 302,
-                "user_id": privacy_safe_audit_tracking_id_or_unavailable(
-                    session_record.get("google_sub"),
-                    "unknown",
-                ),
-            },
-        )
-        self.send_redirect(
-            "/",
-            extra_headers=[
-                ("Set-Cookie", session_cookie),
-                ("Set-Cookie", clear_cookie_header_value(OIDC_STATE_COOKIE_NAME)),
-            ],
-        )
+        self.send_json({"error": "Not found"}, status=404)
 
     def handle_local_component_oidc_callback(self, query: str) -> None:
         params = parse_qs(query, keep_blank_values=True)
@@ -35190,7 +34232,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         )
 
     def handle_logout(self) -> None:
-        session = session_from_cookie_header(self.headers.get("Cookie", ""))
+        session = session_from_cookie_header(self.headers.get("Cookie", ""), auth_state=self.server.internal_auth)
         platform = platform_context_from_auth_session(session)
         grant_id = clean_text(platform.get("validationGrantId")) if platform else ""
         if platform_launch_mode_enabled() and grant_id:
@@ -35205,7 +34247,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             configured_auth_mode() == INTERNAL_AUTH_MODE
             and isinstance(session, dict)
         ):
-            INTERNAL_AUTH_STATE.revoke_session(session.get("session_id"))
+            self.server.internal_auth.revoke_session(session.get("session_id"))
         logout_location = (
             configured_platform_home_url() or "/signed-out"
             if platform_launch_mode_enabled()
@@ -35226,7 +34268,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     def block_untrusted_host(self) -> bool:
         if is_allowed_host_header(self.headers.get("Host", "")):
             return False
-        write_local_log("security_event", {"reason": "untrusted_host", "path": self.path, "status": 403})
+        write_local_log("security_event", {"reason": "untrusted_host", "path": urlparse(self.path).path, "status": 403})
         self.send_json({"status": "blocked", "errors": ["Request host is not allowed for this local runner."]}, status=403)
         return True
 
@@ -35242,7 +34284,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "blocked", "errors": ["Cross-origin requests are not allowed."]}, status=403)
             return True
         supplied_token = self.headers.get(configured_csrf_header_name(), "")
-        expected_token = csrf_token_for_cookie_header(self.headers.get("Cookie", ""))
+        expected_token = csrf_token_for_cookie_header(self.headers.get("Cookie", ""), auth_state=self.server.internal_auth)
         if not secrets.compare_digest(supplied_token, expected_token):
             write_local_log("security_event", {"reason": "invalid_csrf", "path": path, "status": 403})
             self.send_json({"status": "blocked", "errors": ["Missing or invalid local session token."]}, status=403)

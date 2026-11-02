@@ -1,3 +1,5 @@
+import { signIn } from "./internal-password-browser-test.mjs";
+import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthetic-browser-boundary.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -10,7 +12,7 @@ for (const key of Object.keys(process.env)) {
 // Synthetic-only owner-UAT U1/U2 regression: production server, UI, normalisation and XLSX code;
 // only the AI provider is replaced by a deterministic caller-written draft (no network, no paid AI).
 const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
-const { chromium, request } = createRequire(path.join(sourceRoot, "package.json"))("playwright");
+const { chromium } = createRequire(path.join(sourceRoot, "package.json"))("playwright");
 const args = process.argv.slice(2);
 const measureOnly = args.includes("--measure-only");
 const reliability = args.includes("--alpha2-reliability");
@@ -27,7 +29,7 @@ const cpuThrottle = Number((args.find((arg) => arg.startsWith("--cpu-throttle=")
 const profiledFunctions = (args.find((arg) => arg.startsWith("--profile=")) || "--profile=").split("=")[1].split(",").filter(Boolean);
 const extraCatalogItems = Number((args.find((arg) => arg.startsWith("--catalog-extra=")) || "--catalog-extra=0").split("=")[1]);
 const evidenceRoot = process.env.SQAG_OWNER_UAT_EVIDENCE_ROOT || path.join(sourceRoot, "_logs/browser/ouat");
-const runRoot = path.join(evidenceRoot, Date.now().toString(36));
+const runRoot = await freshBrowserRun(evidenceRoot, "run-");
 const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles", "logs", "downloads"].map((name) => [name, path.join(runRoot, name)]));
 await Promise.all(Object.values(dirs).map((dir) => fs.mkdir(dir, { recursive: true })));
 const writeJson = (file, value) => fs.writeFile(path.join(runRoot, file), JSON.stringify(value, null, 2) + "\n");
@@ -138,7 +140,7 @@ if (reliability) {
 }
 await fs.cp(path.join(sourceRoot, "tests/fixtures/quote-generator/profiles", profileId), path.join(dirs.profiles, profileId), { recursive: true });
 
-let server, browser, serverErr = "";
+let server, browser, browserBoundary, serverErr = "";
 const network = [];
 let checkpointGate = null;
 let exportPollGate = null;
@@ -226,8 +228,9 @@ const timings = [];
 try {
   server = startServer();
   const baseUrl = await server.ready;
-  browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ acceptDownloads: true });
+  browser = await chromium.launch({ headless: true, ...(process.env.CI ? {} : { channel: "chrome" }) });
+  browserBoundary = new SyntheticBrowserBoundary(baseUrl);
+  const context = await browserBoundary.newContext(browser, { acceptDownloads: true });
   const page = await context.newPage();
   const cdp = await context.newCDPSession(page);
   if (cpuThrottle > 1) await cdp.send("Emulation.setCPUThrottlingRate", { rate: cpuThrottle });
@@ -238,7 +241,7 @@ try {
   });
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
-    if (url.origin !== baseUrl) return route.abort();
+    if (!browserBoundary.admit(url.href)) return route.abort("blockedbyclient");
     if (url.pathname === "/api/jobs" && route.request().method() === "POST"
       && ["generate", "generate_pdf"].includes(route.request().postDataJSON()?.type)) generationRequests += 1;
     if (exportPollGate && !exportPollGate.jobId && url.pathname.startsWith("/api/jobs/") && route.request().method() === "GET") {
@@ -274,9 +277,9 @@ try {
       for (const entry of list.getEntries()) window.__ownerUatEvents?.push({ name: entry.name, duration: entry.duration, processing: entry.processingEnd - entry.processingStart });
     }).observe({ type: "event", durationThreshold: 16, buffered: true });
   });
-  await page.goto(baseUrl + "/login", { waitUntil: "domcontentloaded" });
+  await signIn(page, baseUrl);
   await page.waitForFunction(async () => (await fetch("/api/session").then((r) => r.json())).authenticated === true, null, { timeout: 30000 });
-  const api = await request.newContext({ storageState: await context.storageState() });
+  const api = context.request;
   await page.locator("#newQuoteButton").click();
   await page.locator("#imageIntake").waitFor({ state: "visible" });
   const render = await noisePng(page, 1600, 1100);
@@ -358,7 +361,7 @@ try {
         receiptFields: lines.flatMap((line) => line.possible_pricing_matches || []).filter((match) => "selection_receipt" in match).length,
       };
     };
-    const savedDetail = (await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(historicalSessionId))).json()).quote_session;
+    const savedDetail = (await (await browserBoundary.get(api, baseUrl + "/api/quote-sessions/" + encodeURIComponent(historicalSessionId))).json()).quote_session;
     const savedShape = historicalShape(savedDetail?.draft_state);
     assert(savedShape.variants.every((variant) => variant === "historical") && savedShape.offered.every((count) => count > 0) && savedShape.receiptFields === 0, "saved HISTORICAL quote shape", savedShape);
     // The server ledger tracks the saved rows; the browser only echoes their revisions back.
@@ -690,7 +693,7 @@ try {
       const deadline = Date.now() + 60000;
       let terminal;
       while (Date.now() < deadline) {
-        terminal = await (await api.get(baseUrl + "/api/jobs/" + encodeURIComponent(accepted.id))).json();
+        terminal = await (await browserBoundary.get(api, baseUrl + "/api/jobs/" + encodeURIComponent(accepted.id))).json();
         if (["completed", "failed", "needs_review"].includes(terminal.status)) break;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
@@ -712,9 +715,9 @@ try {
     const download = await downloadPromise;
     const xlsxPath = path.join(dirs.downloads, "owner-uat.xlsx");
     await download.saveAs(xlsxPath);
-    const detail = await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(sessionId))).json();
+    const detail = await (await browserBoundary.get(api, baseUrl + "/api/quote-sessions/" + encodeURIComponent(sessionId))).json();
     assert(detail.quote_session?.exports?.xlsx?.exists === true && detail.quote_session.exports.xlsx.stale === false, "protected XLSX export not current", detail.quote_session?.exports);
-    const protectedBytes = await (await api.get(new URL(detail.quote_session.exports.xlsx.url, baseUrl).toString())).body();
+    const protectedBytes = await (await browserBoundary.get(api, new URL(detail.quote_session.exports.xlsx.url, baseUrl).toString())).body();
     assert(protectedBytes.equals(await fs.readFile(xlsxPath)), "protected XLSX differs from the UI download");
     if (resumeExport) {
       const metadata = JSON.parse(await fs.readFile(path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json"), "utf8"));
@@ -816,6 +819,7 @@ try {
         "malformed-authority-items", "missing-selected-item", "duplicate-selected-item",
         "invalid-item-price", "changed-item-price", "changed-item-unit", "changed-item-description", "changed-item-section"];
       for (const fault of profileRecoveryFaults) {
+        const outageDiagnosticStarted = performance.now();
         const storageBeforeOutage = await page.evaluate(() => ({
           quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
           workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
@@ -860,6 +864,15 @@ try {
           workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
           restoredRows: state.outputRows.length,
         }));
+        (result.profileOutageDiagnostics ||= []).push({
+          fault, stage: "before-recovery-assertions", profilesRejected,
+          quoteStorageUnchanged: outage.quote === storageBeforeOutage.quote,
+          workspaceStorageUnchanged: outage.workspace === storageBeforeOutage.workspace,
+          restoredRows: outage.restoredRows, noRowsRestored: outage.restoredRows === 0,
+          durableMetadataUnchanged: await fs.readFile(targetPath, "utf8") === metadataBeforeOutage,
+          elapsedMs: performance.now() - outageDiagnosticStarted,
+        });
+        await writeJson("result.json", result);
         assert(profilesRejected && outage.quote === storageBeforeOutage.quote
           && outage.workspace === storageBeforeOutage.workspace && outage.restoredRows === 0,
         "reference outage rewrote saved pricing or admitted rows without the catalogue: " + fault);
@@ -880,9 +893,9 @@ try {
       await page.locator("#sideDownloadButton").click();
       const copiedPath = path.join(dirs.downloads, "output-reference-selection.xlsx");
       await (await copiedDownload).saveAs(copiedPath);
-      const saved = await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(targetId))).json();
+      const saved = await (await browserBoundary.get(api, baseUrl + "/api/quote-sessions/" + encodeURIComponent(targetId))).json();
       assert(saved.quote_session?.exports?.xlsx?.exists && saved.quote_session.exports.xlsx.stale === false, "target XLSX not current");
-      const bytes = await (await api.get(new URL(saved.quote_session.exports.xlsx.url, baseUrl).toString())).body();
+      const bytes = await (await browserBoundary.get(api, new URL(saved.quote_session.exports.xlsx.url, baseUrl).toString())).body();
       assert(bytes.length > 1000 && bytes.subarray(0, 2).toString() === "PK" && bytes.equals(await fs.readFile(copiedPath)),
         "target protected XLSX differs from the downloaded workbook");
       assert(await fs.readFile(originalPath, "utf8") === originalMetadata, "target selection/export changed the original quote");
@@ -948,6 +961,7 @@ try {
     result.status = "PASS";
   }
   assert(pageErrors.length === 0, "page errors", pageErrors);
+  browserBoundary.assertClean();
   await writeJson("result.json", result);
   console.log(JSON.stringify(result, null, 2));
 } catch (error) {
@@ -971,4 +985,5 @@ try {
   exportPollGate?.release?.();
   if (browser) await browser.close().catch(() => {});
   if (server?.child && server.child.exitCode === null) server.child.kill();
+  browserBoundary?.assertClean();
 }

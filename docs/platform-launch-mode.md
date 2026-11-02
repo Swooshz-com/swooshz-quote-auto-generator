@@ -2,8 +2,8 @@
 
 This runbook covers the final SQAG-side adapter boundary for Swooshz Platform
 launch handoff. Select it explicitly with `SQAG_AUTH_MODE=platform`. The
-temporary `internal_google` lane is mutually exclusive and documented in
-`docs/internal-google-auth-mode.md`.
+temporary `internal_password` lane is mutually exclusive and documented in
+`docs/internal-password-auth-mode.md`.
 
 ## Boundary
 

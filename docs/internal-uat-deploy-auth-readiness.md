@@ -1,24 +1,13 @@
 # Internal UAT Deploy/Auth Readiness
 
-## 2026-07-24 authentication-mode update
+## Staff access and inference
 
-Deploy authentication is now selected explicitly with `SQAG_AUTH_MODE`.
-`platform` retains the final Platform architecture; `internal_google` enables
-the temporary private exact-allowlist alpha lane; `local` is rejected in
-deploy mode. Missing, unknown, mixed, or incomplete modes fail closed.
-
-The complete temporary OIDC, admission, session, logout, and readiness contract
-is canonical in `docs/internal-google-auth-mode.md`. Where older sections below
-describe Platform as the only deploy-capable mode, read them as the Platform
-branch of the explicit selector. Legacy `AUTH_ALLOWED_*` settings remain local
-component-test inputs and are forbidden in `internal_google`.
-
-Temporary internal admission uses only `SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON`
-plus one fixed `SQAG_INTERNAL_WORKSPACE_ID`. Each bounded record binds an exact
-Google subject to one canonical email and one `admin` or `operator` role. The
-former `SQAG_INTERNAL_ALLOWED_EMAILS`, `SQAG_INTERNAL_ADMIN_EMAILS`, and
-`SQAG_INTERNAL_OPERATOR_EMAILS` variables are rejected, including mixed
-configuration. Real subject enrolment is separately authorised provider work.
+`SQAG_AUTH_MODE=internal_password` is the temporary private, single-instance
+staff boundary. The complete configuration, group-password trust model, stable
+ownership, CSRF, rate limits, session revocation and retained independent modes
+are in [staff access](internal-password-auth-mode.md). All inference uses the
+[explicit gateway contract](ai-gateway.md). Real values and cutover remain
+separately approved host operations.
 
 ## Purpose
 
@@ -42,7 +31,7 @@ The deploy/auth surface is already represented in `.env.example` and
 - `APP_MODE=deploy`: gated deploy mode. The server defaults to a deploy bind
   host and `AUTH_REQUIRED=true`.
 - `SQAG_AUTH_MODE`: explicit deploy selector: `platform`,
-  `internal_google`, or local-only `local`.
+  `internal_password`, or local-only `local`.
 - `AUTH_REQUIRED`: explicit auth gate toggle. In deploy mode, leaving this
   unset still defaults to auth required. Setting it to `false` is treated as an
   incomplete auth boundary and must not be used for hosted UAT.
@@ -82,11 +71,10 @@ The deploy/auth surface is already represented in `.env.example` and
   screenshots, reports, or chat. `SQAG_PLATFORM_REQUEST_TIMEOUT_SECONDS` is an
   optional bounded, non-secret timeout. Platform deploy mode keeps the fixed
   production origins; loopback flexibility is local-mode only.
-- For `SQAG_AUTH_MODE=internal_google`, `SQAG_PLATFORM_LAUNCH_MODE` must be
+- For `SQAG_AUTH_MODE=internal_password`, `SQAG_PLATFORM_LAUNCH_MODE` must be
   `disabled`, and `SQAG_PUBLIC_BASE_URL` must be the one dedicated
   host-configured internal-alpha HTTPS origin. It must be origin-only and
-  distinct from the production SQAG origin; `OIDC_REDIRECT_URI` must equal
-  `<SQAG_PUBLIC_BASE_URL>/callback`. The exact configured hostname is the only
+  distinct from the production SQAG origin. The exact configured hostname is the only
   accepted deploy `Host` value.
 - `SQAG_TRUSTED_PROXY_CIDRS`: mandatory deploy-mode comma-separated CIDRs for
   only the reverse-proxy peers that connect directly to SQAG. SQAG accepts a
@@ -113,7 +101,7 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
   incomplete.
 - The Platform deploy path refuses to start without a complete Swooshz Platform
   launch boundary because database and object-storage records require the
-  consumed Platform workspace identity. The internal-Google path is separate:
+  consumed Platform workspace identity. The internal-password path is separate:
   it uses the fixed configured internal workspace and does not convert
   standalone OIDC claims into Platform membership or entitlement.
 - Deploy preflight, startup, Platform launch, and protected request handling
@@ -133,10 +121,10 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
 - In local OIDC component mode, `/login` redirects to `OIDC_AUTHORIZE_URL` with the configured client,
   redirect URI, response type, scope, and signed state when the auth boundary
   is complete.
-- In `internal_google`, `/callback` validates one-time state, nonce, S256 PKCE,
-  the maintained-library verified ID token, exact issuer/audience, verified
-  email, and the configured subject/email identity record before creating a
-  session. Unknown or reassigned subjects fail before session creation.
+- In `internal_password`, the same-origin form POST consumes a browser-bound
+  nonce and checks the shared group password against the exact selected alias.
+  The old internal provider callback is unavailable. See the canonical staff
+  access contract for stable bindings and credential/policy invalidation.
 - Provider tokens, raw provider responses, authorization codes,
   `OIDC_CLIENT_SECRET`, and `SESSION_SECRET` must not be printed or returned.
 - In-memory jobs are acceptable for local mode and a first single-instance UAT
@@ -179,7 +167,7 @@ toolkit/infrastructure workflow, not this repo.
 
 Before a VPS or live OIDC provider exists, use
 `docs/internal-uat-login-and-pre-vps-dry-run.md` for the approved-tester login
-expectations, offline Coolify env template check, mocked OIDC route coverage,
+expectations, offline Coolify env template check, synthetic password and independent Platform route coverage,
 and safe synthetic deploy preflight.
 
 ## Explicitly Not Ready

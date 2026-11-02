@@ -3,7 +3,7 @@ import io
 import json
 import shutil
 import sys
-import time
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,7 +42,7 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
             "private-code",
             "private-state",
         }
-        work_dir = test_temp_root() / f"internal-alpha-hosted-validation-{time.time_ns()}"
+        work_dir = Path(tempfile.mkdtemp(prefix="iav-", dir=test_temp_root()))
         self.addCleanup(lambda: shutil.rmtree(work_dir, ignore_errors=True))
 
         report = verifier.run_verification(work_dir=work_dir)
@@ -79,7 +79,7 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
             self.assertNotIn(value, text)
 
     def test_cli_output_is_json_metadata_only(self):
-        work_dir = test_temp_root() / f"internal-alpha-hosted-validation-cli-{time.time_ns()}"
+        work_dir = Path(tempfile.mkdtemp(prefix="iav-", dir=test_temp_root()))
         self.addCleanup(lambda: shutil.rmtree(work_dir, ignore_errors=True))
 
         stdout = io.StringIO()

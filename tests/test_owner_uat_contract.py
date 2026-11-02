@@ -1,6 +1,9 @@
 """Owner UAT regressions across UI actions and trusted pricing/export boundaries."""
 import copy
 import json
+import os
+from pathlib import Path
+from tests.rendered_browser_support import owned_browser_evidence_directory
 import subprocess
 import unittest
 import zipfile
@@ -66,13 +69,16 @@ class OwnerUatContractTest(unittest.TestCase):
                 self.assertNotEqual(admitted[0]['pricing_authority']['price'], 999999)
 
     def test_rendered_selection_fx_reload_and_current_xlsx(self):
-        result = subprocess.run([require_node(self), 'scripts/playwright-smoke.mjs', '--g3-pricing', '--alpha1'],
-            text=True, capture_output=True, cwd=ROOT, timeout=180)
+        with owned_browser_evidence_directory() as evidence_root:
+            result = subprocess.run([require_node(self), 'scripts/playwright-smoke.mjs', '--g3-pricing', '--alpha1'],
+                env={**os.environ, 'SQAG_OWNER_UAT_EVIDENCE_ROOT': evidence_root},
+                text=True, capture_output=True, cwd=ROOT, timeout=180)
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         evidence = json.loads(result.stdout)['analysis']['ownerUat']
         self.assertEqual(evidence['status'], 'FXUI_G3_RENDERED_SERVER_CURRENT_XLSX_PASS')
         self.assertEqual(evidence['providerCalls'], 0)
-        workbook = ROOT / '_logs/browser/playwright-smoke/owner-uat-c17-current.xlsx'
+        workbook = Path(evidence['workbookPath'])
+        self.assertTrue(workbook.resolve().is_relative_to(Path(evidence_root).resolve()))
         ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
         with zipfile.ZipFile(workbook) as archive:
             sheet = ET.fromstring(archive.read('xl/worksheets/sheet1.xml'))

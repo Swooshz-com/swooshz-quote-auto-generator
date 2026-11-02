@@ -23,13 +23,21 @@ git diff --check
 node --check webapp\static\app.js
 python -m py_compile webapp\server.py webapp\postgres_migrations.py scripts\migrate_sqag_storage.py scripts\preflight_sqag_migrations.py scripts\generate_quote.py scripts\live_ai_basis_chat_smoke.py
 python scripts\validate_local_pdf_dependency_usage.py
-python -m unittest tests.test_internal_google_auth tests.test_internal_google_auth_webapp
+python -m unittest tests.test_internal_password_auth tests.test_internal_password_auth_webapp
 python -m unittest discover -s tests
 npm run playwright:ai-stress
 npm run playwright:smoke
 ```
 
 ## Feature Coverage Guide
+
+- Synthetic hosted-validation verifier: Run
+  `python -m unittest tests.test_internal_alpha_hosted_validation_verifier`.
+  Keep each fixture in a unique short `iav-` temporary directory under the
+  existing owned test root, so nested verifier run directories do not exhaust
+  Windows path capacity. Retain the metadata-only output assertions, blocked
+  readiness checks and registered cleanup. These checks use synthetic local
+  services and do not establish live hosted readiness.
 
 - Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.
 - Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
@@ -130,6 +138,9 @@ npm run playwright:smoke
   `tests.test_webapp.GenerationDiagnosticReadFailureTest`,
   `tests.test_generate_quote.GeneratorDiagnosticIdentityTest`,
   `tests.test_quote_flow_reliability` and `tests.test_owner_uat_contract`.
+  The generation-output harness builds immutable production source once per
+  invocation and evaluates it in a fresh VM for each case. Preserve all nine
+  tests, their assertions and matrices, and the 30-second subprocess limit.
   Duplicate must preserve current Output edits/subsets independently of its Reset
   snapshot, strip source-bound seals/catalogue claims, and obtain target grants
   only through explicit selection/Confirm. Cover save/reopen, manual FX,
@@ -170,8 +181,8 @@ npm run playwright:smoke
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret
-  handling: run `tests.test_internal_google_auth`,
-  `tests.test_internal_google_auth_webapp`, focused Platform/session tests, and
+  handling: run `tests.test_internal_password_auth`,
+  `tests.test_internal_password_auth_webapp`, focused Platform/session tests, and
   then the full unit and Playwright suites. Internal identity changes must cover
   strict bounded JSON parsing, bidirectional subject/email substitution,
   role/workspace changes, policy fingerprinting, restart, route denial without
@@ -188,6 +199,11 @@ npm run playwright:smoke
   refusal of missing, duplicate, unvalidated, drifted, premature, and stale
   attempt constraints on disposable PostgreSQL 17. Never point this CI test
   at a provider or production database.
+
+- Browser harness startup and cleanup: run `python -m unittest tests.test_smoke_harness_lifecycle tests.test_alpha1_harness_lifecycle`. Preserve non-zero startup failures, handle already-exited children, and register exit listeners before signalling. Synthetic browser login must use its actual loopback origin; generated carriers must resolve shared helper imports from the maintained source.
+- Missing AI pricing import configuration: run the Markdown missing-configuration test in `tests.test_webapp` and `tests.test_pricing_import_telemetry`. Assert zero sends, unsaved/non-saveable state, a configuration-required review layout, and matching support references. Keep transport, refusal and invalid-output negative controls distinct.
+
+- AI operation lifetime: run `tests.test_gateway_operation_lifecycle` with the gateway, telemetry and import suites. Cover all six routes, missing/malformed configuration and credentials, success, refusal, response shape and JSON failures, logger exceptions, nested same-feature parents, concurrent threads, and immutable metadata batches. Keep exactly one terminal record per actual send and canonical zero-send validation. The G3 metadata fixture must admit source-backed synthetic metadata through real gateway admission while rejecting other operations and external network access.
 
 - AI telemetry attempt numbering, pre-transport validation, provider fallback,
   or model privacy: run `tests.test_telemetry_producer`,
@@ -344,9 +360,10 @@ Supplied arrays, objects and rows must have supported shapes, with no silent
 material row removal. JSON admission accepts one bounded object and rejects
 duplicate keys, array wrappers, extra objects and nested nonfinite numbers. Keep
 the demonstrated fenced/trailing-prose chat consumer until its response contract
-is explicitly changed. All OpenAI adapters share shape/completion/refusal checks;
-DeepSeek adapters enforce their existing completion finish reason. Routing,
-transport retries and support-operation provider failover remain unchanged.
+is explicitly changed. All six maintained gateway callers share shape/completion/refusal checks.
+The retained legacy envelope parser tests cover historical consumers only.
+Full analysis and pricing calls send once; text retries stay on the captured
+route and never switch model, provider or response parser.
 Confidence supplied by a fresh response is an integer from 0 to 100, including
 0 and 1; fractions, percent strings and conflicting aliases reject. Saved/user
 confidence and commercial-number normalisers remain compatible with their existing
@@ -382,63 +399,68 @@ classes. Prompt text, filenames, media/base64, private identifiers/URLs, model
 configuration values, credentials, headers, and raw provider bodies are excluded.
 The fingerprint is not evidence of historical failure causation.
 
-The final assembled Responses envelope enforces OpenAI's combined `input_file` limit using decoded file bytes and a deterministic decimal ceiling of 50,000,000 bytes, in addition to per-file and envelope-size validation. Contract tests cover the accepted five-PDF reproducer and below/exact/above aggregate boundaries before mocked transport. The same final boundary validates bounded syntax and exact equality to the captured full-draft model and reasoning settings. It does not keep a model registry or model-specific effort list. The requested runtime settings are `gpt-6.1-sol/high` for Normal Analyse and `gpt-6-astra/high` for High Quality; they are configuration examples, not source defaults.
+The final assembled Responses envelope enforces the application's combined
+`input_file` ceiling of 50,000,000 decoded bytes, alongside per-file and
+whole-envelope bounds. Retain the five-PDF control and below/exact/above aggregate
+boundaries. Original PDFs, rendered pages and catalogue visuals keep their order,
+detail levels and independent budgets; draft rendering keeps no debug images.
 
-Reasoning configuration is fail-closed at that final boundary. Normal Analyse reads
-`OPENAI_DRAFT_MODEL` and `OPENAI_DRAFT_REASONING_EFFORT`; High Quality reads
-`OPENAI_DRAFT_HIGH_QUALITY_MODEL` and
-`OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Each selected mode requires both
-explicit settings. Missing, empty, whitespace-only or malformed values,
-and assembled/configured mismatches reject with
-`failure_boundary=request_validation`, `attempt_number=0`, and zero sends.
-There are no source defaults or cross-mode fallbacks for full Analyse.
-Model IDs admit 1-200 ASCII letters/digits and `._:/-`, starting with a letter
-or digit. After the existing trim/whitespace/lowercase normalisation, effort
-identifiers admit 1-64 ASCII letters/digits and `_-`, starting with a letter.
-Unknown syntactically valid model IDs and efforts reach Responses unchanged.
-The provider decides access, reasoning compatibility and image/PDF capability;
-accepting an identifier does not promise those capabilities.
-[GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
-and the [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
-document the requested High Quality pair. There is no automatic discovery,
-provider retry, model substitution or effort downgrade for full Analyse.
-High Quality aliases retain their existing mode semantics. Reader tests cover missing,
-empty, whitespace, dotenv, and process-override values using mocked
-dotenv access. Each operation captures one immutable mode/model/effort snapshot
-for its assembled request, final validator and telemetry. A mid-prompt setting
-change must not alter the captured pair, trigger a false mismatch or misreport
-the sent model. A later operation must observe changed settings. Final-envelope
-tests cover arbitrary/future model and effort identifiers in both modes,
-malformed configured/body efforts, configured/body mismatch, invalid explicit
-models, and model mismatch;
-`draft_quote_basis` must propagate request validation without local starter
-fallback. A six-page synthetic PDF exercises the valid High Quality
-`gpt-6-astra/high` configuration through real local PDF rendering and mocked
-transport, preserving the original PDF and retaining no debug images. Support
-operations keep their existing route-specific defaults and validation. Run the focused oracle with
-`python -m unittest tests.test_openai_draft_request_contract`.
+All six operation routes require explicit namespaced model, reasoning effort and
+single downstream endpoint settings described in [the gateway contract](ai-gateway.md).
+There are no model defaults or cross-route substitutions. Reasoning must match
+one of the seven supported values exactly, without trimming or case changes.
+Test each accepted effort and shape-valid unknown values on every route. Missing,
+empty, malformed or unsupported settings and assembled/configured mismatches
+reject with `failure_boundary=request_validation`, `attempt_number=0` and zero
+sends. Missing-key tests remove their own setting; fixtures must not refill it.
 
-OpenAI support-operation model readers apply route defaults only to absent or blank
-values; full Analyse requires explicit per-mode settings and has no source defaults.
-In deployed mode, full Analyse reads process environment values only, so missing or
-blank Coolify settings cannot fall through to a local `.env`. Local development
-retains `.env` support. Tests poison the dotenv reader to prove this distinction.
-Full Analyse accepts operator-configured model/effort identifiers without source
-registration, and ignores attempted client overrides. Exercise malformed values
-through Normal and High Quality full-draft construction. Support operations keep
-their existing strict route model checks: exercise `!!!` and unsupported
-`gpt-6-sol` through selected-line and answer basis-chat dispatch, and OpenAI
-pricing import and metadata requests. Each invalid configuration must report
-`failure_boundary=request_validation`, `attempt_number=0`, and zero provider
-sends. A basis-chat request-validation failure is terminal; it must not fall
-through from an invalid answer route to a valid selected-line model. Provider,
-runtime, and model-output fallback tests must continue to prove the existing
-alternate-provider behavior. Syntactically valid configurations rejected by the
-provider must make one send, return the protected sanitised error reference, and
-never fall back to another model/effort. Arbitrary configuration canaries must
-not survive log projection, telemetry, generation-evidence compaction or the
-structural request hash. Only the fixed support-route model retains a public
-OpenAI diagnostic label; configurable full-Analyse labels are redacted.
+Deploy configuration comes from process settings only. Poison the dotenv reader
+to prove that missing Coolify settings cannot fall through to a local file.
+Local development keeps its explicit dotenv source. Complete synthetic fixtures
+provide all six routes, even when a test exercises just one. Every operation
+captures an immutable configuration for request, retries, metadata batches and
+telemetry. Change settings mid-prompt and between operations to prove snapshot
+stability and later refresh. Client model/effort overrides have no effect.
+
+Use explicit completed, incomplete, refused, malformed and mismatched-model
+Responses fixtures. Do not repair envelopes or insert missing model/status fields
+at test runtime. Mock only the actual bounded transport's opener, retaining the
+socket denial backstop. A six-page synthetic PDF covers High Quality through real
+local rendering and mocked transport. Gateway admission is followed by the same
+JSON, confidence, quantity, row identity and pricing-authority validators.
+
+Full analysis and pricing failures have a one-send budget. Text calls may retry
+only the existing bounded transient failures on the same captured route; partial
+output, refusal and auth/payment/permission failures never replay. Preserve safe
+HTTP parameter/class/code controls, privacy canaries, usage availability, retry
+lineage and exactly one terminal record per actual send. Provider contract,
+response shape, JSON, HTTP and transport failures remain separately identifiable.
+Unknown configured model labels stay out of logs and forensic derivations;
+closed historical public telemetry labels retain their existing positive tests.
+
+Pricing-import telemetry checks in `tests.test_pricing_import_telemetry` use the
+actual bounded opener for success, configuration rejection, HTTP/connection,
+refusal and malformed JSON paths. Preserve one send-terminal record per actual
+send, distinct zero-send validation, matching import run/stage identifiers,
+truthful usage and phase timings, and separate uploaded-filename response checks
+from filename/provider-content exclusion in logs.
+
+`tests.test_alpha1_harness_lifecycle` exercises the real harness main function in
+an isolated child with a fake server. Normal return closes once and exits zero;
+a serving exception closes once and retains its exception and nonzero exit.
+
+The loaded-browser fixture uses `tests/gateway_browser_harness.py` to inject a
+loopback-only opener into the actual bounded transport. It accepts only its
+literal synthetic credential and fixed local fixture endpoint. Production retains
+the fixed HTTPS gateway URL. Preserve the three real server-backed selected-line
+proposals, pricing authority and current XLSX assertions in that browser flow.
+
+Login source checks include `GET /login` issuance limits before nonce allocation,
+a separate POST password-attempt budget, trusted client resolution and no
+allocation on rate denial. Login access logs contain only the canonical `/login`
+route for query keys/values, fragments, absolute-form userinfo/authority and initial
+double-slash request targets. Exercise both pure projection and the actual local
+HTTP handler, while retaining unrelated route logging behaviour.
 
 Contract coverage includes exact Responses field sets, invalid envelopes, whole
 request rejection, one-send failures, privacy canaries, and N-1/N/N+1 boundaries
@@ -482,6 +504,27 @@ owner UAT.
 
 
 ## Current quotation links and completed jobs
+
+Atomic text writes use short temporary basenames in the destination directory.
+Run the two `test_atomic_text_*` cases in `tests.test_quote_publication_projection`
+for real-filesystem old-helper versus revised-helper path growth and replacement
+failure preservation. The regression accepts an old-helper success on hosts
+that support its longer path, and always checks revised-helper success and
+bounded temporary names. Path-length qualification on the affected host requires
+actual old-helper failure and revised-helper success; a contrary result blocks
+that qualification. Retain the existing local publication staging, rollback and transaction
+checks, and the rendered source-provenance XLSX download regression. Temporary
+creation permissions, UTF8 bytes, flush/fsync, replacement and cleanup remain part
+of the atomic-write contract.
+
+Local unpublished publication directories use an independent short random name
+ending in `.staging`. The publication-projection regressions cover bounded
+same-parent staging of both exports and nonempty draft files, unchanged final
+publication identity, exclusive collisions and copy-failure rollback preserving
+prior metadata and bytes. Retain the controlled long-parent filesystem comparison
+and the original rendered quote save/reload/XLSX check for the admitted Windows
+environment. Temporary names keep their existing permissions and transaction
+tracking; final publication paths, metadata and links retain their existing format.
 
 Run `python -m unittest tests.test_quote_publication_projection tests.test_object_pdf_completion`
 for current publication eligibility, saved/list/job/resume projections and protected

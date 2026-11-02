@@ -1198,30 +1198,33 @@ class Pr140RegressionTest(unittest.TestCase):
         )
 
     def test_retention_worker_masks_unexpected_storage_errors(self):
-        args = mock.Mock(
-            apply=True,
-            dry_run=False,
-            database_url="sqlite:///synthetic",
-            use_configured_database=False,
-            now=None,
-            batch_size=1,
-            workspace_id="workspace-a",
-        )
-        output = io.StringIO()
-        with (
-            mock.patch.object(enforce_forensic_retention, "parse_args", return_value=args),
-            mock.patch.object(
-                webapp.DatabaseSqagStorage,
-                "ensure_ready",
-                side_effect=RuntimeError("private-provider-marker"),
-            ),
-            contextlib.redirect_stdout(output),
-        ):
-            result = enforce_forensic_retention.main()
-        rendered = output.getvalue()
-        self.assertEqual(result, 1)
-        self.assertIn("retention_storage_unavailable", rendered)
-        self.assertNotIn("private-provider-marker", rendered)
+        with tempfile.TemporaryDirectory(prefix="sqag-retention-error-") as temporary:
+            database_path = Path(temporary) / "retention.sqlite3"
+            args = mock.Mock(
+                apply=True,
+                dry_run=False,
+                database_url="sqlite:///" + database_path.as_posix(),
+                use_configured_database=False,
+                now=None,
+                batch_size=1,
+                workspace_id="workspace-a",
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(enforce_forensic_retention, "parse_args", return_value=args),
+                mock.patch.object(
+                    webapp.DatabaseSqagStorage,
+                    "ensure_retention_ready",
+                    side_effect=RuntimeError("private-provider-marker"),
+                ) as ensure_ready,
+                contextlib.redirect_stdout(output),
+            ):
+                result = enforce_forensic_retention.main()
+            ensure_ready.assert_called_once_with()
+            rendered = output.getvalue()
+            self.assertEqual(result, 1)
+            self.assertIn("retention_storage_unavailable", rendered)
+            self.assertNotIn("private-provider-marker", rendered)
 
     def test_late_sibling_run_aborts_retention_before_artifact_deletion(self):
         store = self.store()
