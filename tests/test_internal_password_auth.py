@@ -100,6 +100,30 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
         self.assertNotIn(selected.credential_digest.hex(), repr(selected))
         self.assertNotIn(selected.credential_salt.hex(), repr(selected))
 
+    def test_configuration_validation_keeps_all_bounds_without_a_kdf(self):
+        values = policy_values()
+        changes = [
+            {"workspace_id": None}, {"workspace_id": "bad workspace"},
+            {"allowed_emails": None}, {"allowed_emails": email() + ";"},
+            {"allowed_emails": email() + ";" + email().upper()},
+            {"bindings_json": "[NaN]"}, {"bindings_json": "[]"},
+            {"bindings_json": values["bindings_json"].replace('"admin"', '"owner"')},
+            {"password": None}, {"password": "short"}, {"password": "x" * 1025},
+            {"password": "bad\npassword-value"}, {"password": "bad\ud800password-value"},
+            {"password": "\u00e9" * 5}, {"password": "\u00e9" * 513},
+            {"salt_key": None}, {"salt_key": "invalid-key-type"}, {"salt_key": b"x" * 31},
+        ]
+        with mock.patch.object(auth.hashlib, "pbkdf2_hmac", side_effect=AssertionError("KDF must not run")) as derive:
+            auth.InternalAuthPolicy.validate_values(**values)
+            for change in changes:
+                for reader in (auth.InternalAuthPolicy.validate_values, auth.InternalAuthPolicy.from_values):
+                    with self.subTest(field=next(iter(change)), reader=reader.__name__), self.assertRaises(auth.InternalAuthConfigError):
+                        reader(**(values | change))
+            derive.assert_not_called()
+        with mock.patch.object(auth.InternalAuthPolicy, "validate_values", wraps=auth.InternalAuthPolicy.validate_values) as validate:
+            policy()
+            validate.assert_called_once_with(**values)
+
     def test_password_kdf_and_comparison_cover_every_login_outcome(self):
         selected = policy()
         cases = [(email(), policy_values()["password"], True),

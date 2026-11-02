@@ -2004,8 +2004,8 @@ def internal_password_mode_enabled() -> bool:
     return configured_auth_mode() == INTERNAL_AUTH_MODE
 
 
-def internal_auth_policy() -> InternalAuthPolicy:
-    return InternalAuthPolicy.from_values(
+def internal_auth_policy_values() -> dict[str, Any]:
+    return dict(
         workspace_id=read_dotenv_value(INTERNAL_WORKSPACE_ID_ENV_NAME),
         allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
         bindings_json=read_dotenv_value(INTERNAL_IDENTITY_BINDINGS_ENV_NAME),
@@ -2014,9 +2014,13 @@ def internal_auth_policy() -> InternalAuthPolicy:
     )
 
 
+def internal_auth_policy() -> InternalAuthPolicy:
+    return InternalAuthPolicy.from_values(**internal_auth_policy_values())
+
+
 def internal_auth_policy_config_complete() -> bool:
     try:
-        internal_auth_policy()
+        InternalAuthPolicy.validate_values(**internal_auth_policy_values())
     except InternalAuthConfigError:
         return False
     return True

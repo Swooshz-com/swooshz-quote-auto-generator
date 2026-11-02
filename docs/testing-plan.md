@@ -36,7 +36,10 @@ npm run playwright:smoke
   Keep each fixture in a unique short `iav-` temporary directory under the
   existing owned test root, so nested verifier run directories do not exhaust
   Windows path capacity. Retain the metadata-only output assertions, blocked
-  readiness checks and registered cleanup. These checks use synthetic local
+  readiness checks and registered cleanup. Configuration metadata must include
+  the current server auth variable names and classify staff aliases, identity
+  bindings, the login password and the signing secret as host-secret-manager-only;
+  no values are emitted. These checks use synthetic local
   services and do not establish live hosted readiness.
 
 - Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.

@@ -10,6 +10,7 @@ import unittest
 import urllib.parse
 from unittest import mock
 from webapp import server as webapp
+from webapp import internal_password_auth as auth
 from tests.test_internal_password_auth import email, policy_values
 
 ORIGIN = "https://internal-alpha.example.test"
@@ -89,7 +90,9 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
 
     def test_A07_A08_A12_guards_precede_verification(self):
         verify=mock.Mock(side_effect=AssertionError("credential verification must not run"))
-        with mock.patch.object(self.server.internal_auth,"authenticate",verify):
+        with mock.patch.object(self.server.internal_auth,"authenticate",verify), mock.patch.object(
+            auth.hashlib, "pbkdf2_hmac", side_effect=AssertionError("credential derivation must not run")
+        ) as derive:
             for headers,body in [({},""),({"Origin":"https://other.example.test"},""),({"Origin":ORIGIN,"Content-Type":"application/json"},"{}"),({"Origin":ORIGIN,"Content-Type":"application/x-www-form-urlencoded"},"email=x&email=y&password=z&nonce=n"),({"Origin":ORIGIN,"Content-Type":"application/x-www-form-urlencoded"},"nonce=bad&email=x&password=z")]:
                 with self.subTest(index=len(body)): self.assertIn(self.http("POST","/login",headers,body)[0],[403,429])
             nonce,cookie=self.start()
@@ -97,6 +100,7 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
             with mock.patch.object(webapp,"is_rate_limited",return_value=True):
                 self.assertEqual(self.http("POST","/login",dict(Origin=ORIGIN,Cookie=cookie,**{"Content-Type":"application/x-www-form-urlencoded"}),body)[0],429)
         verify.assert_not_called()
+        derive.assert_not_called()
         self.assertEqual(self.http("POST","/login",{"Host":"other.example.test"})[0],403)
 
     def test_A06_GET_nonce_rate_limit_precedes_allocation_and_is_separate_from_POST(self):

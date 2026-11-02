@@ -55,9 +55,11 @@ fingerprint; password, signing-secret or identity-policy changes revoke sessions
 No extra credential, salt setting, persistent verifier or package is required.
 The KDF uses the OpenSSL support already required by the pinned Python runtime.
 The work factor follows [OWASP password guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2);
-configuration/session checks also derive the verifier, so qualify request cost on
-the intended single-instance host before cutover. Unknown aliases
-and wrong passwords receive the same generic failure and a support reference.
+configuration guards share the complete bounded validator without deriving a
+credential. Actual login and session-policy checks derive the verifier without a
+cache, so qualify request cost on the intended single-instance host before
+cutover. Unknown aliases and wrong passwords receive the same generic failure
+and a support reference.
 
 The HTTP server owns its nonce and session registries. A successful login rotates
 the prior session; the host-only cookie contains only the mode and opaque session

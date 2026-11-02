@@ -115,6 +115,21 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
             expected = verifier.safe_failure_report(stage)
             self.assertEqual(verifier.public_report_metadata(expected), expected)
 
+    def test_auth_environment_metadata_matches_the_current_server_contract(self):
+        report = verifier.public_report_metadata(self.projected_fixture())
+        names = {
+            verifier.webapp.AUTH_REQUIRED_ENV_NAME, verifier.webapp.AUTH_MODE_ENV_NAME,
+            verifier.webapp.SESSION_SECRET_ENV_NAME, verifier.webapp.INTERNAL_WORKSPACE_ID_ENV_NAME,
+            verifier.webapp.INTERNAL_ALLOWED_EMAILS_ENV_NAME, verifier.webapp.INTERNAL_LOGIN_PASSWORD_ENV_NAME,
+            verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
+        }
+        self.assertTrue(names <= set(report["required_env_names"]))
+        private_names = {
+            verifier.webapp.SESSION_SECRET_ENV_NAME, verifier.webapp.INTERNAL_ALLOWED_EMAILS_ENV_NAME,
+            verifier.webapp.INTERNAL_LOGIN_PASSWORD_ENV_NAME, verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
+        }
+        self.assertTrue(private_names <= set(report["host_secret_manager_only_env_names"]))
+
     def test_cli_projection_refuses_canaries_at_every_string_leaf(self):
         import copy
         canary = "synthetic-private-projection-canary"

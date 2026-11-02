@@ -53,7 +53,7 @@ def strict_object(pairs):
     return result
 
 
-def password_digest(value, *, salt):
+def password_bytes(value):
     if not isinstance(value, str):
         raise InternalAuthConfigError("password_invalid")
     try:
@@ -62,7 +62,11 @@ def password_digest(value, *, salt):
         raise InternalAuthConfigError("password_invalid") from exc
     if not 12 <= len(raw) <= MAX_PASSWORD_BYTES or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise InternalAuthConfigError("password_invalid")
-    return hashlib.pbkdf2_hmac("sha256", raw, salt, PASSWORD_KDF_ITERATIONS, dklen=32)
+    return raw
+
+
+def password_digest(value, *, salt):
+    return hashlib.pbkdf2_hmac("sha256", password_bytes(value), salt, PASSWORD_KDF_ITERATIONS, dklen=32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,7 +84,8 @@ class InternalAuthPolicy:
     credential_salt: bytes = dataclasses.field(repr=False)
 
     @classmethod
-    def from_values(cls, *, workspace_id, allowed_emails, bindings_json, password, salt_key):
+    def validate_values(cls, *, workspace_id, allowed_emails, bindings_json, password, salt_key):
+        """Validate the complete current configuration without deriving a credential."""
         if not isinstance(workspace_id, str) or not WORKSPACE_ID_PATTERN.fullmatch(workspace_id):
             raise InternalAuthConfigError("internal_workspace_invalid")
         if not isinstance(allowed_emails, str):
@@ -133,6 +138,15 @@ class InternalAuthPolicy:
         # Reuse the existing secret's entropy without exposing it as the salt. The
         # purpose/context binding is stable across reloads and alias reordering.
         salt = hmac.digest(salt_key, b"sqag-internal-password-verifier-v1\0" + material, "sha256")
+        password_bytes(password)
+        return identities, material, salt
+
+    @classmethod
+    def from_values(cls, *, workspace_id, allowed_emails, bindings_json, password, salt_key):
+        identities, material, salt = cls.validate_values(
+            workspace_id=workspace_id, allowed_emails=allowed_emails,
+            bindings_json=bindings_json, password=password, salt_key=salt_key,
+        )
         digest = password_digest(password, salt=salt)
         return cls(workspace_id, identities, hashlib.sha256(material + digest).hexdigest(), digest, salt)
 
