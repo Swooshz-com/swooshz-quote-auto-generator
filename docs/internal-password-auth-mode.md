@@ -46,8 +46,17 @@ userinfo, query names/values and fragments, including initial double slashes.
 origin and a short-lived browser-bound nonce. The server consumes the nonce
 atomically, accepts only three bounded form fields, and rate-limits before
 password verification. The initial limit is ten attempts per effective client per
-60 seconds, with bounded shared overflow buckets. The shared credential uses a
-constant-time fixed-size comparison, including unknown aliases. Unknown aliases
+60 seconds, with bounded shared overflow buckets. The shared credential uses
+PBKDF2-HMAC-SHA256 with 600,000 iterations and a 32-byte result before a constant-time fixed-size comparison, including unknown
+aliases and bounded invalid-input dummy checks. The salt is purpose-separated
+with HMAC from the existing `SESSION_SECRET` and canonical workspace/identity
+context. Identical configuration and alias reordering keep the same policy
+fingerprint; password, signing-secret or identity-policy changes revoke sessions.
+No extra credential, salt setting, persistent verifier or package is required.
+The KDF uses the OpenSSL support already required by the pinned Python runtime.
+The work factor follows [OWASP password guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2);
+configuration/session checks also derive the verifier, so qualify request cost on
+the intended single-instance host before cutover. Unknown aliases
 and wrong passwords receive the same generic failure and a support reference.
 
 The HTTP server owns its nonce and session registries. A successful login rotates

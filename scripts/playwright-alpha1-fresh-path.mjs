@@ -1,4 +1,4 @@
-import { signIn } from "./internal-password-browser-test.mjs";
+import { signIn, browserAuthority, assertBrowserAuthorityUnchanged } from "./internal-password-browser-test.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -484,7 +484,7 @@ try {
   const profileResponse = await api.get(baseUrl + "/api/profiles");
   assert(profileResponse.status() === 200, "Authenticated profile lookup failed.");
   const profileData = await profileResponse.json();
-  assert(profileData.workspace?.workspace?.id === "workspace-internal-alpha", "Profile lookup returned a different authenticated workspace.");
+  const initialAuthority = browserAuthority(auth.body, profileData);
   assert(profileData.pricing_references?.some((item) => item.id === fixtureId && item.source === "local"), "Selected local pricing reference is missing.");
   assert(profileData.pricing_references.find(item=>item.id===fixtureId&&item.source==="local")?.label===referenceConfig.label,"Authenticated UI reference label differs from the selected fixture.");
 
@@ -567,7 +567,10 @@ try {
   const createdAuthResponse=await api.get(baseUrl+"/api/session");
   assert(createdAuthResponse.status()===200,"Authenticated session disappeared after fresh quote creation.");
   const createdAuth=await createdAuthResponse.json();
-  assert(createdAuth.authenticated&&createdAuth.user?.account==="workspace-internal-alpha","Authenticated workspace changed after fresh quote creation.");
+  const createdProfilesResponse = await api.get(baseUrl + "/api/profiles");
+  assert(createdProfilesResponse.status() === 200, "Authenticated workspace lookup failed after fresh quote creation.");
+  const createdAuthority = browserAuthority(createdAuth, await createdProfilesResponse.json());
+  assertBrowserAuthorityUnchanged(initialAuthority, createdAuthority);
   await writeJson('customer-checkpoint-proof.json', { checkpoint, protectedDetail: checkpointDetail, status: 'PASS', manualSaveOrStateRepair: false });
   completedChecks.push('customer_next_committed_profile_reference_checkpoint'); phase = 'normal_mock_analysis'; await writeJson('progress.json', {phase,completedChecks});
   // Fresh company-step Next opens the existing Normal Analyse confirmation.

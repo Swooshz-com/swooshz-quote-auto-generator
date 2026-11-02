@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -19,6 +20,7 @@ MAX_LOGIN_NONCES = 1024
 MAX_INTERNAL_IDENTITIES = 100
 MAX_INTERNAL_IDENTITIES_JSON_BYTES = 16 * 1024
 MAX_PASSWORD_BYTES = 1024
+PASSWORD_KDF_ITERATIONS = 600_000
 WORKSPACE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,63}")
 USER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{5,254}")
 EMAIL_PATTERN = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
@@ -51,7 +53,7 @@ def strict_object(pairs):
     return result
 
 
-def password_digest(value):
+def password_digest(value, *, salt):
     if not isinstance(value, str):
         raise InternalAuthConfigError("password_invalid")
     try:
@@ -60,7 +62,7 @@ def password_digest(value):
         raise InternalAuthConfigError("password_invalid") from exc
     if not 12 <= len(raw) <= MAX_PASSWORD_BYTES or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise InternalAuthConfigError("password_invalid")
-    return hashlib.sha256(raw).digest()
+    return hashlib.pbkdf2_hmac("sha256", raw, salt, PASSWORD_KDF_ITERATIONS, dklen=32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,9 +77,10 @@ class InternalAuthPolicy:
     identities: tuple[InternalIdentity, ...]
     fingerprint: str = dataclasses.field(repr=False)
     credential_digest: bytes = dataclasses.field(repr=False)
+    credential_salt: bytes = dataclasses.field(repr=False)
 
     @classmethod
-    def from_values(cls, *, workspace_id, allowed_emails, bindings_json, password):
+    def from_values(cls, *, workspace_id, allowed_emails, bindings_json, password, salt_key):
         if not isinstance(workspace_id, str) or not WORKSPACE_ID_PATTERN.fullmatch(workspace_id):
             raise InternalAuthConfigError("internal_workspace_invalid")
         if not isinstance(allowed_emails, str):
@@ -124,9 +127,14 @@ class InternalAuthPolicy:
         if bound_emails != set(emails):
             raise InternalAuthConfigError("internal_binding_set_mismatch")
         identities = tuple(sorted(identities, key=lambda identity: identity.user_id))
-        digest = password_digest(password)
+        if not isinstance(salt_key, bytes) or len(salt_key) < 32:
+            raise InternalAuthConfigError("password_salt_key_invalid")
         material = json.dumps([workspace_id, [dataclasses.astuple(i) for i in identities]], separators=(",", ":"), ensure_ascii=True).encode()
-        return cls(workspace_id, identities, hashlib.sha256(material + digest).hexdigest(), digest)
+        # Reuse the existing secret's entropy without exposing it as the salt. The
+        # purpose/context binding is stable across reloads and alias reordering.
+        salt = hmac.digest(salt_key, b"sqag-internal-password-verifier-v1\0" + material, "sha256")
+        digest = password_digest(password, salt=salt)
+        return cls(workspace_id, identities, hashlib.sha256(material + digest).hexdigest(), digest, salt)
 
     def identity_for_subject(self, subject):
         return next((i for i in self.identities if i.user_id == subject), None)
@@ -166,10 +174,10 @@ class InternalAuthState:
         # Always perform the fixed-size shared-credential comparison, including unknown aliases.
         valid_password_input = True
         try:
-            supplied = password_digest(password)
+            supplied = password_digest(password, salt=policy.credential_salt)
         except InternalAuthConfigError:
             valid_password_input = False
-            supplied = hashlib.sha256(b"invalid-login-input").digest()
+            supplied = password_digest("invalid-login-input", salt=policy.credential_salt)
         matches = self._verifier(supplied, policy.credential_digest)
         try:
             canonical = canonical_email(email)

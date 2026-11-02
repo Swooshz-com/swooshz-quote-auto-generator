@@ -17,7 +17,8 @@ def policy_values():
     return dict(workspace_id="workspace-internal-alpha", allowed_emails=email()+";"+email("operator"),
                 bindings_json=json.dumps([dict(user_id="stable-google-subject", email=email(), role="admin"),
                                           dict(user_id="stable-google-operator-subject", email=email("operator"), role="operator")]),
-                password="synthetic-group-password-value")
+                password="synthetic-group-password-value",
+                salt_key=b"synthetic-session-secret-with-enough-entropy")
 
 
 def policy(**changes):
@@ -75,6 +76,64 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
         for password in [None, "", "short", "x"*1025, "bad\npassword"]:
             with self.subTest(kind=type(password).__name__),self.assertRaises(auth.InternalAuthStateError):
                 state.authenticate(email=email(),password=password,policy=selected)
+
+    def test_password_kdf_context_and_reload_matrix(self):
+        selected = policy()
+        self.assertEqual(len(selected.credential_digest), 32)
+        self.assertEqual(len(selected.credential_salt), 32)
+        self.assertEqual(selected.fingerprint, policy().fingerprint)
+        self.assertEqual(selected.credential_salt, policy().credential_salt)
+        for change in ({"password": "rotated-synthetic-password"},
+                       {"salt_key": b"different-synthetic-session-secret-key"},
+                       {"workspace_id": "another-synthetic-workspace"},
+                       {"bindings_json": policy_values()["bindings_json"].replace('"admin"', '"operator"')}):
+            with self.subTest(field=next(iter(change))):
+                changed = policy(**change)
+                self.assertNotEqual(selected.fingerprint, changed.fingerprint)
+                state = auth.InternalAuthState()
+                cookie = state.authenticate(email=email(), password=policy_values()["password"], policy=selected)
+                with self.assertRaises(auth.InternalAuthStateError):
+                    state.validate_session(cookie, policy=changed, current_mode=auth.INTERNAL_AUTH_MODE)
+        for value in (None, b"", b"x" * 31, "invalid-key-type"):
+            with self.subTest(key_type=type(value).__name__), self.assertRaises(auth.InternalAuthConfigError):
+                policy(salt_key=value)
+        self.assertNotIn(selected.credential_digest.hex(), repr(selected))
+        self.assertNotIn(selected.credential_salt.hex(), repr(selected))
+
+    def test_password_kdf_and_comparison_cover_every_login_outcome(self):
+        selected = policy()
+        cases = [(email(), policy_values()["password"], True),
+                 (email("operator"), policy_values()["password"], True),
+                 (email(), "wrong-password-value", False),
+                 (email("unknown"), policy_values()["password"], False),
+                 (None, policy_values()["password"], False),
+                 (email(), None, False), (email(), "", False),
+                 (email(), "x" * 1025, False), (email(), "invalid\npassword", False)]
+        for alias, password, accepted in cases:
+            compare = mock.Mock(wraps=auth.secrets.compare_digest)
+            state = auth.InternalAuthState(verifier=compare)
+            with self.subTest(alias_known=alias == email(), password_type=type(password).__name__), mock.patch.object(
+                auth.hashlib, "pbkdf2_hmac", wraps=auth.hashlib.pbkdf2_hmac
+            ) as derive:
+                if accepted:
+                    state.authenticate(email=alias, password=password, policy=selected)
+                else:
+                    with self.assertRaises(auth.InternalAuthStateError) as caught:
+                        state.authenticate(email=alias, password=password, policy=selected)
+                    self.assertEqual(str(caught.exception), "Authentication could not be completed.")
+                derive.assert_called_once()
+                self.assertEqual(derive.call_args.args[0], "sha256")
+                self.assertEqual(derive.call_args.args[2:], (selected.credential_salt, 600_000))
+                self.assertEqual(derive.call_args.kwargs, {"dklen": 32})
+                compare.assert_called_once()
+                self.assertEqual(tuple(map(len, compare.call_args.args)), (32, 32))
+
+    def test_password_utf8_byte_bounds_and_invalid_encoding(self):
+        for value in ("\u00e9" * 6, "\u00e9" * 512):
+            self.assertEqual(len(policy(password=value).credential_digest), 32)
+        for value in ("\u00e9" * 5, "\u00e9" * 513, "bad\x00password-value", "bad\ud800password-value"):
+            with self.subTest(length=len(value)), self.assertRaises(auth.InternalAuthConfigError):
+                policy(password=value)
 
     def test_A07_A16_nonce_expiry_replay_browser_binding_and_concurrent_consumption(self):
         now = [1000]; state = auth.InternalAuthState(clock=lambda: now[0])

@@ -2842,11 +2842,11 @@ async function verifyRun639PricingAuthorityRestorationAndPresentation(page) {
       }
       if (
         pricingAuthorityVersionIsValid(true)
-        || pricingAuthorityNumber("1Ù¢") !== null
+        || pricingAuthorityNumber("1\u0662") !== null
         || pricingAuthorityNumber("77%") !== null
         || canonicalPricingAuthorityText("a\u001cb") !== "a b"
         || canonicalPricingAuthorityText("a\ufeffb") !== "a b"
-        || canonicalPricingAuthorityText("e\u0301  item") !== "Ã© item"
+        || canonicalPricingAuthorityText("e\u0301  item") !== "\u00e9 item"
       ) {
         throw new Error("Browser authority schema, decimal, or whitespace contract diverged.");
       }

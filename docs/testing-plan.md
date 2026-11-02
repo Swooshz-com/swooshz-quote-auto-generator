@@ -462,6 +462,24 @@ route for query keys/values, fragments, absolute-form userinfo/authority and ini
 double-slash request targets. Exercise both pure projection and the actual local
 HTTP handler, while retaining unrelated route logging behaviour.
 
+Password verification controls retain identical-configuration fingerprints, secret
+and identity-context rotation, UTF-8 byte bounds, and one PBKDF2 derivation plus
+one fixed-length comparison for every valid, incorrect, unknown-alias or invalid
+login input. Run the password policy, actual-HTTP and identity-continuity modules;
+measure representative login and session-check cost without changing timeouts.
+The browser authority controls in `tests.test_browser_smoke_authority` compare
+public opaque recovery scope and authenticated workspace before/after quote
+creation, rejecting changed authority or missing permissions without exposing a
+user record. The browser final-authority test also executes the maintained smoke's
+actual schema/decimal/Unicode/whitespace assertion with each negative control.
+
+The hosted-validation verifier projects successful and failed reports through a
+closed, typed public metadata vocabulary before serialization. Run
+`tests.test_internal_alpha_hosted_validation_verifier` for success, exceptions,
+prohibited markers, unknown keys/types/values and canaries at every string leaf.
+Only reviewed environment names and readiness IDs may leave; values and arbitrary
+exceptions must not appear on stdout.
+
 Contract coverage includes exact Responses field sets, invalid envelopes, whole
 request rejection, one-send failures, privacy canaries, and N-1/N/N+1 boundaries
 for reference/catalog counts, decoded media/derived-image bytes, dimensions,

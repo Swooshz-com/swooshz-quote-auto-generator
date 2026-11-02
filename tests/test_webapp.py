@@ -45678,6 +45678,19 @@ eval([
   "outputRowFxMultiplier",
   "applyPricingAuthorityProjection",
 ].map(extractFunction).join("\n"));
+// Execute the maintained smoke's actual compound assertion, including its UTF-8 fixtures.
+const smokeSource = fs.readFileSync("scripts/playwright-smoke.mjs", "utf8");
+const compound = smokeSource.match(/if \(\s*pricingAuthorityVersionIsValid\(true\)[\s\S]*?throw new Error\("Browser authority schema, decimal, or whitespace contract diverged\."\);\s*\}/);
+assert(compound, "Maintained browser authority assertion is missing");
+const verifySmokeAuthority = new Function("pricingAuthorityVersionIsValid", "pricingAuthorityNumber", "canonicalPricingAuthorityText", compound[0]);
+verifySmokeAuthority(pricingAuthorityVersionIsValid, pricingAuthorityNumber, canonicalPricingAuthorityText);
+for (const altered of [
+  [() => true, pricingAuthorityNumber, canonicalPricingAuthorityText],
+  [pricingAuthorityVersionIsValid, value => value === "1\u0662" ? 12 : pricingAuthorityNumber(value), canonicalPricingAuthorityText],
+  [pricingAuthorityVersionIsValid, value => value === "77%" ? 77 : pricingAuthorityNumber(value), canonicalPricingAuthorityText],
+  ...["a\u001cb", "a\ufeffb", "e\u0301  item"].map(invalid => [pricingAuthorityVersionIsValid, pricingAuthorityNumber, value => value === invalid ? invalid : canonicalPricingAuthorityText(value)]),
+]) assert.throws(() => verifySmokeAuthority(...altered), /Browser authority schema/);
+
 
 assert.strictEqual(pricingAuthorityVersionIsValid(1), true);
 assert.strictEqual(pricingAuthorityVersionIsValid(true), false);

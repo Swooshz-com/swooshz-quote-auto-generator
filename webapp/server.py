@@ -2010,6 +2010,7 @@ def internal_auth_policy() -> InternalAuthPolicy:
         allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
         bindings_json=read_dotenv_value(INTERNAL_IDENTITY_BINDINGS_ENV_NAME),
         password=read_dotenv_value(INTERNAL_LOGIN_PASSWORD_ENV_NAME),
+        salt_key=session_secret().encode("utf-8"),
     )
 
 
