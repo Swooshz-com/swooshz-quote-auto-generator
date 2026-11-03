@@ -1,0 +1,22 @@
+# Application image source: b38dda4f2a39d178e8e930055a27b57bd560f709
+# Coolify supplies the runtime environment file and proxy routing.
+services:
+  quote-internal:
+    image: "sha256:44da23e485b93e0c3ac4c062eb5ba05ef03454b2fa16b69c0c3aa8c21ffd9b66"
+    pull_policy: never
+    platform: linux/amd64
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 2g
+    memswap_limit: 2g
+    mem_reservation: 1g
+    expose:
+      - "8765"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -s -X 'GET' -f 'http://localhost:8765/api/health' > /dev/null || wget -q -O- 'http://localhost:8765/api/health' > /dev/null || exit 1"
+      interval: 10s
+      timeout: 5s
+      start_period: 90s
+      retries: 12
