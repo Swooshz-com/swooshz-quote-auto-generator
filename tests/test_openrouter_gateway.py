@@ -229,3 +229,17 @@ class OpenRouterGatewayTest(unittest.TestCase):
         self.assertEqual(gateway.admitted_usage({"input_tokens":2,"output_tokens":3,"total_tokens":5,"private":"canary"}),{"input_tokens":2,"output_tokens":3,"total_tokens":5})
         for value in [None,[],{}, {"input_tokens":True},{"input_tokens":-1},{"total_tokens":float("inf")},{"total_tokens":"3"},{"input_tokens":2,"output_tokens":3,"total_tokens":4},{"output_tokens":2,"output_tokens_details":{"reasoning_tokens":3}}]:
             with self.subTest(kind=type(value).__name__): self.assertIsNone(gateway.admitted_usage(value))
+
+
+class ReportedResponseCostTest(unittest.TestCase):
+    def test_accepts_only_bounded_nonnegative_numbers_for_the_configured_model(self):
+        model = "openai/gpt-6.1-sol"
+        for cost in (0, 0.125, 2**53 - 1):
+            response = {"model": model, "usage": {"cost": cost}}
+            self.assertEqual(gateway.reported_response_cost_usd(response, model), cost)
+            self.assertIsNone(gateway.reported_response_cost_usd(response, "openai/gpt-6-astra"))
+        for cost in (None, False, True, "0.125", -1, float("nan"), float("inf"), 2**53):
+            with self.subTest(cost=cost):
+                self.assertIsNone(gateway.reported_response_cost_usd(
+                    {"model": model, "usage": {"cost": cost}}, model,
+                ))

@@ -256,6 +256,17 @@ def admitted_usage(value):
     return result or None
 
 
+def reported_response_cost_usd(response, model):
+    """Admit only the optional USD cost for this request's configured model."""
+    if not isinstance(response, dict) or response.get("model") != model:
+        return None
+    usage = response.get("usage")
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    if type(cost) in (int, float) and 0 <= cost <= 2**53 - 1:
+        return cost
+    return None
+
+
 def safe_response_diagnostics(data):
     if not isinstance(data, dict):
         return {}
@@ -361,7 +372,7 @@ class AiGateway:
                     exc.diagnostics.update({key:value for key,value in usage.items() if key != "output_tokens_details"})
                 exc.diagnostics["attempt_number"]=attempt
                 if send_budget is not None:
-                    send_budget.finish(usage)
+                    send_budget.finish(usage, cost_usd=reported_response_cost_usd(data, route.model))
                 if self._telemetry is not None:
                     self._telemetry(operation,attempt,"failed",self._clock()-start,{**exc.diagnostics, "usage":usage, "retry_pending":exc.retryable and attempt<=len(delays)})
                 if exc.retryable and attempt<=len(delays):
@@ -377,7 +388,7 @@ class AiGateway:
                 raise
             usage = admitted_usage(result.get("usage"))
             if send_budget is not None:
-                send_budget.finish(usage)
+                send_budget.finish(usage, cost_usd=reported_response_cost_usd(data, route.model))
             if self._telemetry is not None:
                 self._telemetry(operation,attempt,"success",self._clock()-start,{"usage":usage, "retry_pending":False})
             return result

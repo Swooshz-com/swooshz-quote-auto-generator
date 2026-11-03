@@ -25859,12 +25859,17 @@ class DraftSendBudget:
         self.stage = None
         self.pending_model = model
 
-    def finish(self, usage):
+    def finish(self, usage, *, cost_usd=None):
         totals = self.by_model.setdefault(self.pending_model, {
             "sends": 0, "unknown_usage_attempts": 0,
+            "reported_cost_usd": 0, "unknown_cost_attempts": 0,
             "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
         })
         totals["sends"] += 1
+        if cost_usd is None:
+            totals["unknown_cost_attempts"] += 1
+        else:
+            totals["reported_cost_usd"] += cost_usd
         keys = ("input_tokens", "output_tokens", "total_tokens")
         if usage is None or any(key not in usage for key in keys):
             totals["unknown_usage_attempts"] += 1
@@ -25874,7 +25879,8 @@ class DraftSendBudget:
 
     def summary(self):
         total = {key: sum(row[key] for row in self.by_model.values())
-                 for key in ("sends", "unknown_usage_attempts", "input_tokens", "output_tokens", "total_tokens")}
+                 for key in ("sends", "unknown_usage_attempts", "input_tokens", "output_tokens", "total_tokens",
+                             "reported_cost_usd", "unknown_cost_attempts")}
         # Configured model IDs are private. This draft pins one model to its
         # selected route, so the route identifies the model slot in safe logs.
         return {"provider": AI_PROVIDER_OPENROUTER,
@@ -26070,10 +26076,14 @@ def request_openai_quote_basis(
     if prepared.single_send:
         budget = DraftSendBudget(operation, configuration.model, 0)
         budget.next_stage(synthesis=True)
-        data, shape_fingerprint = send_draft_request(
-            gateway, operation, configuration,
-            [{"type": "input_text", "text": prompt}, *prepared.single_send, *catalog_parts], budget,
-        )
+        try:
+            data, shape_fingerprint = send_draft_request(
+                gateway, operation, configuration,
+                [{"type": "input_text", "text": prompt}, *prepared.single_send, *catalog_parts], budget,
+            )
+        finally:
+            if budget.by_model:
+                write_local_log("draft_batch_usage", budget.summary())
     else:
         data, shape_fingerprint = run_draft_batches(
             prepared, gateway, operation, configuration, prompt, catalog_parts,

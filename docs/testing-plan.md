@@ -49,7 +49,8 @@ npm run playwright:smoke
   requests through the deployed ingress with a synthetic PDF over 16 MiB before
   rollout. Check that a multi-batch analysis includes every source page, a failed
   batch returns a support reference without a draft, and usage distinguishes
-  measured tokens from sends with unavailable usage. Keep this check separate
+  measured tokens and OpenRouter-reported cost from sends with unavailable
+  usage or cost. Keep this check separate
   from customer documents and the live AI provider.
 
 - Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.

@@ -189,7 +189,7 @@ class DraftRequestContractTest(unittest.TestCase):
             if parts[0]["text"].startswith("Inspect each attached visual"):
                 return json_response(
                     body["model"], {"observations": ["Observed scope"] * (len(parts) - 1)},
-                    usage={"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
+                    usage={"input_tokens": 12, "output_tokens": 8, "total_tokens": 20, "cost": 0.125},
                 )
             return json_response(body["model"], {})
         self.send.side_effect = send
@@ -1089,6 +1089,7 @@ class DraftRequestContractTest(unittest.TestCase):
         self.assertEqual(totals["total"], {
             "sends": 4, "unknown_usage_attempts": 1,
             "input_tokens": 36, "output_tokens": 24, "total_tokens": 60,
+            "reported_cost_usd": 0.375, "unknown_cost_attempts": 1,
         })
         self.assertEqual(server.sanitize_log_value(totals)["by_model"],
                          [{"route": "draft", **totals["total"]}])
@@ -1096,6 +1097,49 @@ class DraftRequestContractTest(unittest.TestCase):
         terminal = [call.args[1] for call in log.call_args_list if call.args[0] == "ai_call_attempt"]
         self.assertEqual(len(terminal), 4)
         self.assertEqual([item["status"] for item in terminal], ["success"] * 4)
+
+    def test_failed_batch_accounts_for_reported_cost_and_timeout_is_unknown(self):
+        for terminal, expected_cost, unknown in (
+            (json_response("openai/gpt-6.1-sol", {}, status="incomplete", usage={"cost": 0.125}), 0.125, 0),
+            (TimeoutError(), 0, 1),
+        ):
+            with self.subTest(terminal=type(terminal)):
+                self.send.reset_mock()
+                self.send.side_effect = [terminal]
+                with mock.patch.object(server, "write_local_log", return_value=True) as log:
+                    with self.assertRaises(server.DraftBatchError):
+                        self.capture(self.payload(synthetic_pdf(13)))
+                totals = next(call.args[1]["total"] for call in log.call_args_list
+                              if call.args[0] == "draft_batch_usage")
+                self.assertEqual(totals["sends"], 1)
+                self.assertEqual(totals["reported_cost_usd"], expected_cost)
+                self.assertEqual(totals["unknown_cost_attempts"], unknown)
+                self.send.assert_called_once()
+
+    def test_single_send_reports_zero_cost_even_without_tokens(self):
+        self.send.return_value = json_response("openai/gpt-6.1-sol", {}, usage={"cost": 0})
+        with mock.patch.object(server, "write_local_log", return_value=True) as log:
+            self.capture()
+        totals = next(call.args[1]["total"] for call in log.call_args_list
+                      if call.args[0] == "draft_batch_usage")
+        self.assertEqual(totals["sends"], 1)
+        self.assertEqual(totals["unknown_usage_attempts"], 1)
+        self.assertEqual(totals["reported_cost_usd"], 0)
+        self.assertEqual(totals["unknown_cost_attempts"], 0)
+
+    def test_max_pages_and_seven_byte_limited_images_use_sixteen_sends(self):
+        # Scale the byte ceiling down while preserving the production packing
+        # relationship: six small pages fit and each large image fits alone.
+        page = self.image
+        large_image = "data:image/png;base64," + "A" * (6 * len(page))
+        references = self.payload(synthetic_pdf(48), *([large_image] * 7))["images"]
+        rendered = [{"page": number, "data_url": page} for number in range(1, 49)]
+        with (mock.patch.object(server, "render_pdf_pages_with_pdfium", return_value=rendered),
+              mock.patch.object(server, "MAX_DRAFT_BATCH_MEDIA_CHARS", len(large_image))):
+            prepared = server.prepare_draft_media(references)
+        self.assertEqual([len(batch) for batch in prepared.batches], [6] * 8 + [1] * 7)
+        self.assertEqual(len(prepared.batches) + 1, 16)
+        self.assertLess(len(prepared.batches) + 1, server.MAX_DRAFT_BATCH_CALLS)
 
     def test_preflight_rejects_total_page_cap_and_call_cap_without_sending(self):
         with self.assertRaises(server.DraftBatchError) as error:
