@@ -14713,6 +14713,10 @@ function dashboardSessionProjectNumberText(session = {}) {
   return String(session.customer_summary?.project_number || "").trim();
 }
 
+function dashboardSessionCreatorText(session = {}) {
+  return typeof session.created_by === "string" ? session.created_by || "Unknown" : "";
+}
+
 function dashboardSessionSearchText(session = {}) {
   const shortReference = dashboardShortSessionReference(session);
   return [
@@ -14722,7 +14726,7 @@ function dashboardSessionSearchText(session = {}) {
     dashboardSessionProjectText(session),
     dashboardSessionShowNameText(session),
     dashboardSessionProjectNumberText(session),
-    typeof session.created_by === "string" ? session.created_by : "",
+    dashboardSessionCreatorText(session),
   ].map((value) => String(value || "").toLowerCase()).join(" ");
 }
 
@@ -15635,6 +15639,7 @@ function renderDashboardSinglePanel(activeSession = {}) {
   const status = quoteSessionStatus(activeSession);
   const customer = dashboardSessionCustomerText(activeSession);
   const project = dashboardSessionProjectText(activeSession);
+  const creator = dashboardSessionCreatorText(activeSession);
   const showName = dashboardSessionShowNameText(activeSession);
   const projectNumber = dashboardSessionProjectNumberText(activeSession);
   const profile = activeSession.quote_company_profile?.display_name || "Quote Company";
@@ -15653,7 +15658,7 @@ function renderDashboardSinglePanel(activeSession = {}) {
         <h3 id="dashboardSelectedSessionTitle">${escapeHtml(customer)}</h3>
         <p class="settings-note">${escapeHtml(project)}</p>
         <p class="dashboard-selected-created"><span>Created ${escapeHtml(createdText)}</span><span>Modified ${escapeHtml(modifiedText)}</span></p>
-        ${typeof activeSession.created_by === "string" ? `<p class="settings-note">Created by ${escapeHtml(activeSession.created_by || "Unknown")}</p>` : ""}
+        ${creator ? `<p class="settings-note">Created by ${escapeHtml(creator)}</p>` : ""}
       </div>
       ${dashboardSelectedCloseButton("Clear selected session")}
     </header>

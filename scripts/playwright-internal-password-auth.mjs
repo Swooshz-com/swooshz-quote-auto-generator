@@ -126,6 +126,12 @@ try {
     await cards.filter({ hasText: "Mapped fixture" }).waitFor();
     assert.equal(await cards.count(), 1);
   }
+  for (const creator of ["UNKNOWN", "knoWN"]) {
+    await page.locator("#dashboardSearchInput").fill(creator);
+    await cards.filter({ hasText: "Legacy fixture" }).waitFor();
+    assert.equal(await cards.count(), 1);
+  }
+  assert.equal(await page.evaluate(() => dashboardSessionSearchText({}).includes("unknown")), false);
   await page.locator("#dashboardSearchInput").fill("Legacy fixture");
   await cards.filter({ hasText: "Legacy fixture" }).waitFor();
   assert.equal(await cards.count(), 1);
