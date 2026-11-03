@@ -12,7 +12,7 @@ os.environ["SQAG_DISABLE_DOTENV"] = "1"
 from webapp import server as webapp
 from tests.gateway_test_support import synthetic_configuration
 
-SYNTHETIC_PASSWORD = "synthetic-browser-group-password"
+SYNTHETIC_OPERATOR_PASSWORD = "synthetic-browser-operator-password"
 
 
 def configure_auth_env():
@@ -25,11 +25,13 @@ def configure_auth_env():
         "SQAG_TRACKING_HMAC_KEY":"synthetic-browser-tracking-key", "SQAG_TRACKING_HMAC_KEY_VERSION":"synthetic-v1",
         "SQAG_TRUSTED_PROXY_CIDRS":"127.0.0.1/32", "SQAG_PLATFORM_LAUNCH_MODE":"disabled",
         "SQAG_PUBLIC_BASE_URL":"https://internal-alpha.example.test", "SQAG_INTERNAL_WORKSPACE_ID":"workspace-internal-alpha",
-        "SQAG_INTERNAL_ALLOWED_EMAILS":"alpha-admin"+"@"+"example.test;alpha-operator"+"@"+"example.test",
+        "SQAG_INTERNAL_ALLOWED_EMAILS":"alpha-operator"+"@"+"example.test",
+        "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN":"alpha-admin"+"@"+"example.test",
         "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON":json.dumps([
             {"user_id":"synthetic-browser-subject", "email":"alpha-admin"+"@"+"example.test", "role":"admin"},
             {"user_id":"synthetic-browser-operator-subject", "email":"alpha-operator"+"@"+"example.test", "role":"operator"}]),
-        "SQAG_INTERNAL_LOGIN_PASSWORD":SYNTHETIC_PASSWORD,
+        "SQAG_INTERNAL_LOGIN_PASSWORD":SYNTHETIC_OPERATOR_PASSWORD,
+        "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD":"synthetic-browser-admin-password",
         **synthetic_configuration(),
     })
 

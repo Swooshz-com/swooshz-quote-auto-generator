@@ -14,11 +14,16 @@ def email(name="admin"):
 
 
 def policy_values():
-    return dict(workspace_id="workspace-internal-alpha", allowed_emails=email()+";"+email("operator"),
+    return dict(workspace_id="workspace-internal-alpha", allowed_emails=email("operator"), allowed_admin_emails=email(),
+                admin_password="synthetic-admin-password-value",
                 bindings_json=json.dumps([dict(user_id="stable-google-subject", email=email(), role="admin"),
                                           dict(user_id="stable-google-operator-subject", email=email("operator"), role="operator")]),
                 password="synthetic-group-password-value",
                 salt_key=b"synthetic-session-secret-with-enough-entropy")
+
+
+def password_for(alias):
+    return policy_values()["admin_password" if alias == email() else "password"]
 
 
 def policy(**changes):
@@ -31,12 +36,12 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
         rows = json.loads(values["bindings_json"])
         rows.reverse()
         rows[0]["email"] = rows[0]["email"].upper()
-        other = policy(bindings_json=json.dumps(rows), allowed_emails="  "+email("operator").upper()+" ; "+email())
+        other = policy(bindings_json=json.dumps(rows), allowed_emails="  "+email("operator").upper()+" ", allowed_admin_emails=email().upper())
         self.assertEqual(policy().fingerprint, other.fingerprint)
         self.assertNotEqual(policy(password="different-synthetic-password").fingerprint, other.fingerprint)
 
     def test_A03_invalid_allowlist_matrix(self):
-        cases = [None, [], "", ";", email()+";", email()+";"+email().upper(),
+        cases = [None, [], ";", email()+";", email()+";"+email().upper(),
                  "*"+"@"+"example.test", "example.test", "x\n"+email(), "\u00e9"+email(),
                  email()+","+email("other"), ";".join(email(str(i)) for i in range(101)), "a"*16500]
         for value in cases:
@@ -45,7 +50,7 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
 
     def test_A04_binding_matrix(self):
         rows = json.loads(policy_values()["bindings_json"])
-        variants = [None, "{}", "[]", "[NaN]", '[{"user_id":"x","user_id":"y"}]', json.dumps(rows[:1])]
+        variants = [None, "{}", "[NaN]", '[{"user_id":"x","user_id":"y"}]']
         for field, value in [("user_id", rows[0]["user_id"]), ("email", rows[0]["email"]), ("role", "owner"), ("role", None), ("user_id", "short"), ("workspace", "extra")]:
             changed = [dict(r) for r in rows]; changed[1][field] = value
             variants.append(json.dumps(changed))
@@ -59,9 +64,9 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
     def test_A09_A10_shared_password_selects_exact_stable_alias(self):
         state = auth.InternalAuthState(); selected = policy()
         for name, uid, role in [("admin", "stable-google-subject", "admin"), ("operator", "stable-google-operator-subject", "operator")]:
-            cookie = state.authenticate(email=email(name), password=policy_values()["password"], policy=selected)
+            cookie = state.authenticate(email=email(name), password=password_for(email(name)), policy=selected)
             self.assertEqual(set(cookie), {"auth_mode", "session_id"})
-            record = state.validate_session(cookie, policy=selected, current_mode=auth.INTERNAL_AUTH_MODE)
+            record = state.validate_session(cookie, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
             self.assertEqual(record["user"], dict(subject=uid, account=selected.workspace_id, internal_role=role, auth_mode=auth.INTERNAL_AUTH_MODE))
         verifier = mock.Mock(wraps=auth.secrets.compare_digest)
         state = auth.InternalAuthState(verifier=verifier)
@@ -71,7 +76,7 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
         self.assertEqual(verifier.call_count, 3)
 
     def test_A09_invalid_input_never_matches_the_dummy_comparison_path(self):
-        selected=policy(password="invalid-login-input")
+        selected=policy(admin_password="invalid-login-input")
         state=auth.InternalAuthState()
         for password in [None, "", "short", "x"*1025, "bad\npassword"]:
             with self.subTest(kind=type(password).__name__),self.assertRaises(auth.InternalAuthStateError):
@@ -79,26 +84,26 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
 
     def test_password_kdf_context_and_reload_matrix(self):
         selected = policy()
-        self.assertEqual(len(selected.credential_digest), 32)
-        self.assertEqual(len(selected.credential_salt), 32)
+        self.assertEqual(len(selected.credentials["admin"][0]), 32)
+        self.assertEqual(len(selected.credentials["admin"][1]), 32)
         self.assertEqual(selected.fingerprint, policy().fingerprint)
-        self.assertEqual(selected.credential_salt, policy().credential_salt)
+        self.assertEqual(selected.credentials["admin"][1], policy().credentials["admin"][1])
         for change in ({"password": "rotated-synthetic-password"},
                        {"salt_key": b"different-synthetic-session-secret-key"},
                        {"workspace_id": "another-synthetic-workspace"},
-                       {"bindings_json": policy_values()["bindings_json"].replace('"admin"', '"operator"')}):
+                       {"allowed_admin_emails": "", "allowed_emails": email()+";"+email("operator")}):
             with self.subTest(field=next(iter(change))):
                 changed = policy(**change)
                 self.assertNotEqual(selected.fingerprint, changed.fingerprint)
                 state = auth.InternalAuthState()
-                cookie = state.authenticate(email=email(), password=policy_values()["password"], policy=selected)
+                cookie = state.authenticate(email=email(), password=password_for(email()), policy=selected)
                 with self.assertRaises(auth.InternalAuthStateError):
-                    state.validate_session(cookie, policy=changed, current_mode=auth.INTERNAL_AUTH_MODE)
+                    state.validate_session(cookie, policy_fingerprint=changed.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
         for value in (None, b"", b"x" * 31, "invalid-key-type"):
             with self.subTest(key_type=type(value).__name__), self.assertRaises(auth.InternalAuthConfigError):
                 policy(salt_key=value)
-        self.assertNotIn(selected.credential_digest.hex(), repr(selected))
-        self.assertNotIn(selected.credential_salt.hex(), repr(selected))
+        self.assertNotIn(selected.credentials["admin"][0].hex(), repr(selected))
+        self.assertNotIn(selected.credentials["admin"][1].hex(), repr(selected))
 
     def test_configuration_validation_keeps_all_bounds_without_a_kdf(self):
         values = policy_values()
@@ -106,7 +111,8 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
             {"workspace_id": None}, {"workspace_id": "bad workspace"},
             {"allowed_emails": None}, {"allowed_emails": email() + ";"},
             {"allowed_emails": email() + ";" + email().upper()},
-            {"bindings_json": "[NaN]"}, {"bindings_json": "[]"},
+            {"bindings_json": "[NaN]"}, {"bindings_json": "{}"},
+            {"bindings_json": "[" * 4000 + "]" * 4000},
             {"bindings_json": values["bindings_json"].replace('"admin"', '"owner"')},
             {"password": None}, {"password": "short"}, {"password": "x" * 1025},
             {"password": "bad\npassword-value"}, {"password": "bad\ud800password-value"},
@@ -126,8 +132,10 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
 
     def test_password_kdf_and_comparison_cover_every_login_outcome(self):
         selected = policy()
-        cases = [(email(), policy_values()["password"], True),
-                 (email("operator"), policy_values()["password"], True),
+        cases = [(email(), password_for(email()), True),
+                 (email("operator"), password_for(email("operator")), True),
+                 (email("operator"), password_for(email()), False),
+                 (email(), password_for(email("operator")), False),
                  (email(), "wrong-password-value", False),
                  (email("unknown"), policy_values()["password"], False),
                  (None, policy_values()["password"], False),
@@ -147,17 +155,51 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
                     self.assertEqual(str(caught.exception), "Authentication could not be completed.")
                 derive.assert_called_once()
                 self.assertEqual(derive.call_args.args[0], "sha256")
-                self.assertEqual(derive.call_args.args[2:], (selected.credential_salt, 600_000))
+                self.assertEqual(derive.call_args.args[2:], (selected.credentials["operator" if alias != email() else "admin"][1], 600_000))
                 self.assertEqual(derive.call_args.kwargs, {"dklen": 32})
                 compare.assert_called_once()
                 self.assertEqual(tuple(map(len, compare.call_args.args)), (32, 32))
 
     def test_password_utf8_byte_bounds_and_invalid_encoding(self):
         for value in ("\u00e9" * 6, "\u00e9" * 512):
-            self.assertEqual(len(policy(password=value).credential_digest), 32)
+            self.assertEqual(len(policy(password=value).credentials["operator"][0]), 32)
         for value in ("\u00e9" * 5, "\u00e9" * 513, "bad\x00password-value", "bad\ud800password-value"):
             with self.subTest(length=len(value)), self.assertRaises(auth.InternalAuthConfigError):
                 policy(password=value)
+
+    def test_role_transitions_and_stable_unbound_ownership(self):
+        alias = email("new")
+        original = policy(allowed_emails=alias, allowed_admin_emails="")
+        uid = original.identities[0].user_id
+        promoted = policy(allowed_emails=alias, allowed_admin_emails=alias)
+        admin_only = policy(allowed_emails="", allowed_admin_emails=alias, password="")
+        restored = policy(allowed_emails=alias, allowed_admin_emails="",
+                          password="new-operator-password-value", salt_key=b"x" * 32)
+        self.assertEqual({p.identities[0].user_id for p in (original, promoted, admin_only, restored)}, {uid})
+        self.assertEqual([p.identities[0].role for p in (original, promoted, admin_only, restored)],
+                         ["operator", "admin", "admin", "operator"])
+        state = auth.InternalAuthState()
+        for prior, current in ((original, promoted), (promoted, restored), (restored, policy())):
+            password = (password_for(email()) if prior is promoted else
+                        "new-operator-password-value" if prior is restored else password_for(email("operator")))
+            cookie = state.authenticate(email=alias, password=password, policy=prior)
+            with self.assertRaises(auth.InternalAuthStateError):
+                state.validate_session(cookie, policy_fingerprint=current.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
+        self.assertIsNone(policy().identity_for_subject(uid))
+
+    def test_conflicts_include_inactive_and_projected_bridge_ids(self):
+        long_id = "x" * 129
+        for first, second in ((long_id, auth.project_binding_id(long_id)),
+                              (auth.stable_alias_id(policy_values()["workspace_id"], email("operator")), "other-subject")):
+            rows = [dict(email=email("inactive"), user_id=first, role="operator"),
+                    dict(email=email("other"), user_id=second, role="admin")]
+            with self.assertRaises(auth.InternalAuthConfigError):
+                policy(bindings_json=json.dumps(rows))
+        for changes in (dict(allowed_emails="", allowed_admin_emails=""),
+                        dict(admin_password=password_for(email("operator"))),
+                        dict(allowed_admin_emails=email()+";"+email().upper())):
+            with self.assertRaises(auth.InternalAuthConfigError):
+                policy(**changes)
 
     def test_A07_A16_nonce_expiry_replay_browser_binding_and_concurrent_consumption(self):
         now = [1000]; state = auth.InternalAuthState(clock=lambda: now[0])
@@ -179,18 +221,18 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
     def test_A11_A15_A16_rotation_revocation_policy_and_capacity(self):
         now = [1000]; state = auth.InternalAuthState(clock=lambda: now[0]); selected = policy()
         def login(previous=""):
-            return state.authenticate(email=email(), password=policy_values()["password"], policy=selected, previous_session_id=previous)
+            return state.authenticate(email=email(), password=password_for(email()), policy=selected, previous_session_id=previous)
         first=login(); second=login(first["session_id"])
-        with self.assertRaises(auth.InternalAuthStateError): state.validate_session(first, policy=selected, current_mode=auth.INTERNAL_AUTH_MODE)
-        for changed in [policy(password="changed-group-password"), policy(workspace_id="other-workspace"), policy(bindings_json=policy_values()["bindings_json"].replace('"admin"', '"operator"'))]:
+        with self.assertRaises(auth.InternalAuthStateError): state.validate_session(first, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
+        for changed in [policy(password="changed-group-password"), policy(workspace_id="other-workspace"), policy(allowed_admin_emails="", allowed_emails=email()+";"+email("operator"))]:
             current=login()
             with self.subTest(change=changed.workspace_id), self.assertRaises(auth.InternalAuthStateError):
-                state.validate_session(current, policy=changed, current_mode=auth.INTERNAL_AUTH_MODE)
+                state.validate_session(current, policy_fingerprint=changed.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
         current=login(); now[0] += auth.INTERNAL_SESSION_TTL_SECONDS
-        with self.assertRaises(auth.InternalAuthStateError): state.validate_session(current, policy=selected, current_mode=auth.INTERNAL_AUTH_MODE)
-        with self.assertRaises(auth.InternalAuthStateError): auth.InternalAuthState().validate_session(second, policy=selected, current_mode=auth.INTERNAL_AUTH_MODE)
+        with self.assertRaises(auth.InternalAuthStateError): state.validate_session(current, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
+        with self.assertRaises(auth.InternalAuthStateError): auth.InternalAuthState().validate_session(second, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
         current=login(); self.assertTrue(state.revoke_session(current["session_id"]))
-        with self.assertRaises(auth.InternalAuthStateError): state.validate_session(current, policy=selected, current_mode=auth.INTERNAL_AUTH_MODE)
+        with self.assertRaises(auth.InternalAuthStateError): state.validate_session(current, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
         with mock.patch.object(auth, "MAX_INTERNAL_SESSIONS", 1):
             state=auth.InternalAuthState(); first=login()
             with self.assertRaises(auth.InternalAuthStateError): login()
@@ -245,17 +287,17 @@ def simultaneous(operations, scheduled_lock=None):
 
 class InternalPasswordConcurrencyTest(unittest.TestCase):
     def validate(self, state, cookie, selected):
-        return state.validate_session(cookie, policy=selected, current_mode=auth.INTERNAL_AUTH_MODE)
+        return state.validate_session(cookie, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
 
     def test_A16_concurrent_capacity_preserves_untargeted_alias(self):
         for capacity in (1, 2, 3):
             with self.subTest(capacity=capacity), mock.patch.object(auth, "MAX_INTERNAL_SESSIONS", capacity):
                 selected = policy()
                 state = auth.InternalAuthState(clock=lambda: 1000)
-                other = state.authenticate(email=email("operator"), password=policy_values()["password"], policy=selected)
+                other = state.authenticate(email=email("operator"), password=password_for(email("operator")), policy=selected)
                 calls = {
                     str(index): lambda: state.authenticate(
-                        email=email(), password=policy_values()["password"], policy=selected,
+                        email=email(), password=password_for(email()), policy=selected,
                     ) for index in range(6)
                 }
                 outcomes = simultaneous(calls)
@@ -272,9 +314,9 @@ class InternalPasswordConcurrencyTest(unittest.TestCase):
         selected = policy()
         with mock.patch.object(auth, "MAX_INTERNAL_SESSIONS", 1):
             state = auth.InternalAuthState(clock=lambda: 1000)
-            previous = state.authenticate(email=email(), password=policy_values()["password"], policy=selected)
+            previous = state.authenticate(email=email(), password=password_for(email()), policy=selected)
             outcomes = simultaneous({str(index): lambda: state.authenticate(
-                email=email(), password=policy_values()["password"], policy=selected,
+                email=email(), password=password_for(email()), policy=selected,
                 previous_session_id=previous["session_id"],
             ) for index in range(6)})
             admitted = [value for status, value in outcomes.values() if status == "allowed"]
@@ -292,12 +334,12 @@ class InternalPasswordConcurrencyTest(unittest.TestCase):
                     selected = policy()
                     lock = ScheduledRegistryLock()
                     state = auth.InternalAuthState(clock=lambda: 1000, lock=lock)
-                    previous = state.authenticate(email=email(alias), password=policy_values()["password"], policy=selected)
+                    previous = state.authenticate(email=email(alias), password=password_for(email(alias)), policy=selected)
                     peer_alias = "operator" if alias == "admin" else "admin"
-                    peer = state.authenticate(email=email(peer_alias), password=policy_values()["password"], policy=selected)
+                    peer = state.authenticate(email=email(peer_alias), password=password_for(email(peer_alias)), policy=selected)
                     lock.order = order
                     outcomes = simultaneous({
-                        "rotate": lambda: state.authenticate(email=email(alias), password=policy_values()["password"], policy=selected, previous_session_id=previous["session_id"]),
+                        "rotate": lambda: state.authenticate(email=email(alias), password=password_for(email(alias)), policy=selected, previous_session_id=previous["session_id"]),
                         "logout_revoke": lambda: state.revoke_session(previous["session_id"]),
                         "validate": lambda: self.validate(state, previous, selected),
                     }, lock)

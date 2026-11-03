@@ -28,7 +28,7 @@ try {
   await page.route("**/api/quote-sessions", route => route.fulfill({status:200, contentType:"application/json", body:'{"quote_sessions":[]}'}));
   await page.route("**/api/log", route => route.fulfill({status:204,body:""}));
   assert.equal((await context.request.get(base+"/api/session")).status(),401);
-  for (const [alias,password] of [["unknown"+"@"+"example.test","synthetic-browser-group-password"],["alpha-admin"+"@"+"example.test","synthetic-wrong-password"]]) {
+  for (const [alias,password] of [["unknown"+"@"+"example.test","synthetic-browser-admin-password"],["alpha-admin"+"@"+"example.test","synthetic-wrong-password"]]) {
     await page.goto(base+"/login");
     await page.getByLabel("Email",{exact:true}).fill(alias);
     await page.getByLabel("Password",{exact:true}).fill(password);
@@ -52,7 +52,7 @@ try {
     assert.equal((await page.goto(base+"/")).status(),401);
     assert.equal(await page.locator("#topbarLogoutLink").count(),0);
   }
-  await signIn(page,base,"alpha-operator"+"@"+"example.test");
+  await signIn(page,base,"alpha-operator"+"@"+"example.test","synthetic-browser-operator-password");
   const selected=await (await context.request.get(base+"/api/session")).json();
   assert.equal(selected.authenticated,true); assert.notEqual(selected.browser_recovery_scope,session.browser_recovery_scope);
   assert.equal((await copied.get(base+"/api/session")).status(),401);

@@ -7765,7 +7765,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         from tests.test_internal_password_auth import email, policy_values
         with mock.patch.dict(os.environ, internal_env(), clear=True):
             state = webapp.InternalAuthState()
-            cookie_payload = state.authenticate(email=email(), password=policy_values()["password"], policy=webapp.internal_auth_policy())
+            cookie_payload = state.authenticate(email=email(), password=policy_values()["admin_password"], policy=webapp.internal_auth_policy())
             header = webapp.SESSION_COOKIE_NAME+"="+webapp.signed_cookie_value(cookie_payload)
             self.assertIsNotNone(webapp.session_from_cookie_header(header, auth_state=state))
             self.assertTrue(state.revoke_session(cookie_payload["session_id"]))

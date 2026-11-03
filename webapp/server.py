@@ -426,6 +426,8 @@ INTERNAL_WORKSPACE_ID_ENV_NAME = "SQAG_INTERNAL_WORKSPACE_ID"
 INTERNAL_IDENTITY_BINDINGS_ENV_NAME = "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON"
 INTERNAL_LOGIN_PASSWORD_ENV_NAME = "SQAG_INTERNAL_LOGIN_PASSWORD"
 INTERNAL_ALLOWED_EMAILS_ENV_NAME = "SQAG_INTERNAL_ALLOWED_EMAILS"
+INTERNAL_ALLOWED_ADMIN_EMAILS_ENV_NAME = "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN"
+INTERNAL_ADMIN_LOGIN_PASSWORD_ENV_NAME = "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD"
 INTERNAL_ADMIN_EMAILS_ENV_NAME = "SQAG_INTERNAL_ADMIN_EMAILS"
 INTERNAL_OPERATOR_EMAILS_ENV_NAME = "SQAG_INTERNAL_OPERATOR_EMAILS"
 QUOTE_OUTPUT_ROOT_ENV_NAME = "QUOTE_OUTPUT_ROOT"
@@ -544,6 +546,9 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
     """Own authentication state for exactly this running HTTP instance."""
     def __init__(self, *args, internal_auth=None, **kwargs):
         self.internal_auth = internal_auth if internal_auth is not None else InternalAuthState()
+        self.internal_policy = (
+            internal_auth_policy() if internal_password_config_complete() else None
+        )
         super().__init__(*args, **kwargs)
 
 AI_LOG_TRACKING_CONTEXT = threading.local()
@@ -2005,11 +2010,17 @@ def internal_password_mode_enabled() -> bool:
 
 
 def internal_auth_policy_values() -> dict[str, Any]:
+    def policy_value(name):
+        # Explicit empty host settings remove optional aliases or credentials.
+        return os.environ[name] if name in os.environ else read_dotenv_value(name)
+
     return dict(
-        workspace_id=read_dotenv_value(INTERNAL_WORKSPACE_ID_ENV_NAME),
-        allowed_emails=read_dotenv_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
-        bindings_json=read_dotenv_value(INTERNAL_IDENTITY_BINDINGS_ENV_NAME),
-        password=read_dotenv_value(INTERNAL_LOGIN_PASSWORD_ENV_NAME),
+        workspace_id=policy_value(INTERNAL_WORKSPACE_ID_ENV_NAME),
+        allowed_emails=policy_value(INTERNAL_ALLOWED_EMAILS_ENV_NAME),
+        allowed_admin_emails=policy_value(INTERNAL_ALLOWED_ADMIN_EMAILS_ENV_NAME),
+        bindings_json=policy_value(INTERNAL_IDENTITY_BINDINGS_ENV_NAME),
+        password=policy_value(INTERNAL_LOGIN_PASSWORD_ENV_NAME),
+        admin_password=policy_value(INTERNAL_ADMIN_LOGIN_PASSWORD_ENV_NAME),
         salt_key=session_secret().encode("utf-8"),
     )
 
@@ -2168,6 +2179,8 @@ def platform_launch_config_complete() -> bool:
             INTERNAL_WORKSPACE_ID_ENV_NAME,
             INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
             INTERNAL_LOGIN_PASSWORD_ENV_NAME,
+            INTERNAL_ADMIN_LOGIN_PASSWORD_ENV_NAME,
+            INTERNAL_ALLOWED_ADMIN_EMAILS_ENV_NAME,
             "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
             INTERNAL_ALLOWED_EMAILS_ENV_NAME,
             INTERNAL_ADMIN_EMAILS_ENV_NAME,
@@ -2610,7 +2623,10 @@ def session_from_cookie_header(cookie_header: str, *, auth_state: InternalAuthSt
         if auth_state is None or not internal_password_config_complete():
             return None
         try:
-            return auth_state.validate_session(payload, policy=internal_auth_policy(), current_mode=mode)
+            return auth_state.validate_session(
+                payload, policy_fingerprint=InternalAuthPolicy.fingerprint_for_values(**internal_auth_policy_values()),
+                current_mode=mode,
+            )
         except (InternalAuthConfigError, InternalAuthStateError):
             return None
     if not isinstance(payload.get("user"), dict):
@@ -3217,8 +3233,7 @@ def deploy_uat_preflight_status() -> dict[str, Any]:
     elif auth_mode == INTERNAL_AUTH_MODE:
         add(PLATFORM_LAUNCH_MODE_ENV_NAME, configured_platform_launch_mode() == "disabled", "must be disabled")
         add("platform auth configuration absent", not bool(clean_text(read_dotenv_value(PLATFORM_BASE_URL_ENV_NAME)) or clean_text(read_dotenv_value(PLATFORM_SERVICE_SECRET_ENV_NAME))), "must not be mixed with internal_password")
-        for name in (INTERNAL_WORKSPACE_ID_ENV_NAME, INTERNAL_ALLOWED_EMAILS_ENV_NAME, INTERNAL_IDENTITY_BINDINGS_ENV_NAME, INTERNAL_LOGIN_PASSWORD_ENV_NAME):
-            add(name, bool(read_dotenv_value(name)), "must be present in server configuration")
+        add(INTERNAL_WORKSPACE_ID_ENV_NAME, bool(read_dotenv_value(INTERNAL_WORKSPACE_ID_ENV_NAME)), "must be present in server configuration")
         add("internal allowlist and role policy", internal_auth_policy_config_complete(), "must be exact, complete, and conflict-free")
         add("legacy auth escape hatches absent", not bool(clean_text(read_dotenv_value(AUTH_ALLOWED_EMAILS_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_ALLOWED_DOMAINS_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME)) or clean_text(read_dotenv_value(AUTH_APPROVED_TESTER_ROLE_ENV_NAME))), "must not be configured")
         add("internal password auth contract", internal_password_config_complete(), "must be complete and fail closed")
@@ -32941,6 +32956,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             })
             return
         if path == "/api/pricing-reference/template.xlsx":
+            if internal_password_mode_enabled():
+                allowed, error = self.require_permission("canManagePricingReferences")
+                if not allowed:
+                    self.send_json(error, status=403)
+                    return
             self.send_pricing_reference_template()
             return
         if path.startswith("/api/jobs/") and "/files/" in path:
@@ -33001,6 +33021,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         request_ai_tracking = self.current_ai_log_tracking()
 
         if parsed.path == "/api/pricing-reference/validate":
+            if internal_password_mode_enabled():
+                allowed, error = self.require_permission("canImportPricingReferences")
+                if not allowed:
+                    self.send_json(error, status=403)
+                    return
             self.send_json(validate_pricing_reference_upload(payload))
             return
 
@@ -34156,7 +34181,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 raise InternalAuthStateError("login_form_invalid")
             self.server.internal_auth.consume_login(values["nonce"], cookies_from_header(self.headers.get("Cookie", "")).get("sqag_login_binding", ""))
             previous = verified_cookie_payload(cookies_from_header(self.headers.get("Cookie", "")).get(SESSION_COOKIE_NAME, ""), allow_expired=True) or {}
-            record = self.server.internal_auth.authenticate(email=values["email"], password=values["password"], policy=internal_auth_policy(), previous_session_id=previous.get("session_id", ""))
+            policy = self.server.internal_policy
+            fingerprint = InternalAuthPolicy.fingerprint_for_values(**internal_auth_policy_values())
+            if policy is None or policy.fingerprint != fingerprint:
+                raise InternalAuthStateError("login_denied")
+            record = self.server.internal_auth.authenticate(email=values["email"], password=values["password"], policy=policy, previous_session_id=previous.get("session_id", ""))
         except (InternalAuthConfigError, InternalAuthStateError, ValueError, UnicodeError, OSError):
             self.send_password_failure(403, "login_denied")
             return

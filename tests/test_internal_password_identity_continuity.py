@@ -30,8 +30,6 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         self.data_fixture.setUp()
         self.stack.callback(self.data_fixture.doCleanups)
         self.http_fixture = http_fixtures.InternalPasswordAuthWebappTest(methodName="runTest")
-        self.http_fixture.setUp()
-        self.stack.callback(self.http_fixture.doCleanups)
         self.root = fixtures.test_temp_root() / ("identity-" + str(time.time_ns()))
         self.root.mkdir(parents=True)
         self.database_url = "sqlite:///" + (self.root / "identity.sqlite3").as_posix()
@@ -41,13 +39,14 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
             "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database",
             "SQAG_DATABASE_URL": self.database_url,
             "QUOTE_DATA_ROOT": str(self.root / "data"),
-            "SQAG_INTERNAL_ALLOWED_EMAILS": ";".join(row["email"] for row in rows),
+            "SQAG_INTERNAL_ALLOWED_EMAILS": ";".join(row["email"] for row in rows if row["role"] == "operator"),
             "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON": json.dumps(rows),
             "SQAG_TRACKING_HMAC_KEY": "synthetic-identity-tracking-hmac-key-value",
             "SQAG_TRACKING_HMAC_KEY_VERSION": "test-v1",
             "OPENROUTER_API_KEY": "synthetic-key", **fixtures.SYNTHETIC_DRAFT_CONFIG,
         }
-        self.stack.enter_context(mock.patch.dict(os.environ, env))
+        self.http_fixture.setUp(extra_env=env)
+        self.stack.callback(self.http_fixture.doCleanups)
         webapp.apply_sqag_storage_migrations(self.database_url)
         self.job_ids = []
         self.stack.callback(self.remove_owned_jobs)
@@ -64,7 +63,7 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         cookie = webapp.SESSION_COOKIE_NAME + "=" + raw
         opaque = webapp.verified_cookie_payload(raw)
         session = self.http_fixture.server.internal_auth.validate_session(
-            opaque, policy=webapp.internal_auth_policy(), current_mode=webapp.INTERNAL_AUTH_MODE,
+            opaque, policy_fingerprint=self.http_fixture.server.internal_policy.fingerprint, current_mode=webapp.INTERNAL_AUTH_MODE,
         )
         status, _, body = self.http_fixture.http("GET", "/api/session", {"Cookie": cookie})
         self.assertEqual(status, 200)
@@ -146,7 +145,7 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         for alias, workspace, quote, early, job, profile in cases:
             with self.subTest(alias=alias, workspace=workspace):
                 changes = {} if workspace is None else {"SQAG_INTERNAL_WORKSPACE_ID": workspace}
-                with mock.patch.dict(os.environ, changes):
+                with mock.patch.dict(os.environ, changes), self.http_fixture.fresh_server_if(changes):
                     cookie, session, _ = self.admit(alias)
                     self.assert_actor_access(cookie, session, session_id, job_id, quote=quote, early=early, job=job, profile=profile)
         self.assertEqual(self.saved_snapshot(storage, session_id), original)
@@ -190,9 +189,10 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         for changes, shared_profile in cases:
             with self.subTest(changes=tuple(changes)), mock.patch.dict(os.environ, changes):
                 self.assertEqual(self.get(cookie, "/api/session")[0], 401)
-                changed_cookie, changed_session, changed_public = self.admit()
-                self.assertNotEqual(changed_public["browser_recovery_scope"], public["browser_recovery_scope"])
-                self.assert_actor_access(changed_cookie, changed_session, session_id, job_id, quote=False, early=False, job=False, profile=shared_profile)
+                with self.http_fixture.fresh_server_if(changes):
+                    changed_cookie, changed_session, changed_public = self.admit()
+                    self.assertNotEqual(changed_public["browser_recovery_scope"], public["browser_recovery_scope"])
+                    self.assert_actor_access(changed_cookie, changed_session, session_id, job_id, quote=False, early=False, job=False, profile=shared_profile)
         old = webapp.signed_cookie_value({"auth_mode": "internal_google", "user": {"subject": "stable-google-operator-subject", "account": policy_values()["workspace_id"]}})
         old_cookie = webapp.SESSION_COOKIE_NAME + "=" + old
         self.assertEqual(self.get(old_cookie, "/api/session")[0], 401)

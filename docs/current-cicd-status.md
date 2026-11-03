@@ -286,8 +286,8 @@ retrospective, native-output and browser gates remain required. CI makes no real
 provider calls and requires no login or OpenRouter secret.
 
 Runtime configuration replaces the maintained Google identity map with
-`SQAG_INTERNAL_ALLOWED_EMAILS`, `SQAG_INTERNAL_IDENTITY_BINDINGS_JSON` and
-`SQAG_INTERNAL_LOGIN_PASSWORD`. Existing workspace, stable user IDs and signing
+the [role-specific lists and passwords](internal-password-auth-mode.md), with
+server-only continuity bindings. Existing workspace, stable user IDs and signing
 and recovery secrets must remain unchanged when a separately approved cutover is
 performed. Shared-password holders can select any configured alias and its role.
 
