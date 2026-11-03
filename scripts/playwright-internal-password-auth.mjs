@@ -81,6 +81,11 @@ try {
   await cards.filter({ hasText: "Mapped fixture" }).click();
   await page.getByText("Created by alpha-operator" + "@" + "example.test", { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "Modify quote" }).isDisabled(), true);
+  for (const creator of ["ALPHA-OPERATOR" + "@" + "EXAMPLE.TEST", "OPERATOR"]) {
+    await page.locator("#dashboardSearchInput").fill(creator);
+    await cards.filter({ hasText: "Mapped fixture" }).waitFor();
+    assert.equal(await cards.count(), 1);
+  }
   await page.locator("#dashboardSearchInput").fill("Legacy fixture");
   await cards.filter({ hasText: "Legacy fixture" }).waitFor();
   assert.equal(await cards.count(), 1);

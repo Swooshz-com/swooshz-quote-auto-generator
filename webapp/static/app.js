@@ -14703,6 +14703,7 @@ function dashboardSessionSearchText(session = {}) {
     dashboardSessionProjectText(session),
     dashboardSessionShowNameText(session),
     dashboardSessionProjectNumberText(session),
+    typeof session.created_by === "string" ? session.created_by : "",
   ].map((value) => String(value || "").toLowerCase()).join(" ");
 }
 
