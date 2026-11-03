@@ -581,6 +581,7 @@ ALLOWED_LOG_EVENTS = {
     "profile_export_not_found",
     "quote_artifact_storage_blocked",
     "quote_publication_compensation_failed",
+    "quote_session_delete_attempt",
     "quote_session_projection_failed",
     "quote_session_update_failed",
     "quote_session_runtime_storage_blocked",
@@ -17032,7 +17033,7 @@ class DatabaseSqagStorage:
                 raise
             raise self._storage_unavailable_error(exc) from exc
 
-    def delete_quote_session(self, session_id: str) -> bool:
+    def delete_quote_session(self, session_id: str, *, allow_workspace_admin: bool = False) -> bool:
         safe_id = safe_quote_session_id(session_id, "")
         if not safe_id:
             return False
@@ -17045,7 +17046,10 @@ class DatabaseSqagStorage:
             )
             return bool(
                 metadata
-                and self._quote_session_editable_by_current_user(metadata)
+                and (
+                    self._quote_session_editable_by_current_user(metadata)
+                    or (allow_workspace_admin and self.can_view_other_user_quote_sessions())
+                )
                 and not self._session_deletion_blocked_by_hold(
                     connection, safe_id
                 )
@@ -33503,8 +33507,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/log":
-            logged = write_local_log(
-                clean_text(payload.get("event")) or "client_event",
+            event = log_event_name(payload.get("event")) or "client_event"
+            logged = event != "quote_session_delete_attempt" and write_local_log(
+                event,
                 payload.get("details") if isinstance(payload.get("details"), dict) else {},
             )
             self.send_json({"status": "logged" if logged else "ignored"})
@@ -33512,39 +33517,60 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
 
         self.send_json({"error": "Not found"}, status=404)
 
-    def do_DELETE(self) -> None:
-        if self.block_untrusted_host():
-            return
-        parsed = urlparse(self.path)
-        if self.block_unauthenticated_request(parsed.path):
-            return
-        if self.block_unsafe_post(parsed.path):
-            return
-        quote_session_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", parsed.path)
-        if quote_session_match:
+    def handle_quote_session_delete(self, session_id: str, path: str) -> None:
+        session = None
+        outcome = "rejected"
+        error_reference = ""
+        try:
+            if self.block_unauthenticated_request(path):
+                return
+            session = self.current_auth_session()
+            if self.block_unsafe_post(path):
+                return
             allowed, error = self.require_permission("canGenerateQuote")
             if not allowed:
                 self.send_json(error, status=403)
                 return
             try:
-                storage = self.current_quote_session_storage()
-                if storage is None:
-                    return
-                deleted = storage.delete_quote_session(quote_session_match.group(1))
+                storage = quote_session_storage_for_auth_session(session)
+                staff = self.current_staff_identity(session)
+                if staff and staff["role"] == "admin" and isinstance(storage, DatabaseSqagStorage):
+                    deleted = storage.delete_quote_session(session_id, allow_workspace_admin=True)
+                else:
+                    deleted = storage.delete_quote_session(session_id)
             except SqagStorageAccessError as exc:
+                outcome = "error" if exc.status >= 500 else "rejected"
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
-            except Exception as exc:  # pragma: no cover - defensive HTTP boundary
+            except Exception:
+                outcome = "error"
                 error_reference = new_error_reference()
-                write_local_log("server_error", {
-                    "error_reference": error_reference,
-                    "reason": "quote_session_delete_failed",
-                    "session_id": safe_quote_session_id(quote_session_match.group(1), ""),
-                    "errors": safe_error_messages([str(exc)]),
-                })
-                self.send_json({"status": "failed", "errors": safe_error_messages([f"Unexpected local runner error. Reference: {error_reference}."])}, status=500)
+                self.send_json(failed_result_payload(error_reference), status=500)
                 return
+            outcome = "success" if deleted else "rejected"
             self.send_json({"status": "deleted" if deleted else "not_found"}, status=200 if deleted else 404)
+        finally:
+            actor = platform_user_id_from_auth_session(session)
+            workspace = platform_workspace_id_from_auth_session(session)
+            write_local_log("quote_session_delete_attempt", {
+                "actor_tracking_id": privacy_safe_audit_tracking_id_or_unavailable("actor:" + actor) if actor else "",
+                "workspace_tracking_id": privacy_safe_audit_tracking_id_or_unavailable("workspace:" + workspace) if workspace else "",
+                "quote_tracking_id": privacy_safe_audit_tracking_id_or_unavailable("quote:" + session_id),
+                "outcome": outcome,
+                "error_reference": error_reference,
+            })
+
+    def do_DELETE(self) -> None:
+        if self.block_untrusted_host():
+            return
+        parsed = urlparse(self.path)
+        quote_session_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", parsed.path)
+        if quote_session_match:
+            self.handle_quote_session_delete(quote_session_match.group(1), parsed.path)
+            return
+        if self.block_unauthenticated_request(parsed.path):
+            return
+        if self.block_unsafe_post(parsed.path):
             return
         pricing_match = re.fullmatch(r"/api/settings/pricing-references/([A-Za-z0-9_-]+)", parsed.path)
         if pricing_match:

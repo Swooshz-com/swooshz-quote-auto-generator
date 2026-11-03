@@ -15798,7 +15798,11 @@ function renderQuoteSessionDeleteModal() {
   const bulk = state.quoteSessionDeleteBulk || sessionIds.length > 1;
   if (elements.quoteSessionDeleteTitle) elements.quoteSessionDeleteTitle.textContent = bulk ? "Delete selected quote sessions?" : "Delete quote session?";
   if (elements.quoteSessionDeleteText) {
-    elements.quoteSessionDeleteText.textContent = bulk ? QUOTE_SESSION_DELETE_BULK_MESSAGE : QUOTE_SESSION_DELETE_SINGLE_MESSAGE;
+    const localMessage = bulk ? QUOTE_SESSION_DELETE_BULK_MESSAGE : QUOTE_SESSION_DELETE_SINGLE_MESSAGE;
+    const workspaceMessage = bulk
+      ? "This deletes the selected quote sessions and their saved exports from the workspace. This cannot be undone."
+      : "This deletes this quote session and its saved exports from the workspace. This cannot be undone.";
+    elements.quoteSessionDeleteText.textContent = state.staffEmail ? workspaceMessage : localMessage;
   }
   if (elements.confirmQuoteSessionDeleteButton) {
     elements.confirmQuoteSessionDeleteButton.textContent = bulk ? "Delete selected" : "Delete session";

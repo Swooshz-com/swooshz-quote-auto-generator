@@ -202,7 +202,8 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
                     path = "/api/quote-sessions/" + session_id
                     self.assertEqual(self.get(cookie, path)[0], 404)
                     self.assertEqual(self.get(cookie, path + "/download/xlsx")[0], 404)
-                    self.assertEqual(self.http_fixture.http("DELETE", path, headers)[0], 404)
+                    if alias != "admin":
+                        self.assertEqual(self.http_fixture.http("DELETE", path, headers)[0], 404)
         # Existing save recovery issues a fresh caller-owned ID on an ownership
         # conflict. It must leave the requested session and its owner untouched.
         before = owner_storage._read_quote_session_metadata_for_workspace(ids[0])
@@ -219,9 +220,48 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         self.assertNotIn("created_by", new_metadata)
         changes = {"SQAG_INTERNAL_WORKSPACE_ID": "workspace-identity-other"}
         with mock.patch.dict(os.environ, changes), self.http_fixture.fresh_server_if(changes):
-            other, _, _ = self.admit("admin")
+            other, _, other_public = self.admit("admin")
             self.assertEqual(json.loads(self.get(other, "/api/quote-sessions")[2])["quote_sessions"], [])
             self.assertEqual(self.get(other, "/api/quote-sessions/" + ids[0])[0], 404)
+            other_headers = headers | {"Cookie": other, other_public["csrf_header"]: other_public["csrf_token"]}
+            self.assertEqual(self.http_fixture.http("DELETE", "/api/quote-sessions/" + ids[0], other_headers)[0], 404)
+
+        def delete_as(cookie, public, session_id, expected_status, outcome):
+            audit = self.http_fixture.logs
+            audit.reset_mock()
+            delete_headers = headers | {"Cookie": cookie, public["csrf_header"]: public["csrf_token"]}
+            status, _, response = self.http_fixture.http("DELETE", "/api/quote-sessions/" + session_id, delete_headers)
+            self.assertEqual(status, expected_status)
+            records = [call.args[1] for call in audit.call_args_list if call.args[0] == "quote_session_delete_attempt"]
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record["outcome"], outcome)
+            for field in ("actor_tracking_id", "workspace_tracking_id", "quote_tracking_id"):
+                self.assertRegex(record[field], r"^pid-test-v1-[0-9a-f]{24}$")
+            self.assertNotIn(session_id, str(record))
+            self.assertNotIn("@", str(record))
+            return json.loads(response)
+
+        # A storage failure is logged once without including its exception.
+        with mock.patch.object(webapp.DatabaseSqagStorage, "delete_quote_session",
+                               side_effect=RuntimeError("synthetic-private-exception")):
+            failed = delete_as(admin_cookie, admin_public, ids[0], 500, "error")
+            self.assertRegex(failed["error_reference"], r"^ERR-[0-9A-F]{8}$")
+            self.assertNotIn("synthetic-private-exception", str(self.http_fixture.logs.call_args_list))
+        with mock.patch.object(webapp.DatabaseSqagStorage, "_session_deletion_blocked_by_hold", return_value=True):
+            delete_as(admin_cookie, admin_public, ids[0], 404, "rejected")
+        delete_as(peer_cookie, peer_public, ids[0], 404, "rejected")
+        delete_as(peer_cookie, peer_public, ids[1], 200, "success")
+        # A dashboard bulk confirmation calls DELETE once per selected quote.
+        for session_id in (ids[0], ids[2]):
+            delete_as(admin_cookie, admin_public, session_id, 200, "success")
+            self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace(session_id), ({}, []))
+        self.assertEqual(json.loads(self.get(admin_cookie, "/api/quote-sessions")[2])["quote_sessions"][0]["session_id"], new_id)
+        status, _, response = self.http_fixture.http("POST", "/api/log", headers, json.dumps({
+            "event": "QUOTE SESSION DELETE ATTEMPT", "details": {"outcome": "success"},
+        }))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(response), {"status": "ignored"})
 
     def test_A18_legacy_owner_mapping_recovery_and_saved_data_are_preserved(self):
         values = policy_values()

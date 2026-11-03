@@ -91,7 +91,11 @@ the server. A domain revisit stays signed out until an explicit new login.
 Storage, jobs, downloads and asynchronous snapshots retain the same stable user
 and workspace keys. Staff see their own dashboard rows. Admins see all rows in their own workspace.
 Rows outside the previous admin read scope are summaries only. Quote details,
-artifacts and mutation permissions retain their existing checks. The dashboard
+artifacts and edits retain their existing checks. Staff can delete their own
+quotes. Admins can delete any quote in their workspace, including summary-only
+rows. Legal holds and artifact cleanup checks still apply. The server writes one
+local deletion outcome per request, including each target in a bulk delete, with
+pseudonymous actor, workspace and quote references where available. The dashboard
 looks up the creator's email from the saved opaque owner ID and the current
 workspace's verified aliases. Unmapped records show Unknown. Unbound aliases receive a versioned workspace-and-email ID. Password and signing
 secret rotation leave that ID stable, as does removal and re-addition of the same

@@ -138,6 +138,28 @@ try {
   await cards.first().click();
   await page.getByText("Created by Unknown", { exact: true }).waitFor();
   await page.locator("#dashboardSearchInput").fill("");
+  const deleted = [];
+  await page.route("**/api/quote-sessions/*", async route => {
+    if (route.request().method() !== "DELETE") return route.fallback();
+    const id = new URL(route.request().url()).pathname.split("/").at(-1);
+    const index = quoteSummaries.findIndex(summary => summary.session_id === id);
+    assert.ok(index >= 0);
+    deleted.push(id);
+    quoteSummaries.splice(index, 1);
+    await route.fulfill({ json: { status: "deleted" } });
+  });
+  await page.evaluate(() => requestQuoteSessionDelete("quote-browser-mapped"));
+  assert.match(await page.locator("#quoteSessionDeleteText").textContent(), /this quote session.*from the workspace/);
+  await page.locator("#cancelQuoteSessionDeleteButton").click();
+  assert.deepEqual(deleted, []);
+  await page.evaluate(() => requestQuoteSessionDelete(
+    ["quote-browser-mapped", "quote-browser-unmapped"], { bulk: true },
+  ));
+  assert.match(await page.locator("#quoteSessionDeleteText").textContent(), /selected quote sessions.*from the workspace/);
+  await page.locator("#confirmQuoteSessionDeleteButton").click();
+  await page.locator("#quoteSessionDeleteModal").waitFor({ state: "hidden" });
+  assert.deepEqual(deleted, ["quote-browser-mapped", "quote-browser-unmapped"]);
+
   const logout=page.waitForResponse(r=>r.url()===base+"/logout"&&r.request().method()==="POST");
   await page.locator("#topbarLogoutLink").click();
   assert.equal((await logout).status(),204); await page.waitForURL(base+"/signed-out");
