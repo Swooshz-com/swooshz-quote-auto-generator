@@ -10671,26 +10671,33 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_internal_uat_coolify_env_template_rejects_disguised_team_password(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
         source_text = source.read_text(encoding="utf-8")
-        disguised_secret = source_text.replace(
-            "SQAG_INTERNAL_LOGIN_PASSWORD=<host-secret-manager-shared-team-password>",
-            "SQAG_INTERNAL_LOGIN_PASSWORD=<literal-reusable-service-credential>",
-        )
+        placeholders = {
+            "SQAG_INTERNAL_LOGIN_PASSWORD": "<host-secret-manager-operator-password>",
+            "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "<host-secret-manager-admin-password>",
+        }
+        for key, marker in placeholders.items():
+            with self.subTest(key=key):
+                disguised_secret = source_text.replace(
+                    f"{key}={marker}",
+                    f"{key}=<literal-reusable-service-credential>",
+                )
+                self.assertNotEqual(disguised_secret, source_text)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            template = Path(tmp) / "sqag.uat.env.example"
-            template.write_text(disguised_secret, encoding="utf-8")
-            result = deploy_template.verify_template(template)
+                with tempfile.TemporaryDirectory() as tmp:
+                    template = Path(tmp) / "sqag.uat.env.example"
+                    template.write_text(disguised_secret, encoding="utf-8")
+                    result = deploy_template.verify_template(template)
 
-        findings = [deploy_template.finding_to_dict(finding) for finding in result["findings"]]
-        self.assertEqual(result["status"], "blocked")
-        self.assertIn(
-            {
-                "key": "SQAG_INTERNAL_LOGIN_PASSWORD",
-                "category": "unexpected-placeholder",
-                "message": "security-sensitive placeholder does not match the approved template marker",
-            },
-            findings,
-        )
+                findings = [deploy_template.finding_to_dict(finding) for finding in result["findings"]]
+                self.assertEqual(result["status"], "blocked")
+                self.assertIn(
+                    {
+                        "key": key,
+                        "category": "unexpected-placeholder",
+                        "message": "security-sensitive placeholder does not match the approved template marker",
+                    },
+                    findings,
+                )
 
     def test_internal_uat_coolify_env_template_requires_placeholder_proxy_cidrs(self):
         source = ROOT / 'deploy' / 'internal-uat' / 'coolify' / 'sqag.uat.env.example'
