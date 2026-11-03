@@ -20022,7 +20022,11 @@ const state = {
   pricingReferenceId: "reference-a",
   pricingReferenceSource: "bundled",
 };
-const elements = { profileSelect: { value: "local::reference-b" } };
+const elements = {
+  profileSelect: { value: "local::reference-b" },
+  selectedPricingReferenceSummary: { textContent: "" },
+  pricingReferenceSourceBadge: { textContent: "" },
+};
 const currencyNode = { textContent: "" };
 const taxNode = { textContent: "" };
 const document = {
@@ -20048,6 +20052,11 @@ eval([
   "pricingReferenceFromSelectionValue",
   "pendingPricingReference",
   "pricingReferenceBasisValues",
+  "pricingReferenceSourceLabel",
+  "selectedPricingReferenceTax",
+  "selectedPricingReferenceCurrency",
+  "selectedPricingReferenceTaxText",
+  "renderSelectedPricingReferenceSummary",
   "syncPricingReferenceContextPills",
   "renderPendingPricingReferenceBasis",
   "resetPendingPricingReferenceSelection",
@@ -20058,12 +20067,16 @@ handleProfileSelectionChange();
 assert.strictEqual(state.pricingReferenceId, "reference-a");
 assert.strictEqual(state.pricingReferenceSource, "bundled");
 assert.strictEqual(currencyNode.textContent, "USD");
+assert.strictEqual(elements.selectedPricingReferenceSummary.textContent, "Selected. Continue to apply this pricing reference.");
+assert.strictEqual(elements.pricingReferenceSourceBadge.textContent, "Local catalog");
 assert.strictEqual(taxNode.textContent, "VAT 20%");
 
 assert.strictEqual(resetPendingPricingReferenceSelection(), true);
 assert.strictEqual(elements.profileSelect.value, "bundled::reference-a");
 assert.strictEqual(currencyNode.textContent, "SGD");
 assert.strictEqual(taxNode.textContent, "GST 9%");
+assert.strictEqual(elements.selectedPricingReferenceSummary.textContent, "Managed in Settings.");
+assert.strictEqual(elements.pricingReferenceSourceBadge.textContent, "Repo catalog");
 assert.strictEqual(navUpdates, 2);
 """
         completed = subprocess.run(
@@ -24409,7 +24422,7 @@ assert.notStrictEqual(pricingReferenceExportBlockReason(bundled), "");
 assert.strictEqual(pricingReferenceSourceLabel(company), "Workspace catalog");
 assert.strictEqual(pricingReferenceSourceLabel(local), "Local catalog");
 assert.strictEqual(pricingReferenceSourceLabel(bundled), "Repo catalog");
-const summaryBody = source.split("function renderSelectedPricingReferenceSummary()")[1].split("function todayDateInputValue")[0];
+const summaryBody = source.split("function renderSelectedPricingReferenceSummary(")[1].split("function todayDateInputValue")[0];
 assert.ok(summaryBody.includes("elements.pricingReferenceSourceBadge.textContent = pricingReferenceSourceLabel(reference);"));
 
 state.pricingReferences = [];

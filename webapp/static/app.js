@@ -2216,8 +2216,10 @@ function pricingReferenceBasisValues(reference = currentPricingReference()) {
 }
 
 function renderPendingPricingReferenceBasis() {
-  const basis = pricingReferenceBasisValues(pendingPricingReference() || currentPricingReference());
-  syncPricingReferenceContextPills(basis.currency, basis.taxText);
+  const intent = state.pricingReferenceSelectionIntent;
+  const pending = pendingPricingReference();
+  const preview = pending && intent?.id === pending.id && intent.source === pending.source ? pending : null;
+  renderSelectedPricingReferenceSummary({ previewOnly: true, pendingReference: preview });
 }
 
 function resetPendingPricingReferenceSelection() {
@@ -3340,25 +3342,31 @@ function resetQuoteCommercialFieldsToSelectedPricingReference(options = {}) {
   updateOutputHeader();
 }
 
-function renderSelectedPricingReferenceSummary() {
+function renderSelectedPricingReferenceSummary({ previewOnly = false, pendingReference = null } = {}) {
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
-  const reference = currentPricingReference();
+  const reference = pendingReference || currentPricingReference();
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
   const taxText = selectedPricingReferenceTaxText();
+  const displayedBasis = pendingReference
+    ? pricingReferenceBasisValues(pendingReference)
+    : reference ? { currency, taxText } : { currency: "-", taxText: "-" };
   if (elements.pricingReferenceSourceBadge) {
     elements.pricingReferenceSourceBadge.textContent = pricingReferenceSourceLabel(reference);
   }
   if (elements.selectedPricingReferenceSummary) {
-    elements.selectedPricingReferenceSummary.textContent = reference
-      ? "Managed in Settings."
-      : state.pricingReferences.length
-        ? "Select a pricing reference."
-        : MISSING_PRICING_REFERENCES_MESSAGE;
+    elements.selectedPricingReferenceSummary.textContent = pendingReference
+      ? "Selected. Continue to apply this pricing reference."
+      : reference
+        ? "Managed in Settings."
+        : state.pricingReferences.length
+          ? "Select a pricing reference."
+          : MISSING_PRICING_REFERENCES_MESSAGE;
   }
-  if (elements.selectedPricingReferenceCurrency) elements.selectedPricingReferenceCurrency.textContent = currency;
-  if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = taxText;
-  syncPricingReferenceContextPills(currency, taxText);
+  if (elements.selectedPricingReferenceCurrency) elements.selectedPricingReferenceCurrency.textContent = displayedBasis.currency;
+  if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = displayedBasis.taxText;
+  syncPricingReferenceContextPills(displayedBasis.currency, displayedBasis.taxText);
+  if (previewOnly) return;
   applyPricingReferenceCommercialDefaults();
   if (!ownedCommercial) {
     if (elements.taxLabel) elements.taxLabel.value = tax.label;
@@ -13634,6 +13642,7 @@ async function applySessionData(data = {}) {
   state.authenticated = Boolean(data.authenticated);
   state.staffEmail = state.authenticated && typeof data.staff_identity?.email === "string" ? data.staff_identity.email : "";
   state.authUser = data.user && typeof data.user === "object" ? data.user : null;
+  if (elements.feedbackButton) elements.feedbackButton.hidden = Object.hasOwn(data, "staff_identity");
   state.authenticationRecoveryBoot = false;
   state.browserRecoveryScope = nextRecoveryScope;
   if (data.permissions && typeof data.permissions === "object") {

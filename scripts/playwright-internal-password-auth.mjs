@@ -75,6 +75,36 @@ try {
   assert.equal((await copied.get(base+"/logout")).status(),405);
   assert.equal((await copied.post(base+"/logout",{headers:{Origin:base}})).status(),403);
   await page.waitForFunction(()=>typeof state!=="undefined"&&!state.isBooting);
+  await page.evaluate(() => {
+    state.pricingReferences = [
+      { id: "fixture-catalogue", source: "company", label: "Workspace fixture", currency: "SGD",
+        tax: { label: "GST", rate: 0.09 } },
+    ];
+    state.pricingReferenceId = "fixture-catalogue";
+    state.pricingReferenceSource = "bundled";
+    state.quoteCommercialLifecycle = "RECOVERED";
+    renderProfileOptions();
+    elements.profileSelect.value = "company::fixture-catalogue";
+    elements.profileSelect.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  assert.equal(await page.locator("#selectedPricingReferenceSummary").textContent(),
+    "Selected. Continue to apply this pricing reference.");
+  assert.equal(await page.locator("#customerDetailsPanel [data-reference-basis-currency]").textContent(), "SGD");
+  assert.equal(await page.locator("#customerDetailsPanel [data-reference-basis-tax]").textContent(), "GST 9%");
+  assert.equal(await page.evaluate(() => currentPricingReference()), null);
+  await page.evaluate(() => resetPendingPricingReferenceSelection());
+  assert.equal(await page.locator("#profileSelect").inputValue(), "");
+  assert.equal(await page.locator("#selectedPricingReferenceSummary").textContent(), "Select a pricing reference.");
+  assert.equal(await page.locator("#customerDetailsPanel [data-reference-basis-currency]").textContent(), "-");
+  assert.equal(await page.locator("#customerDetailsPanel [data-reference-basis-tax]").textContent(), "-");
+  const feedback = page.locator("#feedbackButton");
+  assert.equal(await feedback.isVisible(), false);
+  // The independent session response shape has no staff_identity field.
+  const { staff_identity: _staffIdentity, ...independentSession } = session;
+  assert.equal(await page.evaluate(data => applySessionData(data), independentSession), true);
+  assert.equal(await feedback.isVisible(), true);
+  assert.equal(await page.evaluate(() => refreshSessionToken()), true);
+  assert.equal(await feedback.isVisible(), false);
   const cards = page.locator(".dashboard-session-card");
   await cards.nth(1).waitFor();
   assert.equal(await cards.count(), 2);
