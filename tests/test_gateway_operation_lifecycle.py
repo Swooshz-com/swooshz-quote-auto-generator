@@ -133,7 +133,7 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
                         elif case=="shape":self.send.return_value=FixtureHttpResponse({"model":self.model(operation),"status":"completed","output":7})
                         elif case=="model_json":self.send.return_value=FixtureHttpResponse(responses_envelope(self.model(operation),"PRIVATE_NOT_JSON"))
                         real_request=ai_gateway.AiGateway.request
-                        def malformed(subject,chosen,body):return real_request(subject,chosen,{**body,"unexpected":True})
+                        def malformed(subject,chosen,body,**kwargs):return real_request(subject,chosen,{**body,"unexpected":True},**kwargs)
                         with mock.patch.object(ai_gateway.AiGateway,"request",malformed if case=="envelope" else real_request):
                             if case=="success":self.invoke(operation)
                             else:

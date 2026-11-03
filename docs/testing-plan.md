@@ -42,6 +42,16 @@ npm run playwright:smoke
   no values are emitted. These checks use synthetic local
   services and do not establish live hosted readiness.
 
+- PDF references for quote analysis: run the focused draft request and gateway
+  tests, then run the internal-password browser harness to check file admission.
+  The app accepts up to 24 MiB per PDF, 128 MiB across reference files and 48 PDF
+  pages per analysis. Draft save and analysis carry base64 JSON, so test both
+  requests through the deployed ingress with a synthetic PDF over 16 MiB before
+  rollout. Check that a multi-batch analysis includes every source page, a failed
+  batch returns a support reference without a draft, and usage distinguishes
+  measured tokens from sends with unavailable usage. Keep this check separate
+  from customer documents and the live AI provider.
+
 - Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.
 - Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.

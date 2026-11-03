@@ -1947,10 +1947,11 @@ class WebappServerTest(unittest.TestCase):
         return state, state_cookie
 
     def test_job_request_limit_covers_documented_reference_upload_capacity(self):
-        max_reference_bytes = webapp.MAX_REFERENCE_IMAGES * max(webapp.MAX_IMAGE_BYTES, webapp.MAX_PDF_BYTES)
+        max_reference_bytes = webapp.MAX_DRAFT_SOURCE_BYTES
         base64_bytes = ((max_reference_bytes + 2) // 3) * 4
 
-        self.assertGreaterEqual(webapp.request_body_limit("/api/jobs"), base64_bytes + 2 * 1024 * 1024)
+        for path in ("/api/jobs", "/api/draft", "/api/quote-sessions"):
+            self.assertGreaterEqual(webapp.request_body_limit(path), base64_bytes + 2 * 1024 * 1024)
         self.assertEqual(webapp.request_body_limit("/api/settings/pricing-references/import-preview"), webapp.MAX_REQUEST_BYTES)
 
     def test_privacy_page_is_available_and_generic_pdpa_gdpr_notice(self):
@@ -12954,6 +12955,46 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["result"]["source"], "openai")
 
+    def test_ai_requests_batch_through_both_http_entry_points(self):
+        payload = valid_payload()
+        payload["images"] = [{"name": "synthetic-scope.pdf", "data_url": synthetic_pdf(13)}]
+        model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"]
+
+        def send(request, **kwargs):
+            parts = json.loads(request.data)["input"][0]["content"]
+            if parts[0]["text"].startswith("Inspect each attached visual"):
+                result = {"observations": ["Synthetic scope"] * (len(parts) - 1)}
+            else:
+                self.assertIn('"source": "Reference 1, PDF page 13"', parts[0]["text"])
+                result = {"quote_basis_sections": [{"title": "Synthetic Scope", "lines": [{
+                    "tag": "Confirm", "text": "Synthetic booth fascia", "quantity": 1,
+                    "unit": "nos", "confidence_pct": 80,
+                }]}], "line_items": []}
+            return FixtureHttpResponse(responses_envelope(model, json.dumps(result)))
+
+        self.reset_rate_limit_state()
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "user"}),
+            mock.patch.object(webapp.urllib.request, "urlopen", side_effect=send) as provider,
+            LocalRunnerServer() as runner,
+        ):
+            session = self.http_json(runner, "GET", "/api/session")["body"]
+            headers = {session["csrf_header"]: session["csrf_token"]}
+            direct = self.http_json(runner, "POST", "/api/draft", body=payload, headers=headers)
+            self.assertEqual(direct["status"], 200, direct["body"])
+            self.assertEqual(direct["body"]["source"], "openai")
+            self.assertEqual(provider.call_count, 4)
+
+            request = {"type": "draft", "payload": payload, "job_id": "job-pdf-batch-12345678"}
+            queued = self.http_json(runner, "POST", "/api/jobs", body=request, headers=headers)
+            self.assertEqual(queued["status"], 202, queued["body"])
+            completed = wait_for_job(queued["body"]["job_id"], timeout=8)
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["result"]["source"], "openai")
+            replay = self.http_json(runner, "POST", "/api/jobs", body=request, headers=headers)
+            self.assertEqual(replay["body"]["job_id"], queued["body"]["job_id"])
+            self.assertEqual(provider.call_count, 8)
+
     def test_create_job_reuses_client_job_id_without_starting_duplicate_worker(self):
         payload = valid_payload()
         ai_draft = {"status": "drafted", "source": "openai", "quote_basis": {}, "line_items": []}
@@ -13552,7 +13593,6 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Internal catalog reference images follow", json.dumps(content))
 
     def test_ai_requests_send_pdf_references_as_input_files(self):
-        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
@@ -13578,7 +13618,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
         self.assertEqual(input_files[0]["file_data"], synthetic_pdf())
-        self.assertEqual(len(uploaded_images), 1)
+        self.assertEqual(len(uploaded_images), 2)
 
     def test_ai_requests_send_rendered_pdf_pages_as_high_detail_images(self):
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
@@ -13603,7 +13643,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         ]
 
         with (
-            mock.patch.object(webapp, "pdf_reference_page_images", return_value=rendered_pages, create=True) as render_pages,
+            mock.patch.object(webapp, "render_pdf_pages_with_pdfium", return_value=rendered_pages) as render_pages,
             mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen,
         ):
             webapp.request_openai_quote_basis(payload, "sk-test-redacted")
@@ -13622,48 +13662,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         )
         self.assertIn("Rendered PDF page images follow", json.dumps(content))
-        self.assertEqual(render_pages.call_args.kwargs["max_pages"], webapp.MAX_RENDERED_PDF_PAGES)
+        self.assertEqual(render_pages.call_args.args[2], webapp.MAX_DRAFT_PDF_PAGES)
+        self.assertTrue(render_pages.call_args.kwargs["complete"])
 
-    def test_ai_requests_cap_rendered_pdf_pages_separately_from_reference_file_limit(self):
-        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
-        payload = valid_payload()
-        payload["images"] = [
-            {
-                "name": "long-deck.pdf",
-                "type": "application/pdf",
-                "size": 16,
-                "data_url": synthetic_pdf(),
-            },
-            *[
-                {
-                    "name": f"ref-{index}.jpg",
-                    "type": "image/jpeg",
-                    "size": 4,
-                    "data_url": synthetic_image("JPEG", color="black"),
-                }
-                for index in range(webapp.MAX_REFERENCE_IMAGES - 1)
-            ],
-        ]
-        rendered_pages = [
-            {"name": f"long-deck-page-{index}.jpg", "page": index, "data_url": synthetic_image("JPEG", color="white")}
-            for index in range(webapp.MAX_RENDERED_PDF_PAGES + 4)
-        ]
-
-        with (
-            mock.patch.object(webapp, "pdf_reference_page_images", return_value=rendered_pages, create=True),
-            mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen,
-        ):
-            webapp.request_openai_quote_basis(payload, "sk-test-redacted")
-
-        content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
-        high_detail_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
-        rendered_urls = [item["image_url"] for item in high_detail_images if item["image_url"] == synthetic_image("JPEG", color="white")]
-        uploaded_urls = [item["image_url"] for item in high_detail_images if item["image_url"] == synthetic_image("JPEG", color="black")]
-        self.assertEqual(len(rendered_urls), webapp.MAX_RENDERED_PDF_PAGES)
-        self.assertEqual(len(uploaded_urls), webapp.MAX_REFERENCE_IMAGES - 1)
-
-    def test_ai_requests_send_pdf_only_as_input_file_even_when_type_is_stale(self):
-        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
+    def test_ai_requests_send_pdf_and_rendered_page_even_when_type_is_stale(self):
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
@@ -13684,10 +13686,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(len(input_files), 1)
         self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
         self.assertEqual(input_files[0]["file_data"], synthetic_pdf())
-        self.assertEqual(uploaded_images, [])
+        self.assertEqual(len(uploaded_images), 1)
 
     def test_ai_requests_send_pdf_and_images_with_data_url_mime_precedence(self):
-        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
@@ -13713,7 +13714,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(len(input_files), 1)
         self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
-        self.assertEqual([item["image_url"] for item in uploaded_images], [synthetic_image("JPEG")])
+        self.assertEqual(len(uploaded_images), 2)
+        self.assertEqual(uploaded_images[-1]["image_url"], synthetic_image("JPEG"))
 
     def test_openai_request_ignores_local_catalog_visuals(self):
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))

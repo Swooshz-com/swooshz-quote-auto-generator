@@ -119,7 +119,8 @@ const REFERENCE_FILE_ACCEPT = "image/png,image/jpeg,image/webp,application/pdf,.
 const MAX_PRICING_REFERENCE_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES = 8;
 const MAX_REFERENCE_IMAGE_MIB = 12;
-const MAX_REFERENCE_PDF_MIB = 16;
+const MAX_REFERENCE_PDF_MIB = 24;
+const MAX_REFERENCE_TOTAL_MIB = 128;
 const DEFAULT_DATE_LABEL = "Date:";
 const DEFAULT_TERMS_HEADING = "Terms & Conditions:";
 const DEFAULT_NOTES_HEADING = "Note:";
@@ -164,7 +165,7 @@ const QUOTE_COPY = {
   label: "Quotation",
   intakeSubtitle: "Drop reference images or PDFs for a real workspace quote.",
   dropTitle: "Drop reference images or PDFs to start",
-  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references. Images up to ${MAX_REFERENCE_IMAGE_MIB} MiB each, PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each. Remote AI analysis sends selected refs to the configured provider.`,
+  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references. Images up to ${MAX_REFERENCE_IMAGE_MIB} MiB each, PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each. Up to ${MAX_REFERENCE_TOTAL_MIB} MiB total. Remote AI analysis sends selected refs to the configured provider.`,
   imageNoun: "reference file",
   analyzeLabel: "Start Analysis",
   fallbackAction: "review the reference files",
@@ -1946,7 +1947,12 @@ async function readImagesFromFiles(files) {
     setImageUploadStatus([duplicateMessage, overflowMessage].filter(Boolean).join(" "));
     return;
   }
-  state.images = [...state.images, ...unique];
+  const nextImages = [...state.images, ...unique];
+  if (nextImages.reduce((total, image) => total + (Number(image.size) || 0), 0) > MAX_REFERENCE_TOTAL_MIB * 1024 * 1024) {
+    setImageUploadStatus(`Choose up to ${MAX_REFERENCE_TOTAL_MIB} MiB of reference files in total.`);
+    return;
+  }
+  state.images = nextImages;
   await persistSessionFiles(sessionFileRecordsFromImages(state.images)).catch(() => {});
   renderFiles();
   if (!quoteHasDerivedResults()) setWorkflowStage("ready_to_analyze");

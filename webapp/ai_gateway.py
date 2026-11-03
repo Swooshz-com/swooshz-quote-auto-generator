@@ -330,7 +330,7 @@ class AiGateway:
         self._clock,self._sleep=clock,sleep
         self._telemetry=telemetry
 
-    def request(self,operation,envelope):
+    def request(self,operation,envelope, *, send_budget=None):
         route=self.configuration.route(operation)
         if not isinstance(envelope,dict) or set(envelope)-{"model","input","reasoning","max_output_tokens"} or envelope.get("model")!=route.model or envelope.get("reasoning")!={"effort":route.effort} or not isinstance(envelope.get("input"),list) or not envelope["input"]:
             raise GatewayError("envelope_invalid")
@@ -349,6 +349,8 @@ class AiGateway:
         for attempt in range(1,len(delays)+2):
             start=self._clock()
             data = None
+            if send_budget is not None:
+                send_budget.claim(operation, route.model)
             try:
                 data=self._transport.send(encoded,credential=credential,timeout=self.configuration.timeout_seconds)
                 result=admit_response(data,route)
@@ -358,11 +360,24 @@ class AiGateway:
                 if usage is not None:
                     exc.diagnostics.update({key:value for key,value in usage.items() if key != "output_tokens_details"})
                 exc.diagnostics["attempt_number"]=attempt
+                if send_budget is not None:
+                    send_budget.finish(usage)
                 if self._telemetry is not None:
                     self._telemetry(operation,attempt,"failed",self._clock()-start,{**exc.diagnostics, "usage":usage, "retry_pending":exc.retryable and attempt<=len(delays)})
                 if exc.retryable and attempt<=len(delays):
                     self._sleep(delays[attempt-1]); continue
                 raise
+            except Exception:
+                if send_budget is not None:
+                    send_budget.finish(None)
+                    if self._telemetry is not None:
+                        self._telemetry(operation,attempt,"failed",self._clock()-start,{
+                            "failure_boundary":"provider_transport", "usage":None, "retry_pending":False,
+                        })
+                raise
+            usage = admitted_usage(result.get("usage"))
+            if send_budget is not None:
+                send_budget.finish(usage)
             if self._telemetry is not None:
-                self._telemetry(operation,attempt,"success",self._clock()-start,{"usage":admitted_usage(result.get("usage")), "retry_pending":False})
+                self._telemetry(operation,attempt,"success",self._clock()-start,{"usage":usage, "retry_pending":False})
             return result

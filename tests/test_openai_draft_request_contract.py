@@ -143,7 +143,6 @@ class DraftRequestContractTest(unittest.TestCase):
         self.enterContext(mock.patch.object(server, "build_quote_draft_prompt", return_value="Synthetic prompt"))
         self.catalog = self.enterContext(mock.patch.object(server, "catalog_visual_image_entries_for_payload", return_value=[]))
         self.real_pdf_pages = server.pdf_reference_page_images
-        self.pages = self.enterContext(mock.patch.object(server, "pdf_reference_page_images", return_value=[]))
         self.enterContext(mock.patch.object(server, "normalize_ai_draft", return_value={"ok": True}))
         response = json_response("openai/gpt-6.1-sol", {})
         self.send = self.enterContext(mock.patch.object(server.urllib.request, "urlopen", return_value=response))
@@ -183,6 +182,18 @@ class DraftRequestContractTest(unittest.TestCase):
         self.assertEqual(request.method, "POST")
         return {k:v for k,v in json.loads(request.data).items() if k not in {"provider", "store"}}
 
+    def mock_batch_responses(self):
+        def send(request, **kwargs):
+            body = json.loads(request.data)
+            parts = body["input"][0]["content"]
+            if parts[0]["text"].startswith("Inspect each attached visual"):
+                return json_response(
+                    body["model"], {"observations": ["Observed scope"] * (len(parts) - 1)},
+                    usage={"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
+                )
+            return json_response(body["model"], {})
+        self.send.side_effect = send
+
     def assert_rejected(self, payload, forbidden_values=()):
         self.send.reset_mock()
         self.send.side_effect = None
@@ -220,7 +231,20 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.send.assert_called_once()
                 expected = [{"type": "input_text", "text": "Synthetic prompt"}]
                 for index, url in enumerate(urls):
-                    expected.append({"type": "input_file", "filename": f"synthetic-{index}", "file_data": url} if url == self.pdf else {"type": "input_image", "image_url": url, "detail": "high"})
+                    if url == self.pdf:
+                        expected.extend([
+                            {"type": "input_file", "filename": f"synthetic-{index}", "file_data": url},
+                            {"type": "input_text", "text": (
+                                f"Rendered PDF page images follow for synthetic-{index} (pages 1). "
+                                "Use these images for visual layout, labels, dimensions, and render details; "
+                                "the original PDF file remains attached for full document context."
+                            )},
+                            {"type": "input_image", "image_url": self.real_pdf_pages(
+                                {"name": "synthetic.pdf", "data_url": url}, retain_debug=False,
+                            )[0]["data_url"], "detail": "high"},
+                        ])
+                    else:
+                        expected.append({"type": "input_image", "image_url": url, "detail": "high"})
                 self.assertEqual(body, {"model": "openai/gpt-6.1-sol", "input": [{"role": "user", "content": expected}], "reasoning": {"effort": "high"}})
 
     def test_shared_browser_media_records_pass_actual_validator(self):
@@ -278,7 +302,6 @@ class DraftRequestContractTest(unittest.TestCase):
             self.assertEqual(self.capture(self.payload(url))["input"][0]["content"][1]["image_url"], url)
 
     def test_catalog_and_pdf_page_semantics(self):
-        self.pages.return_value = [{"page": 1, "data_url": self.image}]
         self.catalog.return_value = [{"data_url": self.image, "id": "synthetic"}]
         parts = self.capture(self.payload(self.pdf, self.image))["input"][0]["content"]
         self.assertEqual([p["type"] for p in parts], ["input_text", "input_file", "input_text", "input_image", "input_image", "input_text", "input_image"])
@@ -410,7 +433,7 @@ class DraftRequestContractTest(unittest.TestCase):
     def test_pdf_byte_limit_matches_browser_json_and_preserves_aggregate_ceiling(self):
         template = base64.b64decode(self.pdf.partition(",")[2])
         end = template.rindex(b"startxref")
-        self.assertEqual(server.MAX_PDF_BYTES, 16 * 1024 * 1024)
+        self.assertEqual(server.MAX_PDF_BYTES, 24 * 1024 * 1024)
         for size in (server.MAX_PDF_BYTES - 1, server.MAX_PDF_BYTES, server.MAX_PDF_BYTES + 1):
             with self.subTest(size=size):
                 # Insert a synthetic PDF comment after xref so object offsets stay valid.
@@ -427,26 +450,23 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.assertLessEqual(len(direct_body), server.request_body_limit("/api/draft"))
                 self.assertLessEqual(len(job_body), server.request_body_limit("/api/jobs"))
                 self.send.reset_mock()
+                self.mock_batch_responses()
                 self.capture(payload)
-                self.send.assert_called_once()
+                self.assertEqual(self.send.call_count, 2)
+                self.assertNotIn("input_file", [part["type"] for call in self.send.call_args_list
+                    for part in json.loads(call.args[0].data)["input"][0]["content"]])
         self.assertEqual(server.MAX_IMAGE_BYTES, 12 * 1024 * 1024)
         self.assertEqual(server.MAX_DRAFT_INPUT_FILE_TOTAL_BYTES, 50_000_000)
 
     def test_input_file_aggregate_bytes_boundaries_and_five_pdf_reproducer(self):
         decoded_pdf_bytes = len(base64.b64decode(self.pdf.split(",", 1)[1]))
-        payload = self.payload(self.pdf, self.pdf)
-        for limit in (2 * decoded_pdf_bytes - 1, 2 * decoded_pdf_bytes, 2 * decoded_pdf_bytes + 1):
-            with self.subTest(limit=limit):
-                with mock.patch.object(server, "MAX_DRAFT_INPUT_FILE_TOTAL_BYTES", limit):
-                    if 2 * decoded_pdf_bytes > limit:
-                        self.assert_rejected(payload)
-                    else:
-                        self.capture(payload)
-
-        # The accepted G4 reproducer is five valid PDFs whose aggregate bytes
-        # exceed the final input_file ceiling before the mocked transport.
-        with mock.patch.object(server, "MAX_DRAFT_INPUT_FILE_TOTAL_BYTES", 4 * decoded_pdf_bytes):
-            self.assert_rejected(self.payload(*([self.pdf] * 5)))
+        self.mock_batch_responses()
+        for count, limit, expected_sends in ((2, 1, 2), (2, 2, 1), (5, 4, 2)):
+            with self.subTest(count=count, limit=limit):
+                self.send.reset_mock()
+                with mock.patch.object(server, "MAX_DRAFT_INPUT_FILE_TOTAL_BYTES", limit * decoded_pdf_bytes):
+                    self.capture(self.payload(*([self.pdf] * count)))
+                self.assertEqual(self.send.call_count, expected_sends)
 
     def test_full_draft_model_and_effort_are_separate_by_mode(self):
         branches = (
@@ -489,10 +509,10 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.assertEqual(body["reasoning"], {"effort": effort})
                 self.assertEqual(
                     [part["type"] for part in body["input"][0]["content"]],
-                    ["input_text", "input_file", "input_image"],
+                    ["input_text", "input_file", "input_text", "input_image", "input_image"],
                 )
                 self.assertEqual(body["input"][0]["content"][1]["file_data"], self.pdf)
-                self.assertEqual(body["input"][0]["content"][2]["image_url"], self.image)
+                self.assertEqual(body["input"][0]["content"][4]["image_url"], self.image)
 
 
     def test_full_draft_explicit_configuration_is_the_only_selection_authority(self):
@@ -1036,12 +1056,14 @@ class DraftRequestContractTest(unittest.TestCase):
                     self.assertEqual(handler.read_json(), {})
 
     def test_page_budget_and_derived_media_byte_boundaries(self):
-        for count in (server.MAX_RENDERED_PDF_PAGES - 1, server.MAX_RENDERED_PDF_PAGES, server.MAX_RENDERED_PDF_PAGES + 1):
-            self.pages.return_value = [{"page": index + 1, "data_url": self.image} for index in range(count)]
-            parts = self.capture(self.payload(self.pdf))["input"][0]["content"]
-            self.assertEqual(sum(part["type"] == "input_image" for part in parts), min(count, server.MAX_RENDERED_PDF_PAGES))
-            self.assertFalse(self.pages.call_args.kwargs["retain_debug"])
+        for count in (server.MAX_RENDERED_PDF_PAGES - 1, server.MAX_RENDERED_PDF_PAGES):
+            self.send.reset_mock()
+            parts = self.capture(self.payload(synthetic_pdf(count)))["input"][0]["content"]
+            self.assertEqual(sum(part["type"] == "input_image" for part in parts), count)
+            self.send.assert_called_once()
         length = len(base64.b64decode(self.image.split(",")[1]))
+        self.enterContext(mock.patch.object(server, "render_pdf_pages_with_pdfium",
+                                           return_value=[{"page": 1, "data_url": self.image}]))
         for limit in (length - 1, length, length + 1):
             for constant in ("MAX_RENDERED_PDF_PAGE_BYTES", "MAX_PRICING_REFERENCE_VISUAL_BYTES"):
                 self.catalog.return_value = [{"data_url": self.image}]
@@ -1050,6 +1072,67 @@ class DraftRequestContractTest(unittest.TestCase):
                         self.assert_rejected(self.payload(self.pdf))
                     else:
                         self.capture(self.payload(self.pdf))
+
+    def test_batch_coverage_mixed_sources_and_reserved_synthesis(self):
+        self.mock_batch_responses()
+        payload = self.payload(synthetic_pdf(8), self.image, synthetic_pdf(7))
+        with mock.patch.object(server, "write_local_log", return_value=True) as log:
+            synthesis = self.capture(payload)["input"][0]["content"][0]["text"]
+        expected = [*(f"Reference 1, PDF page {page}" for page in range(1, 9)),
+                    "Reference 2, uploaded image",
+                    *(f"Reference 3, PDF page {page}" for page in range(1, 8))]
+        self.assertEqual(self.send.call_count, 4)
+        for source in expected:
+            self.assertIn(f'"source": "{source}"', synthesis)
+        totals = [call.args[1] for call in log.call_args_list if call.args[0] == "draft_batch_usage"][0]
+        self.assertTrue(server.is_loggable_event("draft_batch_usage"))
+        self.assertEqual(totals["total"], {
+            "sends": 4, "unknown_usage_attempts": 1,
+            "input_tokens": 36, "output_tokens": 24, "total_tokens": 60,
+        })
+        self.assertEqual(server.sanitize_log_value(totals)["by_model"],
+                         [{"route": "draft", **totals["total"]}])
+        self.assertNotIn("openai/gpt-6.1-sol", json.dumps(totals))
+        terminal = [call.args[1] for call in log.call_args_list if call.args[0] == "ai_call_attempt"]
+        self.assertEqual(len(terminal), 4)
+        self.assertEqual([item["status"] for item in terminal], ["success"] * 4)
+
+    def test_preflight_rejects_total_page_cap_and_call_cap_without_sending(self):
+        with self.assertRaises(server.DraftBatchError) as error:
+            self.capture(self.payload(synthetic_pdf(30), synthetic_pdf(19)))
+        self.assertEqual(error.exception.diagnostics["source_number"], 2)
+        self.assertEqual(error.exception.diagnostics["batch_failure_reason"], "pdf_page_limit")
+        with mock.patch.object(server, "MAX_DRAFT_BATCH_CALLS", 3):
+            with self.assertRaises(server.DraftBatchError):
+                self.capture(self.payload(synthetic_pdf(13)))
+        self.send.assert_not_called()
+
+    def test_failed_second_pdf_preflight_reports_only_source_and_page(self):
+        original = server.render_pdf_pages_with_pdfium
+
+        def render(raw, name, max_pages, **options):
+            if name == "synthetic-1":
+                raise server.DraftBatchError("pdf_page_render", page=2)
+            return original(raw, name, max_pages, **options)
+
+        with mock.patch.object(server, "render_pdf_pages_with_pdfium", side_effect=render):
+            with self.assertRaises(server.DraftBatchError) as error:
+                self.capture(self.payload(synthetic_pdf(13), synthetic_pdf(2)))
+        details = server.ai_error_log_details("err-0123456789ab", error.exception)
+        self.assertEqual((details["source_number"], details["page_number"]), (2, 2))
+        self.assertNotIn("synthetic-1", str(details))
+        self.send.assert_not_called()
+
+    def test_batch_timeout_and_partial_observations_stop_without_synthesis(self):
+        for response in (TimeoutError(), json_response("openai/gpt-6.1-sol", {"observations": ["partial"]})):
+            with self.subTest(response=type(response)):
+                self.send.reset_mock()
+                self.send.side_effect = response if isinstance(response, Exception) else None
+                self.send.return_value = response
+                with self.assertRaises(server.DraftBatchError) as error:
+                    self.capture(self.payload(synthetic_pdf(13)))
+                self.assertEqual(error.exception.diagnostics["batch_number"], 1)
+                self.send.assert_called_once()
 
     def test_invalid_media_never_enters_local_starter_fallback(self):
         with mock.patch.object(server, "default_quote_basis") as fallback:

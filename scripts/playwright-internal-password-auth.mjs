@@ -106,10 +106,10 @@ try {
   assert.equal(await page.evaluate(() => refreshSessionToken()), true);
   assert.equal(await feedback.isVisible(), false);
   const fileInput = page.locator("#imageInput");
-  const pdfLimit = 16 * 1024 * 1024;
+  const pdfLimit = 24 * 1024 * 1024;
   await fileInput.setInputFiles({ name: "synthetic-large.pdf", mimeType: "application/pdf",
     buffer: Buffer.alloc(pdfLimit + 1) });
-  await page.getByText("Choose images up to 12 MiB and PDFs up to 16 MiB each.", { exact: true }).waitFor({ state: "attached" });
+  await page.getByText("Choose images up to 12 MiB and PDFs up to 24 MiB each.", { exact: true }).waitFor({ state: "attached" });
   assert.equal(await page.evaluate(() => state.images.length), 0);
   await fileInput.setInputFiles({ name: "synthetic-boundary.pdf", mimeType: "application/pdf",
     buffer: Buffer.alloc(pdfLimit) });
