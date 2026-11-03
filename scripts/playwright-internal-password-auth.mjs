@@ -28,15 +28,37 @@ try {
   await page.route("**/api/quote-sessions", route => route.fulfill({status:200, contentType:"application/json", body:'{"quote_sessions":[]}'}));
   await page.route("**/api/log", route => route.fulfill({status:204,body:""}));
   assert.equal((await context.request.get(base+"/api/session")).status(),401);
-  for (const [alias,password] of [["unknown"+"@"+"example.test","synthetic-browser-admin-password"],["alpha-admin"+"@"+"example.test","synthetic-wrong-password"]]) {
-    await page.goto(base+"/login");
+  async function assertAuthLayout(title, action) {
+    await page.getByRole("heading", { name: title, exact: true }).waitFor();
+    await page.locator(".auth-brand").getByText("Swooshz Quote Generator").waitFor();
+    assert.equal(await page.getByRole("link", { name: "Privacy Notice" }).getAttribute("href"), "/privacy");
+    const panel = await page.locator(".auth-panel").boundingBox();
+    const viewport = page.viewportSize();
+    assert.ok(panel && panel.x >= 0 && panel.x + panel.width <= viewport.width);
+    assert.ok(await action.evaluate(element => element.getBoundingClientRect().height >= 44));
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), viewport.width);
+  }
+  for (const [width, height, alias, password] of [
+    [1280, 800, "unknown" + "@" + "example.test", "synthetic-browser-admin-password"],
+    [375, 667, "alpha-admin" + "@" + "example.test", "synthetic-wrong-password"],
+  ]) {
+    await page.setViewportSize({ width, height });
+    await page.goto(base + "/login");
+    await assertAuthLayout("Staff sign in", page.getByRole("button", { name: "Sign in", exact: true }));
+    await page.keyboard.press("Tab");
+    assert.equal(await page.locator(":focus").getAttribute("name"), "email");
     await page.getByLabel("Email",{exact:true}).fill(alias);
     await page.getByLabel("Password",{exact:true}).fill(password);
     const failed=page.waitForResponse(r=>r.url()===base+"/login"&&r.request().method()==="POST");
     await page.getByRole("button",{name:"Sign in",exact:true}).click();
     assert.equal((await failed).status(),403);
+    const retry = page.getByRole("link", { name: "Try again", exact: true });
+    await assertAuthLayout("Could not sign in", retry);
+    assert.match(await page.locator("#authPageMessage").innerText(), /support with reference /);
+    assert.equal(await retry.getAttribute("href"), "/login");
     assert.equal((await context.request.get(base+"/api/session")).status(),401);
   }
+  await page.setViewportSize({ width: 1280, height: 800 });
   await signIn(page,base);
   const session=await (await context.request.get(base+"/api/session")).json();
   assert.equal(session.authenticated,true); assert.equal(session.user,null); assert.ok(session.browser_recovery_scope);

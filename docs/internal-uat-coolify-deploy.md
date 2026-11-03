@@ -161,9 +161,9 @@ Required names for any future hosted validation environment:
 | Reverse proxy | `SQAG_TRUSTED_PROXY_CIDRS` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
 
-Password mode rejects the former internal Google configuration and mixed OIDC
-or Platform configuration. Preserve the existing user IDs, roles and workspace
-in the server-only identity bindings. Actual credentials and identity-continuity
+Password mode ignores retired Google settings and rejects mixed OIDC or Platform
+configuration. Keep the workspace and existing user IDs for continuity. Set
+staff roles in the active password-mode email lists. Actual credentials and identity-continuity
 qualification remain separate host operations, not repository validation. See
 [internal staff password access](internal-password-auth-mode.md) for the exact
 admission and session contract. The independent local OIDC and Platform adapters

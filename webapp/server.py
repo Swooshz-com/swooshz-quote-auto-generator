@@ -428,8 +428,6 @@ INTERNAL_LOGIN_PASSWORD_ENV_NAME = "SQAG_INTERNAL_LOGIN_PASSWORD"
 INTERNAL_ALLOWED_EMAILS_ENV_NAME = "SQAG_INTERNAL_ALLOWED_EMAILS"
 INTERNAL_ALLOWED_ADMIN_EMAILS_ENV_NAME = "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN"
 INTERNAL_ADMIN_LOGIN_PASSWORD_ENV_NAME = "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD"
-INTERNAL_ADMIN_EMAILS_ENV_NAME = "SQAG_INTERNAL_ADMIN_EMAILS"
-INTERNAL_OPERATOR_EMAILS_ENV_NAME = "SQAG_INTERNAL_OPERATOR_EMAILS"
 QUOTE_OUTPUT_ROOT_ENV_NAME = "QUOTE_OUTPUT_ROOT"
 QUOTE_TMP_ROOT_ENV_NAME = "QUOTE_TMP_ROOT"
 QUOTE_LOG_ROOT_ENV_NAME = "QUOTE_LOG_ROOT"
@@ -2039,8 +2037,7 @@ def internal_auth_policy_config_complete() -> bool:
 
 def internal_password_config_complete() -> bool:
     incompatible_keys = (
-        "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON", INTERNAL_ADMIN_EMAILS_ENV_NAME,
-        INTERNAL_OPERATOR_EMAILS_ENV_NAME, AUTH_ALLOWED_EMAILS_ENV_NAME,
+        AUTH_ALLOWED_EMAILS_ENV_NAME,
         AUTH_ALLOWED_DOMAINS_ENV_NAME, AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME,
         AUTH_APPROVED_TESTER_ROLE_ENV_NAME, PLATFORM_BASE_URL_ENV_NAME,
         PLATFORM_SERVICE_SECRET_ENV_NAME, OIDC_ISSUER_URL_ENV_NAME,
@@ -2181,10 +2178,7 @@ def platform_launch_config_complete() -> bool:
             INTERNAL_LOGIN_PASSWORD_ENV_NAME,
             INTERNAL_ADMIN_LOGIN_PASSWORD_ENV_NAME,
             INTERNAL_ALLOWED_ADMIN_EMAILS_ENV_NAME,
-            "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
             INTERNAL_ALLOWED_EMAILS_ENV_NAME,
-            INTERNAL_ADMIN_EMAILS_ENV_NAME,
-            INTERNAL_OPERATOR_EMAILS_ENV_NAME,
             OIDC_ISSUER_URL_ENV_NAME,
             OIDC_CLIENT_ID_ENV_NAME,
             OIDC_CLIENT_SECRET_ENV_NAME,
@@ -3151,11 +3145,23 @@ def safe_logout_redirect_url(value: str) -> str:
     return "/signed-out"
 
 
-def auth_html_page(title: str, message: str, *, action_href: str = "/login", action_label: str = "Sign in") -> bytes:
-    safe_title = html.escape(clean_text(title) or "Internal UAT access", quote=True)
+def auth_html_page(
+    title: str, message: str, *, action_href: str = "/login", action_label: str = "Sign in",
+    nonce: str | None = None,
+) -> bytes:
+    safe_title = html.escape(clean_text(title) or "Swooshz Quote Generator", quote=True)
     safe_message = html.escape(clean_text(message), quote=True)
-    safe_action_href = html.escape(safe_logout_redirect_url(action_href), quote=True)
-    safe_action_label = html.escape(clean_text(action_label) or "Continue", quote=True)
+    if nonce is not None:
+        action = f"""<form class="auth-form" action="/login" method="post" aria-describedby="authPageMessage">
+        <input type="hidden" name="nonce" value="{html.escape(nonce, quote=True)}">
+        <label>Email <input name="email" type="email" autocomplete="username" maxlength="254" required></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" maxlength="1024" required></label>
+        <button class="primary-button" type="submit">Sign in</button>
+      </form>"""
+    else:
+        safe_action_href = html.escape(safe_logout_redirect_url(action_href), quote=True)
+        safe_action_label = html.escape(clean_text(action_label) or "Continue", quote=True)
+        action = f'<a class="primary-button auth-panel-action" href="{safe_action_href}">{safe_action_label}</a>'
     body = f"""<!doctype html>
 <html lang="en">
   <head>
@@ -3163,16 +3169,21 @@ def auth_html_page(title: str, message: str, *, action_href: str = "/login", act
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{safe_title}</title>
     <link rel="icon" href="/static/assets/swooshz-mark.png">
-    <link rel="stylesheet" href="/static/styles.css?v=66">
+    <link rel="stylesheet" href="/static/styles.css?v={static_asset_version("styles.css")}">
   </head>
   <body class="auth-page">
     <main class="auth-panel" aria-labelledby="authPageTitle">
-      <img src="/static/assets/swooshz-mark.png" alt="" class="auth-panel-mark">
-      <p class="workspace-pane-eyebrow">INTERNAL UAT</p>
+      <div class="auth-brand">
+        <img src="/static/assets/swooshz-mark.png" alt="" class="auth-panel-mark">
+        <p>Swooshz Quote Generator</p>
+      </div>
       <h1 id="authPageTitle">{safe_title}</h1>
-      <p>{safe_message}</p>
-      <p class="auth-panel-note">Approved internal testers only. This app does not offer public signup, password login, account management, or customer portal access.</p>
-      <a class="primary-button auth-panel-action" href="{safe_action_href}">{safe_action_label}</a>
+      <p id="authPageMessage">{safe_message}</p>
+      {action}
+      <nav class="auth-panel-note auth-links" aria-label="Legal">
+        <a href="/terms">Terms</a>
+        <a href="/privacy">Privacy Notice</a>
+      </nav>
     </main>
   </body>
 </html>
@@ -3948,12 +3959,12 @@ def production_readiness_status(
             blockers.append(readiness_blocker(
                 "internal_password_auth_contract_incomplete",
                 "P1",
-                "Temporary internal Google authentication is selected but its exact allowlist, role, OIDC, or session contract is incomplete.",
+                "Staff password access is selected but its role lists, passwords, or session configuration are incomplete.",
             ))
         blockers.append(readiness_blocker(
             "temporary_internal_auth_not_public_release_ready",
             "P1",
-            "Temporary internal Google authentication can never satisfy public production readiness.",
+            "Staff password access is limited to internal use.",
             gates=("production",),
         ))
     if not database_mode:
@@ -32605,7 +32616,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if path == "/signed-out":
             self.send_auth_page(
                 "Signed out",
-                "You have been signed out of the internal UAT quote runner.",
+                "Your session has ended. Sign in again to open the quote generator.",
                 action_href=configured_platform_home_url() or "/login",
                 action_label="Sign in again",
             )
@@ -34073,11 +34084,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return False
         if self.command == "GET" and not path.startswith("/api/"):
             if internal_password_mode_enabled():
-                # A domain revisit must not let provider SSO undo app logout.
-                # Only the explicit sign-in action starts a new OIDC transaction.
+                # Require an explicit sign-in after logout.
                 self.send_auth_page(
                     "Sign in required",
-                    "Sign in to open the internal UAT quote runner.",
+                    "Sign in to open the quote generator.",
                     action_href="/login",
                     action_label="Sign in",
                     status=401,
@@ -34121,24 +34131,15 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         try:
             nonce, binding = self.server.internal_auth.begin_login()
         except InternalAuthStateError:
-            self.send_json({"error": "Sign in is temporarily unavailable."}, status=503)
+            self.send_password_failure(503, "login_capacity")
             return
-        body = ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                "<title>Staff sign in</title></head><body><main><h1>Staff sign in</h1>"
-                "<p>Choose an approved staff email and enter the shared team password.</p>"
-                "<form action=\"/login\" method=\"post\">"
-                f"<input type=\"hidden\" name=\"nonce\" value=\"{html.escape(nonce)}\">"
-                "<p><label>Email <input name=\"email\" type=\"email\" autocomplete=\"username\" maxlength=\"254\" required></label></p>"
-                "<p><label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" maxlength=\"1024\" required></label></p>"
-                "<button type=\"submit\">Sign in</button></form></main></body></html>").encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Set-Cookie", cookie_header_value("sqag_login_binding", binding, max_age=LOGIN_NONCE_TTL_SECONDS))
-        self.send_security_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_auth_page(
+            "Staff sign in", "Enter your approved staff email and the password for your role.",
+            nonce=nonce,
+            extra_headers=[("Set-Cookie", cookie_header_value(
+                "sqag_login_binding", binding, max_age=LOGIN_NONCE_TTL_SECONDS,
+            ))],
+        )
 
     def handle_password_login(self) -> None:
         if not internal_password_mode_enabled():
@@ -34207,8 +34208,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         reference = new_error_reference()
         write_local_log("security_event", {"reason":reason, "path":"/login", "status":status, "error_reference":reference})
-        self.send_auth_page("Sign in was not completed", "Sign in could not be completed. Start a new sign-in attempt. Reference: "+reference,
-                            status=status, extra_headers=[("Set-Cookie", clear_cookie_header_value("sqag_login_binding"))])
+        self.send_auth_page(
+            "Could not sign in",
+            f"Try again. If this keeps happening, contact support with reference {reference}.",
+            action_label="Try again", status=status,
+            extra_headers=[("Set-Cookie", clear_cookie_header_value("sqag_login_binding"))],
+        )
 
     def handle_oidc_callback(self, query: str) -> None:
         if deploy_requires_trusted_proxy_guard() or deploy_requires_auth_guard():
@@ -34420,8 +34425,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         action_href: str = "/login",
         action_label: str = "Sign in",
         extra_headers: list[tuple[str, str]] | None = None,
+        nonce: str | None = None,
     ) -> None:
-        body = auth_html_page(title, message, action_href=action_href, action_label=action_label)
+        body = auth_html_page(title, message, action_href=action_href, action_label=action_label, nonce=nonce)
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

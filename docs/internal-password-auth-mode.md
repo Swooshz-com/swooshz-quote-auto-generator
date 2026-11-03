@@ -38,12 +38,18 @@ The alias union and the binding array are each limited to 100 identities.
 Each list and the binding JSON are each limited to 16 KiB. Emails
 are at most 254 characters; stable IDs retain the previous 6-255-character ASCII
 syntax. Host parsing and env-size compatibility require separate installed tests.
-The former internal Google mode, identity map, admin/operator email lists,
-OIDC configuration and Platform configuration are refused in password mode.
+The retired Google mode cannot start a session. The former Google identity map
+and role lists are ignored by the runtime and rejected by the current deployment
+template verifier. They are `SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON`,
+`SQAG_INTERNAL_ADMIN_EMAILS` and `SQAG_INTERNAL_OPERATOR_EMAILS`. Keep them only
+with rollback snapshots that still run the old Google implementation. The
+independent local OIDC and Platform settings remain incompatible with password
+mode.
 
 ## Request and session behaviour
 
-`GET /login` renders a standalone form without listing allowed identities. It
+`GET /login` renders a branded form without listing allowed identities. Staff
+enter their approved email and the password for their role. It
 limits form issuance to ten requests per effective client per 60 seconds before
 allocating a nonce. This bucket is separate from the password-attempt budget.
 Login logs keep only the canonical `/login` path, discarding submitted authority,

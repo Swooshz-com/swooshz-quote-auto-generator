@@ -67,7 +67,14 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
         for alias in (email(), email("operator")):
             admin = alias == email()
             with mock.patch.object(auth.hashlib, "pbkdf2_hmac", wraps=auth.hashlib.pbkdf2_hmac) as derive:
-                self.assertEqual(self.login(alias, password_for(email("operator") if admin else email()))[0], 403)
+                status, _, body = self.login(alias, password_for(email("operator") if admin else email()))
+                self.assertEqual(status, 403)
+                reference = re.search(rb"reference (ERR-[0-9A-F]{8})", body)
+                self.assertIsNotNone(reference)
+                self.logs.assert_any_call("security_event", {
+                    "reason": "login_denied", "path": "/login", "status": 403,
+                    "error_reference": reference.group(1).decode("ascii"),
+                })
                 status, headers, _ = self.login(alias)
                 self.assertEqual(status, 302)
                 self.assertEqual(derive.call_count, 2)
@@ -117,8 +124,13 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
     def test_A01_A19_incomplete_mixed_and_old_mode_fail_closed(self):
         for key in ["SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD","SQAG_INTERNAL_LOGIN_PASSWORD","SQAG_INTERNAL_WORKSPACE_ID","SESSION_SECRET","SQAG_TRUSTED_PROXY_CIDRS"]:
             with self.subTest(key=key), mock.patch.dict(os.environ,{key:""}): self.assertFalse(webapp.internal_password_config_complete())
-        for key in ["OIDC_CLIENT_ID","SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON","SQAG_PLATFORM_SERVICE_SECRET","SQAG_INTERNAL_ADMIN_EMAILS"]:
+        for key in ["OIDC_CLIENT_ID", "SQAG_PLATFORM_SERVICE_SECRET"]:
             with self.subTest(key=key),mock.patch.dict(os.environ,{key:"synthetic-unused-value"}): self.assertFalse(webapp.internal_password_config_complete())
+        retired_keys = ("SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON", "SQAG_INTERNAL_ADMIN_EMAILS",
+                        "SQAG_INTERNAL_OPERATOR_EMAILS")
+        with mock.patch.dict(os.environ, dict.fromkeys(retired_keys, "synthetic-obsolete-setting")):
+            self.assertTrue(webapp.internal_password_config_complete())
+            self.assertEqual(self.login()[0], 302)
         with mock.patch.dict(os.environ,{"SQAG_AUTH_MODE":"internal_google"}): self.assertTrue(webapp.deploy_requires_auth_guard())
         self.assertEqual(self.http("GET","/callback?code=synthetic")[0],404)
 
