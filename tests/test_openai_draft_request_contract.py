@@ -340,6 +340,42 @@ class DraftRequestContractTest(unittest.TestCase):
         for entries in [None, {}, [], [None], [{"data_url": self.image}], [{"name": "ignored", "type": "text/plain"}]]:
             self.assert_rejected({"images": entries})
 
+    def test_draft_pre_send_media_diagnostics_disambiguate_without_sending(self):
+        corrupt = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\ncorrupt").decode("ascii")
+        cases = (
+            ("reference_media", "media_dimension_limit", synthetic_image(size=(4097, 1)), []),
+            ("reference_media", "media_decode_failed", corrupt, []),
+            ("catalog_media", "media_decode_failed", self.image, [{"data_url": corrupt}]),
+        )
+        for stage, reason, upload, catalog in cases:
+            with self.subTest(stage=stage, reason=reason), mock.patch.object(
+                server, "pricing_reference_authority_error", return_value=""
+            ), mock.patch.object(server, "write_local_log") as logs:
+                self.catalog.return_value = catalog
+                self.send.reset_mock()
+                payload = self.payload(upload)
+                payload["images"][0]["name"] = "synthetic-private-filename.png"
+                server.finish_draft_job("job-synthetic", payload)
+                self.send.assert_not_called()
+                attempts = [call.args[1] for call in logs.call_args_list if call.args[0] == "ai_call_attempt"]
+                outer = [call.args[1] for call in logs.call_args_list if call.args[0] == "draft_failed"]
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(len(outer), 1)
+                for record in (attempts[0], outer[0]):
+                    self.assertEqual(record["failure_boundary"], "request_validation")
+                    self.assertEqual(record["attempt_number"], 0)
+                    self.assertEqual(record["request_validation_stage"], stage)
+                    self.assertEqual(record["request_validation_reason"], reason)
+                    self.assertNotIn("synthetic-private-filename", str(record))
+                    self.assertNotIn("data:image", str(record))
+        self.catalog.return_value = []
+        self.capture()
+        self.send.assert_called_once()
+        self.assertEqual(server.safe_ai_output_diagnostics({
+            "request_validation_stage": "arbitrary_value",
+            "request_validation_reason": "arbitrary_value",
+        }), {})
+
     def test_invalid_assembled_envelope(self):
         valid = self.capture()
         cases = []

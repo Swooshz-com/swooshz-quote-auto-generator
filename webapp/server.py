@@ -1268,10 +1268,14 @@ class AiTransportOperationScope:
                     duration_ms=self.pending["duration_ms"], error_reference=self.error_reference,
                     **self.attempt_metadata, **details)
             elif self.operation["attempt_number"] == 0 and not self.validation_recorded and (exc_type is not None or self.pre_send_failure):
+                diagnostics = safe_ai_output_diagnostics(getattr(exc, "diagnostics", {}))
+                validation_details = {key: diagnostics[key] for key in (
+                    "request_validation_stage", "request_validation_reason",
+                ) if key in diagnostics}
                 log_ai_call_attempt(feature=self.feature, provider=AI_PROVIDER_OPENROUTER, model="", status="failed",
                     attempt_number=0, failure_boundary="request_validation", failure_kind="configuration",
                     retry_lineage_id=self.operation["retry_lineage_id"], error_reference=self.error_reference,
-                    **self.attempt_metadata)
+                    **self.attempt_metadata, **validation_details)
         finally:
             self.active = False
             self.context.transport_operation = self.previous_operation
@@ -21148,7 +21152,16 @@ SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS = {
 }
 
 
+DRAFT_REQUEST_VALIDATION_STAGES = frozenset({
+    "reference_media", "catalog_media", "rendered_pdf_media", "request_envelope",
+})
+DRAFT_REQUEST_VALIDATION_REASONS = frozenset({
+    "invalid_input", "invalid_media_format", "media_byte_limit", "media_dimension_limit", "media_decode_failed",
+})
+
 SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
+    "request_validation_stage",
+    "request_validation_reason",
     "provider_error_type",
     "provider_error_param",
     "request_shape_sha256",
@@ -21176,6 +21189,11 @@ def safe_ai_output_diagnostics(value: Any) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {}
     for key in SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS | SAFE_AI_FAILURE_DIAGNOSTIC_KEYS:
         item = value.get(key)
+        if key in {"request_validation_stage", "request_validation_reason"}:
+            allowed = DRAFT_REQUEST_VALIDATION_STAGES if key == "request_validation_stage" else DRAFT_REQUEST_VALIDATION_REASONS
+            if isinstance(item, str) and item in allowed:
+                diagnostics[key] = item
+            continue
         if key == "provider_error_param":
             param = safe_draft_error_param(item)
             if param:
@@ -25575,17 +25593,22 @@ def normalize_ai_draft(
     return result
 
 
-def draft_request_invalid() -> None:
+def draft_request_invalid(stage: str = "request_envelope", reason: str = "invalid_input") -> None:
     raise OpenAIAnalysisError(
         "AI draft request contains invalid or unsupported media or request fields.",
-        diagnostics={"failure_boundary": "request_validation", "attempt_number": 0},
-    )
+        diagnostics={
+            "failure_boundary": "request_validation", "attempt_number": 0,
+            "request_validation_stage": stage, "request_validation_reason": reason,
+        },
+    ) from None
 
 
-def validate_draft_media(data_url: Any, max_bytes: int | None = None) -> str:
+def validate_draft_media(
+    data_url: Any, max_bytes: int | None = None, *, stage: str = "reference_media",
+) -> str:
     """Validate in memory; never normalize or retain supplied media or parser errors."""
     if not isinstance(data_url, str):
-        draft_request_invalid()
+        draft_request_invalid(stage, "invalid_media_format")
     prefix, separator, encoded = data_url.partition(",")
     mime_by_prefix = {
         "data:image/jpeg;base64": "image/jpeg",
@@ -25595,58 +25618,68 @@ def validate_draft_media(data_url: Any, max_bytes: int | None = None) -> str:
     }
     mime = mime_by_prefix.get(prefix)
     if not separator or not mime:
-        draft_request_invalid()
+        draft_request_invalid(stage, "invalid_media_format")
     limit = max_bytes if max_bytes is not None else (MAX_PDF_BYTES if mime == "application/pdf" else MAX_IMAGE_BYTES)
-    if not encoded or len(encoded) > 4 * ((limit + 2) // 3):
-        draft_request_invalid()
+    if not encoded:
+        draft_request_invalid(stage, "invalid_media_format")
+    if len(encoded) > 4 * ((limit + 2) // 3):
+        draft_request_invalid(stage, "media_byte_limit")
     try:
         raw = base64.b64decode(encoded, validate=True)
-        if not raw or len(raw) > limit or base64.b64encode(raw).decode("ascii") != encoded:
-            draft_request_invalid()
+        if len(raw) > limit:
+            draft_request_invalid(stage, "media_byte_limit")
+        if not raw or base64.b64encode(raw).decode("ascii") != encoded:
+            draft_request_invalid(stage, "invalid_media_format")
         if mime == "application/pdf":
             if not looks_like_complete_pdf(raw):
-                draft_request_invalid()
+                draft_request_invalid(stage, "invalid_media_format")
             import pypdfium2 as pdfium
 
             document = pdfium.PdfDocument(io.BytesIO(raw))
             try:
                 if len(document) < 1:
-                    draft_request_invalid()
+                    draft_request_invalid(stage, "invalid_media_format")
                 for index in range(len(document)):
                     page = document[index]
                     try:
                         if any(not math.isfinite(dimension) or dimension <= 0 for dimension in page.get_size()):
-                            draft_request_invalid()
+                            draft_request_invalid(stage, "invalid_media_format")
                     finally:
                         page.close()
             finally:
                 document.close()
         else:
             if image_mime_type_from_bytes(raw) != mime:
-                draft_request_invalid()
+                draft_request_invalid(stage, "invalid_media_format")
             from PIL import Image
 
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
                 with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
-                    if image.format != PROMPT_IMAGE_PIL_FORMAT_BY_MIME[mime] or not prompt_image_dimensions_are_allowed(image.size):
-                        draft_request_invalid()
+                    if image.format != PROMPT_IMAGE_PIL_FORMAT_BY_MIME[mime]:
+                        draft_request_invalid(stage, "invalid_media_format")
+                    if not prompt_image_dimensions_are_allowed(image.size):
+                        draft_request_invalid(stage, "media_dimension_limit")
                     image.verify()
                 with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
                     image.load()
+    except OpenAIAnalysisError:
+        raise
     except Exception:
-        # Parser exceptions may contain supplied content; do not chain or log them.
-        draft_request_invalid()
-    return mime
+        # Parser exceptions may contain supplied content. Raise outside the handler.
+        pass
+    else:
+        return mime
+    draft_request_invalid(stage, "media_decode_failed")
 
 
 def validate_draft_references(payload: dict[str, Any]) -> list[dict[str, Any]]:
     entries = payload.get("images")
     if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_REFERENCE_IMAGES:
-        draft_request_invalid()
+        draft_request_invalid("reference_media")
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"].strip():
-            draft_request_invalid()
+            draft_request_invalid("reference_media")
         validate_draft_media(entry.get("data_url"))
     return entries
 
@@ -25776,18 +25809,20 @@ def request_openai_quote_basis(
                         ),
                     })
                     for page in rendered_pages:
-                        if validate_draft_media(page.get("data_url"), MAX_RENDERED_PDF_PAGE_BYTES) == "application/pdf":
-                            draft_request_invalid()
+                        if validate_draft_media(page.get("data_url"), MAX_RENDERED_PDF_PAGE_BYTES, stage="rendered_pdf_media") == "application/pdf":
+                            draft_request_invalid("rendered_pdf_media", "invalid_media_format")
                         content.append({"type": "input_image", "image_url": page["data_url"], "detail": "high"})
                     rendered_pdf_pages_remaining -= len(rendered_pages)
         elif mime_type.startswith("image/"):
             content.append({"type": "input_image", "image_url": data_url, "detail": "high"})
     catalog_visuals = catalog_visual_image_entries_for_payload(payload, auth_session=auth_session)
     if not isinstance(catalog_visuals, list) or len(catalog_visuals) > MAX_PROMPT_CATALOG_VISUAL_IMAGES:
-        draft_request_invalid()
+        draft_request_invalid("catalog_media")
     for image in catalog_visuals:
-        if not isinstance(image, dict) or validate_draft_media(image.get("data_url"), MAX_PRICING_REFERENCE_VISUAL_BYTES) == "application/pdf":
-            draft_request_invalid()
+        if not isinstance(image, dict) or validate_draft_media(
+            image.get("data_url"), MAX_PRICING_REFERENCE_VISUAL_BYTES, stage="catalog_media",
+        ) == "application/pdf":
+            draft_request_invalid("catalog_media", "invalid_media_format")
     catalog_visual_prompt = catalog_visual_prompt_text(catalog_visuals)
     if catalog_visual_prompt:
         content.append({"type": "input_text", "text": catalog_visual_prompt})
