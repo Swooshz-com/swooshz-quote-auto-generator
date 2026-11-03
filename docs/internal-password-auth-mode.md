@@ -80,17 +80,20 @@ eight hours; at most 4,096 sessions and 1,024 pending nonces are retained. Resta
 logout and any material policy or password change invalidate sessions. Existing
 Google-mode cookies cannot establish password access.
 
-`/api/session` returns permissions and an opaque browser-recovery scope without
-an identity roster, binding digest or internal user record. `POST /logout`
+`/api/session` returns permissions, the signed-in staff member's own email and
+role, and an opaque browser-recovery scope. It omits the identity roster,
+binding digest and internal user record. `POST /logout`
 requires the authenticated session's CSRF token and revokes the copied cookie on
 the server. A domain revisit stays signed out until an explicit new login.
 
 ## Existing work and independent modes
 
 Storage, jobs, downloads and asynchronous snapshots retain the same stable user
-and workspace keys. Operators retain owner-only editing. Existing same-workspace
-admin visibility of progressed/generated quotations remains bounded; other users'
-drafts are not made editable. Unbound aliases receive a versioned workspace-and-email ID. Password and signing
+and workspace keys. Staff see their own dashboard rows. Admins see all rows in their own workspace.
+Rows outside the previous admin read scope are summaries only. Quote details,
+artifacts and mutation permissions retain their existing checks. The dashboard
+looks up the creator's email from the saved opaque owner ID and the current
+workspace's verified aliases. Unmapped records show Unknown. Unbound aliases receive a versioned workspace-and-email ID. Password and signing
 secret rotation leave that ID stable, as does removal and re-addition of the same
 alias. Renaming an alias needs a separate continuity decision. Admins manage
 pricing references, including imports and exports. Operators can select a

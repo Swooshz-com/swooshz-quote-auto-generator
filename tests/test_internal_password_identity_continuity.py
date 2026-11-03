@@ -151,6 +151,78 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         self.assertEqual(self.saved_snapshot(storage, session_id), original)
         self.assertEqual(self.get(owner_cookie, "/api/session")[0], 200)
 
+    def test_staff_dashboard_projects_only_workspace_summaries_and_verified_creators(self):
+        owner_cookie, owner, owner_public = self.admit()
+        peer_cookie, peer, peer_public = self.admit("peer")
+        admin_cookie, _, admin_public = self.admit("admin")
+        owner_storage = webapp.app_storage_for_auth_session(owner)
+        peer_storage = webapp.app_storage_for_auth_session(peer)
+        ids = ("quote-staff-owner", "quote-staff-peer", "quote-staff-legacy")
+        payload = fixtures.valid_payload()
+        for session_id, storage in zip(ids, (owner_storage, peer_storage, owner_storage)):
+            payload["quote_session"] = {
+                "session_id": session_id, "draft_state": {"activeSidePanel": "customer"},
+                "owner": {"user_id": "client-supplied-owner"}, "created_by": email("forged"),
+            }
+            storage.create_or_update_quote_session(payload)
+        with owner_storage.connection() as connection:
+            row = connection.execute(
+                "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                (owner_storage.workspace_id, ids[2]),
+            ).fetchone()
+            legacy = json.loads(row["metadata_json"])
+            legacy.pop("owner")
+            connection.execute(
+                "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ?",
+                (json.dumps(legacy), owner_storage.workspace_id, ids[2]),
+            )
+            connection.commit()
+        for cookie, expected, alias, public in (
+            (owner_cookie, {ids[0]: email("operator")}, "operator", owner_public),
+            (peer_cookie, {ids[1]: email("peer")}, "peer", peer_public),
+            (admin_cookie, dict(zip(ids, (email("operator"), email("peer"), ""))), "admin", admin_public),
+        ):
+            with self.subTest(alias=alias):
+                role = "admin" if alias == "admin" else "operator"
+                self.assertEqual(public["staff_identity"], {"email": email(alias), "role": role})
+                self.assertIsNone(public["user"])
+                status, _, body = self.get(cookie, "/api/quote-sessions?role=admin&owner_id=any")
+                self.assertEqual(status, 200)
+                sessions = json.loads(body)["quote_sessions"]
+                self.assertEqual({row["session_id"]: row["created_by"] for row in sessions}, expected)
+                self.assertEqual(len(sessions), len(expected))
+                for session in sessions:
+                    self.assertNotIn("owner", session)
+                    if alias == "admin":
+                        self.assertTrue(session["dashboard_summary_only"])
+                        self.assertTrue({"draft_state", "draft_files", "exports", "pricing_ledger"}.isdisjoint(session))
+                headers = {"Cookie": cookie, "Origin": http_fixtures.ORIGIN,
+                           public["csrf_header"]: public["csrf_token"], "Content-Type": "application/json"}
+                for session_id in set(ids) - ({ids[0]} if alias == "operator" else {ids[1]} if alias == "peer" else set()):
+                    path = "/api/quote-sessions/" + session_id
+                    self.assertEqual(self.get(cookie, path)[0], 404)
+                    self.assertEqual(self.get(cookie, path + "/download/xlsx")[0], 404)
+                    self.assertEqual(self.http_fixture.http("DELETE", path, headers)[0], 404)
+        # Existing save recovery issues a fresh caller-owned ID on an ownership
+        # conflict. It must leave the requested session and its owner untouched.
+        before = owner_storage._read_quote_session_metadata_for_workspace(ids[0])
+        payload["quote_session"]["session_id"] = ids[0]
+        headers = {"Cookie": admin_cookie, "Origin": http_fixtures.ORIGIN, "Content-Type": "application/json",
+                   admin_public["csrf_header"]: admin_public["csrf_token"]}
+        status, _, body = self.http_fixture.http("POST", "/api/quote-sessions", headers, json.dumps(payload))
+        self.assertEqual(status, 200)
+        new_id = json.loads(body)["quote_session"]["session_id"]
+        self.assertNotIn(new_id, ids)
+        self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace(ids[0]), before)
+        new_metadata, _ = owner_storage._read_quote_session_metadata_for_workspace(new_id)
+        self.assertEqual(new_metadata["owner"], {"user_id": "stable-google-subject"})
+        self.assertNotIn("created_by", new_metadata)
+        changes = {"SQAG_INTERNAL_WORKSPACE_ID": "workspace-identity-other"}
+        with mock.patch.dict(os.environ, changes), self.http_fixture.fresh_server_if(changes):
+            other, _, _ = self.admit("admin")
+            self.assertEqual(json.loads(self.get(other, "/api/quote-sessions")[2])["quote_sessions"], [])
+            self.assertEqual(self.get(other, "/api/quote-sessions/" + ids[0])[0], 404)
+
     def test_A18_legacy_owner_mapping_recovery_and_saved_data_are_preserved(self):
         values = policy_values()
         legacy_subject = "stable-google-operator-subject"

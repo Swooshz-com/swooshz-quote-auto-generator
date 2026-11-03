@@ -16633,7 +16633,11 @@ class DatabaseSqagStorage:
         self._run_storage_transaction(mark_failed)
         return changed
 
-    def list_quote_sessions(self) -> list[dict[str, Any]]:
+    def list_quote_sessions(self, *, staff_policy: InternalAuthPolicy | None = None) -> list[dict[str, Any]]:
+        staff_dashboard = staff_policy is not None and staff_policy.workspace_id == self.workspace_id
+        creators = {
+            privacy_safe_tracking_id(identity.user_id): identity.email for identity in staff_policy.identities
+        } if staff_dashboard else {}
         with self.connection() as connection:
             rows = connection.execute("select metadata_json from sqag_quote_sessions where workspace_id = ?", (self.workspace_id,)).fetchall()
         sessions: list[dict[str, Any]] = []
@@ -16644,10 +16648,24 @@ class DatabaseSqagStorage:
                 continue
             if not isinstance(metadata, dict):
                 continue
-            if not self._quote_session_visible_to_current_user(metadata):
+            if self._quote_session_visible_to_current_user(metadata):
+                session = self._public_quote_session(metadata)
+            elif staff_dashboard and self.can_view_other_user_quote_sessions():
+                # Extra dashboard rows are summaries. Never resolve artifacts or draft files here.
+                normalized = normalized_quote_session_metadata(metadata)
+                if not normalized:
+                    continue
+                session = {key: normalized[key] for key in (
+                    "session_id", "created_at", "updated_at", "customer_summary",
+                    "quote_company_profile", "pricing_reference", "commercials",
+                )}
+                session["draft_progress"] = quote_session_draft_progress(normalized["draft_state"])
+                session["dashboard_summary_only"] = True
+            else:
                 continue
-            session = self._public_quote_session(metadata)
             if session:
+                if staff_dashboard:
+                    session["created_by"] = creators.get(self._quote_session_owner_id(metadata), "")
                 sessions.append(session)
         return sorted(sessions, key=lambda item: (iso_timestamp_sort_value(item.get("updated_at")), clean_text(item.get("session_id")).casefold()), reverse=True)
 
@@ -32653,6 +32671,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "authenticated": bool(session),
                 "permissions": self.current_permissions(),
                 "user": None if internal_password_mode_enabled() else (session.get("user") if session else None),
+                **({"staff_identity": self.current_staff_identity(session)} if internal_password_mode_enabled() else {}),
                 "browser_recovery_scope": browser_recovery_scope(session),
             })
             return
@@ -32727,7 +32746,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if storage is None:
                 return
             try:
-                sessions = storage.list_quote_sessions()
+                auth_session = self.current_auth_session()
+                staff_identity = self.current_staff_identity(auth_session)
+                if staff_identity and isinstance(storage, DatabaseSqagStorage):
+                    sessions = storage.list_quote_sessions(staff_policy=self.server.internal_policy)
+                else:
+                    sessions = storage.list_quote_sessions()
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
@@ -33643,6 +33667,16 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "failed", "errors": safe_error_messages([f"Unexpected local runner error. Reference: {error_reference}."])}, status=500)
             return
         self.send_json(result)
+
+    def current_staff_identity(self, session: dict[str, Any] | None) -> dict[str, str] | None:
+        policy = self.server.internal_policy
+        if not policy or not session or session.get("auth_mode") != INTERNAL_AUTH_MODE:
+            return None
+        user = session["user"]
+        identity = policy.identity_for_subject(user.get("subject"))
+        if not identity or user.get("account") != policy.workspace_id or user.get("internal_role") != identity.role:
+            return None
+        return {"email": identity.email, "role": identity.role}
 
     def current_quote_session_storage(self) -> LocalSqagStorage | DatabaseSqagStorage | None:
         try:

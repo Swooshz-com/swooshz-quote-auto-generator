@@ -25,7 +25,14 @@ try {
     external.push("external request blocked"); return route.abort("blockedbyclient");
   });
   const page = await context.newPage();
-  await page.route("**/api/quote-sessions", route => route.fulfill({status:200, contentType:"application/json", body:'{"quote_sessions":[]}'}));
+  // HTTP tests independently verify server-side ownership and row admission.
+  const quoteSummaries = [
+    { session_id: "quote-browser-mapped", customer_summary: { customer_name: "Mapped fixture" },
+      created_by: "alpha-operator" + "@" + "example.test", dashboard_summary_only: true },
+    { session_id: "quote-browser-unmapped", customer_summary: { customer_name: "Legacy fixture" },
+      created_by: "", dashboard_summary_only: true },
+  ];
+  await page.route("**/api/quote-sessions", route => route.fulfill({ json: { quote_sessions: quoteSummaries } }));
   await page.route("**/api/log", route => route.fulfill({status:204,body:""}));
   assert.equal((await context.request.get(base+"/api/session")).status(),401);
   async function assertAuthLayout(title, action) {
@@ -62,10 +69,24 @@ try {
   await signIn(page,base);
   const session=await (await context.request.get(base+"/api/session")).json();
   assert.equal(session.authenticated,true); assert.equal(session.user,null); assert.ok(session.browser_recovery_scope);
+  assert.deepEqual(session.staff_identity, { email: "alpha-admin" + "@" + "example.test", role: "admin" });
+  await page.locator("#topbarAuthText").getByText("Signed in as alpha-admin" + "@" + "example.test (Admin)", { exact: true }).waitFor();
   const copied=await request.newContext({storageState:await context.storageState()});
   assert.equal((await copied.get(base+"/logout")).status(),405);
   assert.equal((await copied.post(base+"/logout",{headers:{Origin:base}})).status(),403);
   await page.waitForFunction(()=>typeof state!=="undefined"&&!state.isBooting);
+  const cards = page.locator(".dashboard-session-card");
+  await cards.nth(1).waitFor();
+  assert.equal(await cards.count(), 2);
+  await cards.filter({ hasText: "Mapped fixture" }).click();
+  await page.getByText("Created by alpha-operator" + "@" + "example.test", { exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Modify quote" }).isDisabled(), true);
+  await page.locator("#dashboardSearchInput").fill("Legacy fixture");
+  await cards.filter({ hasText: "Legacy fixture" }).waitFor();
+  assert.equal(await cards.count(), 1);
+  await cards.first().click();
+  await page.getByText("Created by Unknown", { exact: true }).waitFor();
+  await page.locator("#dashboardSearchInput").fill("");
   const logout=page.waitForResponse(r=>r.url()===base+"/logout"&&r.request().method()==="POST");
   await page.locator("#topbarLogoutLink").click();
   assert.equal((await logout).status(),204); await page.waitForURL(base+"/signed-out");
@@ -76,6 +97,8 @@ try {
   }
   await signIn(page,base,"alpha-operator"+"@"+"example.test","synthetic-browser-operator-password");
   const selected=await (await context.request.get(base+"/api/session")).json();
+  assert.deepEqual(selected.staff_identity, { email: "alpha-operator" + "@" + "example.test", role: "operator" });
+  await page.locator("#topbarAuthText").getByText("Signed in as alpha-operator" + "@" + "example.test (Operator)", { exact: true }).waitFor();
   assert.equal(selected.authenticated,true); assert.notEqual(selected.browser_recovery_scope,session.browser_recovery_scope);
   assert.equal((await copied.get(base+"/api/session")).status(),401);
   assert.deepEqual(external,[]);

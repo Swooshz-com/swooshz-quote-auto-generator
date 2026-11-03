@@ -315,6 +315,7 @@ const state = {
   authRequired: false,
   authenticated: false,
   authUser: null,
+  staffEmail: "",
   browserRecoveryScope: "",
   isRecoveryScopeTransitioning: false,
   pendingFeedback: "",
@@ -13631,6 +13632,7 @@ async function applySessionData(data = {}) {
   state.csrfToken = data.csrf_token;
   state.authRequired = Boolean(data.auth_required);
   state.authenticated = Boolean(data.authenticated);
+  state.staffEmail = state.authenticated && typeof data.staff_identity?.email === "string" ? data.staff_identity.email : "";
   state.authUser = data.user && typeof data.user === "object" ? data.user : null;
   state.authenticationRecoveryBoot = false;
   state.browserRecoveryScope = nextRecoveryScope;
@@ -13654,7 +13656,8 @@ function renderAuthState() {
   if (!showAuthState) return;
   if (state.authenticated) {
     const role = authRoleLabel();
-    elements.topbarAuthText.textContent = role ? `Signed in as approved tester (${role})` : "Signed in as approved tester";
+    const label = state.staffEmail || "approved tester";
+    elements.topbarAuthText.textContent = role ? `Signed in as ${label} (${role})` : `Signed in as ${label}`;
   } else {
     elements.topbarAuthText.textContent = "Sign in required for internal UAT";
   }
@@ -13702,6 +13705,7 @@ async function recoverRequiredAuthentication(status, data = {}) {
   clearQuoteSessionDraftSaveTimer();
   state.authRequired = true;
   state.authenticated = false;
+  state.staffEmail = "";
   state.csrfToken = "";
   renderAuthState();
   const epoch = browserRecoveryEpoch;
@@ -15073,7 +15077,7 @@ function mergeDashboardDraftSummaryDetails(draftState = {}, session = {}) {
 }
 
 function dashboardSessionCanModify(session = {}) {
-  return Boolean(safeQuoteSessionId(session.session_id || ""));
+  return session.dashboard_summary_only !== true && Boolean(safeQuoteSessionId(session.session_id || ""));
 }
 
 async function loadQuoteSessionDetail(sessionId = "") {
@@ -15629,6 +15633,7 @@ function renderDashboardSinglePanel(activeSession = {}) {
         <h3 id="dashboardSelectedSessionTitle">${escapeHtml(customer)}</h3>
         <p class="settings-note">${escapeHtml(project)}</p>
         <p class="dashboard-selected-created"><span>Created ${escapeHtml(createdText)}</span><span>Modified ${escapeHtml(modifiedText)}</span></p>
+        ${typeof activeSession.created_by === "string" ? `<p class="settings-note">Created by ${escapeHtml(activeSession.created_by || "Unknown")}</p>` : ""}
       </div>
       ${dashboardSelectedCloseButton("Clear selected session")}
     </header>
