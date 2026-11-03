@@ -10767,7 +10767,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertIn("topbarAuthState", html_text)
         self.assertIn("Sign in required for internal UAT", js)
-        self.assertIn("Signed in as approved tester", js)
+        self.assertIn(
+            'state.staffEmail = state.authenticated && typeof data.staff_identity?.email === "string"'
+            ' ? data.staff_identity.email : "";',
+            js,
+        )
+        self.assertIn('const label = state.staffEmail || "approved tester";', js)
+        self.assertIn('topbarAuthText.textContent = role ? `Signed in as ${label} (${role})`', js)
+        self.assertIn('state.authenticated = false;\n  state.staffEmail = "";', js)
         self.assertIn("topbarLogoutLink", js)
         self.assertIn("auth-page", css)
         self.assertNotIn("authUser.email", js)
