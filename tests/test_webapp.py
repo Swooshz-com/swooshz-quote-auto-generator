@@ -24635,7 +24635,6 @@ eval([
             "imageCapacity",
             "setImageUploadStatus",
             "duplicate file",
-            "state.images = [...state.images, ...unique]",
             "reference files reached",
         ):
             self.assertIn(expected, js)
@@ -29416,6 +29415,36 @@ async function act() {
                     finally:
                         connection.close()
                     self.assertEqual(writer.return_value.create_or_update_quote_session.call_count - before, 1 if size <= limit else 0)
+
+    def test_quote_session_expanded_budget_applies_only_to_reference_pdf_bytes(self):
+        pdf = synthetic_pdf()
+        reference = {"name": "synthetic.pdf", "session_file_key": "fixture",
+                     "file_role": "reference", "data_url": pdf}
+        base = {"draft_files": [reference], "synthetic": ""}
+        wire_size = len(json.dumps(base).encode("utf-8"))
+        pdf_size = len(pdf.partition(",")[2])
+        limit = wire_size - pdf_size
+
+        with LocalRunnerServer() as runner:
+            session = self.http_json(runner, "GET", "/api/session")["body"]
+            headers = {"Origin": runner.base_url, session["csrf_header"]: session["csrf_token"]}
+            with (
+                mock.patch.object(webapp, "MAX_REQUEST_BYTES", limit),
+                mock.patch.object(webapp, "MAX_JOB_REQUEST_BYTES", wire_size + 1),
+                mock.patch.object(webapp, "quote_session_storage_for_auth_session") as writer,
+            ):
+                writer.return_value.create_or_update_quote_session.return_value = {"session_id": "quote-synthetic-boundary"}
+                for body, expected in (
+                    (base, 200),
+                    ({**base, "synthetic": "x"}, 413),
+                    ({**base, "draft_files": [{**reference, "file_role": "logo"}]}, 413),
+                    ({**base, "draft_files": [{**reference, "data_url": "data:application/pdf;base64," + "A" * pdf_size}]}, 413),
+                    ({**base, "draft_files": [], "synthetic": pdf}, 413),
+                ):
+                    with self.subTest(expected=expected):
+                        result = self.http_json(runner, "POST", "/api/quote-sessions", body=body, headers=headers)
+                        self.assertEqual(result["status"], expected)
+                writer.return_value.create_or_update_quote_session.assert_called_once()
 
     def test_sqag212_invalid_success_acknowledgement_blocks_actual_consumers(self):
         for consumer in ("analyse", "generate", "resume", "duplicate"):

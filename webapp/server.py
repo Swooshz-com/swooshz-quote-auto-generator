@@ -781,11 +781,45 @@ GENERATION_REQUEST_ALREADY_ACCEPTED_MESSAGE = "This generation request has alrea
 
 
 def request_body_limit(path: str) -> int:
-    # The browser saves draft reference files before starting analysis.
     path = urlparse(path).path
     if path in {"/api/jobs", "/api/draft", "/api/quote-sessions"}:
         return MAX_JOB_REQUEST_BYTES
     return MAX_REQUEST_BYTES
+
+
+def pdf_request_fits_standard_budget(path: str, payload: dict[str, Any], length: int) -> bool:
+    """Allow only admitted PDF bytes to extend the standard JSON limit."""
+    checkpoint = path == "/api/quote-sessions"
+    entries = payload.get("draft_files" if checkpoint else "images")
+    if not isinstance(entries, list):
+        return False
+    seen_keys: set[str] = set()
+    source_bytes = 0
+    pdf_wire_bytes = 0
+    for entry in entries[:MAX_REFERENCE_IMAGES + int(checkpoint)]:
+        if not isinstance(entry, dict):
+            continue
+        if checkpoint:
+            key = dashboard_safe_text(entry.get("session_file_key"), 180)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if entry.get("file_role") != "reference":
+                continue
+        elif not isinstance(entry.get("name"), str) or not entry["name"].strip():
+            continue
+        url = entry.get("data_url")
+        if not isinstance(url, str) or not url.startswith("data:application/pdf;base64,"):
+            continue
+        try:
+            validate_draft_media(url)
+        except OpenAIAnalysisError:
+            return False
+        offset = len("data:application/pdf;base64,")
+        encoded_length = len(url) - offset
+        source_bytes += encoded_length // 4 * 3 - (2 if url.endswith("==") else int(url.endswith("=")))
+        pdf_wire_bytes += encoded_length
+    return source_bytes <= MAX_DRAFT_SOURCE_BYTES and length - pdf_wire_bytes <= MAX_REQUEST_BYTES
 
 
 def safe_stderr(message: str) -> None:
@@ -34691,13 +34725,22 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             raise RequestBodyError("Request body is required.")
+        too_large = "Request body is too large for the local runner."
         if length > request_body_limit(self.path):
-            raise RequestBodyError("Request body is too large for the local runner.", status=413)
+            raise RequestBodyError(too_large, status=413)
+        path = urlparse(self.path).path
+        needs_pdf_budget = length > MAX_REQUEST_BYTES and path in {"/api/draft", "/api/quote-sessions"}
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            if needs_pdf_budget:
+                raise RequestBodyError(too_large, status=413) from None
             raise RequestBodyError("Request body must be valid JSON.") from exc
+        if needs_pdf_budget and (
+            not isinstance(payload, dict) or not pdf_request_fits_standard_budget(path, payload, length)
+        ):
+            raise RequestBodyError(too_large, status=413)
         if not isinstance(payload, dict):
             raise RequestBodyError("Request body must be a JSON object.")
         return payload

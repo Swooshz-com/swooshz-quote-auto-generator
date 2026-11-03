@@ -449,6 +449,11 @@ class DraftRequestContractTest(unittest.TestCase):
                 job_body = json.dumps({"type": "draft", "payload": json.loads(direct_body)}).encode()
                 self.assertLessEqual(len(direct_body), server.request_body_limit("/api/draft"))
                 self.assertLessEqual(len(job_body), server.request_body_limit("/api/jobs"))
+                handler = object.__new__(server.QuoteRunnerHandler)
+                handler.path = "/api/draft"
+                handler.headers = {"Content-Type": "application/json", "Content-Length": str(len(direct_body))}
+                handler.rfile = io.BytesIO(direct_body)
+                self.assertEqual(handler.read_json()["images"][0]["data_url"], data_url)
                 self.send.reset_mock()
                 self.mock_batch_responses()
                 self.capture(payload)
@@ -1041,19 +1046,31 @@ class DraftRequestContractTest(unittest.TestCase):
                     self.capture()
 
     def test_inbound_json_boundaries(self):
-        for length in (99, 100, 101):
-            handler = object.__new__(server.QuoteRunnerHandler)
-            handler.path = "/api/jobs"
-            handler.headers = {"Content-Type": "application/json", "Content-Length": str(length)}
-            handler.rfile = io.BytesIO(b'{}' + b' ' * (length - 2))
-            with mock.patch.object(server, "MAX_JOB_REQUEST_BYTES", 100):
-                if length > 100:
-                    with self.assertRaises(server.RequestBodyError) as caught:
-                        handler.read_json()
-                    self.assertEqual(caught.exception.status, 413)
-                    self.assertEqual(handler.rfile.tell(), 0)
-                else:
-                    self.assertEqual(handler.read_json(), {})
+        for path in ("/api/jobs", "/api/draft", "/api/quote-sessions"):
+            for length in (99, 100, 101):
+                handler = object.__new__(server.QuoteRunnerHandler)
+                handler.path = path
+                handler.headers = {"Content-Type": "application/json", "Content-Length": str(length)}
+                handler.rfile = io.BytesIO(b'{}' + b' ' * (length - 2))
+                with mock.patch.object(server, "MAX_JOB_REQUEST_BYTES", 100):
+                    if length > 100:
+                        with self.assertRaises(server.RequestBodyError) as caught:
+                            handler.read_json()
+                        self.assertEqual(caught.exception.status, 413)
+                        self.assertEqual(handler.rfile.tell(), 0)
+                    else:
+                        self.assertEqual(handler.read_json(), {})
+
+    def test_direct_draft_extended_limit_rejects_non_pdf_json(self):
+        body = json.dumps(self.payload() | {"_pricing_reference_snapshot": None}).encode()
+        handler = object.__new__(server.QuoteRunnerHandler)
+        handler.path = "/api/draft"
+        handler.headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        with mock.patch.object(server, "MAX_REQUEST_BYTES", len(body) - 1):
+            with self.assertRaises(server.RequestBodyError) as caught:
+                handler.read_json()
+        self.assertEqual(caught.exception.status, 413)
 
     def test_page_budget_and_derived_media_byte_boundaries(self):
         for count in (server.MAX_RENDERED_PDF_PAGES - 1, server.MAX_RENDERED_PDF_PAGES):
