@@ -407,6 +407,31 @@ class DraftRequestContractTest(unittest.TestCase):
             else:
                 self.capture()
 
+    def test_pdf_byte_limit_matches_browser_json_and_preserves_aggregate_ceiling(self):
+        template = base64.b64decode(self.pdf.partition(",")[2])
+        end = template.rindex(b"startxref")
+        self.assertEqual(server.MAX_PDF_BYTES, 16 * 1024 * 1024)
+        for size in (server.MAX_PDF_BYTES - 1, server.MAX_PDF_BYTES, server.MAX_PDF_BYTES + 1):
+            with self.subTest(size=size):
+                # Insert a synthetic PDF comment after xref so object offsets stay valid.
+                padding = size - len(template)
+                pdf = template[:end] + b"%" + b"x" * (padding - 2) + b"\n" + template[end:]
+                data_url = "data:application/pdf;base64," + base64.b64encode(pdf).decode("ascii")
+                payload = self.payload(data_url)
+                if size > server.MAX_PDF_BYTES:
+                    self.assert_rejected(payload)
+                    continue
+                # Exercise the same JSON and base64 encodings as the browser.
+                direct_body = json.dumps(payload | {"_pricing_reference_snapshot": None}).encode()
+                job_body = json.dumps({"type": "draft", "payload": json.loads(direct_body)}).encode()
+                self.assertLessEqual(len(direct_body), server.request_body_limit("/api/draft"))
+                self.assertLessEqual(len(job_body), server.request_body_limit("/api/jobs"))
+                self.send.reset_mock()
+                self.capture(payload)
+                self.send.assert_called_once()
+        self.assertEqual(server.MAX_IMAGE_BYTES, 12 * 1024 * 1024)
+        self.assertEqual(server.MAX_DRAFT_INPUT_FILE_TOTAL_BYTES, 50_000_000)
+
     def test_input_file_aggregate_bytes_boundaries_and_five_pdf_reproducer(self):
         decoded_pdf_bytes = len(base64.b64decode(self.pdf.split(",", 1)[1]))
         payload = self.payload(self.pdf, self.pdf)

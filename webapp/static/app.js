@@ -118,6 +118,8 @@ const PRICING_REFERENCE_FILE_ACCEPT = ".xlsx,.csv,.md";
 const REFERENCE_FILE_ACCEPT = "image/png,image/jpeg,image/webp,application/pdf,.pdf";
 const MAX_PRICING_REFERENCE_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES = 8;
+const MAX_REFERENCE_IMAGE_MIB = 12;
+const MAX_REFERENCE_PDF_MIB = 16;
 const DEFAULT_DATE_LABEL = "Date:";
 const DEFAULT_TERMS_HEADING = "Terms & Conditions:";
 const DEFAULT_NOTES_HEADING = "Note:";
@@ -162,7 +164,7 @@ const QUOTE_COPY = {
   label: "Quotation",
   intakeSubtitle: "Drop reference images or PDFs for a real workspace quote.",
   dropTitle: "Drop reference images or PDFs to start",
-  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references, 12 MB each; remote AI analysis sends selected refs to the configured provider.`,
+  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references. Images up to ${MAX_REFERENCE_IMAGE_MIB} MiB each, PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each. Remote AI analysis sends selected refs to the configured provider.`,
   imageNoun: "reference file",
   analyzeLabel: "Start Analysis",
   fallbackAction: "review the reference files",
@@ -1921,6 +1923,14 @@ async function readImagesFromFiles(files) {
     return;
   }
   const overflowCount = Math.max(0, referenceFiles.length - capacity);
+  const oversizedFile = referenceFiles.slice(0, capacity).find((file) => {
+    const limit = referenceFileType(file) === "application/pdf" ? MAX_REFERENCE_PDF_MIB : MAX_REFERENCE_IMAGE_MIB;
+    return file.size > limit * 1024 * 1024;
+  });
+  if (oversizedFile) {
+    setImageUploadStatus(`Choose images up to ${MAX_REFERENCE_IMAGE_MIB} MiB and PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each.`);
+    return;
+  }
   let images;
   try {
     images = await filesToImageEntries(referenceFiles, capacity);
