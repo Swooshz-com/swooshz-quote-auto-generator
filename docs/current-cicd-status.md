@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-09-30
+Last updated: 2026-11-04
 
 Source of truth: `.github/workflows/ci.yml`
 
@@ -79,6 +79,8 @@ Source of truth: `.github/workflows/ci.yml`
 
 ## Validate App Checks
 
+- Runs on `ubuntu-24.04` so the locked Playwright Chromium dependency installer
+  uses a supported Ubuntu runtime. Other jobs retain their existing runner selection.
 - Installs Python 3.12.13 (the exact patch shared with the retrospective job) and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
   This current application dependency set is used only by `Validate app`; the
