@@ -1,4 +1,4 @@
-pypdfium2==5.13.0
+pypdfium2==5.14.0
 pillow==13.0.0
 PyJWT[crypto]==2.15.1
 cryptography==50.0.2
