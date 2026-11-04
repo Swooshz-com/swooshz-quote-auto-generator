@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-10-30
+Last updated: 2026-11-05
 
 Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
 
@@ -152,31 +152,33 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 ## Deploy Runtime Gate
 
 - CI still performs no deployment.
-- Normal and High Quality full Analyse each require explicit model and reasoning
-  settings in the deployed process environment (Coolify): `OPENAI_DRAFT_MODEL`,
-  `OPENAI_DRAFT_REASONING_EFFORT`, `OPENAI_DRAFT_HIGH_QUALITY_MODEL`, and
-  `OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Each operation captures its
-  selected mode's pair once for payload validation and telemetry. Missing, blank
-  or malformed settings fail before provider transport; source defaults
-  and local `.env` values cannot fill deployed gaps. The requested runtime pairs
-  are `gpt-6.1-sol/high` and `gpt-6-astra/high`. Bounded model and effort
-  identifiers pass through without a source allowlist. The provider owns model
-  access, reasoning compatibility and image/PDF capability; an incompatible pair
-  fails truthfully after one send without a model/effort downgrade. Arbitrary
-  configured model labels are redacted from logs, telemetry and evidence. Local
-  development retains `.env` support. These request checks do not change
-  process-only liveness or perform
-  configuration mutation, deployment or provider verification.
+- All six maintained inference operations require `OPENROUTER_API_KEY` and
+  explicit `OPENROUTER_<SUFFIX>_MODEL`,
+  `OPENROUTER_<SUFFIX>_REASONING_EFFORT` and
+  `OPENROUTER_<SUFFIX>_PROVIDER_ONLY` settings in the deployed process environment.
+  The suffixes, timeout and required privacy/routing settings are defined in
+  [the gateway contract](ai-gateway.md). Each operation captures one immutable
+  configuration for payload validation, transport and telemetry. Missing, blank
+  or invalid settings fail before transport; source defaults and local `.env`
+  values cannot fill deployed gaps. There is no provider/model fallback or
+  effort downgrade. Arbitrary configured model labels are redacted from logs,
+  telemetry and evidence. Local development retains explicit `.env` support.
+  These source checks do not verify installed configuration, account access or
+  exact Responses image/PDF/effort/privacy compatibility, and do not change
+  process-only liveness or perform configuration mutation or deployment.
 - `APP_MODE=deploy` requires an explicit `SQAG_AUTH_MODE` of `platform` or
   `internal_password`, plus `AUTH_REQUIRED=true`; missing, unknown, local, mixed,
   or incomplete configurations fail closed.
 - `platform` preserves the Swooshz Platform launch, workspace, entitlement, and
   per-request validation/revocation boundary.
 - `internal_password` is a temporary single-instance private-alpha lane with
-  one bounded server-only stable-ID/email/role binding map and exact semicolon
-  allowlist, a shared group password, per-request policy revalidation and
-  server-side revocation. Mixed legacy configuration is rejected. It can never
-  satisfy public production readiness.
+  separate semicolon-delimited operator/admin alias lists and distinct shared
+  passwords for each configured role. Optional server-only continuity bindings
+  preserve stable IDs; the role lists grant access, with admin precedence on
+  overlap. It retains per-request policy revalidation and server-side revocation.
+  See [internal staff password access](internal-password-auth-mode.md) for the
+  exact settings and limits. Mixed legacy configuration is rejected. It can
+  never satisfy public production readiness.
 - Platform deploy requests accept only signed sessions containing the consumed Platform
   user, workspace, app, and supported membership-role context. Pre-existing
   OIDC-only cookies are treated as unauthenticated and cannot inherit a tester

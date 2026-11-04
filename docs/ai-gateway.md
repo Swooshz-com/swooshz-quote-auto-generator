@@ -76,9 +76,12 @@ Responses media/effort/privacy equivalence for this installation.
 
 ## Remaining installed holds
 
-The actual prior per-operation models and efforts have not been acquired. Exact
-mapping, any conflict with historical provider policy, approved downstream
-endpoint/privacy behaviour, original-PDF-plus-image compatibility, identity
-continuity and all installed route checks remain cutover/acceptance holds.
+Per-operation model and effort mappings are recorded for the current candidate.
+Recorded mappings do not prove the effective installed settings or exact
+model/provider/account/media/privacy compatibility. The reported installed Normal
+PDF-analysis request failed with HTTP 404; its cause remains unverified. Approved
+downstream endpoint/privacy behaviour, original-PDF-plus-image compatibility,
+identity continuity and successful qualification of all six installed operations
+remain acceptance holds.
 Synthetic tests prove source contracts only. No credentials, live inference,
 deployment or customer-record operation is authorised by these instructions.
