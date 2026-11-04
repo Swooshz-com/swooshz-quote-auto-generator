@@ -34,7 +34,6 @@ ROOT = Path(__file__).resolve().parents[1]
 QUOTE_GENERATOR_FIXTURE_ROOT = ROOT / "tests" / "fixtures" / "quote-generator"
 KONCEPT_PROFILE = QUOTE_GENERATOR_FIXTURE_ROOT / "profiles" / "synthetic-exhibition-fixture-template"
 KONCEPT_PRICING_REFERENCE = QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references" / "synthetic-exhibition-fixture-pricing"
-TEST_SAMPLE_ROOT = QUOTE_GENERATOR_FIXTURE_ROOT / "samples" / "kent-group"
 LEGACY_BUNDLED_PROFILE = ROOT / "profiles" / "koncept"
 LEGACY_BUNDLED_PRICING_REFERENCE = ROOT / "pricing-references" / "koncept-exhibition-quotation"
 KONCEPT_CATALOG = KONCEPT_PRICING_REFERENCE / "pricing-catalog.json"
@@ -56,6 +55,26 @@ import verify_internal_uat_deploy_template as deploy_template
 from webapp import server as webapp
 
 AI_DRAFT_PROTECTED_MODE_UNAVAILABLE_MESSAGE = "AI draft generation is not available in this environment."
+
+def synthetic_distinct_pages_pdf(pages):
+    """Build a small PDF whose pages each draw a differently placed black box."""
+    objects = ["<< /Type /Catalog /Pages 2 0 R >>"]
+    kids = " ".join(f"{3 + index * 2} 0 R" for index in range(pages))
+    objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {pages} >>")
+    for index in range(pages):
+        content = f"0 g {10 + index * 60} 20 50 50 re f".encode("ascii")
+        objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents {4 + index * 2} 0 R >>")
+        objects.append(f"<< /Length {len(content)} >>\nstream\n{content.decode('ascii')}\nendstream")
+    body = b"%PDF-1.4\n"
+    offsets = []
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(body))
+        body += f"{number} 0 obj\n{obj}\nendobj\n".encode("ascii")
+    xref_at = len(body)
+    body += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii")
+    body += "".join(f"{offset:010d} 00000 n \n" for offset in offsets).encode("ascii")
+    body += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode("ascii")
+    return body
 
 
 def highly_compressible_rgb_png(width, height):
@@ -11598,12 +11617,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(profile_pack.layout_rules_path, expected_layout)
         self.assertEqual(webapp.default_layout_rules_payload()["template"]["workbook"], "quotation-layout.xlsx")
 
-    def test_sample_fixture_is_test_only_and_not_product_loaded(self):
-        raw_sample = json.loads((TEST_SAMPLE_ROOT / "sample.json").read_text(encoding="utf-8"))
-
-        self.assertEqual(raw_sample["profile_id"], "koncept")
-        self.assertEqual(raw_sample["pricing_reference_id"], "koncept-exhibition-quotation")
-        self.assertTrue((TEST_SAMPLE_ROOT / "kent-group.pdf").is_file())
+    def test_sample_loaders_are_not_product_loaded(self):
+        self.assertFalse((QUOTE_GENERATOR_FIXTURE_ROOT / "samples").exists())
         self.assertFalse(hasattr(webapp, "load_sample"))
         self.assertFalse(hasattr(webapp, "list_samples"))
         self.assertFalse(hasattr(webapp, "sample_dir"))
@@ -11978,17 +11993,17 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual({image["renderer"] for image in images}, {"pdfium"})
         self.assertTrue(all(image["data_url"].startswith("data:image/jpeg;base64,") for image in images))
 
-    def test_pdf_reference_page_images_uses_pdfium_for_sample_pdf_when_installed(self):
+    def test_pdf_reference_page_images_uses_pdfium_for_synthetic_pdf_when_installed(self):
         try:
             import pypdfium2  # noqa: F401
         except Exception:
             self.skipTest("pypdfium2 is not installed in this runtime.")
 
-        pdf_path = TEST_SAMPLE_ROOT / "kent-group.pdf"
         entry = {
-            "name": "kent-group.pdf",
+            "name": "synthetic-deck.pdf",
             "type": "application/pdf",
-            "data_url": webapp.file_data_url(pdf_path),
+            "data_url": "data:application/pdf;base64,"
+            + base64.b64encode(synthetic_distinct_pages_pdf(3)).decode("ascii"),
         }
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(webapp, "DEFAULT_TMP_ROOT", Path(tmp)):
@@ -12628,7 +12643,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["images"] = [
             {
-                "name": "kent-group.pdf",
+                "name": "synthetic-deck.pdf",
                 "type": "application/pdf",
                 "size": 16,
                 "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
@@ -12647,7 +12662,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
         input_files = [item for item in content if item.get("type") == "input_file"]
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
-        self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
+        self.assertEqual(input_files[0]["filename"], "synthetic-deck.pdf")
         self.assertEqual(input_files[0]["file_data"], "data:application/pdf;base64,JVBERi0xLjQK")
         self.assertEqual(len(uploaded_images), 1)
 
@@ -12659,7 +12674,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["images"] = [
             {
-                "name": "kent-group.pdf",
+                "name": "synthetic-deck.pdf",
                 "type": "application/pdf",
                 "size": 16,
                 "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
@@ -12672,8 +12687,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             },
         ]
         rendered_pages = [
-            {"name": "kent-group-page-1.jpg", "page": 1, "data_url": "data:image/jpeg;base64,cGFnZTE="},
-            {"name": "kent-group-page-2.jpg", "page": 2, "data_url": "data:image/jpeg;base64,cGFnZTI="},
+            {"name": "synthetic-deck-page-1.jpg", "page": 1, "data_url": "data:image/jpeg;base64,cGFnZTE="},
+            {"name": "synthetic-deck-page-2.jpg", "page": 2, "data_url": "data:image/jpeg;base64,cGFnZTI="},
         ]
 
         with (
@@ -12685,7 +12700,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
         input_files = [item for item in content if item.get("type") == "input_file"]
         high_detail_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
-        self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
+        self.assertEqual(input_files[0]["filename"], "synthetic-deck.pdf")
         self.assertEqual(input_files[0]["file_data"], "data:application/pdf;base64,JVBERi0xLjQK")
         self.assertEqual(
             [item["image_url"] for item in high_detail_images],
@@ -12747,7 +12762,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["images"] = [
             {
-                "name": "kent-group.pdf",
+                "name": "synthetic-deck.pdf",
                 "type": "image/png",
                 "size": 16,
                 "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
@@ -12761,7 +12776,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         input_files = [item for item in content if item.get("type") == "input_file"]
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(len(input_files), 1)
-        self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
+        self.assertEqual(input_files[0]["filename"], "synthetic-deck.pdf")
         self.assertEqual(input_files[0]["file_data"], "data:application/pdf;base64,JVBERi0xLjQK")
         self.assertEqual(uploaded_images, [])
 
@@ -12773,7 +12788,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         payload["images"] = [
             {
-                "name": "kent-group.pdf",
+                "name": "synthetic-deck.pdf",
                 "type": "image/png",
                 "size": 16,
                 "data_url": "data:application/pdf;base64,JVBERi0xLjQK",
@@ -12793,7 +12808,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         input_files = [item for item in content if item.get("type") == "input_file"]
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(len(input_files), 1)
-        self.assertEqual(input_files[0]["filename"], "kent-group.pdf")
+        self.assertEqual(input_files[0]["filename"], "synthetic-deck.pdf")
         self.assertEqual([item["image_url"] for item in uploaded_images], ["data:image/jpeg;base64,ZmFrZQ=="])
 
     def test_openai_request_ignores_local_catalog_visuals(self):
