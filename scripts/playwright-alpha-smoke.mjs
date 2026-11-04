@@ -800,6 +800,18 @@ async function main() {
     assert(new URL(await page.locator("#sideDownloadButton").getAttribute("href"), baseUrl).toString() === currentXlsxUrl, "Reopened quote does not point to current XLSX.");
     const currentPdfViewUrl = new URL(afterPdf.exports.pdf.view_url, baseUrl).toString();
     assert(new URL(await page.locator("#sideViewPdfButton").getAttribute("href"), baseUrl).toString() === currentPdfViewUrl, "Reopened quote does not point to the current protected PDF view.");
+    const reuseJobCount = trace.jobs.length;
+    const reusePopupPromise = page.waitForEvent("popup", { timeout: 30000 });
+    const reuseResponsePromise = page.context().waitForEvent("response", {
+      predicate: (response) => response.url() === currentPdfViewUrl,
+      timeout: 30000,
+    });
+    await page.locator("#sideViewPdfButton").click();
+    const [reusedPopup, reusedResponse] = await Promise.all([reusePopupPromise, reuseResponsePromise]);
+    assert(reusedResponse.status() === 200 && (reusedResponse.headers()["content-type"] || "").includes("application/pdf")
+      && (reusedResponse.headers()["content-disposition"] || "").startsWith("inline;"), "Reopened PDF did not reuse its protected inline artifact.");
+    assert(trace.jobs.length === reuseJobCount, "Viewing a current saved PDF dispatched an unnecessary generation job.");
+    await reusedPopup.close();
     const postGenerationState = await quoteSessionDetail(api, baseUrl, sessionId);
     assert(postGenerationState.exports?.xlsx?.sha256 === currentXlsx.sha256 && postGenerationState.exports?.pdf?.sha256 === currentPdf.sha256, "Post-generation readback changed artifact identity.");
     assert(Number(postGenerationState.draft_state?.outputRows?.find((row) => row.description === pricedItem.description)?.quantity) === 2, "Post-generation durable state changed the latest edit.");

@@ -299,6 +299,7 @@ const state = {
   isAnalysisRunning: false,
   isGenerating: false,
   isPreparingOutput: false,
+  outputReferenceSelection: null,
   aiFailed: false,
   draftSource: "",
   lastAnalysisMode: ANALYSIS_MODE_STANDARD,
@@ -871,6 +872,8 @@ function normalizeActiveJob(job = {}, options = {}) {
   if (![...SERVER_JOB_TYPES, "confirm_basis"].includes(type) || !id) return null;
   if (SERVER_JOB_TYPES.has(type) && !/^job-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
   if (type === "confirm_basis" && !/^operation-[A-Za-z0-9_-]{8,80}$/.test(id)) return null;
+  if (["generate", "generate_pdf"].includes(type) && Object.prototype.hasOwnProperty.call(job, "outputRowsSchema")
+    && job.outputRowsSchema !== "swooshz.quote-output-rows.v1") return null;
   const phase = String(job.phase || "").trim();
   if (!["starting", "running"].includes(phase)) return null;
   const rawStartedAt = job.startedAt ?? job.created_at ?? job.createdAt;
@@ -1136,7 +1139,7 @@ function formatQuantityNumber(value) {
 
 function normalizeQuantityPrefixUnit(value = "") {
   const unit = String(value || "").toLowerCase().replace(/\s+/g, " ").replace(/\.+$/g, "").trim();
-  if (["sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."].includes(unit)) return "sqm";
+  if (["sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."].includes(unit)) return "sqm";
   if (["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"].includes(unit)) return "nos";
   if (["lot", "lots"].includes(unit)) return "lot";
   if (["set", "sets"].includes(unit)) return "set";
@@ -1165,7 +1168,7 @@ function quantityUnitAliases(unit = "") {
   const aliases = new Set();
   if (normalized) aliases.add(normalized);
   if (normalized === "sqm") {
-    ["sqm", "m2", "m^2", "sq m", "sq.m", "sq.m."].forEach((alias) => aliases.add(alias));
+    ["sqm", "m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m."].forEach((alias) => aliases.add(alias));
   }
   if (/^nos?\.?$/.test(normalized)) {
     ["nos", "nos.", "no", "no.", "pcs", "pieces", "units"].forEach((alias) => aliases.add(alias));
@@ -1227,7 +1230,7 @@ function neutralizeFormulaText(value = "") {
 function normalizeUnit(value = "") {
   const text = String(value || "").normalize("NFC").trim();
   const lower = text.toLowerCase().replace(/\s+/g, " ").replace(/^[.\s]+|[.\s]+$/g, "");
-  if (["m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) {
+  if (["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) {
     return "sqm";
   }
   if (["m run", "m. run"].includes(lower)) return "m run";
@@ -2636,7 +2639,7 @@ function canonicalPricingAuthorityText(value = "") {
 function canonicalPricingAuthorityUnit(value = "") {
   const text = canonicalPricingAuthorityText(value);
   const lower = text.toLowerCase().replace(/^[. ]+|[. ]+$/g, "");
-  if (["m2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) return "sqm";
+  if (["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"].includes(lower)) return "sqm";
   if (["m run", "m. run"].includes(lower)) return "m run";
   if (["m length", "m. length"].includes(lower)) return "m length";
   if (["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"].includes(lower)) return "nos";
@@ -4762,12 +4765,7 @@ function quoteCommercialRestorationReviewReason(saved = {}, normalizedSnapshot =
   return "";
 }
 
-async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
-  if (commitActiveOutputEditor() === "blocked") return false;
-  if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION) {
-    return false;
-  }
-  const savedState = saved;
+function quoteSessionSnapshotForRestoration(savedState = {}) {
   const containers = [savedState];
   const draftCandidates = [];
   let containerMalformed = false;
@@ -4800,6 +4798,19 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
       ...(draftCandidates[0] || {}),
       ...savedState,
     };
+  return { containers, draftCandidates, containerMalformed, nestedSession, restoredState };
+}
+
+async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
+  if (commitActiveOutputEditor() === "blocked") return false;
+  if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION) {
+    return false;
+  }
+  const savedState = saved;
+  const { containers, draftCandidates, containerMalformed, nestedSession, restoredState } = quoteSessionSnapshotForRestoration(savedState);
+  if (isPlainObject(restoredState.originalAnalysisSnapshot)
+    && Object.prototype.hasOwnProperty.call(restoredState.originalAnalysisSnapshot, "line_items")
+    && !Array.isArray(restoredState.originalAnalysisSnapshot.line_items)) return false;
   const canRestoreBrowserTransientAuthority = !containerMalformed
     && options.suppressAutomaticOperations !== true
     && !nestedSession
@@ -5677,10 +5688,11 @@ async function confirmProfileOverwriteSave(event) {
 
 function applySavedCompanyProfileProfile(profile = {}) {
   const defaults = profile.defaults && typeof profile.defaults === "object" ? profile.defaults : {};
-  if (!Object.keys(defaults).length) return;
-  applyQuoteDetails(defaults, { includeLogo: true, clearLogo: true, partial: true });
-  clearGeneratedQuoteState();
-  setWorkflowStage(state.images.length ? "ready_to_analyze" : "needs_images");
+  if (Object.keys(defaults).length) {
+    applyQuoteDetails(defaults, { includeLogo: true, clearLogo: true, partial: true });
+  }
+  // A replaced layout also invalidates exports when its company defaults are unchanged.
+  invalidateGeneratedExportsForPresentationChange();
 }
 
 async function saveNamedCompanyProfile(label = "", options = {}) {
@@ -8823,7 +8835,16 @@ async function loadProfiles() {
   const context = beginAuthorityProfileRequest();
   const { ok, data } = await getJson("/api/profiles");
   if (!authorityProfileRequestIsFresh(context)) return false;
-  if (!ok || !Array.isArray(data.profiles) || !Array.isArray(data.pricing_references)) return false;
+  if (!ok || !isPlainObject(data) || !Array.isArray(data.profiles) || !Array.isArray(data.pricing_references)) return false;
+  if (!data.profiles.every((profile) => isPlainObject(profile)
+    && typeof profile.id === "string" && profile.id.trim())) return false;
+  const referenceBases = data.pricing_references.map((reference) => (
+    isPlainObject(reference) && typeof reference.id === "string"
+      && typeof reference.source === "string" && typeof reference.currency === "string"
+      ? pricingReferenceAuthorityBasis(reference) : null
+  ));
+  if (referenceBases.some((basis) => !basis)
+    || new Set(referenceBases.map((basis) => `${basis.source}::${basis.id}`)).size !== referenceBases.length) return false;
   const profiles = data.profiles;
   const workspace = data.workspace && typeof data.workspace === "object" ? data.workspace : null;
   const defaultProfileId = data.default_profile_id || DEFAULT_PROFILE_ID;
@@ -8852,7 +8873,10 @@ async function loadProfiles() {
   state.defaultPricingReferenceId = defaultPricingReferenceId;
   state.pricingReferences = pricingReferences;
   syncSelectedPricingReference();
-  if (!authorityProfileRequestIsFresh(refreshedContext)) return false;
+  // The checked response owns these synchronous workspace/default-selection
+  // changes. Rebind them without accepting a newer request sequence.
+  const committedContext = refreshAuthorityProfileRequestContext(refreshedContext);
+  if (!committedContext || !authorityProfileRequestIsFresh(committedContext)) return false;
   renderProfileOptions();
   renderPresetOptions();
   return true;
@@ -8962,34 +8986,37 @@ async function confirmQuoteDependencyChange() {
     hideQuoteDependencyConfirmModal();
     return;
   }
-  const originPanel = state.activeSidePanel;
-  hideQuoteDependencyConfirmModal();
-  let generatedStateCleared = false;
-  if (changes.includes("pricing_reference")) {
-    generatedStateCleared = applyPendingPricingReferenceSelection();
-  }
-  if (changes.includes("reference_files") && !generatedStateCleared) {
-    clearGeneratedQuoteState();
-    generatedStateCleared = true;
-  }
-  if (generatedStateCleared) {
-    setWorkflowStage(hasReferenceFilesForNavigation() ? "ready_to_analyze" : "needs_images");
-  }
-  if (!hasReferenceFilesForNavigation()) {
-    if (generatedStateCleared) await saveQuoteSessionDraftState({ quoteGenerated: false });
-    updateSidePanelNav();
-    return;
-  }
-  const targetPanel = originPanel === "images" ? "customer" : "quote_company";
-  if (originPanel === "customer") {
-    await advanceCustomerStep();
-    return;
-  }
-  const moved = setSidePanel(targetPanel, { notify: true });
-  if (!moved) updateSidePanelNav();
-  if (generatedStateCleared || moved) {
-    await saveQuoteSessionDraftState({ quoteGenerated: false });
-  }
+  if (appIsBusy()) return;
+  await withQuoteStepLoading(async () => {
+    const originPanel = state.activeSidePanel;
+    hideQuoteDependencyConfirmModal();
+    let generatedStateCleared = false;
+    if (changes.includes("pricing_reference")) {
+      generatedStateCleared = applyPendingPricingReferenceSelection();
+    }
+    if (changes.includes("reference_files") && !generatedStateCleared) {
+      clearGeneratedQuoteState();
+      generatedStateCleared = true;
+    }
+    if (generatedStateCleared) {
+      setWorkflowStage(hasReferenceFilesForNavigation() ? "ready_to_analyze" : "needs_images");
+    }
+    if (!hasReferenceFilesForNavigation()) {
+      const saved = !generatedStateCleared || await saveQuoteSessionDraftState({ quoteGenerated: false });
+      updateSidePanelNav();
+      return Boolean(saved);
+    }
+    const targetPanel = originPanel === "images" ? "customer" : "quote_company";
+    if (originPanel === "customer") {
+      return await advanceCustomerStep();
+    }
+    const moved = setSidePanel(targetPanel, { notify: true });
+    if (!moved) updateSidePanelNav();
+    if (generatedStateCleared || moved) {
+      return Boolean(await saveQuoteSessionDraftState({ quoteGenerated: false }));
+    }
+    return false;
+  });
 }
 
 function quoteCompanyPresentationSignature() {
@@ -9340,14 +9367,14 @@ function quoteSessionHasFreshOutputExports() {
 }
 
 function appIsBusy() {
-  return state.isAnalysisRunning || state.isGenerating || state.isPreparingOutput || state.quoteSessionRestoreBusy || state.quoteSessionDashboardBusy;
+  return state.isAnalysisRunning || state.isGenerating || state.isPreparingOutput || Boolean(state.outputReferenceSelection) || state.quoteSessionRestoreBusy || state.quoteSessionDashboardBusy;
 }
 
 function appBusyTitle() {
   if (state.quoteSessionDashboardBusy) return "Dashboard is loading.";
   if (state.quoteSessionRestoreBusy) return "Quote session is loading.";
   if (state.isAnalysisRunning) return "Analysis is running.";
-  if (state.isPreparingOutput) return "Output is being prepared.";
+  if (state.isPreparingOutput || state.outputReferenceSelection) return "Output is being prepared.";
   if (state.isGenerating) return "Quotation generation is running.";
   return "";
 }
@@ -9405,7 +9432,10 @@ function showExcelGeneratingModal(options = {}) {
   elements.excelGeneratingMessage.textContent = options.message || "Preparing the quotation workbook.";
   if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = false;
   if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = true;
-  if (elements.excelGeneratingActionButton) elements.excelGeneratingActionButton.dataset.exportAction = "";
+  if (elements.excelGeneratingActionButton) {
+    elements.excelGeneratingActionButton.hidden = false;
+    elements.excelGeneratingActionButton.dataset.exportAction = "";
+  }
   if (["excel_ready", "pdf_ready"].includes(state.restorableOverlay)) {
     state.restorableOverlay = "";
     saveWorkspaceViewState();
@@ -9440,6 +9470,7 @@ function showGeneratedExportReadyModal(viewPdf = false) {
   if (elements.excelGeneratingSpinner) elements.excelGeneratingSpinner.hidden = true;
   if (elements.excelGeneratingActions) elements.excelGeneratingActions.hidden = false;
   if (elements.excelGeneratingActionButton) {
+    elements.excelGeneratingActionButton.hidden = false;
     elements.excelGeneratingActionButton.textContent = viewPdf ? "Open PDF" : "Download Excel";
     elements.excelGeneratingActionButton.dataset.exportAction = viewPdf ? "pdf" : "excel";
   }
@@ -9557,6 +9588,28 @@ function viewCurrentPdfFile(file = state.pdfFile, preparedWindow = null) {
   link.click();
   link.remove();
   return true;
+}
+
+async function handleViewPdf(event) {
+  event.preventDefault();
+  if (elements.sideViewPdfButton.getAttribute("aria-disabled") === "true") {
+    const validation = outputRowsValid();
+    if (!validation.valid) renderOutputValidationMessages(validation.errors);
+    return;
+  }
+  if (commitActiveOutputEditor() === "blocked") return;
+  if (pdfFileIsFresh(state.pdfFile)) return viewCurrentPdfFile();
+  const pdfWindow = window.open("about:blank", "_blank");
+  let openedPdf = false;
+  showExcelGeneratingModal(generationLoadingModalOptions(true));
+  await waitForUiPaint();
+  try {
+    const generated = await handleGenerate({ viewPdf: true });
+    if (generated) openedPdf = viewCurrentPdfFile(state.pdfFile, pdfWindow);
+  } finally {
+    if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();
+    hideExcelGeneratingModal();
+  }
 }
 
 function pricingMatchStatus(row = {}) {
@@ -10358,6 +10411,20 @@ function renderOutputEditCell(row = {}, index = 0, field = "", extraClass = "") 
   `;
 }
 
+function outputReferenceCatalogItem(row = {}, reference = currentPricingReference()) {
+  const keyword = String(row.pricing_keyword || "").trim();
+  if (keyword) return pricingReferenceCatalogItem(reference, keyword);
+  // Duplicates strip source-bound catalogue claims. Their unique, explicitly
+  // included basis selection can still identify the display-only reference;
+  // it supplies no grant until the operator selects it on the target quote.
+  const rowId = String(row.source_basis_line_id || "");
+  if (!rowId) return null;
+  const lines = (state.quoteBasisSections || []).flatMap((section) => section?.lines || [])
+    .filter((line) => line && [line.id, line.source_line_item_id].includes(rowId));
+  if (lines.length !== 1 || normalizeBasisTag(lines[0].tag) !== "Include" || lines[0].custom_pricing) return null;
+  return pricingReferenceCatalogItem(reference, String(lines[0].pricing_keyword || "").trim());
+}
+
 // Display-only catalogue lookup: never promote a cached row price or manual authority.
 function outputCatalogueBaseline(row = {}) {
   const admitted = quoteCommercialSnapshotPricingBasis();
@@ -10376,7 +10443,7 @@ function outputCatalogueBaseline(row = {}) {
   if (Object.entries(rowBasisFields).some(([field, key]) => (
     Object.hasOwn(row, field) && row[field] !== admitted[key]
   ))) return null;
-  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  const item = outputReferenceCatalogItem(row, reference);
   if (!item) return null;
   const context = pricingAuthorityContext(row);
   const description = pricingAuthorityCatalogDescription(item);
@@ -10884,7 +10951,7 @@ function applyOutputIncludedAction(button) {
   return "committed";
 }
 
-function applyOutputReferencePricing(button) {
+async function applyOutputReferencePricing(button) {
   if (appIsBusy() || !button?.isConnected || !elements.pricingMatchesBody.contains(button)) return "unchanged";
   const pending = activeOutputEditor;
   const index = state.outputRows.indexOf(pending?.row);
@@ -10893,28 +10960,109 @@ function applyOutputReferencePricing(button) {
   const row = state.outputRows[index];
   const price = outputCatalogueBaseline(row);
   const reference = currentPricingReference();
-  const item = pricingReferenceCatalogItem(reference, row.pricing_keyword);
+  const item = outputReferenceCatalogItem(row, reference);
   if (price === null || !item) return "unchanged";
-  const next = { ...row, price_mode: "Priced" };
+  const rowId = String(row.source_basis_line_id || "");
+  if (!rowId || state.outputRows.filter((entry) => entry.source_basis_line_id === rowId).length !== 1) return "unchanged";
+  const next = { ...row, pricing_keyword: item.id, price_mode: "Priced" };
   delete next.display_price;
   const authority = normalizeOutputPricingAuthority(
     buildPricingAuthority("catalog", next, { price, reference, catalogItem: item }), next, { reference, catalogItem: item },
   );
   if (!authority) return "unchanged";
-  const unchanged = outputPriceAuthority(row)?.variant === "catalog";
   revokeOutputEditor();
-  if (unchanged) { renderPricingMatches(state.outputRows); resumeBlockedOutputDraftSave(); return "unchanged"; }
   next.pricing_authority = authority;
-  state.outputRows[index] = preserveOutputRowIdentity(row, recalculateOutputRow(applyPricingAuthorityProjection(next, authority)));
-  state.lineItems = outputRowsToLineItems();
-  markOutputRowsDirty();
-  const validation = outputRowsValid();
-  renderOutputValidationMessages(validation.valid ? [] : validation.errors);
-  renderPricingMatches(state.outputRows);
-  renderMatchSummary({ pricing_matches: state.outputRows });
+  const scope = currentBrowserRecoveryScope();
+  const recoveryEpoch = browserRecoveryEpoch;
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const revision = state.outputRevision;
+  const context = () => JSON.stringify({
+    reference: currentPricingReference(), basis: state.quoteBasisSections,
+    commercials: state.quoteCommercialSnapshot, rows: state.outputRows, lineItems: state.lineItems,
+  });
+  const captured = context();
+  // This token owns the busy lifetime. A replaced quote/authentication context
+  // cannot dispatch or adopt an old selection, even if its HTTP request succeeds.
+  const operation = { current: () => state.outputReferenceSelection === operation
+    && !state.isPageUnloading && !state.authenticationRecoveryRequested && !state.isSigningOut && !state.isRecoveryScopeTransitioning
+    && browserRecoveryEpoch === recoveryEpoch && currentBrowserRecoveryScope() === scope && safeQuoteSessionId(state.quoteSessionId || "") === sessionId
+    && state.outputRevision === revision && state.outputRows[index] === row && context() === captured };
+  state.outputReferenceSelection = operation;
   syncControlStates();
-  queueQuoteSessionDraftStateSave({ quoteGenerated: true });
-  return "committed";
+  try {
+    const saveFailure = {};
+    const savedId = await ensureQuoteSession({ quoteGenerated: true, synchronizeDraft: true, saveFailure });
+    if (!operation.current()) return "blocked";
+    if (!savedId || savedId !== sessionId) {
+      renderOutputValidationMessages([quoteSessionDraftSynchronizationFailureMessage(saveFailure.failure)]);
+      return "blocked";
+    }
+    // A draft save never grants pricing. Submit only this explicit selection,
+    // using the revision acknowledged by the preceding save. Keep the candidate
+    // off the visible rows until the conditional server operation accepts it.
+    const candidate = recalculateOutputRow(applyPricingAuthorityProjection(next, authority));
+    const rows = state.outputRows.map((entry) => entry === row ? candidate : entry);
+    const payload = buildLineItemNormalizePayload();
+    payload.line_items = outputRowsToLineItems(rows);
+    payload.quote_session.draft_state.lineItems = payload.line_items;
+    payload.quote_session.draft_state.outputRows = rows;
+    const expected = state.pricingLedgerRevisions?.[sessionId]?.[rowId];
+    // An existing grant can restore reference pricing after a manual/Included
+    // override, including edited quantities. Verify that grant through normal
+    // normalisation before requesting a new one; new selections still require
+    // the server's stricter basis-quantity and semantic admission.
+    const requestOptions = { persistSession: false, sessionId, isCurrent: operation.current };
+    let result = await postJson("/api/line-items/normalize", payload, requestOptions);
+    if (!operation.current()) return "blocked";
+    const normalized = Array.isArray(result.data?.line_items)
+      ? result.data.line_items.filter((entry) => entry?.source_basis_line_id === rowId) : [];
+    const restored = result.ok && result.data?.status === "normalized" && normalized.length === 1
+      && normalized[0]?.pricing_authority?.variant === "catalog" && normalized[0].pricing_authority.catalog_item_id === item.id;
+    if (result.ok && result.data?.status === "normalized" && normalized.length === 1 && !restored) {
+      result = await postJson("/api/quote-sessions/pricing-selections", {
+        ...payload,
+        pricing_selections: [{ source_basis_line_id: rowId, catalog_item_id: item.id,
+          expected_revision: Number.isInteger(expected) && expected >= 0 ? expected : 0 }],
+      }, requestOptions);
+    }
+    if (!operation.current()) return "blocked";
+    const data = result.data || {};
+    const outcomes = Array.isArray(data.selections) ? data.selections : [];
+    const selectedRows = Array.isArray(data.line_items) ? data.line_items.filter((entry) => entry?.source_basis_line_id === rowId) : [];
+    const selected = selectedRows.length === 1 ? normalizeOutputRow(selectedRows[0]) : null;
+    const ledger = data.quote_session?.pricing_ledger;
+    const ledgerValid = isPlainObject(ledger) && Number.isSafeInteger(ledger.revision) && ledger.revision >= 0
+      && isPlainObject(ledger.rows) && Object.values(ledger.rows).every((value) => Number.isSafeInteger(value) && value >= 0)
+      && Number.isSafeInteger(ledger.rows[rowId]) && ledger.rows[rowId] > (Number.isSafeInteger(expected) && expected >= 0 ? expected : 0);
+    if (!result.ok || data.status !== "normalized" || (!restored && (data.quote_session?.session_id !== sessionId
+      || !ledgerValid
+      || outcomes.length !== 1 || outcomes[0]?.source_basis_line_id !== rowId || outcomes[0]?.status !== "selected"))
+      || selected?.pricing_authority?.variant !== "catalog" || selected.pricing_authority.catalog_item_id !== item.id) {
+      renderOutputValidationMessages([data.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE
+        : "Reference price could not be confirmed. Review this row before exporting."]);
+      return "blocked";
+    }
+    if (!restored) state.pricingLedgerRevisions = { [sessionId]: data.quote_session.pricing_ledger.rows };
+    if (restored && outputPriceAuthority(row)?.variant === "catalog"
+      && JSON.stringify(outputPriceAuthority(row)) === JSON.stringify(selected.pricing_authority)) return "unchanged";
+    state.outputRows[index] = preserveOutputRowIdentity(row, selected);
+    state.lineItems = outputRowsToLineItems();
+    markOutputRowsDirty();
+    const validation = outputRowsValid();
+    renderOutputValidationMessages(validation.valid ? [] : validation.errors);
+    queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+    return "committed";
+  } catch {
+    if (operation.current()) renderOutputValidationMessages(["Reference price could not be confirmed. Review this row before exporting."]);
+    return "blocked";
+  } finally {
+    if (state.outputReferenceSelection === operation) {
+      state.outputReferenceSelection = null;
+      renderPricingMatches(state.outputRows);
+      renderMatchSummary({ pricing_matches: state.outputRows });
+      syncControlStates();
+    }
+  }
 }
 
 function openOutputCellEditor(cell, options = {}) {
@@ -11171,10 +11319,10 @@ function basisQuantityLabel(line = {}) {
 
 function basisQuantityDisplayLabel(line = {}) {
   const quantityText = basisQuantityText(line.quantity);
-  if (!quantityText) return "1 lot";
+  if (!quantityText) return "Not measured";
   let unit = normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
   if (/^nos?\.?$/i.test(unit)) unit = "nos.";
-  return `${quantityText}${unit ? ` ${unit}` : ""}`;
+  return `${quantityText}${unit ? ` ${unit}` : " (unit needed)"}`;
 }
 
 function basisChatLineContext(line = {}) {
@@ -13619,32 +13767,46 @@ async function recoverRequiredAuthentication(status, data = {}) {
 }
 
 async function postJson(url, payload, options = {}) {
+  const requestIsCurrent = () => options.isCurrent === undefined
+    || (typeof options.isCurrent === "function" && options.isCurrent());
+  const superseded = () => ({ ok: false, status: 409, data: { status: "conflict", request_superseded: true } });
+  if (!requestIsCurrent()) return superseded();
   if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return { ok: false, status: 401, data: { status: "auth_required" } };
   let response;
   try {
     response = await fetchPostJsonResponse(url, payload);
   } catch (error) {
+    if (!requestIsCurrent()) return superseded();
     return postJsonFetchFailure(url, error);
   }
 
+  if (!requestIsCurrent()) return superseded();
   let data = await jsonFromResponse(response, options);
+  if (!requestIsCurrent()) return superseded();
   if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
+  if (!requestIsCurrent()) return superseded();
   const refreshFailure = {};
   if (response.status === 403 && await refreshSessionToken({ ...options, refreshFailure })
     && !state.authenticationRecoveryRequested && !state.isSigningOut && !state.isPageUnloading) {
+    if (!requestIsCurrent()) return superseded();
     try {
       response = await fetchPostJsonResponse(url, payload);
+      if (!requestIsCurrent()) return superseded();
       data = await jsonFromResponse(response, options);
     } catch (error) {
+      if (!requestIsCurrent()) return superseded();
       return postJsonFetchFailure(url, error);
     }
   }
+  if (!requestIsCurrent()) return superseded();
   if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
+  if (!requestIsCurrent()) return superseded();
   // Keep the original safe status/reference while carrying this save's actual refresh interruption.
   if (options.persistSession === false && refreshFailure.failure?.fetch_failed === true) {
     data = { ...data, fetch_failed: true, page_unloading: refreshFailure.failure.page_unloading === true };
   }
   await adoptServerQuoteCommercialReview(data, options);
+  if (!requestIsCurrent()) return superseded();
   if (!response.ok) {
     const failure = options.persistSession === false
       ? quoteSessionSaveFailureFrom({ data, status: response.status }) : null;
@@ -14283,8 +14445,8 @@ function handleQuoteDetailFieldChange(event = {}) {
 }
 
 async function startQuoteSessionDraftSaveAfterCustomerStep() {
-  if (!markQuoteSessionDraftSaveStartedAfterCustomerStep()) return;
-  await saveQuoteSessionDraftState({ quoteGenerated: false });
+  if (!markQuoteSessionDraftSaveStartedAfterCustomerStep() && !quoteSessionDraftStateCanSave()) return null;
+  return await saveQuoteSessionDraftState({ quoteGenerated: false });
 }
 
 async function saveQuoteSessionDraftStateAfterPanelMove(panelName = state.activeSidePanel) {
@@ -14924,7 +15086,13 @@ async function loadQuoteSessionDetail(sessionId = "") {
     return null;
   }
   const session = data.quote_session && typeof data.quote_session === "object" ? data.quote_session : null;
-  return session && safeQuoteSessionId(session.session_id || "") === safeSessionId ? session : null;
+  if (!session || safeQuoteSessionId(session.session_id || "") !== safeSessionId) {
+    state.quoteSessionLoadError = genericFailureMessage(data);
+    renderQuoteDashboard();
+    return null;
+  }
+  state.quoteSessionLoadError = "";
+  return session;
 }
 
 function dashboardRestoreError(message) {
@@ -15027,6 +15195,10 @@ async function modifyDashboardQuote(sessionId, options = {}) {
   setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(safeSessionId);
+    if (!detailedSession) {
+      finishDashboardOperation();
+      return false;
+    }
     let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
     if (!Object.keys(draftState).length && safeSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
@@ -15064,6 +15236,15 @@ async function modifyDashboardQuote(sessionId, options = {}) {
   }
 }
 
+function copiedQuotePricingRow(row, normalizer = normalizeLineItem) {
+  if (row?.pricing_authority?.variant !== "catalog") return { ...row };
+  const unbound = { ...row, pricing_keyword: "", catalog_description: "", pricing_reference_description: "", status: "unmatched" };
+  delete unbound.pricing_authority;
+  // Reuse legacy recovery's price demotion. Source prices are evidence only;
+  // this quote's explicit confirmation must obtain its own server grants.
+  return normalizeRestoredPricingRow(unbound, normalizer);
+}
+
 async function duplicateDashboardQuote(sessionId, options = {}) {
   if (commitActiveOutputEditor() === "blocked") return false;
   const sourceSessionId = safeQuoteSessionId(sessionId || "");
@@ -15073,11 +15254,22 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
   const operation = isResume ? normalizeDashboardOperation(options.operation || state.dashboardOperation || {}) : saveDashboardOperation({ type: "duplicate", sourceSessionId, targetSessionId });
   if (!operation) return false;
   state.dashboardOperation = operation;
+  const recoveryEpoch = browserRecoveryEpoch;
+  const recoveryScope = currentBrowserRecoveryScope();
+  const operationIsCurrent = () => state.dashboardOperation === operation
+    && recoveryEpoch === browserRecoveryEpoch && recoveryScope === currentBrowserRecoveryScope()
+    && !state.isPageUnloading && !state.authenticationRecoveryRequested && !state.isSigningOut
+    && !state.isRecoveryScopeTransitioning;
   clearQuoteSessionDraftSaveTimer();
   state.quoteSessionRestoreBusy = true;
   setDashboardLoadingState(true, dashboardOperationLoadingOptions(operation));
   try {
     const detailedSession = await loadQuoteSessionDetail(sourceSessionId);
+    if (!operationIsCurrent()) return false;
+    if (!detailedSession) {
+      finishDashboardOperation();
+      return false;
+    }
     let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
     if (!Object.keys(draftState).length && sourceSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
@@ -15093,12 +15285,37 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
     }
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, sourceSessionId);
+    if (!operationIsCurrent()) return false;
+    draftState = {
+      ...draftState,
+      lineItems: Array.isArray(draftState.lineItems) ? draftState.lineItems.map((row) => copiedQuotePricingRow(row)) : draftState.lineItems,
+      outputRows: Array.isArray(draftState.outputRows) ? draftState.outputRows.map((row) => copiedQuotePricingRow(row, normalizeOutputRow)) : draftState.outputRows,
+      originalOutputRows: Array.isArray(draftState.originalOutputRows) ? draftState.originalOutputRows.map((row) => copiedQuotePricingRow(row, normalizeOutputRow)) : draftState.originalOutputRows,
+      originalAnalysisSnapshot: isPlainObject(draftState.originalAnalysisSnapshot)
+        ? { ...draftState.originalAnalysisSnapshot, pricing_analysis_seal: null,
+          ...(Array.isArray(draftState.originalAnalysisSnapshot.line_items)
+            ? { line_items: draftState.originalAnalysisSnapshot.line_items.map((row) => copiedQuotePricingRow(row)) } : {}) } : null,
+    };
     const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: operation.targetSessionId, quoteSessionDraftSaveStarted: true }, { sessionId: operation.targetSessionId, forceQuoteView: false });
     if (!restored) {
       finishDashboardOperation();
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
       return false;
     }
+    // Target normalisation demotes copied claims. Explicit Confirm/selection
+    // remains the only operation that can request new target pricing grants.
+    if (!operationIsCurrent() || safeQuoteSessionId(state.quoteSessionId) !== operation.targetSessionId) return false;
+    if (state.outputRows.length) state.lineItems = outputRowsToLineItems();
+    const normalizePayload = buildLineItemNormalizePayload();
+    const normalized = await postJson("/api/line-items/normalize", normalizePayload);
+    if (!operationIsCurrent() || safeQuoteSessionId(state.quoteSessionId) !== operation.targetSessionId) return false;
+    if (!normalized.ok || !sameLineItemSourceIdentities(normalized.data?.line_items, normalizePayload.line_items)) {
+      finishDashboardOperation();
+      dashboardRestoreError(genericFailureMessages(normalized.data || {})[0]);
+      return false;
+    }
+    state.lineItems = normalized.data.line_items.map(normalizeLineItem);
+    state.outputRows = state.lineItems.map(outputRowFromLineItem);
     state.quoteSessionDraftSaveStarted = true;
     state.quoteSessionRestoredSessionId = "";
     state.quoteSessionRestoredDraftKey = "";
@@ -15119,8 +15336,11 @@ async function duplicateDashboardQuote(sessionId, options = {}) {
     scrollDashboardSessionIntoView(state.dashboardActiveSessionId);
     return true;
   } finally {
-    state.quoteSessionRestoreBusy = false;
-    setDashboardLoadingState(false);
+    if (recoveryEpoch === browserRecoveryEpoch && recoveryScope === currentBrowserRecoveryScope()
+      && (!state.dashboardOperation || state.dashboardOperation === operation)) {
+      state.quoteSessionRestoreBusy = false;
+      setDashboardLoadingState(false);
+    }
   }
 }
 function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "XLSX") {
@@ -16267,6 +16487,71 @@ async function confirmBasis(options = {}) {
   }
 }
 
+function sameLineItemSourceIdentities(rows, inputRows) {
+  if (!Array.isArray(rows) || !Array.isArray(inputRows) || rows.length !== inputRows.length) return false;
+  const counts = new Map();
+  for (const row of inputRows) {
+    if (!isPlainObject(row)) return false;
+    const id = String(row.source_basis_line_id || "");
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  for (const row of rows) {
+    if (!isPlainObject(row)) return false;
+    const id = String(row.source_basis_line_id || "");
+    if (!counts.get(id)) return false;
+    counts.set(id, counts.get(id) - 1);
+  }
+  return true;
+}
+
+function adoptGenerationOutputRows(data = {}, inputRows = state.lineItems, options = {}) {
+  const hasStructuredRows = Object.prototype.hasOwnProperty.call(data, "output_rows");
+  const existingRows = Array.isArray(state.outputRows) ? state.outputRows : [];
+  // Hard/pre-generator failures can legitimately omit diagnostics. Only the
+  // saved-job resume caller may retain usable rows for a legacy-format result;
+  // absence alone never identifies an old runtime or rebuilds CSV authority.
+  const usableExistingRows = existingRows.length > 0 && existingRows.every((row) => (
+    isPlainObject(row) && ["Priced", "Included"].includes(row.price_mode)
+    && typeof row.description === "string" && row.description.trim()
+    && row.quantity !== undefined && typeof row.unit === "string"
+    && isPlainObject(row.pricing_authority) && PRICING_AUTHORITY_VARIANTS.has(row.pricing_authority.variant)
+  ));
+  if (!hasStructuredRows && ["failed", "blocked"].includes(data.status)) return data;
+  if (!hasStructuredRows && options.allowLegacyRows === true && usableExistingRows) return data;
+  const envelope = data.output_rows;
+  const rows = isPlainObject(envelope) && envelope.schema === "swooshz.quote-output-rows.v1"
+    && Array.isArray(envelope.rows) ? envelope.rows : [];
+  const tokens = new Set();
+  const expectedIds = new Map();
+  const receivedIds = new Map();
+  const capturedRows = Array.isArray(inputRows) ? inputRows : [];
+  capturedRows.forEach((row) => {
+    const id = String(row?.source_basis_line_id || "");
+    expectedIds.set(id, (expectedIds.get(id) || 0) + 1);
+  });
+  const valid = hasStructuredRows && rows.length > 0 && rows.length === capturedRows.length && rows.every((row) => {
+    if (!isPlainObject(row) || !/^row-(0|[1-9][0-9]*)$/.test(row.diagnostic_row_id || "")
+      || tokens.has(row.diagnostic_row_id) || typeof row.source_basis_line_id !== "string"
+      || !isPlainObject(row.pricing_authority)
+      || !["catalog", "manual", "included", "none", "historical"].includes(row.pricing_authority.variant)) return false;
+    tokens.add(row.diagnostic_row_id);
+    const id = row.source_basis_line_id;
+    receivedIds.set(id, (receivedIds.get(id) || 0) + 1);
+    if (row.pricing_authority.variant === "catalog" && (!id || expectedIds.get(id) !== 1)) return false;
+    return expectedIds.has(id) && receivedIds.get(id) <= expectedIds.get(id);
+  });
+  if (!valid || (data.status === "completed"
+    && (!usableExistingRows || !sameLineItemSourceIdentities(existingRows, capturedRows)))) {
+    return { ...data, status: "failed", files: [], committed_files: [], errors: [GENERIC_FAILURE_MESSAGE] };
+  }
+  // Publication is bound to the exact saved Output representation. A completed
+  // job validates correspondence but keeps that representation; rewriting its
+  // statuses/formatting here would stale the just-committed workbook on save.
+  if (data.status === "completed") return data;
+  state.outputRows = rows.map(outputRowFromLineItem);
+  return data;
+}
+
 async function handleGenerate(options = {}) {
   if (commitActiveOutputEditor() === "blocked") return false;
   if (state.isGenerating) return;
@@ -16312,12 +16597,12 @@ async function handleGenerate(options = {}) {
     setWorkflowStage("basis_review");
     return;
   }
-  const hadSuccessfulExports = quoteSessionHasFreshOutputExports();
 
   const jobType = viewPdf ? "generate_pdf" : "generate";
   const operation = normalizeActiveJob({
     id: newClientJobId(),
     type: jobType,
+    outputRowsSchema: "swooshz.quote-output-rows.v1",
     phase: "starting",
     startedAt: new Date().toISOString(),
     viewPdf,
@@ -16346,7 +16631,9 @@ async function handleGenerate(options = {}) {
     syncControlStates();
     return;
   }
-  const started = await startJob(jobType, buildPayload({ viewPdf }), { jobId: operation.id });
+  const generationPayload = buildPayload({ viewPdf });
+  const generationInputRows = generationPayload.line_items.map((row) => ({ ...row }));
+  const started = await startJob(jobType, generationPayload, { jobId: operation.id });
   const startedContext = currentGenerationContext();
   transitionGenerationContext(startedContext.session_id, started.data?.generation_run_id || startedContext.run_id);
   if (!started.ok) {
@@ -16373,7 +16660,7 @@ async function handleGenerate(options = {}) {
   state.isGenerating = false;
   clearActiveJob();
 
-  const data = polled.data.result || polled.data || {};
+  const data = adoptGenerationOutputRows(polled.data.result || polled.data || {}, generationInputRows);
   const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
   const previousContext = currentGenerationContext();
   const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
@@ -16385,10 +16672,8 @@ async function handleGenerate(options = {}) {
     setResultStatus(data.status || "Failed", "is-bad");
     const blocked = polled.data.status === "blocked" || data.status === "blocked";
     renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
-    if (!hadSuccessfulExports && data.pricing_matches?.length) {
-      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    }
-    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
+    renderPricingMatches(state.outputRows);
+    renderMatchSummary({ pricing_matches: state.outputRows });
     syncControlStates();
     return;
   }
@@ -16401,10 +16686,8 @@ async function handleGenerate(options = {}) {
     renderMessages([]);
     clearPricingReviewMessages();
     setSidePanel("output", { force: true });
-    if (!hadSuccessfulExports && data.pricing_matches?.length) {
-      renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    }
-    renderMatchSummary(hadSuccessfulExports ? { pricing_matches: state.outputRows } : data);
+    renderPricingMatches(state.outputRows);
+    renderMatchSummary({ pricing_matches: state.outputRows });
   } else {
     setWorkflowStage("completed");
     clearPricingReviewMessages();
@@ -16447,6 +16730,15 @@ async function ensureSavedServerJobStarted(activeJob) {
   if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
   const isDraft = activeJob.type === "draft";
   const viewPdf = activeJob.type === "generate_pdf" || activeJob.viewPdf === true;
+  if (["generate", "generate_pdf"].includes(activeJob.type)) {
+    if (Object.prototype.hasOwnProperty.call(activeJob, "outputRowsSchema")
+      && activeJob.outputRowsSchema !== "swooshz.quote-output-rows.v1") {
+      return { ok: false, data: { status: "failed", errors: [GENERIC_FAILURE_MESSAGE] } };
+    }
+    activeJob = { ...activeJob, outputRowsSchema: "swooshz.quote-output-rows.v1" };
+    state.activeJob = activeJob;
+    saveSessionState();
+  }
   const saveFailure = {};
   const synchronizedSessionId = await ensureQuoteSession({
     quoteGenerated: !isDraft,
@@ -16622,6 +16914,7 @@ async function resumeSavedJob() {
       return;
     }
     const resumedJob = state.activeJob || activeJob;
+    const generationInputRows = state.lineItems.map((row) => ({ ...row }));
 
     const polled = await pollJob(resumedJob.id);
     if (polled.aborted) return;
@@ -16631,7 +16924,8 @@ async function resumeSavedJob() {
       return;
     }
 
-    const data = polled.data.result || polled.data || {};
+    const data = adoptGenerationOutputRows(polled.data.result || polled.data || {}, generationInputRows, { allowLegacyRows: resumedJob.phase === "running"
+      && !Object.prototype.hasOwnProperty.call(resumedJob, "outputRowsSchema") });
     const postCommitProjectionWarning = postCommitProjectionWarningFrom(data);
     const previousContext = currentGenerationContext();
     const resultSessionId = safeQuoteSessionId(data.quote_session?.session_id || previousContext.session_id);
@@ -16646,8 +16940,8 @@ async function resumeSavedJob() {
       setResultStatus(data.status || "Failed", "is-bad");
       const blocked = polled.data.status === "blocked" || data.status === "blocked";
       renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
-      if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-      renderMatchSummary(data);
+      renderPricingMatches(state.outputRows);
+      renderMatchSummary({ pricing_matches: state.outputRows });
       syncControlStates();
       return;
     }
@@ -16663,24 +16957,31 @@ async function resumeSavedJob() {
       setSidePanel("output", { force: true });
     } else {
       setWorkflowStage("completed");
-      if (postCommitProjectionWarning) {
-        setResultStatus("Completed - refresh needed", "is-warn");
-        renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
-      } else {
-        setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
-        renderMessages([]);
-      }
-      clearPricingReviewMessages();
-      setSidePanel("output");
       setDownloadFiles(
         postCommitProjectionWarning
           ? (data.committed_files || [])
           : (data.files || []),
         data.quote_session?.exports,
       );
+      if (postCommitProjectionWarning) {
+        setResultStatus("Completed - refresh needed", "is-warn");
+        renderMessages([postCommitProjectionWarningMessage(postCommitProjectionWarning)], "warn");
+      } else if (viewPdf && !state.pdfFile) {
+        setResultStatus("PDF unavailable", "is-bad");
+        const pdfStatus = data.export_status?.pdf_status || data.export_status?.pdf_readiness || "";
+        const reason = pdfStatus === "workbook_export_unavailable"
+          ? "Workbook PDF export was unavailable, so no PDF was created."
+          : "The export completed but did not return a PDF file.";
+        renderMessages([state.downloadFile ? `${reason} Download Excel is still available.` : reason], "error");
+      } else {
+        setResultStatus(viewPdf ? "PDF ready" : "Completed", "is-ok");
+        renderMessages([]);
+      }
+      clearPricingReviewMessages();
+      setSidePanel("output");
     }
-    if (data.pricing_matches?.length) renderPricingMatches(data.pricing_matches || [], { fromPricingMatches: true });
-    renderMatchSummary(data);
+    renderPricingMatches(state.outputRows);
+    renderMatchSummary({ pricing_matches: state.outputRows });
     if (postCommitProjectionWarning) {
       saveSessionState();
     } else {
@@ -16771,7 +17072,7 @@ function customerStepCheckpointForCurrent() {
     pricingReferenceSource: state.pricingReferenceSource,
     pricingReferenceDigest: digest,
     customer: {
-      client: details.client,
+      client: { ...details.client, address: canonicalPricingAuthorityText(details.client.address) },
       project: details.project,
       quote_date: details.quote_date,
       project_number: details.project_number,
@@ -17013,7 +17314,46 @@ function goToPreviousSidePanel() {
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
 
+async function withQuoteStepLoading(operation) {
+  if (appIsBusy()) return false;
+  state.isPreparingOutput = true;
+  state.quoteSessionLoadError = "";
+  showExcelGeneratingModal({
+    eyebrow: "Quotation output",
+    title: "Preparing Output",
+    message: "Saving the quotation before continuing.",
+  });
+  syncControlStates();
+  let result;
+  try {
+    await waitForUiPaint();
+    result = await operation();
+    return result;
+  } catch {
+    const errorReference = newClientErrorReference();
+    state.quoteSessionLoadError = genericFailureMessage({ error_reference: errorReference });
+    logClientEvent("client_error", { error_reference: errorReference, errors: [GENERIC_FAILURE_MESSAGE] });
+    result = false;
+    return false;
+  } finally {
+    state.isPreparingOutput = false;
+    if (!state.isPageUnloading) {
+      hideExcelGeneratingModal();
+      if (result === false && state.quoteSessionLoadError) {
+        showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message: state.quoteSessionLoadError });
+        elements.excelGeneratingSpinner.hidden = true;
+        elements.excelGeneratingActions.hidden = false;
+        elements.excelGeneratingActionButton.hidden = true;
+        elements.excelGeneratingModal.classList.add("is-ready");
+        elements.excelGeneratingCloseButton?.focus();
+      }
+    }
+    syncControlStates();
+  }
+}
+
 async function goToNextSidePanel(options = {}) {
+  if (appIsBusy() || state.customerStepCheckpointSaveBusy) return false;
   if (commitActiveOutputEditor() === "blocked") return false;
   const index = activeSidePanelIndex();
   if (elements.sideNextButton?.getAttribute("aria-disabled") === "true") {
@@ -17033,30 +17373,37 @@ async function goToNextSidePanel(options = {}) {
   }
   if (state.activeSidePanel === "quote_company") {
     if (quoteHasDerivedResults()) {
-      const moved = setSidePanel("basis", { notify: true });
-      if (moved) await saveQuoteSessionDraftState({ quoteGenerated: quoteSessionHasFreshOutputExports() });
-      return;
+      return await withQuoteStepLoading(async () => {
+        const moved = setSidePanel("basis", { notify: true });
+        if (!moved) return false;
+        const saved = await saveQuoteSessionDraftState({ quoteGenerated: quoteSessionHasFreshOutputExports() });
+        if (!saved) setSidePanel("quote_company", { force: true });
+        return Boolean(saved);
+      });
+    } else {
+      requestStartAnalysis();
     }
-    requestStartAnalysis();
     return;
   }
   if (state.activeSidePanel === "basis") {
-    confirmBasis();
+    await confirmBasis();
     return;
   }
   if (state.activeSidePanel === "output") return;
-  if (state.activeSidePanel === "customer") {
-    applyPendingPricingReferenceSelection();
-    await advanceCustomerStep();
-    return;
-  }
-  const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
-  const moved = setSidePanel(nextPanel, { notify: true });
-  if (moved && nextPanel === "customer") {
-    await startQuoteSessionDraftSaveAfterCustomerStep();
-  } else if (moved) {
-    await saveQuoteSessionDraftState({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
-  }
+  return await withQuoteStepLoading(async () => {
+    if (state.activeSidePanel === "customer") {
+      applyPendingPricingReferenceSelection();
+      return await advanceCustomerStep();
+    }
+    const nextPanel = SIDE_PANEL_SEQUENCE[index + 1];
+    const moved = setSidePanel(nextPanel, { notify: true });
+    if (!moved) return false;
+    const saved = nextPanel === "customer"
+      ? await startQuoteSessionDraftSaveAfterCustomerStep()
+      : await saveQuoteSessionDraftState({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
+    if (!saved) setSidePanel(SIDE_PANEL_SEQUENCE[index], { force: true });
+    return Boolean(saved);
+  });
 }
 
 function handleQuoteBasisClick(event) {
@@ -17121,7 +17468,6 @@ function handleBeforeUnload(event) {
     return undefined;
   }
   if (!pricingReferenceShouldWarnBeforeUnload()) {
-    markPageUnloading();
     return undefined;
   }
   event.preventDefault();
@@ -17277,26 +17623,7 @@ function wireEvents() {
       hideExcelGeneratingModal();
     }
   });
-  elements.sideViewPdfButton.addEventListener("click", async (event) => {
-    event.preventDefault();
-    if (elements.sideViewPdfButton.getAttribute("aria-disabled") === "true") {
-      const validation = outputRowsValid();
-      if (!validation.valid) renderOutputValidationMessages(validation.errors);
-      return;
-    }
-    if (commitActiveOutputEditor() === "blocked") return;
-    const pdfWindow = window.open("about:blank", "_blank");
-    let openedPdf = false;
-    showExcelGeneratingModal(generationLoadingModalOptions(true));
-    await waitForUiPaint();
-    try {
-      const generated = await handleGenerate({ viewPdf: true });
-      if (generated) openedPdf = viewCurrentPdfFile(state.pdfFile, pdfWindow);
-    } finally {
-      if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();
-      hideExcelGeneratingModal();
-    }
-  });
+  elements.sideViewPdfButton.addEventListener("click", handleViewPdf);
   elements.excelGeneratingActionButton?.addEventListener("click", () => {
     handleGeneratedExportReadyAction();
   });
@@ -17682,10 +18009,43 @@ async function setInitialValues() {
   return false;
 }
 
+function startupPricingReferenceIsAvailable() {
+  const saved = safeSessionJson();
+  if (!isPlainObject(saved) || saved.version !== QUOTE_SESSION_STATE_VERSION
+    || saved.browserRecoveryScope !== currentBrowserRecoveryScope()) return true;
+  const { containers, restoredState } = quoteSessionSnapshotForRestoration(saved);
+  const rowSets = [restoredState.lineItems, restoredState.outputRows, restoredState.originalOutputRows];
+  const hasSavedPricing = restoredState.basisConfirmed === true
+    || rowSets.some((rows) => Array.isArray(rows) && rows.length);
+  if (!hasSavedPricing) return true;
+  const identity = (keys) => containers.flatMap((container) => keys
+    .filter((key) => Object.prototype.hasOwnProperty.call(container, key))
+    .map((key) => container[key])).find((value) => typeof value === "string") || "";
+  const id = identity(["pricingReferenceId", "pricing_reference_id"]).trim();
+  const source = identity(["pricingReferenceSource", "pricing_reference_source"]).trim();
+  const references = (Array.isArray(state.pricingReferences) ? state.pricingReferences : []).filter((reference) => {
+    const basis = pricingReferenceAuthorityBasis(reference);
+    return basis && basis.id === id && basis.source === source;
+  });
+  if (references.length !== 1) return false;
+  const reference = references[0];
+  const basis = pricingReferenceAuthorityBasis(reference);
+  return rowSets.flatMap((rows) => Array.isArray(rows) ? rows : []).every((row) => {
+    const authority = row?.pricing_authority;
+    if (authority?.variant !== "catalog") return true;
+    // Changed bases retain the commercial-review path. An unchanged basis must
+    // supply the catalogue content that the restoration validator will consume.
+    if (authority.catalog_digest !== basis.digest || authority.catalog_source !== basis.source
+      || authority.currency !== basis.currency) return true;
+    return normalizeOutputPricingAuthority(authority, row, { reference })?.variant === "catalog";
+  });
+}
+
 async function boot() {
   let dashboardOperation = null;
   let workspaceView = null;
   let sessionReady = false;
+  let profilesReady = false;
   setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
   wireEvents();
   clearLegacyLocalCompanyPresets();
@@ -17699,16 +18059,33 @@ async function boot() {
       if (workspaceView) workspaceView = { ...workspaceView, restorableOverlay: "" };
     } else dashboardOperation = restoredDashboardOperation();
     if (dashboardOperation) setDashboardLoadingState(true, dashboardOperationLoadingOptions(dashboardOperation));
-    await loadProfiles();
+    try {
+      profilesReady = await loadProfiles();
+      if (profilesReady) profilesReady = startupPricingReferenceIsAvailable();
+    } catch {
+      // An unavailable prerequisite must not admit or rewrite saved authority.
+      profilesReady = false;
+    }
+    if (!profilesReady) {
+      setDashboardLoadingState(true, {
+        title: "Workspace unavailable",
+        message: "Pricing references could not be loaded. Refresh this page to try again. Your saved quote has not been changed.",
+      });
+      return;
+    }
     const quoteRestored = await setInitialValues();
     if (workspaceView) applyWorkspaceViewState(workspaceView, { quoteRestored });
     if (state.activeAppView === "quote") showQuoteFlow();
     else showDashboard({ load: false });
     checkHealth();
   } finally {
-    state.isBooting = false;
-    if (!sessionReady) setDashboardLoadingState(false);
-    syncControlStates();
+    if (profilesReady) {
+      state.isBooting = false;
+      syncControlStates();
+    } else if (!sessionReady) {
+      state.isBooting = false;
+      setDashboardLoadingState(false);
+    }
   }
   finishAuthenticationRecovery();
   if (state.activeJob) setDashboardLoadingState(false);
