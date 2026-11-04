@@ -804,7 +804,11 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                     connection.rollback()
         finally:
             connection.close()
-        self.assertEqual(self.apply()["appliedNow"], [])
+        self.assertEqual(self.apply(self.manifest[:9])["appliedNow"], [])
+        self.assertEqual(
+            self.inspect()["pendingMigrationIds"],
+            [migration.migration_id for migration in self.manifest[9:]],
+        )
 
     def test_attempt_semantics_prefix_mismatches_fail_closed(self):
         historical_expression = "attempt_number is null or attempt_number >= 1"

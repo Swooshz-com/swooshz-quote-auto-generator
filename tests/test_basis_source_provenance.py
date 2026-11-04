@@ -170,6 +170,10 @@ class ProviderSourceSelectionTest(unittest.TestCase):
                  mock.patch.object(webapp, "request_openai_quote_basis", side_effect=provider) as remote, \
                  mock.patch.object(webapp, "write_local_log"), existing.LocalRunnerServer() as runner:
                 headers = self.fixture._ledger_runner_headers(runner)
+                saved = self.fixture._ledger_post(runner, headers, "/api/quote-sessions", {
+                    "quote_session": {"session_id": payload["quote_session"]["session_id"]},
+                })
+                self.assertEqual(saved["status"], 200, saved["text"][-800:])
                 drafted = self.fixture._ledger_post(runner, headers, "/api/draft", payload)
                 self.assertEqual(drafted["status"], 200, drafted["text"][-3000:])
                 result = drafted["body"]

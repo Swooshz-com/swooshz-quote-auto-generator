@@ -507,6 +507,10 @@ class ProviderHTTPContractTest(unittest.TestCase):
                  mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send, \
                  mock.patch.object(s, "write_local_log"), existing.LocalRunnerServer() as runner:
                 headers = self.fixture._ledger_runner_headers(runner)
+                saved = self.fixture._ledger_post(runner, headers, "/api/quote-sessions", {
+                    "quote_session": {"session_id": payload["quote_session"]["session_id"]},
+                })
+                self.assertEqual(saved["status"], 200, saved["text"][-800:])
                 drafted = self.fixture._ledger_post(runner, headers, "/api/draft", payload)
                 self.assertEqual(send.call_count, 1)
                 result = drafted["body"]

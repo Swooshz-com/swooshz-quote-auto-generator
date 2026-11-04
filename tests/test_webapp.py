@@ -28626,7 +28626,13 @@ const effects = { anchor_clicks: 0, location_fallbacks: 0, artifact_requests: 0,
 function element() { return { hidden: false, dataset: {}, classList: { add() {}, remove() {} },
   addEventListener: (type, callback) => listeners.set(type, callback), getAttribute: () => "false" }; }
 const elements = {};
-const document = { body: { appendChild() {}, classList: { remove() {} } }, createElement: () => ({
+const spendNodes = new Map();
+const document = {
+  getElementById(id) {
+    if (!spendNodes.has(id)) spendNodes.set(id, element());
+    return spendNodes.get(id);
+  },
+  body: { appendChild() {}, classList: { remove() {} } }, createElement: () => ({
   click() { effects.anchor_clicks += 1; effects.artifact_requests += 1; if (scenario.anchorThrows) throw Error("Synthetic anchor failure"); }, remove() {} }) };
 window.location = { set href(value) { effects.location_fallbacks += 1; effects.artifact_requests += 1; } };
 const outputRowsValid = () => ({ valid: true, errors: [] });
@@ -28640,6 +28646,7 @@ const waitForUiPaint = async () => {};
 const logs = [];
 const messages = [];
 const state = {
+  quoteAiSpendRequest: 0, quoteSessions: [],
   quoteSessionId: scenario.path === "initial" ? "" : "quote-synthetic-a",
   quoteSessionRestoredSessionId: scenario.path === "restored" ? "quote-synthetic-a" : "",
   quoteSessionDraftSaveStarted: true, quoteSessionLoadError: "OLD-REFERENCE-CANARY",
@@ -28837,6 +28844,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
   "newClientErrorReference", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
   "refreshSessionToken", "postJson", "logClientEvent", "ensureClientQuoteSessionId", "mergeDashboardQuoteSession",
+  "quoteAiSpendText", "renderQuoteAiSpend", "refreshQuoteAiSpend",
   "currentQuoteSessionPayload", "currentQuoteSessionDraftState", "quoteSessionDraftComparisonKey",
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
@@ -42596,6 +42604,10 @@ main().catch((error) => {
 
     def _ledger_draft(self, runner, headers, payload, provider_raw):
         """POST /api/draft with the provider's raw JSON fed through the real normaliser (no network, no paid AI)."""
+        saved = self._ledger_post(runner, headers, "/api/quote-sessions", {
+            "quote_session": {"session_id": payload["quote_session"]["session_id"]},
+        })
+        self.assertEqual(saved["status"], 200, saved["text"][-800:])
         original = webapp.read_dotenv_value
 
         def dotenv(name, *args, **kwargs):

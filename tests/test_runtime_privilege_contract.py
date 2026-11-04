@@ -4438,7 +4438,10 @@ order by object_kind, object_schema, object_name, object_type
                         f"{routine.name}({routine.identity_arguments})"
                         for routine in migration_contract.MIGRATION_OBJECTS[-1].routines
                     ),
-                    "applied_prefix_drift:table:public.sqag_telemetry_events",
+                    *(
+                        f"applied_prefix_drift:table:public.{mutation.table_name}"
+                        for mutation in migration_contract.MIGRATION_OBJECTS[-1].constraint_mutations
+                    ),
                 },
             )
         finally:
@@ -4451,6 +4454,41 @@ order by object_kind, object_schema, object_name, object_type
         self.assertTrue(restored_report["safeToApply"])
         self.assertEqual(restored_report["status"], "ready")
         self.assertFalse(restored_report["blockers"])
+
+        # Keep the 010 missing-ledger guard explicit after 011 becomes the head.
+        attempt_migration = next(
+            migration for migration in self.migrations
+            if migration.migration_id == "010_telemetry_attempt_semantics_postgres.sql"
+        )
+        saved_suffix = self._admin_rows(
+            "select sequence_no, migration_id, checksum_sha256, applied_at "
+            "from public.sqag_schema_migrations where sequence_no >= %s order by sequence_no",
+            (attempt_migration.sequence_no,),
+        )
+        self._execute_admin(
+            "delete from public.sqag_schema_migrations where sequence_no >= %s",
+            (attempt_migration.sequence_no,),
+        )
+        try:
+            report = self._inspect()
+            self.assertFalse(report["safeToApply"])
+            self.assertEqual(report["status"], "unsafe")
+            self.assertIn(
+                "applied_prefix_drift:table:public.sqag_telemetry_events", report["blockers"],
+            )
+            self.assertEqual(
+                report["pendingMigrationIds"],
+                [migration.migration_id for migration in self.migrations
+                 if migration.sequence_no >= attempt_migration.sequence_no],
+            )
+        finally:
+            for row in saved_suffix:
+                self._execute_admin(
+                    "insert into public.sqag_schema_migrations "
+                    "(sequence_no, migration_id, checksum_sha256, applied_at) values (%s, %s, %s, %s)",
+                    tuple(row.values()),
+                )
+        self.assertEqual(self._inspect()["status"], "ready")
 
         self._execute_admin(
             "update public.sqag_schema_migrations set checksum_sha256 = %s where migration_id = %s",
@@ -4859,13 +4897,13 @@ order by object_kind, object_schema, object_name, object_type
             [migration.migration_id for migration in self.migrations],
         )
         self.assertEqual(
-            post_009["appliedMigrationIds"][:-2],
+            post_009["appliedMigrationIds"][:7],
             clean_pre_apply["appliedMigrationIds"],
         )
         self.assertEqual(
             set(post_009["appliedMigrationIds"])
             - set(clean_pre_apply["appliedMigrationIds"]),
-            {self.migrations[7].migration_id, self.migrations[8].migration_id},
+            {migration.migration_id for migration in self.migrations[7:]},
         )
         ledger_row = self._admin_row(
             "select sequence_no, migration_id, checksum_sha256, applied_at "
