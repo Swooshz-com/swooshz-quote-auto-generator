@@ -12,6 +12,7 @@ __pycache__/
 Thumbs.db
 .superpowers/
 .agent-toolkit-backups/
+_agent-toolkit-backups/
 node_modules/
 .venv/
 playwright-report/
@@ -49,3 +50,10 @@ generated-quote*.xlsx
 generated-quote*.pdf
 quote-output*.xlsx
 quote-output*.pdf
+
+# Customer files never belong in this public repo. Fixtures must be synthetic
+# and generated in tests; real customer decks stay on local machines only.
+fixtures/**/*.pdf
+tests/fixtures/**/*.pdf
+tests/fixtures/quote-generator/samples/
+fixtures/samples/

@@ -477,6 +477,7 @@ class OidcRuntimeConfig:
             "redirect_uri": self.redirect_uri,
             "response_type": "code",
             "scope": "openid email profile",
+            "prompt": "select_account",
             "state": transaction.state,
             "nonce": transaction.nonce,
             "code_challenge": transaction.code_challenge,

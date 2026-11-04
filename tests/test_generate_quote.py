@@ -12,6 +12,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+import unicodedata
 from unittest import mock
 import zipfile
 from pathlib import Path
@@ -69,6 +70,23 @@ def find_cell_ref(root, expected):
     for cell in root.iter(f"{NS_MAIN}c"):
         if cell_value(root, cell.attrib.get("r", "")) == expected:
             return cell.attrib.get("r", "")
+    return ""
+
+
+def find_acceptance_sequence_ref(root, expected):
+    """Find complete acceptance text across its explicitly reflowed right-column rows."""
+    cells = sorted(
+        [(quote.parse_cell_ref(c.attrib["r"])[0], c.attrib["r"])
+         for c in root.iter(f"{NS_MAIN}c") if re.fullmatch(r"E\d+", c.attrib.get("r", ""))],
+    )
+    for index, (_, ref) in enumerate(cells):
+        text = ""
+        for _, next_ref in cells[index:]:
+            text += cell_value(root, next_ref)
+            if text == expected:
+                return ref
+            if not expected.startswith(text):
+                break
     return ""
 
 
@@ -920,7 +938,7 @@ def generate_layout_workbook(brief_updates=None, layout_template=KONCEPT_LAYOUT)
     line = quote.QuoteLine(
         section="Graphics",
         quantity=24,
-        unit="m length",
+        unit="sqm",
         description="Vinyl printed graphics for a long booth fascia",
         pricing_keyword="vinyl printed graphics",
         display_price="",
@@ -1311,7 +1329,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(cell_value(sheet, "D28"), "GST 9%")
         self.assertEqual(cell_value(sheet, "D29"), "Total including GST")
         self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
-        self.assertEqual(cell_value(sheet, "B38"), "Director")
+        self.assertEqual(cell_value(sheet, "B39"), "Director")
 
     def test_generated_workbook_preserves_template_style_fonts(self):
         tmp, path = generate_layout_workbook()
@@ -1484,6 +1502,212 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertTrue((out_dir / "quotation.pdf").exists())
             self.assertIn("pdf_mode=workbook", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
             self.assertIn("pdf_status=excel_exported", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
+
+    def test_pdf_conversion_resolves_drawing_theme_fonts_without_changing_master(self):
+        drawing = (
+            f'<xdr:wsDr xmlns:xdr="{NS_DRAWING[1:-1]}" xmlns:a="{NS_A[1:-1]}" '
+            f'xmlns:mc="{quote.XMLNS_MC}" xmlns:a14="urn:example:drawing-extension" mc:Ignorable="a14">'
+            '<mc:AlternateContent><mc:Choice Requires="a14">'
+            '<!-- Preserve drawing metadata -->'
+            '<a:r xmlns:a14="urn:example:nested-extension" mc:ProcessContent="a14:item">'
+            '<a:rPr sz="900" b="1"><a:latin typeface="+mn-lt"/></a:rPr>'
+            '<a:t><![CDATA[Example company]]></a:t></a:r>'
+            '<a:r><a:rPr sz="1100"><a:latin typeface="+mj-lt"/></a:rPr>'
+            '<a:t>Example heading</a:t></a:r>'
+            '<a:r><a:rPr><a:latin typeface="Explicit Sans"/></a:rPr>'
+            '<a:t>Explicit font</a:t></a:r>'
+            '</mc:Choice><mc:Fallback/></mc:AlternateContent></xdr:wsDr>'
+        ).encode()
+        theme = (
+            f'<a:theme xmlns:a="{NS_A[1:-1]}"><a:themeElements><a:fontScheme name="Example">'
+            '<a:majorFont><a:latin typeface="Example Heading"/></a:majorFont>'
+            '<a:minorFont><a:latin typeface="Example Body"/></a:minorFont>'
+            '</a:fontScheme></a:themeElements></a:theme>'
+        ).encode()
+        relationships = (
+            f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}">'
+            f'<Relationship Id="rTheme" Type="{NS_REL[1:-1]}/theme" Target="theme/custom.xml"/>'
+            '</Relationships>'
+        ).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            master = root / "quotation.xlsx"
+            destination = root / "export.pdf"
+            with zipfile.ZipFile(master, "w") as archive:
+                archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+                archive.writestr("xl/theme/custom.xml", theme)
+                archive.writestr("xl/drawings/drawing1.xml", drawing)
+                archive.writestr("xl/worksheets/sheet1.xml", b"<sheet/>")
+            before = master.read_bytes()
+            conversion_inputs = []
+
+            def convert(argv, **kwargs):
+                conversion_input = Path(argv[-1])
+                conversion_inputs.append(conversion_input)
+                self.assertNotEqual(conversion_input, master)
+                with zipfile.ZipFile(conversion_input) as archive:
+                    converted_xml = archive.read("xl/drawings/drawing1.xml")
+                    converted_drawing = ET.fromstring(converted_xml)
+                    namespaces = [value for _, value in ET.iterparse(io.BytesIO(converted_xml), events=["start-ns"])]
+                    self.assertIn(("a14", "urn:example:drawing-extension"), namespaces)
+                    self.assertIn(("a14", "urn:example:nested-extension"), namespaces)
+                    self.assertEqual(converted_drawing.attrib[f"{{{quote.XMLNS_MC}}}Ignorable"], "a14")
+                    self.assertEqual(converted_drawing.find(f"{{{quote.XMLNS_MC}}}AlternateContent/{{{quote.XMLNS_MC}}}Choice").attrib["Requires"], "a14")
+                    self.assertEqual(next(converted_drawing.iter(f"{NS_A}r")).attrib[f"{{{quote.XMLNS_MC}}}ProcessContent"], "a14:item")
+                    self.assertIn(b"<!-- Preserve drawing metadata -->", converted_xml)
+                    self.assertIn(b"<![CDATA[Example company]]>", converted_xml)
+                    self.assertEqual(
+                        [node.attrib["typeface"] for node in converted_drawing.iter(f"{NS_A}latin")],
+                        ["Example Body", "Example Heading", "Explicit Sans"],
+                    )
+                    self.assertEqual(next(converted_drawing.iter(f"{NS_A}rPr")).attrib, {"sz": "900", "b": "1"})
+                    self.assertEqual(archive.read("xl/worksheets/sheet1.xml"), b"<sheet/>")
+                    self.assertEqual(archive.read("xl/theme/custom.xml"), theme)
+                (Path(argv[argv.index("--outdir") + 1]) / "quotation.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            with mock.patch.object(quote, "libreoffice_candidates", return_value=["soffice"]), mock.patch.object(
+                quote.subprocess, "run", side_effect=convert,
+            ):
+                self.assertEqual(quote.libreoffice_pdf_export(master, destination), "libreoffice_exported")
+            self.assertEqual(master.read_bytes(), before)
+            self.assertTrue(destination.read_bytes().startswith(b"%PDF-"))
+            self.assertEqual(len(conversion_inputs), 1)
+            self.assertFalse(conversion_inputs[0].exists())
+
+    def test_pdf_conversion_copy_keeps_explicit_fonts_without_a_theme(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.xlsx"
+            converted = Path(tmp) / "conversion.xlsx"
+            parts = {
+                "xl/drawings/drawing1.xml": (
+                    f'<a:rPr xmlns:a="{NS_A[1:-1]}" sz="900">'
+                    '<a:latin typeface="Explicit Sans"/></a:rPr>'
+                ).encode(),
+                "xl/worksheets/sheet1.xml": b"<sheet/>",
+                "xl/sharedStrings.xml": (
+                    f'<sst xmlns="{NS_MAIN[1:-1]}"><si><r><rPr>'
+                    '<rFont val="Explicit Sans"/><sz val="12"/>'
+                    '</rPr><t>Explicit text</t></r></si></sst>'
+                ).encode(),
+            }
+            with zipfile.ZipFile(source, "w") as archive:
+                for name, content in parts.items():
+                    archive.writestr(name, content)
+            quote.write_pdf_conversion_workbook(source, converted)
+            with zipfile.ZipFile(converted) as archive:
+                self.assertEqual({name: archive.read(name) for name in archive.namelist()}, parts)
+
+    def test_pdf_conversion_materialises_partial_rich_text_font_defaults(self):
+        for part, container in (("xl/worksheets/sheet1.xml", "is"), ("xl/sharedStrings.xml", "si")):
+            with self.subTest(part=part), tempfile.TemporaryDirectory() as tmp:
+                master = Path(tmp) / "master.xlsx"
+                converted = Path(tmp) / "converted.xlsx"
+                text = (
+                    f'<root xmlns="{NS_MAIN[1:-1]}" xmlns:mc="{quote.XMLNS_MC}" '
+                    'xmlns:ext="urn:example:extension" mc:Ignorable="ext">'
+                    f'<{container}><r><rPr><b val="0"/></rPr><t>Partial</t></r>'
+                    '<r><rPr><rFont val="Explicit Sans"/><sz val="17"/><i/></rPr><t>Explicit</t></r>'
+                    f'<r><t>Inherited</t></r></{container}></root>'
+                ).encode()
+                styles = (
+                    f'<styleSheet xmlns="{NS_MAIN[1:-1]}"><fonts count="2">'
+                    '<font><sz val="10.5"/><name val="Example Default"/></font>'
+                    '<font><sz val="19"/><name val="Different Cell Font"/></font>'
+                    '</fonts></styleSheet>'
+                ).encode()
+                with zipfile.ZipFile(master, "w") as archive:
+                    archive.writestr(part, text)
+                    archive.writestr("xl/styles.xml", styles)
+                    archive.writestr("unchanged.bin", b"unchanged")
+                before = master.read_bytes()
+                quote.write_pdf_conversion_workbook(master, converted)
+                with zipfile.ZipFile(converted) as archive:
+                    result = ET.fromstring(archive.read(part))
+                    props = list(result.iter(f"{NS_MAIN}rPr"))
+                    self.assertEqual(props[0].find(f"{NS_MAIN}rFont").attrib, {"val": "Example Default"})
+                    self.assertEqual(props[0].find(f"{NS_MAIN}sz").attrib, {"val": "10.5"})
+                    self.assertEqual(props[0].find(f"{NS_MAIN}b").attrib, {"val": "0"})
+                    self.assertEqual(props[1].find(f"{NS_MAIN}rFont").attrib, {"val": "Explicit Sans"})
+                    self.assertEqual(props[1].find(f"{NS_MAIN}sz").attrib, {"val": "17"})
+                    self.assertEqual(len(list(result.iter(f"{NS_MAIN}rPr"))), 2)
+                    self.assertIn(b'xmlns:ext="urn:example:extension"', archive.read(part))
+                    self.assertEqual(archive.read("xl/styles.xml"), styles)
+                    self.assertEqual(archive.read("unchanged.bin"), b"unchanged")
+                self.assertEqual(master.read_bytes(), before)
+
+    def test_pdf_conversion_resolves_rich_text_schemes_and_keeps_explicit_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            master, converted = Path(tmp) / "master.xlsx", Path(tmp) / "converted.xlsx"
+            with zipfile.ZipFile(master, "w") as archive:
+                archive.writestr("xl/styles.xml", f'<styleSheet xmlns="{NS_MAIN[1:-1]}"><fonts><font><name val="Default"/><sz val="9"/></font></fonts></styleSheet>')
+                archive.writestr("xl/sharedStrings.xml", (
+                    f'<sst xmlns="{NS_MAIN[1:-1]}"><si>'
+                    '<r><rPr><scheme val="major"/></rPr><t>Heading</t></r>'
+                    '<r><rPr><scheme val="minor"/></rPr><t>Body</t></r>'
+                    '<r><rPr><rFont val="Explicit"/><sz val="14"/><scheme val="major"/></rPr><t>Explicit</t></r>'
+                    '<r><rPr><rFont val="Explicit"/></rPr><t>Missing size</t></r>'
+                    '</si></sst>'
+                ))
+                archive.writestr("xl/_rels/workbook.xml.rels", f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}"><Relationship Id="theme" Type="{NS_REL[1:-1]}/theme" Target="theme/theme1.xml"/></Relationships>')
+                archive.writestr("xl/theme/theme1.xml", f'<a:theme xmlns:a="{NS_A[1:-1]}"><a:themeElements><a:fontScheme name="Example"><a:majorFont><a:latin typeface="Example Heading"/></a:majorFont><a:minorFont><a:latin typeface="Example Body"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>')
+            quote.write_pdf_conversion_workbook(master, converted)
+            with zipfile.ZipFile(converted) as archive:
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                props = list(root.iter(f"{NS_MAIN}rPr"))
+                self.assertEqual([p.find(f"{NS_MAIN}rFont").attrib["val"] for p in props], ["Example Heading", "Example Body", "Explicit", "Explicit"])
+                self.assertEqual([p.find(f"{NS_MAIN}sz").attrib["val"] for p in props], ["9", "9", "14", "9"])
+
+    def test_pdf_conversion_refuses_unavailable_rich_text_defaults(self):
+        for styles in (None, b"<styleSheet/>", (
+            f'<styleSheet xmlns="{NS_MAIN[1:-1]}"><fonts>'
+            '<font><name val="Example"/><sz val="NaN"/></font></fonts></styleSheet>'
+        ).encode()):
+            with self.subTest(styles=styles), tempfile.TemporaryDirectory() as tmp:
+                master = Path(tmp) / "master.xlsx"
+                converted = Path(tmp) / "converted.xlsx"
+                with zipfile.ZipFile(master, "w") as archive:
+                    archive.writestr("xl/sharedStrings.xml", (
+                        f'<sst xmlns="{NS_MAIN[1:-1]}"><si><r><rPr><b/></rPr><t>Partial</t></r></si></sst>'
+                    ))
+                    if styles is not None:
+                        archive.writestr("xl/styles.xml", styles)
+                before = master.read_bytes()
+                with self.assertRaises(ValueError):
+                    quote.write_pdf_conversion_workbook(master, converted)
+                self.assertEqual(master.read_bytes(), before)
+                self.assertFalse(converted.exists())
+
+    def test_pdf_conversion_refuses_unresolved_or_ambiguous_theme_fonts(self):
+        relationship = (
+            f'<Relationship Id="rTheme" Type="{NS_REL[1:-1]}/theme" '
+            'Target="theme/custom.xml" {mode}/>'
+        )
+        drawing = (
+            f'<a:rPr xmlns:a="{NS_A[1:-1]}"><a:latin typeface="+mn-lt"/></a:rPr>'
+        ).encode()
+        for label, relationships, theme in (
+            ("external", relationship.format(mode='TargetMode="External"'), b"<theme/>"),
+            ("duplicate", relationship.format(mode="") * 2, b"<theme/>"),
+            ("missing_font", relationship.format(mode=""), b"<theme/>"),
+            ("missing_part", relationship.format(mode=""), None),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / "source.xlsx"
+                converted = Path(tmp) / "conversion.xlsx"
+                with zipfile.ZipFile(source, "w") as archive:
+                    archive.writestr("xl/drawings/drawing1.xml", drawing)
+                    archive.writestr(
+                        "xl/_rels/workbook.xml.rels",
+                        f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}">{relationships}</Relationships>',
+                    )
+                    if theme is not None:
+                        archive.writestr("xl/theme/custom.xml", theme)
+                before = source.read_bytes()
+                with self.assertRaises(ValueError):
+                    quote.write_pdf_conversion_workbook(source, converted)
+                self.assertEqual(source.read_bytes(), before)
+                self.assertFalse(converted.exists())
 
     def test_real_libreoffice_pdf_render_preserves_template_fidelity(self):
         running_in_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
@@ -1660,6 +1884,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                             "ink_bbox": dark_mask.getbbox(),
                             "logo_bbox": synthetic_logo_bbox(image),
                             "header_bbox": pdf_text_bbox(textpage, "Rendered Fidelity Co") if "Rendered Fidelity Co" in text else None,
+                            "header_fonts": pdf_phrase_font_names(textpage, "Rendered Fidelity Co") if "Rendered Fidelity Co" in text else [],
+                            "client_fonts": pdf_phrase_font_names(textpage, "Saved Client") if "Saved Client" in text else [],
                             "quantity_bbox": pdf_text_bbox(textpage, "Quantity") if "Quantity" in text else None,
                             "quantity_weights": pdf_phrase_font_weights(textpage, "Quantity") if "Quantity" in text else [],
                         })
@@ -1688,7 +1914,17 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 self.assertIn(expected, first_page["text"])
             self.assertIsNotNone(first_page["logo_bbox"])
             self.assertIsNotNone(first_page["header_bbox"])
+            self.assertTrue(first_page["header_fonts"])
+            self.assertTrue(all(
+                name.split("+")[-1] in {"Calibri", "Calibri-Bold", "Carlito", "Carlito-Regular", "Carlito-Bold"}
+                for name in first_page["header_fonts"]
+            ), first_page["header_fonts"])
             self.assertIsNotNone(first_page["quantity_bbox"])
+            self.assertTrue(first_page["client_fonts"])
+            self.assertTrue(all(
+                name.split("+")[-1] in {"Arial", "ArialMT", "LiberationSans", "LiberationSans-Regular"}
+                for name in first_page["client_fonts"]
+            ), first_page["client_fonts"])
 
             logo_bbox = first_page["logo_bbox"]
             logo_width_px = logo_bbox[2] - logo_bbox[0]
@@ -2711,16 +2947,16 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         row_breaks = sheet.find(f"{NS_MAIN}rowBreaks")
         sheet_view = sheet.find(f"{NS_MAIN}sheetViews/{NS_MAIN}sheetView")
 
-        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), "Quotation!$A$1:$I$40")
-        self.assertEqual(dimension.attrib.get("ref"), "A1:I40")
+        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), "Quotation!$A$1:$I$41")
+        self.assertEqual(dimension.attrib.get("ref"), "A1:I41")
         self.assertIsNone(row_breaks)
         self.assertNotEqual(sheet_view.attrib.get("view"), "pageBreakPreview")
-        self.assertEqual(cell_value(sheet, "B38"), "Director")
-        self.assertEqual(cell_value(sheet, "B40"), "")
+        self.assertEqual(cell_value(sheet, "B39"), "Director")
+        self.assertEqual(cell_value(sheet, "B41"), "")
         self.assertFalse([
             item.attrib.get("r")
             for item in sheet.iter(f"{NS_MAIN}c")
-            if quote.parse_cell_ref(item.attrib.get("r", "A1"))[0] > 40 and quote.parse_cell_ref(item.attrib.get("r", "A1"))[1] <= 9
+            if quote.parse_cell_ref(item.attrib.get("r", "A1"))[0] > 41 and quote.parse_cell_ref(item.attrib.get("r", "A1"))[1] <= 9
         ])
 
     def test_layout_print_area_trims_trailing_blank_manual_page(self):
@@ -2815,9 +3051,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         brief, lines = continuation_acceptance_fidelity_case()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "quotation.xlsx"
-            with mock.patch.object(quote, "layout_chunk_start_row", wraps=quote.layout_chunk_start_row) as place_chunk:
-                quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
-            self.assertGreater(place_chunk.call_args.args[0], quote.FIRST_PRINT_PAGE_END_ROW)
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
             with zipfile.ZipFile(path) as zf:
                 self.assertIsNone(zf.testzip())
                 sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
@@ -2828,7 +3062,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT - 1,
         ])
         self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         page_start = quote.continuation_page_start_for_row(acceptance_row)
         self.assertEqual(page_start, quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_PAGE_HEIGHT)
         self.assertGreaterEqual(acceptance_row, page_start + quote.CONTINUATION_BODY_OFFSET)
@@ -2909,7 +3143,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         )
 
         heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Notes"))[0]
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         self.assertEqual(heading_row, 122)
         numbered_rows = {}
         for row_number in range(heading_row + 1, acceptance_row):
@@ -2983,7 +3217,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         terms_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Payment Terms"))[0]
         notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Standard Notes"))[0]
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         terms_rows = [
             row_number
             for row_number in range(terms_heading_row + 1, notes_heading_row)
@@ -3063,7 +3297,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         )
         self.assertEqual(quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS, 3)
 
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         content_rows = [
             row_number
             for row_number in range(quote.CONTINUATION_PAGE_START_ROW + quote.CONTINUATION_BODY_OFFSET, acceptance_row)
@@ -3541,7 +3775,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual(breaks, [55, 116])
             self.assertEqual(planned_pages, 3)
             self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
-            acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+            acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
             entry_rows = [
                 row_number
                 for row_number in range(61, acceptance_row)
@@ -3918,7 +4152,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         acceptance_refs = [
             find_cell_ref(sheet, "Koncept Image Pte Ltd"),
-            find_cell_ref(sheet, "We accept the quotation amount and the terms"),
+            find_acceptance_sequence_ref(sheet, "We accept the quotation amount and the terms"),
             find_cell_ref(sheet, "Francies Cheng"),
             find_cell_ref(sheet, "Director"),
             find_cell_ref(sheet, "Person in charge"),
@@ -4066,14 +4300,14 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         acceptance_rows = [
             quote.parse_cell_ref(find_cell_ref(sheet, "Koncept Images Pte. Ltd."))[0],
-            quote.parse_cell_ref(find_cell_ref(sheet, "We accept the quotation amount and the terms"))[0],
+            quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, "We accept the quotation amount and the terms"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "_____________________________"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Francies Cheng"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Director"))[0],
         ]
 
         notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["notes_heading"]))[0]
-        acceptance_row = quote.parse_cell_ref(find_cell_ref(sheet, brief["acceptance"]["text"]))[0]
+        acceptance_row = quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, brief["acceptance"]["text"]))[0]
         rendered_note = " ".join(
             cell_value(sheet, f"B{row_number}")
             for row_number in range(notes_heading_row + 1, acceptance_row)
@@ -4156,7 +4390,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         acceptance_rows = [
             quote.parse_cell_ref(find_cell_ref(sheet, "Koncept Images Pte. Ltd."))[0],
-            quote.parse_cell_ref(find_cell_ref(sheet, "We accept the quotation amount and the terms"))[0],
+            quote.parse_cell_ref(find_acceptance_sequence_ref(sheet, "We accept the quotation amount and the terms"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "_____________________________"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Francies Cheng"))[0],
             quote.parse_cell_ref(find_cell_ref(sheet, "Director"))[0],
@@ -4183,7 +4417,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             "",
         )
         self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
-        self.assertEqual(cell_value(sheet, "E32"), "We accept the quotation amount and the terms")
+        self.assertEqual(cell_value(sheet, "E32") + cell_value(sheet, "E33"), "We accept the quotation amount and the terms")
 
     def test_company_detail_drawing_preserves_template_geometry_and_top_alignment(self):
         tmp, path = generate_layout_workbook()
@@ -4413,7 +4647,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertIsNone(font_for_style(styles, cell_style(sheet, "A33")).find(f"{NS_MAIN}i"))
         self.assertIsNone(font_for_style(styles, cell_style(sheet, "A34")).find(f"{NS_MAIN}i"))
         self.assertEqual(cell_value(sheet, "E35"), "")
-        self.assertEqual(cell_value(sheet, "E37"), "We accept the quotation amount and the terms")
+        self.assertEqual(cell_value(sheet, "E37") + cell_value(sheet, "E38"), "We accept the quotation amount and the terms")
 
     def test_brief_can_override_terms_notes_and_company_text(self):
         tmp = tempfile.TemporaryDirectory()
@@ -4525,6 +4759,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                     optional_style = cell_style(sheet, ref) in {
                         cell_style(sheet, find_cell_ref(sheet, "Commercial Terms")),
                         cell_style(sheet, find_cell_ref(sheet, "50% deposit")),
+                        cell_style(sheet, find_cell_ref(sheet, "Accepted by customer")),
+                        cell_style(sheet, find_cell_ref(sheet, "Authorised signer")),
                     }
                     self.assertEqual(run_font_name, font_name(font) if optional_style else "", expected_text)
                     self.assertEqual(run_font_size, font_size(font) if optional_style else "", expected_text)
@@ -5123,6 +5359,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertEqual([row for row, _ in rows], list(range(rows[0][0], rows[0][0] + 3)))
 
     def test_real_libreoffice_original_106_character_footer_reflow_proof(self):
+        if not quote.libreoffice_candidates():
+            message = "LibreOffice is unavailable locally; hosted CI must run this rendered regression."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
         import pypdfium2 as pdfium
         brief, lines, _, _ = optional_text_capacity_case("standard_notes", 1)
         original = "BOLDITALICUNDERLINE" + "x" * 87
@@ -5164,3 +5405,659 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class GeneratorDiagnosticIdentityTest(unittest.TestCase):
+    def test_real_prepare_and_csv_preserve_cardinality_and_formula_safe_source_identity(self):
+        source_ids = ["basis-one", "", "same", "same", "=synthetic", " +synthetic", "-synthetic", "@synthetic"]
+        brief = {"_pricing_authority_enforced": True, "line_items": [
+            {"section": "Synthetic section", "description": "Same synthetic label", "quantity": 2,
+             "unit": "nos", "price_mode": "Priced", "diagnostic_row_id": f"row-{index}",
+             "source_basis_line_id": source_id, "pricing_authority": {"variant": "none"}}
+            for index, source_id in enumerate(source_ids)]}
+        before = copy.deepcopy(brief)
+        prepared = quote.prepare_lines(brief, [], False)
+        self.assertEqual(len(prepared), len(source_ids))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "diagnostics.csv"
+            quote.write_match_csv(path, prepared)
+            with path.open(encoding="utf-8", newline="") as handle: rows = list(csv.DictReader(handle))
+        self.assertEqual([row["diagnostic_row_id"] for row in rows], [f"row-{i}" for i in range(len(source_ids))])
+        self.assertEqual([row["source_basis_line_id"] for row in rows], [quote.spreadsheet_safe_text(value) for value in source_ids])
+        self.assertEqual([row["status"] for row in rows], ["unmatched"] * len(source_ids))
+        self.assertEqual(brief, before)
+
+
+class AcceptanceSignatureLayoutTest(unittest.TestCase):
+    def workbook(self, text, rich=None, *, template=KONCEPT_LAYOUT, extra_acceptance=None):
+        acceptance = {"company_name": "Synthetic left", "text": text,
+                      "person_label": "Synthetic person", "stamp_label": "Synthetic stamp",
+                      "date_label": "Synthetic date"}
+        acceptance.update(extra_acceptance or {})
+        updates = {"acceptance": acceptance, "signature": {
+            "company_signatory": "Synthetic signer", "company_title": "Synthetic title",
+            "company_date_label": "Synthetic date"}}
+        if rich is not None:
+            updates["rich_text"] = {"acceptanceText": rich}
+        tmp, path = generate_layout_workbook(updates, layout_template=template)
+        self.addCleanup(tmp.cleanup)
+        with zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        return path, sheet, workbook
+
+    def column_values(self, sheet, column):
+        cells = [c for c in sheet.iter(f"{NS_MAIN}c")
+                 if re.fullmatch(column + r"\d+", c.attrib.get("r", ""))]
+        return [(quote.parse_cell_ref(c.attrib["r"])[0], cell_value(sheet, c.attrib["r"]))
+                for c in sorted(cells, key=lambda c: quote.parse_cell_ref(c.attrib["r"])[0])
+                if cell_value(sheet, c.attrib["r"])]
+
+    def test_actual_web_mapper_preserves_acceptance_and_signature_paragraphs(self):
+        from tests import test_webapp as web_tests
+        fields = {
+            "acceptance": ("company_name", "text", "person_label", "stamp_label", "date_label"),
+            "signature": ("company_signatory", "company_title", "company_date_label"),
+        }
+        with mock.patch.dict(os.environ, {"APP_MODE": "local", "SQAG_STORAGE_MODE": "local"}, clear=True), \
+             mock.patch.object(web_tests.webapp, "read_dotenv_value", return_value=""):
+            fixture = web_tests.WebappServerTest("test_payload_to_brief_maps_confirmed_form_fields")
+            fixture.setUp()
+            try:
+                for nested in (False, True):
+                    with self.subTest(nested=nested):
+                        payload = web_tests.valid_payload()
+                        payload["rich_text"] = {}
+                        expected = {}
+                        for group, keys in fields.items():
+                            expected[group] = {}
+                            for index, key in enumerate(keys):
+                                prefix = ("A" if group == "acceptance" else "S") + str(index)
+                                value = prefix + " first\r\n\r\n" + prefix + " second"
+                                expected[group][key] = value.replace("\r\n", "\n")
+                                if group == "signature":
+                                    payload[group][key] = value
+                                elif nested or key == "company_name":
+                                    payload["quote_text"].setdefault("acceptance", {})[key] = value
+                                else:
+                                    payload["quote_text"]["acceptance_text" if key == "text" else key] = value
+                        mapped = web_tests.webapp.payload_to_brief(payload)
+                        for group in fields:
+                            self.assertEqual(mapped[group], expected[group])
+                        tmp, path = generate_layout_workbook(mapped)
+                        self.addCleanup(tmp.cleanup)
+                        with zipfile.ZipFile(path) as archive:
+                            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                        for group in fields:
+                            for value in expected[group].values():
+                                first, _, second = value.split("\n")
+                                first_ref, second_ref = find_cell_ref(sheet, first), find_cell_ref(sheet, second)
+                                self.assertTrue(first_ref, first)
+                                self.assertTrue(second_ref, second)
+                                self.assertEqual(quote.parse_cell_ref(second_ref)[0] -
+                                                 quote.parse_cell_ref(first_ref)[0], 2)
+                payload = web_tests.valid_payload()
+                payload["rich_text"] = {}
+                literal = "=SUM(1,2)\n+literal\n-literal\n@literal\nA<br>B"
+                payload["quote_text"]["acceptance_text"] = literal
+                mapped = web_tests.webapp.payload_to_brief(payload)
+                self.assertEqual(mapped["acceptance"]["text"], literal)
+                tmp, path = generate_layout_workbook(mapped)
+                self.addCleanup(tmp.cleanup)
+                with zipfile.ZipFile(path) as archive:
+                    sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                for text in literal.split("\n"):
+                    ref = find_cell_ref(sheet, text)
+                    self.assertTrue(ref, text)
+                    cell = next(c for c in sheet.iter(f"{NS_MAIN}c") if c.get("r") == ref)
+                    self.assertEqual(cell.get("t"), "inlineStr")
+                    self.assertIsNone(cell.find(f"{NS_MAIN}f"))
+            finally:
+                fixture.doCleanups()
+
+    def test_acceptance_selected_font_survives_pdf_conversion_without_master_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            template = Path(temporary) / "layout.xlsx"
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                parts = {name: source.read(name) for name in source.namelist()}
+            styles = ET.fromstring(parts["xl/styles.xml"])
+            for style in (2, 33):
+                font = font_for_style(styles, style)
+                font.find(f"{NS_MAIN}name").set("val", "Times New Roman")
+                font.find(f"{NS_MAIN}sz").set("val", "28")
+            parts["xl/styles.xml"] = ET.tostring(styles)
+            with zipfile.ZipFile(template, "w") as target:
+                for name, data in parts.items():
+                    target.writestr(name, data)
+            path, _, _ = self.workbook("Font test", "<strong>Font</strong> <em>test</em>", template=template)
+            before = path.read_bytes()
+            converted = path.with_name("conversion.xlsx")
+            quote.write_pdf_conversion_workbook(path, converted)
+            self.assertEqual(path.read_bytes(), before)
+            for workbook in (path, converted):
+                with self.subTest(workbook=workbook.name), zipfile.ZipFile(workbook) as archive:
+                    root = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                    style_parts = {"xl/styles.xml": archive.read("xl/styles.xml")}
+                    ref = find_cell_ref(root, "Font test")
+                    self.assertTrue(ref)
+                    first_row = quote.parse_cell_ref(ref)[0]
+                    checked = 0
+                    for cell in root.iter(f"{NS_MAIN}c"):
+                        row, column = quote.parse_cell_ref(cell.get("r"))
+                        if row < first_row or column not in (2, 5) or not cell_value(root, cell.get("r")):
+                            continue
+                        selected = quote.ooxml_style_text_font(style_parts, cell.get("s"))
+                        self.assertEqual(selected, {"font_name": "Times New Roman", "font_size": "28"})
+                        for fragment, name, size in cell_inline_run_fonts(root, cell.get("r")):
+                            if fragment:
+                                checked += 1
+                                self.assertEqual((name, size), ("Times New Roman", "28"))
+                    self.assertGreater(checked, 8)
+                    runs = cell_inline_runs(root, ref)
+                    self.assertTrue(any(run[1] for run in runs))
+                    self.assertTrue(any(run[2] for run in runs))
+
+    def test_acceptance_unicode_marks_stay_with_base_across_run_boundaries(self):
+        for mark in ("\u0301", "\u20dd", "\ufe0f", "\u0903"):
+            with self.subTest(mark=repr(mark)):
+                runs = [quote.RichTextRun("W" * 25), quote.RichTextRun(mark, bold=True),
+                        quote.RichTextRun("W" * 3)]
+                wrapped = quote.wrap_rich_text_runs(runs, max_width=255.75, font_size=10)
+                text_lines = ["".join(r.text for r in line) for line in wrapped]
+                self.assertEqual("".join(text_lines), "W" * 25 + mark + "W" * 3)
+                self.assertFalse(any(unicodedata.category(line[0]).startswith("M") for line in text_lines))
+                self.assertTrue(any(r.text == mark and r.bold for line in wrapped for r in line))
+                if unicodedata.category(mark) in {"Mn", "Me"}:
+                    self.assertEqual(quote.optional_text_character_width(mark), 0)
+                _, sheet, _ = self.workbook("W" * 25 + mark + "W" * 3)
+                fragments = [value for _, value in self.column_values(sheet, "E")
+                             if value and set(value).issubset({"W", mark})]
+                self.assertEqual("".join(fragments), "W" * 25 + mark + "W" * 3)
+                self.assertFalse(any(unicodedata.category(value[0]).startswith("M") for value in fragments))
+
+    def test_acceptance_plain_and_rich_keep_every_paragraph_and_emphasis(self):
+        expected = ["First acceptance", "Second acceptance", "Third acceptance"]
+        _, plain, _ = self.workbook("\n".join(expected))
+        _, rich, _ = self.workbook("\n".join(expected),
+            "<div>First acceptance</div><p><strong>Second acceptance</strong></p>"
+            "<div><em>Third acceptance</em></div>")
+        for sheet in (plain, rich):
+            values = [(row, value) for row, value in self.column_values(sheet, "E") if value in expected]
+            self.assertEqual([value for _, value in values], expected)
+            self.assertEqual([row for row, _ in values], [32, 33, 34])
+            self.assertEqual(find_cell_ref(sheet, "Synthetic signer"), "B39")
+            self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E39")
+        self.assertTrue(cell_inline_runs(rich, "E33")[0][1])
+        self.assertTrue(cell_inline_runs(rich, "E34")[0][2])
+
+    def test_acceptance_short_single_line_keeps_original_signature_offsets(self):
+        _, sheet, _ = self.workbook("Short acceptance")
+        self.assertEqual(find_cell_ref(sheet, "Short acceptance"), "E32")
+        self.assertEqual(find_cell_ref(sheet, "_____________________________________"), "E36")
+        self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E37")
+        self.assertEqual(find_cell_ref(sheet, "Synthetic stamp"), "E38")
+        self.assertEqual(find_cell_refs(sheet, "Synthetic date"), ["B39", "E39"])
+
+    def test_acceptance_wrap_boundaries_keep_combining_runs_and_literal_prefixes(self):
+        for count, expected_lines in ((1, 1), (2, 1), (3, 2)):
+            with self.subTest(count=count):
+                wrapped = quote.wrap_rich_text_runs(
+                    [quote.RichTextRun("W" * count)], max_width=20, font_size=10)
+                self.assertEqual(len(wrapped), expected_lines)
+                self.assertEqual("".join(r.text for line in wrapped for r in line), "W" * count)
+        with self.assertRaisesRegex(ValueError, "glyph exceeds"):
+            quote.wrap_rich_text_runs([quote.RichTextRun("W")], max_width=5, font_size=10)
+        combined = "W\u0301" * 3
+        wrapped = quote.wrap_rich_text_runs(
+            [quote.RichTextRun(combined, bold=True)], max_width=23, font_size=10)
+        self.assertEqual("".join(r.text for line in wrapped for r in line), combined)
+        self.assertTrue(all(r.bold for line in wrapped for r in line))
+        self.assertTrue(all(not unicodedata.combining(line[0].text[0]) for line in wrapped))
+        expected = ["=SUM(1,2)", "+literal", "-literal", "@literal"]
+        _, sheet, _ = self.workbook("\n".join(expected),
+            "".join("<div>" + html.escape(value) + "</div>" for value in expected))
+        self.assertEqual([value for _, value in self.column_values(sheet, "E") if value in expected], expected)
+        for value in expected:
+            cell = next(c for c in sheet.iter(f"{NS_MAIN}c") if c.attrib["r"] == find_cell_ref(sheet, value))
+            self.assertEqual(cell.get("t"), "inlineStr")
+            self.assertIsNone(cell.find(f"{NS_MAIN}f"))
+
+    def test_acceptance_width_uses_visible_template_columns_without_mutating_template(self):
+        original = KONCEPT_LAYOUT.read_bytes()
+        counts = []
+        for width in (3, 15.5, 40):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "layout.xlsx"
+                with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                    parts = {name: source.read(name) for name in source.namelist()}
+                sheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+                for col in sheet.findall(f"{NS_MAIN}cols/{NS_MAIN}col"):
+                    if int(col.get("min")) in (5, 6, 9):
+                        col.set("width", str(width))
+                parts["xl/worksheets/sheet1.xml"] = ET.tostring(sheet)
+                with zipfile.ZipFile(path, "w") as target:
+                    for name, data in parts.items():
+                        target.writestr(name, data)
+                _, output, _ = self.workbook("W" * 80, template=path)
+                fragments = [value for _, value in self.column_values(output, "E") if set(value) == {"W"}]
+                self.assertEqual("".join(fragments), "W" * 80)
+                counts.append(len(fragments))
+        self.assertGreater(counts[0], counts[1])
+        self.assertGreater(counts[1], counts[2])
+        self.assertEqual(KONCEPT_LAYOUT.read_bytes(), original)
+
+    def test_acceptance_oversized_block_uses_remaining_body_and_keeps_final_labels(self):
+        expected = [f"Acceptance line {i:03d}" for i in range(140)]
+        _, sheet, workbook = self.workbook("\n".join(expected))
+        found = [(row, value) for row, value in self.column_values(sheet, "E")
+                 if value.startswith("Acceptance line ")]
+        self.assertEqual([value for _, value in found], expected)
+        self.assertEqual(found[0][0], 32, "Oversized block must use available first-page body.")
+        self.assertIn(55, [row for row, _ in found])
+        for row, _ in found:
+            start = quote.continuation_page_start_for_row(row)
+            if start is not None:
+                self.assertGreaterEqual(row, start + quote.CONTINUATION_BODY_OFFSET)
+                self.assertLessEqual(row, quote.manual_page_end_for_row(row) -
+                                     quote.OPTIONAL_TEXT_CONTINUATION_END_GUARD_ROWS)
+        last_text = found[-1][0]
+        self.assertGreater(quote.parse_cell_ref(find_cell_ref(sheet, "Synthetic person"))[0], last_text)
+        date_rows = [quote.parse_cell_ref(ref)[0] for ref in find_cell_refs(sheet, "Synthetic date")]
+        self.assertEqual(len(date_rows), 2)
+        print_last = int(defined_name_text(workbook, "_xlnm.Print_Area").rsplit("$", 1)[1])
+        self.assertGreaterEqual(print_last, max(date_rows))
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+
+    def test_acceptance_whole_block_fitting_and_one_row_over_admission(self):
+        with zipfile.ZipFile(KONCEPT_LAYOUT) as archive:
+            original_parts = {name: archive.read(name) for name in archive.namelist()}
+        for candidate, expected in ((48, 48), (49, 61)):
+            with self.subTest(candidate=candidate):
+                parts = dict(original_parts)
+                styles = quote.add_quote_layout_styles(parts)
+                root = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+                quote.clear_ooxml_range(root, 1, 1000, 1, 100)
+                last, moved = quote.write_acceptance_signature(root, candidate, {},
+                    {"text": "Short acceptance", "company_name": "Synthetic left"},
+                    {}, "Synthetic left", styles, parts)
+                self.assertEqual(find_cell_ref(root, "Short acceptance"), f"E{expected}")
+                self.assertEqual(last, expected + 8)
+                self.assertEqual(moved, candidate != expected)
+
+    def test_acceptance_hidden_columns_reduce_both_independent_text_widths(self):
+        original = KONCEPT_LAYOUT.read_bytes()
+        counts = []
+        for hidden in (False, True):
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "layout.xlsx"
+                with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                    parts = {name: source.read(name) for name in source.namelist()}
+                root = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+                for col in root.findall(f"{NS_MAIN}cols/{NS_MAIN}col"):
+                    if int(col.get("min")) in (3, 9):
+                        col.set("hidden", "1" if hidden else "0")
+                parts["xl/worksheets/sheet1.xml"] = ET.tostring(root)
+                with zipfile.ZipFile(path, "w") as target:
+                    for name, data in parts.items():
+                        target.writestr(name, data)
+                _, sheet, _ = self.workbook("W" * 80, template=path,
+                    extra_acceptance={"company_name": "M" * 80})
+                lengths = []
+                for column, glyph in (("B", "M"), ("E", "W")):
+                    fragments = [value for _, value in self.column_values(sheet, column)
+                                 if set(value) == {glyph}]
+                    self.assertEqual("".join(fragments), glyph * 80)
+                    lengths.append(len(fragments))
+                counts.append(lengths)
+        self.assertTrue(all(after > before for before, after in zip(*counts)))
+        self.assertEqual(KONCEPT_LAYOUT.read_bytes(), original)
+
+    def test_acceptance_long_rich_signature_labels_continue_without_loss(self):
+        left, right = "LEFTLABEL" * 170, "RIGHTLABEL" * 150
+        extra = {"person_label": right, "stamp_label": "Final stamp", "date_label": "Final date"}
+        tmp, path = generate_layout_workbook({
+            "acceptance": {"company_name": "Synthetic left", "text": "Short acceptance", **extra},
+            "signature": {"company_signatory": left, "company_title": "Final title",
+                          "company_date_label": "Final date"},
+            "rich_text": {"companySignatory": "<div><strong>" + left + "</strong></div>",
+                          "personLabel": "<div><em>" + right + "</em></div>"},
+        })
+        self.addCleanup(tmp.cleanup)
+        with zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        for column, expected, alphabet, attribute in (
+            ("B", left, set("LEFTLABEL"), 1), ("E", right, set("RIGHTLABEL"), 2),
+        ):
+            fragments = [(row, value) for row, value in self.column_values(sheet, column)
+                         if value and set(value).issubset(alphabet)]
+            self.assertEqual("".join(value for _, value in fragments), expected)
+            for row, _ in fragments:
+                self.assertTrue(all(run[attribute] for run in cell_inline_runs(sheet, f"{column}{row}")))
+            final_row = quote.parse_cell_ref(find_cell_ref(sheet, "Final title"))[0]
+            self.assertGreater(final_row, fragments[-1][0])
+        dates = find_cell_refs(sheet, "Final date")
+        self.assertEqual(len(dates), 2)
+        self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
+
+    def test_acceptance_large_font_uses_counted_row_slots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "layout.xlsx"
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                parts = {name: source.read(name) for name in source.namelist()}
+            styles = ET.fromstring(parts["xl/styles.xml"])
+            font = font_for_style(styles, 2)
+            font.find(f"{NS_MAIN}sz").set("val", "36")
+            parts["xl/styles.xml"] = ET.tostring(styles)
+            with zipfile.ZipFile(path, "w") as target:
+                for name, data in parts.items():
+                    target.writestr(name, data)
+            _, sheet, _ = self.workbook("Wide", template=path)
+            ref = find_cell_ref(sheet, "Wide")
+            row, _ = quote.parse_cell_ref(ref)
+            merges = [m.get("ref") for m in sheet.findall(f"{NS_MAIN}mergeCells/{NS_MAIN}mergeCell")]
+            self.assertIn(f"E{row}:I{row + 2}", merges)
+            self.assertEqual([sheet.find(f"{NS_MAIN}sheetData/{NS_MAIN}row[@r='{r}']").get("ht")
+                              for r in range(row, row + 3)], ["18.7"] * 3)
+
+    def test_real_libreoffice_acceptance_multiline_paint_and_signature_clearance(self):
+        if not quote.libreoffice_candidates():
+            message = "LibreOffice required for acceptance text paint/clearance proof."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
+        import pypdfium2 as pdfium
+        import math
+        cases = [
+            ("default", "We accept the quotation amount and the terms", None,
+             ["We accept the quotation amount and the terms"]),
+            ("wide-uppercase", "DDDDDD " * 16, None, [("DDDDDD " * 16).strip()]),
+            ("plain", "First acceptance\nSecond acceptance\nThird acceptance", None,
+             ["First acceptance", "Second acceptance", "Third acceptance"]),
+            ("rich", "First acceptance\nSecond acceptance\nThird acceptance",
+             "<div>First acceptance</div><div><strong>Second acceptance</strong></div>"
+             "<div><em>Third acceptance</em></div>",
+             ["First acceptance", "Second acceptance", "Third acceptance"]),
+        ]
+        cases.append(("selected-font-28", "Large font", "<strong>Large</strong> <em>font</em>", ["Large font"]))
+        for case, plain, rich, expected in cases:
+            with self.subTest(case=case):
+                template = KONCEPT_LAYOUT
+                selected_size = 28 if case == "selected-font-28" else None
+                if selected_size is not None:
+                    temporary = tempfile.TemporaryDirectory()
+                    self.addCleanup(temporary.cleanup)
+                    template = Path(temporary.name) / "layout.xlsx"
+                    with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                        parts = {name: source.read(name) for name in source.namelist()}
+                    styles = ET.fromstring(parts["xl/styles.xml"])
+                    for style in (2, 33):
+                        font = font_for_style(styles, style)
+                        font.find(f"{NS_MAIN}name").set("val", "Arial")
+                        font.find(f"{NS_MAIN}sz").set("val", str(selected_size))
+                    parts["xl/styles.xml"] = ET.tostring(styles)
+                    with zipfile.ZipFile(template, "w") as target:
+                        for name, data in parts.items():
+                            target.writestr(name, data)
+                path, sheet, _ = self.workbook(plain, rich, template=template)
+                width = quote.visible_column_width_points(sheet, 5, 9)
+                scale = float(sheet.find(f"{NS_MAIN}pageSetup").get("scale", "100")) / 100
+                pdf_path = path.with_suffix(".pdf")
+                self.assertEqual(quote.libreoffice_pdf_export(path, pdf_path), "libreoffice_exported")
+                found = {}
+                with pdfium.PdfDocument(str(pdf_path)) as document:
+                    for page_number, page in enumerate(document):
+                        text = page.get_textpage()
+                        characters = [(text.get_text_range(i, 1), i) for i in range(text.count_chars())]
+                        normal, indices = [], []
+                        for fragment, index in characters:
+                            for character in fragment:
+                                if character.isspace():
+                                    if normal and normal[-1] != " ":
+                                        normal.append(" "); indices.append(index)
+                                else:
+                                    normal.append(character); indices.append(index)
+                        normal = "".join(normal)
+                        image = page.render(scale=4).to_pil().convert("L")
+                        for phrase in expected + ["Synthetic person"]:
+                            offset = normal.find(phrase)
+                            if offset < 0:
+                                continue
+                            boxes = []
+                            for i, character in enumerate(phrase):
+                                if character.isspace():
+                                    continue
+                                if selected_size is not None:
+                                    actual_size = pdfium.raw.FPDFText_GetFontSize(text.raw, indices[offset + i])
+                                    self.assertAlmostEqual(actual_size, selected_size * scale, delta=0.2,
+                                                           msg="PDF changed the selected acceptance/signature font size.")
+                                bounds = text.get_charbox(indices[offset + i])
+                                left, bottom, right, top = bounds
+                                crop = image.crop((math.floor(left * 4),
+                                    math.floor((page.get_height() - top) * 4),
+                                    math.ceil(right * 4),
+                                    math.ceil((page.get_height() - bottom) * 4)))
+                                self.assertTrue(any(value < 180 for value in crop.getdata()),
+                                                f"{case}: unpainted acceptance glyph at {i}")
+                                crop.close()
+                                boxes.append(bounds)
+                            self.assertLessEqual(max(b[2] for b in boxes) - min(b[0] for b in boxes),
+                                                 width * scale + 1, "Acceptance exceeds its visible block.")
+                            found[phrase] = (page_number, min(b[1] for b in boxes),
+                                             max(b[3] for b in boxes))
+                        image.close()
+                        text.close()
+                        page.close()
+                self.assertEqual(set(found), set(expected + ["Synthetic person"]))
+                person_page, _, person_top = found["Synthetic person"]
+                for phrase in expected:
+                    page, bottom, _ = found[phrase]
+                    self.assertEqual(page, person_page)
+                    self.assertGreater(bottom, person_top, "Acceptance overlaps signature name.")
+                print("Acceptance paint case: " + json.dumps({
+                    "case": case, "xlsx_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "pdf_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+                    "all_expected_glyph_boxes_have_ink": True, "signature_clearance": True}))
+
+
+class QuantityLayoutTest(unittest.TestCase):
+    def line(self, description, quantity, unit, amount):
+        price = quote.PriceRow(
+            row_number=1,
+            section="Synthetic quantities",
+            description=description,
+            unit_hint=unit,
+            cost=100,
+            gst_multiplier=1,
+            markup=1,
+            remark="",
+        )
+        line = quote.QuoteLine(
+            section="Synthetic quantities",
+            quantity=quantity,
+            unit=unit,
+            description=description,
+            pricing_keyword=description.lower(),
+            display_price="",
+            matched_price=price,
+            amount=amount,
+            match_status="matched",
+            match_candidates=[],
+        )
+        line.pricing_authority = {"variant": "manual", "price_currency": "SGD"}
+        return line
+
+    def workbook(self, lines, *, template=KONCEPT_LAYOUT):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "quotation.xlsx"
+        quote.write_quote_layout_xlsx(template, path, commercial_test_brief(), lines)
+        with zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            styles = ET.fromstring(archive.read("xl/styles.xml"))
+        return path, sheet, workbook, styles
+
+    def description_row(self, sheet, description):
+        ref = find_cell_ref(sheet, description)
+        self.assertTrue(ref, f"Description was not written: {description}")
+        row, _ = quote.parse_cell_ref(ref)
+        return row
+
+    def quantity_fragments(self, sheet, start_row, stop_row):
+        values = []
+        for cell_node in sheet.iter(f"{NS_MAIN}c"):
+            ref = cell_node.attrib.get("r", "")
+            if not re.fullmatch(r"B\d+", ref):
+                continue
+            row, _ = quote.parse_cell_ref(ref)
+            value = cell_value(sheet, ref)
+            if start_row <= row < stop_row and value:
+                values.append((row, value))
+        return sorted(values)
+
+    def assert_quantity_text_preserved(self, fragments, expected, numeric_token):
+        actual = "".join(value for _, value in fragments)
+        self.assertEqual(re.sub(r"\s+", "", actual), re.sub(r"\s+", "", expected))
+        self.assertTrue(
+            any(numeric_token in value for _, value in fragments),
+            f"Numeric token must stay intact in one quantity row: {numeric_token}",
+        )
+
+    def assert_quantity_style_preserved(self, sheet, styles, ref):
+        style_id = cell_style(sheet, ref)
+        self.assertEqual(font_size(font_for_style(styles, style_id)), "13")
+        alignment = alignment_for_style(styles, style_id)
+        self.assertIsNotNone(alignment)
+        self.assertEqual(alignment.attrib.get("horizontal"), "center")
+
+    def test_short_quantity_keeps_original_position_and_style(self):
+        _, sheet, _, styles = self.workbook([
+            self.line("Short synthetic item", 1, "sqm", 37.5),
+        ])
+
+        self.assertEqual(find_cell_ref(sheet, "1 sqm"), "B24")
+        self.assertEqual(cell_value(sheet, "B25"), "")
+        self.assertEqual(cell_value(sheet, "E24"), "37.5")
+        self.assert_quantity_style_preserved(sheet, styles, "B24")
+
+    def test_decimal_integer_and_large_quantities_wrap_without_losing_tokens_or_amounts(self):
+        cases = [
+            ("Decimal quantity item", 11.5, "m length", 41.25, "11.5 m length"),
+            ("Integer quantity item", 24, "square metre panels", 240.5, "24 square metre panels"),
+            ("Large quantity item", 123456, "linear display metres", 1234560.75,
+             "123456 linear display metres"),
+        ]
+        lines = [self.line(description, quantity, unit, amount)
+                 for description, quantity, unit, amount, _ in cases]
+        _, sheet, _, styles = self.workbook(lines)
+        description_rows = [self.description_row(sheet, case[0]) for case in cases]
+        self.assertTrue(any(right > left for left, right in zip(description_rows, description_rows[1:])))
+
+        wrapped_counts = []
+        for index, (description, _, _, amount, expected) in enumerate(cases):
+            row = description_rows[index]
+            stop_row = description_rows[index + 1] if index + 1 < len(cases) else row + 8
+            fragments = self.quantity_fragments(sheet, row, stop_row)
+            self.assert_quantity_text_preserved(fragments, expected, str(cases[index][1]))
+            self.assertEqual(cell_value(sheet, f"E{row}"), str(amount))
+            self.assertTrue(fragments)
+            wrapped_counts.append(len(fragments))
+            for fragment_row, _ in fragments:
+                self.assert_quantity_style_preserved(sheet, styles, f"B{fragment_row}")
+            if index + 1 < len(cases):
+                self.assertGreaterEqual(
+                    description_rows[index + 1] - row,
+                    len(fragments) + 1,
+                    f"Rows were not reserved for all quantity fragments: {description}",
+                )
+
+        self.assertGreater(max(wrapped_counts), 1, "At least one multiword quantity must wrap in the template width.")
+
+    def test_multiline_quantity_moves_as_one_block_at_a_page_boundary(self):
+        preceding = [self.line(
+            "Boundary positioning predecessor " + "detail " * 5, 1, "sqm", 10.25,
+        )]
+        preceding.extend(
+            self.line(f"Boundary predecessor {index:02d}", 1, "sqm", 10.25)
+            for index in range(1, 12)
+        )
+        boundary_line = self.line(
+            "Boundary quantity item", 11.5, "linear metres per display section", 123.75,
+        )
+        _, sheet, _, _ = self.workbook(preceding + [boundary_line])
+        row = self.description_row(sheet, "Boundary quantity item")
+        fragments = self.quantity_fragments(sheet, row, row + 12)
+        self.assert_quantity_text_preserved(
+            fragments, "11.5 linear metres per display section", "11.5",
+        )
+        self.assertGreaterEqual(len(fragments), 2)
+        page_start = quote.continuation_page_start_for_row(row)
+        self.assertIsNotNone(page_start)
+        self.assertEqual(page_start, quote.next_continuation_page_start(quote.FIRST_PRINT_PAGE_END_ROW))
+        self.assertEqual(row, page_start + quote.CONTINUATION_BODY_OFFSET)
+        self.assertEqual(quote.continuation_page_start_for_row(fragments[-1][0]), page_start)
+        self.assertLessEqual(fragments[-1][0], quote.manual_page_end_for_row(row))
+        self.assertEqual(cell_value(sheet, f"E{row}"), "123.75")
+
+    def test_unrepresentable_numeric_quantity_token_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.workbook([
+                self.line("Oversized numeric token", 10 ** 40, "sqm", 1.0),
+            ])
+
+    def test_real_libreoffice_quantity_digits_are_painted_not_only_extractable(self):
+        if not quote.libreoffice_candidates():
+            message = "LibreOffice required for quantity glyph paint proof; hosted CI must run this regression."
+            if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+                self.fail(message)
+            self.skipTest(message)
+
+        import math
+        import pypdfium2 as pdfium
+
+        path, _, _, _ = self.workbook([
+            self.line("Rendered decimal quantity item", 11.5, "m length", 125.75),
+        ])
+        pdf_path = path.with_suffix(".pdf")
+        self.assertEqual(quote.libreoffice_pdf_export(path, pdf_path), "libreoffice_exported")
+        found = False
+        with pdfium.PdfDocument(str(pdf_path)) as document:
+            for page in document:
+                text = page.get_textpage()
+                characters = [(text.get_text_range(index, 1), index)
+                              for index in range(text.count_chars())]
+                normalized, indices = [], []
+                for fragment, index in characters:
+                    for character in fragment:
+                        if character.isspace():
+                            if normalized and normalized[-1] != " ":
+                                normalized.append(" ")
+                                indices.append(index)
+                        else:
+                            normalized.append(character)
+                            indices.append(index)
+                normalized_text = "".join(normalized)
+                offset = normalized_text.find("11.5")
+                if offset < 0:
+                    text.close()
+                    page.close()
+                    continue
+
+                image = page.render(scale=4).to_pil().convert("L")
+                for character_index, digit in enumerate("11.5"):
+                    bounds = text.get_charbox(indices[offset + character_index])
+                    left, bottom, right, top = bounds
+                    crop = image.crop((math.floor(left * 4),
+                                       math.floor((page.get_height() - top) * 4),
+                                       math.ceil(right * 4),
+                                       math.ceil((page.get_height() - bottom) * 4)))
+                    self.assertTrue(any(pixel < 180 for pixel in crop.getdata()),
+                                    f"PDF text contains quantity digit {digit!r} without visible ink.")
+                    crop.close()
+                image.close()
+                text.close()
+                page.close()
+                found = True
+                break
+
+        self.assertTrue(found, "PDF text extraction did not contain the complete 11.5 quantity token.")

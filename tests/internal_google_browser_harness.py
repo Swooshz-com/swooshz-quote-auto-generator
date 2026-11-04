@@ -19,6 +19,7 @@ SYNTHETIC_INTERNAL_ALPHA_ORIGIN = "https://internal-alpha.example.test"
 
 class SyntheticVerifier:
     claim_case = "approved"
+    require_account_choice = False
 
     def exchange_and_verify(self, *, code: str, code_verifier: str, nonce: str):
         if (
@@ -57,13 +58,15 @@ class HarnessHandler(webapp.QuoteRunnerHandler):
             value = (params.get("value") or [""])[0]
             if value not in {
                 "approved",
+                "approved-account-choice",
                 "unknown-sub",
                 "same-email-different-sub",
                 "same-sub-different-email",
             }:
                 self.send_json({"error": "invalid synthetic case"}, status=400)
                 return
-            SyntheticVerifier.claim_case = value
+            SyntheticVerifier.require_account_choice = value == "approved-account-choice"
+            SyntheticVerifier.claim_case = "approved" if SyntheticVerifier.require_account_choice else value
             self.send_json({"status": "ok"})
             return
         if parsed.path == "/__synthetic_oidc/authorize":
@@ -72,7 +75,16 @@ class HarnessHandler(webapp.QuoteRunnerHandler):
             callback = "/callback?" + urllib.parse.urlencode(
                 {"state": state, "code": "synthetic-browser-code"}
             )
-            self.send_redirect(callback)
+            if SyntheticVerifier.require_account_choice:
+                if params.get("prompt") != ["select_account"]:
+                    self.send_json({"error": "account choice not requested"}, status=400)
+                    return
+                self.send_auth_page(
+                    "Choose synthetic account", "Local provider test adapter only.",
+                    action_href=callback, action_label="Choose synthetic account",
+                )
+            else:
+                self.send_redirect(callback)
             return
         super().do_GET()
 
@@ -131,16 +143,11 @@ def main() -> int:
     server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), HarnessHandler)
     host, port = server.server_address
     base_url = f"http://{host}:{port}"
+    # Preserve the production OIDC query; replace only the provider transport.
+    real_authorize_url = webapp.internal_google_authorize_url
     webapp.internal_google_authorize_url = lambda transaction: (
         f"{base_url}/__synthetic_oidc/authorize?"
-        + urllib.parse.urlencode(
-            {
-                "state": transaction.state,
-                "nonce": transaction.nonce,
-                "code_challenge": transaction.code_challenge,
-                "code_challenge_method": "S256",
-            }
-        )
+        + urllib.parse.urlsplit(real_authorize_url(transaction)).query
     )
 
     print(base_url, flush=True)

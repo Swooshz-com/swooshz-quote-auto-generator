@@ -13,12 +13,16 @@ const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
 const { chromium, request } = createRequire(path.join(sourceRoot, "package.json"))("playwright");
 const args = process.argv.slice(2);
 const measureOnly = args.includes("--measure-only");
+const reliability = args.includes("--alpha2-reliability");
+const resumeExport = args.includes("--resume-export");
+const outputReferenceSelection = args.includes("--output-reference-selection");
 const fillerLines = Number((args.find((arg) => arg.startsWith("--lines=")) || "--lines=60").split("=")[1]);
 const latencyMs = Number((args.find((arg) => arg.startsWith("--latency-ms=")) || "--latency-ms=1500").split("=")[1]);
 const cpuProfile = args.includes("--cpu-profile");
 // m2: start a draft autosave that is still in flight (delayed by --latency-ms) when Confirm is clicked.
 const inflightSave = args.includes("--inflight-save");
 const freshAnalysis = args.includes("--fresh-analysis");
+const sourceProvenance = args.includes("--source-provenance");
 const cpuThrottle = Number((args.find((arg) => arg.startsWith("--cpu-throttle=")) || "--cpu-throttle=1").split("=")[1]);
 const profiledFunctions = (args.find((arg) => arg.startsWith("--profile=")) || "--profile=").split("=")[1].split(",").filter(Boolean);
 const extraCatalogItems = Number((args.find((arg) => arg.startsWith("--catalog-extra=")) || "--catalog-extra=0").split("=")[1]);
@@ -34,6 +38,18 @@ const profileId = "synthetic-exhibition-fixture-template";
 const quoteCurrency = (args.find((arg) => arg.startsWith("--currency=")) || "--currency=USD").split("=")[1];
 const fxRate = quoteCurrency === "SGD" ? 1 : 0.7391;
 const cents = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
+
+// Normalized basis quantities are canonical text; seeded saved rows may be numeric.
+const exactPositiveQuantity = (value, expected) => {
+  if (typeof value !== "number" && !(typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value))) return false;
+  const quantity = Number(value);
+  return Number.isFinite(quantity) && quantity > 0 && quantity === expected;
+};
+assert(exactPositiveQuantity(4, 4) && exactPositiveQuantity("4", 4), "quantity assertion rejected a canonical representation");
+for (const invalid of [null, undefined, true, false, "", "4 sqm", " 4 ", NaN, Infinity, 0, -4, 9]) {
+  assert(!exactPositiveQuantity(invalid, 4), "quantity assertion accepted an invalid or changed measurement");
+}
+
 
 // Synthetic catalogue with deliberately similar entries; no shared prefix token across sections.
 const slug = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -85,6 +101,11 @@ for (let index = 0; index < fillerLines; index++) {
   const noun = fillerNouns[index % fillerNouns.length];
   cases.push({ id: "filler-" + (index + 1), kind: "filler", section: catalog.find((item) => item.description.toLowerCase().includes(noun)).section, text: "Additional " + noun + " for zone " + (index + 1), quantity: (index % 4) + 1, unit: noun.includes("carpet") || noun.includes("graphic") || noun.includes("banner") || noun.includes("sticker") ? "sqm" : "nos" });
 }
+if (sourceProvenance) cases.push(
+  { id: "u1-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile physical installation", quantity: 12, unit: "m\u00b2", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
+  { id: "u1-second-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile physical installation", quantity: 7, unit: "m\u00b2", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
+  ...["a", "b"].map((suffix) => ({ id: "u1-unmeasured-" + suffix, kind: "unmeasured", section: "Flooring", text: "Grey carpet tile installation with missing original unit", quantity: 3, unit: "sqm", rawUnit: "", proposal: true })),
+);
 const sections = new Map();
 const lineItems = [];
 for (const entry of cases) {
@@ -93,7 +114,7 @@ for (const entry of cases) {
   if (claimed) line.pricing_keyword = claimed.id;
   if (!sections.has(entry.section)) sections.set(entry.section, { id: slug(entry.section), title: entry.section, lines: [] });
   sections.get(entry.section).lines.push(line);
-  lineItems.push({ section: entry.section, source_basis_line_id: entry.id, description: line.text, quantity: entry.quantity, unit: entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
+  lineItems.push({ section: entry.section, ...(entry.missingSourceId ? {} : { source_basis_line_id: entry.id }), description: line.text, quantity: entry.quantity, unit: entry.rawUnit ?? entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
 }
 const scenarioPath = path.join(runRoot, "scenario.json");
 await fs.writeFile(scenarioPath, JSON.stringify({ raw: { analysis_findings: [], blocking_clarification_questions: [], quote_basis_sections: [...sections.values()], line_items: lineItems } }, null, 2));
@@ -104,10 +125,25 @@ await fs.writeFile(path.join(fixtureDir, "pricing-catalog.json"), JSON.stringify
 const canonicalize = spawnSync(python, ["-c", "import json,sys; sys.path.insert(0, sys.argv[1]); from webapp import server as w; p=sys.argv[2]; d=json.load(open(p, encoding='utf-8')); open(p, 'w', encoding='utf-8').write(json.dumps(w.pricing_reference_catalog_payload(d), indent=2))", sourceRoot, path.join(fixtureDir, "pricing-catalog.json")], { cwd: sourceRoot, windowsHide: true, encoding: "utf8", env: { ...process.env, SQAG_DISABLE_DOTENV: "1" } });
 if (canonicalize.status !== 0) throw new Error("catalogue canonicalisation failed: " + canonicalize.stderr);
 for (const item of JSON.parse(await fs.readFile(path.join(fixtureDir, "pricing-catalog.json"), "utf8")).items) catalog[catalog.findIndex((entry) => entry.id === item.id)] = item;
+if (reliability) {
+  const secondDir = path.join(dirs.pricing, fixtureId + "-replacement");
+  await fs.cp(fixtureDir, secondDir, { recursive: true });
+  const metadata = JSON.parse(await fs.readFile(path.join(secondDir, "reference.json"), "utf8"));
+  metadata.id = fixtureId + "-replacement";
+  metadata.label = "Synthetic Replacement Reference";
+  await fs.writeFile(path.join(secondDir, "reference.json"), JSON.stringify(metadata));
+  const replacement = JSON.parse(await fs.readFile(path.join(secondDir, "pricing-catalog.json"), "utf8"));
+  for (const item of replacement.items) item.sale_unit_price += 1;
+  await fs.writeFile(path.join(secondDir, "pricing-catalog.json"), JSON.stringify(replacement));
+}
 await fs.cp(path.join(sourceRoot, "tests/fixtures/quote-generator/profiles", profileId), path.join(dirs.profiles, profileId), { recursive: true });
 
 let server, browser, serverErr = "";
 const network = [];
+let checkpointGate = null;
+let exportPollGate = null;
+let generationRequests = 0;
+let detailFailurePath = "";
 function startServer() {
   const child = spawn(python, [path.join(sourceRoot, "tests/alpha1_fresh_mock_harness.py"), sourceRoot, dirs.data, dirs.output, dirs.temp, dirs.logs, dirs.pricing, dirs.profiles, scenarioPath], {
     cwd: sourceRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
@@ -203,6 +239,27 @@ try {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.origin !== baseUrl) return route.abort();
+    if (url.pathname === "/api/jobs" && route.request().method() === "POST"
+      && ["generate", "generate_pdf"].includes(route.request().postDataJSON()?.type)) generationRequests += 1;
+    if (exportPollGate && !exportPollGate.jobId && url.pathname.startsWith("/api/jobs/") && route.request().method() === "GET") {
+      const gate = exportPollGate;
+      gate.jobId = decodeURIComponent(url.pathname.split("/").pop());
+      gate.arrived();
+      await gate.wait;
+      return route.abort("aborted").catch(() => {});
+    }
+    if (detailFailurePath && url.pathname === detailFailurePath && route.request().method() === "GET") {
+      detailFailurePath = "";
+      return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "failed", error_reference: "ERR-1234ABCD" }) });
+    }
+    if (checkpointGate && url.pathname === "/api/quote-sessions" && route.request().method() === "POST"
+      && route.request().postDataJSON()?.draft_state?.customerStepCheckpoint) {
+      const gate = checkpointGate;
+      gate.requests += 1;
+      gate.arrived();
+      await gate.wait;
+      if (gate.fail) return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "failed", error_reference: "ERR-1234ABCD" }) });
+    }
     // Model hosted round-trip latency on the endpoints the basis flow waits for.
     if (latencyMs > 0 && route.request().method() === "POST" && ["/api/line-items/normalize", "/api/quote-sessions", "/api/quote-sessions/pricing-selections"].includes(url.pathname)) {
       await new Promise((resolve) => setTimeout(resolve, latencyMs));
@@ -236,7 +293,40 @@ try {
     await page.locator("#quoteExchangeRate").fill(String(fxRate));
     await page.locator("#quoteExchangeRate").press("Tab");
   }
-  await page.locator("#sideNextButton").click();
+  if (reliability) {
+    for (const fail of [true, false]) {
+      let release, arrived;
+      const arrival = new Promise((resolve) => { arrived = resolve; });
+      checkpointGate = { fail, requests: 0, arrived, wait: new Promise((resolve) => { release = resolve; }) };
+      checkpointGate.release = release;
+      await page.locator("#sideNextButton").click();
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible" });
+      if (fail) await page.screenshot({ path: path.join(runRoot, "customer-next-pending.png") });
+      await page.waitForFunction(() => state.customerStepCheckpointSaveBusy);
+      // Repeated activation cannot enqueue another checkpoint while its acknowledgement is pending.
+      await page.evaluate(() => { void goToNextSidePanel(); });
+      await page.waitForFunction(() => document.querySelector("#sideNextButton").getAttribute("aria-disabled") === "true");
+      let arrivalTimer;
+      try {
+        await Promise.race([arrival, new Promise((_, reject) => { arrivalTimer = setTimeout(() => reject(new Error("Customer checkpoint request did not arrive")), 30000); })]);
+      } finally { clearTimeout(arrivalTimer); }
+      assert(checkpointGate.requests === 1, "Customer Next dispatched duplicate checkpoint requests", checkpointGate.requests);
+      release();
+      await page.waitForFunction(() => !appIsBusy() && !state.customerStepCheckpointSaveBusy);
+      if (fail) {
+        assert(await page.evaluate(() => state.activeSidePanel === "customer" && !customerStepCheckpointIsCurrent()), "failed Customer save advanced or unlocked the flow");
+        assert(await page.locator("#excelGeneratingModal").isVisible() && (await page.locator("#excelGeneratingMessage").innerText()).includes("could not be saved")
+          && !(await page.locator("#excelGeneratingSpinner").isVisible()), "Customer failure not visible or spinner retained");
+        await page.screenshot({ path: path.join(runRoot, "customer-save-failure.png") });
+        await page.locator("#excelGeneratingCloseButton").click();
+      }
+      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden" });
+      checkpointGate = null;
+    }
+    result.customerNextFailureRetry = "PASS";
+  } else {
+    await page.locator("#sideNextButton").click();
+  }
   await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
   const preset = await page.locator("#presetSelect option").evaluateAll((options, id) => options.map((o) => o.value).find((value) => value.startsWith("profile:" + id + ":")), profileId);
   await page.locator("#presetSelect").selectOption(preset);
@@ -274,6 +364,41 @@ try {
     // The server ledger tracks the saved rows; the browser only echoes their revisions back.
     assert(historicalIds.every((id) => Number.isInteger(savedDetail?.pricing_ledger?.rows?.[id])), "saved quote has no server row revisions", savedDetail?.pricing_ledger);
     assert(!JSON.stringify(savedDetail).includes('"grant"'), "server pricing grants leaked to the client", savedDetail?.pricing_ledger);
+    if (reliability) {
+      await page.evaluate((id) => {
+        clearQuoteSessionDraftSaveTimer();
+        showDashboard({ load: false });
+        state.dashboardActiveSessionId = id;
+        state.dashboardSelectedSessionIds = [id];
+        renderQuoteDashboard();
+      }, historicalSessionId);
+      const beforeFailure = await page.evaluate((id) => ({
+        summary: JSON.stringify(dashboardSessionById(id)),
+        current: (() => { const draft = currentQuoteSessionDraftState(); delete draft.savedAt; return JSON.stringify(draft); })(),
+        sessionId: state.quoteSessionId,
+      }), historicalSessionId);
+      for (const action of ["modify-session", "duplicate-session"]) {
+        detailFailurePath = "/api/quote-sessions/" + encodeURIComponent(historicalSessionId);
+        const beforePosts = network.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length;
+        await page.locator('[data-dashboard-panel-action="' + action + '"]').click();
+        await page.waitForFunction(() => !state.quoteSessionRestoreBusy && !state.quoteSessionDashboardBusy);
+        const afterFailure = await page.evaluate((id) => ({
+          summary: JSON.stringify(dashboardSessionById(id)),
+          current: (() => { const draft = currentQuoteSessionDraftState(); delete draft.savedAt; return JSON.stringify(draft); })(),
+          sessionId: state.quoteSessionId,
+          view: state.activeAppView, error: state.quoteSessionLoadError,
+        }), historicalSessionId);
+        assert(afterFailure.summary === beforeFailure.summary && afterFailure.current === beforeFailure.current
+          && afterFailure.sessionId === beforeFailure.sessionId && afterFailure.view === "dashboard" && afterFailure.error,
+          "failed detail request changed saved/current quote or hid failure", { action, summaryUnchanged: afterFailure.summary === beforeFailure.summary, currentUnchanged: afterFailure.current === beforeFailure.current, view: afterFailure.view, hasError: Boolean(afterFailure.error) });
+        assert(network.filter((entry) => entry.method === "POST" && entry.path === "/api/quote-sessions").length === beforePosts,
+          "failed detail request saved or duplicated a quote", action);
+      }
+      await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+      await page.waitForFunction((id) => state.quoteSessionId === id && state.activeAppView === "quote" && !appIsBusy(), historicalSessionId);
+      assert(await page.evaluate(() => !state.quoteSessionLoadError), "successful retry retained a stale load error");
+      result.dashboardDetailFailureRetry = "PASS";
+    }
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
     if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
@@ -307,6 +432,27 @@ try {
     return { tag: line?.tag, custom: line?.custom_pricing, variant: row?.pricing_authority?.variant, unit: row?.unit };
   });
   assert((result.countProposalBeforeConfirm.tag === "Custom" || result.countProposalBeforeConfirm.custom) && !["catalog", "manual", "included"].includes(result.countProposalBeforeConfirm.variant), "count selection must start as an unpriced AI proposal", result.countProposalBeforeConfirm);
+
+  if (sourceProvenance) {
+    result.sourceProvenance = await page.evaluate(() => {
+      const ids = ["u1-provenance", "u1-second-provenance"];
+      const lines = state.quoteBasisSections.flatMap((section) => section.lines || []);
+      const seal = state.originalAnalysisSnapshot.pricing_analysis_seal;
+      const evidence = ids.map((id) => ({ id, line: lines.find((line) => line.id === id),
+        row: state.lineItems.find((row) => row.source_basis_line_id === id),
+        sealed: seal.rows.find((row) => row.id === id) }));
+      const unmeasured = lines.filter((line) => ["u1-unmeasured-a", "u1-unmeasured-b"].includes(line.id));
+      return { evidence, unmeasured, unmeasuredHasGrant: seal.rows.some((row) => ["u1-unmeasured-a", "u1-unmeasured-b"].includes(row.id) && row.catalog_item_id) };
+    });
+    assert(result.sourceProvenance.evidence.every(({ line, row, sealed }) => line?.tag === "Custom"
+      && line.possible_pricing_matches?.length > 0 && row?.pricing_authority?.variant === "none"
+      && sealed?.unit === "sqm" && !sealed.catalog_item_id), "missing raw IDs lost original measurement provenance", result.sourceProvenance);
+    assert(result.sourceProvenance.unmeasured.map((line) => line.id).sort().join("|") === "u1-unmeasured-a|u1-unmeasured-b" && !result.sourceProvenance.unmeasuredHasGrant
+      && result.sourceProvenance.unmeasured.every((line) => !line.possible_pricing_matches?.length), "unmeasured ownership offered an unactionable choice", result.sourceProvenance);
+    result.sourceProvenance.missingIdsRecovered = result.sourceProvenance.evidence.map((entry) => entry.id);
+    // Distinct identified rows with missing original units remain visible and unpriced.
+    result.sourceProvenance.unmeasuredCounts = { rawRows: 2, authoredBasisIds: 2, retainedBasisRows: result.sourceProvenance.unmeasured.length };
+  }
 
   // Fresh proposals offer only choices Confirm can honour. Keep a synthetic old cached
   // candidate to prove that a pre-upgrade invalid choice is still refused at the real boundary.
@@ -352,6 +498,13 @@ try {
   for (const entry of cases.filter((item) => ["select", "historical", "unit-review"].includes(item.kind))) await timedClick(page, await possibleMatchControl(page, entry.id, byName(entry.select).id), "possible_match", timings);
   await timedClick(page, await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]'), "tick", timings);
   for (const id of ["u1-review", "u1-legacy"]) await timedClick(page, await basisControl(page, id, "[data-basis-tag]:not([data-basis-tag='Exclude'])"), "tick", timings);
+  if (sourceProvenance) {
+    // Explicitly confirm both Custom physical rows through real controls: original blank
+    // measurement provenance must survive review without acquiring a price.
+    for (const id of ["u1-unmeasured-a", "u1-unmeasured-b"]) {
+      await timedClick(page, await basisControl(page, id, "[data-basis-tag]:not([data-basis-tag='Exclude'])"), "tick", timings);
+    }
+  }
   // Resolve any remaining server-added review line (for example an id-less duplicate) with a real cross.
   for (let guard = 0; guard < 10; guard++) {
     const pending = await page.evaluate(() => {
@@ -399,7 +552,7 @@ try {
   assert(selectionBody.selections.some((entry) => entry.source_basis_line_id === "u1-count" && entry.status === "selected"), "count proposal was not admitted at Confirm", selectionBody.selections);
   assert(selectedCount?.pricing_authority?.variant === "catalog" && selectedCount.pricing_authority.catalog_item_id === byName("Bar Stool").id && selectedCount.pricing_authority.catalog_digest === pricingBasis.digest && selectedCount.pricing_reference_id === pricingBasis.id && selectedCount.pricing_authority.price === byName("Bar Stool").sale_unit_price, "server admission did not bind the selected row to the current reference", selectedCount);
   const selectedCountLine = selectionRequest.quote_basis_sections.flatMap((section) => section.lines || []).find((line) => line.id === "u1-count");
-  assert(selectedCount.quantity === 4 && selectedCountLine?.quantity === 4 && selectedCount.pricing_basis_amount === cents(4 * byName("Bar Stool").sale_unit_price),
+  assert(selectedCount.quantity === 4 && exactPositiveQuantity(selectedCountLine?.quantity, 4) && selectedCount.pricing_basis_amount === cents(4 * byName("Bar Stool").sale_unit_price),
     "Confirm failed to price the valid proposal at its saved basis quantity", { selectedCount, selectedCountLine });
   result.selectedCountBoundary = { section: selectedCount.section, quantity: selectedCount.quantity, basisQuantity: selectedCountLine.quantity, authority: selectedCount.pricing_authority, pricingBasis };
   result.confirm = {
@@ -429,6 +582,14 @@ try {
       const text = (selector) => cells?.querySelector(selector)?.innerText.trim() || "";
       return row ? { index, authority: outputPriceAuthority(row), quantity: row.quantity, rowAmount: row.amount, reference: text('.output-unit-price-cell:not([data-output-edit-field]) .output-cell-text'), quoted: text('[data-output-denomination="quote"] .output-cell-text'), amount: text('.amount-cell') } : null;
     }, id);
+    if (sourceProvenance) {
+      for (const id of ["u1-unmeasured-a", "u1-unmeasured-b"]) {
+        const row = await rowFor(id);
+        assert(row && row.authority?.variant === "none" && row.quoted === "???" && row.amount === "???",
+          "unmeasured physical row disappeared or acquired a quoted price", { id, row });
+      }
+      result.sourceProvenance.unmeasuredOutputUnpriced = true;
+    }
     const expectations = [...cases.filter((item) => ["select", "historical"].includes(item.kind)).map((item) => ({ id: item.id, item: byName(item.select), quantity: item.quantity })), { id: "u1-confirmed", item: byName("6 inch Spotlight"), quantity: 7 }];
     const pricing = [];
     for (const expected of expectations) {
@@ -463,6 +624,7 @@ try {
     assert(edited.authority?.variant === "included" && edited.quoted === "Included" && Number(edited.amount) === 0, "Included action", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
     await page.locator("[data-output-reference-action]").click();
+    await page.waitForFunction(() => !appIsBusy());
     edited = await editedRow();
     assert(edited.authority?.variant === "catalog" && Number(edited.quoted.replace(/,/g, "")) === cents(editedItem.sale_unit_price * fxRate), "Use reference price", edited);
     await (await cellFor("unit_price_override", '[data-output-denomination="quote"]')).click();
@@ -507,8 +669,46 @@ try {
     const exportBlock = () => page.evaluate(() => ({ disabled: document.querySelector("#sideDownloadButton")?.getAttribute("aria-disabled"), title: document.querySelector("#sideDownloadButton")?.title, errors: outputRowsValid().errors }));
     await page.waitForFunction(() => document.querySelector("#sideDownloadButton")?.getAttribute("aria-disabled") !== "true", null, { timeout: 30000 }).catch(async () => assert(false, "export still blocked", await exportBlock()));
     // Protected XLSX: generated workbook carries the admitted amounts.
+    let resumeBefore;
+    if (resumeExport) {
+      let release, arrived;
+      exportPollGate = { arrived: () => arrived(), wait: new Promise((resolve) => { release = resolve; }) };
+      exportPollGate.release = release;
+      exportPollGate.arrival = new Promise((resolve) => { arrived = resolve; });
+    }
     const downloadPromise = page.waitForEvent("download", { timeout: 90000 });
     await page.locator("#sideDownloadButton").click();
+    if (resumeExport) {
+      const gate = exportPollGate;
+      let arrivalTimer;
+      try {
+        await Promise.race([gate.arrival, new Promise((_, reject) => { arrivalTimer = setTimeout(() => reject(new Error("Accepted export poll did not arrive")), 30000); })]);
+      } finally { clearTimeout(arrivalTimer); }
+      const accepted = await page.evaluate(() => ({ id: state.activeJob?.id, phase: state.activeJob?.phase, outputRowsSchema: state.activeJob?.outputRowsSchema }));
+      assert(accepted.id === gate.jobId && accepted.phase === "running" && accepted.outputRowsSchema === "swooshz.quote-output-rows.v1", "export was not accepted/persisted before reload", accepted);
+      // Hold only browser delivery. The real worker must finish and commit once.
+      const deadline = Date.now() + 60000;
+      let terminal;
+      while (Date.now() < deadline) {
+        terminal = await (await api.get(baseUrl + "/api/jobs/" + encodeURIComponent(accepted.id))).json();
+        if (["completed", "failed", "needs_review"].includes(terminal.status)) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert(terminal?.status === "completed" && terminal.result?.status === "completed", "real worker did not complete before resume", {status:terminal?.status,result:terminal?.result?.status});
+      const metadataPath = path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json");
+      const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+      resumeBefore = {
+        generationRequests, jobId: accepted.id, publicationId: metadata.publication?.active_publication_id,
+        outputDirectories: (await fs.readdir(dirs.output)).sort(),
+        provider: JSON.parse(await fs.readFile(path.join(runRoot, "mock-provider-count.json"), "utf8")),
+      };
+      assert(resumeBefore.publicationId && resumeBefore.generationRequests === 1, "export did not commit once before resume", resumeBefore);
+      exportPollGate = null;
+      await page.reload({ waitUntil: "domcontentloaded" });
+      gate.release();
+      await page.waitForFunction(() => !state.isBooting && !state.isGenerating && !state.activeJob && downloadFileIsFresh(state.downloadFile), null, { timeout: 60000 });
+      await page.locator('#excelGeneratingActionButton[data-export-action="excel"]').click();
+    }
     const download = await downloadPromise;
     const xlsxPath = path.join(dirs.downloads, "owner-uat.xlsx");
     await download.saveAs(xlsxPath);
@@ -516,6 +716,16 @@ try {
     assert(detail.quote_session?.exports?.xlsx?.exists === true && detail.quote_session.exports.xlsx.stale === false, "protected XLSX export not current", detail.quote_session?.exports);
     const protectedBytes = await (await api.get(new URL(detail.quote_session.exports.xlsx.url, baseUrl).toString())).body();
     assert(protectedBytes.equals(await fs.readFile(xlsxPath)), "protected XLSX differs from the UI download");
+    if (resumeExport) {
+      const metadata = JSON.parse(await fs.readFile(path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json"), "utf8"));
+      const provider = JSON.parse(await fs.readFile(path.join(runRoot, "mock-provider-count.json"), "utf8"));
+      assert(generationRequests === resumeBefore.generationRequests, "resume started another generation");
+      assert(metadata.publication?.active_publication_id === resumeBefore.publicationId, "resume changed committed publication");
+      assert(JSON.stringify((await fs.readdir(dirs.output)).sort()) === JSON.stringify(resumeBefore.outputDirectories), "resume created another output directory");
+      assert(JSON.stringify(provider) === JSON.stringify(resumeBefore.provider) && provider.real_provider_calls === 0, "resume changed provider counters", provider);
+      result.resumeExport = { status: "PASS", generationRequests, publicationUnchanged: true, outputDirectoriesUnchanged: true,
+        providerUnchanged: true, strictMarkerPreserved: true, realProviderCalls: 0, freshProtectedBytes: protectedBytes.length };
+    }
     // Bind each amount to its own workbook row (description + quantity) and check the totals block.
     const quantityText = (quantity, unit) => String(quantity) + " " + unit;
     const expectedRows = [
@@ -554,6 +764,187 @@ try {
     const exitCode = await new Promise((resolve) => check.once("close", resolve));
     assert(exitCode === 0, "XLSX amounts", checkOut);
     result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };
+    if (outputReferenceSelection) {
+      // A normal duplicated quote has no source-bound grants. Keep the edited
+      // Output subset and its manual price; select one compatible row directly
+      // in Output without Confirm rebuilding rows from the complete basis.
+      const keep = ["u1-count", "u1-graphic"];
+      while (true) {
+        const index = await page.evaluate((ids) => state.outputRows.findIndex((row) => !ids.includes(row.source_basis_line_id)), keep);
+        if (index < 0) break;
+        await page.locator('[data-output-delete-row="' + index + '"]').click();
+        await page.locator("#confirmOutputDeleteButton").click();
+      }
+      await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+      const originalPath = path.join(dirs.data, "quote-sessions", sessionId, "quote-session.json");
+      const originalMetadata = await fs.readFile(originalPath, "utf8");
+      await page.locator("#backToDashboardButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard");
+      await page.locator('[data-quote-session-id="' + sessionId + '"]').first().click();
+      await page.locator('[data-dashboard-panel-action="duplicate-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.dashboardActiveSessionId && state.dashboardActiveSessionId !== id, sessionId);
+      const targetId = await page.evaluate(() => state.dashboardActiveSessionId);
+      await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, targetId);
+      await page.locator("#sideNextButton").click();
+      await page.waitForFunction(() => !appIsBusy());
+      await page.locator('button[data-side-panel="output"]').click();
+      const before = await page.evaluate(() => ({ rows: state.outputRows, reset: state.originalOutputRows, fx: collectQuoteExchangeRate() }));
+      const targetPath = path.join(dirs.data, "quote-sessions", targetId, "quote-session.json");
+      const ungranted = JSON.parse(await fs.readFile(targetPath, "utf8"));
+      assert(before.rows.length === 2 && !ungranted.pricing_ledger?.rows?.["u1-count"]?.grant,
+        "duplicate did not retain the subset without a target grant");
+      assert(before.rows.find((row) => row.source_basis_line_id === "u1-count")?.pricing_authority?.variant !== "catalog",
+        "duplicate retained source catalogue authority");
+      const selectionsBefore = result.selectionStatuses.length;
+      const index = await page.evaluate(() => state.outputRows.findIndex((row) => row.source_basis_line_id === "u1-count"));
+      await page.locator('[data-output-row="' + index + '"][data-output-edit-field="unit_price_override"][data-output-denomination="quote"]').first().click();
+      await page.locator("[data-output-reference-action]").click();
+      await page.waitForFunction(() => !appIsBusy());
+      const selected = await rowFor("u1-count");
+      assert(selected?.authority?.variant === "catalog" && selected.authority.price === byName("Bar Stool").sale_unit_price,
+        "Output reference selection did not obtain target pricing authority", selected);
+      assert(result.selectionStatuses.length === selectionsBefore + 1 && result.selectionStatuses.at(-1) === 200,
+        "Output action did not make one successful conditional selection", result.selectionStatuses);
+      await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
+      const granted = JSON.parse(await fs.readFile(targetPath, "utf8"));
+      assert(granted.pricing_ledger?.rows?.["u1-count"]?.grant?.catalog_item_id === byName("Bar Stool").id,
+        "selection was not persisted in the target ledger");
+      // A transient reference outage must not admit saved rows against an empty
+      // catalogue and persist demoted catalogue/manual authority over recovery.
+      const profileRecoveryFaults = ["unavailable", "empty", "invalid", "missing-authority-items",
+        "malformed-authority-items", "missing-selected-item", "duplicate-selected-item",
+        "invalid-item-price", "changed-item-price", "changed-item-unit", "changed-item-description", "changed-item-section"];
+      for (const fault of profileRecoveryFaults) {
+        const storageBeforeOutage = await page.evaluate(() => ({
+          quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
+          workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
+        }));
+        const metadataBeforeOutage = await fs.readFile(targetPath, "utf8");
+        let profilesRejected = false;
+        const rejectProfiles = async (route) => {
+          profilesRejected = true;
+          if (fault === "unavailable") {
+            await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ status: "unavailable" }) });
+          } else {
+            const response = await route.fetch();
+            const body = await response.json();
+            const references = fault === "empty" ? [] : fault === "invalid" ? [{}]
+              : body.pricing_references.map((reference) => {
+                const selected = reference.authority_items?.find((item) => item.id === byName("Bar Stool").id);
+                if (!selected) return reference;
+                let items = reference.authority_items.map((item) => ({ ...item }));
+                if (fault === "missing-authority-items") items = [];
+                else if (fault === "malformed-authority-items") items = [null];
+                else if (fault === "missing-selected-item") items = items.filter((item) => item.id !== selected.id);
+                else if (fault === "duplicate-selected-item") items.push({ ...selected });
+                else items = items.map((item) => {
+                  if (item.id !== selected.id) return item;
+                  if (fault === "invalid-item-price") return { ...item, sale_unit_price: "invalid" };
+                  if (fault === "changed-item-price") return { ...item, sale_unit_price: item.sale_unit_price + 1 };
+                  if (fault === "changed-item-unit") return { ...item, unit_hint: "lot" };
+                  if (fault === "changed-item-description") return { ...item, description: "Different synthetic item" };
+                  return { ...item, section: "Different synthetic section" };
+                });
+                return { ...reference, items: [], authority_items: items };
+              });
+            await route.fulfill({ response, json: { ...body, pricing_references: references } });
+          }
+        };
+        await page.route("**/api/profiles", rejectProfiles);
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => typeof state !== "undefined" && state.authenticated !== false);
+        await page.waitForTimeout(900); // Exceeds the normal 650ms draft-save debounce.
+        const outage = await page.evaluate(() => ({
+          quote: localStorage.getItem(QUOTE_SESSION_STORAGE_KEY),
+          workspace: localStorage.getItem(WORKSPACE_VIEW_STORAGE_KEY),
+          restoredRows: state.outputRows.length,
+        }));
+        assert(profilesRejected && outage.quote === storageBeforeOutage.quote
+          && outage.workspace === storageBeforeOutage.workspace && outage.restoredRows === 0,
+        "reference outage rewrote saved pricing or admitted rows without the catalogue: " + fault);
+        assert(await fs.readFile(targetPath, "utf8") === metadataBeforeOutage,
+          "reference outage overwrote the durable quote");
+        await page.unroute("**/api/profiles", rejectProfiles);
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0 && !appIsBusy());
+      }
+      await page.locator('button[data-side-panel="output"]').click();
+      const after = await page.evaluate(() => ({ rows: state.outputRows, reset: state.originalOutputRows, fx: collectQuoteExchangeRate() }));
+      assert(after.rows.length === 2 && JSON.stringify(after.rows.map((row) => row.source_basis_line_id)) === JSON.stringify(before.rows.map((row) => row.source_basis_line_id)),
+        "Output selection/reopen rebuilt the basis or reordered the subset");
+      assert(JSON.stringify(after.reset) === JSON.stringify(before.reset) && after.fx === before.fx
+        && JSON.stringify(after.rows.find((row) => row.source_basis_line_id === "u1-graphic")) === JSON.stringify(before.rows.find((row) => row.source_basis_line_id === "u1-graphic")),
+        "Output selection changed reset rows, manual pricing or FX");
+      const copiedDownload = page.waitForEvent("download", { timeout: 90000 });
+      await page.locator("#sideDownloadButton").click();
+      const copiedPath = path.join(dirs.downloads, "output-reference-selection.xlsx");
+      await (await copiedDownload).saveAs(copiedPath);
+      const saved = await (await api.get(baseUrl + "/api/quote-sessions/" + encodeURIComponent(targetId))).json();
+      assert(saved.quote_session?.exports?.xlsx?.exists && saved.quote_session.exports.xlsx.stale === false, "target XLSX not current");
+      const bytes = await (await api.get(new URL(saved.quote_session.exports.xlsx.url, baseUrl).toString())).body();
+      assert(bytes.length > 1000 && bytes.subarray(0, 2).toString() === "PK" && bytes.equals(await fs.readFile(copiedPath)),
+        "target protected XLSX differs from the downloaded workbook");
+      assert(await fs.readFile(originalPath, "utf8") === originalMetadata, "target selection/export changed the original quote");
+      result.outputReferenceSelection = { status: "PASS", rows: 2, targetGrantPersisted: true, conditionalSelections: 1,
+        saveReopen: true, profileOutageRecovery: true, profileOutageRecoveryCases: profileRecoveryFaults.length, manualFxAndResetRetained: true, originalUnchanged: true, protectedXlsxBytes: bytes.length };
+    }
+    if (reliability) {
+      await page.locator("#backToDashboardButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeAppView === "dashboard");
+      await page.locator('[data-quote-session-id="' + sessionId + '"]').first().click();
+      await page.locator('[data-dashboard-panel-action="duplicate-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.dashboardActiveSessionId && state.dashboardActiveSessionId !== id, sessionId);
+      const duplicateId = await page.evaluate(() => state.dashboardActiveSessionId);
+      await page.locator('[data-dashboard-panel-action="modify-session"]').click();
+      await page.waitForFunction((id) => !appIsBusy() && state.activeAppView === "quote" && state.quoteSessionId === id, duplicateId);
+      await page.locator('button[data-side-panel="customer"]').click();
+      const replacementOption = await page.locator("#profileSelect option").evaluateAll((options, id) => options.map((option) => option.value).find((value) => value.endsWith("::" + id)), fixtureId + "-replacement");
+      assert(replacementOption, "replacement reference is absent");
+      await page.locator("#profileSelect").selectOption(replacementOption);
+      const beforeChange = await page.evaluate(() => ({ rows: JSON.stringify(state.outputRows), reference: state.pricingReferenceId }));
+      await page.locator("#sideNextButton").click();
+      await page.locator("#quoteDependencyConfirmModal").waitFor({ state: "visible" });
+      assert(!(await page.locator("#excelGeneratingModal").isVisible()), "dependency confirmation started a loading request");
+      await page.locator("#cancelQuoteDependencyConfirmButton").click();
+      assert(await page.evaluate((before) => JSON.stringify(state.outputRows) === before.rows && state.pricingReferenceId === before.reference, beforeChange), "cancelled reference change altered output");
+      await page.locator("#sideNextButton").click();
+      await page.locator("#confirmQuoteDependencyChangeButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeSidePanel === "quote_company");
+      assert(await page.evaluate((id) => state.pricingReferenceId === id && !state.outputRows.length && !state.lineItems.length && !state.basisConfirmed, fixtureId + "-replacement"), "reference change kept old output or authority");
+      assert(!(await page.locator("#analysisConfirmModal").isVisible()), "reference change auto-started analysis confirmation");
+      await page.locator("#sideNextButton").click();
+      await page.locator("#analysisConfirmModal").waitFor({ state: "visible" });
+      assert(!(await page.locator("#excelGeneratingModal").isVisible()), "analysis choice was treated as pending work");
+      await page.locator("#analysisConfirmStartButton").click();
+      await page.waitForFunction(() => !appIsBusy() && state.activeSidePanel === "basis" && state.quoteBasisSections.length);
+      for (let guard = 0; guard < cases.length + 10; guard++) {
+        const pending = await page.evaluate(() => {
+          for (const section of state.quoteBasisSections) {
+            const index = (section.lines || []).findIndex((line) => !basisLineIsInformationalDimension(line) && (normalizeBasisTag(line.tag) === "Confirm" || isPendingAiProposalLine(line)));
+            if (index >= 0) return { section: section.id, index };
+          }
+          return null;
+        });
+        if (!pending) break;
+        await page.locator('#basisReviewSurface [data-basis-section="' + pending.section + '"][data-basis-line-index="' + pending.index + "\"][data-basis-tag]:not([data-basis-tag='Exclude'])").first().click();
+      }
+      const normalizeBefore = network.filter((entry) => entry.method === "POST" && entry.path === "/api/line-items/normalize").length;
+      await page.locator("#sideNextButton").click();
+      await page.locator("#excelGeneratingModal").waitFor({ state: "visible" });
+      await page.evaluate(() => { void goToNextSidePanel(); });
+      await page.waitForFunction(() => !appIsBusy() && state.activeSidePanel === "output");
+      assert(network.filter((entry) => entry.method === "POST" && entry.path === "/api/line-items/normalize").length === normalizeBefore + 1,
+        "Duplicate/reference Confirm dispatched more than once");
+      const confirmed = await page.evaluate(() => {
+        const row = state.outputRows.find((item) => item.source_basis_line_id === "u1-confirmed");
+        return { reference: state.pricingReferenceId, confirmed: state.basisConfirmed, price: pricingAuthorityPrice(outputPriceAuthority(row)), variant: outputPriceAuthority(row)?.variant };
+      });
+      assert(confirmed.confirmed && confirmed.reference === fixtureId + "-replacement" && confirmed.variant === "catalog"
+        && confirmed.price === byName("6 inch Spotlight").sale_unit_price + 1, "first Confirm after Duplicate/reference change did not admit the new reference", confirmed);
+      result.duplicateReferenceSingleConfirm = "PASS";
+    }
+
     result.status = "PASS";
   }
   assert(pageErrors.length === 0, "page errors", pageErrors);
@@ -576,6 +967,8 @@ try {
   console.error(JSON.stringify(result, null, 2));
   process.exitCode = 1;
 } finally {
+  checkpointGate?.release?.();
+  exportPollGate?.release?.();
   if (browser) await browser.close().catch(() => {});
   if (server?.child && server.child.exitCode === null) server.child.kill();
 }

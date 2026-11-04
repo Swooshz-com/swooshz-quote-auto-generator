@@ -64,6 +64,14 @@ AI provider routing:
 - OpenAI remains the fallback provider and uses `OPENAI_BASIS_LINE_MODEL`, defaulting to `gpt-6-luna` with explicit `high` reasoning, for both messy-import normalization and pricing metadata enrichment. Defaults apply only when the setting is absent or blank; any explicit unsupported model fails request validation before OpenAI transport.
 - DeepSeek pricing import normalization uses a dedicated failover timeout, `DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS` (default 120 seconds), so messy imports give DeepSeek a full bounded attempt before malformed or stalled responses fall back to OpenAI. Other DeepSeek routes continue to use `DEEPSEEK_REQUEST_TIMEOUT_SECONDS`.
 
+AI normalization and metadata responses share strict JSON-object and provider
+completion admission with the other AI routes. Refusal or incomplete status cannot
+be accepted merely because a partial response contains valid JSON. Duplicate keys,
+array wrappers and nonfinite numbers reject. Existing provider failover stays in
+place; an invalid response never becomes a successful import preview by itself.
+Saved pricing values, selected currency/tax and source-backed matching metadata
+remain authoritative and are not inferred from response formatting.
+
 ## Saved order and matching metadata
 
 Saved pricing rows carry:

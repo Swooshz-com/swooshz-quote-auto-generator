@@ -1,0 +1,258 @@
+{
+  "schema": "toolkit-plain-references-baseline/v1",
+  "description": "What was already there when the plain-text check was added. Each entry is allowed up to its count until it is rewritten; new ones fail. This list only shrinks: rewrite an entry, then run the check with --prune-baseline. Never add entries.",
+  "allowed": [
+    {
+      "file": "docs/architecture-dead-code-fallback-audit.md",
+      "rule": "number-reference",
+      "text": "#84",
+      "count": 3
+    },
+    {
+      "file": "docs/architecture-dead-code-fallback-audit.md",
+      "rule": "number-reference",
+      "text": "#88",
+      "count": 1
+    },
+    {
+      "file": "docs/architecture-dead-code-fallback-audit.md",
+      "rule": "number-reference",
+      "text": "#91",
+      "count": 7
+    },
+    {
+      "file": "docs/current-cicd-status.md",
+      "rule": "number-reference",
+      "text": "#160",
+      "count": 1
+    },
+    {
+      "file": "docs/internal-uat-checkpoint.md",
+      "rule": "number-reference",
+      "text": "#75",
+      "count": 1
+    },
+    {
+      "file": "docs/internal-uat-checkpoint.md",
+      "rule": "number-reference",
+      "text": "#76",
+      "count": 1
+    },
+    {
+      "file": "docs/internal-uat-checkpoint.md",
+      "rule": "number-reference",
+      "text": "#77",
+      "count": 1
+    },
+    {
+      "file": "docs/internal-uat-checkpoint.md",
+      "rule": "number-reference",
+      "text": "#79",
+      "count": 1
+    },
+    {
+      "file": "docs/internal-uat-checkpoint.md",
+      "rule": "number-reference",
+      "text": "#81",
+      "count": 1
+    },
+    {
+      "file": "docs/internal-uat-checkpoint.md",
+      "rule": "number-reference",
+      "text": "#82",
+      "count": 2
+    },
+    {
+      "file": "docs/internal-uat-checkpoint.md",
+      "rule": "number-reference",
+      "text": "#86",
+      "count": 1
+    },
+    {
+      "file": "docs/platform-integration-contract.md",
+      "rule": "number-reference",
+      "text": "#114",
+      "count": 1
+    },
+    {
+      "file": "docs/platform-integration-contract.md",
+      "rule": "number-reference",
+      "text": "#79",
+      "count": 1
+    },
+    {
+      "file": "docs/production-readiness-audit.md",
+      "rule": "number-reference",
+      "text": "#140",
+      "count": 10
+    },
+    {
+      "file": "docs/production-readiness-audit.md",
+      "rule": "number-reference",
+      "text": "#152",
+      "count": 1
+    },
+    {
+      "file": "docs/production-readiness-audit.md",
+      "rule": "number-reference",
+      "text": "#79",
+      "count": 1
+    },
+    {
+      "file": "docs/production-readiness-audit.md",
+      "rule": "number-reference",
+      "text": "#84",
+      "count": 3
+    },
+    {
+      "file": "docs/production-readiness-audit.md",
+      "rule": "number-reference",
+      "text": "#88",
+      "count": 5
+    },
+    {
+      "file": "docs/production-readiness-audit.md",
+      "rule": "number-reference",
+      "text": "#89",
+      "count": 5
+    },
+    {
+      "file": "docs/production-readiness-audit.md",
+      "rule": "number-reference",
+      "text": "#91",
+      "count": 5
+    },
+    {
+      "file": "docs/README.md",
+      "rule": "number-reference",
+      "text": "#143",
+      "count": 1
+    },
+    {
+      "file": "docs/README.md",
+      "rule": "number-reference",
+      "text": "#212",
+      "count": 1
+    },
+    {
+      "file": "docs/README.md",
+      "rule": "number-reference",
+      "text": "#82",
+      "count": 1
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#100",
+      "count": 2
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#108",
+      "count": 3
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#112",
+      "count": 1
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#134",
+      "count": 1
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#144",
+      "count": 2
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#79",
+      "count": 1
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#86",
+      "count": 1
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#88",
+      "count": 18
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#89",
+      "count": 14
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#91",
+      "count": 18
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#92",
+      "count": 5
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#93",
+      "count": 5
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#94",
+      "count": 5
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#95",
+      "count": 3
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#96",
+      "count": 3
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#97",
+      "count": 3
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#98",
+      "count": 3
+    },
+    {
+      "file": "docs/release-security-audit.md",
+      "rule": "number-reference",
+      "text": "#99",
+      "count": 3
+    },
+    {
+      "file": "docs/sqag-current-status.md",
+      "rule": "number-reference",
+      "text": "#79",
+      "count": 1
+    }
+  ]
+}
