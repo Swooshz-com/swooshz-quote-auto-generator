@@ -12,6 +12,7 @@ from unittest import mock
 
 from scripts import enforce_forensic_retention as retention_worker
 from webapp import server as webapp
+from tests.test_webapp import generation_diagnostic_manual_brief, write_generator_diagnostic_fixture
 from webapp.forensics import (
     MAX_GENERATION_MANIFEST_BYTES,
     ForensicStore,
@@ -702,7 +703,7 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as tmp:
             root = Path(tmp)
             pricing_path = root / "pricing-catalog.json"
-            pricing_path.write_text(json.dumps({"items": []}), encoding="utf-8")
+            pricing_path.write_text(json.dumps({"schema_version": 1, "currency": "SGD", "items": []}), encoding="utf-8")
             profile = webapp.ProfilePack(
                 "synthetic-profile",
                 webapp.DEFAULT_QUOTE_LAYOUT_TEMPLATE_PATH.parent,
@@ -711,6 +712,7 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
             captured = {}
 
             def run_generator(command, **_kwargs):
+                write_generator_diagnostic_fixture(command)
                 output_dir = Path(command[command.index("--out") + 1])
                 output_dir.mkdir(parents=True, exist_ok=True)
                 (output_dir / "quotation.xlsx").write_bytes(b"synthetic-transient-output")
@@ -732,7 +734,7 @@ class Pr140FiveBlockerRedTest(unittest.TestCase):
                 mock.patch.object(webapp, "load_profile_pack", return_value=profile),
                 mock.patch.object(webapp, "pricing_catalog_path_for_payload", return_value=pricing_path),
                 mock.patch.object(webapp, "save_uploaded_images", return_value=[]),
-                mock.patch.object(webapp, "payload_to_brief", return_value={}),
+                mock.patch.object(webapp, "payload_to_brief", side_effect=lambda *args, **kwargs: generation_diagnostic_manual_brief()),
                 mock.patch.object(webapp.subprocess, "run", side_effect=run_generator),
                 mock.patch.object(webapp, "finish_generation_forensics", side_effect=finish),
             ):
