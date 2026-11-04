@@ -31,6 +31,15 @@ npm run playwright:smoke
 
 ## Feature Coverage Guide
 
+- Pricing-reference startup and first Customer entry: Run
+  `python -m unittest tests.test_webapp.WebappServerTest.test_static_next_to_customer_initializes_untouched_commercial_defaults tests.test_webapp.WebappServerTest.test_static_authority_profile_race_discards_late_request_completely`
+  and `node scripts/playwright-smoke.mjs --pricing-startup`. The bounded browser
+  mode uses isolated synthetic local data and checks the existing selected name,
+  source badge, reference currency and tax before Settings is opened. Retain
+  non-default currency/tax, repeated entry, saved/recovered/pending ownership,
+  first-load rendering and stale-response negative controls. No live provider
+  or hosted service is used.
+
 - Synthetic hosted-validation verifier: Run
   `python -m unittest tests.test_internal_alpha_hosted_validation_verifier`.
   Keep each fixture in a unique short `iav-` temporary directory under the

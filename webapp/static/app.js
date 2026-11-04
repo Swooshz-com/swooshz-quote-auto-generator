@@ -1499,6 +1499,7 @@ function initializeFreshPricingReferenceForCustomer() {
   }
   resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: false });
   if (elements.profileSelect) elements.profileSelect.value = referenceValue;
+  renderSelectedPricingReferenceSummary({ previewOnly: true });
   return Boolean(currentPricingReference());
 }
 
