@@ -24834,7 +24834,7 @@ assert.notStrictEqual(pricingReferenceExportBlockReason(bundled), "");
 assert.strictEqual(pricingReferenceSourceLabel(company), "Workspace catalog");
 assert.strictEqual(pricingReferenceSourceLabel(local), "Local catalog");
 assert.strictEqual(pricingReferenceSourceLabel(bundled), "Repo catalog");
-const summaryBody = source.split("function renderSelectedPricingReferenceSummary()")[1].split("function todayDateInputValue")[0];
+const summaryBody = source.split("function renderSelectedPricingReferenceSummary(")[1].split("function todayDateInputValue")[0];
 assert.ok(summaryBody.includes("elements.pricingReferenceSourceBadge.textContent = pricingReferenceSourceLabel(reference);"));
 
 state.pricingReferences = [];
