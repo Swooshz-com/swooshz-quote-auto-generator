@@ -238,7 +238,7 @@ class ReportedResponseCostTest(unittest.TestCase):
             response = {"model": model, "usage": {"cost": cost}}
             self.assertEqual(gateway.reported_response_cost_usd(response, model), cost)
             self.assertIsNone(gateway.reported_response_cost_usd(response, "openai/gpt-6-astra"))
-        for cost in (None, False, True, "0.125", -1, float("nan"), float("inf"), 2**53):
+        for cost in (None, False, True, "0.125", -1, float("nan"), float("inf"), 2**53, 10**1000):
             with self.subTest(cost=cost):
                 self.assertIsNone(gateway.reported_response_cost_usd(
                     {"model": model, "usage": {"cost": cost}}, model,

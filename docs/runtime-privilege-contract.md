@@ -214,3 +214,8 @@ role edge, ownership, or source SQL relation requires an explicit reviewed
 contract change and corresponding real-runtime evidence. The three provider-
 control rows are repository contract data and must remain an exact match; live
 owner/ACL repair and deployment credentials remain separately gated.
+
+The runtime role may select, insert and update quote AI spend records. The
+maintenance role has no direct grant on `sqag_quote_ai_spend`. Quote deletion
+removes those records through the composite foreign key after the existing
+quote deletion checks.

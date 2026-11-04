@@ -38,3 +38,6 @@ class QuoteFlowReliabilityTest(unittest.TestCase):
 
     def test_generation_contract_marker_dispatch_and_legacy_resume_matrix(self):
         self.run_contract("generation-contract")
+
+    def test_quote_ai_spend_refresh_and_switch_discard_stale_response(self):
+        self.run_contract("ai-spend")

@@ -873,6 +873,38 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         with self.assertRaises(MigrationSafetyError):
             self.apply(self.manifest, stale_database)
 
+    def test_quote_ai_spend_upgrade_and_transactional_cascade(self):
+        self.apply(self.manifest[:-1])
+        connection = self.connect()
+        try:
+            connection.execute(
+                "insert into public.sqag_quote_sessions "
+                "(workspace_id, session_id, metadata_json, created_at, updated_at) "
+                "values ('workspace-test', 'quote-test', '{}', 'created', 'updated')"
+            )
+            connection.commit()
+            applied = self.apply()
+            self.assertEqual(applied["appliedNow"], ["011_quote_ai_spend_postgres.sql"])
+            self.assertEqual(connection.execute(
+                "select count(*) as n from public.sqag_quote_sessions"
+            ).fetchone()["n"], 1)
+            connection.execute(
+                "insert into public.sqag_quote_ai_spend "
+                "values ('workspace-test', 'job-test', 'quote-test', 'user-test', 'created', 'token', 'draft', '[false]')"
+            )
+            connection.commit()
+            connection.execute("delete from public.sqag_quote_sessions")
+            self.assertEqual(connection.execute(
+                "select count(*) as n from public.sqag_quote_ai_spend"
+            ).fetchone()["n"], 0)
+            connection.rollback()
+            self.assertEqual(connection.execute(
+                "select count(*) as n from public.sqag_quote_ai_spend"
+            ).fetchone()["n"], 1)
+        finally:
+            connection.rollback()
+            connection.close()
+
     def test_fresh_apply_complete_ledger_and_second_run_noop(self):
         first = self.apply()
         second = self.apply()

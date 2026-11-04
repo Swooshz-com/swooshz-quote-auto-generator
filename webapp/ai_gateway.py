@@ -2,6 +2,7 @@
 from __future__ import annotations
 import copy
 import dataclasses
+from decimal import Decimal, InvalidOperation
 import json
 import math
 import re
@@ -88,8 +89,15 @@ def _invalid_constant(_):
     raise ValueError("invalid_number")
 
 
+class _ProviderFloat(float):
+    def __new__(cls, value):
+        parsed = super().__new__(cls, value)
+        parsed.lexeme = value
+        return parsed
+
+
 def _finite_float(value):
-    parsed = float(value)
+    parsed = _ProviderFloat(value)
     if not math.isfinite(parsed):
         raise ValueError("invalid_number")
     return parsed
@@ -209,6 +217,9 @@ class BoundedHttpsTransport:
             error = GatewayError("http_error", boundary="provider_http", http_status=status,
                                  retryable=http_error_retryable(status, parsed))
             error.diagnostics.update(metadata)
+            # Keep the billing fields out of diagnostics and business output.
+            if isinstance(parsed, dict):
+                error.reported_cost = (parsed.get("model"), _response_cost(parsed))
             raise error from None
         except (urllib.error.URLError,TimeoutError,OSError) as exc:
             error = GatewayError("connection_failed",boundary="provider_transport",retryable=True)
@@ -256,14 +267,25 @@ def admitted_usage(value):
     return result or None
 
 
-def reported_response_cost_usd(response, model):
-    """Admit only the optional USD cost for this request's configured model."""
-    if not isinstance(response, dict) or response.get("model") != model:
-        return None
+def _response_cost(response):
     usage = response.get("usage")
     cost = usage.get("cost") if isinstance(usage, dict) else None
-    if type(cost) in (int, float) and 0 <= cost <= 2**53 - 1:
+    if isinstance(cost, _ProviderFloat):
+        try:
+            cost = Decimal(cost.lexeme)
+        except InvalidOperation:
+            return None
+    if isinstance(cost, Decimal) and not cost.is_finite():
+        return None
+    if type(cost) in (int, float, Decimal) and 0 <= cost <= 2**53 - 1:
         return cost
+    return None
+
+
+def reported_response_cost_usd(response, model):
+    """Admit only the optional USD cost for this request's configured model."""
+    if isinstance(response, dict) and response.get("model") == model:
+        return _response_cost(response)
     return None
 
 
@@ -333,13 +355,14 @@ def admit_response(data,route):
 
 class AiGateway:
     """Own one immutable operation configuration, credential access, sends and admission."""
-    def __init__(self, configuration, *, credential_reader, transport=None, clock=time.perf_counter, sleep=time.sleep, telemetry=None, operation_owner=None):
+    def __init__(self, configuration, *, credential_reader, transport=None, clock=time.perf_counter, sleep=time.sleep, telemetry=None, operation_owner=None, quote_spend=None):
         self.configuration=configuration
         self.operation_owner=operation_owner
         self._credential_reader=credential_reader
         self._transport=transport if transport is not None else BoundedHttpsTransport()
         self._clock,self._sleep=clock,sleep
         self._telemetry=telemetry
+        self._quote_spend = quote_spend
 
     def request(self,operation,envelope, *, send_budget=None):
         route=self.configuration.route(operation)
@@ -357,13 +380,28 @@ class AiGateway:
         if not isinstance(credential,str) or not credential or len(credential)>4096 or any(c.isspace() or ord(c)<32 or ord(c)>126 for c in credential):
             raise GatewayError("credential_missing")
         delays=(2.0,5.0) if operation in {"basis_line","basis_answer"} else ()
+        spend = self._quote_spend
+        if spend is not None and not spend.tracks(operation):
+            spend = None
         for attempt in range(1,len(delays)+2):
             start=self._clock()
             data = None
             if send_budget is not None:
                 send_budget.claim(operation, route.model)
+            ordinal = spend.reserve() if spend is not None else None
+            cost = None
             try:
-                data=self._transport.send(encoded,credential=credential,timeout=self.configuration.timeout_seconds)
+                try:
+                    data=self._transport.send(encoded,credential=credential,timeout=self.configuration.timeout_seconds)
+                    cost = reported_response_cost_usd(data, route.model)
+                except GatewayError as exc:
+                    billed_model, billed_cost = getattr(exc, "reported_cost", (None, None))
+                    if billed_model == route.model:
+                        cost = billed_cost
+                    raise
+                finally:
+                    if spend is not None:
+                        spend.settle(ordinal, cost)
                 result=admit_response(data,route)
             except GatewayError as exc:
                 exc.diagnostics.update(safe_response_diagnostics(data))
@@ -372,7 +410,7 @@ class AiGateway:
                     exc.diagnostics.update({key:value for key,value in usage.items() if key != "output_tokens_details"})
                 exc.diagnostics["attempt_number"]=attempt
                 if send_budget is not None:
-                    send_budget.finish(usage, cost_usd=reported_response_cost_usd(data, route.model))
+                    send_budget.finish(usage, cost_usd=float(cost) if cost is not None else None)
                 if self._telemetry is not None:
                     self._telemetry(operation,attempt,"failed",self._clock()-start,{**exc.diagnostics, "usage":usage, "retry_pending":exc.retryable and attempt<=len(delays)})
                 if exc.retryable and attempt<=len(delays):
@@ -388,7 +426,7 @@ class AiGateway:
                 raise
             usage = admitted_usage(result.get("usage"))
             if send_budget is not None:
-                send_budget.finish(usage, cost_usd=reported_response_cost_usd(data, route.model))
+                send_budget.finish(usage, cost_usd=float(cost) if cost is not None else None)
             if self._telemetry is not None:
                 self._telemetry(operation,attempt,"success",self._clock()-start,{"usage":usage, "retry_pending":False})
             return result

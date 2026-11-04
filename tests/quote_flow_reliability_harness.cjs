@@ -565,6 +565,48 @@ async function lifecycleCases() {
       assert.equal(requests, 2, "one retry must produce one save");
     }
 
+  } else if (mode === "ai-spend") {
+    const nodes = { basisAiSpend: {}, outputAiSpend: {} };
+    const state = {
+      quoteSessionId: "quote-first", quoteAiSpendRequest: 0,
+      quoteSessions: [
+        { session_id: "quote-first", ai_spend: {
+          draft: { status: "reported", display: "USD 0.00" },
+          basis_chat: { status: "partial", display: "< USD 0.01" },
+          total: { status: "partial", display: "< USD 0.01" },
+        } },
+        { session_id: "quote-second", ai_spend: { total: { status: "unavailable" } } },
+      ],
+    };
+    const context = vm.createContext({
+      state, document: { getElementById: (id) => nodes[id] },
+      safeQuoteSessionId: (id) => id, cleanText: (value) => value || "",
+      safeGenerationRunId: (value) => value || "", elements: {}, renderQuoteDashboard: () => {},
+    });
+    vm.runInContext([
+      "currentGenerationContext", "transitionGenerationContext", "quoteAiSpendText",
+      "renderQuoteAiSpend", "refreshQuoteAiSpend", "mergeDashboardQuoteSession",
+    ].map(extract).join("\n"), context);
+    context.renderQuoteAiSpend();
+    assert.match(nodes.basisAiSpend.textContent, /Analysis \/ Re-Analyse USD 0\.00/);
+    assert.match(nodes.outputAiSpend.textContent, /Basis chat < USD 0\.01 \(partial\)/);
+    let finish;
+    context.getJson = () => new Promise((resolve) => { finish = resolve; });
+    const old = context.refreshQuoteAiSpend("quote-first");
+    context.transitionGenerationContext("quote-second");
+    assert.match(nodes.basisAiSpend.textContent, /AI spend total Unavailable/);
+    context.transitionGenerationContext("quote-first");
+    const quote_sessions = [
+      { session_id: "quote-first", ai_spend: { total: { status: "partial", display: "USD 0.50" } } },
+    ];
+    finish({ ok: true, data: { quote_sessions } });
+    await old;
+    assert.doesNotMatch(nodes.outputAiSpend.textContent, /USD 0\.50/);
+    context.getJson = async () => ({ ok: true, data: { quote_sessions } });
+    await context.refreshQuoteAiSpend("quote-first");
+    assert.match(nodes.outputAiSpend.textContent, /USD 0\.50 \(partial\)/);
+    context.transitionGenerationContext("");
+    assert.equal(nodes.basisAiSpend.hidden, true);
   } else if (mode === "generation-contract") {
     await generationContractCases();
   } else if (mode === "generation-output") {

@@ -103,6 +103,10 @@ from webapp.object_storage import (
     object_storage_provider_status,
 )
 from webapp.postgres_migrations import EXPECTED_TRIGGER_ROUTINE_LINKS
+from webapp.quote_ai_spend import (
+    OPERATIONS as QUOTE_SPEND_OPERATIONS,
+    QuoteSpendBinding, QuoteSpendOperation, QuoteSpendReplay, QuoteSpendUnavailable, spend_summary,
+)
 from webapp.ai_gateway import (AiGateway, GatewayConfiguration, GatewayError,
     safe_draft_error_param, draft_provider_error_diagnostics, SUPPORTED_REASONING_EFFORTS)
 from webapp.internal_password_auth import (
@@ -557,6 +561,7 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
         super().__init__(*args, **kwargs)
 
 AI_LOG_TRACKING_CONTEXT = threading.local()
+QUOTE_SPEND_CONTEXT = contextvars.ContextVar("quote_spend_operation", default=None)
 ALLOWED_LOG_EVENTS = {
     "abuse_signal",
     "ai_call_attempt",
@@ -10986,6 +10991,7 @@ SQAG_STORAGE_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "006_quote_publication_versions.sql",
     PROJECT_ROOT / "migrations" / "007_feedback_publication_binding.sql",
     PROJECT_ROOT / "migrations" / "009_telemetry_events.sql",
+    PROJECT_ROOT / "migrations" / "011_quote_ai_spend.sql",
 ]
 SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "001_platform_scoped_storage.sql",
@@ -10997,6 +11003,7 @@ SQAG_POSTGRES_METADATA_MIGRATION_PATHS = [
     PROJECT_ROOT / "migrations" / "008_quote_session_deletion_hold_authority_postgres.sql",
     PROJECT_ROOT / "migrations" / "009_telemetry_events_postgres.sql",
     PROJECT_ROOT / "migrations" / "010_telemetry_attempt_semantics_postgres.sql",
+    PROJECT_ROOT / "migrations" / "011_quote_ai_spend_postgres.sql",
 ]
 SQAG_PUBLICATION_VERSION_REQUIRED_COLUMNS = {
     "workspace_id", "session_id", "run_id", "job_id", "state",
@@ -11009,6 +11016,10 @@ SQAG_APP_METADATA_REQUIRED_COLUMNS = {
     "sqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
     "sqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
     "sqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
+    "sqag_quote_ai_spend": {
+        "workspace_id", "job_id", "session_id", "actor_id", "incarnation", "claim_token",
+        "category", "attempts_json",
+    },
 }
 
 SQAG_FORENSIC_REQUIRED_COLUMNS = {
@@ -11935,8 +11946,92 @@ def safe_platform_session_context(platform: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def quote_spend_incarnation(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("created_at") or "")
+
+
+LOCAL_QUOTE_SPEND_FILENAME = "quote-ai-spend.json"
+LOCAL_QUOTE_SPEND_CLAIMS_LOCK = threading.Lock()
+
+
 class LocalSqagStorage:
     storage_backend = "local-runtime-json"
+
+    @staticmethod
+    def _read_spend(path: Path) -> dict[str, Any]:
+        if _quote_session_path_is_redirect(path):
+            raise QuoteSpendUnavailable()
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            raise QuoteSpendUnavailable() from None
+        if not isinstance(value, dict):
+            raise QuoteSpendUnavailable()
+        return value
+
+    def _spend_path(self, binding: QuoteSpendBinding) -> Path | None:
+        if quote_session_is_retired(binding.session_id):
+            return None
+        state = _read_local_quote_session_state(binding.session_id)
+        if state["owner"] != binding.session_id or quote_spend_incarnation(state["metadata"]) != binding.incarnation:
+            return None
+        return state["directory"] / LOCAL_QUOTE_SPEND_FILENAME
+
+    def claim_quote_spend(self, binding: QuoteSpendBinding, job_id: str, token: str) -> bool:
+        with quote_session_mutation(binding.session_id), LOCAL_QUOTE_SPEND_CLAIMS_LOCK:
+            path = self._spend_path(binding)
+            if path is None:
+                raise QuoteSpendUnavailable()
+            records = self._read_spend(path)
+            if job_id in records:
+                if binding.matches_claim(records[job_id]):
+                    raise QuoteSpendReplay()
+                return False
+            if self._has_quote_spend_claim(job_id, skip=path.parent):
+                return False
+            records[job_id] = {
+                "claim_token": token, "actor_id": binding.actor_id, "incarnation": binding.incarnation,
+                "category": binding.category, "attempts": [],
+            }
+            atomic_write_text(path, json.dumps(records))
+            return True
+
+    def _has_quote_spend_claim(self, job_id: str, *, skip: Path | None = None) -> bool:
+        root = _quote_session_filesystem_capability()["root"]
+        return any(
+            job_id in self._read_spend(directory / LOCAL_QUOTE_SPEND_FILENAME)
+            for directory in root.iterdir()
+            if directory != skip and not _quote_session_path_is_redirect(directory) and directory.is_dir()
+        )
+
+    def has_quote_spend_claim(self, job_id: str) -> bool:
+        with LOCAL_QUOTE_SPEND_CLAIMS_LOCK:
+            return self._has_quote_spend_claim(job_id)
+
+    def change_quote_spend(self, operation: QuoteSpendOperation, change: Callable) -> Any:
+        binding = operation.binding
+        with quote_session_mutation(binding.session_id):
+            path = self._spend_path(binding)
+            if path is None:
+                return None
+            records = self._read_spend(path)
+            record = records.get(operation.job_id)
+            if not record or record["claim_token"] != operation.token:
+                return None
+            result = change(record["attempts"])
+            atomic_write_text(path, json.dumps(records))
+            return result
+
+    def quote_spend_summary(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        session_id = metadata["session_id"]
+        incarnation = quote_spend_incarnation(metadata)
+        records = self._read_spend(quote_session_dir(session_id) / LOCAL_QUOTE_SPEND_FILENAME)
+        return spend_summary(
+            (record for record in records.values() if record["incarnation"] == incarnation),
+            complete=metadata.get("ai_spend_coverage") is True,
+        )
 
     def workspace(self) -> dict[str, Any]:
         return default_runtime_workspace()
@@ -12173,6 +12268,109 @@ class DatabaseSqagStorage:
         if self.database_family == "postgres_compatible":
             return postgres_storage_connection(self.database_url, expected_role=self.expected_session_role)
         return sqlite_storage_connection(self.database_url)
+
+    def _quote_spend_query(self, connection: Any, sql: str, params: tuple) -> Any:
+        if self.database_family == "sqlite":
+            sql = sql.replace("public.", "main.")
+        return connection.execute(sql, params)
+
+    def _lock_quote_for_spend(self, connection: Any, session_id: str) -> bool:
+        if self.database_family == "sqlite":
+            connection.execute("begin immediate")
+            sql = "select 1 from sqag_quote_sessions where workspace_id = ? and session_id = ?"
+        else:
+            sql = "select 1 from public.sqag_quote_sessions where workspace_id = ? and session_id = ? for update"
+        return connection.execute(sql, (self.workspace_id, session_id)).fetchone() is not None
+
+    def claim_quote_spend(self, binding: QuoteSpendBinding, job_id: str, token: str) -> bool:
+        def claim(connection):
+            if not self._lock_quote_for_spend(connection, binding.session_id):
+                raise QuoteSpendUnavailable()
+            metadata, _ = self._read_quote_session_metadata_for_workspace_on_connection(connection, binding.session_id)
+            if (
+                not self._quote_session_editable_by_current_user(metadata)
+                or binding.workspace_id != self.workspace_id
+                or binding.actor_id != self.user_id
+                or quote_spend_incarnation(metadata) != binding.incarnation
+            ):
+                raise QuoteSpendUnavailable()
+            inserted = self._quote_spend_query(connection,
+                "insert into public.sqag_quote_ai_spend "
+                "(workspace_id, job_id, session_id, actor_id, incarnation, claim_token, category, attempts_json) "
+                "values (?, ?, ?, ?, ?, ?, ?, '[]') on conflict(workspace_id, job_id) do nothing",
+                (self.workspace_id, job_id, binding.session_id, self.user_id,
+                 binding.incarnation, token, binding.category),
+            ).rowcount == 1
+            if inserted:
+                return True
+            existing = self._quote_spend_query(connection,
+                "select session_id, actor_id, category, incarnation from public.sqag_quote_ai_spend "
+                "where workspace_id = ? and job_id = ?",
+                (self.workspace_id, job_id),
+            ).fetchone()
+            if existing and existing["session_id"] == binding.session_id and binding.matches_claim(existing):
+                raise QuoteSpendReplay()
+            return False
+
+        return self._run_storage_transaction(claim)
+
+    def has_quote_spend_claim(self, job_id: str) -> bool:
+        with self.connection() as connection:
+            return self._quote_spend_query(
+                connection,
+                "select 1 from public.sqag_quote_ai_spend where workspace_id = ? and job_id = ?",
+                (self.workspace_id, job_id),
+            ).fetchone() is not None
+
+    def change_quote_spend(self, operation: QuoteSpendOperation, change: Callable) -> Any:
+        binding = operation.binding
+
+        def write(connection):
+            if not self._lock_quote_for_spend(connection, binding.session_id):
+                return None
+            identity = (self.workspace_id, binding.session_id, operation.job_id, operation.token)
+            row = self._quote_spend_query(connection,
+                "select attempts_json from public.sqag_quote_ai_spend "
+                "where workspace_id = ? and session_id = ? and job_id = ? and claim_token = ?",
+                identity,
+            ).fetchone()
+            if not row:
+                return None
+            attempts = json.loads(row["attempts_json"])
+            result = change(attempts)
+            updated = self._quote_spend_query(connection,
+                "update public.sqag_quote_ai_spend set attempts_json = ? "
+                "where workspace_id = ? and session_id = ? and job_id = ? and claim_token = ?",
+                (json.dumps(attempts), *identity),
+            )
+            return result if updated.rowcount == 1 else None
+
+        return self._run_storage_transaction(write)
+
+    def quote_spend_summaries(self, sessions: list[tuple[dict, dict]]) -> None:
+        if not sessions:
+            return
+        ids = [session["session_id"] for session, _ in sessions]
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        with self.connection() as connection:
+            for offset in range(0, len(ids), 200):
+                chunk = ids[offset:offset + 200]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = self._quote_spend_query(connection,
+                    "select session_id, incarnation, category, attempts_json from public.sqag_quote_ai_spend "
+                    f"where workspace_id = ? and session_id in ({placeholders})",
+                    (self.workspace_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    grouped.setdefault((row["session_id"], row["incarnation"]), []).append({
+                        "category": row["category"], "attempts": json.loads(row["attempts_json"]),
+                    })
+        for session, metadata in sessions:
+            session["ai_spend"] = spend_summary(
+                grouped.get((session["session_id"], quote_spend_incarnation(metadata)), ()),
+                complete=metadata.get("ai_spend_coverage") is True,
+                total_only=bool(session.get("dashboard_summary_only")),
+            )
 
     def ensure_ready(self) -> None:
         self._ensure_schema(
@@ -15609,7 +15807,7 @@ class DatabaseSqagStorage:
         metadata = (
             normalized_quote_session_metadata(existing)
             if existing
-            else blank_quote_session_metadata(session_id, now)
+            else new_quote_session_metadata(session_id, now)
         )
         metadata["updated_at"] = now
         if self.user_id and not self._quote_session_owner_id(metadata):
@@ -15721,7 +15919,7 @@ class DatabaseSqagStorage:
             connection,
             session_id,
         )
-        visible = normalized_quote_session_metadata(current) if current else blank_quote_session_metadata(session_id, now)
+        visible = normalized_quote_session_metadata(current) if current else new_quote_session_metadata(session_id, now)
         visible["updated_at"] = now
         if self.user_id and not self._quote_session_owner_id(visible):
             visible["owner"] = {"user_id": self.user_id}
@@ -15978,7 +16176,7 @@ class DatabaseSqagStorage:
             metadata = (
                 normalized_quote_session_metadata(existing)
                 if existing
-                else blank_quote_session_metadata(resolved_session_id, now)
+                else new_quote_session_metadata(resolved_session_id, now)
             )
             metadata["updated_at"] = now
             if self.user_id and not self._quote_session_owner_id(metadata):
@@ -16282,7 +16480,7 @@ class DatabaseSqagStorage:
                 expected_unchanged_drafts=expected_unchanged_drafts,
             )
         now = utc_timestamp()
-        metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
+        metadata = normalized_quote_session_metadata(existing) if existing else new_quote_session_metadata(resolved_session_id, now)
         metadata["updated_at"] = now
         if self.user_id and not self._quote_session_owner_id(metadata):
             metadata["owner"] = {"user_id": self.user_id}
@@ -16692,6 +16890,7 @@ class DatabaseSqagStorage:
         with self.connection() as connection:
             rows = connection.execute("select metadata_json from sqag_quote_sessions where workspace_id = ?", (self.workspace_id,)).fetchall()
         sessions: list[dict[str, Any]] = []
+        spend_sessions = []
         for row in rows:
             try:
                 metadata = json.loads(row["metadata_json"])
@@ -16718,6 +16917,8 @@ class DatabaseSqagStorage:
                 if staff_dashboard:
                     session["created_by"] = creators.get(self._quote_session_owner_id(metadata), "")
                 sessions.append(session)
+                spend_sessions.append((session, metadata))
+        self.quote_spend_summaries(spend_sessions)
         return sorted(sessions, key=lambda item: (iso_timestamp_sort_value(item.get("updated_at")), clean_text(item.get("session_id")).casefold()), reverse=True)
 
     def get_quote_session(self, session_id: str, *, include_draft_state: bool = False) -> dict[str, Any] | None:
@@ -16730,6 +16931,8 @@ class DatabaseSqagStorage:
                 draft_files,
             )
         session = self._public_quote_session(metadata, include_draft_state=include_draft_state, draft_files=draft_files)
+        if session:
+            self.quote_spend_summaries([(session, metadata)])
         return session or None
 
     def _publication_version_lock_identities_for_session(
@@ -18614,7 +18817,8 @@ def configured_ai_gateway(feature: str = "", *, attempt_metadata: Mapping[str, A
         if attempt_observer is not None:
             attempt_observer(operation, attempt, status, duration, details)
     return AiGateway(configuration, credential_reader=lambda: reader(OPENROUTER_API_KEY_ENV_NAME),
-                     telemetry=record_attempt, operation_owner=operation_owner)
+                     telemetry=record_attempt, operation_owner=operation_owner,
+                     quote_spend=QUOTE_SPEND_CONTEXT.get())
 
 
 def gateway_attempt(configuration, operation, attempt, status, duration, details, *, attempt_metadata=None):
@@ -28913,12 +29117,20 @@ def blank_quote_session_metadata(session_id: str, created_at: str) -> dict[str, 
     }
 
 
+def new_quote_session_metadata(session_id: str, created_at: str) -> dict[str, Any]:
+    metadata = blank_quote_session_metadata(session_id, created_at)
+    metadata["ai_spend_coverage"] = True
+    return metadata
+
+
 def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     session_id = safe_quote_session_id(metadata.get("session_id"), "")
     if not session_id:
         return {}
     created_at = dashboard_safe_text(metadata.get("created_at")) or utc_timestamp()
     normalized = blank_quote_session_metadata(session_id, created_at)
+    if metadata.get("ai_spend_coverage") is True:
+        normalized["ai_spend_coverage"] = True
     normalized["updated_at"] = dashboard_safe_text(metadata.get("updated_at")) or created_at
     for key in ("customer_summary", "quote_company_profile", "pricing_reference", "commercials", "status", "exports", "owner", "draft_state", "publication"):
         if isinstance(metadata.get(key), dict):
@@ -29617,7 +29829,7 @@ def create_or_update_quote_session(
     )
     storage = storage or LocalSqagStorage()
     now = utc_timestamp()
-    metadata = normalized_quote_session_metadata(existing) if existing else blank_quote_session_metadata(resolved_session_id, now)
+    metadata = normalized_quote_session_metadata(existing) if existing else new_quote_session_metadata(resolved_session_id, now)
     metadata["updated_at"] = now
     metadata["customer_summary"] = quote_session_customer_summary(payload, patch)
     metadata["quote_company_profile"] = quote_session_profile_summary(payload, patch)
@@ -30053,7 +30265,13 @@ def get_quote_session(session_id: str, *, include_draft_state: bool = False) -> 
     metadata = state["metadata"] if isinstance(state["metadata"], dict) else {}
     if not metadata:
         return None
-    return public_quote_session(metadata, include_draft_state=include_draft_state)
+    session = public_quote_session(metadata, include_draft_state=include_draft_state)
+    if session:
+        with quote_session_mutation(safe_id):
+            if quote_session_is_retired(safe_id):
+                return None
+            session["ai_spend"] = LocalSqagStorage().quote_spend_summary(metadata)
+    return session or None
 
 
 def iso_timestamp_sort_value(value: Any) -> float:
@@ -30619,20 +30837,17 @@ def run_job_worker(
     payload: dict[str, Any],
     ai_tracking_context: dict[str, Any] | None = None,
     auth_session: dict[str, Any] | None = None,
+    quote_spend: QuoteSpendOperation | None = None,
 ) -> None:
-    with ai_log_tracking_scope(
-        ai_tracking_context,
-        auth_session=auth_session,
-    ):
-        if worker in {
-            finish_generate_job,
-            finish_generate_pdf_job,
-            finish_draft_job,
-            finish_basis_chat_job,
-        }:
-            worker(job_id, payload, auth_session=auth_session)
-        else:
-            worker(job_id, payload)
+    token = QUOTE_SPEND_CONTEXT.set(quote_spend)
+    try:
+        with ai_log_tracking_scope(ai_tracking_context, auth_session=auth_session):
+            if worker in {finish_generate_job, finish_generate_pdf_job, finish_draft_job, finish_basis_chat_job}:
+                worker(job_id, payload, auth_session=auth_session)
+            else:
+                worker(job_id, payload)
+    finally:
+        QUOTE_SPEND_CONTEXT.reset(token)
 
 
 
@@ -31860,6 +32075,63 @@ def support_feedback_evidence_for_auth_session(reference: str, reason_code: str,
             )
         return result
 
+def bind_quote_spend(
+    payload: dict[str, Any], auth_session: dict[str, Any] | None, category: str,
+) -> QuoteSpendBinding | None:
+    supplied = payload.get("quote_session")
+    raw_id = supplied.get("session_id") if isinstance(supplied, dict) else None
+    if raw_id in (None, ""):
+        # Existing direct callers can analyse material without a saved quote.
+        return None
+    session_id = safe_quote_session_id(raw_id, "")
+    if not session_id:
+        raise SqagStorageAccessError("Quote is unavailable.", status=404, reason="quote_spend_quote_unavailable")
+    storage = quote_session_storage_for_auth_session(auth_session)
+    if isinstance(storage, DatabaseSqagStorage):
+        metadata, _ = storage._read_quote_session_metadata_for_workspace(session_id)
+        workspace_id, actor_id = storage.workspace_id, storage.user_id
+        editable = storage._quote_session_editable_by_current_user(metadata)
+    else:
+        with quote_session_mutation(session_id):
+            metadata = read_quote_session_metadata(session_id)
+        workspace_id = "local-workspace"
+        actor_id = platform_user_id_from_auth_session(auth_session) or "local-user"
+        editable = True
+    if not metadata or not editable:
+        raise SqagStorageAccessError("Quote is unavailable.", status=404, reason="quote_spend_quote_unavailable")
+    return QuoteSpendBinding(session_id, workspace_id, actor_id, quote_spend_incarnation(metadata), category, storage)
+
+
+def ensure_unbound_spend_request_is_new(job_id: str, auth_session: dict[str, Any] | None) -> None:
+    if not job_id:
+        return
+    try:
+        storage = quote_session_storage_for_auth_session(auth_session)
+        claimed = storage.has_quote_spend_claim(job_id)
+    except Exception as exc:
+        raise SqagStorageAccessError(
+            "AI spend storage is unavailable.", status=503, reason="quote_spend_claim_unavailable",
+        ) from exc
+    if claimed:
+        raise SqagStorageAccessError(
+            "Job request could not be resumed.", status=409, reason="quote_spend_binding_conflict",
+        )
+
+
+def claim_quote_spend(binding: QuoteSpendBinding | None, job_id: str) -> QuoteSpendOperation | None:
+    if binding is None:
+        return None
+    try:
+        return binding.claim(job_id)
+    except QuoteSpendReplay:
+        raise
+    except Exception as exc:
+        # An ambiguous commit must never lead to a provider send.
+        raise SqagStorageAccessError(
+            "AI spend storage is unavailable.", status=503, reason="quote_spend_claim_unavailable",
+        ) from exc
+
+
 def create_job(
     job_type: str,
     payload: dict[str, Any],
@@ -31923,17 +32195,31 @@ def create_job(
     requested_job_id = clean_text(requested_job_id)
     if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
         return blocked(["Job request could not be resumed."], "job_resume_invalid")
+    binding = bind_quote_spend(payload, auth_session, normalized_type) if normalized_type in QUOTE_SPEND_OPERATIONS else None
+    spend_identity = binding.identity if binding is not None else None
+
+    def resume_rejected(existing):
+        return (
+            existing.get("type") != normalized_type
+            or not job_visible_to_context(existing, visibility_context)
+            or existing.get("_quote_spend_identity") != spend_identity
+        )
+
     if requested_job_id:
         with JOBS_LOCK:
             existing = JOBS.get(requested_job_id)
             if existing:
-                if existing.get("type") != normalized_type or not job_visible_to_context(existing, visibility_context):
+                if resume_rejected(existing):
                     return {"status": "blocked", "errors": ["Job request could not be resumed."]}
                 existing = copy.deepcopy(existing)
         if existing:
             return projected_public_job(existing, auth_session)
+    if normalized_type in QUOTE_SPEND_OPERATIONS and binding is None:
+        ensure_unbound_spend_request_is_new(requested_job_id, auth_session)
     job_id = requested_job_id or f"job-{secrets.token_hex(6)}"
-    if normalized_type in {"draft", "generate", "generate_pdf"}:
+    if binding is not None:
+        validated_session_id = binding.session_id
+    elif normalized_type in {"draft", "generate", "generate_pdf"}:
         validated_session_id = validated_generation_session_id(payload, auth_session)
     evidence_assessment = forensic_request_evidence_assessment(payload)
     evidence_error = clean_text(evidence_assessment.get("error"))
@@ -32046,16 +32332,29 @@ def create_job(
         )
     payload = resolved_payload
 
+    try:
+        quote_spend = claim_quote_spend(binding, job_id)
+    except QuoteSpendReplay:
+        return {
+            "job_id": job_id, "type": normalized_type, "status": "blocked",
+            "errors": ["This AI request was already accepted."], "idempotent_replay": True,
+        }
+    if binding is not None and quote_spend is None:
+        # A durable claim can outlive the process's job-result cache.
+        return blocked(["Job request could not be resumed."], "job_resume_invalid")
     if normalized_type == "draft":
-        generation_run_id = begin_generation_forensics(
-            normalized_type,
-            payload,
-            auth_session,
-            job_id=job_id,
-            claim_status="queued",
-            validated_session_id=validated_session_id,
-            request_summary_override=minimal_forensic_request_summary(payload),
-        )
+        try:
+            generation_run_id = begin_generation_forensics(
+                normalized_type,
+                payload,
+                auth_session,
+                job_id=job_id,
+                claim_status="queued",
+                validated_session_id=validated_session_id,
+                request_summary_override=minimal_forensic_request_summary(payload),
+            )
+        except GenerationRunReplay:
+            return blocked(["Job request could not be resumed."], "job_resume_invalid")
         if not generation_run_id:
             return {
                 "job_id": job_id,
@@ -32076,11 +32375,12 @@ def create_job(
         "result": None,
         "errors": [],
         "owner": job_owner_context_from_auth_session(auth_session),
+        "_quote_spend_identity": spend_identity,
         "generation_run_id": generation_run_id,
     }
     with JOBS_LOCK:
         existing = JOBS.get(job_id)
-        rejected_resume = bool(existing and (existing.get("type") != normalized_type or not job_visible_to_context(existing, visibility_context)))
+        rejected_resume = bool(existing and resume_rejected(existing))
         existing = copy.deepcopy(existing) if existing and not rejected_resume else None
         if not existing and not rejected_resume:
             JOBS[job_id] = job
@@ -32097,7 +32397,7 @@ def create_job(
     }[normalized_type]
     thread = threading.Thread(
         target=run_job_worker,
-        args=(worker, job_id, payload, ai_tracking_context, safe_auth_session_for_async(auth_session)),
+        args=(worker, job_id, payload, ai_tracking_context, safe_auth_session_for_async(auth_session), quote_spend),
         daemon=True,
     )
     set_job_state(job_id, status="running")
@@ -33739,16 +34039,42 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     return
                 payload = resolved_payload
                 try:
-                    result = draft_quote_basis(payload, auth_session=auth_session)
+                    binding = bind_quote_spend(payload, auth_session, "draft")
+                    requested_job_id = clean_text(self.headers.get("Idempotency-Key"))
+                    if requested_job_id and not re.fullmatch(r"job-[A-Za-z0-9_-]{8,80}", requested_job_id):
+                        self.send_json({"status": "blocked", "errors": ["Job request could not be resumed."]}, status=400)
+                        return
+                    if binding is None:
+                        ensure_unbound_spend_request_is_new(requested_job_id, auth_session)
+                    spend = claim_quote_spend(binding, requested_job_id or f"job-{secrets.token_hex(12)}")
+                    if binding is not None and spend is None:
+                        self.send_json({"status": "blocked", "errors": ["Job request could not be resumed."]}, status=409)
+                        return
+                    token = QUOTE_SPEND_CONTEXT.set(spend)
+                    try:
+                        result = draft_quote_basis(payload, auth_session=auth_session)
+                    finally:
+                        QUOTE_SPEND_CONTEXT.reset(token)
                     if result.get("status") == "blocked":
                         self.send_json(result, status=503)
                         return
                     self.send_json(result)
-                except OpenAIAnalysisError as exc:
+                except QuoteSpendReplay:
+                    self.send_json(
+                        {"status": "blocked", "errors": ["This AI request was already accepted."], "idempotent_replay": True},
+                        status=409,
+                    )
+                except SqagStorageAccessError as exc:
+                    self.send_json(storage_access_error_payload(exc), status=exc.status)
+                except (OpenAIAnalysisError, QuoteSpendUnavailable) as exc:
                     error_reference = new_error_reference()
                     result = failed_result_payload(error_reference)
                     write_local_log("draft_failed", ai_error_log_details(error_reference, exc))
                     self.send_json(result, status=502)
+                except Exception as exc:
+                    error_reference = new_error_reference()
+                    write_local_log("draft_failed", unexpected_error_log_details(error_reference, exc))
+                    self.send_json(failed_result_payload(error_reference), status=500)
             return
 
         if parsed.path == "/api/generate":
