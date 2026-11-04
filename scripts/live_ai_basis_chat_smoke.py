@@ -1,7 +1,7 @@
 """Run a small live AI smoke test for Re and Ask For Changes.
 
-This script intentionally uses fake booth data and prints only sanitized,
-truncated summaries. It is for occasional paid provider checks after the
+This script intentionally uses fake booth data and prints only outcome
+metadata. It is for occasional paid provider checks after the
 mocked AI basis-chat tests pass.
 """
 
@@ -236,26 +236,28 @@ def run_case(case: dict[str, Any]) -> dict[str, Any]:
     started = time.monotonic()
     try:
         result = webapp.answer_basis_chat(payload)
-    except webapp.OpenAIAnalysisError as exc:
+    except webapp.OpenAIAnalysisError:
         return {
             "name": case["name"],
             "status": "failed",
             "expected": case["expect_type"],
             "elapsed_ms": round((time.monotonic() - started) * 1000),
-            "error": webapp.scrub_sensitive_text(str(exc))[:220],
+            "error_code": "provider_request_failed",
         }
 
     summary = result_summary(result)
     actual_type = str(result.get("type") or ("proposal" if result.get("proposal") else "answer" if result.get("answer") else ""))
-    ok = actual_type == case["expect_type"] and not has_forbidden_output(summary)
+    forbidden_output = has_forbidden_output(summary)
+    ok = actual_type == case["expect_type"] and not forbidden_output
+    source = result.get("source")
     return {
         "name": case["name"],
         "status": "ok" if ok else "failed",
         "expected": case["expect_type"],
-        "actual": actual_type,
-        "source": result.get("source", ""),
+        "actual": actual_type if actual_type in {"answer", "proposal"} else "unknown",
+        "source": source if isinstance(source, str) and source in {"openai", "deepseek", "local"} else "unknown",
         "elapsed_ms": round((time.monotonic() - started) * 1000),
-        "summary": summary,
+        "forbidden_output": forbidden_output,
     }
 
 

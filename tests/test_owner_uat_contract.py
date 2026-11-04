@@ -200,5 +200,144 @@ class OwnerUatContractTest(unittest.TestCase):
         self.assertEqual(webapp.normalize_line_items(payload)[0]['approved_quote_amount'],4)
 
 
+    def test_duplicate_target_ledger_reopen_explicit_confirmation_and_guarded_real_xlsx(self):
+        import contextlib
+        import hashlib
+        import io
+        import os
+        import socket
+        import sys
+        import tempfile
+        from pathlib import Path
+        runtime_root = ROOT / '_tmp' / 'xr'
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='g', dir=runtime_root) as tmp:
+            runtime = Path(tmp)
+            env = {name: os.environ[name] for name in ('SystemRoot', 'WINDIR') if name in os.environ}
+            env.update(APP_MODE='local', USER_TYPE='operator', SQAG_STORAGE_MODE='local', SQAG_ARTIFACT_STORAGE_MODE='local',
+                       QUOTE_DATA_ROOT=str(runtime / 'd'), QUOTE_OUTPUT_ROOT=str(runtime / 'o'), QUOTE_TMP_ROOT=str(runtime / 't'),
+                       QUOTE_LOG_ROOT=str(ROOT / '_logs' / 'server' / 'alpha2-export-recovery' / 'regression'))
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+                stack.enter_context(mock.patch.object(webapp, 'read_dotenv_value', side_effect=lambda name, *a, **k: os.environ.get(name, '')))
+                network = stack.enter_context(mock.patch.object(socket.socket, 'connect', side_effect=AssertionError('No network in this synthetic contract')))
+                storage = webapp.LocalSqagStorage()
+                f = self.fixture
+                original, _ = f._ledger_analysis([
+                    ('cat-row', 'Floors', 'Synthetic carpet tile flooring', 2, 'sqm', f.LEDGER_CARPET),
+                    ('manual-row', 'General', 'Synthetic operator handling', 3, 'nos', None),
+                    ('unpriced-row', 'General', 'Synthetic unidentified item', 1, 'lot', None),
+                ], session_id='quote-regression-original')
+                reference = webapp.exact_pricing_reference_authority(original)
+                manual = next(row for row in original['line_items'] if row['source_basis_line_id'] == 'manual-row')
+                manual.update(pricing_keyword='', price_mode='Priced', unit_price_override=1.01)
+                manual['pricing_authority'] = webapp.build_pricing_authority('manual', manual, price=1.01,
+                    reference_authority=reference)
+                manual['pricing_authority']['price_currency'] = 'AUD'
+                for section in original['quote_basis_sections']:
+                    for line in section['lines']:
+                        line.update(tag='Include' if line['id']=='cat-row' else 'Custom', custom_pricing=line['id']!='cat-row')
+
+                def sync(payload):
+                    f._ledger_sync(payload)
+                    draft = payload['quote_session']['draft_state']
+                    details = copy.deepcopy(fixtures.recovered_convergence_payload(include_included_row=False)['quote_session']['draft_state']['quoteDetails'])
+                    details.update(currency='AUD', exchange_rate=1.37)
+                    details['company']['logo_data_url'] = fixtures.SANITIZED_LOGO_DATA_URL
+                    details['commercial_snapshot']['presence'] = {key:'captured' if webapp.quote_commercial_value_is_present(value) else 'intentional_empty'
+                        for key,value in webapp.quote_commercial_snapshot_raw_values(details).items()}
+                    draft.update(quoteDetails=details, pricingReferenceId=payload['pricing_reference_id'],
+                        pricingReferenceSource=payload['pricing_reference_source'], outputRevision=0,
+                        outputRows=copy.deepcopy(payload['line_items']))
+                    payload.update(quote_exchange_rate=1.37)
+                    payload['quote_session']['commercials'].update(currency='AUD', exchange_rate=1.37)
+                    return payload
+
+                sync(original)
+                storage.create_or_update_quote_session(original)
+                source_id = original['quote_session']['session_id']
+                source_before = json.dumps(webapp.read_quote_session_metadata(source_id), sort_keys=True)
+                target = copy.deepcopy(original)
+                target['quote_session']['session_id'] = 'quote-regression-target'
+                target.pop('pricing_analysis_seal', None)
+                target['quote_session']['draft_state']['originalAnalysisSnapshot']['pricing_analysis_seal'] = None
+                self.assertIsNone(webapp.verified_pricing_analysis_seal(original['pricing_analysis_seal'],
+                    scope=webapp.pricing_ledger_scope_for_storage(storage),session_id='quote-regression-target'))
+                self.assertIsNone(webapp.verified_pricing_analysis_seal(original['pricing_analysis_seal'],scope='workspace:wrong.test',session_id=source_id))
+                normalized = webapp.normalize_line_items_for_quote_basis_review(target)
+                self.assertEqual(len(normalized),3)
+                self.assertEqual({row['source_basis_line_id'] for row in normalized}, {'cat-row','manual-row','unpriced-row'})
+                self.assertNotEqual(next(row for row in normalized if row['source_basis_line_id']=='cat-row')['pricing_authority']['variant'],'catalog')
+                manual_normalized = next(row for row in normalized if row['source_basis_line_id']=='manual-row')
+                self.assertEqual(manual_normalized['pricing_authority']['price_currency'],'AUD')
+                self.assertEqual(manual_normalized['approved_quote_amount'],3.03)
+                target['line_items'] = normalized
+                sync(target)
+                storage.create_or_update_quote_session(target)
+                reopened = storage.get_quote_session('quote-regression-target', include_draft_state=True)
+                self.assertEqual(len(reopened['draft_state']['lineItems']),3)
+                self.assertIsNone(webapp.pricing_ledger_view_for_payload(target).grant('cat-row'))
+                self.assertFalse(any(row['pricing_authority']['variant']=='catalog' for row in webapp.normalize_line_items_for_final_brief(target)))
+                # An unpriced row remains a genuine review blocker; the approved priced subset is explicit.
+                with self.assertRaises(webapp.QuoteCommercialStateError): webapp.payload_to_brief(target)
+                target['line_items'] = [row for row in target['line_items'] if row['source_basis_line_id']!='unpriced-row']
+                sync(target)
+                storage.create_or_update_quote_session(target)
+                revision = webapp.public_pricing_ledger(webapp.read_quote_session_metadata('quote-regression-target'))['rows']['cat-row']
+                selection = {'source_basis_line_id':'cat-row','catalog_item_id':f.LEDGER_CARPET,'expected_revision':revision}
+                selected = webapp.apply_pricing_selections(target,[selection],storage)
+                self.assertEqual(selected['selections'],[{'source_basis_line_id':'cat-row','status':'selected'}])
+                with self.assertRaises(webapp.PricingSelectionConflict): webapp.apply_pricing_selections(target,[selection],storage)
+                target['line_items'] = selected['line_items']
+                sync(target)
+                storage.create_or_update_quote_session(target)
+                for changed, value in (('catalog_digest','sha256:'+'0'*64),('catalog_source','company'),('price',999999),('catalog_unit','lot')):
+                    forged = copy.deepcopy(target)
+                    row = next(row for row in forged['line_items'] if row['source_basis_line_id']=='cat-row')
+                    row['pricing_authority'][changed] = value
+                    self.assertFalse(any(row['pricing_authority']['variant']=='catalog' for row in webapp.normalize_line_items_for_final_brief(forged)),changed)
+
+                def local_generator(command, **kwargs):
+                    output = io.StringIO()
+                    with mock.patch.object(sys, 'argv', ['generate_quote.py', *command[2:]]), contextlib.redirect_stdout(output):
+                        code = quote.main()
+                    return subprocess.CompletedProcess(command, code, output.getvalue(), '')
+
+                with mock.patch.object(webapp, 'begin_generation_forensics', return_value=''), \
+                     mock.patch.object(webapp, 'append_runtime_telemetry'), \
+                     mock.patch.object(webapp.subprocess, 'run', side_effect=local_generator), \
+                     mock.patch.object(webapp, 'quote_session_storage_for_auth_session', return_value=storage):
+                    # The real generator completes and writes real bytes, then a
+                    # diagnostic read failure must truthfully finish without publishing them.
+                    with mock.patch.object(webapp, 'read_pricing_matches', side_effect=OSError('synthetic diagnostic read refused')), \
+                         mock.patch.object(webapp, 'finish_generation_forensics', wraps=webapp.finish_generation_forensics) as finish:
+                        refused = webapp._run_quote_job(copy.deepcopy(target), output_root=runtime/'o',tmp_root=runtime/'t',job_id='job-read-refused')
+                    self.assertEqual((refused['status'],refused['return_code']),('failed',0))
+                    self.assertFalse(refused.get('files'))
+                    manifest = finish.call_args.kwargs['canonical_manifest']
+                    self.assertIs(manifest['generator_executed'],True)
+                    self.assertEqual(manifest['return_code'],0)
+                    self.assertFalse(manifest['artifacts'])
+                    self.assertIsNone(storage.quote_session_export_artifact('quote-regression-target','xlsx'))
+                    self.assertTrue((runtime/'o'/'job-read-refused'/'quotation.xlsx').is_file())
+                    result = webapp._run_quote_job(copy.deepcopy(target), output_root=runtime/'o',tmp_root=runtime/'t',job_id='job-target-positive')
+                self.assertEqual((result['status'],result['return_code']),('completed',0),result)
+                self.assertEqual(len(result['output_rows']['rows']),2)
+                self.assertEqual({row['source_basis_line_id'] for row in result['output_rows']['rows']},{'cat-row','manual-row'})
+                artifact = storage.quote_session_export_artifact('quote-regression-target','xlsx')
+                self.assertIsNotNone(artifact)
+                self.assertEqual(hashlib.sha256(artifact['content']).hexdigest(),artifact['sha256'])
+                with zipfile.ZipFile(io.BytesIO(artifact['content'])) as workbook: self.assertIsNone(workbook.testzip())
+                excluded = copy.deepcopy(target)
+                for section in excluded['quote_basis_sections']:
+                    for line in section['lines']:
+                        if line['id']=='cat-row': line['tag']='Exclude'
+                sync(excluded)
+                storage.create_or_update_quote_session(excluded)
+                self.assertFalse(any(row['pricing_authority']['variant']=='catalog' for row in webapp.normalize_line_items_for_final_brief(target)))
+                self.assertEqual(json.dumps(webapp.read_quote_session_metadata(source_id), sort_keys=True),source_before)
+                network.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

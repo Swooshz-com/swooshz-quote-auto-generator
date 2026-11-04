@@ -6,6 +6,9 @@ const source = fs.readFileSync("webapp/static/app.js", "utf8");
 const digestValidatorSource = source.match(/^const PRICING_REFERENCE_DIGEST_RE = (.+);$/m);
 assert.ok(digestValidatorSource, "Missing production pricing digest validator");
 const PRICING_REFERENCE_DIGEST_RE = eval(digestValidatorSource[1]);
+const whitespaceSource = source.match(/^const PRICING_AUTHORITY_WHITESPACE_RE = (.+);$/m);
+assert.ok(whitespaceSource, "Missing production canonical whitespace expression");
+const PRICING_AUTHORITY_WHITESPACE_RE = eval(whitespaceSource[1]);
 function extract(name) {
   const match = new RegExp(`(?:async )?function ${name}\\(`).exec(source);
   assert.ok(match, `Missing production function ${name}`);
@@ -41,6 +44,7 @@ function commitOutputEditor(editor) {
 }
 let postCount = 0;
 let releaseSave = null;
+let checkpointRequestArrived = null;
 let savedDraft = null;
 let scope = "synthetic-scope";
 let quoteSessionInitialSavePromise = null;
@@ -103,11 +107,22 @@ function errorReferenceFrom() {return "";}
 function newClientErrorReference() {return "ERR-12345678";}
 function quoteSessionDraftSynchronizationFailureMessage() {return "Synthetic save failure";}
 function logClientEvent() {}
+const GENERIC_FAILURE_MESSAGE = "Synthetic referenced failure";
+function genericFailureMessage() {return "Synthetic failure. Reference: ERR-12345678.";}
+async function waitForUiPaint() {}
+function showExcelGeneratingModal() {
+  elements.excelGeneratingModal.hidden = false;
+  elements.excelGeneratingSpinner.hidden = false;
+}
+function hideExcelGeneratingModal() {elements.excelGeneratingModal.hidden = true;}
 async function postJson(url, payload) {
   assert.strictEqual(url, "/api/quote-sessions", "Only synthetic checkpoint saves are permitted");
   postCount++;
   const mode = saveMode;
-  if (mode === "deferred") await new Promise(resolve => {releaseSave = resolve;});
+  if (mode === "deferred") await new Promise(resolve => {
+    releaseSave = resolve;
+    checkpointRequestArrived?.();
+  });
   if (mode === "failure") return {ok: false, status: 500, data: {}};
   savedDraft = clone(payload.draft_state);
   return {ok: true, status: 200, data: {status: mode === "bad_status" ? "unknown" : "saved",
@@ -142,7 +157,8 @@ function requestStartAnalysis() {throw new Error("Analysis must never be chained
 function confirmBasis() {throw new Error("Basis confirmation not part of these controls");}
 function showBlockedAction() {}
 function showBlockedBasisAction() {}
-const functions = ["safeQuoteSessionId", "isPlainObject", "revisionNumber", "splitLines",
+const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading",
+  "safeQuoteSessionId", "isPlainObject", "revisionNumber", "splitLines",
   "normalizeTextNewlines", "normalizedContentFingerprint", "pendingPricingReference",
   "safeQuoteSessionErrorReference", "canStartAnalysis", "startQuoteSessionDraftSaveAfterCustomerStep",
   "currentPricingReference", "pricingReferenceSelectionFromValue", "pricingReferenceFromSelectionValue",
@@ -287,7 +303,14 @@ function control(name, action) {action(); controls.push(name);}
     });
   }
   fresh(); selectB(); saveMode = "deferred";
+  const requestArrived = new Promise(resolve => {checkpointRequestArrived = resolve;});
   const advancing = goToNextSidePanel();
+  let arrivalTimeout;
+  try {
+    await Promise.race([requestArrived, new Promise((_, reject) => {
+      arrivalTimeout = setTimeout(() => reject(new Error("Synthetic checkpoint request did not arrive")), 5000);
+    })]);
+  } finally {clearTimeout(arrivalTimeout); checkpointRequestArrived = null;}
   assert.ok(releaseSave);
   control("pending acknowledgement does not unlock", () => {
     assert.strictEqual(state.activeSidePanel, "customer");

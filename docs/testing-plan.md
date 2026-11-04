@@ -32,8 +32,141 @@ npm run playwright:smoke
 ## Feature Coverage Guide
 
 - Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.
+- Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
+- Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
 - Pricing reference import, catalog matching, currency/tax metadata, or template parsing: add/update parser and normalization tests, then run the relevant `tests.test_webapp` and `tests.test_generate_quote` cases.
+- Pricing-pack reads and numeric admission: Run `tests.test_codeql_boundaries`
+  and the exact-pack, quote-basis and primary-order cases in `tests.test_webapp`.
+  Preserve valid nested catalogues and reject escaped manifests/catalogues before
+  reading them. Linux CI covers real links; Windows controlled resolution tests
+  retain the existing native-link qualification limit. Generator brief writes
+  must use the private atomic writer, with mode 0600 checked on POSIX.
+  Generic resolution, listing, public summary/detail and asset access must share
+  the same fence. Unsafe entries cannot disclose their manifest or substitute a
+  default catalogue; safe listing peers remain available, unrelated errors stay
+  visible and valid Windows directory aliases retain their public spelling.
+  Canonical string-prefix admission must include the directory separator, retain
+  Unicode path spelling and keep the resolved-path checks. Exact-parent and nested
+  paths must pass the same unconditional prefix admission. Cover both directory
+  and asset siblings sharing a prefix before Path resolution, nested Unicode
+  catalogue filenames and resolution failures.
+- Diagnostic JSON privacy: Run `tests.test_codeql_diagnostic_privacy` with mocked
+  providers and configuration. Live-smoke results expose fixed outcome metadata
+  while keeping model and provider exception text internal. Readiness output may
+  name required environment keys but must not echo their values. These tests make
+  no paid provider calls or live network probes.
+- Reusable company-profile import/export: Run `tests.test_profile_roundtrip` and
+  the existing profile import, overwrite and export endpoint cases. Applying an
+  imported profile must preserve quotation analysis, reviewed rows and workflow,
+  while invalidating existing downloads even when only the layout changes.
+  Database and object-storage exports must carry the exact owning profile's
+  workbook, survive reimport, respect workspace isolation and refuse an unavailable
+  required layout. A normal profile save must retain its existing behaviour.
 - Output pricing review, manual price detection, subtotal, Excel download, or quote generation: run generator unit tests plus an app smoke test that reaches output.
+  Run QuantityLayoutTest for quantity/unit output: decimal and integer tokens,
+  longer units, complete centred text at the selected font size, unchanged amounts,
+  shared quantity/description row budgets and page-boundary admission. Reject a
+  numeric token or complete line-item block that cannot fit the selected layout.
+  Its native LibreOffice regression checks rendered digit ink, since complete PDF
+  text extraction can conceal a clipped leading digit. Keep the short quantities,
+  selected profile column widths, print area and existing fonts unchanged.
+  Acceptance and signature text must preserve every plain or rich paragraph and its
+  emphasis. Test visible left/right template widths, narrow and wide unbroken text,
+  combining marks, literal formula prefixes, larger fonts, dynamic signature
+  offsets, exact fitting/one-row-over admission and oversized continuation. Keep
+  the existing short-text positions, optional-text capacity, final labels, logos,
+  print-area and font controls. Run AcceptanceSignatureLayoutTest; its native
+  LibreOffice test must run in CI and checks actual glyph-box paint plus signature
+  clearance. Text extraction alone cannot detect the retained clipping failure.
+  Local renderer skips remain explicit gaps until native rendered proof exists.
+  Exercise the actual web payload mapper into the workbook, using nested and flat
+  plain acceptance/signature fields, CRLF/internal blank lines, literal HTML-like
+  text and formula prefixes. Selected acceptance/signature style fonts must remain
+  explicit in the master and conversion copy, with emphasis and master bytes intact.
+  Keep base/Unicode-mark sequences together across rich-run boundaries, including
+  nonspacing/enclosing marks with combining class zero and spacing marks. Native
+  rendering must also check a larger selected font's actual PDF size and paint.
+  PDF conversion must preserve the XLSX master bytes. Resolve DrawingML Latin
+  theme-font references from that workbook's internal theme in a temporary
+  conversion copy; retain explicit fonts, run sizes/emphasis and every other
+  workbook part. Test custom major/minor fonts, explicit-font/no-theme inputs,
+  unresolved/external/ambiguous themes, converter input and temporary cleanup.
+  The real LibreOffice fidelity regression must measure company-header fonts
+  as well as geometry, so a monospace substitute cannot pass as equivalent.
+  A Calibri-compatible Linux font still does not prove exact Excel typography
+  or pagination; native Excel and installed PDF comparisons remain required
+  before claiming that fidelity.
+  Partially formatted SpreadsheetML text runs must also materialise their
+  workbook-default font and size in the conversion copy. Cover inline and
+  shared strings, explicit run overrides, theme schemes and missing defaults;
+  preserve plain cell inheritance and the XLSX master. The real renderer check
+  must reject a monospace font for the client text, independently of the header.
+  A review result with an explicit empty or diagnostic-only file list must save
+  as review without entering atomic workbook publication. Test this with the real
+  generator, migrated database and synthetic object backend, then resolve pricing
+  explicitly and verify a real durable XLSX after owned scratch cleanup. Completed
+  results with missing artifacts must still fail storage validation; partial review
+  results declaring XLSX retain artifact validation. Legacy results without file
+  declarations retain guarded output-directory discovery only until the saved-result
+  contract is migrated; the publication owner must preserve that consumer meanwhile.
+  Export diagnostics carry a server-created row token and the original source row
+  ID. Test exact correspondence against the captured final brief, including
+  reordered, missing, extra, duplicate and formula-prefixed identities. CSV prices
+  cannot create authority. Structured results preserve manual/quote-currency FX
+  and demote rejected catalogue claims before direct/resumed failure, review or
+  completion adoption. Current malformed results must keep existing rows and
+  refuse new artifact adoption. A direct current completion/review missing its
+  structured contract must fail. Only saved-job resume may retain usable current
+  rows for a legacy-format result; an empty legacy resume must not invent readiness.
+  Current hard-generator/pre-generator failures may legitimately omit diagnostics:
+  preserve the original failure/reference/return code and rows, with no new files.
+  Missing diagnostics alone never identify an old runtime. New generation jobs
+  persist their output-row contract marker before dispatch; a restored starting
+  operation upgrades before its dispatch, while a present invalid marker rejects.
+  Only an already-running saved job with no marker uses legacy row retention.
+  Cover missing/valid/invalid marker across direct, starting and running/resumed
+  operations, completion/review/failure, and present/absent result contracts.
+  Run `tests.test_webapp.GenerationOutputRowsRegression`,
+  `tests.test_webapp.GenerationDiagnosticReadFailureTest`,
+  `tests.test_generate_quote.GeneratorDiagnosticIdentityTest`,
+  `tests.test_quote_flow_reliability` and `tests.test_owner_uat_contract`.
+  Duplicate must preserve current Output edits/subsets independently of its Reset
+  snapshot, strip source-bound seals/catalogue claims, and obtain target grants
+  only through explicit selection/Confirm. Cover save/reopen, manual FX,
+  exclusions, wrong scope/quote/digest/unit, stale revisions, asynchronous
+  operation/auth-scope changes, and genuine guarded XLSX bytes. Retain the
+  original quote unchanged. The rendered resume check is
+  `node scripts/playwright-owner-uat-basis-repair.mjs --resume-export --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD`.
+  It holds the accepted browser poll, lets the real worker commit, reloads into
+  ordinary resume, and verifies automatic save plus fresh protected bytes without
+  another generation, publication or provider call.
+  Local synthetic tests do not establish the cause or
+  job/artifact/counter outcome of a historical installed failure.
+  Output's Use reference price action must synchronise the draft, verify any
+  existing server grant, and request a new grant only through conditional pricing
+  selection. Test missing/copied catalogue keywords against uniquely included
+  basis identities, current reference checks, refusal and stale/authentication
+  responses, including context changes inside the production HTTP helper's CSRF
+  refresh and valid advancing selected-row ledger acknowledgements. Keep the
+  edited Output subset, manual FX prices and Reset snapshot;
+  never rebuild all basis rows as a side effect of selecting one price. Run
+  `python -m unittest tests.test_output_reference_selection` for the closure
+  matrix and a rendered duplicate, target grant, reopen and protected XLSX check.
+  Startup must finish pricing-reference hydration before admitting saved quote
+  rows or releasing the boot persistence fence. An unavailable, malformed or
+  throwing reference load must preserve the exact browser recovery payload and
+  durable quote, retain the loading hold, and dispatch no saved operation.
+  Run `tests.test_startup_profile_recovery` for the prerequisite matrix. The
+  rendered Output-selection regression injects a local reference-list outage,
+  then reloads successfully and verifies retained catalogue/manual authority,
+  FX, edited subset and Reset snapshot before protected XLSX generation.
+  Include successful responses with malformed reference entries, duplicate
+  identities and missing saved references. Hold current-scope priced recovery
+  unchanged, while allowing a genuinely empty new workspace to open Settings.
+  Matching reference headers also need the catalogue content used by saved
+  claims. Exercise missing, malformed, duplicate and inconsistent items under
+  an unchanged reference basis across saved rows and Reset. Keep legitimate
+  changed-basis commercial review and supported nested snapshot restoration.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
 - Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret
@@ -103,7 +236,14 @@ npm run playwright:smoke
   supersede a grant after a saved Exclude, Custom, removed row, other catalogue
   item, other pricing reference or incompatible unit. Manual and Included stay
   operator overrides; Use Reference Price restores only a live grant. The
-  `test_ledger_*` cases cover forged authority (variant flip, deleted authority,
+  selected catalogue label is reference evidence, not additional independent
+  row detail. Run `test_selected_reference_label_is_not_independent_detail`
+  and `test_ledger_reference_only_label_selects_saves_and_reopens` in
+  `tests.test_webapp` for canonical and leading-unit labels whose words also
+  name another catalogue family, real server selection, save/reopen and final
+  brief pricing. Additional conflicting detail, ambiguous identities, quantity
+  divergence, incompatible units and non-Include basis lines stay refused.
+  The `test_ledger_*` cases cover forged authority (variant flip, deleted authority,
   self-built catalogue authority), replay after a saved exclusion or
   replacement, stale revisions and concurrent tabs, an interrupted commit,
   legacy quotes (persisted catalogue prices kept, `HISTORICAL` rows never
@@ -180,6 +320,45 @@ denominations. Enter/Tab without changes must preserve exact authority, revision
 draft key, save count and artifact identity; precision-changing input still rejects.
 
 ## Regression Standard
+
+### Fresh provider response admission
+
+Run `python -m unittest tests.test_provider_response_admission` together with
+`tests.test_basis_dimension_contract`, `tests.test_basis_source_provenance`,
+`tests.test_openai_draft_request_contract`, `tests.test_ai_basis_chat_stress`, and
+`tests.test_quote_flow_reliability`. Fixtures use synthetic data, denied outbound
+sockets and explicitly mocked provider responses. Full Analyse must reject
+inconsistent measurements or malformed scope before pricing and sealing, with a
+support-safe error reference rather than a substitute local draft.
+
+Cover canonical positive quantities, decimal-comma/percent/bool/nonfinite and
+float underflow rejection, coherent prefix-only measurements, conflicting text,
+structured and linked measurements, and unrepresentable derived prices. Keep
+same-text physical rows with distinct IDs through review, actual server selection,
+Output, save/reopen and protected XLSX. Coherent ID aliases and generic equivalent
+units (including Unicode square metres) must preserve original provenance;
+ambiguous/unbound identities reject the response without partial success. Blank
+original measurement units never gain a catalogue grant from a later display unit.
+
+Supplied arrays, objects and rows must have supported shapes, with no silent
+material row removal. JSON admission accepts one bounded object and rejects
+duplicate keys, array wrappers, extra objects and nested nonfinite numbers. Keep
+the demonstrated fenced/trailing-prose chat consumer until its response contract
+is explicitly changed. All OpenAI adapters share shape/completion/refusal checks;
+DeepSeek adapters enforce their existing completion finish reason. Routing,
+transport retries and support-operation provider failover remain unchanged.
+Confidence supplied by a fresh response is an integer from 0 to 100, including
+0 and 1; fractions, percent strings and conflicting aliases reject. Saved/user
+confidence and commercial-number normalisers remain compatible with their existing
+consumers, and saved blank seals/ledgers are never upgraded. Identified items-only
+and legacy basis shapes retain optional-field support; supplied structured basis
+must own every supplied material item exactly once.
+
+Existing genuinely empty-provider-row finalisation retains request rows only for
+review; its analysis seal grants no catalogue price to those fallback rows. The
+quote finaliser owns this recovery path until the recovery contract is explicitly
+replaced. Cover its unpriced save/selection boundary separately from malformed
+material responses, which must reject before any partial success.
 
 ### Full-draft Responses contract
 
@@ -277,3 +456,77 @@ A fix is not complete until the failing behavior has a regression test at the ri
 - CI checks for repository-wide syntax, unit, and smoke coverage.
 
 When production code changes without a matching automated test, the final report must say which affected feature remains manually tested or untested and why.
+
+## Quote reopening and Next acknowledgement
+
+For dashboard Modify/Duplicate detail loading or Next loading changes, run
+`python -m unittest tests.test_quote_flow_reliability` and
+`node scripts/playwright-owner-uat-basis-repair.mjs --lines=6 --latency-ms=300 --alpha2-reliability`.
+The synthetic rendered mode covers a failed Customer checkpoint, visible failure
+with stopped spinner, dismissal and retry, duplicate activation suppression,
+failed Modify/Duplicate reads preserving saved/current drafts without a save,
+and a successful Modify retry. It then covers Duplicate plus a cancelled and
+confirmed pricing-reference replacement, fresh analysis and one Confirm reaching
+Output with the replacement catalogue price. Dependency and analysis choices
+must remain pauses; neither starts a loading request before confirmation.
+Existing protected XLSX amount, pricing-ledger and reopen checks remain active.
+The unit contract also covers saved Customer checkpoint address equivalence
+(NFC and whitespace) while preserving display text and invalidating substantive
+address changes, and fresh protected PDF reuse without a new generation job.
+Run the existing G3 restored-session browser test for the first Modify path.
+The native Alpha smoke additionally verifies a saved/current PDF reopens through
+the protected inline endpoint without another generation job. Real LibreOffice
+conversion, native PDF viewer/rendering and hosted persistence qualification
+remain separate; the synthetic mode does not substitute for native PDF smoke or
+owner UAT.
+
+
+## Current quotation links and completed jobs
+
+Run `python -m unittest tests.test_quote_publication_projection tests.test_object_pdf_completion`
+for current publication eligibility, saved/list/job/resume projections and protected
+XLSX/PDF download plus PDF inline delivery. Historical completed status and evidence
+stay unchanged when an edit, replacement, missing/corrupt artifact or unknown read
+makes ordinary links unavailable. A failed attempt cannot present the independently
+valid prior saved pair as its own output. Committed projection warnings retain their
+bound recovery receipt; both ordinary PDF URLs remain unavailable until recovery.
+
+New eligible links carry an optional `publication` comparison. Retained bound links
+deny after replacement; old unbound URLs intentionally remain CURRENT aliases.
+Empty, duplicate, malformed, wrong-kind and mismatched comparisons deny before
+artifact bytes are read. This comparison grants no access: existing owner, workspace,
+role and authentication checks remain the separate gate. Direct `/api/generate`
+responses and asynchronous jobs never expose private publication identities or proof.
+
+Publication fault tests first establish an eligible revision-bearing draft with
+real saved profile/reference authority, then inject deletion, staleness or storage
+failure. Keep staged invisibility, raw committed completion, forensic idempotence,
+exact object/metadata rollback and prior byte/hash checks. Recorded but unverified
+exports expose unknown `exists`/`missing`, no ordinary URL, and `unverified`
+availability; preserved historical bytes are checked separately from current delivery.
+Bound URL expectations join known session/kind/owner identities to independently
+read persisted publication metadata, including the canonical comparison digest.
+The `--alpha1` smoke also joins the accepted job's actual generator workbook bytes
+to that metadata and retains the original owning-server HTTP receipt and browser
+workbook size/SHA256 checks. Its fixed JSON template identity uses the checked-in LF
+bytes, normalising only CRLF pairs; the receipt also keeps the raw working-tree
+template SHA256. Workbook bytes are never normalised. No result URL alone supplies
+its own expected identity.
+
+Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
+eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity
+reads no PDF body. XLSX keeps its metadata/path projection; download independently
+verifies its bytes. Local XLSX projection uses path/size metadata without reading its
+body. Atomic completion uses already admitted committed files and adds no artifact
+read. Configuration lookup, storage and file work run outside `JOBS_LOCK`. The existing
+second-admission race retains its forensic admission sequencing; this correction does
+not redesign job reservation or replay policy.
+
+After a separately authorised installation, eligible PDF projections can make one
+additional existing object GET per view, or N per list, plus existing ancillary
+publication-authority reads. There is no new HEAD, SDK call, cache, retry or provider
+request. Synthetic local, SQLite BLOB and in-memory object tests do not qualify live
+S3 transport, installed performance, real PDF rendering, native viewer acceptance or
+owner UAT. Direct post-commit warning coverage uses the reachable local publication
+path; database/object generation finalises atomically and has no equivalent later
+projection-read warning branch.
