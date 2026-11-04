@@ -2533,7 +2533,7 @@ async function verifyServerPricingReferenceReviewDurability(page) {
   }
 }
 
-async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
+async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page, screenshotPath = "") {
   let sessionId = "";
   try {
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -2586,6 +2586,10 @@ async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
         pricingReferenceId: state.pricingReferenceId,
         pricingReferenceSource: state.pricingReferenceSource,
         selectedValue: elements.profileSelect.value,
+        selectedLabel: elements.profileSelect.selectedOptions[0]?.textContent || "",
+        sourceBadge: elements.pricingReferenceSourceBadge.textContent,
+        referenceCurrencies: Array.from(document.querySelectorAll("[data-reference-basis-currency]"), element => element.textContent),
+        referenceTaxes: Array.from(document.querySelectorAll("[data-reference-basis-tax]"), element => element.textContent),
         snapshot: state.quoteCommercialSnapshot,
         persistedSnapshot: saved?.quoteDetails?.commercial_snapshot || null,
         sessionId: state.quoteSessionId,
@@ -2598,6 +2602,12 @@ async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
       || afterCustomer.pricingReferenceId !== "synthetic-exhibition-fixture-pricing"
       || afterCustomer.pricingReferenceSource !== "local"
       || afterCustomer.selectedValue !== expectedValue
+      || !afterCustomer.selectedLabel.includes("Synthetic Exhibition Fixture Pricing")
+      || afterCustomer.sourceBadge !== "Local catalog"
+      || !afterCustomer.referenceCurrencies.length
+      || afterCustomer.referenceCurrencies.some(value => value !== "SGD")
+      || !afterCustomer.referenceTaxes.length
+      || afterCustomer.referenceTaxes.some(value => value !== "GST 9%")
       || afterCustomer.snapshot?.pricing_basis?.id !== "synthetic-exhibition-fixture-pricing"
       || afterCustomer.snapshot?.pricing_basis?.source !== "local"
       || afterCustomer.snapshot?.pricing_basis?.currency !== "SGD"
@@ -2606,6 +2616,10 @@ async function verifyFreshPricingAuthorityInitializesBeforeCustomer(page) {
       || afterCustomer.persistedSnapshot?.pricing_basis?.digest !== afterCustomer.snapshot?.pricing_basis?.digest
     ) {
       throw new Error(`Fresh authority did not initialize and persist the configured reference at Customer: ${JSON.stringify(afterCustomer)}.`);
+    }
+    if (screenshotPath) {
+      await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
+      await page.screenshot({ path: screenshotPath });
     }
     sessionId = afterCustomer.sessionId;
   } finally {
@@ -4581,6 +4595,17 @@ async function runG3PricingScope() {
       page.on("response", (response) => {
         if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
       });
+      if (args.includes("--pricing-startup")) {
+        await fs.mkdir(outputDir, { recursive: true });
+        const runRoot = await fs.mkdtemp(path.join(outputDir, "startup-"));
+        await installMockProfiles(page);
+        await verifyFreshPricingAuthorityInitializesBeforeCustomer(page, path.join(runRoot, "pricing-startup.png"));
+        if (consoleProblems.length || networkProblems.length) {
+          throw new Error(`Pricing startup diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);
+        }
+        console.log(JSON.stringify({ status: "ok", mode: "pricing-startup", runRoot }));
+        return;
+      }
       const refresh = await verifyPricingReferenceImmediateRefresh(page);
       let analysis;
       try {
@@ -4607,7 +4632,7 @@ async function main() {
     await run573LoadedAppTwice();
     return;
   }
-  if (options.g3Pricing) { await runG3PricingScope(); return; }
+  if (options.g3Pricing || args.includes("--pricing-startup")) { await runG3PricingScope(); return; }
   let serverInfo = null;
   const hasExistingServer = await healthOk();
   if (!hasExistingServer) {

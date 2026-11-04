@@ -1487,6 +1487,7 @@ function initializeFreshPricingReferenceForCustomer() {
   }
   resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: false });
   if (elements.profileSelect) elements.profileSelect.value = referenceValue;
+  renderSelectedPricingReferenceSummary({ previewOnly: true });
   return Boolean(currentPricingReference());
 }
 
@@ -3336,7 +3337,7 @@ function resetQuoteCommercialFieldsToSelectedPricingReference(options = {}) {
   updateOutputHeader();
 }
 
-function renderSelectedPricingReferenceSummary() {
+function renderSelectedPricingReferenceSummary({ previewOnly = false } = {}) {
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const reference = currentPricingReference();
   const tax = selectedPricingReferenceTax();
@@ -3355,6 +3356,7 @@ function renderSelectedPricingReferenceSummary() {
   if (elements.selectedPricingReferenceCurrency) elements.selectedPricingReferenceCurrency.textContent = currency;
   if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = taxText;
   syncPricingReferenceContextPills(currency, taxText);
+  if (previewOnly) return;
   applyPricingReferenceCommercialDefaults();
   if (!ownedCommercial) {
     if (elements.taxLabel) elements.taxLabel.value = tax.label;
@@ -8852,7 +8854,10 @@ async function loadProfiles() {
   state.defaultPricingReferenceId = defaultPricingReferenceId;
   state.pricingReferences = pricingReferences;
   syncSelectedPricingReference();
-  if (!authorityProfileRequestIsFresh(refreshedContext)) return false;
+  // The checked response owns these synchronous workspace/default-selection
+  // changes. Rebind them without accepting a newer request sequence.
+  const committedContext = refreshAuthorityProfileRequestContext(refreshedContext);
+  if (!committedContext || !authorityProfileRequestIsFresh(committedContext)) return false;
   renderProfileOptions();
   renderPresetOptions();
   return true;

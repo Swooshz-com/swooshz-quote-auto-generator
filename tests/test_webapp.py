@@ -3797,10 +3797,19 @@ const state = {
 function safeQuoteSessionId(value) { return String(value || "").trim(); }
 function normalizeCompanyProfile(value) { return value; }
 function mergePricingReferences(value) { return value; }
-function syncSelectedPricingReference() {}
-function renderProfileOptions() {}
-function renderPresetOptions() {}
+function syncSelectedPricingReference() {
+  if (!state.pricingReferenceId) {
+    state.pricingReferenceId = state.defaultPricingReferenceId;
+    state.pricingReferenceSource = "local";
+  }
+}
+let profileRenders = 0;
+let presetRenders = 0;
+function renderProfileOptions() { profileRenders += 1; }
+function renderPresetOptions() { presetRenders += 1; }
+let duringHydration = null;
 async function hydrateProfileLogoFingerprints(options) {
+  if (duringHydration) await duringHydration();
   return { profiles: options.profiles, companyProfiles: options.companyProfiles };
 }
 const pending = [];
@@ -3862,6 +3871,48 @@ function response(suffix) {
   assert.strictEqual(state.pricingReferences[0].id, "pricing-b");
   assert.strictEqual(state.defaultProfileId, "profile-b");
   assert.strictEqual(state.defaultPricingReferenceId, "pricing-b");
+  // A fresh response may synchronously establish its workspace and default.
+  state.workspace = null;
+  state.pricingReferenceId = "";
+  state.pricingReferenceSource = "";
+  const rendersBefore = [profileRenders, presetRenders];
+  const firstLoad = loadProfiles();
+  await Promise.resolve();
+  pending.at(-1)(response("b"));
+  assert.strictEqual(await firstLoad, true);
+  assert.strictEqual(state.workspace.id, "workspace-b");
+  assert.strictEqual(state.pricingReferenceId, "pricing-b");
+  assert.deepStrictEqual([profileRenders, presetRenders], rendersBefore.map(count => count + 1));
+
+  // Context changes during either await must never commit or render.
+  for (const phase of ["response", "hydration"]) {
+    for (const mutate of [
+      () => { state.browserRecoveryScope += "-changed"; },
+      () => { state.workspace = { id: "changed-workspace" }; },
+      () => { state.pricingReferenceId = "changed-selection"; },
+      () => { authorityProfileRequestSequence += 1; },
+    ]) {
+      const originalState = JSON.parse(JSON.stringify(state));
+      const renders = [profileRenders, presetRenders];
+      let expectedState;
+      duringHydration = phase === "hydration" ? async () => {
+        mutate();
+        expectedState = JSON.stringify(state);
+      } : null;
+      const staleLoad = loadProfiles();
+      await Promise.resolve();
+      if (phase === "response") {
+        mutate();
+        expectedState = JSON.stringify(state);
+      }
+      pending.at(-1)(response("stale"));
+      assert.strictEqual(await staleLoad, false, phase);
+      assert.strictEqual(JSON.stringify(state), expectedState, "stale response committed state");
+      assert.deepStrictEqual([profileRenders, presetRenders], renders, "stale response rendered");
+      Object.assign(state, originalState);
+      duringHydration = null;
+    }
+  }
 })();
 """
         completed = subprocess.run(
@@ -27520,6 +27571,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
+const MISSING_PRICING_REFERENCES_MESSAGE = "No pricing references.";
 const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
@@ -27534,6 +27586,10 @@ const elements = {
   quoteCurrency: { value: "SGD" },
   quoteCurrencyCustom: { value: "", hidden: true, required: false },
   profileSelect: { value: "" },
+  pricingReferenceSourceBadge: { textContent: "Pricing reference unavailable" },
+  selectedPricingReferenceSummary: { textContent: "Select a pricing reference." },
+  selectedPricingReferenceCurrency: { textContent: "-" },
+  selectedPricingReferenceTax: { textContent: "-" },
   quoteExchangeRate: { value: "1" },
   quoteExchangeRateField: { hidden: true },
   quoteTaxLabel: { value: "GST" },
@@ -27563,7 +27619,8 @@ const state = {
   pricingReferenceSelectionIntent: null,
   profiles: [{ id: "default", default_pricing_reference: "koncept-eq" }],
   pricingReferences: [
-    { id: "koncept-eq", source: "local", label: "Koncept EQ", currency: "SGD", tax: { label: "GST", rate: 0.09 } },
+    { id: "alternate", source: "company", label: "Alternate", currency: "USD", tax: { label: "Sales Tax", rate: 0.05 } },
+    { id: "koncept-eq", source: "local", label: "Synthetic reference", currency: "EUR", tax: { label: "VAT", rate: 0.20 } },
   ],
   quoteCommercialTouched: {
     quoteCurrency: false,
@@ -27591,6 +27648,7 @@ function saveSessionState() {}
 function resetQuoteFlowScroll() {}
 function syncPricingReferenceContextPills() {}
 function updateOutputHeader() {}
+function updatePricingReferenceDeleteButton() {}
 function setInputValue(element, value = "") { if (element) element.value = String(value || ""); }
 
 eval([
@@ -27628,11 +27686,17 @@ eval([
   "syncQuoteCommercialContextPills",
   "applyPricingReferenceCommercialDefaults",
   "resetQuoteCommercialFieldsToSelectedPricingReference",
+  "pricingReferenceSourceLabel",
+  "selectedPricingReferenceTaxText",
+  "renderSelectedPricingReferenceSummary",
   "initializeFreshPricingReferenceForCustomer",
   "activeSidePanelIndex",
   "setSidePanel",
 ].map(extractFunction).join("\n"));
 
+let defaultApplications = 0;
+const applyDefaults = applyPricingReferenceCommercialDefaults;
+applyPricingReferenceCommercialDefaults = () => { defaultApplications += 1; return applyDefaults(); };
 assert.strictEqual(setSidePanel("customer", { notify: true }), true);
 assert.strictEqual(state.activeSidePanel, "customer");
 assert.strictEqual(state.pricingReferenceId, "koncept-eq");
@@ -27641,12 +27705,41 @@ assert.strictEqual(elements.profileSelect.value, "local::koncept-eq");
 assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
 assert.strictEqual(state.quoteCommercialSnapshot, null);
 assert.strictEqual(state.pricingReferenceSelectionIntent, null);
-assert.strictEqual(elements.quoteCurrency.value, "SGD");
+assert.strictEqual(elements.quoteCurrency.value, "EUR");
 assert.strictEqual(elements.quoteExchangeRate.value, "1");
-assert.strictEqual(elements.quoteTaxLabel.value, "GST");
-assert.strictEqual(elements.quoteTaxRate.value, "9");
-assert.strictEqual(elements.taxLabel.value, "GST");
-assert.strictEqual(elements.taxRate.value, "9");
+assert.strictEqual(elements.quoteTaxLabel.value, "VAT");
+assert.strictEqual(elements.quoteTaxRate.value, "20");
+assert.strictEqual(elements.taxLabel.value, "VAT");
+assert.strictEqual(elements.taxRate.value, "20");
+assert.strictEqual(elements.pricingReferenceSourceBadge.textContent, "Local catalog");
+assert.strictEqual(elements.selectedPricingReferenceSummary.textContent, "Managed in Settings.");
+assert.strictEqual(elements.selectedPricingReferenceCurrency.textContent, "EUR");
+assert.strictEqual(elements.selectedPricingReferenceTax.textContent, "VAT 20%");
+assert.strictEqual(defaultApplications, 0, "refresh must not apply commercial defaults again");
+state.activeSidePanel = "images";
+assert.strictEqual(setSidePanel("customer", { notify: true }), true);
+assert.strictEqual(elements.selectedPricingReferenceCurrency.textContent, "EUR");
+assert.strictEqual(state.pricingReferenceSelectionIntent, null);
+
+// Saved ownership, pending selection and touched fields forbid fresh defaults.
+for (const mutation of [
+  () => { state.quoteCommercialLifecycle = "EXISTING"; },
+  () => { state.quoteCommercialLifecycle = "RECOVERED"; },
+  () => { state.quoteCommercialSnapshot = { pricing_basis: { id: "alternate", source: "company" } }; },
+  () => { state.quoteSessionRestoredSessionId = "saved-quote"; },
+  () => { state.pricingReferenceSelectionIntent = { id: "alternate", source: "company" }; },
+  () => { state.quoteCommercialTouched.quoteTaxRate = true; },
+]) {
+  const originalState = JSON.parse(JSON.stringify(state));
+  mutation();
+  elements.quoteTaxRate.value = "7";
+  elements.quoteCurrency.value = "USD";
+  const before = JSON.stringify({ state, elements });
+  assert.strictEqual(initializeFreshPricingReferenceForCustomer(), false);
+  assert.strictEqual(JSON.stringify({ state, elements }), before);
+  Object.assign(state, originalState);
+}
+assert.strictEqual(defaultApplications, 0);
 assert.deepStrictEqual(state.quoteCommercialTouched, {
   quoteCurrency: false,
   quoteExchangeRate: false,
@@ -27674,6 +27767,18 @@ assert.strictEqual(setSidePanel("customer", { force: true }), true);
 assert.strictEqual(state.pricingReferenceId, "missing-saved-reference");
 assert.strictEqual(state.pricingReferenceSource, "local");
 assert.strictEqual(elements.profileSelect.value, "local::missing-saved-reference");
+state.pricingReferenceId = "";
+state.pricingReferenceSource = "";
+for (const references of [
+  [],
+  [{ id: "", source: "local" }],
+  [{ id: "invalid-source", source: "unknown" }],
+]) {
+  state.pricingReferences = references;
+  const before = JSON.stringify({ state, elements });
+  assert.strictEqual(initializeFreshPricingReferenceForCustomer(), false);
+  assert.strictEqual(JSON.stringify({ state, elements }), before, "unavailable authority changed");
+}
 """
         completed = subprocess.run(
             [node, "-e", script],

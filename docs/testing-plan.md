@@ -31,6 +31,15 @@ npm run playwright:smoke
 
 ## Feature Coverage Guide
 
+- Pricing-reference startup and first Customer entry: Run
+  `python -m unittest tests.test_webapp.WebappServerTest.test_static_next_to_customer_initializes_untouched_commercial_defaults tests.test_webapp.WebappServerTest.test_static_authority_profile_race_discards_late_request_completely`
+  and `node scripts/playwright-smoke.mjs --pricing-startup`. The bounded browser
+  mode uses isolated synthetic local data and checks the existing selected name,
+  source badge, reference currency and tax before Settings is opened. Retain
+  non-default currency/tax, repeated entry, saved/recovered/pending ownership,
+  first-load rendering and stale-response negative controls. No live provider
+  or hosted service is used.
+
 - Quote basis, `Re`, `Ask For Changes`, AI parsing, or basis UI state: follow `docs/ai-basis-chat-test-playbook.md`, run the mocked tests, and run `npm run playwright:ai-stress` when practical.
 - Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
