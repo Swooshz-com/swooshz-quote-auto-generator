@@ -330,8 +330,16 @@ def synthetic_profile() -> dict[str, Any]:
 
 
 def fake_generator_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    from scripts import generate_quote as generator
+
+    brief = json.loads(Path(command[command.index("--brief") + 1]).read_text(encoding="utf-8"))
+    reference = brief.get("_pricing_reference_authority")
+    rows = generator.extract_price_rows(Path(command[command.index("--template") + 1]), trusted_reference=reference)
+    lines = generator.prepare_lines(brief, rows, "--allow-ambiguous" in command,
+        authority_required=brief.get("_pricing_authority_enforced") is True, trusted_pricing_reference=reference)
     output_dir = Path(command[command.index("--out") + 1])
     output_dir.mkdir(parents=True, exist_ok=True)
+    generator.write_match_csv(output_dir / "pricing_matches.csv", lines)
     (output_dir / "quotation.xlsx").write_bytes(xlsx_bytes())
     (output_dir / "quotation.pdf").write_bytes(b"%PDF-1.4\n% synthetic hosted smoke pdf\n")
     return subprocess.CompletedProcess(

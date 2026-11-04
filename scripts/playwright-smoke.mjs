@@ -238,7 +238,7 @@ function startServer({ mockProvider = false, dataRoot = quoteDataRoot } = {}) {
   server.stderr.on("data", collect);
 
   if (alpha1Scope && !mockProvider) {
-    const receiptSource = { server, origin: new URL(baseUrl).origin, sequence: 0, receipts: [], overflow: false };
+    const receiptSource = { server, origin: new URL(baseUrl).origin, dataRoot: runtimeEnv.QUOTE_DATA_ROOT, outputRoot: runtimeEnv.QUOTE_OUTPUT_ROOT || path.join(root, "_output", "webapp"), sequence: 0, receipts: [], overflow: false };
     alpha1OwnedProtectedHTTP = receiptSource;
     let pendingAccessLine = "";
     server.stderr.on("data", (chunk) => {
@@ -910,6 +910,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
     const firstPostStarted = new Promise((resolve) => { firstPostStartedResolve = resolve; });
     const secondPostStarted = new Promise((resolve) => { secondPostStartedResolve = resolve; });
     const postedJobIds = [];
+    let generationInputRows = null;
     const postPattern = "**/api/jobs";
     const getPattern = "**/api/jobs/job-*";
     const savePattern = "**/api/quote-sessions";
@@ -923,6 +924,10 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       postCount += 1;
       const payload = route.request().postDataJSON();
       postedJobIds.push(payload.job_id || "");
+      if (!Array.isArray(payload.payload?.line_items) || !payload.payload.line_items.length) {
+        throw new Error("Synthetic current completion requires captured generation input rows.");
+      }
+      generationInputRows = structuredClone(payload.payload.line_items);
       if (postCount === 1) {
         firstPostStartedResolve();
         await new Promise((resolve) => { releaseFirstPost = resolve; });
@@ -974,6 +979,16 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
                 status: "completed",
                 files,
                 pricing_matches: [],
+                // Match the current server contract using the actual dispatched
+                // rows; this transport adapter never creates pricing grants.
+                output_rows: {
+                  schema: "swooshz.quote-output-rows.v1",
+                  rows: generationInputRows.map((row, index) => ({
+                    ...row,
+                    diagnostic_row_id: `row-${index}`,
+                    source_basis_line_id: String(row.source_basis_line_id || ""),
+                  })),
+                },
                 quote_session: {
                   session_id: quoteSessionId,
                   ...(testCase.viewPdf ? {
@@ -1258,6 +1273,53 @@ async function verifyGenerationTerminalRecoveryAfterRefresh(page) {
   }
 }
 
+async function alpha1CommittedWorkbookReceipt(sessionId, jobId, previousPublicationId) {
+  const source = alpha1OwnedProtectedHTTP;
+  if (!source || source.server.exitCode !== null || !/^quote-[a-z0-9-]+$/.test(sessionId) || !/^job-[a-z0-9-]+$/.test(jobId)) {
+    throw new Error("Committed workbook receipt requires the original owning server and accepted session/job.");
+  }
+  const metadataBytes = await fs.readFile(path.join(source.dataRoot, "quote-sessions", sessionId, "quote-session.json"));
+  const metadata = JSON.parse(metadataBytes.toString("utf8"));
+  const publication = metadata.publication, proof = publication?.proof;
+  const committed = proof?.publication, artifact = proof?.artifacts?.xlsx;
+  const exported = metadata.exports?.xlsx;
+  const filename = "quotation.xlsx";
+  if (metadata.session_id !== sessionId || publication?.state !== "published" || metadata.status?.quote_generated !== true
+      || proof?.schema !== "swooshz.sqag.quote-publication-proof.v2" || proof?.version !== 2
+      || proof?.commercial_state_schema !== "swooshz.sqag.commercial-state.v1"
+      || proof?.subject?.session_id !== sessionId || proof?.subject?.scope !== "workspace"
+      || proof?.subject?.workspace_id !== "local-workspace" || proof?.subject?.owner_id !== "local-user"
+      || !committed?.id || committed.id === previousPublicationId || committed.id !== publication.active_publication_id
+      || committed.run_id !== publication.run_id || committed.job_id !== publication.job_id
+      || committed.job_id !== "" || publication.job_id !== ""
+      || !Number.isSafeInteger(proof.output_revision) || proof.output_revision < 0
+      || proof.output_revision !== metadata.draft_state?.outputRevision
+      || !/^[0-9a-f]{64}$/.test(proof.commercial_state_digest)
+      || artifact?.session_id !== sessionId || artifact?.filename !== filename
+      || artifact?.publication_id !== committed.id || artifact?.run_id !== committed.run_id
+      || !Number.isSafeInteger(artifact?.size_bytes) || artifact.size_bytes <= 0
+      || !/^[0-9a-f]{64}$/.test(artifact?.sha256)
+      || ["filename", "publication_id", "run_id", "sha256", "size_bytes"].some(key => artifact[key] !== exported?.[key])) {
+    throw new Error("Committed workbook metadata is not a new publication owned by the expected session/artifact.");
+  }
+  // Local publication proof has no job id: join the accepted job through its actual generator output bytes.
+  const generatedBytes = await fs.readFile(path.join(source.outputRoot, jobId, filename));
+  const generatedSha256 = createHash("sha256").update(generatedBytes).digest("hex");
+  if (generatedBytes.length !== artifact.size_bytes || generatedSha256 !== artifact.sha256) {
+    throw new Error("Accepted job workbook bytes do not match its independently persisted publication receipt.");
+  }
+  const identity = [
+    "quote-publication-comparison-v1", "local", "local-workspace", "local-user", sessionId,
+    committed.id, committed.run_id, committed.job_id, proof.output_revision,
+    proof.commercial_state_schema, proof.commercial_state_digest, "xlsx", filename,
+    artifact.publication_id, artifact.run_id, artifact.sha256, artifact.size_bytes,
+  ];
+  const binding = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return { url: `/api/quote-sessions/${sessionId}/download/xlsx?publication=${binding}`,
+    bytes: artifact.size_bytes, sha256: artifact.sha256,
+    metadataSha256: createHash("sha256").update(metadataBytes).digest("hex") };
+}
+
 async function verifyFreshGenerationTerminalStates(page) {
   const sessionId=await currentQuoteSessionId(page);
   if (!sessionId) throw new Error("Fresh terminal contract needs an owned saved session.");
@@ -1267,7 +1329,8 @@ async function verifyFreshGenerationTerminalStates(page) {
   const aliasValue="profile:default:"+aliasPresetId;
   const templateBytes=await fs.readFile(path.join(root,"templates/profile/default/profile.json"));
   const templateSha256=createHash("sha256").update(templateBytes).digest("hex");
-  if(templateSha256!=="88e24cd934fc9d04dbbbe0a53c2c61fccda5305b6803c60cbf89e14af00cb683") throw new Error("Real default template identity changed.");
+  const canonicalTemplateSha256=createHash("sha256").update(templateBytes.toString("utf8").replace(/\r\n/g,"\n")).digest("hex");
+  if(canonicalTemplateSha256!=="88e24cd934fc9d04dbbbe0a53c2c61fccda5305b6803c60cbf89e14af00cb683") throw new Error("Real default template identity changed.");
   const actualProfilesResponse=await page.request.get(baseUrl+"/api/profiles");
   if(actualProfilesResponse.status()!==200) throw new Error("Real server profile metadata was not available.");
   const actualProfiles=await actualProfilesResponse.json();
@@ -1308,12 +1371,13 @@ async function verifyFreshGenerationTerminalStates(page) {
     if(acknowledgedResponse.status()!==200||profileSaved?.session_id!==sessionId) throw new Error("Real default fixture save was not acknowledged under its owned session.");
     const persisted=await dashboardQuoteSessionDetail(page,sessionId);
     if(persisted.status!=="ok"||persisted.quote_session?.session_id!==sessionId||persisted.quote_session.quote_company_profile?.id!=="profile:default"||persisted.quote_session.draft_state?.selectedPresetValue!==aliasValue) throw new Error("Real default profile identity was not durably read back.");
-    console.log(JSON.stringify({status:"alpha1_real_default_profile_fixture_ready",sessionId,serverProfileId:actualDefault.id,serverProfileSummarySha256,templateSha256,selectedPresetValue:aliasValue,persistedProfileId:persisted.quote_session.quote_company_profile.id,saveHttp:acknowledgedResponse.status()}));
+    console.log(JSON.stringify({status:"alpha1_real_default_profile_fixture_ready",sessionId,serverProfileId:actualDefault.id,serverProfileSummarySha256,templateSha256,canonicalTemplateSha256,selectedPresetValue:aliasValue,persistedProfileId:persisted.quote_session.quote_company_profile.id,saveHttp:acknowledgedResponse.status()}));
     await page.locator('button[data-side-panel="output"]:not([disabled])').click();
     await page.locator("#outputSidePanel.is-active").waitFor({state:"visible",timeout:15000});
 
   for (const status of ["completed","needs_review","blocked","failed","interrupted"]) {
-    let finish=false,starts=0,jobId="",polls=0,actualCompletedFile=null;
+    let finish=false,starts=0,jobId="",polls=0,actualCompletedFile=null,ownedFileUrl=null;
+    let previousPublicationId="",committedReceipt=null;
     let acceptedStartResolve;
     const acceptedStart=new Promise(resolve=>{acceptedStartResolve=resolve;});
     const postPattern="**/api/jobs",getPattern="**/api/jobs/job-*";
@@ -1324,6 +1388,9 @@ async function verifyFreshGenerationTerminalStates(page) {
       if(status==="completed") {
         if(payload.payload?.profile_id!=="profile:default") throw new Error("Actual completed-fixture request did not use the real default profile.");
         console.log(JSON.stringify({status:"alpha1_actual_default_profile_request",sessionId,jobId,profileId:payload.payload.profile_id}));
+        const prior=JSON.parse(await fs.readFile(path.join(alpha1OwnedProtectedHTTP.dataRoot,"quote-sessions",sessionId,"quote-session.json"),"utf8"));
+        if(prior.session_id!==sessionId) throw new Error("Prior fixture metadata is not owned by its expected session.");
+        previousPublicationId=prior.publication?.active_publication_id||"";
         const actual=await route.fetch({maxRetries:0});
         if(actual.status()!==202) throw new Error("Actual completed-fixture generation start returned HTTP "+actual.status());
         const data=await actual.json();
@@ -1345,7 +1412,11 @@ async function verifyFreshGenerationTerminalStates(page) {
         if(data.status==="completed") {
           const owned=data.result?.quote_session, file=owned?.exports?.xlsx;
           actualCompletedFile=file;
-          if(owned?.session_id!==sessionId || file?.filename!=="quotation.xlsx" || file?.url!=="/api/quote-sessions/"+sessionId+"/download/xlsx") throw new Error("Actual completed-fixture export is not bound to its owned session/file.");
+          committedReceipt=await alpha1CommittedWorkbookReceipt(sessionId,jobId,previousPublicationId);
+          ownedFileUrl=new URL(committedReceipt.url,page.url()).href;
+          if(owned?.session_id!==sessionId || file?.filename!=="quotation.xlsx" || file?.url!==committedReceipt.url
+              || file?.size_bytes!==committedReceipt.bytes || file?.sha256!==committedReceipt.sha256) throw new Error("Actual completed-fixture export is not bound to its owned session/file/publication.");
+          console.log(JSON.stringify({status:"alpha1_independent_committed_workbook_receipt",sessionId,jobId,url:committedReceipt.url,bytes:committedReceipt.bytes,sha256:committedReceipt.sha256,metadataSha256:committedReceipt.metadataSha256}));
           console.log(JSON.stringify({status:"alpha1_actual_completed_fixture",jobId,sessionId,http:actual.status(),fileUrl:file.url,filename:file.filename,bytes:file.size_bytes,sha256:file.sha256}));
         }
         await route.fulfill({response:actual});
@@ -1369,9 +1440,8 @@ async function verifyFreshGenerationTerminalStates(page) {
         if(saved?.id!==jobId||starts!==1) throw new Error("Interrupted live polling lost recovery identity or started another generation.");
       } else {
         if(status==="completed"){
-          const ownedFileUrl=new URL("/api/quote-sessions/"+sessionId+"/download/xlsx",page.url()).href;
           const receiptSource=alpha1OwnedProtectedHTTP;
-          if(!receiptSource||receiptSource.origin!==new URL(ownedFileUrl).origin||receiptSource.server.exitCode!==null||receiptSource.overflow) throw new Error("Protected workbook needs an intact original owning-server receipt source.");
+          if(!receiptSource||receiptSource.origin!==new URL(page.url()).origin||receiptSource.server.exitCode!==null||receiptSource.overflow) throw new Error("Protected workbook needs an intact original owning-server receipt source.");
           const receiptStartSequence=receiptSource.sequence, receiptDeadline=Date.now()+15000;
           const protectedFileResponse=new Promise((resolve,reject)=>{
             const inspect=()=>{
@@ -1389,7 +1459,7 @@ async function verifyFreshGenerationTerminalStates(page) {
             return receipt;
           });
           const freshDownload=page.waitForEvent("download",{timeout:15000}).then(async download=>{
-            if(download.suggestedFilename()!=="quotation.xlsx"||download.url()!==ownedFileUrl) throw new Error("Fresh completed generation did not download its exact owned workbook.");
+            if(!committedReceipt||!ownedFileUrl||download.suggestedFilename()!=="quotation.xlsx"||download.url()!==ownedFileUrl) throw new Error("Fresh completed generation did not download its exact owned workbook.");
             const downloadFailure=await Promise.race([download.failure(),page.waitForTimeout(15000).then(()=>{throw new Error("Fresh protected workbook download did not complete.");})]);
             if(downloadFailure) throw new Error("Fresh protected workbook download failed: "+downloadFailure);
             const actualDownloadPath=await download.path();
