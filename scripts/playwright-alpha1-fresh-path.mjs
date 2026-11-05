@@ -13,7 +13,7 @@ const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
 const pinnedRequire = createRequire(path.join(sourceRoot,"package.json"));
 const { chromium, request } = pinnedRequire("playwright");
 const packageInfo = JSON.parse(await fs.readFile(path.join(sourceRoot,"node_modules/playwright/package.json"), "utf8"));
-if (packageInfo.version !== "1.60.0") throw new Error("Expected pinned Playwright 1.60.0; found " + packageInfo.version);
+if (packageInfo.version !== "1.64.1") throw new Error("Expected pinned Playwright 1.64.1; found " + packageInfo.version);
 
 const assert = (ok, message) => { if (!ok) throw new Error(message); };
 const evidenceRoot = process.env.SQAG_ALPHA1_EVIDENCE_ROOT || path.join(sourceRoot,"_logs/browser/alpha1-fresh");

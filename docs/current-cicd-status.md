@@ -90,7 +90,7 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 ## Validate App Checks
 
 - Pins the `Validate app` runner to `ubuntu-24.04`, which supports the locked
-  Playwright 1.60.0 browser dependencies. Other jobs retain their existing
+  Playwright 1.64.1 browser dependencies. Other jobs retain their existing
   runners; checks, triggers, permissions and dependencies are unchanged.
 - Installs Python 3.12.13 (the exact patch shared with the retrospective job) and Node 22.
 - Installs pinned Python dependencies with `python -m pip install --only-binary=:all: -r requirements.txt`.
