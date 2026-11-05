@@ -137,17 +137,33 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 - Runs `npm run playwright:ai-stress`.
 - Runs `npm run playwright:internal-auth`.
 - Runs `npm run playwright:smoke` and `npm run playwright:alpha-smoke` without
-  `--alpha1`. All four browser steps remain gated by the successful
+  `--alpha1`, plus `npm run playwright:smoke -- --recovery-only` in a separate
+  process with fresh quote state. All five browser steps remain gated by the successful
   `runtime_prerequisites` privilege-contract validation, including after a
   Python test failure.
-- The default app smoke retains full reload, saved reopen and recovery cases,
-  then runs the isolated mocked-provider pricing/current-XLSX checks. The native
+- The default app smoke covers reload, saved reopen and generation recovery,
+  then runs the isolated mocked-provider pricing/current-XLSX checks. The separate
+  recovery step also checks expired jobs do not resume and pricing-reference
+  selection commits on Customer Next; those two checks are absent from the
+  default broad run. Both app paths drain the existing 60-second write window
+  before generation recovery and require resumed final saves to return HTTP 200.
+  Any observed HTTP 429 on quote-session endpoints fails the app smoke, since
+  throttled saves cannot qualify persisted state. Server limits are unchanged.
+  Default and focused G3 runs use installed Playwright Chromium; screenshot mode
+  keeps the broad visual run and skips the isolated G3 tail. The native
   alpha smoke exercises saved edits, real workbook/PDF generation and access
   denial. Its workbook checks bind description, quantity and amount to the same
   row, verify totals/formulas, formatting, original uploaded logo and print area,
   and join accepted-job bytes, independently persisted publication metadata,
   the comparison-bound protected URL, owning-server HTTP status and native
-  browser download size/SHA256. No live AI provider is used.
+  browser download size/SHA256. Currency and tax expectations come from the
+  selected reference config; customer/project/company text comes from entered
+  fixture inputs. Header and logo anchors must lie within print-area columns,
+  and quantity/estimate headers retain their required alignment. Protected
+  readbacks also check original render/logo bytes, the Customer checkpoint digest
+  and persisted Included authority/zero amount. Exact complete-draft equality
+  and saved-profile binding from the retained fresh runner are not claimed.
+  No live AI provider is used.
 - Alpha1-only runners and their harness lifecycle tests remain available for
   separate retirement work; CI no longer passes their browser scope flag.
 

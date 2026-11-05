@@ -1,7 +1,9 @@
-"""Check the maintained smoke's actual workbook against its generation payload.
+"""Check the maintained smoke's workbook against independently entered values.
 
 Uses only the standard library. Mechanical cell positions describe the selected
-quotation layout; descriptions, quantities, prices, tax and currency are inputs.
+quotation layout; descriptions, quantities and prices are accepted fixture inputs.
+Currency/tax come from reference config and header text from entered form values,
+never the generation request echo.
 """
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
@@ -99,6 +101,11 @@ def verify_workbook(data, payload, expected_rows, logo):
         for ref in ("A20", "B20", "C20", "E20"):
             xf = xfs[cells[ref]["style"]]
             assert fonts[int(xf.get("fontId", "0"))].find("m:b", NS) is not None, "Header is not bold"
+        # The selected quotation layout's rules require centred quantities and
+        # right-aligned estimates, including the table headers.
+        for ref, alignment in (("B20", "center"), ("E20", "right")):
+            node = xfs[cells[ref]["style"]].find("m:alignment", NS)
+            assert node is not None and node.get("horizontal") == alignment, "Wrong header alignment: " + ref
         for index in quantity_indices:
             assert xfs[cells[f"B{index}"]["style"]].find("m:alignment", NS).get("horizontal") == "center", "Quantity is not centred"
         for index in row_indices + totals:
@@ -130,6 +137,21 @@ def verify_workbook(data, payload, expected_rows, logo):
         print_area = workbook.find("m:definedNames/m:definedName[@name='_xlnm.Print_Area']", NS).text
         last_used = max(int(re.search(r"\d+", ref)[0]) for ref, cell in cells.items() if cell["value"] is not None)
         assert print_area == f"Quotation!$A$1:$I${last_used + 1}", "Print area changed"
+        area_columns = re.search(r"!\$([A-Z]+)\$\d+:\$([A-Z]+)\$\d+$", print_area)
+        assert area_columns is not None, "Invalid print area columns"
+
+        def column_index(letters):
+            number = 0
+            for letter in letters:
+                number = number * 26 + ord(letter) - ord("A") + 1
+            return number - 1  # DrawingML columns are zero-based.
+
+        first_column, last_column = map(column_index, area_columns.groups())
+        for anchor in (picture, header):
+            start_column = int(anchor.findtext("xdr:from/xdr:col", namespaces=NS))
+            end_column = int(anchor.findtext("xdr:to/xdr:col", namespaces=NS))
+            assert first_column <= start_column <= end_column <= last_column, "Header/logo anchor outside print area columns"
+        assert header.findtext("xdr:from/xdr:col", namespaces=NS) == picture.findtext("xdr:from/xdr:col", namespaces=NS), "Header details are not aligned to logo"
     return {"status": "valid", "rows_bound": len(row_indices), "totals_bound": len(totals), "original_logo": True}
 
 

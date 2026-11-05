@@ -240,6 +240,10 @@ jobs:
         if: always() && steps.runtime_prerequisites.outcome == 'success'
         run: npm run playwright:smoke
 
+      - name: Run isolated app recovery smoke
+        if: always() && steps.runtime_prerequisites.outcome == 'success'
+        run: npm run playwright:smoke -- --recovery-only
+
       - name: Run minimum internal alpha browser smoke
         if: always() && steps.runtime_prerequisites.outcome == 'success'
         run: npm run playwright:alpha-smoke

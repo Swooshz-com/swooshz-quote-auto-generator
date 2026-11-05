@@ -1,5 +1,6 @@
 """Workbook receipt checks use real generator output and hostile ZIP edits."""
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -41,6 +42,7 @@ class CurrentWorkbookReceiptTest(unittest.TestCase):
             matched_price=None, amount=0 if row["price_mode"] == "Included" else 75,
             match_status="manual-price", match_candidates=[], price_mode=row["price_mode"],
             unit_price_override=row["unit_price"], pricing_authority={"variant": "manual", "price_currency": "SGD"}) for row in cls.rows]
+        cls.lines = lines
         file = Path(cls.temporary.name) / "quotation.xlsx"
         generator.write_quote_layout_xlsx(ROOT / "templates/quote-layout/quotation-layout.xlsx", file, cls.payload, lines)
         cls.data = file.read_bytes()
@@ -136,6 +138,52 @@ class CurrentWorkbookReceiptTest(unittest.TestCase):
                 column.attrib.pop("hidden", None)
         with self.assertRaisesRegex(AssertionError, "Internal columns"):
             self.verify(self.mutate("xl/worksheets/sheet1.xml", edit))
+
+    def test_wrong_context_shared_by_request_and_workbook_rejects_entered_expectations(self):
+        # Generate each wrong workbook with the same wrong inputs a stale browser
+        # request would carry. Verification still uses the independently entered
+        # text and reference currency/tax, never that corrupted request echo.
+        for path, wrong in ((('currency',), 'USD'), (('tax', 'rate'), 0.12),
+                            (('tax', 'label'), 'VAT'), (('company', 'name'), 'Wrong company'),
+                            (('company', 'header_details'), 'Wrong header')):
+            with self.subTest(path=path):
+                request = copy.deepcopy(self.payload)
+                target = request
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = wrong
+                if path == ('company', 'header_details'):
+                    request['company']['header_lines'] = [wrong]
+                file = Path(self.temporary.name) / 'wrong-context.xlsx'
+                generator.write_quote_layout_xlsx(ROOT / 'templates/quote-layout/quotation-layout.xlsx',
+                                                 file, request, self.lines)
+                with self.assertRaises(AssertionError):
+                    self.verify(file.read_bytes())
+
+    def test_header_or_logo_anchor_outside_print_columns_rejects(self):
+        for shape in ('sp', 'pic'):
+            for marker in ('from', 'to'):
+                with self.subTest(shape=shape, marker=marker):
+                    def edit(tree):
+                        anchor = next(node for node in tree if node.find('xdr:' + shape, NS) is not None)
+                        anchor.find('xdr:' + marker + '/xdr:col', NS).text = '14'
+                    with self.assertRaisesRegex(AssertionError, 'outside print area columns'):
+                        self.verify(self.mutate('xl/drawings/drawing1.xml', edit))
+        def misalign(tree):
+            header = next(node for node in tree if node.find('xdr:sp', NS) is not None)
+            header.find('xdr:from/xdr:col', NS).text = '7'
+        with self.assertRaisesRegex(AssertionError, 'not aligned to logo'):
+            self.verify(self.mutate('xl/drawings/drawing1.xml', misalign))
+
+    def test_changed_quantity_or_estimate_header_alignment_rejects(self):
+        sheet = ET.fromstring(zipfile.ZipFile(io.BytesIO(self.data)).read('xl/worksheets/sheet1.xml'))
+        for ref in ('B20', 'E20'):
+            with self.subTest(ref=ref):
+                style = int(next(cell for cell in sheet.findall('.//m:c', NS) if cell.get('r') == ref).get('s'))
+                def edit(tree):
+                    tree.find('m:cellXfs', NS)[style].find('m:alignment', NS).set('horizontal', 'left')
+                with self.assertRaisesRegex(AssertionError, 'Wrong header alignment: ' + ref):
+                    self.verify(self.mutate('xl/styles.xml', edit))
 
 
 if __name__ == "__main__":

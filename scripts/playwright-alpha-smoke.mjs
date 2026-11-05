@@ -25,6 +25,43 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function requireOriginalUploadBytes(detail, originals) {
+  const files = detail.draft_files;
+  assert(Array.isArray(files) && files.length === originals.length, "Protected original upload count changed.");
+  assert(new Set(files.map(file => file.session_file_key)).size === files.length
+    && files.every(file => file.session_file_key), "Protected original upload keys are missing or duplicated.");
+  for (const original of originals) {
+    const matches = files.filter(file => file.name === original.name && file.file_role === original.file_role);
+    assert(matches.length === 1, "Protected original upload identity changed.");
+    const file = matches[0];
+    const encoded = typeof file.data_url === "string" && file.data_url.match(/^data:([^;,]+);base64,([A-Za-z0-9+/]+={0,2})$/);
+    assert(encoded && encoded[1] === original.type && file.type === original.type, "Protected original upload MIME changed.");
+    const bytes = Buffer.from(encoded[2], "base64");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    assert(bytes.toString("base64") === encoded[2] && bytes.equals(original.buffer)
+      && Number(file.size) === original.buffer.length, "Protected original upload bytes changed.");
+    if (Object.hasOwn(file, "content_fingerprint")) {
+      assert(file.content_fingerprint === "sha256:" + digest, "Protected original upload fingerprint changed.");
+    }
+  }
+}
+
+function requirePersistedIncluded(detail, description) {
+  const row = detail.draft_state?.outputRows?.find(item => item.description === description);
+  assert(row?.price_mode === "Included" && row.pricing_authority?.variant === "included"
+    && row.pricing_authority.price === 0 && row.amount === 0,
+  "Saved Included authority and numeric zero amount must persist.");
+}
+
+function requireCustomerCheckpoint(detail, checkpoint) {
+  const saved = detail.draft_state?.customerStepCheckpoint;
+  assert(checkpoint.current && checkpoint.reference?.digest_sha256
+    && /^sha256:[a-f0-9]{64}$/.test(checkpoint.reference.digest_sha256), "Customer Next lacks a current reference digest.");
+  assert(saved?.sessionId === detail.session_id && saved.sessionId === checkpoint.checkpoint?.sessionId
+    && saved.pricingReferenceDigest === checkpoint.reference.digest_sha256,
+  "Protected Customer checkpoint lost its session or pricing-reference digest.");
+}
+
 function generationRunIdBinding(accepted, terminal) {
   const acceptedId = typeof accepted?.generation_run_id === "string" ? accepted.generation_run_id.trim() : "";
   if (!acceptedId) return "";
@@ -431,7 +468,11 @@ async function main() {
     const renderBuffer = await makePng(fixturePage, renderSvg);
     const logoBuffer = await makePng(fixturePage, logoSvg);
     await fixturePage.close();
-    await page.locator("#imageInput").setInputFiles({ name: "synthetic-booth-render.png", mimeType: "image/png", buffer: renderBuffer });
+    const originalUploads = [
+      { name: "synthetic-booth-render.png", type: "image/png", file_role: "reference", buffer: renderBuffer },
+      { name: "synthetic-alpha-logo.png", type: "image/png", file_role: "quote_company_logo", buffer: logoBuffer },
+    ];
+    await page.locator("#imageInput").setInputFiles({ name: originalUploads[0].name, mimeType: originalUploads[0].type, buffer: renderBuffer });
     await page.locator("#fileList .file-item").filter({ hasText: "synthetic-booth-render.png" }).waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#sideNextButton").click();
     await page.locator("#customerDetailsPanel").waitFor({ state: "visible", timeout: 15000 });
@@ -446,7 +487,11 @@ async function main() {
     await page.locator("#quoteDate").fill(new Date().toISOString().slice(0, 10));
     await page.locator("#sideNextButton").click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible", timeout: 15000 });
-    await page.locator("#headerLogoInput").setInputFiles({ name: "synthetic-alpha-logo.png", mimeType: "image/png", buffer: logoBuffer });
+    const customerCheckpoint = await page.evaluate(() => ({ current: customerStepCheckpointIsCurrent(),
+      checkpoint: state.customerStepCheckpoint, reference: currentPricingReference() }));
+    assert(customerCheckpoint.current && customerCheckpoint.reference?.id === referenceConfig.id
+      && customerCheckpoint.reference.source === "local", "Customer Next did not commit the selected pricing reference.");
+    await page.locator("#headerLogoInput").setInputFiles({ name: originalUploads[1].name, mimeType: originalUploads[1].type, buffer: logoBuffer });
     const companyFields = [
       ["#headerDetailsEditor", "Synthetic Internal Alpha | Singapore"],
       ["#quoteCompanyNameEditor", "Synthetic Alpha Fabrication"],
@@ -490,6 +535,8 @@ async function main() {
     const beforeSeed = await quoteSessionDetail(api, baseUrl, sessionId);
     assert(beforeSeed.session_id === sessionId && beforeSeed.customer_summary?.customer_name === expectedCustomer, "Created quote identity or customer context is incorrect.");
     assert(beforeSeed.pricing_reference?.id === referenceConfig.id && beforeSeed.pricing_reference?.source === "local", "Created quote lost its selected pricing authority.");
+    requireCustomerCheckpoint(beforeSeed, customerCheckpoint);
+    requireOriginalUploadBytes(beforeSeed, originalUploads);
 
     // This is only the deterministic basis fixture for a local synthetic run. The edit and generation actions still use normal UI controls and real application routes.
     const basisSections = fixtureItems.map((item, index) => ({
@@ -655,6 +702,8 @@ async function main() {
     const durableRows = durableAfterEdit.draft_state?.outputRows || [];
     assert(Number(durableRows.find((row) => row.description === pricedItem.description)?.quantity) === 2, "Independent readback lost the latest visible quantity.");
     assert(durableRows.find((row) => row.description === includedItem.description)?.price_mode === "Included", "Independent readback lost the visible Included-row edit.");
+    requirePersistedIncluded(durableAfterEdit, includedItem.description);
+    requireOriginalUploadBytes(durableAfterEdit, originalUploads);
     assert(durableAfterEdit.pricing_reference?.id === referenceConfig.id && durableAfterEdit.pricing_reference?.source === "local", "Durable readback changed the pricing authority.");
 
     const editCard = page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`);
@@ -708,6 +757,8 @@ async function main() {
     assert(Array.isArray(xlsxJobRequest.line_items) && xlsxJobRequest.line_items.length === fixtureItems.length, "XLSX request did not contain normalized line items.");
 
     const xlsxReadback = await quoteSessionDetail(api, baseUrl, sessionId);
+    requirePersistedIncluded(xlsxReadback, includedItem.description);
+    requireOriginalUploadBytes(xlsxReadback, originalUploads);
     assert(xlsxReadback.exports?.xlsx?.exists === true && xlsxReadback.exports.xlsx.stale === false, "Generated XLSX is not current.");
     const xlsxJobSession = xlsxTerminal.result.quote_session;
     assert(xlsxJobSession.exports?.xlsx?.sha256 === xlsxReadback.exports.xlsx.sha256, "XLSX result and independent readback differ on artifact hash.");
@@ -750,10 +801,13 @@ async function main() {
     };
     const expectedWorkbook = {
       // Persist only verifier inputs, never the full browser request or media.
-      payload: { currency: xlsxJobRequest.quote_currency, tax: xlsxJobRequest.quote_tax,
-        client: { name: xlsxJobRequest.client.name }, project: { title: xlsxJobRequest.project.title },
-        company: { name: xlsxJobRequest.company.name, header_details: xlsxJobRequest.company.header_details },
-        project_number: xlsxJobRequest.project_number, line_items: xlsxJobRequest.line_items.map(workbookRow) },
+      // Commercial defaults come from the reference; text comes from inputs we
+      // filled, so stale values shared by the request and workbook cannot pass.
+      payload: { currency: referenceConfig.currency, tax: referenceConfig.tax,
+        client: { name: expectedCustomer }, project: { title: expectedProject },
+        company: { name: companyFields.find(([selector]) => selector === "#quoteCompanyNameEditor")[1],
+          header_details: companyFields.find(([selector]) => selector === "#headerDetailsEditor")[1] },
+        project_number: expectedProjectNumber, line_items: xlsxJobRequest.line_items.map(workbookRow) },
       rows: fixtureItems.map((item, index) => ({ ...workbookRow({ description: item.description,
         quantity: index === 0 ? 2 : 1, unit: item.unit_hint,
         price_mode: index === 0 ? "Priced" : "Included" }), unit_price: item.price })),
@@ -885,6 +939,8 @@ async function main() {
     await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
     await reusedPopup.close();
     const postGenerationState = await quoteSessionDetail(api, baseUrl, sessionId);
+    requirePersistedIncluded(postGenerationState, includedItem.description);
+    requireOriginalUploadBytes(postGenerationState, originalUploads);
     assert(postGenerationState.exports?.xlsx?.sha256 === currentXlsx.sha256 && postGenerationState.exports?.pdf?.sha256 === currentPdf.sha256, "Post-generation readback changed artifact identity.");
     assert(Number(postGenerationState.draft_state?.outputRows?.find((row) => row.description === pricedItem.description)?.quantity) === 2, "Post-generation durable state changed the latest edit.");
 

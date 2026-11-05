@@ -172,8 +172,25 @@ for (const result of ['strictXlsx', 'strictCurrentXlsx']) {
         script = "const assert = require('node:assert/strict');\nconst {createHash} = require('node:crypto');\n" + \
             "const xlsxJobRequest = " + json.dumps(payload) + ";\n" + \
             "const fixtureItems = " + json.dumps(items) + ";\n" + \
+            "const referenceConfig = " + (REFERENCE / "reference.json").read_text(encoding="utf-8") + ";\n" + \
+            "const expectedCustomer = " + json.dumps(payload["client"]["name"]) + ";\n" + \
+            "const expectedProject = " + json.dumps(payload["project"]["title"]) + ";\n" + \
+            "const expectedProjectNumber = " + json.dumps(payload["project_number"]) + ";\n" + \
+            "const companyFields = " + json.dumps([["#quoteCompanyNameEditor", payload["company"]["name"]],
+                                                     ["#headerDetailsEditor", payload["company"]["header_details"]]]) + ";\n" + \
             "const logoBuffer = Buffer.from(" + json.dumps(base64.b64encode(logo).decode("ascii")) + ", 'base64');\n" + \
-            expression + "\nprocess.stdout.write(JSON.stringify(expectedWorkbook));"
+            "function expectations(xlsxJobRequest) {\n" + expression + "\nreturn expectedWorkbook; }\n" + r'''
+const expectedWorkbook = expectations(xlsxJobRequest);
+// Corrupt the request echo while preserving the values the smoke entered and
+// reference config. Its expectations must not follow those stale request fields.
+for (const [key, wrong] of Object.entries({quote_currency: 'XXX', quote_tax: {label: 'WRONG', rate: 0.5},
+  client: {name: 'Wrong buyer'}, project: {title: 'Wrong project'}, project_number: 'Wrong number',
+  company: {name: 'Wrong company', header_details: 'Wrong header'}})) {
+  assert.deepEqual(expectations({...xlsxJobRequest, [key]: wrong}), expectedWorkbook,
+    'Workbook expectations followed request echo: ' + key);
+}
+process.stdout.write(JSON.stringify(expectedWorkbook));
+'''
         expected = subprocess.run(["node", "-e", script], cwd=ROOT, text=True, capture_output=True, timeout=15)
         self.assertEqual(expected.returncode, 0, expected.stderr)
         for actual, row in zip(json.loads(expected.stdout)["payload"]["line_items"], json.loads(expected.stdout)["rows"]):
