@@ -410,6 +410,16 @@ async function verifyMobileHeaderOrder(page) {
 }
 
 async function verifyMobileBasisLegendAndOutputCards(page) {
+  if (!alpha1Scope) {
+    // Reload recovery honours the saved Customer checkpoint. Establish it through
+    // the normal save action before injecting the component's Output rows.
+    await seedQuoteDraftFromTestFixture(page);
+    await page.locator("#sideNextButton", { hasText: "Next: Customer" }).click();
+    await page.locator("#customerDetailsPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.locator("#sideNextButton", { hasText: "Next: Quote Company" }).click();
+    await page.locator("#quoteCompanyPanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+    await page.waitForFunction(() => customerStepCheckpointIsCurrent(), null, { timeout: 15000 });
+  }
   await page.setViewportSize({ width: 520, height: 720 });
   await page.evaluate(() => {
     selectPricingReferenceOptionValue(firstPricingReferenceOptionValue());
@@ -545,8 +555,9 @@ async function verifyMobileBasisLegendAndOutputCards(page) {
   if (!alpha1Scope) {
   const quoteRestoreEvidence = await page.evaluate(async (expected) => {
     const snapshot = buildSessionSnapshot();
-    snapshot.quoteSessionId = "quote-manual-description-restore";
-    snapshot.quoteSessionDraftSaveStarted = true;
+    if (!snapshot.quoteSessionId || !customerStepCheckpointIsCurrent()) {
+      throw new Error("Manual description restore fixture needs its saved Customer checkpoint.");
+    }
     const restored = await applyQuoteSessionSnapshot(snapshot, {
       forceQuoteView: true,
       sessionId: snapshot.quoteSessionId,
