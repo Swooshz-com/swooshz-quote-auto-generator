@@ -74,6 +74,14 @@ invented. Diagnostic events contain safe status, counts and matching support
 references, without prompts, uploads, model outputs, provider error text,
 credentials, identity maps or arbitrary configured model values.
 
+Unexpected-error server logs include up to four repository-relative `failure_site`
+locations (file, function and line, innermost first), an optional innermost external
+module/function in `failure_site_external`, and up to four exception class names in
+`error_chain`; each entry is limited to 120 characters and the combined fields to
+1,200 characters. These fields stay server-side and never contain exception
+messages, arguments, locals, source lines or absolute paths; diagnostic failure
+preserves the original log fields without these additions.
+
 The [Responses usage guide](https://openrouter.ai/docs/api_reference/responses/basic-usage),
 [reasoning guide](https://openrouter.ai/docs/api_reference/responses/reasoning),
 [stateless error contract](https://openrouter.ai/docs/api_reference/responses/error-handling)

@@ -30546,6 +30546,50 @@ def health_status(*, force_dependency_probe: bool = False) -> dict[str, Any]:
         return status
 
 
+def _unexpected_error_diagnostics(exc: BaseException) -> dict[str, Any]:
+    """Project code metadata only; never format exceptions or inspect locals/source."""
+    diagnostics: dict[str, Any] = {}
+    sites: list[str] = []
+    root = PROJECT_ROOT.resolve()
+    frame_traceback = exc.__traceback__
+    while frame_traceback is not None:
+        code = frame_traceback.tb_frame.f_code
+        function = code.co_name
+        if not code.co_filename.startswith("<") and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*|<(?:module|lambda|listcomp|dictcomp|setcomp|genexpr)>", function):
+            filename = Path(code.co_filename).resolve()
+            try:
+                relative = filename.relative_to(root)
+            except ValueError:
+                module = frame_traceback.tb_frame.f_globals.get("__name__", "")
+                if isinstance(module, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", module):
+                    # Overwrite while walking outwards to inwards: retain only the innermost.
+                    diagnostics["failure_site_external"] = module[:59] + ":" + function[:60]
+            else:
+                if len(relative.parts) == 1 or relative.parts[0] in {"webapp", "scripts"}:
+                    path = relative.as_posix()
+                    line = str(frame_traceback.tb_lineno)
+                    name_budget = 120 - len(path) - len(line) - 2
+                    if name_budget > 0 and re.fullmatch(r"[A-Za-z0-9_./-]+", path):
+                        sites.append(f"{path}:{function[:name_budget]}:{line}")
+                        sites = sites[-4:]
+        frame_traceback = frame_traceback.tb_next
+    if sites:
+        diagnostics["failure_site"] = list(reversed(sites))
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(chain) < 4 and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            break
+        chain.append(name[:120])
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    diagnostics["error_chain"] = chain
+    # At most 4 sites, 4 classes and one external site, each at most 120 chars.
+    return diagnostics
+
+
 def unexpected_error_log_details(error_reference: str, exc: BaseException | None = None, **details: Any) -> dict[str, Any]:
     log_details: dict[str, Any] = {"error_reference": clean_text(error_reference)}
     if exc is not None:
@@ -30553,6 +30597,14 @@ def unexpected_error_log_details(error_reference: str, exc: BaseException | None
     for key, value in details.items():
         if value not in (None, "", [], {}):
             log_details[key] = value
+    if exc is not None:
+        try:
+            diagnostics = _unexpected_error_diagnostics(exc)
+        except BaseException:
+            # Diagnostics must never replace the original failure or add partial fields.
+            pass
+        else:
+            log_details.update(diagnostics)
     return log_details
 
 

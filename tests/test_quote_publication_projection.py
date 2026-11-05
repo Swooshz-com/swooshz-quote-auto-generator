@@ -684,6 +684,40 @@ class PublicationProjectionTest(unittest.TestCase):
             self.assertNotIn("private-canary-never-return", repr(logged.call_args))
             self.assertEqual(s.JOBS[job_id], before)
 
+    def test_empty_publication_source_logs_failure_site_only_on_server(self):
+        with self.case("local"):
+            job_id = "job-projection-local-empty-source"
+            self.outputs[job_id] = (b"PK-synthetic-valid-before-staging", None)
+            original_stage = s.stage_local_quote_publication
+
+            def empty_source(session_id, result, output_dir, **kwargs):
+                (output_dir / "quotation.xlsx").write_bytes(b"")
+                return original_stage(session_id, result, output_dir, **kwargs)
+
+            with mock.patch.object(s, "stage_local_quote_publication", side_effect=empty_source):
+                status, body = self.post_generate(job_id)
+            self.assertEqual(status, 500, body)
+            result = json.loads(body)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["errors"], s.generic_referenced_errors(result["error_reference"]))
+            self.assertFalse(result.get("files"))
+            log_root = Path(os.environ["QUOTE_LOG_ROOT"])
+            records = [json.loads(line) for path in log_root.rglob("*.jsonl") for line in path.read_text(encoding="utf-8").splitlines()]
+            event = next(record for record in records if record["event"] == "quote_session_update_failed")
+            details = event["details"]
+            self.assertEqual(details["error_reference"], result["error_reference"])
+            self.assertEqual(details["error_type"], "ValueError")
+            self.assertEqual(details["error_chain"], ["ValueError"])
+            self.assertRegex(details["failure_site"][0], r"^webapp/server\.py:stage_local_quote_publication:\d+$")
+            self.assertLessEqual(len(details["failure_site"]), 4)
+            for field in ("failure_site", "failure_site_external", "error_chain"):
+                self.assertNotIn(field.encode(), body)
+            for text in (body.decode(), json.dumps(event)):
+                self.assertNotIn("Generated quote publication source is empty", text)
+                self.assertNotIn(str(self.root), text)
+                self.assertNotIn(str(existing.ROOT), text)
+            self.assert_public_privacy(body)
+
     def test_failed_attempt_keeps_prior_saved_pair_but_advertises_no_attempt_outputs(self):
         for mode in ("local", "database", "object"):
             with self.subTest(mode=mode), self.case(mode):
