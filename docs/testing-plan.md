@@ -220,6 +220,16 @@ npm run playwright:smoke
   a cookie, and browser positive/negative flows. Provider behavior must use
   local synthetic adapters only.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
+  Run `python -m unittest tests.test_ci_browser_scope` for the maintained CI
+  browser commands and their four runtime-prerequisite gates. Both
+  `npm run playwright:smoke` and `npm run playwright:alpha-smoke` run without
+  `--alpha1`. The app smoke includes the isolated mocked-provider pricing and
+  current-XLSX flow after its full reload/recovery checks. The Python step still
+  sets `SQAG_VALIDATION_SCOPE: alpha1`: its only consumer skips the separately
+  tracked saved Modify/restoration case in `tests.test_webapp`, while the fresh
+  review/pricing case remains enabled. Do not remove that exclusion without
+  separately qualifying restoration. The owner contract invokes `--g3-pricing`
+  without the retired browser flag.
 - PostgreSQL migration manifest, ledger, preflight, or operator command: run
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL
   service and require fresh apply, complete schema, exact checksums, no-op
@@ -598,12 +608,33 @@ exports expose unknown `exists`/`missing`, no ordinary URL, and `unverified`
 availability; preserved historical bytes are checked separately from current delivery.
 Bound URL expectations join known session/kind/owner identities to independently
 read persisted publication metadata, including the canonical comparison digest.
-The `--alpha1` smoke also joins the accepted job's actual generator workbook bytes
-to that metadata and retains the original owning-server HTTP receipt and browser
-workbook size/SHA256 checks. Its fixed JSON template identity uses the checked-in LF
-bytes, normalising only CRLF pairs; the receipt also keeps the raw working-tree
-template SHA256. Workbook bytes are never normalised. No result URL alone supplies
-its own expected identity.
+The maintained `npm run playwright:alpha-smoke` joins the accepted job's actual
+generator workbook bytes to that metadata and checks the original owning-server
+HTTP receipt and native browser workbook filename, URL, size and SHA256. The
+authenticated protected download must equal the native browser bytes before PDF
+generation. `scripts/verify_current_workbook.py` independently binds each accepted
+priced/Included row's description, quantity, unit and numeric amount, then checks
+cached totals, dynamic formulas/currency, bold headers, centred quantities, money
+formatting, hidden internal columns, original uploaded logo, header placement and
+the selected quotation print area. It runs before and after native PDF generation.
+These checks use the existing quotation layout and synthetic catalogue inputs;
+they introduce no pricing aliases or product UI changes.
+
+Run `python -m unittest tests.test_current_workbook_receipt tests.test_workbook_http_receipt`
+for real-generator workbook proof and negative controls: swapped row amounts,
+incorrect quantities, formula/currency corruption, wrong logo/print area, exposed
+internal columns, stale or mismatched publication/owner/revision, wrong accepted
+job bytes, forged URLs, wrong download bytes and failed owning-server HTTP status.
+Run both full browser commands in an environment with Playwright Chromium and,
+for the native alpha smoke, LibreOffice and the declared Python PDF dependencies.
+Missing local dependencies are a test gap, not a passing browser result.
+
+The retained `--alpha1` runners additionally keep their fixed JSON template
+identity using checked-in LF bytes, normalising only CRLF pairs, and raw
+working-tree template SHA256. Their dedicated files and shared synthetic draft
+harness remain for separate retirement work and existing owner-basis consumers.
+Workbook bytes are never normalised. No result URL alone supplies its own
+expected identity.
 
 Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
 eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity

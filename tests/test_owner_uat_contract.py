@@ -70,7 +70,7 @@ class OwnerUatContractTest(unittest.TestCase):
 
     def test_rendered_selection_fx_reload_and_current_xlsx(self):
         with owned_browser_evidence_directory() as evidence_root:
-            result = subprocess.run([require_node(self), 'scripts/playwright-smoke.mjs', '--g3-pricing', '--alpha1'],
+            result = subprocess.run([require_node(self), 'scripts/playwright-smoke.mjs', '--g3-pricing'],
                 env={**os.environ, 'SQAG_OWNER_UAT_EVIDENCE_ROOT': evidence_root},
                 text=True, capture_output=True, cwd=ROOT, timeout=180)
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)

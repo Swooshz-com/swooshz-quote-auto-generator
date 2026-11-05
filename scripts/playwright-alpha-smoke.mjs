@@ -1,4 +1,5 @@
 import { signIn } from "./internal-password-browser-test.mjs";
+import { LocalWorkbookReceipt } from "./workbook-receipt.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -337,6 +338,7 @@ async function main() {
   let reopenContext;
   let api;
   let anonymousApi;
+  let workbookReceipts;
   try {
     const referenceConfig = JSON.parse(await fs.readFile(path.join(fixtureDir, "reference.json"), "utf8"));
     const catalog = JSON.parse(await fs.readFile(path.join(fixtureDir, "pricing-catalog.json"), "utf8"));
@@ -386,6 +388,7 @@ async function main() {
     await fs.writeFile(shimPath, harnessSource, "utf8");
 
     harness = startHarness(shimPath, [dataRoot, outputRoot, tmpRoot, serverLogDir, localPricingRoot], root);
+    workbookReceipts = new LocalWorkbookReceipt(harness.child, dataRoot, outputRoot);
     const baseUrl = await harness.baseUrlPromise;
     const health = await fetch(`${baseUrl}/api/health`);
     assert(health.ok && (await health.json()).status === "ok", "Synthetic alpha server health check failed.");
@@ -570,6 +573,11 @@ async function main() {
     assert(normalization.status === 200 && normalization.body.status === "normalized", "Application quote-basis normalization failed.");
     assert(Array.isArray(normalization.body.line_items) && normalization.body.line_items.length === fixtureItems.length, "Application normalization did not resolve both fixture lines.");
     assert(normalization.payload?.pricing_reference_id === referenceConfig.id || normalization.payload?.pricing_reference?.id === referenceConfig.id, "Normalization used a different pricing authority.");
+    for (const item of fixtureItems) {
+      const row = normalization.body.line_items.find((line) => line.pricing_keyword === item.id);
+      assert(row?.pricing_authority?.variant === "catalog" && row.pricing_authority.catalog_item_id === item.id
+        && Number(row.catalog_unit_price) === item.price, "Normalization lost authoritative catalogue identity or price.");
+    }
     await page.locator("#pricingMatchesBody tr").nth(fixtureItems.length - 1).waitFor({ state: "visible", timeout: 15000 });
 
     const pricedItem = fixtureItems[0];
@@ -659,6 +667,7 @@ async function main() {
     assert(await page.locator("#sideDownloadButton").getAttribute("aria-disabled") !== "true", "Current XLSX action is not enabled after reopen.");
 
     const firstJobIndex = trace.jobs.length;
+    const workbookReceiptSequence = workbookReceipts.sequence;
     const xlsxTerminalPromise = waitUntil(() => {
       const job = trace.jobs.slice(firstJobIndex).find((item) => item.type === "generate");
       return job?.polls.find((poll) => ["completed", "failed", "needs_review"].includes(poll.body?.status)) || null;
@@ -700,7 +709,29 @@ async function main() {
     assert(xlsxJobSession.exports?.xlsx?.sha256 === xlsxReadback.exports.xlsx.sha256, "XLSX result and independent readback differ on artifact hash.");
     assert(xlsxJobSession.exports?.xlsx?.publication_id === xlsxReadback.exports.xlsx.publication_id, "XLSX result and readback differ on publication identity.");
     assert(xlsxReadback.exports.xlsx.publication_id, "Published XLSX has no publication identity.");
-    const downloadedXlsxDigest = createHash("sha256").update(await fs.readFile(xlsxPath)).digest("hex");
+    const downloadedXlsxBytes = await fs.readFile(xlsxPath);
+    const downloadedXlsxDigest = createHash("sha256").update(downloadedXlsxBytes).digest("hex");
+    const committedWorkbook = await workbookReceipts.committed(sessionId, xlsxJob.accepted.job_id,
+      xlsxReadback.exports.xlsx, durableAfterEdit.exports?.xlsx?.publication_id || "");
+    const originalWorkbookHTTP = await workbookReceipts.browserDownload(committedWorkbook,
+      xlsxDownload, downloadedXlsxBytes, baseUrl, workbookReceiptSequence);
+    const protectedFirstXlsx = await authenticatedDownload(api, baseUrl, xlsxReadback.exports.xlsx,
+      path.join(downloadsRoot, "first-protected-quotation.xlsx"), "XLSX");
+    assert(downloadedXlsxBytes.equals(protectedFirstXlsx.bytes), "Native browser and protected HTTP workbook bytes differ.");
+    const expectedWorkbook = {
+      payload: xlsxJobRequest,
+      rows: fixtureItems.map((item, index) => ({ description: item.description,
+        quantity: index === 0 ? 2 : 1, unit: item.unit_hint,
+        price_mode: index === 0 ? "Priced" : "Included", unit_price: item.price })),
+      logo: { bytes: logoBuffer.length, sha256: createHash("sha256").update(logoBuffer).digest("hex") },
+    };
+    // Keep uploaded media out of the Windows command line and its size limit.
+    const workbookExpectationsPath = path.join(downloadsRoot, "workbook-expectations.json");
+    await fs.writeFile(workbookExpectationsPath, JSON.stringify(expectedWorkbook));
+    const strictXlsx = await spawnCollect(python, ["scripts/verify_current_workbook.py", xlsxPath,
+      workbookExpectationsPath], { cwd: root });
+    assert(strictXlsx.code === 0, "Row-bound workbook verification failed: " + safeErrorText(strictXlsx.stderr || strictXlsx.stdout));
+    const workbookValidation = JSON.parse(strictXlsx.stdout.trim());
     assert(downloadedXlsxDigest === xlsxReadback.exports.xlsx.sha256, "UI-downloaded XLSX differs from the published artifact.");
     const xlsxValidation = await validateXlsx(xlsxPath, [
       expectedCustomer, expectedProject, expectedProjectNumber, ...fixtureItems.map((item) => item.description),
@@ -762,6 +793,9 @@ async function main() {
     const currentXlsxValidation = await validateXlsx(currentXlsxPath, [
       expectedCustomer, expectedProject, expectedProjectNumber, ...fixtureItems.map((item) => item.description),
     ], [expectedLineAmount, Math.round(expectedLineAmount * 1.09 * 100) / 100], includedItem.description);
+    const strictCurrentXlsx = await spawnCollect(python, ["scripts/verify_current_workbook.py", currentXlsxPath,
+      workbookExpectationsPath], { cwd: root });
+    assert(strictCurrentXlsx.code === 0, "Post-PDF workbook verification failed: " + safeErrorText(strictCurrentXlsx.stderr || strictCurrentXlsx.stdout));
     const pdfValidation = await validatePdf(currentPdfPath);
     await pdfPopup.close();
 
@@ -837,7 +871,7 @@ async function main() {
         pdf: { run_id: resultRunIdPdf, status: pdfTerminal.status, publication_id: publicationId },
       },
       artifacts: {
-        xlsx: { sha256: currentXlsx.sha256, bytes: currentXlsx.size, validation: currentXlsxValidation },
+        xlsx: { sha256: currentXlsx.sha256, bytes: currentXlsx.size, validation: currentXlsxValidation, workbookValidation, committedWorkbook, originalWorkbookHTTP },
         pdf: { sha256: currentPdf.sha256, bytes: currentPdf.size, validation: pdfValidation },
       },
       matrix: {
@@ -866,6 +900,7 @@ async function main() {
     if (reopenContext) await reopenContext.close().catch(() => {});
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
+    if (workbookReceipts) workbookReceipts.close();
     await stopHarness(harness).catch(() => {});
     if (runRoot) {
       const tempRoot = path.resolve(os.tmpdir()) + path.sep;

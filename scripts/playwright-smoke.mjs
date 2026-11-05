@@ -5632,8 +5632,9 @@ async function main() {
     await browser.close();
     await stopServer(serverInfo);
   }
+  // Keep real mocked-provider pricing and current XLSX coverage in the default CI path.
+  await runG3PricingScope();
   if (alpha1Scope) {
-    await runG3PricingScope();
     console.log(JSON.stringify({status:"ok",scope:"alpha1",broadComponentsComplete:true,isolatedNormalPricingComplete:true}));
   }
 }
