@@ -901,7 +901,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
 
 async function verifyGenerationLoadingModalSurvivesRefresh(page) {
   // Let the unchanged local-runner write window drain after the preceding CRUD controls.
-  if (alpha1Scope) await page.waitForTimeout(60000);
+  await page.waitForTimeout(60000);
   const cases = [
     { type: "generate", viewPdf: false, title: "Regenerating Excel", finalizingTitle: "Finalizing Excel", readyTitle: "Excel ready", action: "excel", button: "#sideDownloadButton" },
     { type: "generate_pdf", viewPdf: true, title: "Generating PDF", finalizingTitle: "Finalizing PDF", readyTitle: "PDF ready", action: "pdf", button: "#sideViewPdfButton" },
@@ -1094,12 +1094,10 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (activeDuringFinalization?.type !== testCase.type) {
         throw new Error("Recovered " + testCase.type + " cleared its active job before finalization completed.");
       }
-      const finalSaveResponse = alpha1Scope ? page.waitForResponse(response => new URL(response.url()).pathname === "/api/quote-sessions" && response.request().method() === "POST", { timeout: 15000 }) : null;
+      const finalSaveResponse = page.waitForResponse(response => new URL(response.url()).pathname === "/api/quote-sessions" && response.request().method() === "POST", { timeout: 15000 });
       releaseFinalSave();
-      if (finalSaveResponse) {
-        const response = await finalSaveResponse;
-        if (response.status() !== 200) throw new Error("Actual resumed final save returned HTTP " + response.status());
-      }
+      const response = await finalSaveResponse;
+      if (response.status() !== 200) throw new Error("Actual resumed final save returned HTTP " + response.status());
       await page.waitForFunction(() => {
         const saved = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
         return !saved.activeJob;
@@ -4687,7 +4685,7 @@ async function runG3PricingScope() {
         const serverOutput = serverInfo.output.join("").trim();
         throw new Error(`Could not start isolated G3 webapp at ${baseUrl}.${serverOutput ? `\n\n${serverOutput}` : ""}`);
       }
-      browser = await chromium.launch({ headless: !options.headed, ...(process.env.CI ? {} : { channel: "chrome" }) });
+      browser = await chromium.launch({ headless: !options.headed });
       const context = await browserBoundary.newContext(browser, { viewport: { width: 1365, height: 768 } });
       const page = await context.newPage();
       const consoleProblems = [];
@@ -4730,6 +4728,12 @@ async function runG3PricingScope() {
     }
 
   } finally {options.port=originalPort;baseUrl=originalBaseUrl;}
+}
+
+function requireNoQuoteSessionRateLimits(networkProblems) {
+  if (networkProblems.some(problem => /^429 .*\/api\/quote-sessions(?:[/?]|$)/.test(problem))) {
+    throw new Error("Quote-session save was rate limited (HTTP 429); smoke cannot qualify persisted state.");
+  }
 }
 
 async function main() {
@@ -4778,6 +4782,7 @@ async function main() {
       await verifyGenerationTerminalRecoveryAfterRefresh(page);
       await verifyExpiredQuoteJobsDoNotResume(page);
       await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
+      requireNoQuoteSessionRateLimits(networkProblems);
       console.log(JSON.stringify({
         status: "ok",
         mode: "recovery-only",
@@ -5619,6 +5624,7 @@ async function main() {
       await verifyPricingReferenceSelectionCommitsOnCustomerNext(page);
     }
 
+    requireNoQuoteSessionRateLimits(networkProblems);
     console.log(JSON.stringify({
       status: alpha1Scope ? "broad_component_phase_complete" : "ok",
       url: page.url(),
@@ -5639,9 +5645,10 @@ async function main() {
     await browser.close();
     await stopServer(serverInfo);
   }
+  // Keep real mocked-provider pricing and current XLSX coverage in the default CI path.
+  if (!options.screenshots) await runG3PricingScope();
   if (alpha1Scope) {
-    await runG3PricingScope();
-    console.log(JSON.stringify({status:"ok",scope:"alpha1",broadComponentsComplete:true,isolatedNormalPricingComplete:true}));
+    console.log(JSON.stringify({status:"ok",scope:"alpha1",broadComponentsComplete:true,isolatedNormalPricingComplete:!options.screenshots}));
   }
 }
 

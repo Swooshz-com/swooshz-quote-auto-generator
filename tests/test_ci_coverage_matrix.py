@@ -10,7 +10,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PREREQUISITES = "always() && steps.alpha1_prerequisites.outcome == 'success'"
+PREREQUISITES = "always() && steps.runtime_prerequisites.outcome == 'success'"
 JOB_CONDITION = (
     "always() && needs.retrospective_exact_starting_head_red.result == 'success' "
     "&& needs.secret-scan.result == 'success' "
@@ -65,7 +65,7 @@ def validate_commands(document, workflow, package):
                 if re.search(r'\b(?:npm run playwright:|python -m unittest\b)', block)}
     if selected != {row[0] for row in declarations}:
         raise ValueError('CI test step inventory differs from the coverage matrix')
-    prerequisite = '        id: alpha1_prerequisites\n'
+    prerequisite = '        id: runtime_prerequisites\n'
     if steps.count(prerequisite) != 1:
         raise ValueError('Missing or ambiguous browser prerequisite step')
     commands = set()
@@ -86,7 +86,7 @@ def validate_commands(document, workflow, package):
 
     suites = table(document, 'browser', (
         'Suite', 'Package script', 'Script definition', 'CI command', 'Reason or limit'))
-    required = {'app-fresh', 'app-full', 'alpha-fresh', 'alpha-full', 'pricing-startup'}
+    required = {'app-fresh', 'app-full', 'app-recovery', 'alpha-fresh', 'alpha-full', 'pricing-startup'}
     if not required <= {row[0] for row in suites}:
         raise ValueError('Missing critical browser lifecycle declaration')
     scripts = {key: value for key, value in package['scripts'].items()
@@ -164,11 +164,12 @@ class CoverageMatrixTests(unittest.TestCase):
         mutations = (
             ('python -m unittest discover -s tests', 'python -m unittest tests.test_generate_quote'),
             ('python -m unittest discover -s tests', 'python -m unittest discover -s tests -k fresh'),
-            ('npm run playwright:smoke -- --alpha1', 'npm run playwright:smoke -- --pricing-startup'),
-            ('npm run playwright:alpha-smoke -- --alpha1', 'npm run playwright:alpha-smoke -- --other'),
+            ('run: npm run playwright:smoke\n', 'run: npm run playwright:smoke -- --alpha1\n'),
+            ('run: npm run playwright:alpha-smoke\n', 'run: npm run playwright:alpha-smoke -- --alpha1\n'),
+            ('--recovery-only', '--pricing-startup'),
             ('npm run playwright:ai-stress', 'npm run playwright:ai-stress || true'),
             ('SQAG_VALIDATION_SCOPE: alpha1', 'SQAG_VALIDATION_SCOPE: fresh-only'),
-            ('id: alpha1_prerequisites', 'id: renamed_prerequisites'),
+            ('id: runtime_prerequisites', 'id: renamed_prerequisites'),
             (f'if: {PREREQUISITES}', 'if: false'),
             (f'if: {JOB_CONDITION}', 'if: false'),
             ('      - name: Run Python tests', '      - name: Run Python tests\n        continue-on-error: true'),

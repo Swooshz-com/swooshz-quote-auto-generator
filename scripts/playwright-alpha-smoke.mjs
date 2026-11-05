@@ -1,4 +1,5 @@
 import { signIn } from "./internal-password-browser-test.mjs";
+import { LocalWorkbookReceipt } from "./workbook-receipt.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -22,6 +23,43 @@ let quoteSaveSequence = 0;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function requireOriginalUploadBytes(detail, originals) {
+  const files = detail.draft_files;
+  assert(Array.isArray(files) && files.length === originals.length, "Protected original upload count changed.");
+  assert(new Set(files.map(file => file.session_file_key)).size === files.length
+    && files.every(file => file.session_file_key), "Protected original upload keys are missing or duplicated.");
+  for (const original of originals) {
+    const matches = files.filter(file => file.name === original.name && file.file_role === original.file_role);
+    assert(matches.length === 1, "Protected original upload identity changed.");
+    const file = matches[0];
+    const encoded = typeof file.data_url === "string" && file.data_url.match(/^data:([^;,]+);base64,([A-Za-z0-9+/]+={0,2})$/);
+    assert(encoded && encoded[1] === original.type && file.type === original.type, "Protected original upload MIME changed.");
+    const bytes = Buffer.from(encoded[2], "base64");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    assert(bytes.toString("base64") === encoded[2] && bytes.equals(original.buffer)
+      && Number(file.size) === original.buffer.length, "Protected original upload bytes changed.");
+    if (Object.hasOwn(file, "content_fingerprint")) {
+      assert(file.content_fingerprint === "sha256:" + digest, "Protected original upload fingerprint changed.");
+    }
+  }
+}
+
+function requirePersistedIncluded(detail, description) {
+  const row = detail.draft_state?.outputRows?.find(item => item.description === description);
+  assert(row?.price_mode === "Included" && row.pricing_authority?.variant === "included"
+    && row.pricing_authority.price === 0 && row.amount === 0,
+  "Saved Included authority and numeric zero amount must persist.");
+}
+
+function requireCustomerCheckpoint(detail, checkpoint) {
+  const saved = detail.draft_state?.customerStepCheckpoint;
+  assert(checkpoint.current && checkpoint.reference?.digest_sha256
+    && /^sha256:[a-f0-9]{64}$/.test(checkpoint.reference.digest_sha256), "Customer Next lacks a current reference digest.");
+  assert(saved?.sessionId === detail.session_id && saved.sessionId === checkpoint.checkpoint?.sessionId
+    && saved.pricingReferenceDigest === checkpoint.reference.digest_sha256,
+  "Protected Customer checkpoint lost its session or pricing-reference digest.");
 }
 
 function generationRunIdBinding(accepted, terminal) {
@@ -58,8 +96,12 @@ function safeJsonRequest(req) {
   try { return req.postDataJSON(); } catch { return null; }
 }
 
-function safeErrorText(value) {
-  return String(value?.message || value || "unknown error").replace(/[\r\n]+/g, " ").slice(0, 500);
+function safeErrorText(value, exceptionTail = false) {
+  const text = String(value?.message || value || "unknown error");
+  // The verifier sees synthetic inputs only. Keep its final exception, without
+  // copying traceback source lines or serialising uploaded media/job payloads.
+  if (exceptionTail) return text.trim().split(/\r?\n/).at(-1).slice(-400);
+  return text.replace(/[\r\n]+/g, " ").slice(0, 500);
 }
 
 async function waitUntil(predicate, label, timeoutMs = 20000) {
@@ -337,6 +379,7 @@ async function main() {
   let reopenContext;
   let api;
   let anonymousApi;
+  let workbookReceipts;
   try {
     const referenceConfig = JSON.parse(await fs.readFile(path.join(fixtureDir, "reference.json"), "utf8"));
     const catalog = JSON.parse(await fs.readFile(path.join(fixtureDir, "pricing-catalog.json"), "utf8"));
@@ -386,6 +429,7 @@ async function main() {
     await fs.writeFile(shimPath, harnessSource, "utf8");
 
     harness = startHarness(shimPath, [dataRoot, outputRoot, tmpRoot, serverLogDir, localPricingRoot], root);
+    workbookReceipts = new LocalWorkbookReceipt(harness.child, dataRoot, outputRoot);
     const baseUrl = await harness.baseUrlPromise;
     const health = await fetch(`${baseUrl}/api/health`);
     assert(health.ok && (await health.json()).status === "ok", "Synthetic alpha server health check failed.");
@@ -424,7 +468,11 @@ async function main() {
     const renderBuffer = await makePng(fixturePage, renderSvg);
     const logoBuffer = await makePng(fixturePage, logoSvg);
     await fixturePage.close();
-    await page.locator("#imageInput").setInputFiles({ name: "synthetic-booth-render.png", mimeType: "image/png", buffer: renderBuffer });
+    const originalUploads = [
+      { name: "synthetic-booth-render.png", type: "image/png", file_role: "reference", buffer: renderBuffer },
+      { name: "synthetic-alpha-logo.png", type: "image/png", file_role: "quote_company_logo", buffer: logoBuffer },
+    ];
+    await page.locator("#imageInput").setInputFiles({ name: originalUploads[0].name, mimeType: originalUploads[0].type, buffer: renderBuffer });
     await page.locator("#fileList .file-item").filter({ hasText: "synthetic-booth-render.png" }).waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#sideNextButton").click();
     await page.locator("#customerDetailsPanel").waitFor({ state: "visible", timeout: 15000 });
@@ -439,7 +487,11 @@ async function main() {
     await page.locator("#quoteDate").fill(new Date().toISOString().slice(0, 10));
     await page.locator("#sideNextButton").click();
     await page.locator("#quoteCompanyPanel").waitFor({ state: "visible", timeout: 15000 });
-    await page.locator("#headerLogoInput").setInputFiles({ name: "synthetic-alpha-logo.png", mimeType: "image/png", buffer: logoBuffer });
+    const customerCheckpoint = await page.evaluate(() => ({ current: customerStepCheckpointIsCurrent(),
+      checkpoint: state.customerStepCheckpoint, reference: currentPricingReference() }));
+    assert(customerCheckpoint.current && customerCheckpoint.reference?.id === referenceConfig.id
+      && customerCheckpoint.reference.source === "local", "Customer Next did not commit the selected pricing reference.");
+    await page.locator("#headerLogoInput").setInputFiles({ name: originalUploads[1].name, mimeType: originalUploads[1].type, buffer: logoBuffer });
     const companyFields = [
       ["#headerDetailsEditor", "Synthetic Internal Alpha | Singapore"],
       ["#quoteCompanyNameEditor", "Synthetic Alpha Fabrication"],
@@ -483,6 +535,8 @@ async function main() {
     const beforeSeed = await quoteSessionDetail(api, baseUrl, sessionId);
     assert(beforeSeed.session_id === sessionId && beforeSeed.customer_summary?.customer_name === expectedCustomer, "Created quote identity or customer context is incorrect.");
     assert(beforeSeed.pricing_reference?.id === referenceConfig.id && beforeSeed.pricing_reference?.source === "local", "Created quote lost its selected pricing authority.");
+    requireCustomerCheckpoint(beforeSeed, customerCheckpoint);
+    requireOriginalUploadBytes(beforeSeed, originalUploads);
 
     // This is only the deterministic basis fixture for a local synthetic run. The edit and generation actions still use normal UI controls and real application routes.
     const basisSections = fixtureItems.map((item, index) => ({
@@ -570,6 +624,11 @@ async function main() {
     assert(normalization.status === 200 && normalization.body.status === "normalized", "Application quote-basis normalization failed.");
     assert(Array.isArray(normalization.body.line_items) && normalization.body.line_items.length === fixtureItems.length, "Application normalization did not resolve both fixture lines.");
     assert(normalization.payload?.pricing_reference_id === referenceConfig.id || normalization.payload?.pricing_reference?.id === referenceConfig.id, "Normalization used a different pricing authority.");
+    for (const item of fixtureItems) {
+      const row = normalization.body.line_items.find((line) => line.pricing_keyword === item.id);
+      assert(row?.pricing_authority?.variant === "catalog" && row.pricing_authority.catalog_item_id === item.id
+        && Number(row.catalog_unit_price) === item.price, "Normalization lost authoritative catalogue identity or price.");
+    }
     await page.locator("#pricingMatchesBody tr").nth(fixtureItems.length - 1).waitFor({ state: "visible", timeout: 15000 });
 
     const pricedItem = fixtureItems[0];
@@ -643,6 +702,8 @@ async function main() {
     const durableRows = durableAfterEdit.draft_state?.outputRows || [];
     assert(Number(durableRows.find((row) => row.description === pricedItem.description)?.quantity) === 2, "Independent readback lost the latest visible quantity.");
     assert(durableRows.find((row) => row.description === includedItem.description)?.price_mode === "Included", "Independent readback lost the visible Included-row edit.");
+    requirePersistedIncluded(durableAfterEdit, includedItem.description);
+    requireOriginalUploadBytes(durableAfterEdit, originalUploads);
     assert(durableAfterEdit.pricing_reference?.id === referenceConfig.id && durableAfterEdit.pricing_reference?.source === "local", "Durable readback changed the pricing authority.");
 
     const editCard = page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`);
@@ -659,6 +720,7 @@ async function main() {
     assert(await page.locator("#sideDownloadButton").getAttribute("aria-disabled") !== "true", "Current XLSX action is not enabled after reopen.");
 
     const firstJobIndex = trace.jobs.length;
+    const workbookReceiptSequence = workbookReceipts.sequence;
     const xlsxTerminalPromise = waitUntil(() => {
       const job = trace.jobs.slice(firstJobIndex).find((item) => item.type === "generate");
       return job?.polls.find((poll) => ["completed", "failed", "needs_review"].includes(poll.body?.status)) || null;
@@ -695,12 +757,69 @@ async function main() {
     assert(Array.isArray(xlsxJobRequest.line_items) && xlsxJobRequest.line_items.length === fixtureItems.length, "XLSX request did not contain normalized line items.");
 
     const xlsxReadback = await quoteSessionDetail(api, baseUrl, sessionId);
+    requirePersistedIncluded(xlsxReadback, includedItem.description);
+    requireOriginalUploadBytes(xlsxReadback, originalUploads);
     assert(xlsxReadback.exports?.xlsx?.exists === true && xlsxReadback.exports.xlsx.stale === false, "Generated XLSX is not current.");
     const xlsxJobSession = xlsxTerminal.result.quote_session;
     assert(xlsxJobSession.exports?.xlsx?.sha256 === xlsxReadback.exports.xlsx.sha256, "XLSX result and independent readback differ on artifact hash.");
     assert(xlsxJobSession.exports?.xlsx?.publication_id === xlsxReadback.exports.xlsx.publication_id, "XLSX result and readback differ on publication identity.");
     assert(xlsxReadback.exports.xlsx.publication_id, "Published XLSX has no publication identity.");
-    const downloadedXlsxDigest = createHash("sha256").update(await fs.readFile(xlsxPath)).digest("hex");
+    const downloadedXlsxBytes = await fs.readFile(xlsxPath);
+    const downloadedXlsxDigest = createHash("sha256").update(downloadedXlsxBytes).digest("hex");
+    const committedWorkbook = await workbookReceipts.committed(sessionId, xlsxJob.accepted.job_id,
+      xlsxReadback.exports.xlsx, durableAfterEdit.exports?.xlsx?.publication_id || "");
+    const originalWorkbookHTTP = await workbookReceipts.browserDownload(committedWorkbook,
+      xlsxDownload, downloadedXlsxBytes, baseUrl, workbookReceiptSequence);
+    const protectedFirstXlsx = await authenticatedDownload(api, baseUrl, xlsxReadback.exports.xlsx,
+      path.join(downloadsRoot, "first-protected-quotation.xlsx"), "XLSX");
+    assert(downloadedXlsxBytes.equals(protectedFirstXlsx.bytes), "Native browser and protected HTTP workbook bytes differ.");
+    // Match payload_to_brief/prepare_lines and customer_quote_description.
+    // Output edits retain editor.value strings until server normalisation.
+    const workbookRow = (item) => {
+      const text = (value) => String(value || "").replace(/\s+/g, " ").trim().normalize("NFC");
+      const rawDescription = text(item.description);
+      const match = rawDescription.match(/^\[\s*([\s\S]*?)\s*\](?:\s*-\s*([\s\S]+))?$/);
+      const reference = match ? text(match[1]) : "";
+      const detail = match ? text(match[2]) : "";
+      const description = reference ? reference + (detail ? " - " + detail : "") : rawDescription;
+      const rawUnit = text(item.unit);
+      const lowerUnit = rawUnit.toLowerCase().replace(/^[. ]+|[. ]+$/g, "");
+      const unitGroups = [
+        ["sqm", ["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"]],
+        ["m run", ["m run", "m. run"]], ["m length", ["m length", "m. length"]],
+        ["nos", ["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"]],
+        ["lot", ["lot", "lots"]], ["sets", ["set", "sets"]],
+      ];
+      const unit = unitGroups.find(([, aliases]) => aliases.includes(lowerUnit))?.[0] || rawUnit;
+      const quantityText = String(item.quantity ?? "").replace(/[,%]/g, "").trim();
+      const quantity = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(quantityText) ? Number(quantityText) : null;
+      assert(quantity !== null && Number.isFinite(quantity), "Workbook request has invalid quantity.");
+      const mode = text(item.price_mode).toLowerCase();
+      const included = mode === "included" || text(item.unit_price_override) === "Included"
+        || (mode !== "priced" && text(item.display_price).toLowerCase() === "included");
+      return { description, quantity, unit, price_mode: included ? "Included" : "Priced" };
+    };
+    const expectedWorkbook = {
+      // Persist only verifier inputs, never the full browser request or media.
+      // Commercial defaults come from the reference; text comes from inputs we
+      // filled, so stale values shared by the request and workbook cannot pass.
+      payload: { currency: referenceConfig.currency, tax: referenceConfig.tax,
+        client: { name: expectedCustomer }, project: { title: expectedProject },
+        company: { name: companyFields.find(([selector]) => selector === "#quoteCompanyNameEditor")[1],
+          header_details: companyFields.find(([selector]) => selector === "#headerDetailsEditor")[1] },
+        project_number: expectedProjectNumber, line_items: xlsxJobRequest.line_items.map(workbookRow) },
+      rows: fixtureItems.map((item, index) => ({ ...workbookRow({ description: item.description,
+        quantity: index === 0 ? 2 : 1, unit: item.unit_hint,
+        price_mode: index === 0 ? "Priced" : "Included" }), unit_price: item.price })),
+      logo: { bytes: logoBuffer.length, sha256: createHash("sha256").update(logoBuffer).digest("hex") },
+    };
+    // Keep uploaded media out of the Windows command line and its size limit.
+    const workbookExpectationsPath = path.join(downloadsRoot, "workbook-expectations.json");
+    await fs.writeFile(workbookExpectationsPath, JSON.stringify(expectedWorkbook));
+    const strictXlsx = await spawnCollect(python, ["scripts/verify_current_workbook.py", xlsxPath,
+      workbookExpectationsPath], { cwd: root });
+    assert(strictXlsx.code === 0, "Row-bound workbook verification failed: " + safeErrorText(strictXlsx.stderr || strictXlsx.stdout, true));
+    const workbookValidation = JSON.parse(strictXlsx.stdout.trim());
     assert(downloadedXlsxDigest === xlsxReadback.exports.xlsx.sha256, "UI-downloaded XLSX differs from the published artifact.");
     const xlsxValidation = await validateXlsx(xlsxPath, [
       expectedCustomer, expectedProject, expectedProjectNumber, ...fixtureItems.map((item) => item.description),
@@ -772,6 +891,9 @@ async function main() {
     const currentXlsxValidation = await validateXlsx(currentXlsxPath, [
       expectedCustomer, expectedProject, expectedProjectNumber, ...fixtureItems.map((item) => item.description),
     ], [expectedLineAmount, Math.round(expectedLineAmount * 1.09 * 100) / 100], includedItem.description);
+    const strictCurrentXlsx = await spawnCollect(python, ["scripts/verify_current_workbook.py", currentXlsxPath,
+      workbookExpectationsPath], { cwd: root });
+    assert(strictCurrentXlsx.code === 0, "Post-PDF workbook verification failed: " + safeErrorText(strictCurrentXlsx.stderr || strictCurrentXlsx.stdout, true));
     const pdfValidation = await validatePdf(currentPdfPath);
     await pdfPopup.close();
 
@@ -817,6 +939,8 @@ async function main() {
     await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
     await reusedPopup.close();
     const postGenerationState = await quoteSessionDetail(api, baseUrl, sessionId);
+    requirePersistedIncluded(postGenerationState, includedItem.description);
+    requireOriginalUploadBytes(postGenerationState, originalUploads);
     assert(postGenerationState.exports?.xlsx?.sha256 === currentXlsx.sha256 && postGenerationState.exports?.pdf?.sha256 === currentPdf.sha256, "Post-generation readback changed artifact identity.");
     assert(Number(postGenerationState.draft_state?.outputRows?.find((row) => row.description === pricedItem.description)?.quantity) === 2, "Post-generation durable state changed the latest edit.");
 
@@ -858,7 +982,7 @@ async function main() {
         pdf: { run_id: resultRunIdPdf, status: pdfTerminal.status, publication_id: publicationId },
       },
       artifacts: {
-        xlsx: { sha256: currentXlsx.sha256, bytes: currentXlsx.size, validation: currentXlsxValidation },
+        xlsx: { sha256: currentXlsx.sha256, bytes: currentXlsx.size, validation: currentXlsxValidation, workbookValidation, committedWorkbook, originalWorkbookHTTP },
         pdf: { sha256: currentPdf.sha256, bytes: currentPdf.size, validation: pdfValidation },
       },
       matrix: {
@@ -887,6 +1011,7 @@ async function main() {
     if (reopenContext) await reopenContext.close().catch(() => {});
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
+    if (workbookReceipts) workbookReceipts.close();
     await stopHarness(harness).catch(() => {});
     if (runRoot) {
       const tempRoot = path.resolve(os.tmpdir()) + path.sep;

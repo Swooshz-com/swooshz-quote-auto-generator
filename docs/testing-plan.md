@@ -40,7 +40,7 @@ branch-protection setting is changed by this contract.
 | Feature | Test or suite | Execution and remaining limit |
 | --- | --- | --- |
 | First Customer entry, selected reference, currency and tax | `tests.test_webapp.WebappServerTest.test_static_next_to_customer_initializes_untouched_commercial_defaults`; `tests.test_webapp.WebappServerTest.test_static_authority_profile_race_discards_late_request_completely`; pricing-startup browser mode | Python discovery and fresh app smoke; focused visible-only startup mode is manual. State assertions alone do not prove visible labels. |
-| Save, reload, Modify, interrupted duplicate and restored pricing authority | Full app smoke; full alpha smoke; restoration test in the skip table | Full lifecycle qualification is a known gap: both direct CI browser commands select fresh Alpha1 scope and discovery excludes the restoration test. Fresh coverage must not be reported as full recovery coverage. |
+| Save, reload, Modify, interrupted duplicate and restored pricing authority | Full app smoke; full alpha smoke; restoration test in the skip table | CI selects the maintained full app and alpha commands plus an isolated recovery command. Discovery still excludes the separately tracked Python restoration test; browser selection is not a passing runtime receipt. |
 | Upload, basis review and generated XLSX | `tests.test_generate_quote`; `tests.test_quote_flow_reliability`; app smoke | Python discovery and fresh app smoke use synthetic inputs. No paid inference or customer files. |
 | Durable publication, protected XLSX/PDF and rollback | `tests.test_quote_publication_projection`; `tests.test_object_pdf_completion`; `tests.test_postgres_metadata_storage` | Python discovery; publication tests use local databases and synthetic object/query adapters. Disposable PostgreSQL migration coverage does not qualify the full publication journey or live Neon/R2. |
 | PostgreSQL migration and runtime privileges | `tests.test_postgres_migration_ledger`; `tests.test_runtime_privilege_contract` | Discovery with the disposable PostgreSQL 17 service; missing local service is a dependency skip, not hosted readiness. |
@@ -53,7 +53,7 @@ branch-protection setting is changed by this contract.
 ### Declared CI test commands
 
 These are the exact test steps in the `validate` job. `prerequisites` means
-`always() && steps.alpha1_prerequisites.outcome == 'success'`; `none` means no
+`always() && steps.runtime_prerequisites.outcome == 'success'`; `none` means no
 step-level condition or scope override. Command, condition and scope changes
 require review of this table, including any intentional narrowing. Extra shell
 wrappers or failure suppression in these steps are rejected by the contract.
@@ -64,8 +64,9 @@ wrappers or failure suppression in these steps are rejected by the contract.
 | Run Python tests | `python -m unittest discover -s tests` | alpha1 | none |
 | Run AI basis chat stress smoke | `npm run playwright:ai-stress` | none | prerequisites |
 | Run synthetic internal password auth smoke | `npm run playwright:internal-auth` | none | prerequisites |
-| Run app smoke test | `npm run playwright:smoke -- --alpha1` | none | prerequisites |
-| Run minimum internal alpha browser smoke | `npm run playwright:alpha-smoke -- --alpha1` | none | prerequisites |
+| Run app smoke test | `npm run playwright:smoke` | none | prerequisites |
+| Run isolated app recovery smoke | `npm run playwright:smoke -- --recovery-only` | none | prerequisites |
+| Run minimum internal alpha browser smoke | `npm run playwright:alpha-smoke` | none | prerequisites |
 <!-- coverage-ci:end -->
 
 ### Browser suite inventory
@@ -73,24 +74,25 @@ wrappers or failure suppression in these steps are rejected by the contract.
 Every `playwright:` package script is declared, including setup and manual tools.
 An `absent` command is deliberately outside direct CI selection and needs a
 reason. Indirect rendered checks reached through Python are not counted as a
-direct full-suite run. The full suites remain acceptance gaps until their
-failures are repaired and the owning lane approves CI wiring. Do not remove old
-failing fixtures or narrow their assertions to make that transition green.
+direct full-suite run. The maintained full suites and isolated recovery mode are
+selected by CI. Selection alone does not establish a passing browser receipt.
+Do not remove old failing fixtures or narrow their assertions to pass.
 
 <!-- coverage-browser:start -->
 | Suite | Package script | Script definition | CI command | Reason or limit |
 | --- | --- | --- | --- | --- |
 | browser-install | playwright:install | `playwright install chromium` | absent | Setup tool; CI installs Chromium with dependencies through npx. |
 | download-confirm | playwright:download-confirm | `node scripts/playwright-download-excel-confirm-regression.mjs` | absent | Focused manual download regression; not a direct CI command. |
-| app-fresh | playwright:smoke | `node scripts/playwright-smoke.mjs` | `npm run playwright:smoke -- --alpha1` | Fresh Alpha1 scope omits some reload and interrupted duplicate recovery branches. |
-| app-full | playwright:smoke | `node scripts/playwright-smoke.mjs` | absent | Manual full lifecycle command: npm run playwright:smoke. Full-smoke audit failure needs owning-lane repair before CI wiring. |
+| app-fresh | playwright:smoke | `node scripts/playwright-smoke.mjs` | absent | Retained manual --alpha1 path; CI selects the maintained full and isolated recovery paths. |
+| app-full | playwright:smoke | `node scripts/playwright-smoke.mjs` | `npm run playwright:smoke` | Broad lifecycle plus isolated G3 pricing/current XLSX. Expired-job and Customer Next commit checks run in the separate recovery step. |
+| app-recovery | playwright:smoke | `node scripts/playwright-smoke.mjs` | `npm run playwright:smoke -- --recovery-only` | Separate process/server/state for interrupted saves, terminal and expired jobs, and pricing-reference commit on Customer Next; avoids broad-run stale-draft contamination. |
 | pricing-startup | playwright:smoke | `node scripts/playwright-smoke.mjs` | absent | Manual focused command: npm run playwright:smoke -- --pricing-startup. Visible first-entry check, not a full lifecycle. |
 | customer-summary | playwright:customer-summary | `node scripts/playwright-customer-summary.mjs` | absent | Synthetic Customer summary matrix: first-entry visible reference, currency, tax, repeated entry, reload recovery, pending selection and held profile responses; manual command, not yet wired into CI; wiring is tracked separately. |
 | ai-stress | playwright:ai-stress | `node scripts/playwright-ai-basis-chat-stress.mjs` | `npm run playwright:ai-stress` | Mocked basis chat and interruption checks; no live provider readiness. |
 | internal-auth | playwright:internal-auth | `node scripts/playwright-internal-password-auth.mjs` | `npm run playwright:internal-auth` | Synthetic local staff admission and denial. |
-| screenshots | playwright:screenshot | `node scripts/playwright-smoke.mjs --screenshots` | absent | Manual visual tool; screenshots alone do not prove lifecycle acceptance. |
-| alpha-fresh | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | `npm run playwright:alpha-smoke -- --alpha1` | Alternate fresh-path implementation; does not execute the full alpha main journey. |
-| alpha-full | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | absent | Manual full lifecycle command: npm run playwright:alpha-smoke. Saved-reopen audit failure needs owning-lane investigation. |
+| screenshots | playwright:screenshot | `node scripts/playwright-smoke.mjs --screenshots` | absent | Manual broad-run visual tool using Playwright Chromium; skips the isolated G3 tail. Default full-smoke CI still runs G3. |
+| alpha-fresh | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | absent | Retained manual --alpha1 path; dedicated files remain for separate retirement work. |
+| alpha-full | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | `npm run playwright:alpha-smoke` | Native saved edits, reopen, workbook/PDF and protected download checks; renderer dependencies required. |
 | owner-uat | playwright:owner-uat-basis | `node scripts/playwright-owner-uat-basis-repair.mjs --lines=24 --latency-ms=800` | absent | Operator tool; bounded rendered variants also run indirectly in focused Python tests. |
 <!-- coverage-browser:end -->
 
@@ -310,6 +312,16 @@ the owner-approved CI lane.
   a cookie, and browser positive/negative flows. Provider behavior must use
   local synthetic adapters only.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
+  Run `python -m unittest tests.test_ci_browser_scope` for the maintained CI
+  browser commands and their four runtime-prerequisite gates. Both
+  `npm run playwright:smoke` and `npm run playwright:alpha-smoke` run without
+  `--alpha1`. The app smoke includes the isolated mocked-provider pricing and
+  current-XLSX flow after its full reload/recovery checks. The Python step still
+  sets `SQAG_VALIDATION_SCOPE: alpha1`: its only consumer skips the separately
+  tracked saved Modify/restoration case in `tests.test_webapp`, while the fresh
+  review/pricing case remains enabled. Do not remove that exclusion without
+  separately qualifying restoration. The owner contract invokes `--g3-pricing`
+  without the retired browser flag.
 - PostgreSQL migration manifest, ledger, preflight, or operator command: run
   `tests.test_postgres_migration_ledger` against the isolated CI PostgreSQL
   service and require fresh apply, complete schema, exact checksums, no-op
@@ -688,12 +700,59 @@ exports expose unknown `exists`/`missing`, no ordinary URL, and `unverified`
 availability; preserved historical bytes are checked separately from current delivery.
 Bound URL expectations join known session/kind/owner identities to independently
 read persisted publication metadata, including the canonical comparison digest.
-The `--alpha1` smoke also joins the accepted job's actual generator workbook bytes
-to that metadata and retains the original owning-server HTTP receipt and browser
-workbook size/SHA256 checks. Its fixed JSON template identity uses the checked-in LF
-bytes, normalising only CRLF pairs; the receipt also keeps the raw working-tree
-template SHA256. Workbook bytes are never normalised. No result URL alone supplies
-its own expected identity.
+The maintained `npm run playwright:alpha-smoke` joins the accepted job's actual
+generator workbook bytes to that metadata and checks the original owning-server
+HTTP receipt and native browser workbook filename, URL, size and SHA256. The
+authenticated protected download must equal the native browser bytes before PDF
+generation. `scripts/verify_current_workbook.py` independently binds each accepted
+priced/Included row's description, quantity, unit and numeric amount, then checks
+cached totals, dynamic formulas/currency, bold headers, centred quantities, money
+formatting, hidden internal columns, original uploaded logo, header placement and
+the selected quotation print area. It runs before and after native PDF generation.
+Currency/tax expectations come from the selected reference config; customer,
+project, company name and header details come from the fixture inputs entered in
+the smoke, not the generation request echo. Both header/logo anchors must remain
+inside print-area columns. B20 quantity and E20 estimate headers must be centred
+and right-aligned respectively, as the active quotation layout rules require.
+Protected same-session reads check original render/logo bytes, Customer checkpoint
+session/digest and Included authority with numeric zero amount. The maintained
+alpha smoke does not claim exact complete-draft equality or saved-profile binding
+through generation from the retained fresh-path runner.
+These checks use the existing quotation layout and synthetic catalogue inputs;
+they introduce no pricing aliases or product UI changes.
+
+Run `python -m unittest tests.test_alpha_workbook_request tests.test_current_workbook_receipt tests.test_workbook_http_receipt`
+for browser-request mapping, real-generator workbook proof and negative controls: swapped row amounts,
+incorrect quantities, formula/currency corruption, wrong logo/print area, exposed
+internal columns, stale or mismatched publication/owner/revision, wrong accepted
+job bytes, forged URLs, wrong download bytes and failed owning-server HTTP status.
+Negative controls also reject wrong reference currency/tax, company name/header
+details shared by request and workbook, out-of-area header/logo anchors and changed
+B20/E20 alignment. Run `python -m unittest tests.test_ci_smoke_reliability` for
+the default-path rate-window drain, unconditional final-save status check, fatal
+quote-session throttling, screenshot mode and protected readback guards.
+Both broad and isolated recovery app modes wait out the unchanged 60-second write
+window before generation recovery. Resumed final saves must return HTTP 200;
+any HTTP 429 observed on quote-session endpoints fails the run. The separate
+`npm run playwright:smoke -- --recovery-only` CI step retains expired-job and
+Customer Next selection-commit checks on fresh state; the broad default run
+does not invoke those two checks. No server rate limit is loosened.
+Run both full browser commands in an environment with Playwright Chromium and,
+for the native alpha smoke, LibreOffice and the declared Python PDF dependencies.
+Missing local dependencies are a test gap, not a passing browser result.
+The smoke uses Playwright Chromium locally as well as in CI. Screenshot mode
+runs the broad visual journey without the isolated G3 tail; default CI retains it.
+On Windows, native Excel COM PDF export may rewrite the workbook tax formula's
+expression while preserving its value. The post-PDF exact formula assertion
+still rejects such a rewrite; record it as a local converter qualification gap.
+CI's LibreOffice path and the verifier's formula requirements remain unchanged.
+
+The retained `--alpha1` runners additionally keep their fixed JSON template
+identity using checked-in LF bytes, normalising only CRLF pairs, and raw
+working-tree template SHA256. Their dedicated files and shared synthetic draft
+harness remain for separate retirement work and existing owner-basis consumers.
+Workbook bytes are never normalised. No result URL alone supplies its own
+expected identity.
 
 Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
 eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity
