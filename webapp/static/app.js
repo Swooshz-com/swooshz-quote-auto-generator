@@ -14375,7 +14375,7 @@ function quoteSessionDraftSynchronizationFailureMessage(failure = null) {
   } else if (failure?.status === 403) {
     message = "Quote could not be saved. Check your permission to save quotes and try again.";
   } else if (failure?.status === 413) {
-    message = `Quote could not be saved because the request is too large. PDFs can be up to ${MAX_REFERENCE_PDF_MIB} MiB each, with up to ${MAX_REFERENCE_TOTAL_MIB} MiB of reference files in total and 96 pages across PDFs. Reduce reference files and try again.`;
+    message = "Quote could not be saved because the request is too large. PDFs can be up to 48 MiB each, with up to 128 MiB of reference files in total and 96 pages across PDFs. Reduce reference files and try again.";
   } else if (failure?.status === 429) {
     message = "Quote could not be saved because there were too many requests. Wait a moment and try again.";
   }
