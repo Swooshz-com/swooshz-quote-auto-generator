@@ -9597,15 +9597,11 @@ function downloadCurrentExcelFile(file = state.downloadFile) {
   return true;
 }
 
-function viewCurrentPdfFile(file = state.pdfFile, preparedWindow = null) {
+function viewCurrentPdfFile(file = state.pdfFile) {
   if (commitActiveOutputEditor() === "blocked") return false;
-  if (!file?.url) {
-    if (preparedWindow && !preparedWindow.closed) preparedWindow.close();
-    return false;
-  }
-  const opened = preparedWindow || window.open(file.url, "_blank");
+  if (!file?.url) return false;
+  const opened = window.open(file.url, "_blank");
   if (opened) {
-    if (preparedWindow) opened.location.href = new URL(file.url, window.location.href).href;
     window.setTimeout(() => {
       if (!opened.closed) opened.opener = null;
     }, 0);
@@ -9629,17 +9625,15 @@ async function handleViewPdf(event) {
     return;
   }
   if (commitActiveOutputEditor() === "blocked") return;
-  if (pdfFileIsFresh(state.pdfFile)) return viewCurrentPdfFile();
-  const pdfWindow = window.open("about:blank", "_blank");
-  let openedPdf = false;
+  if (pdfFileIsFresh(state.pdfFile)) return showGeneratedExportReadyModal(true);
+  let pdfReady = false;
   showExcelGeneratingModal(generationLoadingModalOptions(true));
-  await waitForUiPaint();
   try {
+    await waitForUiPaint();
     const generated = await handleGenerate({ viewPdf: true });
-    if (generated) openedPdf = viewCurrentPdfFile(state.pdfFile, pdfWindow);
+    if (generated) pdfReady = showGeneratedExportReadyModal(true);
   } finally {
-    if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();
-    hideExcelGeneratingModal();
+    if (!pdfReady) hideExcelGeneratingModal();
   }
 }
 
