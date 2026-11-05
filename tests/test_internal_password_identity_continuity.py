@@ -232,8 +232,14 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
             delete_headers = headers | {"Cookie": cookie, public["csrf_header"]: public["csrf_token"]}
             status, _, response = self.http_fixture.http("DELETE", "/api/quote-sessions/" + session_id, delete_headers)
             self.assertEqual(status, expected_status)
-            records = [call.args[1] for call in audit.call_args_list if call.args[0] == "quote_session_delete_attempt"]
-            self.assertEqual(len(records), 1)
+            # The response can arrive before the handler's finally block logs.
+            deadline = time.monotonic() + 5
+            while True:
+                records = [call.args[1] for call in audit.call_args_list if call.args[0] == "quote_session_delete_attempt"]
+                if records or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(records), 1, "Expected exactly one quote_session_delete_attempt audit record within 5 seconds")
             record = records[0]
             self.assertEqual(record["outcome"], outcome)
             for field in ("actor_tracking_id", "workspace_tracking_id", "quote_tracking_id"):
