@@ -433,7 +433,7 @@ class DraftRequestContractTest(unittest.TestCase):
     def test_pdf_byte_limit_matches_browser_json_and_preserves_aggregate_ceiling(self):
         template = base64.b64decode(self.pdf.partition(",")[2])
         end = template.rindex(b"startxref")
-        self.assertEqual(server.MAX_PDF_BYTES, 24 * 1024 * 1024)
+        self.assertEqual(server.MAX_PDF_BYTES, 48 * 1024 * 1024)
         for size in (server.MAX_PDF_BYTES - 1, server.MAX_PDF_BYTES, server.MAX_PDF_BYTES + 1):
             with self.subTest(size=size):
                 # Insert a synthetic PDF comment after xref so object offsets stay valid.
@@ -1144,7 +1144,7 @@ class DraftRequestContractTest(unittest.TestCase):
         self.assertEqual(totals["reported_cost_usd"], 0)
         self.assertEqual(totals["unknown_cost_attempts"], 0)
 
-    def test_max_pages_and_seven_byte_limited_images_use_sixteen_sends(self):
+    def test_48_pages_and_seven_byte_limited_images_use_sixteen_sends(self):
         # Scale the byte ceiling down while preserving the production packing
         # relationship: six small pages fit and each large image fits alone.
         page = self.image
@@ -1160,7 +1160,7 @@ class DraftRequestContractTest(unittest.TestCase):
 
     def test_preflight_rejects_total_page_cap_and_call_cap_without_sending(self):
         with self.assertRaises(server.DraftBatchError) as error:
-            self.capture(self.payload(synthetic_pdf(30), synthetic_pdf(19)))
+            self.capture(self.payload(synthetic_pdf(60), synthetic_pdf(37)))
         self.assertEqual(error.exception.diagnostics["source_number"], 2)
         self.assertEqual(error.exception.diagnostics["batch_failure_reason"], "pdf_page_limit")
         with mock.patch.object(server, "MAX_DRAFT_BATCH_CALLS", 3):

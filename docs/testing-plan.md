@@ -53,7 +53,7 @@ npm run playwright:smoke
 
 - PDF references for quote analysis: run the focused draft request and gateway
   tests, then run the internal-password browser harness to check file admission.
-  The app accepts up to 24 MiB per PDF, 128 MiB across reference files and 48 PDF
+  The app accepts up to 48 MiB per PDF, 128 MiB across reference files and 96 PDF
   pages per analysis. Draft save and analysis carry base64 JSON, so test both
   requests through the deployed ingress with a synthetic PDF over 16 MiB before
   rollout. Check that a multi-batch analysis includes every source page, a failed

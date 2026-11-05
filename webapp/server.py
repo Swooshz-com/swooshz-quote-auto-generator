@@ -204,9 +204,9 @@ DEFAULT_CURRENCY_LABEL = "SGD"
 MISSING_IMAGES_MESSAGE = "Please upload reference images first so I can analyze the design and prepare the quote."
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
-MAX_PDF_BYTES = 24 * 1024 * 1024
+MAX_PDF_BYTES = 48 * 1024 * 1024
 MAX_SINGLE_SEND_PDF_BYTES = 16 * 1024 * 1024
-MAX_DRAFT_PDF_PAGES = 48
+MAX_DRAFT_PDF_PAGES = 96
 MAX_DRAFT_BATCH_MEDIA = 6
 MAX_DRAFT_BATCH_MEDIA_CHARS = 17 * 1024 * 1024
 MAX_DRAFT_BATCH_CALLS = 18
@@ -405,7 +405,7 @@ PUBLICATION_RETENTION_CURRENT = "current_version_retained"
 PUBLICATION_RETENTION_HELD = "held"
 PUBLICATION_RETENTION_FAILED = "failed"
 PUBLICATION_RETENTION_REFERENCED = "feedback_referenced"
-MAX_QUOTE_ARTIFACT_BYTES = 24 * 1024 * 1024
+MAX_QUOTE_ARTIFACT_BYTES = MAX_PDF_BYTES
 DEFAULT_CSRF_HEADER_NAME = "X-Swooshz-CSRF"
 CSRF_HEADER_NAME_ENV_NAME = "LOCAL_RUNNER_CSRF_HEADER_NAME"
 CSRF_TOKEN_ENV_NAME = "LOCAL_RUNNER_CSRF_TOKEN"
@@ -1098,7 +1098,7 @@ def ai_failure_metadata(
     metadata: dict[str, Any] = {
         "failure_kind": failure_kind,
         "error_type": type(chain[-1]).__name__ if chain else type(exception).__name__,
-        "safe_error_summary": summaries[failure_kind],
+        "safe_error_summary": draft_limit_message(diagnostics.get("batch_failure_reason", "")) or summaries[failure_kind],
     }
     if diagnostics:
         metadata.update(diagnostics)
@@ -19390,7 +19390,10 @@ def render_pdf_pages_with_pdfium(pdf_bytes: bytes, source_name: str, max_pages: 
     images: list[dict[str, Any]] = []
     try:
         if complete and not 1 <= len(document) <= max_pages:
-            raise DraftBatchError("pdf_page_limit")
+            raise DraftBatchError("pdf_page_limit", diagnostics={
+                "pdf_total_pages": len(document), "pdf_total_bytes": len(pdf_bytes),
+                "pdf_page_count_complete": 1,
+            })
         page_count = min(max_pages, len(document))
         for page_index in range(page_count):
             page = None
@@ -21449,6 +21452,12 @@ SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
     "source_number",
     "page_number",
     "batch_number",
+    "pdf_total_pages",
+    "pdf_total_bytes",
+    "pdf_page_limit",
+    "pdf_byte_limit",
+    "source_byte_limit",
+    "pdf_page_count_complete",
 }
 
 
@@ -21458,6 +21467,11 @@ def safe_ai_output_diagnostics(value: Any) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {}
     for key in SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS | SAFE_AI_FAILURE_DIAGNOSTIC_KEYS:
         item = value.get(key)
+        if key in {"pdf_total_pages", "pdf_total_bytes", "pdf_page_limit", "pdf_byte_limit",
+                   "source_byte_limit", "pdf_page_count_complete"}:
+            if type(item) is int and 0 <= item <= (1 << 63) - 1:
+                diagnostics[key] = item
+            continue
         if key in {"request_validation_stage", "request_validation_reason"}:
             allowed = DRAFT_REQUEST_VALIDATION_STAGES if key == "request_validation_stage" else DRAFT_REQUEST_VALIDATION_REASONS
             if isinstance(item, str) and item in allowed:
@@ -25862,12 +25876,14 @@ def normalize_ai_draft(
     return result
 
 
-def draft_request_invalid(stage: str = "request_envelope", reason: str = "invalid_input") -> None:
+def draft_request_invalid(stage: str = "request_envelope", reason: str = "invalid_input",
+                          *, diagnostics: dict[str, Any] | None = None) -> None:
     raise OpenAIAnalysisError(
         "AI draft request contains invalid or unsupported media or request fields.",
         diagnostics={
             "failure_boundary": "request_validation", "attempt_number": 0,
             "request_validation_stage": stage, "request_validation_reason": reason,
+            **safe_ai_output_diagnostics(diagnostics),
         },
     ) from None
 
@@ -25891,12 +25907,18 @@ def validate_draft_media(
     limit = max_bytes if max_bytes is not None else (MAX_PDF_BYTES if mime == "application/pdf" else MAX_IMAGE_BYTES)
     if not encoded:
         draft_request_invalid(stage, "invalid_media_format")
+    pdf_size_diagnostics = {
+        "batch_failure_reason": "pdf_byte_limit",
+        "pdf_total_bytes": len(encoded) // 4 * 3 - (2 if encoded.endswith("==") else int(encoded.endswith("="))),
+        "pdf_total_pages": 0, "pdf_page_count_complete": 0,
+        "pdf_byte_limit": limit, "pdf_page_limit": MAX_DRAFT_PDF_PAGES,
+    } if mime == "application/pdf" else {}
     if len(encoded) > 4 * ((limit + 2) // 3):
-        draft_request_invalid(stage, "media_byte_limit")
+        draft_request_invalid(stage, "media_byte_limit", diagnostics=pdf_size_diagnostics)
     try:
         raw = base64.b64decode(encoded, validate=True)
         if len(raw) > limit:
-            draft_request_invalid(stage, "media_byte_limit")
+            draft_request_invalid(stage, "media_byte_limit", diagnostics=pdf_size_diagnostics)
         if not raw or base64.b64encode(raw).decode("ascii") != encoded:
             draft_request_invalid(stage, "invalid_media_format")
         if mime == "application/pdf":
@@ -25909,7 +25931,10 @@ def validate_draft_media(
                 if len(document) < 1:
                     draft_request_invalid(stage, "invalid_media_format")
                 if len(document) > MAX_DRAFT_PDF_PAGES:
-                    raise DraftBatchError("pdf_page_limit")
+                    raise DraftBatchError("pdf_page_limit", diagnostics={
+                        "pdf_total_pages": len(document), "pdf_total_bytes": len(raw),
+                        "pdf_page_count_complete": 1,
+                    })
                 for index in range(len(document)):
                     page = document[index]
                     try:
@@ -25954,12 +25979,19 @@ def validate_draft_references(payload: dict[str, Any]) -> list[dict[str, Any]]:
             draft_request_invalid("reference_media")
         try:
             validate_draft_media(entry.get("data_url"))
-        except DraftBatchError as exc:
-            raise DraftBatchError(exc.diagnostics["batch_failure_reason"], source=source) from None
+        except OpenAIAnalysisError as exc:
+            if exc.diagnostics.get("batch_failure_reason") in {"pdf_page_limit", "pdf_byte_limit"}:
+                diagnostics = {**exc.diagnostics, **draft_pdf_limit_diagnostics(entries), "source_number": source}
+                if isinstance(exc, DraftBatchError):
+                    raise DraftBatchError(diagnostics["batch_failure_reason"], source=source,
+                                          diagnostics=diagnostics) from None
+                raise OpenAIAnalysisError(str(exc), diagnostics=diagnostics) from None
+            raise
         encoded = entry["data_url"].partition(",")[2]
         total_bytes += len(encoded) // 4 * 3 - (2 if encoded.endswith("==") else int(encoded.endswith("=")))
         if total_bytes > MAX_DRAFT_SOURCE_BYTES:
-            raise DraftBatchError("source_byte_limit", source=source)
+            raise DraftBatchError("source_byte_limit", source=source,
+                                  diagnostics=draft_pdf_limit_diagnostics(entries))
     return entries
 
 
@@ -26049,11 +26081,60 @@ def validate_draft_responses_envelope(
     return encoded, fingerprint
 
 
+def draft_limit_message(reason: str) -> str:
+    return {
+        "pdf_page_limit": f"PDF references can have up to {MAX_DRAFT_PDF_PAGES} pages in total across PDFs.",
+        "pdf_byte_limit": f"PDF references can be up to {MAX_PDF_BYTES // (1024 * 1024)} MiB each.",
+        "source_byte_limit": f"Reference files can be up to {MAX_DRAFT_SOURCE_BYTES // (1024 * 1024)} MiB in total.",
+    }.get(reason, "")
+
+
+def draft_pdf_limit_diagnostics(references) -> dict[str, int]:
+    """Count only on failure; never decode an over-limit file for diagnostics.
+
+    Zero complete means the page count is partial, not a claimed empty PDF.
+    Encoded byte counts are meaningful for canonical base64 references only.
+    """
+    pages = total_bytes = 0
+    complete = 1
+    for reference in references:
+        url = reference.get("data_url") if isinstance(reference, dict) else None
+        if not isinstance(url, str) or not url.startswith("data:application/pdf;base64,"):
+            continue
+        encoded = url.partition(",")[2]
+        size = len(encoded) // 4 * 3 - (2 if encoded.endswith("==") else int(encoded.endswith("=")))
+        total_bytes += max(0, size)
+        if not 0 < size <= MAX_PDF_BYTES:
+            complete = 0
+            continue
+        try:
+            import pypdfium2 as pdfium
+
+            raw = base64.b64decode(encoded, validate=True)
+            document = pdfium.PdfDocument(io.BytesIO(raw))
+            try:
+                pages += len(document)
+            finally:
+                document.close()
+        except Exception:
+            # Parser errors may contain supplied content; diagnostic counts are best effort.
+            complete = 0
+    return {
+        "pdf_total_pages": pages, "pdf_total_bytes": total_bytes,
+        "pdf_page_count_complete": complete, "pdf_page_limit": MAX_DRAFT_PDF_PAGES,
+        "pdf_byte_limit": MAX_PDF_BYTES, "source_byte_limit": MAX_DRAFT_SOURCE_BYTES,
+    }
+
+
 class DraftBatchError(OpenAIAnalysisError):
-    def __init__(self, reason, *, source=0, page=0, batch=0):
+    def __init__(self, reason, *, source=0, page=0, batch=0, diagnostics=None):
         super().__init__(
-            "AI analysis could not cover every reference.",
+            draft_limit_message(reason) or "AI analysis could not cover every reference.",
             diagnostics={
+                **safe_ai_output_diagnostics(diagnostics),
+                **({"pdf_page_limit": MAX_DRAFT_PDF_PAGES, "pdf_byte_limit": MAX_PDF_BYTES,
+                    "source_byte_limit": MAX_DRAFT_SOURCE_BYTES}
+                   if reason in {"pdf_page_limit", "pdf_byte_limit", "source_byte_limit"} else {}),
                 "failure_boundary": "draft_batch", "batch_failure_reason": reason,
                 "source_number": source, "page_number": page, "batch_number": batch,
             },
@@ -26145,7 +26226,10 @@ def prepare_draft_media(references):
             pages = render_pdf_pages_with_pdfium(raw, filename, pages_remaining, complete=True)
         except DraftBatchError as exc:
             raise DraftBatchError(exc.diagnostics["batch_failure_reason"], source=source,
-                                  page=exc.diagnostics["page_number"]) from None
+                                  page=exc.diagnostics["page_number"],
+                                  diagnostics=(draft_pdf_limit_diagnostics(references)
+                                               if exc.diagnostics["batch_failure_reason"] == "pdf_page_limit"
+                                               else exc.diagnostics)) from None
         except Exception:
             raise DraftBatchError("pdf_render", source=source) from None
         pdf_bytes_total += len(raw)
@@ -26834,6 +26918,8 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
             )
             return result
         except OpenAIAnalysisError as exc:
+            if draft_limit_message(exc.diagnostics.get("batch_failure_reason", "")):
+                raise
             if exc.diagnostics.get("failure_boundary") == "request_validation":
                 validation_metadata = ai_failure_metadata(
                     exc,
@@ -30437,10 +30523,13 @@ def generic_referenced_errors(error_reference: str = "") -> list[str]:
     return [GENERIC_REFERENCED_FAILURE_MESSAGE]
 
 
-def failed_result_payload(error_reference: str) -> dict[str, Any]:
+def failed_result_payload(error_reference: str, *, exception: BaseException | None = None) -> dict[str, Any]:
+    diagnostics = safe_ai_output_diagnostics(getattr(exception, "diagnostics", {}))
+    message = draft_limit_message(diagnostics.get("batch_failure_reason", ""))
     return {
         "status": "failed",
-        "errors": generic_referenced_errors(error_reference),
+        "errors": ([f"{message} Reference: {clean_text(error_reference)}."] if message
+                   else generic_referenced_errors(error_reference)),
         "error_reference": clean_text(error_reference),
     }
 
@@ -30812,7 +30901,7 @@ def finish_draft_job(job_id: str, payload: dict[str, Any], auth_session: dict[st
         result = draft_quote_basis(payload, auth_session=auth_session)
     except OpenAIAnalysisError as exc:
         error_reference = new_error_reference()
-        result = failed_result_payload(error_reference)
+        result = failed_result_payload(error_reference, exception=exc)
         write_local_log("draft_failed", ai_error_log_details(error_reference, exc, job_id=job_id))
     except Exception as exc:  # pragma: no cover - defensive worker boundary
         error_reference = new_error_reference()
@@ -34147,7 +34236,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     self.send_json(storage_access_error_payload(exc), status=exc.status)
                 except (OpenAIAnalysisError, QuoteSpendUnavailable) as exc:
                     error_reference = new_error_reference()
-                    result = failed_result_payload(error_reference)
+                    result = failed_result_payload(error_reference, exception=exc)
                     write_local_log("draft_failed", ai_error_log_details(error_reference, exc))
                     self.send_json(result, status=502)
                 except Exception as exc:
