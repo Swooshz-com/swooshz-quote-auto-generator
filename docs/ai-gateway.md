@@ -81,6 +81,7 @@ module/function in `failure_site_external`, and up to four exception class names
 1,200 characters. These fields stay server-side and never contain exception
 messages, arguments, locals, source lines or absolute paths; diagnostic failure
 preserves the original log fields without these additions.
+Publication admission failures also include a server-only `failure_reason` field containing a validated static condition name, without supplied values.
 
 The [Responses usage guide](https://openrouter.ai/docs/api_reference/responses/basic-usage),
 [reasoning guide](https://openrouter.ai/docs/api_reference/responses/reasoning),

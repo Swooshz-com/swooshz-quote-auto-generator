@@ -28326,6 +28326,18 @@ def quote_session_publication_freshness_proof(patch: dict[str, Any]) -> dict[str
     }
 
 
+def publication_subject_id(value: Any) -> str:
+    """Admit an exact storage subject, without trimming, hashing or case folding.
+
+    Password bindings and platform subjects use privacy_safe_tracking_id before
+    storage. Its bounded ASCII output includes internal-v1: and sha256: subjects;
+    resource IDs deliberately keep their separate, narrower grammar.
+    """
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None:
+        return ""
+    return value
+
+
 def quote_session_publication_freshness_proof_matches(
     metadata: dict[str, Any],
     patch: dict[str, Any],
@@ -28337,7 +28349,7 @@ def quote_session_publication_freshness_proof_matches(
         metadata,
         patch,
         workspace_id=safe_resource_id(subject.get("workspace_id"), ""),
-        owner_id=safe_resource_id(subject.get("owner_id"), ""),
+        owner_id=publication_subject_id(subject.get("owner_id")),
         authority=None,
         require_authority=False,
     ) is not None
@@ -28471,7 +28483,7 @@ def quote_session_current_v2_publication_proof(
     raw_session_id = metadata.get("session_id")
     session_id = safe_quote_session_id(raw_session_id, "")
     expected_workspace = safe_resource_id(workspace_id, "")
-    expected_owner = safe_resource_id(owner_id, "")
+    expected_owner = publication_subject_id(owner_id)
     if (
         not session_id
         or raw_session_id != session_id
@@ -28680,7 +28692,7 @@ def quote_session_publication_proof(
             "session_id": session_id,
             "scope": "workspace",
             "workspace_id": safe_resource_id(workspace_id, ""),
-            "owner_id": safe_resource_id(owner_id, ""),
+            "owner_id": publication_subject_id(owner_id),
         },
         "pricing_reference": {
             "id": safe_resource_id(pricing.get("id"), ""),
@@ -28701,26 +28713,38 @@ def quote_session_publication_proof(
             run_id=safe_reference(run_id, "run-"),
         ),
     }
-    required_digests = [
-        proof["pricing_reference"]["digest"],
-        proof["profile"]["digest"],
-        proof["profile"]["layout_digest"],
-        proof["profile"]["layout_rules_digest"],
-    ]
-    if (
-        not session_id
-        or not safe_publication
-        or proof["subject"]["scope"] != "workspace"
-        or not proof["subject"]["workspace_id"]
-        or not proof["subject"]["owner_id"]
-        or proof["output_revision"] < 0
-        or not proof["pricing_reference"]["id"]
-        or proof["pricing_reference"]["source"] not in PRICING_REFERENCE_SOURCES
-        or not proof["profile"]["id"]
-        or proof["profile"]["source"] not in {"company", "profile"}
-        or any(re.fullmatch(r"[0-9a-f]{64}", digest) is None for digest in required_digests)
-    ):
-        raise ValueError("Quote publication authority evidence is incomplete.")
+    return _validate_quote_publication_authority_proof(proof)
+
+
+class QuotePublicationAuthorityIncomplete(ValueError):
+    """Publication admission failed; the reason contains only a static field name."""
+
+    def __init__(self, safe_reason: str) -> None:
+        super().__init__("Quote publication authority evidence is incomplete.")
+        self.safe_reason = safe_reason
+
+
+def _validate_quote_publication_authority_proof(proof: dict[str, Any]) -> dict[str, Any]:
+    """Check the projected proof in a fixed order without exposing supplied values."""
+    checks = (
+        ("session_id", bool(proof["subject"]["session_id"])),
+        ("publication_id", bool(proof["publication"]["id"])),
+        ("scope", proof["subject"]["scope"] == "workspace"),
+        ("workspace_id", bool(proof["subject"]["workspace_id"])),
+        ("owner_id", bool(publication_subject_id(proof["subject"]["owner_id"]))),
+        ("output_revision", quote_session_strict_revision_number(proof["output_revision"], -1) >= 0),
+        ("pricing_reference_id", bool(proof["pricing_reference"]["id"])),
+        ("pricing_reference_source", proof["pricing_reference"]["source"] in PRICING_REFERENCE_SOURCES),
+        ("profile_id", bool(proof["profile"]["id"])),
+        ("profile_source", proof["profile"]["source"] in {"company", "profile"}),
+        ("pricing_reference_digest", re.fullmatch(r"[0-9a-f]{64}", proof["pricing_reference"]["digest"]) is not None),
+        ("profile_digest", re.fullmatch(r"[0-9a-f]{64}", proof["profile"]["digest"]) is not None),
+        ("profile_layout_digest", re.fullmatch(r"[0-9a-f]{64}", proof["profile"]["layout_digest"]) is not None),
+        ("profile_layout_rules_digest", re.fullmatch(r"[0-9a-f]{64}", proof["profile"]["layout_rules_digest"]) is not None),
+    )
+    for reason, valid in checks:
+        if not valid:
+            raise QuotePublicationAuthorityIncomplete(reason)
     return proof
 
 
@@ -30586,7 +30610,10 @@ def _unexpected_error_diagnostics(exc: BaseException) -> dict[str, Any]:
         chain.append(name[:120])
         current = current.__cause__ if current.__cause__ is not None else current.__context__
     diagnostics["error_chain"] = chain
-    # At most 4 sites, 4 classes and one external site, each at most 120 chars.
+    safe_reason = getattr(exc, "safe_reason", None)
+    if isinstance(safe_reason, str) and re.fullmatch(r"[a-z_]{1,60}", safe_reason):
+        diagnostics["failure_reason"] = safe_reason
+    # At most 4 sites, 4 classes and one external site (120 chars each), plus a 60-char reason.
     return diagnostics
 
 
