@@ -95,8 +95,10 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
     });
     assert.equal(blocked.save,null);assert.equal(blocked.generation,false);assert.equal(blocked.moved,false);for(const key of ['fresh','discard','restore','duplicate'])assert.equal(blocked[key],false);assert.deepEqual(blocked.after,blocked.before);assert.equal(page.context().pages().length,pageCount);
   }
+  const pagesBeforeBlockedExport=page.context().pages().length;
   await page.locator('#sideDownloadButton').click();
   await page.locator('#sideViewPdfButton').evaluate(e=>e.click());
+  assert.equal(page.context().pages().length,pagesBeforeBlockedExport,'Invalid editor must not open a PDF tab');
   assert.equal(await page.locator('#excelGeneratingModal').isVisible(),false);
   assert.equal(effects.length,0,'Invalid editor must reject before mutable HTTP requests');page.off('request',observe);
   assert.equal(await page.evaluate(()=>quoteSessionDraftComparisonKey(currentQuoteSessionDraftState())),staged);

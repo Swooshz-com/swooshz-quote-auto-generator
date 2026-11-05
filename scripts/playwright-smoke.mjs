@@ -1019,8 +1019,12 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
 
     try {
       await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
+      const pagesBeforeExport = page.context().pages().length;
       await page.locator(testCase.button + ":not([disabled])").click();
       await firstPostStarted;
+      if (testCase.viewPdf && page.context().pages().length !== pagesBeforeExport) {
+        throw new Error("PDF generation opened a waiting tab before refresh.");
+      }
       const savedBeforeRefresh = await page.evaluate(() => JSON.parse(
         window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
       ));
@@ -1103,6 +1107,9 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 15000 });
       const readyTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
       const readyAction = await page.locator("#excelGeneratingActionButton").getAttribute("data-export-action");
+      if (testCase.viewPdf && page.context().pages().length !== pagesBeforeExport) {
+        throw new Error("Refreshed PDF generation opened a tab before its ready action.");
+      }
       if (readyTitle !== testCase.readyTitle || readyAction !== testCase.action) {
         throw new Error("Recovered " + testCase.type + " result was not attached to its restored splash.");
       }
