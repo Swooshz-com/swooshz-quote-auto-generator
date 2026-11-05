@@ -8984,3 +8984,74 @@ body.privacy-page {
 .output-match-table .output-price-switch:focus-visible { outline: 2px solid #0f766e; outline-offset: 2px; }
 
 .output-match-table .output-price-switch:disabled { background: #f1f5f9; color: #64748b; border-color: #cbd5e1; cursor: not-allowed; }
+
+/* Shared control sizing for approved quote actions. */
+.basis-line-actions {
+  grid-template-columns: repeat(3, 32px);
+  gap: 8px;
+}
+
+.company-preset-profile-card .company-preset-action-panel,
+.excel-generating-actions:has([data-export-action="pdf"]) {
+  gap: 8px;
+}
+
+.company-preset-profile-card .company-preset-action-panel > button,
+.company-preset-profile-card .company-preset-more > .company-preset-more-button,
+.excel-generating-actions:has([data-export-action="pdf"]) > button {
+  box-sizing: border-box;
+  height: 40px;
+  min-height: 40px;
+  min-width: 96px;
+  padding: 0 16px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  line-height: 1.25;
+  align-self: center;
+  white-space: nowrap;
+}
+
+.basis-line-actions > button {
+  box-sizing: border-box;
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-radius: var(--radius-md);
+  align-self: center;
+}
+
+.excel-generating-actions:has([data-export-action="pdf"]) {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.basis-line-actions > button:focus-visible,
+.company-preset-profile-card .company-preset-action-panel > button:focus-visible,
+.company-preset-profile-card .company-preset-more > .company-preset-more-button:focus-visible,
+.excel-generating-actions:has([data-export-action="pdf"]) > button:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .basis-line-actions > button,
+  .company-preset-profile-card .company-preset-action-panel > button,
+  .company-preset-profile-card .company-preset-more > .company-preset-more-button,
+  .excel-generating-actions:has([data-export-action="pdf"]) > button {
+    height: 44px;
+    min-height: 44px;
+  }
+
+  .basis-line-actions {
+    grid-template-columns: repeat(3, 44px);
+    width: max-content;
+  }
+
+  .basis-line-actions > button {
+    width: 44px;
+  }
+}

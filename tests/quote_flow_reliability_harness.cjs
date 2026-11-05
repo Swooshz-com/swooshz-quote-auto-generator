@@ -278,6 +278,10 @@ function fixture(names) {
   const calls = [];
   const node = () => ({ hidden: true, textContent: "", dataset: {}, focus() {}, classList: { add() {}, remove() {} } });
   const elements = Object.fromEntries(["excelGeneratingModal", "excelGeneratingSpinner", "excelGeneratingActions", "excelGeneratingActionButton", "excelGeneratingCloseButton", "excelGeneratingEyebrow", "excelGeneratingTitle", "excelGeneratingMessage"].map((name) => [name, node()]));
+  elements.excelGeneratingActions.children = [elements.excelGeneratingActionButton, elements.excelGeneratingCloseButton];
+  elements.excelGeneratingActions.prepend = function (child) {
+    this.children = [child, ...this.children.filter(existing => existing !== child)];
+  };
   elements.sideNextButton = { getAttribute() { return "false"; } };
   const state = { isPreparingOutput: false, activeSidePanel: "customer", quoteSessionLoadError: "" };
   const context = vm.createContext({ state, elements, calls, Promise,
@@ -532,10 +536,17 @@ async function lifecycleCases() {
     assert.equal(elements.excelGeneratingTitle.textContent, "PDF ready");
     assert.equal(elements.excelGeneratingMessage.textContent, "Your PDF is ready. Click Open PDF to view it in a new tab.");
     assert.equal(elements.excelGeneratingActionButton.textContent, "Open PDF");
+    assert.deepEqual(elements.excelGeneratingActions.children, [elements.excelGeneratingCloseButton, elements.excelGeneratingActionButton]);
     assert(!elements.excelGeneratingModal.hidden && elements.excelGeneratingSpinner.hidden);
     assert.equal(state.restorableOverlay, "pdf_ready");
     assert.equal(openedUrls.length, 0, "Saved reuse shows the site's ready screen without opening a tab");
     await freshClick;
+    c.downloadFileIsFresh = () => true;
+    state.downloadFile = { url: "/api/synthetic.xlsx" };
+    assert.equal(c.showGeneratedExportReadyModal(false), true);
+    assert.deepEqual(elements.excelGeneratingActions.children, [elements.excelGeneratingActionButton, elements.excelGeneratingCloseButton]);
+    assert.equal(c.showGeneratedExportReadyModal(true), true);
+    assert.deepEqual(elements.excelGeneratingActions.children, [elements.excelGeneratingCloseButton, elements.excelGeneratingActionButton]);
     c.handleGeneratedExportReadyAction();
     assert.deepEqual(openedUrls, [state.pdfFile.url], "Open PDF opens synchronously within its button click");
     assert(elements.excelGeneratingModal.hidden);
