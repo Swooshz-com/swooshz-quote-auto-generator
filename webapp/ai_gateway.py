@@ -117,6 +117,7 @@ class GatewayRoute:
 class GatewayConfiguration:
     routes: tuple[GatewayRoute, ...]
     timeout_seconds: int
+    zdr: bool
 
     @classmethod
     def capture(cls, reader):
@@ -136,13 +137,16 @@ class GatewayConfiguration:
                 raise GatewayError("provider_policy")
             routes.append(GatewayRoute(operation,model,effort,providers[0]))
         expected = {"OPENROUTER_REQUIRE_PARAMETERS":"true", "OPENROUTER_ALLOW_FALLBACKS":"false",
-                    "OPENROUTER_DATA_COLLECTION":"deny", "OPENROUTER_ZDR":"true"}
+                    "OPENROUTER_DATA_COLLECTION":"deny"}
         if any(reader(key) != value for key,value in expected.items()):
+            raise GatewayError("provider_policy")
+        raw_zdr = reader("OPENROUTER_ZDR")
+        if raw_zdr not in ("true", "false"):
             raise GatewayError("provider_policy")
         raw_timeout = reader("OPENROUTER_REQUEST_TIMEOUT_SECONDS")
         if not isinstance(raw_timeout,str) or not re.fullmatch(r"[0-9]{1,4}",raw_timeout) or not 10 <= int(raw_timeout) <= 1800:
             raise GatewayError("timeout_configuration")
-        return cls(tuple(routes),int(raw_timeout))
+        return cls(tuple(routes),int(raw_timeout),raw_zdr == "true")
 
     def route(self,operation):
         route = next((r for r in self.routes if r.operation == operation),None)
@@ -152,7 +156,7 @@ class GatewayConfiguration:
     def provider_policy(self, operation):
         provider = self.route(operation).provider
         return {"only":[provider], "order":[provider], "allow_fallbacks":False,
-                "require_parameters":True, "data_collection":"deny", "zdr":True}
+                "require_parameters":True, "data_collection":"deny", "zdr":self.zdr}
 
 
 def safe_draft_error_param(value: Any) -> str:

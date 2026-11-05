@@ -115,7 +115,6 @@ EXPECTED_VALUES = {'APP_MODE': 'deploy',
  'OPENROUTER_ALLOW_FALLBACKS': 'false',
  'OPENROUTER_DATA_COLLECTION': 'deny',
  'OPENROUTER_REQUIRE_PARAMETERS': 'true',
- 'OPENROUTER_ZDR': 'true',
  'SQAG_ARTIFACT_STORAGE_MODE': 'object',
  'SQAG_AUTH_MODE': 'internal_password',
  'SQAG_PLATFORM_LAUNCH_MODE': 'disabled',
@@ -259,6 +258,9 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
     for key, expected in EXPECTED_VALUES.items():
         if values.get(key, "") != expected:
             findings.append(Finding(key, "unexpected-value", "value does not match the internal UAT template expectation"))
+
+    if values.get("OPENROUTER_ZDR") not in ("true", "false"):
+        findings.append(Finding("OPENROUTER_ZDR", "unexpected-value", "value must be exactly true or false"))
 
     for key in sorted(FORBIDDEN_KEYS):
         if key in values:

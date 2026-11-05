@@ -1,5 +1,6 @@
 """G01-G13 synthetic gateway boundaries; no network or paid inference."""
 import copy
+import dataclasses
 import io
 import json
 import unittest
@@ -60,6 +61,55 @@ class OpenRouterGatewayTest(unittest.TestCase):
             self.assertEqual(sent["provider"]["data_collection"],"deny"); self.assertFalse(sent["store"])
             credential.assert_called_once()
         self.assertEqual(self.config(values).route("draft").model,"other/model")
+
+    def test_G04_zdr_boolean_is_explicit_and_snapshotted_for_all_operations(self):
+        for raw_zdr, expected in (("true", True), ("false", False)):
+            values=synthetic_configuration(overrides={"OPENROUTER_ZDR":raw_zdr})
+            config=self.config(values)
+            self.assertIs(config.zdr,expected)
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                config.zdr = not expected
+            values["OPENROUTER_ZDR"]="false" if expected else "true"
+            for operation in gateway.ROUTE_KEYS:
+                with self.subTest(zdr=raw_zdr,operation=operation):
+                    route=config.route(operation); transport=RecordingTransport([completed(route)])
+                    gateway.AiGateway(config,credential_reader=lambda:"synthetic",transport=transport).request(operation,envelope(route))
+                    self.assertEqual(len(transport.calls),1)
+                    sent=transport.calls[0][0]
+                    self.assertIs(sent["provider"]["zdr"],expected)
+                    self.assertEqual(sent["provider"],{"only":[route.provider],"order":[route.provider],
+                        "allow_fallbacks":False,"require_parameters":True,"data_collection":"deny","zdr":expected})
+                    self.assertIs(sent["store"],False)
+
+    def test_G04_missing_empty_or_invalid_zdr_never_reads_credentials_or_sends(self):
+        for value in (None,"","True","False","1","no"," true","false ",True,False,1,[],{}):
+            values=synthetic_configuration()
+            if value is None:
+                values.pop("OPENROUTER_ZDR")
+            else:
+                values["OPENROUTER_ZDR"]=value
+            for operation in gateway.ROUTE_KEYS:
+                transport=RecordingTransport([]); credential=mock.Mock(return_value="synthetic")
+                with self.subTest(zdr=value,operation=operation),self.assertRaises(gateway.GatewayError) as caught:
+                    config=self.config(values)
+                    gateway.AiGateway(config,credential_reader=credential,transport=transport).request(operation,envelope(config.route(operation)))
+                self.assertEqual(caught.exception.reason,"provider_policy")
+                self.assertEqual(transport.calls,[])
+                credential.assert_not_called()
+
+    def test_G04_zdr_false_keeps_other_provider_policy_guards(self):
+        cases=[("OPENROUTER_DATA_COLLECTION",value) for value in (None,"","allow","DENY")]
+        cases += [("OPENROUTER_REQUIRE_PARAMETERS","false"),("OPENROUTER_ALLOW_FALLBACKS","true")]
+        for operation,suffix in gateway.ROUTE_KEYS.items():
+            route_cases=cases+[("OPENROUTER_"+suffix+"_PROVIDER_ONLY",value) for value in ('[]','["one","two"]')]
+            for key,value in route_cases:
+                values=synthetic_configuration(overrides={"OPENROUTER_ZDR":"false",key:value})
+                transport=RecordingTransport([])
+                with self.subTest(operation=operation,key=key,value=value),self.assertRaises(gateway.GatewayError) as caught:
+                    config=self.config(values)
+                    gateway.AiGateway(config,credential_reader=lambda:"synthetic",transport=transport).request(operation,envelope(config.route(operation)))
+                self.assertEqual(caught.exception.reason,"provider_policy")
+                self.assertEqual(transport.calls,[])
 
     def test_G02_G04_invalid_or_old_configuration_never_sends(self):
         values=synthetic_configuration()

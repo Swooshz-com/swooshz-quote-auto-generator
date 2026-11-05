@@ -35,7 +35,14 @@ Also configure `OPENROUTER_API_KEY`, a 10-1800-second integer
 - `OPENROUTER_REQUIRE_PARAMETERS=true`.
 - `OPENROUTER_ALLOW_FALLBACKS=false`.
 - `OPENROUTER_DATA_COLLECTION=deny`.
-- `OPENROUTER_ZDR=true`.
+- `OPENROUTER_ZDR` must be exactly `true` or `false`; it has no default.
+
+The gateway sends an explicit boolean `provider.zdr` for either value. Setting
+`false` is an owner-approved relaxation of the zero-data-retention requirement;
+data collection stays denied. The deploy template retains `true` as its default.
+Missing, empty or other values fail with `provider_policy` before any request.
+Live compatibility is proved only by installed qualification of the exact
+model/provider/account/media/effort/privacy combination.
 
 Configuration is captured once into an immutable operation snapshot. Metadata
 batches reuse that snapshot. The credential is server-only and never enters
@@ -78,9 +85,8 @@ Responses media/effort/privacy equivalence for this installation.
 
 Per-operation model and effort mappings are recorded for the current candidate.
 Recorded mappings do not prove the effective installed settings or exact
-model/provider/account/media/privacy compatibility. The reported installed Normal
-PDF-analysis request failed with HTTP 404; its cause remains unverified. Approved
-downstream endpoint/privacy behaviour, original-PDF-plus-image compatibility,
+model/provider/account/media/privacy compatibility. Approved downstream
+endpoint/privacy behaviour, original-PDF-plus-image compatibility,
 identity continuity and successful qualification of all six installed operations
 remain acceptance holds.
 Synthetic tests prove source contracts only. No credentials, live inference,
