@@ -407,7 +407,6 @@ async function main() {
       return response.status === 200 && response.body.authenticated ? response : false;
     }, "synthetic internal authentication", 20000);
     assert(authState.body.user === null && authState.body.authenticated === true, "Synthetic auth established an unexpected user identity.");
-    assert(authState.body.user?.account === workspaceId, "Synthetic auth did not establish the expected workspace.");
     assert(authState.body.permissions?.canGenerateQuote === true, "Synthetic authenticated user cannot generate quotes.");
 
     api = await request.newContext({ storageState: await context.storageState() });
@@ -478,7 +477,9 @@ async function main() {
     const sessionId = createdSave.body.quote_session.session_id;
     assert(createdSave.payload?.pricing_reference?.id === referenceConfig.id && createdSave.payload?.pricing_reference?.source === "local", "UI-created quote did not retain the selected pricing authority.");
     const authSession = await getJson(await api.get(`${baseUrl}/api/session`), "Authenticated session continuity before fixture setup");
-    assert(authSession.authenticated && authSession.user?.account === workspaceId, "Authenticated workspace changed after quote creation.");
+    assert(authSession.authenticated, "Authenticated session disappeared after quote creation.");
+    const createdProfileData = await getJson(await api.get(`${baseUrl}/api/profiles`), "Authenticated workspace continuity after quote creation");
+    assert(createdProfileData.workspace?.workspace?.id === workspaceId, "Authenticated workspace changed after quote creation.");
     const beforeSeed = await quoteSessionDetail(api, baseUrl, sessionId);
     assert(beforeSeed.session_id === sessionId && beforeSeed.customer_summary?.customer_name === expectedCustomer, "Created quote identity or customer context is incorrect.");
     assert(beforeSeed.pricing_reference?.id === referenceConfig.id && beforeSeed.pricing_reference?.source === "local", "Created quote lost its selected pricing authority.");
