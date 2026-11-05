@@ -150,7 +150,7 @@ function attachTrace(page, baseUrl) {
       if (url.pathname === "/api/quote-sessions" && req.method() === "POST") {
         const record = quoteSaveRequestRecords.get(req) || { sequence: 0, payload: safeJsonRequest(req) };
         trace.quoteSaves.push({ ...record, status: response.status(), body: await response.json() });
-      } else if (url.pathname === "/api/line-items/normalize" && req.method() === "POST") {
+      } else if (["/api/line-items/normalize", "/api/quote-sessions/pricing-selections"].includes(url.pathname) && req.method() === "POST") {
         trace.normalizations.push({ status: response.status(), payload: safeJsonRequest(req), body: await response.json() });
       } else if (url.pathname === "/api/jobs" && req.method() === "POST") {
         trace.jobs.push({ type: safeJsonRequest(req)?.type || "", request: safeJsonRequest(req), accepted: await response.json(), polls: [] });

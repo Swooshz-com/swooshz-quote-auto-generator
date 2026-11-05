@@ -2,6 +2,7 @@
 
 import io
 import json
+import re
 import tempfile
 import unittest
 import zipfile
@@ -136,7 +137,7 @@ class UnexpectedErrorDiagnosticTest(unittest.TestCase):
             details = s.unexpected_error_log_details(REFERENCE, error)
         self.assertNotIn("failure_site", details)
         self.assertNotIn(str(s.PROJECT_ROOT), json.dumps(details))
-        self.assertRegex(details["failure_site_external"], r"^tests\.test_unexpected_error_diagnostics:[A-Za-z_]+$")
+        self.assertRegex(details["failure_site_external"], rf"^{re.escape(__name__)}:[A-Za-z_]+$")
 
     def test_diagnostic_failure_including_system_exit_preserves_original_fields(self):
         original = ValueError("canary-detail-text")
