@@ -118,6 +118,7 @@ class GatewayConfiguration:
     routes: tuple[GatewayRoute, ...]
     timeout_seconds: int
     zdr: bool
+    draft_batch_effort: str | None = None
 
     @classmethod
     def capture(cls, reader):
@@ -146,7 +147,11 @@ class GatewayConfiguration:
         raw_timeout = reader("OPENROUTER_REQUEST_TIMEOUT_SECONDS")
         if not isinstance(raw_timeout,str) or not re.fullmatch(r"[0-9]{1,4}",raw_timeout) or not 10 <= int(raw_timeout) <= 1800:
             raise GatewayError("timeout_configuration")
-        return cls(tuple(routes),int(raw_timeout),raw_zdr == "true")
+        batch_effort = reader("OPENROUTER_DRAFT_BATCH_REASONING_EFFORT")
+        if batch_effort is not None and batch_effort != "" and (
+                not isinstance(batch_effort, str) or batch_effort not in SUPPORTED_REASONING_EFFORTS):
+            raise GatewayError("routing_configuration")
+        return cls(tuple(routes),int(raw_timeout),raw_zdr == "true", batch_effort or None)
 
     def route(self,operation):
         route = next((r for r in self.routes if r.operation == operation),None)
@@ -368,8 +373,16 @@ class AiGateway:
         self._telemetry=telemetry
         self._quote_spend = quote_spend
 
-    def request(self,operation,envelope, *, send_budget=None):
+    def request(self,operation,envelope, *, send_budget=None, draft_batch=False):
         route=self.configuration.route(operation)
+        if draft_batch:
+            if operation not in {"draft", "draft_high_quality"}:
+                raise GatewayError("envelope_invalid")
+            effort = self.configuration.draft_batch_effort
+            if effort is not None:
+                if not isinstance(effort, str) or effort not in SUPPORTED_REASONING_EFFORTS:
+                    raise GatewayError("routing_configuration")
+                route = dataclasses.replace(route, effort=effort)
         if not isinstance(envelope,dict) or set(envelope)-{"model","input","reasoning","max_output_tokens"} or envelope.get("model")!=route.model or envelope.get("reasoning")!={"effort":route.effort} or not isinstance(envelope.get("input"),list) or not envelope["input"]:
             raise GatewayError("envelope_invalid")
         body=copy.deepcopy(envelope)

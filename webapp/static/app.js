@@ -119,7 +119,7 @@ const REFERENCE_FILE_ACCEPT = "image/png,image/jpeg,image/webp,application/pdf,.
 const MAX_PRICING_REFERENCE_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES = 8;
 const MAX_REFERENCE_IMAGE_MIB = 12;
-const MAX_REFERENCE_PDF_MIB = 24;
+const MAX_REFERENCE_PDF_MIB = 48;
 const MAX_REFERENCE_TOTAL_MIB = 128;
 const DEFAULT_DATE_LABEL = "Date:";
 const DEFAULT_TERMS_HEADING = "Terms & Conditions:";
@@ -165,7 +165,7 @@ const QUOTE_COPY = {
   label: "Quotation",
   intakeSubtitle: "Drop reference images or PDFs for a real workspace quote.",
   dropTitle: "Drop reference images or PDFs to start",
-  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references. Images up to ${MAX_REFERENCE_IMAGE_MIB} MiB each, PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each. Up to ${MAX_REFERENCE_TOTAL_MIB} MiB total. Remote AI analysis sends selected refs to the configured provider.`,
+  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references. Images up to ${MAX_REFERENCE_IMAGE_MIB} MiB each, PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each and 96 pages in total across PDFs. Up to ${MAX_REFERENCE_TOTAL_MIB} MiB total. Remote AI analysis sends selected refs to the configured provider.`,
   imageNoun: "reference file",
   analyzeLabel: "Start Analysis",
   fallbackAction: "review the reference files",
@@ -14369,7 +14369,7 @@ function quoteSessionDraftSynchronizationFailureMessage(failure = null) {
   } else if (failure?.status === 403) {
     message = "Quote could not be saved. Check your permission to save quotes and try again.";
   } else if (failure?.status === 413) {
-    message = "Quote could not be saved because the request is too large. Reduce reference files and try again.";
+    message = "Quote could not be saved because the request is too large. PDFs can be up to 48 MiB each, with up to 128 MiB of reference files in total and 96 pages across PDFs. Reduce reference files and try again.";
   } else if (failure?.status === 429) {
     message = "Quote could not be saved because there were too many requests. Wait a moment and try again.";
   }

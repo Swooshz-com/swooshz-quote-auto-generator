@@ -151,6 +151,12 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 
 ## Deploy Runtime Gate
 
+- The deploy-template verifier permits the optional
+  `OPENROUTER_DRAFT_BATCH_REASONING_EFFORT` key to be absent, empty or the reviewed
+  placeholder. Runtime capture validates a nonempty value against the existing
+  effort set before any send. The four-send page-batch pool retains the 18-send
+  ceiling and zero retries; no CI job, trigger or required check changes.
+
 - CI still performs no deployment.
 - All six maintained inference operations require `OPENROUTER_API_KEY` and
   explicit `OPENROUTER_<SUFFIX>_MODEL`,
@@ -161,7 +167,7 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
   configuration for payload validation, transport and telemetry. Missing, blank
   or invalid settings fail before transport; source defaults and local `.env`
   values cannot fill deployed gaps. There is no provider/model fallback or
-  effort downgrade. Arbitrary configured model labels are redacted from logs,
+  silent effort downgrade. Arbitrary configured model labels are redacted from logs,
   telemetry and evidence. Local development retains explicit `.env` support.
   These source checks do not verify installed configuration, account access or
   exact Responses image/PDF/effort/privacy compatibility, and do not change
