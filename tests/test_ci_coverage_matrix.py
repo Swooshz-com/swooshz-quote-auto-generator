@@ -26,7 +26,7 @@ def table(document, name, columns):
     body = document.split(start)[1].split(end)[0].strip().splitlines()
     cells = [tuple(cell.strip().strip('`') for cell in line.strip('|').split('|'))
              for line in body]
-    if len(cells) < 3 or cells[0] != columns or cells[1] != ('---',) * len(columns):
+    if len(cells) < 2 or cells[0] != columns or cells[1] != ('---',) * len(columns):
         raise ValueError(f"Invalid coverage table header: {name}")
     rows = cells[2:]
     if any(len(row) != len(columns) or not all(row) for row in rows):
@@ -86,7 +86,7 @@ def validate_commands(document, workflow, package):
 
     suites = table(document, 'browser', (
         'Suite', 'Package script', 'Script definition', 'CI command', 'Reason or limit'))
-    required = {'app-fresh', 'app-full', 'app-recovery', 'alpha-fresh', 'alpha-full', 'pricing-startup'}
+    required = {'app-full', 'app-recovery', 'app-terminal', 'alpha-full', 'pricing-startup'}
     if not required <= {row[0] for row in suites}:
         raise ValueError('Missing critical browser lifecycle declaration')
     scripts = {key: value for key, value in package['scripts'].items()
@@ -164,11 +164,12 @@ class CoverageMatrixTests(unittest.TestCase):
         mutations = (
             ('python -m unittest discover -s tests', 'python -m unittest tests.test_generate_quote'),
             ('python -m unittest discover -s tests', 'python -m unittest discover -s tests -k fresh'),
-            ('run: npm run playwright:smoke\n', 'run: npm run playwright:smoke -- --alpha1\n'),
-            ('run: npm run playwright:alpha-smoke\n', 'run: npm run playwright:alpha-smoke -- --alpha1\n'),
+            ('run: npm run playwright:smoke\n', 'run: npm run playwright:smoke -- --pricing-startup\n'),
+            ('run: npm run playwright:alpha-smoke\n', 'run: npm run playwright:alpha-smoke -- --pricing-startup\n'),
             ('--recovery-only', '--pricing-startup'),
             ('npm run playwright:ai-stress', 'npm run playwright:ai-stress || true'),
-            ('SQAG_VALIDATION_SCOPE: alpha1', 'SQAG_VALIDATION_SCOPE: fresh-only'),
+            ('      - name: Run Python tests\n', '      - name: Run Python tests\n        env:\n          SQAG_VALIDATION_SCOPE: narrowed'),
+            ('--terminal-only', '--pricing-startup'),
             ('id: runtime_prerequisites', 'id: renamed_prerequisites'),
             (f'if: {PREREQUISITES}', 'if: false'),
             (f'if: {JOB_CONDITION}', 'if: false'),
@@ -189,7 +190,7 @@ class CoverageMatrixTests(unittest.TestCase):
 
     def test_undocumented_and_retargeted_browser_scripts_are_detected(self):
         for key, definition in (('playwright:new', 'node scripts/new.mjs'),
-                                ('playwright:smoke', 'node scripts/playwright-smoke.mjs --alpha1')):
+                                ('playwright:smoke', 'node scripts/playwright-smoke.mjs --pricing-startup')):
             package = json.loads(json.dumps(self.package))
             package['scripts'][key] = definition
             with self.subTest(script=key), self.assertRaises(ValueError):
@@ -208,11 +209,11 @@ class CoverageMatrixTests(unittest.TestCase):
     def test_scope_skip_addition_reason_change_and_unexplained_scope_are_detected(self):
         original = (
             'class ExampleTest:\n'
-            "    @unittest.skipIf(os.environ.get('SQAG_VALIDATION_SCOPE') == 'alpha1', 'Reviewed reason')\n"
+            "    @unittest.skipIf(os.environ.get('SQAG_VALIDATION_SCOPE') == 'narrowed', 'Reviewed reason')\n"
             '    def test_example(self): pass\n'
         )
         expected = [('tests/example.py::ExampleTest.test_example',
-                     "os.environ.get('SQAG_VALIDATION_SCOPE') == 'alpha1'", 'Reviewed reason')]
+                     "os.environ.get('SQAG_VALIDATION_SCOPE') == 'narrowed'", 'Reviewed reason')]
         self.assertEqual(scope_skips({'tests/example.py': original}), expected)
         changed = original.replace('Reviewed reason', 'Unreviewed omission')
         self.assertNotEqual(scope_skips({'tests/example.py': changed}), expected)
