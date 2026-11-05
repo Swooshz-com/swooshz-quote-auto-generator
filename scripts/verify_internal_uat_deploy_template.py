@@ -149,6 +149,10 @@ EXACT_PLACEHOLDERS = {'OPENROUTER_API_KEY': '<host-secret-manager-openrouter-key
  'SQAG_INTERNAL_WORKSPACE_ID': '<host-configured-fixed-internal-workspace-id>',
  'SQAG_TRACKING_HMAC_KEY': '<host-secret-manager-dedicated-tracking-hmac-key>'}
 
+OPTIONAL_PLACEHOLDERS = {
+    "OPENROUTER_DRAFT_BATCH_REASONING_EFFORT": "<host-reviewed-draft-batch-reasoning-effort>",
+}
+
 FORBIDDEN_KEYS = {'AI_BASIS_ANSWER_PROVIDER',
  'AI_BASIS_LINE_PROVIDER',
  'AI_PRICING_IMPORT_PROVIDER',
@@ -254,6 +258,10 @@ def verify_template(path: Path = DEFAULT_TEMPLATE) -> dict[str, object]:
     for key, expected in EXACT_PLACEHOLDERS.items():
         if values.get(key, "") != expected:
             findings.append(Finding(key, "unexpected-placeholder", "security-sensitive placeholder does not match the approved template marker"))
+
+    for key, expected in OPTIONAL_PLACEHOLDERS.items():
+        if values.get(key, "") not in ("", expected):
+            findings.append(Finding(key, "unexpected-placeholder", "optional setting must be empty or use the approved template marker"))
 
     for key, expected in EXPECTED_VALUES.items():
         if values.get(key, "") != expected:

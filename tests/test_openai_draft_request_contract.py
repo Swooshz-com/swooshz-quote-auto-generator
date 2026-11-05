@@ -1122,16 +1122,22 @@ class DraftRequestContractTest(unittest.TestCase):
         ):
             with self.subTest(terminal=type(terminal)):
                 self.send.reset_mock()
-                self.send.side_effect = [terminal]
+                def outcome(*args, **kwargs):
+                    if isinstance(terminal, Exception):
+                        raise terminal
+                    return terminal
+                self.send.side_effect = outcome
                 with mock.patch.object(server, "write_local_log", return_value=True) as log:
                     with self.assertRaises(server.DraftBatchError):
                         self.capture(self.payload(synthetic_pdf(13)))
                 totals = next(call.args[1]["total"] for call in log.call_args_list
                               if call.args[0] == "draft_batch_usage")
-                self.assertEqual(totals["sends"], 1)
-                self.assertEqual(totals["reported_cost_usd"], expected_cost)
-                self.assertEqual(totals["unknown_cost_attempts"], unknown)
-                self.send.assert_called_once()
+                # All three initial page batches are already in flight. Each
+                # settles once; a failed batch prevents the synthesis send.
+                self.assertEqual(totals["sends"], 3)
+                self.assertEqual(totals["reported_cost_usd"], expected_cost * 3)
+                self.assertEqual(totals["unknown_cost_attempts"], unknown * 3)
+                self.assertEqual(self.send.call_count, 3)
 
     def test_single_send_reports_zero_cost_even_without_tokens(self):
         self.send.return_value = json_response("openai/gpt-6.1-sol", {}, usage={"cost": 0})
@@ -1193,7 +1199,7 @@ class DraftRequestContractTest(unittest.TestCase):
                 with self.assertRaises(server.DraftBatchError) as error:
                     self.capture(self.payload(synthetic_pdf(13)))
                 self.assertEqual(error.exception.diagnostics["batch_number"], 1)
-                self.send.assert_called_once()
+                self.assertEqual(self.send.call_count, 3)
 
     def test_invalid_media_never_enters_local_starter_fallback(self):
         with mock.patch.object(server, "default_quote_basis") as fallback:

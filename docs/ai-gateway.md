@@ -64,6 +64,23 @@ PDFs above 16 MiB or analyses above 12 PDF pages use rendered-image batches.
 Each batch carries at most six images and 17 MiB of media characters.
 Rendered pages remain bounded to 1 MiB each, so 96 PDF pages fit 16 batches
 plus one synthesis send, within the unchanged 18-send budget, without retries.
+Page-observation batches run in a fixed pool of at most four sends per analysis.
+Results keep source order regardless of completion order. The first failure stops
+new submissions; in-flight sends finish and settle before the lowest failing
+batch number is reported. Synthesis starts only after every batch succeeds.
+Provider rate limits and timeouts fail the whole analysis with the existing
+batch failure reason, with zero retries. Concurrent analyses each have their own
+pool; this does not impose a global provider concurrency limit.
+
+`OPENROUTER_DRAFT_BATCH_REASONING_EFFORT` is optional. Missing or empty values
+inherit the selected draft route's effort. Set it to `medium` for a separately
+reviewed lower-effort page-observation run. It accepts exactly the same supported
+values as route efforts, with no trimming or case conversion; invalid values
+reject the captured configuration before any send. The immutable snapshot applies
+to both standard and high-quality page batches only. Synthesis, the single-send
+path and all other operations retain their existing route effort. The deploy
+template leaves this setting empty; it does not change a host's configuration.
+
 Mixed uploads can require more batches and still fail the existing call-budget
 preflight. Original PDF input-file sends retain the 50,000,000-byte combined
 limit; a 48 MiB PDF uses image batches rather than an original-file send.
