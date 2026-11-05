@@ -59,8 +59,12 @@ function safeJsonRequest(req) {
   try { return req.postDataJSON(); } catch { return null; }
 }
 
-function safeErrorText(value) {
-  return String(value?.message || value || "unknown error").replace(/[\r\n]+/g, " ").slice(0, 500);
+function safeErrorText(value, exceptionTail = false) {
+  const text = String(value?.message || value || "unknown error");
+  // The verifier sees synthetic inputs only. Keep its final exception, without
+  // copying traceback source lines or serialising uploaded media/job payloads.
+  if (exceptionTail) return text.trim().split(/\r?\n/).at(-1).slice(-400);
+  return text.replace(/[\r\n]+/g, " ").slice(0, 500);
 }
 
 async function waitUntil(predicate, label, timeoutMs = 20000) {
@@ -719,7 +723,14 @@ async function main() {
       path.join(downloadsRoot, "first-protected-quotation.xlsx"), "XLSX");
     assert(downloadedXlsxBytes.equals(protectedFirstXlsx.bytes), "Native browser and protected HTTP workbook bytes differ.");
     const expectedWorkbook = {
-      payload: xlsxJobRequest,
+      // Adapt browser field names and catalogue display notation to the
+      // verifier's workbook-facing contract, as payload_to_brief/the writer do.
+      payload: { ...xlsxJobRequest, currency: xlsxJobRequest.quote_currency,
+        line_items: xlsxJobRequest.line_items.map((item) => {
+          const match = item.description.trim().match(/^\[\s*([\s\S]*?)\s*\](?:\s*-\s*([\s\S]+))?$/);
+          const description = (match ? [match[1].trim(), (match[2] || "").trim()].filter(Boolean).join(" - ") : "") || item.description;
+          return { ...item, description };
+        }) },
       rows: fixtureItems.map((item, index) => ({ description: item.description,
         quantity: index === 0 ? 2 : 1, unit: item.unit_hint,
         price_mode: index === 0 ? "Priced" : "Included", unit_price: item.price })),
@@ -730,7 +741,7 @@ async function main() {
     await fs.writeFile(workbookExpectationsPath, JSON.stringify(expectedWorkbook));
     const strictXlsx = await spawnCollect(python, ["scripts/verify_current_workbook.py", xlsxPath,
       workbookExpectationsPath], { cwd: root });
-    assert(strictXlsx.code === 0, "Row-bound workbook verification failed: " + safeErrorText(strictXlsx.stderr || strictXlsx.stdout));
+    assert(strictXlsx.code === 0, "Row-bound workbook verification failed: " + safeErrorText(strictXlsx.stderr || strictXlsx.stdout, true));
     const workbookValidation = JSON.parse(strictXlsx.stdout.trim());
     assert(downloadedXlsxDigest === xlsxReadback.exports.xlsx.sha256, "UI-downloaded XLSX differs from the published artifact.");
     const xlsxValidation = await validateXlsx(xlsxPath, [
@@ -795,7 +806,7 @@ async function main() {
     ], [expectedLineAmount, Math.round(expectedLineAmount * 1.09 * 100) / 100], includedItem.description);
     const strictCurrentXlsx = await spawnCollect(python, ["scripts/verify_current_workbook.py", currentXlsxPath,
       workbookExpectationsPath], { cwd: root });
-    assert(strictCurrentXlsx.code === 0, "Post-PDF workbook verification failed: " + safeErrorText(strictCurrentXlsx.stderr || strictCurrentXlsx.stdout));
+    assert(strictCurrentXlsx.code === 0, "Post-PDF workbook verification failed: " + safeErrorText(strictCurrentXlsx.stderr || strictCurrentXlsx.stdout, true));
     const pdfValidation = await validatePdf(currentPdfPath);
     await pdfPopup.close();
 

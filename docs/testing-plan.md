@@ -620,8 +620,8 @@ the selected quotation print area. It runs before and after native PDF generatio
 These checks use the existing quotation layout and synthetic catalogue inputs;
 they introduce no pricing aliases or product UI changes.
 
-Run `python -m unittest tests.test_current_workbook_receipt tests.test_workbook_http_receipt`
-for real-generator workbook proof and negative controls: swapped row amounts,
+Run `python -m unittest tests.test_alpha_workbook_request tests.test_current_workbook_receipt tests.test_workbook_http_receipt`
+for browser-request mapping, real-generator workbook proof and negative controls: swapped row amounts,
 incorrect quantities, formula/currency corruption, wrong logo/print area, exposed
 internal columns, stale or mismatched publication/owner/revision, wrong accepted
 job bytes, forged URLs, wrong download bytes and failed owning-server HTTP status.

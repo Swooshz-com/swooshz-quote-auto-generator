@@ -49,13 +49,24 @@ def verify_workbook(data, payload, expected_rows, logo):
             assert Decimal(cells[ref]["value"]) == expected, "Wrong amount in its own row: " + ref
 
         assert expected_rows and len(expected_rows) == len(payload["line_items"]), "Missing expected rows"
-        row_indices, subtotal = [], Decimal(0)
+        row_indices, quantity_indices, subtotal = [], [], Decimal(0)
         for actual, expected in zip(payload["line_items"], expected_rows):
             assert all(actual[key] == expected[key] for key in ("description", "quantity", "unit", "price_mode")), "Generation rows differ from accepted edits"
             index = unique_row("C", expected["description"])
             row_indices.append(index)
             quantity = format(Decimal(str(expected["quantity"])).normalize(), "f")
-            assert cells[f"B{index}"]["value"] == quantity + " " + expected["unit"], "Wrong quantity/unit in its own row"
+            # The layout writer wraps long units into consecutive cells in the
+            # same item block. Never borrow quantity text from another item.
+            quantity_parts = [cells[f"B{index}"]["value"]]
+            quantity_indices.append(index)
+            continuation = index + 1
+            while cells.get(f"B{continuation}", {}).get("value"):
+                assert not any(cells.get(f"{column}{continuation}", {}).get("value") is not None
+                               for column in ("A", "E")), "Quantity crosses an item boundary"
+                quantity_parts.append(cells[f"B{continuation}"]["value"])
+                quantity_indices.append(continuation)
+                continuation += 1
+            assert " ".join(quantity_parts) == quantity + " " + expected["unit"], "Wrong quantity/unit in its own row"
             amount = Decimal(0) if expected["price_mode"] == "Included" else money(Decimal(str(expected["quantity"])) * Decimal(str(expected["unit_price"])))
             numeric(f"E{index}", amount)
             subtotal += amount
@@ -85,7 +96,7 @@ def verify_workbook(data, payload, expected_rows, logo):
         for ref in ("A20", "B20", "C20", "E20"):
             xf = xfs[cells[ref]["style"]]
             assert fonts[int(xf.get("fontId", "0"))].find("m:b", NS) is not None, "Header is not bold"
-        for index in row_indices:
+        for index in quantity_indices:
             assert xfs[cells[f"B{index}"]["style"]].find("m:alignment", NS).get("horizontal") == "center", "Quantity is not centred"
         for index in row_indices + totals:
             xf = xfs[cells[f"E{index}"]["style"]]
