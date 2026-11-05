@@ -71,6 +71,21 @@ class CurrentWorkbookReceiptTest(unittest.TestCase):
     def test_real_generated_workbook_binds_rows_totals_styles_and_original_logo(self):
         self.assertEqual(self.verify(), {"status": "valid", "rows_bound": 2, "totals_bound": 3, "original_logo": True})
 
+    def test_request_row_mismatches_name_index_and_key_without_values(self):
+        for index in range(len(self.rows)):
+            for key in ("description", "quantity", "unit", "price_mode"):
+                for missing in (False, True):
+                    with self.subTest(index=index, key=key, missing=missing):
+                        rows = [dict(row) for row in self.rows]
+                        if missing:
+                            rows[index].pop(key)
+                        else:
+                            rows[index][key] = "private-value-must-not-appear"
+                        with self.assertRaises(AssertionError) as error:
+                            verify_workbook(self.data, {**self.payload, "line_items": rows}, self.rows, self.logo_receipt)
+                        self.assertEqual(str(error.exception),
+                                         f"Generation rows differ from accepted edits: row index {index}, key {key}")
+
     def test_cli_reads_expectations_from_file_instead_of_a_large_command_argument(self):
         expectations = Path(self.temporary.name) / "expectations.json"
         payload = {**self.payload, "images": [{"synthetic_unused_media": "x" * 40000}]}

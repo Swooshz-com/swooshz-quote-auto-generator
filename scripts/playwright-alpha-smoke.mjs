@@ -722,18 +722,41 @@ async function main() {
     const protectedFirstXlsx = await authenticatedDownload(api, baseUrl, xlsxReadback.exports.xlsx,
       path.join(downloadsRoot, "first-protected-quotation.xlsx"), "XLSX");
     assert(downloadedXlsxBytes.equals(protectedFirstXlsx.bytes), "Native browser and protected HTTP workbook bytes differ.");
+    // Match payload_to_brief/prepare_lines and customer_quote_description.
+    // Output edits retain editor.value strings until server normalisation.
+    const workbookRow = (item) => {
+      const text = (value) => String(value || "").replace(/\s+/g, " ").trim().normalize("NFC");
+      const rawDescription = text(item.description);
+      const match = rawDescription.match(/^\[\s*([\s\S]*?)\s*\](?:\s*-\s*([\s\S]+))?$/);
+      const reference = match ? text(match[1]) : "";
+      const detail = match ? text(match[2]) : "";
+      const description = reference ? reference + (detail ? " - " + detail : "") : rawDescription;
+      const rawUnit = text(item.unit);
+      const lowerUnit = rawUnit.toLowerCase().replace(/^[. ]+|[. ]+$/g, "");
+      const unitGroups = [
+        ["sqm", ["m2", "m\u00b2", "m^2", "sq m", "sq.m", "sq.m.", "square metre", "square meter", "square metres", "square meters"]],
+        ["m run", ["m run", "m. run"]], ["m length", ["m length", "m. length"]],
+        ["nos", ["nos", "no", "pc", "pcs", "piece", "pieces", "unit", "units"]],
+        ["lot", ["lot", "lots"]], ["sets", ["set", "sets"]],
+      ];
+      const unit = unitGroups.find(([, aliases]) => aliases.includes(lowerUnit))?.[0] || rawUnit;
+      const quantityText = String(item.quantity ?? "").replace(/[,%]/g, "").trim();
+      const quantity = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(quantityText) ? Number(quantityText) : null;
+      assert(quantity !== null && Number.isFinite(quantity), "Workbook request has invalid quantity.");
+      const mode = text(item.price_mode).toLowerCase();
+      const included = mode === "included" || text(item.unit_price_override) === "Included"
+        || (mode !== "priced" && text(item.display_price).toLowerCase() === "included");
+      return { description, quantity, unit, price_mode: included ? "Included" : "Priced" };
+    };
     const expectedWorkbook = {
-      // Adapt browser field names and catalogue display notation to the
-      // verifier's workbook-facing contract, as payload_to_brief/the writer do.
-      payload: { ...xlsxJobRequest, currency: xlsxJobRequest.quote_currency,
-        line_items: xlsxJobRequest.line_items.map((item) => {
-          const match = item.description.trim().match(/^\[\s*([\s\S]*?)\s*\](?:\s*-\s*([\s\S]+))?$/);
-          const description = (match ? [match[1].trim(), (match[2] || "").trim()].filter(Boolean).join(" - ") : "") || item.description;
-          return { ...item, description };
-        }) },
-      rows: fixtureItems.map((item, index) => ({ description: item.description,
+      // Persist only verifier inputs, never the full browser request or media.
+      payload: { currency: xlsxJobRequest.quote_currency, tax: xlsxJobRequest.quote_tax,
+        client: { name: xlsxJobRequest.client.name }, project: { title: xlsxJobRequest.project.title },
+        company: { name: xlsxJobRequest.company.name, header_details: xlsxJobRequest.company.header_details },
+        project_number: xlsxJobRequest.project_number, line_items: xlsxJobRequest.line_items.map(workbookRow) },
+      rows: fixtureItems.map((item, index) => ({ ...workbookRow({ description: item.description,
         quantity: index === 0 ? 2 : 1, unit: item.unit_hint,
-        price_mode: index === 0 ? "Priced" : "Included", unit_price: item.price })),
+        price_mode: index === 0 ? "Priced" : "Included" }), unit_price: item.price })),
       logo: { bytes: logoBuffer.length, sha256: createHash("sha256").update(logoBuffer).digest("hex") },
     };
     // Keep uploaded media out of the Windows command line and its size limit.

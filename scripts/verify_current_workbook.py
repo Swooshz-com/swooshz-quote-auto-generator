@@ -50,8 +50,11 @@ def verify_workbook(data, payload, expected_rows, logo):
 
         assert expected_rows and len(expected_rows) == len(payload["line_items"]), "Missing expected rows"
         row_indices, quantity_indices, subtotal = [], [], Decimal(0)
-        for actual, expected in zip(payload["line_items"], expected_rows):
-            assert all(actual[key] == expected[key] for key in ("description", "quantity", "unit", "price_mode")), "Generation rows differ from accepted edits"
+        for row_index, (actual, expected) in enumerate(zip(payload["line_items"], expected_rows)):
+            for key in ("description", "quantity", "unit", "price_mode"):
+                assert key in actual and key in expected and actual[key] == expected[key], (
+                    f"Generation rows differ from accepted edits: row index {row_index}, key {key}"
+                )
             index = unique_row("C", expected["description"])
             row_indices.append(index)
             quantity = format(Decimal(str(expected["quantity"])).normalize(), "f")
