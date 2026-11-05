@@ -24,7 +24,7 @@ function extract(start, end) {
 }
 const stopSource = extract('async function stopServer(serverInfo)', 'async function screenshot(page, name)');
 const runSource = extract('async function runG3PricingScope()', 'async function main()');
-const scope = { options: { keepServer: false, host: '127.0.0.1', port: 17 }, baseUrl: 'http://127.0.0.1:17', outputDir: 'prior-output', path, os, alpha1Scope: false, process: { env: {} }, root: 'synthetic-repo', freshBrowserRun: async () => 'fresh-evidence', SyntheticBrowserBoundary };
+const scope = { options: { keepServer: false, host: '127.0.0.1', port: 17 }, baseUrl: 'http://127.0.0.1:17', outputDir: 'prior-output', path, os, process: { env: {} }, root: 'synthetic-repo', freshBrowserRun: async () => 'fresh-evidence', SyntheticBrowserBoundary };
 Object.defineProperty(scope, 'outputDir', { get: () => 'prior-output', set: () => { throw new Error('SYNTHETIC_OUTPUT_GLOBAL_MUTATION'); } });
 vm.runInNewContext(stopSource + '\n' + runSource + '\nglobalThis.subjectStop = stopServer; globalThis.subjectRun = runG3PricingScope;', scope);
 const timeout = setTimeout(() => { console.error('Synthetic lifecycle operation did not settle'); process.exit(1); }, 8000);

@@ -34074,13 +34074,9 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                     webapp.PRICING_REFERENCE_SELECTION_ERROR_MESSAGE,
                 )
 
-    def test_alpha1_fresh_review_and_pricing_use_real_browser_session_and_database_path(self):
+    def test_g3_fresh_review_and_pricing_use_real_browser_session_and_database_path(self):
         self._run_g3_browser_pricing_scope(exercise_restoration=False)
 
-    @unittest.skipIf(
-        os.environ.get("SQAG_VALIDATION_SCOPE") == "alpha1",
-        "Alpha2 Modify/restoration only; e3 CI38415683936 attempt1 remains FAIL; shared assertions gate Alpha1 separately.",
-    )
     def test_g3_restoration_review_and_pricing_use_real_browser_session_and_database_path(self):
         self._run_g3_browser_pricing_scope(exercise_restoration=True)
 
@@ -34561,7 +34557,7 @@ async function main() {
       })(),
       restoreError: state.quoteSessionLoadError || "",
     })).catch((captureError) => ({ captureError: String(captureError) }));
-    console.error(JSON.stringify({ scope: exerciseRestoration ? "alpha2" : "alpha1", diagnostic, consoleProblems }));
+    console.error(JSON.stringify({ scope: exerciseRestoration ? "alpha2" : "fresh", diagnostic, consoleProblems }));
     throw error;
   } finally {
     await context.close();
@@ -42091,8 +42087,8 @@ main().catch((error) => {
 
     OWNER_HISTORICAL_CLAIM = "synthetic-graphics-synthetic-hanging-banner"
 
-    # --- Alpha1 root pricing ledger (M1/M2/M3): the server, not the browser's row JSON, owns pricing trust. ---
-    LEDGER_SESSION = "quote-ledger-alpha1"
+    # --- Pricing ledger (M1/M2/M3): the server, not the browser's row JSON, owns pricing trust. ---
+    LEDGER_SESSION = "quote-ledger-regression"
     LEDGER_CARPET = "synthetic-floors-synthetic-carpet-tile"
 
     def _ledger_analysis(self, rows, *, session_id=LEDGER_SESSION, auth_session=None, payload=None):

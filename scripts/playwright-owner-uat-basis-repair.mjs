@@ -147,7 +147,7 @@ let exportPollGate = null;
 let generationRequests = 0;
 let detailFailurePath = "";
 function startServer() {
-  const child = spawn(python, [path.join(sourceRoot, "tests/alpha1_fresh_mock_harness.py"), sourceRoot, dirs.data, dirs.output, dirs.temp, dirs.logs, dirs.pricing, dirs.profiles, scenarioPath], {
+  const child = spawn(python, [path.join(sourceRoot, "tests/owner_uat_mock_harness.py"), sourceRoot, dirs.data, dirs.output, dirs.temp, dirs.logs, dirs.pricing, dirs.profiles, scenarioPath], {
     cwd: sourceRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, OPENAI_API_KEY: "", DEEPSEEK_API_KEY: "", SQAG_DISABLE_DOTENV: "1", PYTHONUNBUFFERED: "1" },
   });

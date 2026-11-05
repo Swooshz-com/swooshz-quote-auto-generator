@@ -21,8 +21,9 @@ NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
       "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
 
 
-def verify_workbook(data, payload, expected_rows, logo):
+def verify_workbook(data, payload, expected_rows, logo, *, template_path=None):
     """Bind values to their own rows, rather than finding numbers anywhere."""
+    template_path = template_path or Path(__file__).resolve().parents[1] / "templates/quote-layout/quotation-layout.xlsx"
     money = lambda value: Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         assert archive.testzip() is None, "Corrupt workbook"
@@ -92,9 +93,9 @@ def verify_workbook(data, payload, expected_rows, logo):
         assert int(start) <= min(row_indices) <= max(row_indices) <= int(end) < totals[0], "Subtotal excludes a line"
         assert cells[f"E{totals[1]}"]["formula"] == f"ROUND(E{totals[0]}*{rate:.6f},2)", "Wrong tax formula"
         assert cells[f"E{totals[2]}"]["formula"] == f"SUM(E{totals[0]}:E{totals[1]})", "Wrong final total formula"
-        assert cells["A6"]["value"] == payload["client"]["name"]
-        assert cells["A18"]["value"] == payload["project"]["title"]
-        assert any(ref.startswith("B") and cell["value"] == payload["company"]["name"] for ref, cell in cells.items())
+        assert cells["A6"]["value"] == payload["client"]["name"], "Customer name differs in A6"
+        assert cells["A18"]["value"] == payload["project"]["title"], "Project title differs in A18"
+        assert any(ref.startswith("B") and cell["value"] == payload["company"]["name"] for ref, cell in cells.items()), "Company name differs in workbook header"
 
         styles = ET.fromstring(archive.read("xl/styles.xml"))
         xfs, fonts = styles.find("m:cellXfs", NS), styles.find("m:fonts", NS)
@@ -129,7 +130,7 @@ def verify_workbook(data, payload, expected_rows, logo):
                    and payload["company"]["header_details"] in "".join(anchor.find("xdr:sp/xdr:txBody", NS).itertext())]
         assert len(headers) == 1, "Missing header details"
         header = headers[0]
-        assert "Project No: " + payload["project_number"] in "".join(header.itertext())
+        assert "Project No: " + payload["project_number"] in "".join(header.itertext()), "Project number differs in header details"
         assert header.find("xdr:sp/xdr:txBody/a:bodyPr", NS).get("anchor") == "t"
         assert all(run.get("sz") == "900" for run in header.findall("xdr:sp/xdr:txBody/a:p/a:r/a:rPr", NS))
         assert int(header.findtext("xdr:from/xdr:row", namespaces=NS)) > int(picture.findtext("xdr:to/xdr:row", namespaces=NS)), "Header overlaps logo"
@@ -137,8 +138,8 @@ def verify_workbook(data, payload, expected_rows, logo):
         print_area = workbook.find("m:definedNames/m:definedName[@name='_xlnm.Print_Area']", NS).text
         last_used = max(int(re.search(r"\d+", ref)[0]) for ref, cell in cells.items() if cell["value"] is not None)
         assert print_area == f"Quotation!$A$1:$I${last_used + 1}", "Print area changed"
-        area_columns = re.search(r"!\$([A-Z]+)\$\d+:\$([A-Z]+)\$\d+$", print_area)
-        assert area_columns is not None, "Invalid print area columns"
+        area = re.search(r"!\$([A-Z]+)\$(\d+):\$([A-Z]+)\$(\d+)$", print_area)
+        assert area is not None, "Invalid print area bounds"
 
         def column_index(letters):
             number = 0
@@ -146,12 +147,29 @@ def verify_workbook(data, payload, expected_rows, logo):
                 number = number * 26 + ord(letter) - ord("A") + 1
             return number - 1  # DrawingML columns are zero-based.
 
-        first_column, last_column = map(column_index, area_columns.groups())
+        first_column, last_column = column_index(area[1]), column_index(area[3])
+        first_row, last_row = int(area[2]) - 1, int(area[4]) - 1
+        # Header/logo placement belongs to the selected layout. Read its source
+        # geometry rather than accepting two equally misplaced generated shapes.
+        with zipfile.ZipFile(template_path) as template:
+            template_drawing = ET.fromstring(template.read("xl/drawings/drawing1.xml"))
+        template_header = next(anchor for anchor in template_drawing if anchor.find("xdr:sp", NS) is not None)
         for anchor in (picture, header):
             start_column = int(anchor.findtext("xdr:from/xdr:col", namespaces=NS))
             end_column = int(anchor.findtext("xdr:to/xdr:col", namespaces=NS))
+            start_row = int(anchor.findtext("xdr:from/xdr:row", namespaces=NS))
+            end_row = int(anchor.findtext("xdr:to/xdr:row", namespaces=NS))
             assert first_column <= start_column <= end_column <= last_column, "Header/logo anchor outside print area columns"
+            assert first_row <= start_row <= end_row <= last_row, "Header/logo anchor outside print area rows"
         assert header.findtext("xdr:from/xdr:col", namespaces=NS) == picture.findtext("xdr:from/xdr:col", namespaces=NS), "Header details are not aligned to logo"
+        # The template contains the details shape; the logo is inserted above
+        # it with image-dependent height. Bind both columns to that source shape
+        # and the header rows exactly, retaining the logo/no-overlap check above.
+        for anchor in (picture, header):
+            for marker in ("from", "to"):
+                for axis in (("col", "row") if anchor is header else ("col",)):
+                    coordinate = f"xdr:{marker}/xdr:{axis}"
+                    assert anchor.findtext(coordinate, namespaces=NS) == template_header.findtext(coordinate, namespaces=NS), "Header/logo anchor differs from selected template: " + marker + "/" + axis
     return {"status": "valid", "rows_bound": len(row_indices), "totals_bound": len(totals), "original_logo": True}
 
 

@@ -11,8 +11,8 @@ import runpy, sys
 from pathlib import Path
 root = Path(sys.argv[1])
 mode = sys.argv[2]
-sys.argv = [str(root / "tests/alpha1_fresh_mock_harness.py"), str(root)] + [str(root / ".tmp/harness-lifecycle-fixture")] * 6
-loaded = runpy.run_path(str(root / "tests/alpha1_fresh_mock_harness.py"), run_name="synthetic_harness")
+sys.argv = [str(root / "tests/owner_uat_mock_harness.py"), str(root)] + [str(root / "_tmp/harness-lifecycle-fixture")] * 7
+loaded = runpy.run_path(str(root / "tests/owner_uat_mock_harness.py"), run_name="synthetic_harness")
 namespace = loaded["main"].__globals__
 namespace["configure_auth_env"] = lambda: None
 class FakeServer:
@@ -32,7 +32,7 @@ print("SYNTHETIC_NORMAL_RETURN", flush=True)
 """
 
 
-class Alpha1HarnessLifecycleTest(unittest.TestCase):
+class OwnerHarnessLifecycleTest(unittest.TestCase):
     def child(self, mode):
         env = {key:os.environ[key] for key in ("PATH","SystemRoot","COMSPEC","TEMP","TMP") if key in os.environ}
         env.update(APP_MODE="local", SQAG_DISABLE_DOTENV="1", PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
