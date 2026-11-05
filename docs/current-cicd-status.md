@@ -125,20 +125,17 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 - Disposable PostgreSQL 17 runtime privilege-contract tests exercise the fourteen canonical query keys, exact result shapes, the automatic creator-admin control edge with ADMIN true, INHERIT false, and SET false, creator REVOKE non-removability, absence of inherited/SET/effective runtime authority, the real publication checksum-backfill path and its prescribed legacy `sqag_quote_artifacts` view read, the exact Boundary B owner authority split for database/schema ACL and PUBLIC TEMPORARY operations, complete table/column privilege matrices, complete default-ACL object classes, and database/schema grant-option semantics with disposable service databases and roles only. The hosted exact-head evidence must report zero skips.
 - Boundary A remains repository-only. It performs no live database, provider, credential, Coolify, deployment, or activation mutation.
 - Green CI does not authorise Boundary B or #160; those scopes require their own exact-head authority and verification.
-- Runs `python -m unittest discover -s tests`. The Python step retains
-  `SQAG_VALIDATION_SCOPE: alpha1` solely to exclude the separately tracked
-  saved Modify/restoration browser case in `tests.test_webapp`. Its fresh
-  review/pricing case still runs. Removing this exclusion needs separate
-  restoration qualification; it does not select either CI browser smoke's path.
+- Runs `python -m unittest discover -s tests` without validation-scope overrides,
+  including fresh and saved Modify/restoration browser pricing checks.
 - Runs the actual generated-workbook -> LibreOffice -> PDF -> PDFium raster and
   geometry regression, including canonical workbook styles, dimensions, bold
   headers, merges/header placement, logo aspect/no-overlap, print area,
   scaling, margins, page count, and deterministic rendered output.
 - Runs `npm run playwright:ai-stress`.
 - Runs `npm run playwright:internal-auth`.
-- Runs `npm run playwright:smoke` and `npm run playwright:alpha-smoke` without
-  `--alpha1`, plus `npm run playwright:smoke -- --recovery-only` in a separate
-  process with fresh quote state. All five browser steps remain gated by the successful
+- Runs `npm run playwright:smoke` and `npm run playwright:alpha-smoke`, plus `npm run playwright:smoke -- --recovery-only` in a separate
+  process with fresh quote state. The isolated `npm run playwright:smoke -- --terminal-only` step checks live
+  needs-review, blocked, failed and interrupted polling without reload. All six browser steps remain gated by the successful
   `runtime_prerequisites` privilege-contract validation, including after a
   Python test failure.
 - The default app smoke covers reload, saved reopen and generation recovery,
@@ -158,14 +155,20 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
   the comparison-bound protected URL, owning-server HTTP status and native
   browser download size/SHA256. Currency and tax expectations come from the
   selected reference config; customer/project/company text comes from entered
-  fixture inputs. Header and logo anchors must lie within print-area columns,
+  fixture inputs. Header and logo anchors must lie within print-area rows and columns and match the selected template geometry,
   and quantity/estimate headers retain their required alignment. Protected
   readbacks also check original render/logo bytes, the Customer checkpoint digest
   and persisted Included authority/zero amount. Exact complete-draft equality
-  and saved-profile binding from the retained fresh runner are not claimed.
+  and saved-profile binding through generation are not claimed; the owner UAT
+  carrier separately checks saved-profile selection.
   No live AI provider is used.
-- Alpha1-only runners and their harness lifecycle tests remain available for
-  separate retirement work; CI no longer passes their browser scope flag.
+- Owner basis UAT uses `tests/owner_uat_mock_harness.py` with a caller-written
+  synthetic scenario and network denial. Its lifecycle tests cover normal and
+  exceptional shutdown.
+- Last CI check-up: 2026-11-05, local read-only check against e83883b; hosted
+  job times and required-check settings were not accessible from this sandbox.
+  The changed-workflow check reports ten existing action references without
+  full commit pins. Action pinning remains separate from browser scope selection.
 
 ## Security And Secrets
 
