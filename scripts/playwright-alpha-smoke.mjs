@@ -774,23 +774,23 @@ async function main() {
     const pdfPopupRequests = [];
     const pdfPopupResponses = [];
     const observedPdfPopups = [];
-    page.on("popup", (popup) => {
-      observedPdfPopups.push(popup);
-      popup.on("request", (request) => pdfPopupRequests.push(request.url()));
-      popup.on("response", (response) => pdfPopupResponses.push({
+    page.on("popup", (popup) => observedPdfPopups.push(popup));
+    // The first navigation can precede popup listeners; observe it at context level.
+    page.context().on("request", (request) => {
+      if (new URL(request.url()).pathname.endsWith("/view/pdf")) pdfPopupRequests.push(request.url());
+    });
+    page.context().on("response", (response) => {
+      if (!new URL(response.url()).pathname.endsWith("/view/pdf")) return;
+      pdfPopupResponses.push({
         url: response.url(),
         status: response.status(),
         contentType: response.headers()["content-type"] || "",
         contentDisposition: response.headers()["content-disposition"] || "",
-      }));
+      });
     });
     const pdfJobIndex = trace.jobs.length;
-    const popupPromise = page.waitForEvent("popup", { timeout: 90000 }).then((popup) => ({ popup }), (error) => ({ error }));
+    const pagesBeforePdf = page.context().pages().length;
     await page.locator("#sideViewPdfButton").click();
-    const popupResult = await popupPromise;
-    assert(popupResult.popup, `View PDF did not open a popup: ${popupResult.error?.message || "unknown browser error"}.`);
-    const pdfPopup = popupResult.popup;
-    await pdfPopup.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
     await waitUntil(() => trace.jobs.length > pdfJobIndex && trace.jobs.slice(pdfJobIndex).some((job) => job.type === "generate_pdf"), "real PDF generation job");
     const pdfJob = trace.jobs.slice(pdfJobIndex).find((job) => job.type === "generate_pdf");
     await waitUntil(() => pdfJob.polls.some((poll) => ["completed", "failed", "needs_review"].includes(poll.body?.status)), "terminal PDF generation result", 90000);
@@ -803,6 +803,16 @@ async function main() {
     const pdfViewUrl = afterPdf.exports?.pdf?.view_url;
     assert(pdfViewUrl && pdfViewUrl === pdfJobSession.exports?.pdf?.view_url, "Completed PDF result did not publish the current protected inline view URL.");
     const expectedPdfViewUrl = new URL(pdfViewUrl, baseUrl).href;
+    await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 30000 });
+    assert((await page.locator("#excelGeneratingTitle").innerText()).trim() === "PDF ready", "PDF ready title is missing.");
+    assert((await page.locator("#excelGeneratingActionButton").innerText()).trim() === "Open PDF", "Open PDF action is missing.");
+    assert(await page.locator("#excelGeneratingSpinner").isHidden(), "Ready PDF still shows a spinner.");
+    assert(await page.locator("#excelGeneratingActionButton").evaluate(element => element === document.activeElement), "Ready action did not receive keyboard focus.");
+    assert(observedPdfPopups.length === 0 && pdfPopupRequests.length === 0 && page.context().pages().length === pagesBeforePdf, "View PDF opened a tab or fetched the PDF before Open PDF was clicked.");
+    const popupPromise = page.waitForEvent("popup", { timeout: 30000 });
+    await page.locator("#excelGeneratingActionButton").click();
+    const pdfPopup = await popupPromise;
+    await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
     await waitUntil(() => pdfPopupResponses.some((response) => response.url === expectedPdfViewUrl), "protected inline PDF preview response", 30000);
     const pdfPopupUrl = await pdfPopup.url();
     const sidePdfHref = await page.locator("#sideViewPdfButton").getAttribute("href").catch(() => null);
@@ -852,16 +862,27 @@ async function main() {
     const currentPdfViewUrl = new URL(afterPdf.exports.pdf.view_url, baseUrl).toString();
     assert(new URL(await page.locator("#sideViewPdfButton").getAttribute("href"), baseUrl).toString() === currentPdfViewUrl, "Reopened quote does not point to the current protected PDF view.");
     const reuseJobCount = trace.jobs.length;
+    const pagesBeforeReuse = page.context().pages().length;
+    const requestsBeforeReuse = pdfPopupRequests.length;
+    const popupsBeforeReuse = observedPdfPopups.length;
+    await page.locator("#sideViewPdfButton").click();
+    await page.locator("#excelGeneratingModal.is-ready").waitFor({ state: "visible", timeout: 15000 });
+    assert((await page.locator("#excelGeneratingTitle").innerText()).trim() === "PDF ready", "Saved PDF did not show the ready screen.");
+    assert((await page.locator("#excelGeneratingActionButton").innerText()).trim() === "Open PDF", "Saved PDF action is missing.");
+    assert(await page.locator("#excelGeneratingSpinner").isHidden(), "Saved PDF must not show generation loading.");
+    assert(page.context().pages().length === pagesBeforeReuse && observedPdfPopups.length === popupsBeforeReuse && pdfPopupRequests.length === requestsBeforeReuse, "Saved PDF opened before its ready action.");
+    assert(trace.jobs.length === reuseJobCount, "Saved PDF ready screen regenerated the quote.");
     const reusePopupPromise = page.waitForEvent("popup", { timeout: 30000 });
     const reuseResponsePromise = page.context().waitForEvent("response", {
       predicate: (response) => response.url() === currentPdfViewUrl,
       timeout: 30000,
     });
-    await page.locator("#sideViewPdfButton").click();
+    await page.locator("#excelGeneratingActionButton").click();
     const [reusedPopup, reusedResponse] = await Promise.all([reusePopupPromise, reuseResponsePromise]);
     assert(reusedResponse.status() === 200 && (reusedResponse.headers()["content-type"] || "").includes("application/pdf")
       && (reusedResponse.headers()["content-disposition"] || "").startsWith("inline;"), "Reopened PDF did not reuse its protected inline artifact.");
     assert(trace.jobs.length === reuseJobCount, "Viewing a current saved PDF dispatched an unnecessary generation job.");
+    await page.locator("#excelGeneratingModal").waitFor({ state: "hidden", timeout: 15000 });
     await reusedPopup.close();
     const postGenerationState = await quoteSessionDetail(api, baseUrl, sessionId);
     assert(postGenerationState.exports?.xlsx?.sha256 === currentXlsx.sha256 && postGenerationState.exports?.pdf?.sha256 === currentPdf.sha256, "Post-generation readback changed artifact identity.");

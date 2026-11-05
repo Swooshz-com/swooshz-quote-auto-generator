@@ -433,7 +433,7 @@ class DraftRequestContractTest(unittest.TestCase):
     def test_pdf_byte_limit_matches_browser_json_and_preserves_aggregate_ceiling(self):
         template = base64.b64decode(self.pdf.partition(",")[2])
         end = template.rindex(b"startxref")
-        self.assertEqual(server.MAX_PDF_BYTES, 24 * 1024 * 1024)
+        self.assertEqual(server.MAX_PDF_BYTES, 48 * 1024 * 1024)
         for size in (server.MAX_PDF_BYTES - 1, server.MAX_PDF_BYTES, server.MAX_PDF_BYTES + 1):
             with self.subTest(size=size):
                 # Insert a synthetic PDF comment after xref so object offsets stay valid.
@@ -1122,16 +1122,22 @@ class DraftRequestContractTest(unittest.TestCase):
         ):
             with self.subTest(terminal=type(terminal)):
                 self.send.reset_mock()
-                self.send.side_effect = [terminal]
+                def outcome(*args, **kwargs):
+                    if isinstance(terminal, Exception):
+                        raise terminal
+                    return terminal
+                self.send.side_effect = outcome
                 with mock.patch.object(server, "write_local_log", return_value=True) as log:
                     with self.assertRaises(server.DraftBatchError):
                         self.capture(self.payload(synthetic_pdf(13)))
                 totals = next(call.args[1]["total"] for call in log.call_args_list
                               if call.args[0] == "draft_batch_usage")
-                self.assertEqual(totals["sends"], 1)
-                self.assertEqual(totals["reported_cost_usd"], expected_cost)
-                self.assertEqual(totals["unknown_cost_attempts"], unknown)
-                self.send.assert_called_once()
+                # All three initial page batches are already in flight. Each
+                # settles once; a failed batch prevents the synthesis send.
+                self.assertEqual(totals["sends"], 3)
+                self.assertEqual(totals["reported_cost_usd"], expected_cost * 3)
+                self.assertEqual(totals["unknown_cost_attempts"], unknown * 3)
+                self.assertEqual(self.send.call_count, 3)
 
     def test_single_send_reports_zero_cost_even_without_tokens(self):
         self.send.return_value = json_response("openai/gpt-6.1-sol", {}, usage={"cost": 0})
@@ -1144,7 +1150,7 @@ class DraftRequestContractTest(unittest.TestCase):
         self.assertEqual(totals["reported_cost_usd"], 0)
         self.assertEqual(totals["unknown_cost_attempts"], 0)
 
-    def test_max_pages_and_seven_byte_limited_images_use_sixteen_sends(self):
+    def test_48_pages_and_seven_byte_limited_images_use_sixteen_sends(self):
         # Scale the byte ceiling down while preserving the production packing
         # relationship: six small pages fit and each large image fits alone.
         page = self.image
@@ -1160,7 +1166,7 @@ class DraftRequestContractTest(unittest.TestCase):
 
     def test_preflight_rejects_total_page_cap_and_call_cap_without_sending(self):
         with self.assertRaises(server.DraftBatchError) as error:
-            self.capture(self.payload(synthetic_pdf(30), synthetic_pdf(19)))
+            self.capture(self.payload(synthetic_pdf(60), synthetic_pdf(37)))
         self.assertEqual(error.exception.diagnostics["source_number"], 2)
         self.assertEqual(error.exception.diagnostics["batch_failure_reason"], "pdf_page_limit")
         with mock.patch.object(server, "MAX_DRAFT_BATCH_CALLS", 3):
@@ -1193,7 +1199,7 @@ class DraftRequestContractTest(unittest.TestCase):
                 with self.assertRaises(server.DraftBatchError) as error:
                     self.capture(self.payload(synthetic_pdf(13)))
                 self.assertEqual(error.exception.diagnostics["batch_number"], 1)
-                self.send.assert_called_once()
+                self.assertEqual(self.send.call_count, 3)
 
     def test_invalid_media_never_enters_local_starter_fallback(self):
         with mock.patch.object(server, "default_quote_basis") as fallback:

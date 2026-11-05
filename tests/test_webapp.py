@@ -20890,7 +20890,8 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertNotIn("openPendingPdfWindow", js)
         self.assertNotIn("navigatePendingPdfWindow", js)
         self.assertNotIn("closePendingPdfWindow", js)
-        self.assertIn('const pdfWindow = window.open("about:blank", "_blank");', js)
+        self.assertNotIn('window.open("about:blank", "_blank")', js)
+        self.assertNotIn("preparedWindow", js)
         self.assertIn('window.open(file.url, "_blank")', js)
         self.assertIn("opened.opener = null;", js)
         self.assertNotIn("window.location.assign(file.url)", js)
@@ -20900,7 +20901,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn('workspacePaneFooter.classList.toggle("is-output-step", isOutputStep)', js)
         self.assertIn('elements.sideDownloadButton.addEventListener("click", async (event) => {', js)
         self.assertIn('elements.sideViewPdfButton.addEventListener("click", handleViewPdf);', js)
-        download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  document.addEventListener("keydown"', 1)[0]
+        download_handler = js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split('  elements.sideViewPdfButton.addEventListener', 1)[0]
         pdf_handler = js.split("async function handleViewPdf(event)", 1)[1].split("function pricingMatchStatus", 1)[0]
         loading_options_body = js.split("function generationLoadingModalOptions", 1)[1].split("function generationFinalizingModalOptions", 1)[0]
         finalizing_options_body = js.split("function generationFinalizingModalOptions", 1)[1].split("function clearActiveJob", 1)[0]
@@ -20915,11 +20916,13 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("await handleGenerate();", download_handler)
         self.assertIn("downloadCurrentExcelFile();", download_handler)
         self.assertIn("hideExcelGeneratingModal();", download_handler)
-        self.assertIn("if (pdfFileIsFresh(state.pdfFile)) return viewCurrentPdfFile();", pdf_handler)
+        self.assertIn("if (pdfFileIsFresh(state.pdfFile)) return showGeneratedExportReadyModal(true);", pdf_handler)
         self.assertIn("await handleGenerate({ viewPdf: true });", pdf_handler)
-        self.assertIn("viewCurrentPdfFile(state.pdfFile, pdfWindow);", pdf_handler)
-        self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("viewCurrentPdfFile(state.pdfFile, pdfWindow);"))
-        self.assertIn("if (pdfWindow && !pdfWindow.closed && !openedPdf) pdfWindow.close();", pdf_handler)
+        self.assertIn("if (generated) pdfReady = showGeneratedExportReadyModal(true);", pdf_handler)
+        self.assertLess(pdf_handler.index("await handleGenerate({ viewPdf: true });"), pdf_handler.index("if (generated) pdfReady = showGeneratedExportReadyModal(true);"))
+        self.assertIn("if (!pdfReady) hideExcelGeneratingModal();", pdf_handler)
+        self.assertNotIn("window.open", pdf_handler)
+        self.assertNotIn("viewCurrentPdfFile(", pdf_handler)
         self.assertIn("showExcelGeneratingModal(generationLoadingModalOptions(true));", pdf_handler)
         self.assertIn('title: "Generating PDF"', loading_options_body)
         self.assertIn('title: viewPdf ? "Finalizing PDF" : "Finalizing Excel"', finalizing_options_body)

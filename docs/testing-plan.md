@@ -29,6 +29,96 @@ npm run playwright:ai-stress
 npm run playwright:smoke
 ```
 
+## Coverage Matrix and CI Scope
+
+The tables below describe coverage selection, not passing test receipts. The
+read-only contract `python -m unittest tests.test_ci_coverage_matrix` compares
+them with `package.json`, `.github/workflows/ci.yml` and scope-based unittest
+skips. It runs through the existing unittest discovery command. No workflow or
+branch-protection setting is changed by this contract.
+
+| Feature | Test or suite | Execution and remaining limit |
+| --- | --- | --- |
+| First Customer entry, selected reference, currency and tax | `tests.test_webapp.WebappServerTest.test_static_next_to_customer_initializes_untouched_commercial_defaults`; `tests.test_webapp.WebappServerTest.test_static_authority_profile_race_discards_late_request_completely`; pricing-startup browser mode | Python discovery and fresh app smoke; focused visible-only startup mode is manual. State assertions alone do not prove visible labels. |
+| Save, reload, Modify, interrupted duplicate and restored pricing authority | Full app smoke; full alpha smoke; restoration test in the skip table | Full lifecycle qualification is a known gap: both direct CI browser commands select fresh Alpha1 scope and discovery excludes the restoration test. Fresh coverage must not be reported as full recovery coverage. |
+| Upload, basis review and generated XLSX | `tests.test_generate_quote`; `tests.test_quote_flow_reliability`; app smoke | Python discovery and fresh app smoke use synthetic inputs. No paid inference or customer files. |
+| Durable publication, protected XLSX/PDF and rollback | `tests.test_quote_publication_projection`; `tests.test_object_pdf_completion`; `tests.test_postgres_metadata_storage` | Python discovery; publication tests use local databases and synthetic object/query adapters. Disposable PostgreSQL migration coverage does not qualify the full publication journey or live Neon/R2. |
+| PostgreSQL migration and runtime privileges | `tests.test_postgres_migration_ledger`; `tests.test_runtime_privilege_contract` | Discovery with the disposable PostgreSQL 17 service; missing local service is a dependency skip, not hosted readiness. |
+| Workbook layout and actual rendered PDF | `tests.test_generate_quote` native LibreOffice cases | Discovery after CI converter/font readiness checks. Local renderer skips leave fidelity unverified; XLSX remains the default master. |
+| Staff access, CSRF and protected routes | `tests.test_internal_password_auth`; `tests.test_internal_password_auth_webapp`; internal-auth browser suite | Discovery and direct synthetic browser command; no real credentials or identity-provider calls. |
+| AI request routing, privacy and errors | `tests.test_openrouter_gateway`; `tests.test_gateway_operation_lifecycle`; ai-stress browser suite | Discovery and mocked browser transport; request shape does not establish live provider eligibility. |
+| Installed source/image/asset identity | Operator comparison against the accepted candidate | Not established by event-head CI. Installation checks require their own read-only evidence; no deployment is performed here. |
+| Coverage selection and omissions | `tests.test_ci_coverage_matrix` | Discovery rejects command drift, undocumented package browser scripts and unexplained scope-based skips. It does not execute browser journeys or enforce GitHub required checks. |
+
+### Declared CI test commands
+
+These are the exact test steps in the `validate` job. `prerequisites` means
+`always() && steps.alpha1_prerequisites.outcome == 'success'`; `none` means no
+step-level condition or scope override. Command, condition and scope changes
+require review of this table, including any intentional narrowing. Extra shell
+wrappers or failure suppression in these steps are rejected by the contract.
+
+<!-- coverage-ci:start -->
+| Step | Command | Scope | Condition |
+| --- | --- | --- | --- |
+| Run Python tests | `python -m unittest discover -s tests` | alpha1 | none |
+| Run AI basis chat stress smoke | `npm run playwright:ai-stress` | none | prerequisites |
+| Run synthetic internal password auth smoke | `npm run playwright:internal-auth` | none | prerequisites |
+| Run app smoke test | `npm run playwright:smoke -- --alpha1` | none | prerequisites |
+| Run minimum internal alpha browser smoke | `npm run playwright:alpha-smoke -- --alpha1` | none | prerequisites |
+<!-- coverage-ci:end -->
+
+### Browser suite inventory
+
+Every `playwright:` package script is declared, including setup and manual tools.
+An `absent` command is deliberately outside direct CI selection and needs a
+reason. Indirect rendered checks reached through Python are not counted as a
+direct full-suite run. The full suites remain acceptance gaps until their
+failures are repaired and the owning lane approves CI wiring. Do not remove old
+failing fixtures or narrow their assertions to make that transition green.
+
+<!-- coverage-browser:start -->
+| Suite | Package script | Script definition | CI command | Reason or limit |
+| --- | --- | --- | --- | --- |
+| browser-install | playwright:install | `playwright install chromium` | absent | Setup tool; CI installs Chromium with dependencies through npx. |
+| download-confirm | playwright:download-confirm | `node scripts/playwright-download-excel-confirm-regression.mjs` | absent | Focused manual download regression; not a direct CI command. |
+| app-fresh | playwright:smoke | `node scripts/playwright-smoke.mjs` | `npm run playwright:smoke -- --alpha1` | Fresh Alpha1 scope omits some reload and interrupted duplicate recovery branches. |
+| app-full | playwright:smoke | `node scripts/playwright-smoke.mjs` | absent | Manual full lifecycle command: npm run playwright:smoke. Full-smoke audit failure needs owning-lane repair before CI wiring. |
+| pricing-startup | playwright:smoke | `node scripts/playwright-smoke.mjs` | absent | Manual focused command: npm run playwright:smoke -- --pricing-startup. Visible first-entry check, not a full lifecycle. |
+| customer-summary | playwright:customer-summary | `node scripts/playwright-customer-summary.mjs` | absent | Synthetic Customer summary matrix: first-entry visible reference, currency, tax, repeated entry, reload recovery, pending selection and held profile responses; manual command, not yet wired into CI; wiring is tracked separately. |
+| ai-stress | playwright:ai-stress | `node scripts/playwright-ai-basis-chat-stress.mjs` | `npm run playwright:ai-stress` | Mocked basis chat and interruption checks; no live provider readiness. |
+| internal-auth | playwright:internal-auth | `node scripts/playwright-internal-password-auth.mjs` | `npm run playwright:internal-auth` | Synthetic local staff admission and denial. |
+| screenshots | playwright:screenshot | `node scripts/playwright-smoke.mjs --screenshots` | absent | Manual visual tool; screenshots alone do not prove lifecycle acceptance. |
+| alpha-fresh | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | `npm run playwright:alpha-smoke -- --alpha1` | Alternate fresh-path implementation; does not execute the full alpha main journey. |
+| alpha-full | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | absent | Manual full lifecycle command: npm run playwright:alpha-smoke. Saved-reopen audit failure needs owning-lane investigation. |
+| owner-uat | playwright:owner-uat-basis | `node scripts/playwright-owner-uat-basis-repair.mjs --lines=24 --latency-ms=800` | absent | Operator tool; bounded rendered variants also run indirectly in focused Python tests. |
+<!-- coverage-browser:end -->
+
+### Intentional scope skips and receipts
+
+This table enumerates every unittest decorator using `SQAG_VALIDATION_SCOPE`.
+The exact predicate and reason are checked without importing or running the
+affected tests. Host/dependency skips (Node, Playwright, PostgreSQL, renderer,
+fonts, WebP, symlink and filesystem support) are separate runtime limits; they
+must appear in the run receipt and cannot silently become scope exclusions.
+
+<!-- coverage-skips:start -->
+| Test | Predicate | Reason |
+| --- | --- | --- |
+| tests/test_webapp.py::WebappServerTest.test_g3_restoration_review_and_pricing_use_real_browser_session_and_database_path | `os.environ.get('SQAG_VALIDATION_SCOPE') == 'alpha1'` | Alpha2 Modify/restoration only; e3 CI38415683936 attempt1 remains FAIL; shared assertions gate Alpha1 separately. |
+<!-- coverage-skips:end -->
+
+For each candidate qualification, retain the exact command and candidate identity,
+test count, failures/errors, skip count and named skip reasons. Report zero
+unexpected skips only after comparing the actual runner output with the scope
+table and available dependencies. Required PostgreSQL/native-rendering checks
+need zero skips on their provisioned CI host. This static contract is not a
+runtime skip-receipt collector. Full recovery, installed identity, live provider
+eligibility and hosted storage remain unverified until their own evidence exists.
+When workflow selection changes, update this matrix and
+`docs/current-cicd-status.md` together. Required-check/ruleset changes belong to
+the owner-approved CI lane.
+
 ## Feature Coverage Guide
 
 - Pricing-reference startup and first Customer entry: Run
@@ -53,7 +143,7 @@ npm run playwright:smoke
 
 - PDF references for quote analysis: run the focused draft request and gateway
   tests, then run the internal-password browser harness to check file admission.
-  The app accepts up to 24 MiB per PDF, 128 MiB across reference files and 48 PDF
+  The app accepts up to 48 MiB per PDF, 128 MiB across reference files and 96 PDF
   pages per analysis. Draft save and analysis carry base64 JSON, so test both
   requests through the deployed ingress with a synthetic PDF over 16 MiB before
   rollout. Check that a multi-batch analysis includes every source page, a failed

@@ -507,32 +507,152 @@ async function lifecycleCases() {
     assert.equal((await c.loadQuoteSessionDetail("quote-test")).session_id, "quote-test");
     assert.equal(state.quoteSessionLoadError, "");
   } else if (mode === "pdf") {
-    const { context: c, calls, state, elements } = fixture(["revisionNumber", "pdfFileIsFresh", "handleViewPdf"]);
+    const { context: c, calls, state, elements } = fixture([
+      "revisionNumber", "pdfFileIsFresh", "handleViewPdf", "viewCurrentPdfFile",
+      "showGeneratedExportReadyModal", "handleGeneratedExportReadyAction", "hideExcelGeneratingModal",
+    ]);
     elements.sideViewPdfButton = { getAttribute: () => "false" };
     state.outputRevision = 5;
     state.pdfFileRevision = 5;
     state.pdfFile = { url: "/api/quote-sessions/quote-test/view/pdf" };
-    c.viewCurrentPdfFile = (file = state.pdfFile, prepared) => { calls.push({ viewed: file.url, prepared: Boolean(prepared) }); return true; };
+    c.saveSessionState = () => {};
+    const openedUrls = [];
+    c.window = {
+      open(url, target) {
+        assert.notEqual(url, "about:blank");
+        assert.equal(target, "_blank");
+        openedUrls.push(url);
+        return { closed: false, opener: null };
+      },
+      setTimeout: (fn) => fn(),
+    };
     c.handleGenerate = async () => { throw Error("fresh PDF must not regenerate"); };
     const event = { preventDefault() {} };
-    await c.handleViewPdf(event);
-    assert.deepEqual(calls, [{ viewed: state.pdfFile.url, prepared: false }]);
-    calls.length = 0;
-    let popup;
-    c.window = { open(url) { assert.equal(url, "about:blank"); popup = { closed: false, close() { this.closed = true; } }; return popup; } };
+    const freshClick = c.handleViewPdf(event);
+    assert.equal(elements.excelGeneratingTitle.textContent, "PDF ready");
+    assert.equal(elements.excelGeneratingMessage.textContent, "Your PDF is ready. Click Open PDF to view it in a new tab.");
+    assert.equal(elements.excelGeneratingActionButton.textContent, "Open PDF");
+    assert(!elements.excelGeneratingModal.hidden && elements.excelGeneratingSpinner.hidden);
+    assert.equal(state.restorableOverlay, "pdf_ready");
+    assert.equal(openedUrls.length, 0, "Saved reuse shows the site's ready screen without opening a tab");
+    await freshClick;
+    c.handleGeneratedExportReadyAction();
+    assert.deepEqual(openedUrls, [state.pdfFile.url], "Open PDF opens synchronously within its button click");
+    assert(elements.excelGeneratingModal.hidden);
+    openedUrls.length = 0;
     c.generationLoadingModalOptions = () => ({});
     state.pdfFileRevision = 4;
-    c.handleGenerate = async () => false;
+
+    // All unsuccessful paths stop loading without opening a tab or offering stale files.
+    for (const outcome of ["blocked", "missing", "stale", "throw"]) {
+      c.handleGenerate = async () => {
+        if (outcome === "throw") throw Error("controlled PDF failure");
+        state.pdfFile = outcome === "missing" ? null : { url: "/api/quote-sessions/quote-test/view/pdf" };
+        return outcome !== "blocked";
+      };
+      if (outcome === "throw") await assert.rejects(c.handleViewPdf(event), /controlled PDF failure/);
+      else await c.handleViewPdf(event);
+      assert(elements.excelGeneratingModal.hidden, outcome);
+      assert.equal(openedUrls.length, 0, outcome);
+      assert.notEqual(state.restorableOverlay, "pdf_ready", outcome);
+    }
+    c.waitForUiPaint = async () => { throw Error("controlled paint failure"); };
+    await assert.rejects(c.handleViewPdf(event), /controlled paint failure/);
+    assert(elements.excelGeneratingModal.hidden);
+    c.waitForUiPaint = async () => {};
+
+    // Use the real generation/file-attachment path, with transport and final save held.
+    vm.runInContext([
+      "handleGenerate", "setDownloadFiles", "clearActiveJob",
+      "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage",
+    ].map(extract).join("\n"), c);
+    state.activeSidePanel = "output";
+    state.basisConfirmed = true;
+    state.outputRows = [{ description: "Synthetic row" }];
+    state.pdfFile = null;
+    state.pdfFileRevision = -1;
+    let release, releaseSave, saveStarted = false, generationReturned;
+    const gate = new Promise(resolve => { release = resolve; });
+    const saveGate = new Promise(resolve => { releaseSave = resolve; });
+    const result = {
+      status: "completed",
+      files: [{ name: "quotation.pdf", url: "/api/jobs/synthetic/files/quotation.pdf" }],
+      quote_session: { session_id: "quote-test", exports: {
+        pdf: { view_url: "/api/quote-sessions/quote-test/view/pdf?current" },
+      } },
+    };
+    Object.assign(c, {
+      quoteCommercialReviewRequired: () => false,
+      outputRowsValid: () => ({ valid: true, errors: [] }),
+      outputRowsToLineItems: () => state.outputRows,
+      missingDetailFields: () => [], normalizeActiveJob: value => value,
+      newClientJobId: () => "job-synthetic", setWorkflowStage() {},
+      setResultStatus() {}, renderMessages() {}, clearPricingReviewMessages() {},
+      ensureQuoteSession: async () => "quote-test",
+      buildPayload: options => { assert.equal(options.viewPdf, true); return { line_items: state.outputRows }; },
+      startJob: async type => { assert.equal(type, "generate_pdf"); return { ok: true, data: { job_id: "job-synthetic" } }; },
+      currentGenerationContext: () => ({ session_id: "quote-test", run_id: "" }),
+      transitionGenerationContext() {}, safeQuoteSessionId: value => value,
+      pollJob: async () => { await gate; return { ok: true, data: { status: "completed", result } }; },
+      isInterruptedJobPoll: () => false,
+      // Output-row contract validation has its own matrix; keep this timing case focused.
+      adoptGenerationOutputRows: value => value,
+      setSidePanel() {}, renderPricingMatches() {}, renderMatchSummary() {},
+      updateDownloadButton() {},
+      saveQuoteSessionDraftState: async () => {
+        saveStarted = true;
+        assert.equal(state.pdfFile.url, result.quote_session.exports.pdf.view_url);
+        assert.equal(c.pdfFileIsFresh(), true);
+        await saveGate;
+        return { session_id: "quote-test" };
+      },
+    });
+    const realGenerate = c.handleGenerate;
+    c.handleGenerate = async options => { generationReturned = await realGenerate(options); return generationReturned; };
+    const pending = c.handleViewPdf(event);
+    await new Promise(setImmediate);
+    assert.equal(state.pdfFile, null);
+    assert.equal(c.pdfFileIsFresh(), false);
+    assert(!elements.excelGeneratingModal.hidden && !elements.excelGeneratingSpinner.hidden);
+    assert.equal(openedUrls.length, 0);
+    release();
+    await new Promise(setImmediate);
+    assert(saveStarted, "Completed job reaches the final save before handleGenerate returns");
+    assert.equal(state.pdfFile.url, result.quote_session.exports.pdf.view_url);
+    assert.equal(c.pdfFileIsFresh(), true);
+    assert.equal(generationReturned, undefined);
+    assert(!elements.excelGeneratingModal.hidden && !elements.excelGeneratingSpinner.hidden);
+    assert.equal(openedUrls.length, 0);
+    releaseSave(); await pending;
+    assert.equal(generationReturned, true);
+    assert(!elements.excelGeneratingModal.hidden && elements.excelGeneratingSpinner.hidden);
+    assert.equal(elements.excelGeneratingTitle.textContent, "PDF ready");
+    assert.equal(elements.excelGeneratingMessage.textContent, "Your PDF is ready. Click Open PDF to view it in a new tab.");
+    assert.equal(elements.excelGeneratingActionButton.textContent, "Open PDF");
+    assert.equal(elements.excelGeneratingActionButton.dataset.exportAction, "pdf");
+    assert.equal(state.restorableOverlay, "pdf_ready");
+    assert.equal(openedUrls.length, 0, "Completion waits for a real Open PDF click");
+
+    c.commitActiveOutputEditor = () => "blocked";
+    c.handleGeneratedExportReadyAction();
+    assert.equal(openedUrls.length, 0);
+    assert(!elements.excelGeneratingModal.hidden);
+    c.commitActiveOutputEditor = () => "none";
+    c.handleGeneratedExportReadyAction();
+    assert.deepEqual(openedUrls, [state.pdfFile.url]);
+    assert(elements.excelGeneratingModal.hidden);
+    assert.equal(state.restorableOverlay, "");
+
+    // Close is safe: View PDF returns to ready with no regeneration or automatic tab.
+    c.showGeneratedExportReadyModal(true);
+    c.hideExcelGeneratingModal();
+    c.handleGenerate = async () => { throw Error("dismissed ready PDF must not regenerate"); };
     await c.handleViewPdf(event);
-    assert(popup.closed && elements.excelGeneratingModal.hidden, "failed generation must close the waiting tab and spinner");
-    assert(!calls.some((entry) => entry.viewed), "stale PDF was viewed");
-    c.handleGenerate = async () => { throw Error("controlled PDF failure"); };
-    await assert.rejects(c.handleViewPdf(event), /controlled PDF failure/);
-    assert(popup.closed && elements.excelGeneratingModal.hidden);
-    c.handleGenerate = async () => { state.pdfFile = { url: "/api/quote-sessions/quote-test/view/pdf?current" }; state.pdfFileRevision = 5; return true; };
-    calls.length = 0;
-    await c.handleViewPdf(event);
-    assert(!popup.closed && calls.some((entry) => entry.viewed === state.pdfFile.url && entry.prepared));
+    assert.equal(openedUrls.length, 1);
+    assert(!elements.excelGeneratingModal.hidden && elements.excelGeneratingSpinner.hidden);
+    assert.equal(elements.excelGeneratingActionButton.textContent, "Open PDF");
+    c.handleGeneratedExportReadyAction();
+    assert.equal(openedUrls.length, 2);
     assert(elements.excelGeneratingModal.hidden);
     calls.length = 0;
     elements.sideViewPdfButton.getAttribute = () => "true";
@@ -540,6 +660,11 @@ async function lifecycleCases() {
     c.renderOutputValidationMessages = () => { calls.push("blocked"); };
     await c.handleViewPdf(event);
     assert.deepEqual(calls, ["blocked"]);
+    assert.equal(openedUrls.length, 2);
+    elements.sideViewPdfButton.getAttribute = () => "false";
+    c.commitActiveOutputEditor = () => "blocked";
+    await c.handleViewPdf(event);
+    assert.equal(openedUrls.length, 2);
   } else if (mode === "ack") {
     for (const panel of ["images", "quote_company"]) {
       const { context: c, state, elements } = fixture(["withQuoteStepLoading", "goToNextSidePanel"]);

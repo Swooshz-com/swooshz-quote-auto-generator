@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -26,6 +27,34 @@ IGNORED_LOCAL_ARTIFACT_PATHS = {
 
 
 class SensitiveFixtureScanTest(unittest.TestCase):
+    def test_marker_regex_matches_and_rejects_long_whitespace_quickly(self):
+        cases = (
+            (scan_sensitive_fixtures.REAL_COMPANY_RE, ("koncept", "images", "pte")),
+            (scan_sensitive_fixtures.REAL_COMPANY_RE, ("koncept", "image", "pte")),
+            (scan_sensitive_fixtures.CUSTOMER_SAMPLE_RE, ("kent", "group")),
+        )
+        for pattern, words in cases:
+            for separator in (" ", "   ", "-", "---", " -  - ", "\t\n"):
+                for transform in (str.lower, str.upper, str.swapcase):
+                    text = transform(separator.join(words))
+                    with self.subTest(pattern=pattern.pattern, text=text):
+                        self.assertIsNotNone(pattern.fullmatch(text))
+            for text in ("".join(words), " ".join((*words[:-1], "unrelated"))):
+                with self.subTest(pattern=pattern.pattern, text=text):
+                    self.assertIsNone(pattern.search(text))
+
+        for pattern, prefix in (
+            (scan_sensitive_fixtures.REAL_COMPANY_RE, "koncept"),
+            (scan_sensitive_fixtures.REAL_COMPANY_RE, "koncept images"),
+            (scan_sensitive_fixtures.CUSTOMER_SAMPLE_RE, "kent"),
+        ):
+            with self.subTest(pattern=pattern.pattern, prefix=prefix):
+                start = time.perf_counter()
+                match = pattern.search(prefix + " " * 50 + "unrelated")
+                elapsed = time.perf_counter() - start
+                self.assertIsNone(match)
+                self.assertLess(elapsed, 2.0)
+
     def test_current_committed_fixture_scan_has_no_blocking_findings(self):
         findings = scan_sensitive_fixtures.scan_tracked_files(Path.cwd())
         blocking = [finding for finding in findings if finding.severity == "block"]
