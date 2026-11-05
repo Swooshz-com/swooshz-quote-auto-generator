@@ -64,6 +64,7 @@ class FakePostgresConnection:
         "sqag_pricing_references",
         "sqag_quote_publication_versions",
         "sqag_quote_sessions",
+        "sqag_quote_ai_spend",
         "sqag_object_artifacts",
     }
 
@@ -93,6 +94,10 @@ class FakePostgresConnection:
                 "sqag_profiles": {"workspace_id", "profile_id", "payload_json", "created_at", "updated_at"},
                 "sqag_pricing_references": {"workspace_id", "reference_id", "payload_json", "created_at", "updated_at"},
                 "sqag_quote_sessions": {"workspace_id", "session_id", "metadata_json", "draft_files_json", "created_at", "updated_at"},
+                "sqag_quote_ai_spend": {
+                    "workspace_id", "job_id", "session_id", "actor_id", "incarnation",
+                    "claim_token", "category", "attempts_json",
+                },
                 "sqag_object_artifacts": {
                     "artifact_id",
                     "workspace_id",
@@ -407,6 +412,7 @@ class SqliteSqagMigrationTest(unittest.TestCase):
             "008_quote_session_deletion_hold_authority_postgres.sql",
             "009_telemetry_events_postgres.sql",
             "010_telemetry_attempt_semantics_postgres.sql",
+            "011_quote_ai_spend_postgres.sql",
         ]
 
         with mock.patch(

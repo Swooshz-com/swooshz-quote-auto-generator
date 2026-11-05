@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from webapp import server as webapp
+from tests.gateway_test_support import synthetic_configuration, json_response, responses_envelope, FixtureHttpResponse, install_mock_responses_transport
+from webapp.ai_gateway import OPENROUTER_RESPONSES_URL
 
 
 RE_CHAOS_PROMPTS = [
@@ -95,7 +97,7 @@ def stress_payload() -> dict:
     }
 
 
-def openai_response(payload: dict) -> mock.MagicMock:
+def openai_response(payload: dict) -> FixtureHttpResponse:
     intent = webapp.basis_chat_required_intent(payload)
     if intent == "answer":
         content = {"intent": "answer", "answer": "- **Meaning:** This line needs operator confirmation."}
@@ -112,22 +114,17 @@ def openai_response(payload: dict) -> mock.MagicMock:
                 },
             },
         }
-    response = mock.MagicMock()
-    response.__enter__.return_value.read.return_value = json.dumps({"output_text": json.dumps(content)}).encode("utf-8")
-    return response
+    operation = "basis_answer" if intent == "answer" else "basis_line"
+    return json_response("synthetic/"+operation, content)
 
 
 class AIBasisChatStressTest(unittest.TestCase):
+    def setUp(self):
+        install_mock_responses_transport(self)
+        self.enterContext(mock.patch.dict(webapp.os.environ,{"APP_MODE":"local", "SQAG_DISABLE_DOTENV":"1"}))
+
     def openai_models(self, name: str) -> str:
-        if name == webapp.OPENAI_API_KEY_ENV_NAME:
-            return "sk-test-redacted"
-        if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-            return "gpt-6-luna"
-        if name == webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME:
-            return "gpt-6.1-sol"
-        if name in {webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME, webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME}:
-            return "gpt-6-luna"
-        return ""
+        return synthetic_configuration(credential="synthetic-key").get(name, "")
 
     def test_re_chaos_prompts_start_on_basis_line_model(self):
         for prompt in RE_CHAOS_PROMPTS:
@@ -150,7 +147,7 @@ class AIBasisChatStressTest(unittest.TestCase):
 
                 bodies = [json.loads(call.args[0].data.decode("utf-8")) for call in urlopen.call_args_list]
                 urlopen.assert_called_once()
-                self.assertEqual(bodies[0]["model"], "gpt-6-luna")
+                self.assertEqual(bodies[0]["model"], "synthetic/basis_line")
                 self.assertEqual(bodies[0]["reasoning"], {"effort": "high"})
                 self.assertNotIn("gpt-6-sol", [body["model"] for body in bodies])
                 if result:
@@ -167,16 +164,15 @@ class AIBasisChatStressTest(unittest.TestCase):
             "line_index": 0,
             "line": "Confirm: 100mm raised platform with needle punch carpet.",
         }
-        bad_response = mock.MagicMock()
-        bad_response.__enter__.return_value.read.return_value = json.dumps({"output_text": "not json"}).encode("utf-8")
+        bad_response = FixtureHttpResponse(responses_envelope("synthetic/basis_line", "not json"))
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=self.openai_models):
             with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[bad_response, openai_response(payload)]) as urlopen:
                 with self.assertRaises(webapp.OpenAIAnalysisError):
-                    webapp.request_openai_basis_chat(payload, "sk-test-redacted")
+                    webapp.request_configured_basis_chat(payload)
 
         models = [json.loads(call.args[0].data.decode("utf-8"))["model"] for call in urlopen.call_args_list]
-        self.assertEqual(models, ["gpt-6-luna"])
+        self.assertEqual(models, ["synthetic/basis_line"])
         sent_body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
         self.assertEqual(sent_body["reasoning"], {"effort": "high"})
 
@@ -198,7 +194,7 @@ class AIBasisChatStressTest(unittest.TestCase):
                 body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
                 urlopen.assert_called_once()
                 self.assertEqual(webapp.basis_chat_required_intent(payload), "answer")
-                self.assertEqual(body["model"], "gpt-6-luna")
+                self.assertEqual(body["model"], "synthetic/basis_answer")
                 self.assertEqual(body["reasoning"], {"effort": "high"})
                 self.assertEqual(result["status"], "answered")
                 self.assertEqual(result["type"], "answer")
@@ -208,7 +204,7 @@ class AIBasisChatStressTest(unittest.TestCase):
         routes = (
             (
                 "selected line",
-                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME,
+                "OPENROUTER_BASIS_LINE_MODEL",
                 {
                     "question": "change 100mm to 150mm",
                     "scope": "line",
@@ -219,7 +215,7 @@ class AIBasisChatStressTest(unittest.TestCase):
             ),
             (
                 "answer",
-                webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME,
+                "OPENROUTER_BASIS_ANSWER_MODEL",
                 {"question": "what does this mean?", "scope": "quote", "field": "", "line_index": -1, "line": ""},
             ),
         )
@@ -228,10 +224,10 @@ class AIBasisChatStressTest(unittest.TestCase):
                 with self.subTest(route=label, model=invalid_model):
                     payload = stress_payload()
                     payload["basis_chat"] = basis_chat
-                    values = {
-                        webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-                        webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
-                        webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "gpt-6-luna",
+                    values = {**synthetic_configuration(credential="synthetic-key"),
+                        webapp.OPENROUTER_API_KEY_ENV_NAME: "sk-test-redacted",
+                        "OPENROUTER_BASIS_LINE_MODEL": "synthetic/basis_line",
+                        "OPENROUTER_BASIS_ANSWER_MODEL": "synthetic/basis_answer",
                     }
                     values[model_env_name] = invalid_model
                     with mock.patch.object(webapp, "read_dotenv_value", side_effect=values.get):
@@ -252,10 +248,10 @@ class AIBasisChatStressTest(unittest.TestCase):
             "line_index": -1,
             "line": "",
         }
-        values = {
-            webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-            webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "!!!",
-            webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
+        values = {**synthetic_configuration(credential="synthetic-key"),
+            webapp.OPENROUTER_API_KEY_ENV_NAME: "sk-test-redacted",
+            "OPENROUTER_BASIS_ANSWER_MODEL": "!!!",
+            "OPENROUTER_BASIS_LINE_MODEL": "synthetic/basis_line",
         }
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=values.get):
@@ -287,7 +283,7 @@ class AIBasisChatStressTest(unittest.TestCase):
             },
         }
         rate_limit = webapp.urllib.error.HTTPError(
-            "https://api.openai.com/v1/responses",
+            OPENROUTER_RESPONSES_URL,
             503,
             "service unavailable",
             {},

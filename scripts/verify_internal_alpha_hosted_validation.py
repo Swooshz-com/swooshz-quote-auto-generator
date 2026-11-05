@@ -41,13 +41,11 @@ REQUIRED_ENV_NAMES = [
     "SQAG_PLATFORM_LAUNCH_MODE",
     "SQAG_PUBLIC_BASE_URL",
     "SQAG_INTERNAL_WORKSPACE_ID",
-    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
-    "OIDC_ISSUER_URL",
-    "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
-    "OIDC_REDIRECT_URI",
-    "OIDC_AUTHORIZE_URL",
-    "OIDC_TOKEN_URL",
+    "SQAG_INTERNAL_ALLOWED_EMAILS",
+    "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN",
+    "SQAG_INTERNAL_LOGIN_PASSWORD",
+    "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD",
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON",
     'SQAG_TRUSTED_PROXY_CIDRS',
     "QUOTE_DATA_ROOT",
     "QUOTE_OUTPUT_ROOT",
@@ -60,10 +58,12 @@ HOST_SECRET_MANAGER_ONLY_ENV_NAMES = [
     "SESSION_SECRET",
     "SQAG_TRACKING_HMAC_KEY",
     "SQAG_DATABASE_URL",
-    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
-    "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
-    "OPENAI_API_KEY",
+    "SQAG_INTERNAL_ALLOWED_EMAILS",
+    "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN",
+    "SQAG_INTERNAL_LOGIN_PASSWORD",
+    "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD",
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON",
+    "OPENROUTER_API_KEY",
     "DEEPSEEK_API_KEY",
 ]
 
@@ -145,6 +145,207 @@ def privacy_summary() -> dict[str, str]:
     }
 
 
+# Closed public vocabulary. Projection rebuilds keys and scalar values from these
+# constants; it never forwards caller strings, secret-manager values or exceptions.
+_PUBLIC_REPORT_SHAPE = {'schema': ('swooshz.sqag.internal-alpha-hosted-validation.v1',),
+ 'status': ('passed', 'failed'),
+ 'synthetic_only': (True,),
+ 'live_deployment_evidence': (False,),
+ 'hosted_smoke_scope': {'evidence_scope': ('synthetic_local_hosted_contract',),
+                        'public_hosted_url_tested': (False,),
+                        'live_neon_r2_evidence': (False,),
+                        'platform_handoff_evidence': (False,)},
+ 'target_posture': {'environment': ('blocked-deploy-database-blob-artifact-validation',),
+                    'app_mode': ('deploy',),
+                    'storage_mode': ('database',),
+                    'artifact_storage_mode': ('database',),
+                    'database_url_source': ('host_secret_manager_only',),
+                    'fixed_internal_workspace_required': (True,),
+                    'platform_handoff_enabled': (False,),
+                    'launch_ready': (False,),
+                    'object_mode_final_production_storage': (False,)},
+ 'required_env_names': [('APP_MODE',
+                         'AUTH_REQUIRED',
+                         'SQAG_AUTH_MODE',
+                         'SESSION_SECRET',
+                         'SQAG_TRACKING_HMAC_KEY',
+                         'SQAG_TRACKING_HMAC_KEY_VERSION',
+                         'SQAG_STORAGE_MODE',
+                         'SQAG_ARTIFACT_STORAGE_MODE',
+                         'SQAG_DATABASE_URL',
+                         'SQAG_PLATFORM_LAUNCH_MODE',
+                         'SQAG_PUBLIC_BASE_URL',
+                         'SQAG_INTERNAL_WORKSPACE_ID',
+                         'SQAG_INTERNAL_ALLOWED_EMAILS',
+                         'SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN',
+                         'SQAG_INTERNAL_LOGIN_PASSWORD',
+                         'SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD',
+                         'SQAG_INTERNAL_IDENTITY_BINDINGS_JSON',
+                         'SQAG_TRUSTED_PROXY_CIDRS',
+                         'QUOTE_DATA_ROOT',
+                         'QUOTE_OUTPUT_ROOT',
+                         'QUOTE_TMP_ROOT',
+                         'QUOTE_LOG_ROOT',
+                         'PORT')],
+ 'host_secret_manager_only_env_names': [('SESSION_SECRET',
+                                         'SQAG_TRACKING_HMAC_KEY',
+                                         'SQAG_DATABASE_URL',
+                                         'SQAG_INTERNAL_ALLOWED_EMAILS',
+                                         'SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN',
+                                         'SQAG_INTERNAL_LOGIN_PASSWORD',
+                                         'SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD',
+                                         'SQAG_INTERNAL_IDENTITY_BINDINGS_JSON',
+                                         'OPENROUTER_API_KEY',
+                                         'DEEPSEEK_API_KEY')],
+ 'health': {'path': ('/api/health',), 'expected_status': (200,), 'metadata_only': (True,)},
+ 'evidence': {'backup_restore': ('passed', 'failed'),
+              'hosted_observability': ('passed', 'failed'),
+              'hosted_smoke': ('passed', 'failed')},
+ 'readiness': {'internal_alpha_ready': (False, True),
+               'production_ready': (False, True),
+               'blocker_ids': [('session_business_hardening_incomplete',
+                                'production_deployment_operations_evidence_missing',
+                                'deploy_mode_required',
+                                'auth_required_disabled',
+                                'auth_mode_missing_or_invalid',
+                                'local_runtime_storage',
+                                'local_artifact_storage',
+                                'database_url_missing',
+                                'database_url_unsupported_for_production',
+                                'database_blob_artifact_storage_not_launch_ready',
+                                'sqlite_not_final_production',
+                                'postgres_neon_runtime_adapter_missing',
+                                'postgres_driver_unavailable',
+                                'postgres_neon_database_evidence_missing',
+                                'object_storage_missing',
+                                'object_storage_provider_unavailable',
+                                'object_lifecycle_evidence_missing',
+                                'object_retention_delete_evidence_missing',
+                                'db_object_backup_restore_evidence_missing',
+                                'local_staging_cleanup_evidence_missing',
+                                'backup_restore_unverified',
+                                'hosted_logging_monitoring_missing',
+                                'hosted_smoke_evidence_missing',
+                                'object_retention_delete_live_evidence_missing',
+                                'db_object_backup_restore_live_evidence_missing',
+                                'platform_auth_contract_incomplete',
+                                'temporary_internal_auth_not_public_release_ready',
+                                'internal_password_auth_contract_incomplete')],
+               'production_blocker_ids': [('session_business_hardening_incomplete',
+                                           'production_deployment_operations_evidence_missing',
+                                           'deploy_mode_required',
+                                           'auth_required_disabled',
+                                           'auth_mode_missing_or_invalid',
+                                           'local_runtime_storage',
+                                           'local_artifact_storage',
+                                           'database_url_missing',
+                                           'database_url_unsupported_for_production',
+                                           'database_blob_artifact_storage_not_launch_ready',
+                                           'sqlite_not_final_production',
+                                           'postgres_neon_runtime_adapter_missing',
+                                           'postgres_driver_unavailable',
+                                           'postgres_neon_database_evidence_missing',
+                                           'object_storage_missing',
+                                           'object_storage_provider_unavailable',
+                                           'object_lifecycle_evidence_missing',
+                                           'object_retention_delete_evidence_missing',
+                                           'db_object_backup_restore_evidence_missing',
+                                           'local_staging_cleanup_evidence_missing',
+                                           'backup_restore_unverified',
+                                           'hosted_logging_monitoring_missing',
+                                           'hosted_smoke_evidence_missing',
+                                           'object_retention_delete_live_evidence_missing',
+                                           'db_object_backup_restore_live_evidence_missing',
+                                           'platform_auth_contract_incomplete',
+                                           'temporary_internal_auth_not_public_release_ready',
+                                           'internal_password_auth_contract_incomplete')]},
+ 'validation_commands': [('python scripts/verify_database_backup_restore.py --work-dir '
+                          '<synthetic-work-dir>',
+                          'python scripts/verify_hosted_observability.py --work-dir '
+                          '<synthetic-work-dir>',
+                          'python scripts/verify_hosted_smoke.py --work-dir <synthetic-work-dir>',
+                          'python scripts/check_production_readiness.py '
+                          '--with-backup-restore-evidence --with-hosted-observability-evidence '
+                          '--with-hosted-smoke-evidence')],
+ 'proves': [('synthetic SQLite database/database-artifact backup, restore, rollback, and '
+             'retention-policy evidence ran',
+             'synthetic privacy-minimized hosted observability schema and health metadata evidence',
+             'synthetic/local deploy/database/database-artifact hosted-contract smoke evidence on '
+             '127.0.0.1',
+             'readiness checker blocks DB/BLOB artifact mode from launch, hosted, protected, '
+             'deploy, and production readiness')],
+ 'does_not_prove': [('live VPS, Coolify, DNS, TLS, firewall, reverse proxy, or host health '
+                     'evidence',
+                     'real OIDC provider login/logout or live Swooshz Platform integration',
+                     'real object-storage provider, DB+object backup/restore, or live '
+                     'retention/delete evidence',
+                     'a public hosted URL test, live Neon/R2 evidence, or Platform handoff '
+                     'evidence',
+                     'hosted launch readiness, production deployment operations, alert delivery, '
+                     'supply-chain hardening, or production readiness')],
+ 'privacy': {'output': ('metadata-only',),
+             'paths': ('omitted',),
+             'database_urls': ('omitted',),
+             'hostnames': ('omitted',),
+             'cookies': ('omitted',),
+             'tokens': ('omitted',),
+             'oauth_values': ('omitted',),
+             'artifact_bytes': ('omitted',),
+             'quote_contents': ('omitted',),
+             'pricing_profile_payloads': ('omitted',),
+             'object_keys': ('omitted',)},
+ 'notes': [('Use this as metadata-only local/synthetic evidence that the old DB/BLOB launch '
+            'posture remains blocked.',
+            'Do not paste environment values, DB URLs, hostnames, tokens, cookies, generated '
+            'quotes, or private tenant data into reports.')]}
+_FAILURE_REPORT_SHAPE = {'schema': ('swooshz.sqag.internal-alpha-hosted-validation.v1',),
+ 'status': ('failed',),
+ 'failed_stage': ('exception', 'privacy_guard', 'metadata_projection'),
+ 'synthetic_only': (True,),
+ 'live_deployment_evidence': (False,),
+ 'hosted_smoke_scope': {'evidence_scope': ('synthetic_local_hosted_contract',),
+                        'public_hosted_url_tested': (False,),
+                        'live_neon_r2_evidence': (False,),
+                        'platform_handoff_evidence': (False,)},
+ 'production_ready': (False,),
+ 'privacy': {'output': ('metadata-only',),
+             'paths': ('omitted',),
+             'database_urls': ('omitted',),
+             'hostnames': ('omitted',),
+             'cookies': ('omitted',),
+             'tokens': ('omitted',),
+             'oauth_values': ('omitted',),
+             'artifact_bytes': ('omitted',),
+             'quote_contents': ('omitted',),
+             'pricing_profile_payloads': ('omitted',),
+             'object_keys': ('omitted',)},
+ 'notes': [('Hosted validation failed before producing complete blocked-readiness evidence.',
+            'Failure details are omitted to avoid printing private paths, URLs, secrets, or '
+            'payloads.')]}
+
+
+def _project_metadata(value, shape):
+    if isinstance(shape, dict):
+        if type(value) is not dict or value.keys() != shape.keys():
+            raise ValueError("Unsafe verification metadata.")
+        return {key: _project_metadata(value[key], child) for key, child in shape.items()}
+    if isinstance(shape, list):
+        if type(value) is not list or len(value) > len(shape[0]):
+            raise ValueError("Unsafe verification metadata.")
+        return [_project_metadata(item, shape[0]) for item in value]
+    for public_value in shape:
+        if type(value) is type(public_value) and value == public_value:
+            return public_value
+    raise ValueError("Unsafe verification metadata.")
+
+
+def public_report_metadata(report):
+    if type(report) is not dict:
+        raise ValueError("Unsafe verification metadata.")
+    shape = _FAILURE_REPORT_SHAPE if "failed_stage" in report else _PUBLIC_REPORT_SHAPE
+    return _project_metadata(report, shape)
+
+
 def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     parent = work_dir or (ROOT / "_tmp" / "internal-alpha-hosted-validation")
     run_root = parent / f"run-{time.time_ns()}"
@@ -155,7 +356,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     readiness_env = {
         "APP_MODE": "deploy",
         "AUTH_REQUIRED": "true",
-        "SQAG_AUTH_MODE": "internal_google",
+        "SQAG_AUTH_MODE": "internal_password",
         "SESSION_SECRET": "synthetic-session-secret-with-enough-entropy",
         "SQAG_TRACKING_HMAC_KEY": "synthetic-tracking-key",
         "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
@@ -163,22 +364,18 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
         "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
         "SQAG_PUBLIC_BASE_URL": SYNTHETIC_INTERNAL_ALPHA_ORIGIN,
         "SQAG_INTERNAL_WORKSPACE_ID": "workspace-synthetic-alpha",
-        "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
+        "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN": "synthetic.tester"+"@"+"example.test",
+        "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "synthetic-admin-password-value",
+        "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON": json.dumps(
             [
                 {
-                    "sub": "synthetic-hosted-subject",
+                    "user_id": "synthetic-hosted-subject",
                     "email": "synthetic.tester@example.test",
                     "role": "admin",
                 }
             ],
             separators=(",", ":"),
         ),
-        "OIDC_ISSUER_URL": "https://accounts.google.com",
-        "OIDC_CLIENT_ID": "synthetic-client-id",
-        "OIDC_CLIENT_SECRET": "synthetic-client-secret",
-        "OIDC_REDIRECT_URI": f"{SYNTHETIC_INTERNAL_ALPHA_ORIGIN}/callback",
-        "OIDC_AUTHORIZE_URL": "https://accounts.google.com/o/oauth2/v2/auth",
-        "OIDC_TOKEN_URL": "https://oauth2.googleapis.com/token",
         "SQAG_STORAGE_MODE": "database",
         "SQAG_ARTIFACT_STORAGE_MODE": "database",
         "SQAG_DATABASE_URL": f"sqlite:///{(run_root / 'readiness.sqlite3').as_posix()}",
@@ -269,7 +466,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     text = json.dumps(report, sort_keys=True)
     if any(marker in text for marker in PROHIBITED_OUTPUT_MARKERS):
         return safe_failure_report("privacy_guard")
-    return report
+    return public_report_metadata(report)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -284,8 +481,12 @@ def main(argv: list[str] | None = None) -> int:
         report = run_verification(work_dir=args.work_dir)
     except Exception:
         report = safe_failure_report("exception")
-    print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report.get("status") == "passed" else 1
+    try:
+        public_report = public_report_metadata(report)
+    except ValueError:
+        public_report = public_report_metadata(safe_failure_report("metadata_projection"))
+    print(json.dumps(public_report, indent=2, sort_keys=True))
+    return 0 if public_report.get("status") == "passed" else 1
 
 
 if __name__ == "__main__":

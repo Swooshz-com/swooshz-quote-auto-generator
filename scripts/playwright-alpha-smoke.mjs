@@ -1,3 +1,4 @@
+import { signIn } from "./internal-password-browser-test.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -149,7 +150,7 @@ function attachTrace(page, baseUrl) {
       if (url.pathname === "/api/quote-sessions" && req.method() === "POST") {
         const record = quoteSaveRequestRecords.get(req) || { sequence: 0, payload: safeJsonRequest(req) };
         trace.quoteSaves.push({ ...record, status: response.status(), body: await response.json() });
-      } else if (url.pathname === "/api/line-items/normalize" && req.method() === "POST") {
+      } else if (["/api/line-items/normalize", "/api/quote-sessions/pricing-selections"].includes(url.pathname) && req.method() === "POST") {
         trace.normalizations.push({ status: response.status(), payload: safeJsonRequest(req), body: await response.json() });
       } else if (url.pathname === "/api/jobs" && req.method() === "POST") {
         trace.jobs.push({ type: safeJsonRequest(req)?.type || "", request: safeJsonRequest(req), accepted: await response.json(), polls: [] });
@@ -365,42 +366,23 @@ async function main() {
     await verifyPdfValidatorRejectsMalformedControl(downloadsRoot);
     await fs.cp(fixtureDir, fixtureCopy, { recursive: true });
 
-    let harnessSource = await fs.readFile(path.join(root, "tests", "internal_google_browser_harness.py"), "utf8");
+    let harnessSource = await fs.readFile(path.join(root, "tests", "internal_password_browser_harness.py"), "utf8");
     const rootMarker = "ROOT = Path(__file__).resolve().parents[1]";
-    const appModeMarker = '"APP_MODE": "deploy",';
-    const harnessNewline = harnessSource.includes(String.fromCharCode(13,10)) ? String.fromCharCode(13,10) : String.fromCharCode(10);
-    const resetMarker = "    webapp.INTERNAL_AUTH_STATE.reset()" + harnessNewline + "    webapp.is_allowed_host_header = lambda _host: True";
-    assert(harnessSource.split(rootMarker).length === 2, "Synthetic auth harness root marker changed; refusing a mismatched fixture setup.");
-    assert(harnessSource.split(appModeMarker).length === 2, "Synthetic auth harness app-mode marker changed; refusing a mismatched fixture setup.");
-    assert(harnessSource.split(resetMarker).length === 2, "Synthetic auth harness setup marker changed; refusing a mismatched fixture setup.");
-    harnessSource = harnessSource
-      .replace(rootMarker, "ROOT = Path(sys.argv[1]).resolve()")
-      .replace(appModeMarker, '"APP_MODE": "local",')
-      .replace(resetMarker, `    os.environ.update({
-            "SQAG_DISABLE_DOTENV": "1",
-            "QUOTE_DATA_ROOT": sys.argv[2],
-            "QUOTE_OUTPUT_ROOT": sys.argv[3],
-            "QUOTE_TMP_ROOT": sys.argv[4],
-            "QUOTE_LOG_ROOT": sys.argv[5],
-            "SQAG_LOCAL_PRICING_REFERENCES_ROOT": sys.argv[6],
-            "OPENAI_API_KEY": "",
-            "DEEPSEEK_API_KEY": "",
-        })
-    _alpha_default_runtime_workspace = webapp.default_runtime_workspace
+    assert(harnessSource.split(rootMarker).length === 2, "Synthetic auth harness root marker changed.");
+    harnessSource = harnessSource.replace(rootMarker, "ROOT = Path(sys.argv[1]).resolve()");
+    const setupMarker = "    # SYNTHETIC_WORKSPACE_SETUP";
+    assert(harnessSource.split(setupMarker).length === 2, "Synthetic workspace setup marker changed.");
+    harnessSource = harnessSource.replace(setupMarker, `    _alpha_default_runtime_workspace = webapp.default_runtime_workspace
     def _alpha_local_runtime_workspace():
         value = _alpha_default_runtime_workspace()
         for key in ("company", "workspace"):
             target = value.get(key)
             if isinstance(target, dict):
-                target["id"] = "workspace-internal-alpha"
-                target["slug"] = "workspace-internal-alpha"
-                target["display_name"] = "Synthetic Internal Alpha"
+                target.update(id="workspace-internal-alpha", slug="workspace-internal-alpha", display_name="Synthetic Internal Alpha")
         return value
     webapp.default_runtime_workspace = _alpha_local_runtime_workspace
-    webapp.INTERNAL_AUTH_STATE.reset()
-    webapp.is_allowed_host_header = lambda _host: True
 `);
-    const shimPath = path.join(runRoot, "internal_google_browser_harness.py");
+    const shimPath = path.join(runRoot, "internal_password_browser_harness.py");
     await fs.writeFile(shimPath, harnessSource, "utf8");
 
     harness = startHarness(shimPath, [dataRoot, outputRoot, tmpRoot, serverLogDir, localPricingRoot], root);
@@ -416,7 +398,7 @@ async function main() {
     const anonymousSessions = await anonymousApi.get(`${baseUrl}/api/quote-sessions`);
     assert(anonymousSessions.status() === 401, `Anonymous protected quote-session request returned HTTP ${anonymousSessions.status()}.`);
 
-    await page.goto(`${baseUrl}/login`, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await signIn(page, baseUrl);
     const authState = await waitUntil(async () => {
       const response = await page.evaluate(async () => {
         const result = await fetch("/api/session");
@@ -424,8 +406,7 @@ async function main() {
       });
       return response.status === 200 && response.body.authenticated ? response : false;
     }, "synthetic internal authentication", 20000);
-    assert(authState.body.user?.subject === "synthetic-browser-subject", "Synthetic auth established an unexpected user identity.");
-    assert(authState.body.user?.account === workspaceId, "Synthetic auth did not establish the expected workspace.");
+    assert(authState.body.user === null && authState.body.authenticated === true, "Synthetic auth established an unexpected user identity.");
     assert(authState.body.permissions?.canGenerateQuote === true, "Synthetic authenticated user cannot generate quotes.");
 
     api = await request.newContext({ storageState: await context.storageState() });
@@ -496,7 +477,9 @@ async function main() {
     const sessionId = createdSave.body.quote_session.session_id;
     assert(createdSave.payload?.pricing_reference?.id === referenceConfig.id && createdSave.payload?.pricing_reference?.source === "local", "UI-created quote did not retain the selected pricing authority.");
     const authSession = await getJson(await api.get(`${baseUrl}/api/session`), "Authenticated session continuity before fixture setup");
-    assert(authSession.authenticated && authSession.user?.account === workspaceId, "Authenticated workspace changed after quote creation.");
+    assert(authSession.authenticated, "Authenticated session disappeared after quote creation.");
+    const createdProfileData = await getJson(await api.get(`${baseUrl}/api/profiles`), "Authenticated workspace continuity after quote creation");
+    assert(createdProfileData.workspace?.workspace?.id === workspaceId, "Authenticated workspace changed after quote creation.");
     const beforeSeed = await quoteSessionDetail(api, baseUrl, sessionId);
     assert(beforeSeed.session_id === sessionId && beforeSeed.customer_summary?.customer_name === expectedCustomer, "Created quote identity or customer context is incorrect.");
     assert(beforeSeed.pricing_reference?.id === referenceConfig.id && beforeSeed.pricing_reference?.source === "local", "Created quote lost its selected pricing authority.");

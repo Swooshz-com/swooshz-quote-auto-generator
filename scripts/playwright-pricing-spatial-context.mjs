@@ -2,18 +2,23 @@
 // Anchor checks fail closed if the shared carrier changes instead of silently skipping coverage.
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
+import { freshBrowserRun } from './synthetic-browser-boundary.mjs';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const evidence = process.env.SQAG_OWNER_UAT_EVIDENCE_ROOT || path.join(root, '_logs/browser/pricing-spatial-context');
-await fs.mkdir(evidence, { recursive: true });
+const carrierRoot = await freshBrowserRun(evidence, 'carrier-');
 let code = await fs.readFile(path.join(root, 'scripts/playwright-owner-uat-basis-repair.mjs'), 'utf8');
 function replaceOnce(before, after) {
   if (code.split(before).length !== 2) throw new Error('Shared pricing carrier anchor changed: ' + before.slice(0, 90));
   code = code.replace(before, after);
 }
 replaceOnce('const sourceRoot = fileURLToPath(new URL("..", import.meta.url));', 'const sourceRoot = process.cwd();');
+replaceOnce('import { signIn } from "./internal-password-browser-test.mjs";',
+  `import { signIn } from ${JSON.stringify(pathToFileURL(path.join(root, 'scripts/internal-password-browser-test.mjs')).href)};`);
 replaceOnce('import path from "node:path";', 'import path from "node:path";\nimport os from "node:os";');
+replaceOnce('import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthetic-browser-boundary.mjs";',
+  `import { SyntheticBrowserBoundary, freshBrowserRun } from ${JSON.stringify(pathToFileURL(path.join(root, 'scripts/synthetic-browser-boundary.mjs')).href)};`);
 replaceOnce('const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles", "logs", "downloads"].map((name) => [name, path.join(runRoot, name)]));', `
 const nativeRunRoot = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-spatial-"));
 const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles", "logs", "downloads"].map((name) => [name,
@@ -60,11 +65,11 @@ replaceOnce('    await writeJson("u1-pricing.json", pricing);', `
       "resolved manual price retained a stale unit refusal");
     result.spatialPartialRefusal = { refusalReview, resolvedVideo };
     await writeJson("u1-pricing.json", pricing);`);
-const runtime = path.join(evidence, 'pricing-spatial-carrier.mjs');
+const runtime = path.join(carrierRoot, 'pricing-spatial-carrier.mjs');
 await fs.writeFile(runtime, code);
 const child = spawn(process.execPath, [runtime, '--lines=0', '--latency-ms=100', '--fresh-analysis', ...process.argv.slice(2)], {
   cwd: root, windowsHide: true, stdio: 'inherit',
-  env: { ...process.env, SQAG_OWNER_UAT_EVIDENCE_ROOT: evidence },
+  env: { ...process.env, SQAG_OWNER_UAT_EVIDENCE_ROOT: carrierRoot },
 });
 const exitCode = await new Promise((resolve) => child.once('exit', resolve));
 process.exitCode = exitCode ?? 1;

@@ -12,20 +12,17 @@ This playbook covers:
 
 - `Re`: per-line basis revision.
 - `Ask For Changes`: quote-basis question flow. Quote-scope edit proposals are not supported; use `Re` on a selected line.
-- AI response parsing for OpenAI and optional DeepSeek text routes.
+- AI response admission through the configured OpenRouter text routes.
 - Quote basis proposal preview, apply, discard, and retry behavior.
 - User-facing error handling when AI returns malformed or unusable JSON.
 
 ## Model Routing
 
-- Without `DEEPSEEK_API_KEY`, `Re` selected-line edits use `OPENAI_BASIS_LINE_MODEL`, and answer-style `Ask For Changes` uses `OPENAI_BASIS_ANSWER_MODEL`. Both OpenAI routes default to `gpt-6-luna` and send `high` reasoning. Explicit model mismatches reject before OpenAI transport.
-- OpenAI basis chat does not fall back to either full-draft model; `OPENAI_DRAFT_MODEL` and `OPENAI_DRAFT_HIGH_QUALITY_MODEL` remain reserved for full quote-basis drafting.
-- OpenAI model defaults apply only when a route setting is absent or blank. An explicit unsupported model must fail route validation before provider transport. Request-validation failures are terminal and must not fall through from an invalid answer route to a valid selected-line model; provider, runtime, and model-output fallback behavior stays covered by its existing regression tests.
-- With `DEEPSEEK_API_KEY`, text-only basis chat uses route-specific DeepSeek model defaults: `Re` selected-line edits use `DEEPSEEK_BASIS_LINE_MODEL` defaulting to `deepseek-v4-flash`, and answer-style `Ask For Changes` uses `DEEPSEEK_BASIS_ANSWER_MODEL` defaulting to `deepseek-v4-flash`.
-- `DEEPSEEK_MODEL` remains the legacy/global DeepSeek fallback model, defaulting to `deepseek-v4-pro`. A custom non-Pro value still acts as a global override, but `DEEPSEEK_MODEL=deepseek-v4-pro` does not suppress Flash route defaults.
-- Flash-routed DeepSeek basis chat must retry the Pro/global DeepSeek model before falling back to OpenAI.
-- If a DeepSeek route fails or returns malformed/unusable JSON, retry through the next configured model/provider when available, including OpenAI when `OPENAI_API_KEY` is configured.
-- Provider/network/auth failures should be sanitized in user-facing errors and logs. Do not leak raw provider responses or keys.
+- Selected-line `Re` uses the explicit `BASIS_LINE` route; answers and other basis chat use `BASIS_ANSWER`.
+- Configure the complete six-operation catalogue and server-only credential in [the gateway contract](ai-gateway.md). There are no model defaults or credential-driven provider selection.
+- Capture model, effort and downstream endpoint once. Unknown effort, incomplete settings or a request/configuration mismatch reject before transport.
+- A failed answer route never switches to the line route, full-draft model or another provider. Text retries are bounded transient retries on the same route; malformed, refused and partial responses are not replayed.
+- Preserve explicit Responses fixtures, business admission, privacy-safe diagnostics and one terminal telemetry record per actual send.
 
 This playbook does not cover:
 

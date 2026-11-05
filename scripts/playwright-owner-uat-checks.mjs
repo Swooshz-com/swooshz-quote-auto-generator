@@ -267,7 +267,7 @@ export async function verifyOwnerUatChecks(page, sessionId, outputDir) {
   const bytes=await fs.readFile(target),sha256=createHash('sha256').update(bytes).digest('hex');
   assert.equal(sha256,saved.exports.xlsx.sha256);
   assert.equal(saved.exports.xlsx.stale,false);
-  const proof={status:'FXUI_G3_RENDERED_SERVER_CURRENT_XLSX_PASS',ui:'OWNER_ACCEPTED_S3',uiSourceSHA256:createHash('sha256').update(await fs.readFile(new URL('../webapp/static/app.js',import.meta.url))).digest('hex'),keyboardProof,catalogueProof,requirements:['R01','R02','R03','R05','R06','R07','R08','R09','R10','R11'],pageErrors:0,sessionId,fixture,fx:3,manualQuoteUnitPrice:1,approvedQuoteAmount:2,bytes:bytes.length,sha256,providerCalls:0,seed:'Existing local G3 mock response plus explicit component fixture; no live injection'};
+  const proof={status:'FXUI_G3_RENDERED_SERVER_CURRENT_XLSX_PASS',workbookPath:target,ui:'OWNER_ACCEPTED_S3',uiSourceSHA256:createHash('sha256').update(await fs.readFile(new URL('../webapp/static/app.js',import.meta.url))).digest('hex'),keyboardProof,catalogueProof,requirements:['R01','R02','R03','R05','R06','R07','R08','R09','R10','R11'],pageErrors:0,sessionId,fixture,fx:3,manualQuoteUnitPrice:1,approvedQuoteAmount:2,bytes:bytes.length,sha256,providerCalls:0,seed:'Existing local G3 mock response plus explicit component fixture; no live injection'};
   await fs.writeFile(path.join(outputDir,'owner-uat-c17-proof.json'),JSON.stringify(proof,null,2));
   proof.delayedGeneration=await verifyDelayedGenerationAdmission(page,cell,editor,index,outputDir);
   await fs.writeFile(path.join(outputDir,'owner-uat-c17-proof.json'),JSON.stringify(proof,null,2));

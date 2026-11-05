@@ -118,6 +118,9 @@ const PRICING_REFERENCE_FILE_ACCEPT = ".xlsx,.csv,.md";
 const REFERENCE_FILE_ACCEPT = "image/png,image/jpeg,image/webp,application/pdf,.pdf";
 const MAX_PRICING_REFERENCE_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES = 8;
+const MAX_REFERENCE_IMAGE_MIB = 12;
+const MAX_REFERENCE_PDF_MIB = 24;
+const MAX_REFERENCE_TOTAL_MIB = 128;
 const DEFAULT_DATE_LABEL = "Date:";
 const DEFAULT_TERMS_HEADING = "Terms & Conditions:";
 const DEFAULT_NOTES_HEADING = "Note:";
@@ -162,7 +165,7 @@ const QUOTE_COPY = {
   label: "Quotation",
   intakeSubtitle: "Drop reference images or PDFs for a real workspace quote.",
   dropTitle: "Drop reference images or PDFs to start",
-  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references, 12 MB each; remote AI analysis sends selected refs to the configured provider.`,
+  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references. Images up to ${MAX_REFERENCE_IMAGE_MIB} MiB each, PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each. Up to ${MAX_REFERENCE_TOTAL_MIB} MiB total. Remote AI analysis sends selected refs to the configured provider.`,
   imageNoun: "reference file",
   analyzeLabel: "Start Analysis",
   fallbackAction: "review the reference files",
@@ -232,6 +235,7 @@ const BASIS_TAGS = [
 ];
 
 const state = {
+  quoteAiSpendRequest: 0,
   profileId: "",
   pricingReferenceId: "",
   pricingReferenceSource: "",
@@ -315,6 +319,7 @@ const state = {
   authRequired: false,
   authenticated: false,
   authUser: null,
+  staffEmail: "",
   browserRecoveryScope: "",
   isRecoveryScopeTransitioning: false,
   pendingFeedback: "",
@@ -786,6 +791,10 @@ function transitionGenerationContext(sessionId = "", runId = "") {
   const previousContext = currentGenerationContext();
   if (previousContext.session_id !== safeSessionId && state.basisChat) invalidateBasisChatAuthority();
   state.quoteSessionId = safeSessionId;
+  if (previousContext.session_id !== safeSessionId) {
+    state.quoteAiSpendRequest += 1;
+    renderQuoteAiSpend();
+  }
   state.lastGenerationRunId = safeRunId;
   state.lastGenerationRunSessionId = safeRunId ? safeSessionId : "";
   if (
@@ -1490,6 +1499,7 @@ function initializeFreshPricingReferenceForCustomer() {
   }
   resetQuoteCommercialFieldsToSelectedPricingReference({ markOwned: false });
   if (elements.profileSelect) elements.profileSelect.value = referenceValue;
+  renderSelectedPricingReferenceSummary({ previewOnly: true });
   return Boolean(currentPricingReference());
 }
 
@@ -1920,6 +1930,14 @@ async function readImagesFromFiles(files) {
     return;
   }
   const overflowCount = Math.max(0, referenceFiles.length - capacity);
+  const oversizedFile = referenceFiles.slice(0, capacity).find((file) => {
+    const limit = referenceFileType(file) === "application/pdf" ? MAX_REFERENCE_PDF_MIB : MAX_REFERENCE_IMAGE_MIB;
+    return file.size > limit * 1024 * 1024;
+  });
+  if (oversizedFile) {
+    setImageUploadStatus(`Choose images up to ${MAX_REFERENCE_IMAGE_MIB} MiB and PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each.`);
+    return;
+  }
   let images;
   try {
     images = await filesToImageEntries(referenceFiles, capacity);
@@ -1935,7 +1953,12 @@ async function readImagesFromFiles(files) {
     setImageUploadStatus([duplicateMessage, overflowMessage].filter(Boolean).join(" "));
     return;
   }
-  state.images = [...state.images, ...unique];
+  const nextImages = [...state.images, ...unique];
+  if (nextImages.reduce((total, image) => total + (Number(image.size) || 0), 0) > MAX_REFERENCE_TOTAL_MIB * 1024 * 1024) {
+    setImageUploadStatus(`Choose up to ${MAX_REFERENCE_TOTAL_MIB} MiB of reference files in total.`);
+    return;
+  }
+  state.images = nextImages;
   await persistSessionFiles(sessionFileRecordsFromImages(state.images)).catch(() => {});
   renderFiles();
   if (!quoteHasDerivedResults()) setWorkflowStage("ready_to_analyze");
@@ -2215,8 +2238,10 @@ function pricingReferenceBasisValues(reference = currentPricingReference()) {
 }
 
 function renderPendingPricingReferenceBasis() {
-  const basis = pricingReferenceBasisValues(pendingPricingReference() || currentPricingReference());
-  syncPricingReferenceContextPills(basis.currency, basis.taxText);
+  const intent = state.pricingReferenceSelectionIntent;
+  const pending = pendingPricingReference();
+  const preview = pending && intent?.id === pending.id && intent.source === pending.source ? pending : null;
+  renderSelectedPricingReferenceSummary({ previewOnly: true, pendingReference: preview });
 }
 
 function resetPendingPricingReferenceSelection() {
@@ -3339,25 +3364,31 @@ function resetQuoteCommercialFieldsToSelectedPricingReference(options = {}) {
   updateOutputHeader();
 }
 
-function renderSelectedPricingReferenceSummary() {
+function renderSelectedPricingReferenceSummary({ previewOnly = false, pendingReference = null } = {}) {
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
-  const reference = currentPricingReference();
+  const reference = pendingReference || currentPricingReference();
   const tax = selectedPricingReferenceTax();
   const currency = selectedPricingReferenceCurrency();
   const taxText = selectedPricingReferenceTaxText();
+  const displayedBasis = pendingReference
+    ? pricingReferenceBasisValues(pendingReference)
+    : reference ? { currency, taxText } : { currency: "-", taxText: "-" };
   if (elements.pricingReferenceSourceBadge) {
     elements.pricingReferenceSourceBadge.textContent = pricingReferenceSourceLabel(reference);
   }
   if (elements.selectedPricingReferenceSummary) {
-    elements.selectedPricingReferenceSummary.textContent = reference
-      ? "Managed in Settings."
-      : state.pricingReferences.length
-        ? "Select a pricing reference."
-        : MISSING_PRICING_REFERENCES_MESSAGE;
+    elements.selectedPricingReferenceSummary.textContent = pendingReference
+      ? "Selected. Continue to apply this pricing reference."
+      : reference
+        ? "Managed in Settings."
+        : state.pricingReferences.length
+          ? "Select a pricing reference."
+          : MISSING_PRICING_REFERENCES_MESSAGE;
   }
-  if (elements.selectedPricingReferenceCurrency) elements.selectedPricingReferenceCurrency.textContent = currency;
-  if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = taxText;
-  syncPricingReferenceContextPills(currency, taxText);
+  if (elements.selectedPricingReferenceCurrency) elements.selectedPricingReferenceCurrency.textContent = displayedBasis.currency;
+  if (elements.selectedPricingReferenceTax) elements.selectedPricingReferenceTax.textContent = displayedBasis.taxText;
+  syncPricingReferenceContextPills(displayedBasis.currency, displayedBasis.taxText);
+  if (previewOnly) return;
   applyPricingReferenceCommercialDefaults();
   if (!ownedCommercial) {
     if (elements.taxLabel) elements.taxLabel.value = tax.label;
@@ -12962,6 +12993,7 @@ async function buildAiBasisChatResponse(text, options = {}) {
       return { errorDisplayed: true };
     }
     const job = polled.job;
+    void refreshQuoteAiSpend(state.quoteSessionId);
     const result = job.result && !Array.isArray(job.result) ? job.result : Object.create(null);
     if (["blocked", "failed"].includes(job.status)) {
       const message = basisChatFriendlyError(result);
@@ -13631,7 +13663,9 @@ async function applySessionData(data = {}) {
   state.csrfToken = data.csrf_token;
   state.authRequired = Boolean(data.auth_required);
   state.authenticated = Boolean(data.authenticated);
+  state.staffEmail = state.authenticated && typeof data.staff_identity?.email === "string" ? data.staff_identity.email : "";
   state.authUser = data.user && typeof data.user === "object" ? data.user : null;
+  if (elements.feedbackButton) elements.feedbackButton.hidden = Object.hasOwn(data, "staff_identity");
   state.authenticationRecoveryBoot = false;
   state.browserRecoveryScope = nextRecoveryScope;
   if (data.permissions && typeof data.permissions === "object") {
@@ -13654,7 +13688,8 @@ function renderAuthState() {
   if (!showAuthState) return;
   if (state.authenticated) {
     const role = authRoleLabel();
-    elements.topbarAuthText.textContent = role ? `Signed in as approved tester (${role})` : "Signed in as approved tester";
+    const label = state.staffEmail || "approved tester";
+    elements.topbarAuthText.textContent = role ? `Signed in as ${label} (${role})` : `Signed in as ${label}`;
   } else {
     elements.topbarAuthText.textContent = "Sign in required for internal UAT";
   }
@@ -13702,6 +13737,7 @@ async function recoverRequiredAuthentication(status, data = {}) {
   clearQuoteSessionDraftSaveTimer();
   state.authRequired = true;
   state.authenticated = false;
+  state.staffEmail = "";
   state.csrfToken = "";
   renderAuthState();
   const epoch = browserRecoveryEpoch;
@@ -14113,6 +14149,7 @@ function mergeDashboardQuoteSession(session = {}) {
   state.quoteSessions = index >= 0
     ? existing.map((item, itemIndex) => (itemIndex === index ? { ...item, ...nextSession } : item))
     : [nextSession, ...existing];
+  if (safeSessionId === state.quoteSessionId) renderQuoteAiSpend();
 }
 
 function currentQuoteSessionPayload(options = {}) {
@@ -14690,6 +14727,10 @@ function dashboardSessionProjectNumberText(session = {}) {
   return String(session.customer_summary?.project_number || "").trim();
 }
 
+function dashboardSessionCreatorText(session = {}) {
+  return typeof session.created_by === "string" ? session.created_by || "Unknown" : "";
+}
+
 function dashboardSessionSearchText(session = {}) {
   const shortReference = dashboardShortSessionReference(session);
   return [
@@ -14699,6 +14740,7 @@ function dashboardSessionSearchText(session = {}) {
     dashboardSessionProjectText(session),
     dashboardSessionShowNameText(session),
     dashboardSessionProjectNumberText(session),
+    dashboardSessionCreatorText(session),
   ].map((value) => String(value || "").toLowerCase()).join(" ");
 }
 
@@ -15073,7 +15115,7 @@ function mergeDashboardDraftSummaryDetails(draftState = {}, session = {}) {
 }
 
 function dashboardSessionCanModify(session = {}) {
-  return Boolean(safeQuoteSessionId(session.session_id || ""));
+  return session.dashboard_summary_only !== true && Boolean(safeQuoteSessionId(session.session_id || ""));
 }
 
 async function loadQuoteSessionDetail(sessionId = "") {
@@ -15363,6 +15405,45 @@ function dashboardExportAvailabilityItem(session = {}, kind = "xlsx", label = "X
   return { kind, label, exportInfo, available: false, statusText, className: "is-unavailable" };
 }
 
+function quoteAiSpendText(amount) {
+  if (amount?.status === "partial") {
+    return amount.display ? amount.display + " (partial)" : "Unknown (partial)";
+  }
+  if (amount?.status === "reported" && amount.display) return amount.display;
+  if (amount?.status === "none") return "No sends";
+  return "Unavailable";
+}
+
+function renderQuoteAiSpend() {
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const spend = state.quoteSessions?.find((session) => session.session_id === sessionId)?.ai_spend;
+  const text = [
+    "Analysis / Re-Analyse " + quoteAiSpendText(spend?.draft),
+    "Basis chat " + quoteAiSpendText(spend?.basis_chat),
+    "AI spend total " + quoteAiSpendText(spend?.total),
+  ].join(" · ");
+  for (const id of ["basisAiSpend", "outputAiSpend"]) {
+    const target = document.getElementById(id);
+    if (!target) continue;
+    target.hidden = !sessionId;
+    if (target.textContent !== text) target.textContent = text;
+  }
+}
+
+async function refreshQuoteAiSpend(sessionId) {
+  if (!sessionId || sessionId !== state.quoteSessionId) return;
+  const request = ++state.quoteAiSpendRequest;
+  const { ok, data } = await getJson("/api/quote-sessions", { logFetchFailure: false });
+  if (request !== state.quoteAiSpendRequest || sessionId !== state.quoteSessionId) return;
+  const current = ok && Array.isArray(data.quote_sessions)
+    ? data.quote_sessions.find((session) => session.session_id === sessionId)
+    : null;
+  if (state.quoteSessions.some((session) => session.session_id === sessionId)) {
+    mergeDashboardQuoteSession({ session_id: sessionId, ai_spend: current?.ai_spend });
+  }
+  renderQuoteDashboard();
+}
+
 function dashboardSessionCard(session = {}) {
   const status = quoteSessionStatus(session);
   const customer = dashboardSessionCustomerText(session);
@@ -15427,6 +15508,10 @@ function dashboardSessionCard(session = {}) {
           <div class="dashboard-session-subtotal-cell">
             <dt>Subtotal</dt>
             <dd class="dashboard-session-subtotal">${subtotalHtml}</dd>
+          </div>
+          <div>
+            <dt>AI spend</dt>
+            <dd>${escapeHtml(quoteAiSpendText(session.ai_spend?.total))}</dd>
           </div>
         </dl>
         <div class="dashboard-session-record-zone dashboard-session-result-zone">
@@ -15611,6 +15696,7 @@ function renderDashboardSinglePanel(activeSession = {}) {
   const status = quoteSessionStatus(activeSession);
   const customer = dashboardSessionCustomerText(activeSession);
   const project = dashboardSessionProjectText(activeSession);
+  const creator = dashboardSessionCreatorText(activeSession);
   const showName = dashboardSessionShowNameText(activeSession);
   const projectNumber = dashboardSessionProjectNumberText(activeSession);
   const profile = activeSession.quote_company_profile?.display_name || "Quote Company";
@@ -15629,6 +15715,7 @@ function renderDashboardSinglePanel(activeSession = {}) {
         <h3 id="dashboardSelectedSessionTitle">${escapeHtml(customer)}</h3>
         <p class="settings-note">${escapeHtml(project)}</p>
         <p class="dashboard-selected-created"><span>Created ${escapeHtml(createdText)}</span><span>Modified ${escapeHtml(modifiedText)}</span></p>
+        ${creator ? `<p class="settings-note">Created by ${escapeHtml(creator)}</p>` : ""}
       </div>
       ${dashboardSelectedCloseButton("Clear selected session")}
     </header>
@@ -15768,7 +15855,11 @@ function renderQuoteSessionDeleteModal() {
   const bulk = state.quoteSessionDeleteBulk || sessionIds.length > 1;
   if (elements.quoteSessionDeleteTitle) elements.quoteSessionDeleteTitle.textContent = bulk ? "Delete selected quote sessions?" : "Delete quote session?";
   if (elements.quoteSessionDeleteText) {
-    elements.quoteSessionDeleteText.textContent = bulk ? QUOTE_SESSION_DELETE_BULK_MESSAGE : QUOTE_SESSION_DELETE_SINGLE_MESSAGE;
+    const localMessage = bulk ? QUOTE_SESSION_DELETE_BULK_MESSAGE : QUOTE_SESSION_DELETE_SINGLE_MESSAGE;
+    const workspaceMessage = bulk
+      ? "This deletes the selected quote sessions and their saved exports from the workspace. This cannot be undone."
+      : "This deletes this quote session and its saved exports from the workspace. This cannot be undone.";
+    elements.quoteSessionDeleteText.textContent = state.staffEmail ? workspaceMessage : localMessage;
   }
   if (elements.confirmQuoteSessionDeleteButton) {
     elements.confirmQuoteSessionDeleteButton.textContent = bulk ? "Delete selected" : "Delete session";
@@ -16038,6 +16129,7 @@ function dashboardDateFilterSummaryText(filteredCount = 0, totalCount = 0) {
 }
 
 function renderQuoteDashboard() {
+  renderQuoteAiSpend();
   if (elements.dashboardSearchInput) elements.dashboardSearchInput.value = state.dashboardSearch || "";
   updateDashboardSummary();
   if (elements.dashboardDateFilter) elements.dashboardDateFilter.value = state.dashboardDateFilter || "all";
@@ -16315,6 +16407,7 @@ async function handleDraftBasis(options = {}) {
   saveSessionState();
 
   const polled = await pollJob(state.activeJob.id);
+  if (!polled.aborted) void refreshQuoteAiSpend(synchronizedSessionId);
   if (polled.aborted) {
     restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "draft_poll_aborted" });
     return;
@@ -16838,6 +16931,7 @@ async function resumeSavedJob() {
       return;
     }
     const resumedJob = state.activeJob || activeJob;
+    const spendSessionId = state.quoteSessionId;
 
     const polled = await pollJob(resumedJob.id, (job) => {
       if (job.created_at && !state.activeJob?.startedAt) {
@@ -16846,6 +16940,7 @@ async function resumeSavedJob() {
         saveSessionState();
       }
     });
+    if (!polled.aborted) void refreshQuoteAiSpend(spendSessionId);
     if (polled.aborted) {
       restoreQuoteCommercialOverrideSnapshot(quoteCommercialSnapshot, { reason: "resume_draft_poll_aborted" });
       return;

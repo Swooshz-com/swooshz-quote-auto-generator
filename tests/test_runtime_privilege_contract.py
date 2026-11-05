@@ -123,6 +123,47 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
             },
         )
 
+    def test_causal_telemetry_acl_query_keeps_009_inventory_after_manifest_grows(self):
+        tables = {"sqag_telemetry_events", "sqag_telemetry_source_state"}
+        telemetry = next(
+            spec for spec in migration_contract.MIGRATION_OBJECTS
+            if spec.migration_id == "009_telemetry_events_postgres.sql"
+        )
+        subject = RuntimePrivilegeContractPostgresIntegrationTest("runTest")
+        observed_triggers = [
+            {"table_name": trigger.table_name, "name": trigger.name}
+            for trigger in telemetry.triggers
+        ]
+        class QueryCaptured(Exception):
+            pass
+
+        def capture_acl_query(statement, params=(), *, database_name=None):
+            self.assertNotIn("in ()", statement)
+            self.assertEqual(statement.count("%s"), 2)
+            self.assertEqual(set(params), tables)
+            self.assertEqual(database_name, "synthetic-disposable")
+            raise QueryCaptured()
+
+        with (
+            mock.patch.object(subject, "_admin_connection"),
+            mock.patch.object(subject, "_admin_rows", side_effect=capture_acl_query) as query,
+            mock.patch.object(migration_contract, "_fetch_public_relations", return_value={}),
+            mock.patch.object(migration_contract, "_fetch_public_tables",
+                              return_value={name: {} for name in tables}),
+            mock.patch.object(migration_contract, "_fetch_public_indexes",
+                              return_value={index.name: {} for index in telemetry.indexes}),
+            mock.patch.object(migration_contract, "_fetch_public_triggers", return_value=observed_triggers),
+            mock.patch.object(migration_contract, "_table_matches", return_value=True) as table_matches,
+            mock.patch.object(migration_contract, "_index_matches", return_value=True) as index_matches,
+            mock.patch.object(migration_contract, "_trigger_matches", return_value=True) as trigger_matches,
+        ):
+            with self.assertRaises(QueryCaptured):
+                subject._assert_causal_telemetry_catalog_and_acl_contract("synthetic-disposable")
+        query.assert_called_once()
+        self.assertEqual(table_matches.call_count, 2)
+        self.assertEqual(index_matches.call_count, len(telemetry.indexes))
+        self.assertEqual(trigger_matches.call_count, len(telemetry.triggers))
+
     def test_callable_session_hold_authority_contract_is_exact(self):
         manifest = contract.validate_manifest()
         self.assertEqual(
@@ -4438,7 +4479,10 @@ order by object_kind, object_schema, object_name, object_type
                         f"{routine.name}({routine.identity_arguments})"
                         for routine in migration_contract.MIGRATION_OBJECTS[-1].routines
                     ),
-                    "applied_prefix_drift:table:public.sqag_telemetry_events",
+                    *(
+                        f"applied_prefix_drift:table:public.{mutation.table_name}"
+                        for mutation in migration_contract.MIGRATION_OBJECTS[-1].constraint_mutations
+                    ),
                 },
             )
         finally:
@@ -4451,6 +4495,41 @@ order by object_kind, object_schema, object_name, object_type
         self.assertTrue(restored_report["safeToApply"])
         self.assertEqual(restored_report["status"], "ready")
         self.assertFalse(restored_report["blockers"])
+
+        # Keep the 010 missing-ledger guard explicit after 011 becomes the head.
+        attempt_migration = next(
+            migration for migration in self.migrations
+            if migration.migration_id == "010_telemetry_attempt_semantics_postgres.sql"
+        )
+        saved_suffix = self._admin_rows(
+            "select sequence_no, migration_id, checksum_sha256, applied_at "
+            "from public.sqag_schema_migrations where sequence_no >= %s order by sequence_no",
+            (attempt_migration.sequence_no,),
+        )
+        self._execute_admin(
+            "delete from public.sqag_schema_migrations where sequence_no >= %s",
+            (attempt_migration.sequence_no,),
+        )
+        try:
+            report = self._inspect()
+            self.assertFalse(report["safeToApply"])
+            self.assertEqual(report["status"], "unsafe")
+            self.assertIn(
+                "applied_prefix_drift:table:public.sqag_telemetry_events", report["blockers"],
+            )
+            self.assertEqual(
+                report["pendingMigrationIds"],
+                [migration.migration_id for migration in self.migrations
+                 if migration.sequence_no >= attempt_migration.sequence_no],
+            )
+        finally:
+            for row in saved_suffix:
+                self._execute_admin(
+                    "insert into public.sqag_schema_migrations "
+                    "(sequence_no, migration_id, checksum_sha256, applied_at) values (%s, %s, %s, %s)",
+                    tuple(row.values()),
+                )
+        self.assertEqual(self._inspect()["status"], "ready")
 
         self._execute_admin(
             "update public.sqag_schema_migrations set checksum_sha256 = %s where migration_id = %s",
@@ -4859,13 +4938,13 @@ order by object_kind, object_schema, object_name, object_type
             [migration.migration_id for migration in self.migrations],
         )
         self.assertEqual(
-            post_009["appliedMigrationIds"][:-2],
+            post_009["appliedMigrationIds"][:7],
             clean_pre_apply["appliedMigrationIds"],
         )
         self.assertEqual(
             set(post_009["appliedMigrationIds"])
             - set(clean_pre_apply["appliedMigrationIds"]),
-            {self.migrations[7].migration_id, self.migrations[8].migration_id},
+            {migration.migration_id for migration in self.migrations[7:]},
         )
         ledger_row = self._admin_row(
             "select sequence_no, migration_id, checksum_sha256, applied_at "
@@ -5610,7 +5689,10 @@ order by owner.rolname, schema_name, grantee, acl.privilege_type
         )
 
     def _assert_causal_telemetry_catalog_and_acl_contract(self, database_name: str) -> None:
-        migration = migration_contract.MIGRATION_OBJECTS[-2]
+        migration = next(
+            spec for spec in migration_contract.MIGRATION_OBJECTS
+            if spec.migration_id == "009_telemetry_events_postgres.sql"
+        )
         telemetry_tables = {table.name for table in migration.tables}
         with self._admin_connection(database_name) as raw_connection:
             connection = webapp.PostgresConnectionAdapter(raw_connection)

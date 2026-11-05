@@ -399,11 +399,55 @@ body.auth-page {
   box-shadow: var(--shadow-md);
 }
 
-.auth-panel-mark {
-  width: 44px;
-  height: 44px;
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+  font-weight: 750;
+}
+
+.auth-brand .auth-panel-mark {
+  flex: none;
+  width: 40px;
+  height: 40px;
   object-fit: contain;
-  margin-bottom: 18px;
+}
+
+.auth-brand p {
+  margin: 0;
+}
+
+.auth-form {
+  display: grid;
+  gap: 16px;
+}
+
+.auth-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 24px;
+}
+
+.auth-links a {
+  color: var(--green-dark);
+}
+
+.auth-panel a:focus-visible,
+.auth-panel button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 3px;
+}
+
+@media (max-width: 480px) {
+  body.auth-page {
+    padding: 16px;
+  }
+
+  .auth-panel {
+    padding: 24px;
+  }
 }
 
 .auth-panel h1 {

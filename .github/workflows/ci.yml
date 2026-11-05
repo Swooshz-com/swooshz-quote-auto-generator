@@ -201,12 +201,12 @@ jobs:
           node --check webapp/static/app.js
           node --check scripts/playwright-smoke.mjs
           node --check scripts/playwright-ai-basis-chat-stress.mjs
-          node --check scripts/playwright-internal-google-auth.mjs
+          node --check scripts/playwright-internal-password-auth.mjs
           node --check scripts/playwright-alpha-smoke.mjs
 
       - name: Check Python syntax
         run: |
-          python -m py_compile webapp/server.py webapp/internal_google_auth.py webapp/postgres_migrations.py tests/internal_google_browser_harness.py tests/test_runtime_privilege_contract.py scripts/migrate_sqag_storage.py scripts/preflight_sqag_migrations.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py scripts/validate_runtime_privilege_contract.py scripts/assert_postgres17.py
+          python -m py_compile webapp/server.py webapp/internal_password_auth.py webapp/ai_gateway.py webapp/postgres_migrations.py tests/internal_password_browser_harness.py tests/test_runtime_privilege_contract.py scripts/migrate_sqag_storage.py scripts/preflight_sqag_migrations.py scripts/generate_quote.py scripts/live_ai_basis_chat_smoke.py scripts/build_pricing_catalog.py scripts/pricing_reference_cleanup.py scripts/pricing_reference_enrichment.py scripts/validate_dynamic_pricing_reference_rules.py scripts/validate_local_pdf_dependency_usage.py scripts/validate_runtime_privilege_contract.py scripts/assert_postgres17.py
 
       - name: Guard local PDF dependency usage
         run: python scripts/validate_local_pdf_dependency_usage.py
@@ -230,7 +230,7 @@ jobs:
         if: always() && steps.alpha1_prerequisites.outcome == 'success'
         run: npm run playwright:ai-stress
 
-      - name: Run synthetic internal Google auth smoke
+      - name: Run synthetic internal password auth smoke
         if: always() && steps.alpha1_prerequisites.outcome == 'success'
         run: npm run playwright:internal-auth
 

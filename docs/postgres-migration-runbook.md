@@ -21,6 +21,7 @@ chat, logs, screenshots, and command history.
 7. `008_quote_session_deletion_hold_authority_postgres.sql`
 8. `009_telemetry_events_postgres.sql`
 9. `010_telemetry_attempt_semantics_postgres.sql`
+10. `011_quote_ai_spend_postgres.sql`
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database
@@ -45,6 +46,26 @@ its exact expression on the exact public table, refuses missing, duplicate,
 unvalidated, or drifted checks, and installs a deterministic successor that
 permits zero only for the canonical request-validation event. It changes no
 rows and widens no privileges.
+
+Migration 011 adds `sqag_quote_ai_spend`, a workspace and job key for durable
+claims, and a workspace and session index. The composite foreign key cascades
+on successful quote deletion, including maintenance deletion. The existing
+quote deletion and legal hold checks still control that deletion. Runtime can
+select, insert and update spend records. Existing quotes and telemetry are
+unchanged and no historical charges are inferred. The SQLite migration adds
+the corresponding table and index. File-backed quotes use a separate record
+in the quote directory.
+
+For rollout, use the existing pre-apply and post-apply checks and verify the
+runtime privilege contract. Drain tracked AI jobs before switching app
+versions so that old workers cannot send during cutover. The new app requires
+migration 011 in database mode. Application rollback can retain the additive
+table and its ledger entry. Keep analysis and Basis chat idle on the old
+version until the new version is restored to avoid untracked charges and
+replays. Older quote saves may remove the coverage marker. On upgrade the
+reported amount remains visible and history is marked partial. A storage
+rollback to a pre-migration backup would also lose charges recorded after the
+backup. Use the normal restore process if that separate action is authorised.
 
 The runner accepts only an exact ordered prefix of the repository manifest.
 It fails closed for checksum drift, unknown or out-of-order rows, a complete

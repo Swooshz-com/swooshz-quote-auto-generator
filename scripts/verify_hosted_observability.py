@@ -117,7 +117,7 @@ def run_verification(*, work_dir: Path | None = None) -> dict[str, Any]:
     )
     ai_logged = webapp.log_ai_call_attempt(
         feature="draft_quote_basis",
-        provider=webapp.AI_PROVIDER_OPENAI,
+        provider=webapp.AI_PROVIDER_OPENROUTER,
         model="gpt-test",
         status="failed",
         duration_ms=123,

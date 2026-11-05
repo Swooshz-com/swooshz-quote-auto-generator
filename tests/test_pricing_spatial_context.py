@@ -1,6 +1,8 @@
 """Independent primary-object wording survives spatial catalogue context and ledger checks."""
 import copy
 import json
+import os
+from tests.rendered_browser_support import owned_browser_evidence_directory
 import subprocess
 import unittest
 from tests import test_webapp as fixtures
@@ -18,10 +20,12 @@ class PricingSpatialContextTest(unittest.TestCase):
         # unittest discovery is a required CI gate after Chromium installation.
         # Match the existing owner-UAT wrapper: missing Playwright is a failure,
         # and require_node fails in CI (only a missing local Node may skip).
-        result = subprocess.run(
-            [fixtures.require_node(self), 'scripts/playwright-pricing-spatial-context.mjs'],
-            text=True, capture_output=True, cwd=fixtures.ROOT, timeout=180,
-        )
+        with owned_browser_evidence_directory() as evidence_root:
+            result = subprocess.run(
+                [fixtures.require_node(self), 'scripts/playwright-pricing-spatial-context.mjs'],
+                env={**os.environ, 'SQAG_OWNER_UAT_EVIDENCE_ROOT': evidence_root},
+                text=True, capture_output=True, cwd=fixtures.ROOT, timeout=180,
+            )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         evidence = json.loads(result.stdout)
         self.assertEqual(evidence['status'], 'PASS')

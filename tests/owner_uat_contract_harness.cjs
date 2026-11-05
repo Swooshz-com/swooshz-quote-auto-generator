@@ -21,6 +21,10 @@ const outputRowIdentities=new WeakMap();
 const nodes = new Map();
 function node() { return {value:'',textContent:'',hidden:false,querySelector(){return null;},querySelectorAll(){return [];},classList:{toggle(){},add(){},remove(){}}}; }
 const elements = new Proxy({}, { get(_t,k) {if(!nodes.has(k))nodes.set(k,node());return nodes.get(k);} });
+const document = { getElementById(id) {
+  if (!nodes.has(id)) nodes.set(id, node());
+  return nodes.get(id);
+} };
 function noop() {}
 const markOutputRowsDirty=noop,renderOutputValidationMessages=noop,renderPricingMatches=noop,renderMatchSummary=noop,syncControlStates=noop,queueQuoteSessionDraftStateSave=noop,updateQuoteBasisCard=noop,setDownloadFiles=noop;
 const resetOutputSortModeToPricingReference=noop,updateDashboardSummary=noop,ensureDashboardCustomDateDefaults=noop,syncDashboardCustomDateRangeControls=noop,renderDashboardPageControls=noop,pruneDashboardSelection=noop;
@@ -55,7 +59,7 @@ function filteredDashboardSessions(){return state.dashboardSearch?[]:state.quote
 function pagedDashboardSessions(v){return v;}
 function dashboardPageRange(n){return {start:n?1:0,end:n};}
 function dashboardDateFilterSummaryText(){return '';}
-for (const name of ['normalizeUnit','numberOrNull','formatAmount','pricingAuthorityPrice','pricingAuthorityNumber','unitPriceEditKind','roundCommercialCents','quoteFxMultiplier','quoteAmountValue','effectiveOutputUnitPrice','synchronizeOwnedOutputRowPrice','recalculateOutputRow','outputPriceAuthority','outputPriceDenomination','admittedOutputPrice','revokeOutputEditor','resumeBlockedOutputDraftSave','preserveOutputRowIdentity','outputRowIdentity','outputCellDisplayValue','outputEditorPlaceholder','outputEditorHtml','commitOutputEditor','applyPossiblePricingMatch','renderQuoteDashboard']) eval(extract(name));
+for (const name of ['normalizeUnit','numberOrNull','formatAmount','pricingAuthorityPrice','pricingAuthorityNumber','unitPriceEditKind','roundCommercialCents','quoteFxMultiplier','quoteAmountValue','effectiveOutputUnitPrice','synchronizeOwnedOutputRowPrice','recalculateOutputRow','outputPriceAuthority','outputPriceDenomination','admittedOutputPrice','revokeOutputEditor','resumeBlockedOutputDraftSave','preserveOutputRowIdentity','outputRowIdentity','outputCellDisplayValue','outputEditorPlaceholder','outputEditorHtml','commitOutputEditor','applyPossiblePricingMatch','safeQuoteSessionId','quoteAiSpendText','renderQuoteAiSpend','renderQuoteDashboard']) eval(extract(name));
 if(source.includes('function outputRowFxMultiplier('))eval(extract('outputRowFxMultiplier'));
 if (input.mode==='reopen') {
   for(const variant of ['manual','catalog']) for(const denomination of variant==='catalog'?['reference']:['reference','quote']) {

@@ -23,7 +23,7 @@
             <span id="topbarAuthText">Internal UAT</span>
             <a href="/logout" id="topbarLogoutLink">Logout</a>
           </span>
-          <button class="topbar-privacy-link topbar-feedback-button" type="button" id="feedbackButton">Feedback</button>
+          <button class="topbar-privacy-link topbar-feedback-button" type="button" id="feedbackButton" hidden>Feedback</button>
           <a class="topbar-privacy-link" href="/terms" target="_blank" rel="noopener">Terms</a>
           <a class="topbar-privacy-link" href="/privacy" target="_blank" rel="noopener">Privacy Notice</a>
           <button class="topbar-action" type="button" id="backToDashboardButton" aria-label="Open dashboard" hidden>
@@ -293,7 +293,7 @@
                     <path d="M24 22v16M18 28l6-6 6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
                   </svg>
                   <span class="drop-title" id="dropTitle">Drag and drop reference images or PDFs here</span>
-                  <span class="drop-meta" id="dropMeta">PNG, JPG, or WebP. Up to 8 references, 12 MB each.</span>
+                  <span class="drop-meta" id="dropMeta">JPG, PNG, WebP, or PDF. Up to 8 references. Images up to 12 MiB each, PDFs up to 24 MiB each. Up to 128 MiB total.</span>
                   <span class="drop-action">Choose Files</span>
                 </label>
                 <p class="image-upload-status" id="imageUploadStatus" aria-live="polite"></p>
@@ -752,6 +752,7 @@
                   <strong>AI analysis failed.</strong>
                   <span>Failed. Please try again. Contact support if this keeps happening.</span>
                 </div>
+                <p id="basisAiSpend" aria-live="polite" hidden></p>
                 <section class="basis-review-surface" id="basisReviewSurface" aria-live="polite">
                   <div class="basis-empty-state">
                     <strong>Quotation basis draft</strong>
@@ -761,6 +762,7 @@
               </section>
 
               <section class="side-panel-card side-panel-section" id="outputSidePanel" data-side-panel-content="output">
+                <p id="outputAiSpend" aria-live="polite" hidden></p>
                 <div class="assistant-output quote-basis-card output-card" id="assistantOutput">
                   <span class="result-pill sr-only" id="resultStatus" aria-live="polite">No job yet</span>
                   <div class="quote-basis-header output-page-header">

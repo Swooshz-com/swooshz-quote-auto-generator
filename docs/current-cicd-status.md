@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-10-26
+Last updated: 2026-11-05
 
 Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
 
@@ -15,7 +15,7 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 - No deployment job is configured
 - This remediation adds no deployment job
 - No production environment mutation is performed by CI
-- CI does not require OpenAI, DeepSeek, Gemini, Google OIDC, deployment, or production secrets
+- CI does not require OpenAI, DeepSeek, Gemini, internal password login, deployment, or production secrets
 
 ## Plain-Text Check
 
@@ -97,8 +97,10 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
   This current application dependency set is used only by `Validate app`; the
   retrospective job uses its own closed fixture dependency snapshot and does
   not read or install from `requirements.txt`.
-- Uses pinned PyJWT and cryptography packages for synthetic RS256/JWK and OIDC
-  claim-validation compatibility tests; CI never contacts Google.
+- The retired internal Google verifier no longer adds PyJWT or cryptography
+  to `requirements.txt`. Independent local OIDC and Platform component contracts
+  retain their standard-library HTTP and HMAC session helpers; those helpers do
+  not require the removed packages. Their tests mock identity-provider requests.
 - Installs `pip-audit` and runs `python -m pip_audit -r requirements.txt --strict` against pinned Python dependencies.
 - Installs Playwright Chromium.
 - Starts an isolated disposable PostgreSQL 17 service for migration-ledger
@@ -150,32 +152,34 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 ## Deploy Runtime Gate
 
 - CI still performs no deployment.
-- Normal and High Quality full Analyse each require explicit model and reasoning
-  settings in the deployed process environment (Coolify): `OPENAI_DRAFT_MODEL`,
-  `OPENAI_DRAFT_REASONING_EFFORT`, `OPENAI_DRAFT_HIGH_QUALITY_MODEL`, and
-  `OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT`. Each operation captures its
-  selected mode's pair once for payload validation and telemetry. Missing, blank
-  or malformed settings fail before provider transport; source defaults
-  and local `.env` values cannot fill deployed gaps. The requested runtime pairs
-  are `gpt-6.1-sol/high` and `gpt-6-astra/high`. Bounded model and effort
-  identifiers pass through without a source allowlist. The provider owns model
-  access, reasoning compatibility and image/PDF capability; an incompatible pair
-  fails truthfully after one send without a model/effort downgrade. Arbitrary
-  configured model labels are redacted from logs, telemetry and evidence. Local
-  development retains `.env` support. These request checks do not change
-  process-only liveness or perform
-  configuration mutation, deployment or provider verification.
+- All six maintained inference operations require `OPENROUTER_API_KEY` and
+  explicit `OPENROUTER_<SUFFIX>_MODEL`,
+  `OPENROUTER_<SUFFIX>_REASONING_EFFORT` and
+  `OPENROUTER_<SUFFIX>_PROVIDER_ONLY` settings in the deployed process environment.
+  The suffixes, timeout and required privacy/routing settings are defined in
+  [the gateway contract](ai-gateway.md). Each operation captures one immutable
+  configuration for payload validation, transport and telemetry. Missing, blank
+  or invalid settings fail before transport; source defaults and local `.env`
+  values cannot fill deployed gaps. There is no provider/model fallback or
+  effort downgrade. Arbitrary configured model labels are redacted from logs,
+  telemetry and evidence. Local development retains explicit `.env` support.
+  These source checks do not verify installed configuration, account access or
+  exact Responses image/PDF/effort/privacy compatibility, and do not change
+  process-only liveness or perform configuration mutation or deployment.
 - `APP_MODE=deploy` requires an explicit `SQAG_AUTH_MODE` of `platform` or
-  `internal_google`, plus `AUTH_REQUIRED=true`; missing, unknown, local, mixed,
+  `internal_password`, plus `AUTH_REQUIRED=true`; missing, unknown, local, mixed,
   or incomplete configurations fail closed.
 - `platform` preserves the Swooshz Platform launch, workspace, entitlement, and
   per-request validation/revocation boundary.
-- `internal_google` is a temporary single-instance private-alpha lane with
-  one bounded server-only subject/email/role identity map, verified Google OIDC
-  code flow, per-request mapping revalidation, and server-side session
-  revocation. Legacy email-list configuration is rejected. It can never
-  satisfy public production readiness.
-- Deploy requests accept only signed sessions containing the consumed Platform
+- `internal_password` is a temporary single-instance private-alpha lane with
+  separate semicolon-delimited operator/admin alias lists and distinct shared
+  passwords for each configured role. Optional server-only continuity bindings
+  preserve stable IDs; the role lists grant access, with admin precedence on
+  overlap. It retains per-request policy revalidation and server-side revocation.
+  See [internal staff password access](internal-password-auth-mode.md) for the
+  exact settings and limits. Mixed legacy configuration is rejected. It can
+  never satisfy public production readiness.
+- Platform deploy requests accept only signed sessions containing the consumed Platform
   user, workspace, app, and supported membership-role context. Pre-existing
   OIDC-only cookies are treated as unauthenticated and cannot inherit a tester
   role or reach AI/import routes.
@@ -275,3 +279,22 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
 Review the `Validate app` Ubuntu 24.04 pin when the locked Playwright version supports a newer runner and the full rendered gate passes. The `ubuntu-latest` move to Ubuntu 26.04 currently fails browser installation before tests; remove the pin only after that compatibility is verified.
 
 Update this file whenever CI/CD jobs, triggers, required checks, branch protection, deployment behavior, secret requirements, or security gates change.
+
+## Login and inference source contract
+
+CI compiles `webapp/internal_password_auth.py`, `webapp/ai_gateway.py` and
+`tests/internal_password_browser_harness.py`. The existing security, unit,
+retrospective, native-output and browser gates remain required. CI makes no real
+provider calls and requires no login or OpenRouter secret.
+
+Runtime configuration replaces the maintained Google identity map with
+the [role-specific lists and passwords](internal-password-auth-mode.md), with
+server-only continuity bindings. Existing workspace, stable user IDs and signing
+and recovery secrets must remain unchanged when a separately approved cutover is
+performed. Shared-password holders can select any configured alias and its role.
+
+All maintained inference uses `OPENROUTER_API_KEY` and explicit model, reasoning
+and downstream provider settings for each operation. See
+[the gateway contract](ai-gateway.md). Live route preservation, identity continuity,
+privacy/account compatibility, installed agent checks and owner acceptance remain
+unqualified by mocked CI. This source change adds no deployment job or authority.

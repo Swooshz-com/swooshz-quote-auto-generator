@@ -523,16 +523,20 @@ def test_temp_root() -> Path:
     return root
 
 
-SYNTHETIC_DRAFT_CONFIG = {
-    "OPENAI_DRAFT_MODEL": "gpt-6.1-sol",
-    "OPENAI_DRAFT_REASONING_EFFORT": "high",
-    "OPENAI_DRAFT_HIGH_QUALITY_MODEL": "gpt-6.1-sol",
-    "OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT": "max",
+from tests.gateway_test_support import synthetic_configuration, responses_envelope, json_response, FixtureHttpResponse, install_mock_responses_transport
+from webapp.ai_gateway import OPENROUTER_RESPONSES_URL, ROUTE_KEYS
+SYNTHETIC_DRAFT_CONFIG = synthetic_configuration() | {
+    "OPENROUTER_DRAFT_MODEL": "openai/gpt-6.1-sol",
+    "OPENROUTER_DRAFT_REASONING_EFFORT": "high",
+    "OPENROUTER_DRAFT_HIGH_QUALITY_MODEL": "openai/gpt-6.1-sol",
+    "OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT": "max",
 }
 
 
+
 def synthetic_draft_dotenv_value(name: str) -> str:
-    return SYNTHETIC_DRAFT_CONFIG.get(name, "")
+    # Complete positive request fixture. Missing-key cases use their own empty reader.
+    return {**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY": "synthetic-key"}.get(name, "")
 
 
 def isolated_env(**overrides: str) -> dict[str, str]:
@@ -542,7 +546,7 @@ def isolated_env(**overrides: str) -> dict[str, str]:
         "SQAG_STORAGE_MODE": "local",
         "SQAG_ARTIFACT_STORAGE_MODE": "local",
         "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
-        "OPENAI_API_KEY": "",
+        "OPENROUTER_API_KEY": "",
         "DEEPSEEK_API_KEY": "",
         "PYTHONIOENCODING": "utf-8",
         "TEMP": str(test_temp_root()),
@@ -1027,6 +1031,158 @@ class LocalRunnerServer:
             self.host_patcher.stop()
 
 
+def _ledger_timeout_diagnostic_sink(record):
+    print(json.dumps(record, separators=(",", ":")), flush=True)
+
+
+class _PricingLedgerTimeoutProbe:
+    """Compare one owned server's call boundaries without recording their contents."""
+
+    def __init__(self, owner, runner_context, *, sink, clock=time.monotonic):
+        self.owner = owner
+        self.runner_context = runner_context
+        self.sink = sink
+        self.clock = clock
+        self.started = clock()
+        self.lock = threading.Lock()
+        self.thread_case = threading.local()
+        self.case_ordinal = 0
+        self.last_elapsed = 0.0
+        self.runner = None
+        self.client_installed = False
+        self.handler_installed = False
+
+    def set_case(self, ordinal):
+        with self.lock:
+            self.case_ordinal = ordinal if type(ordinal) is int and 1 <= ordinal <= 9 else 0
+
+    def _case(self):
+        with self.lock:
+            return self.case_ordinal
+
+    def _emit(self, phase, outcome, *, ordinal=None, status=0, error=None, **ignored):
+        phases = {"startup", "client_call", "handler", "response_write", "cleanup", "restore"}
+        outcomes = {"entered", "returned", "raised"}
+        statuses = {200, 201, 202, 204, 400, 401, 403, 404, 405, 409, 413, 422, 429, 500, 502, 503}
+        exceptions = {
+            TimeoutError: "TimeoutError", BrokenPipeError: "BrokenPipeError",
+            ConnectionAbortedError: "ConnectionAbortedError", ConnectionResetError: "ConnectionResetError",
+            OSError: "OSError", ValueError: "ValueError", TypeError: "TypeError",
+            RuntimeError: "RuntimeError", AssertionError: "AssertionError",
+        }
+        with self.lock:
+            elapsed = max(self.last_elapsed, max(0.0, self.clock() - self.started))
+            self.last_elapsed = elapsed
+            case = self.case_ordinal if ordinal is None else ordinal
+            record = {
+                "event": "pricing_ledger_timeout_diagnostic",
+                "phase": phase if type(phase) is str and phase in phases else "unknown",
+                "outcome": outcome if type(outcome) is str and outcome in outcomes else "unknown",
+                "elapsed_seconds": round(elapsed, 6),
+                "case_ordinal": case if type(case) is int and 0 <= case <= 9 else 0,
+                "http_status": status if type(status) is int and status in statuses else 0,
+                "exception_class": "none" if error is None else exceptions.get(type(error), "OtherException"),
+            }
+            self.sink(record)
+
+    def _call(self, phase, original, args, kwargs, *, ordinal, status=0):
+        self._emit(phase, "entered", ordinal=ordinal, status=status)
+        try:
+            result = original(*args, **kwargs)
+        except BaseException as error:
+            self._emit(phase, "raised", ordinal=ordinal, status=status, error=error)
+            raise
+        if phase == "client_call" and type(result) is dict:
+            status = result.get("status", 0)
+        self._emit(phase, "returned", ordinal=ordinal, status=status)
+        return result
+
+    def _install(self):
+        probe = self
+        self.owner_had_client = "http_json" in vars(self.owner)
+        self.owner_client_value = vars(self.owner).get("http_json")
+        original_client = self.owner.http_json
+        self.original_handler_class = self.runner.server.RequestHandlerClass
+        original_handler = self.original_handler_class.handle_pricing_selections
+        original_send = self.original_handler_class.send_json
+
+        def client(*args, **kwargs):
+            runner = args[0] if args else kwargs.get("runner")
+            method = args[1] if len(args) > 1 else kwargs.get("method")
+            path = args[2] if len(args) > 2 else kwargs.get("path")
+            if runner is probe.runner and type(method) is str and method == "POST" and type(path) is str and path == "/api/quote-sessions/pricing-selections":
+                # This boundary includes request sending, response waiting and response parsing.
+                return probe._call("client_call", original_client, args, kwargs, ordinal=probe._case())
+            return original_client(*args, **kwargs)
+
+        class ScopedHandler(self.original_handler_class):
+            def handle_pricing_selections(handler, *args, **kwargs):
+                if handler.server is not probe.runner.server:
+                    return original_handler(handler, *args, **kwargs)
+                ordinal = probe._case()
+                had_case = hasattr(probe.thread_case, "ordinal")
+                previous = getattr(probe.thread_case, "ordinal", None)
+                probe.thread_case.ordinal = ordinal
+                try:
+                    return probe._call("handler", original_handler, (handler, *args), kwargs, ordinal=ordinal)
+                finally:
+                    if had_case:
+                        probe.thread_case.ordinal = previous
+                    else:
+                        del probe.thread_case.ordinal
+
+            def send_json(handler, *args, **kwargs):
+                ordinal = getattr(probe.thread_case, "ordinal", None)
+                if handler.server is not probe.runner.server or ordinal is None:
+                    return original_send(handler, *args, **kwargs)
+                status = kwargs.get("status", args[1] if len(args) > 1 else 200)
+                return probe._call("response_write", original_send, (handler, *args), kwargs, ordinal=ordinal, status=status)
+
+        self.runner.server.RequestHandlerClass = ScopedHandler
+        self.handler_installed = True
+        self.owner.http_json = client
+        self.client_installed = True
+
+    def _restore(self):
+        if self.handler_installed:
+            self.runner.server.RequestHandlerClass = self.original_handler_class
+            self.handler_installed = False
+        if self.client_installed:
+            if self.owner_had_client:
+                self.owner.http_json = self.owner_client_value
+            else:
+                del self.owner.http_json
+            self.client_installed = False
+        self._emit("restore", "returned")
+
+    def _cleanup(self, exc_type, exc, tb):
+        return self._call("cleanup", self.runner_context.__exit__, (exc_type, exc, tb), {}, ordinal=self._case())
+
+    def __enter__(self):
+        self._emit("startup", "entered")
+        try:
+            self.runner = self.runner_context.__enter__()
+        except BaseException as error:
+            self._emit("startup", "raised", error=error)
+            raise
+        try:
+            self._install()
+        except BaseException:
+            try:
+                self._cleanup(*sys.exc_info())
+            finally:
+                self._restore()
+            raise
+        self._emit("startup", "returned")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return self._cleanup(exc_type, exc, tb)
+        finally:
+            self._restore()
+
+
 def local_http_get_json(runner: LocalRunnerServer, path: str) -> tuple[int, dict]:
     connection = http.client.HTTPConnection(
         runner.server.server_address[0],
@@ -1105,10 +1261,11 @@ def write_generator_diagnostic_fixture(command):
 class WebappServerTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
+        install_mock_responses_transport(self)
         self._test_data_root = test_temp_root() / f"webapp-test-data-{time.time_ns()}"
         data_root_patcher = mock.patch.dict(
             os.environ,
-            {"QUOTE_DATA_ROOT": str(self._test_data_root), **SYNTHETIC_DRAFT_CONFIG},
+            {"QUOTE_DATA_ROOT": str(self._test_data_root), "OPENROUTER_API_KEY":"synthetic-key", "SQAG_DISABLE_DOTENV":"1", **SYNTHETIC_DRAFT_CONFIG},
             clear=False,
         )
         data_root_patcher.start()
@@ -1129,7 +1286,7 @@ class WebappServerTest(unittest.TestCase):
         for patcher in patchers:
             patcher.start()
             self.addCleanup(patcher.stop)
-        if self._testMethodName.startswith(("test_openai_", "test_ai_requests_", "test_protected_draft_", "test_run410_")) and self._testMethodName != "test_openai_request_resolves_bundled_catalog_visual_paths":
+        if self._testMethodName.startswith(("test_openai_", "test_ai_requests_", "test_protected_draft_", "test_run410_", "test_gateway_")) and self._testMethodName != "test_openai_request_resolves_bundled_catalog_visual_paths":
             # Transport tests need decodable catalog media; the historical tiny PNG
             # fixture has an invalid IDAT checksum. Keep resolver tests independent.
             catalog_entries = webapp.catalog_visual_image_entries_for_payload
@@ -1810,10 +1967,11 @@ class WebappServerTest(unittest.TestCase):
         return state, state_cookie
 
     def test_job_request_limit_covers_documented_reference_upload_capacity(self):
-        max_reference_bytes = webapp.MAX_REFERENCE_IMAGES * max(webapp.MAX_IMAGE_BYTES, webapp.MAX_PDF_BYTES)
+        max_reference_bytes = webapp.MAX_DRAFT_SOURCE_BYTES
         base64_bytes = ((max_reference_bytes + 2) // 3) * 4
 
-        self.assertGreaterEqual(webapp.request_body_limit("/api/jobs"), base64_bytes + 2 * 1024 * 1024)
+        for path in ("/api/jobs", "/api/draft", "/api/quote-sessions"):
+            self.assertGreaterEqual(webapp.request_body_limit(path), base64_bytes + 2 * 1024 * 1024)
         self.assertEqual(webapp.request_body_limit("/api/settings/pricing-references/import-preview"), webapp.MAX_REQUEST_BYTES)
 
     def test_privacy_page_is_available_and_generic_pdpa_gdpr_notice(self):
@@ -3895,9 +4053,13 @@ function syncSelectedPricingReference() {
     state.pricingReferenceSource = "local";
   }
 }
-function renderProfileOptions() {}
-function renderPresetOptions() {}
+let profileRenders = 0;
+let presetRenders = 0;
+function renderProfileOptions() { profileRenders += 1; }
+function renderPresetOptions() { presetRenders += 1; }
+let duringHydration = null;
 async function hydrateProfileLogoFingerprints(options) {
+  if (duringHydration) await duringHydration();
   return { profiles: options.profiles, companyProfiles: options.companyProfiles };
 }
 const pending = [];
@@ -3966,12 +4128,44 @@ function response(suffix) {
   state.workspace = null;
   state.pricingReferenceId = "";
   state.pricingReferenceSource = "";
+  const rendersBefore = [profileRenders, presetRenders];
   const firstHydration = loadProfiles();
   await Promise.resolve();
   pending[2](response("b"));
   assert.strictEqual(await firstHydration, true);
   assert.strictEqual(state.workspace.id, "workspace-b");
   assert.strictEqual(state.pricingReferenceId, "pricing-b");
+  assert.deepStrictEqual([profileRenders, presetRenders], rendersBefore.map(count => count + 1));
+
+  // Context changes during either await must never commit or render.
+  for (const phase of ["response", "hydration"]) {
+    for (const mutate of [
+      () => { state.browserRecoveryScope += "-changed"; },
+      () => { state.workspace = { id: "changed-workspace" }; },
+      () => { state.pricingReferenceId = "changed-selection"; },
+      () => { authorityProfileRequestSequence += 1; },
+    ]) {
+      const originalState = JSON.parse(JSON.stringify(state));
+      const renders = [profileRenders, presetRenders];
+      let expectedState;
+      duringHydration = phase === "hydration" ? async () => {
+        mutate();
+        expectedState = JSON.stringify(state);
+      } : null;
+      const staleLoad = loadProfiles();
+      await Promise.resolve();
+      if (phase === "response") {
+        mutate();
+        expectedState = JSON.stringify(state);
+      }
+      pending.at(-1)(response("stale"));
+      assert.strictEqual(await staleLoad, false, phase);
+      assert.strictEqual(JSON.stringify(state), expectedState, "stale response committed state");
+      assert.deepStrictEqual([profileRenders, presetRenders], renders, "stale response rendered");
+      Object.assign(state, originalState);
+      duringHydration = null;
+    }
+  }
   const malformed = [
     data => { data.profiles = [{}]; },
     data => { data.pricing_references = [{}]; },
@@ -5039,7 +5233,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 diagnostics={"failure_boundary": "model_output_contract", "response_contract_reason": "linked_quantity_conflict"},
             ) if family == "contract" else webapp.OpenAIAnalysisError("PRIVATE_TRANSPORT_CANARY")
             with self.subTest(family=family), \
-                 mock.patch.dict(os.environ, isolated_env(APP_MODE="deploy", OPENAI_API_KEY=key), clear=True), \
+                 mock.patch.dict(os.environ, isolated_env(APP_MODE="deploy", OPENROUTER_API_KEY=key), clear=True), \
                  mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value), \
                  mock.patch.object(webapp, "request_openai_quote_basis", side_effect=failure) as provider, \
                  mock.patch.object(webapp, "default_quote_basis", side_effect=AssertionError("FALLBACK_DENIED")), \
@@ -5079,7 +5273,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_protected_draft_remote_ai_failure_blocks_without_local_success(self):
         payload = valid_payload()
         with (
-            mock.patch.dict(os.environ, isolated_env(APP_MODE="deploy", OPENAI_API_KEY="sk-test-redacted"), clear=False),
+            mock.patch.dict(os.environ, isolated_env(APP_MODE="deploy", OPENROUTER_API_KEY="sk-test-redacted"), clear=False),
             mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
             mock.patch.object(
                 webapp,
@@ -5103,7 +5297,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             APP_MODE="deploy",
             SQAG_STORAGE_MODE="database",
             SQAG_DATABASE_URL=database_url,
-            OPENAI_API_KEY="sk-test-redacted",
+            OPENROUTER_API_KEY="sk-test-redacted",
         )
         payload = valid_payload()
         payload["profile_id"] = "hosted-draft-profile"
@@ -5156,7 +5350,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             APP_MODE="deploy",
             SQAG_STORAGE_MODE="database",
             SQAG_DATABASE_URL=database_url,
-            OPENAI_API_KEY="sk-test-redacted",
+            OPENROUTER_API_KEY="sk-test-redacted",
         )
         payload = valid_payload()
         payload["profile_id"] = "missing-hosted-draft-profile"
@@ -5223,13 +5417,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "synthetic-confidential-marker in synthetic private runtime failed with "
             "sk-test-redacted and generated draft text."
         )
-        log_root = test_temp_root() / f"draft-protected-log-{time.time_ns()}"
+        log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"draft-protected-log-{time.time_ns()}"
         with (
             mock.patch.dict(
                 os.environ,
                     isolated_env(
                         APP_MODE="deploy",
-                        OPENAI_API_KEY="sk-test-redacted",
+                        OPENROUTER_API_KEY="sk-test-redacted",
                         QUOTE_LOG_ROOT=str(log_root),
                     ),
                 clear=False,
@@ -5269,7 +5463,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
         private_provider_message = "PRIVATE_PROVIDER_BODY prompt text and generated draft text"
         http_error = webapp.urllib.error.HTTPError(
-            url=webapp.OPENAI_RESPONSES_URL,
+            url=OPENROUTER_RESPONSES_URL,
             code=400,
             msg="Bad Request",
             hdrs={},
@@ -5281,14 +5475,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 }
             }).encode("utf-8")),
         )
-        log_root = test_temp_root() / f"draft-protected-http-log-{time.time_ns()}"
+        log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"draft-protected-http-log-{time.time_ns()}"
 
         with (
             mock.patch.dict(
                 os.environ,
                 isolated_env(
                     APP_MODE="deploy",
-                    OPENAI_API_KEY="sk-test-observability",
+                    OPENROUTER_API_KEY="sk-test-observability",
                     QUOTE_LOG_ROOT=str(log_root),
                 ),
                 clear=True,
@@ -5361,10 +5555,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             (
                 "incomplete",
                 {
+                    "model": SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"],
                     "status": "incomplete",
                     "incomplete_details": {"reason": "max_output_tokens"},
                     "output": [{
-                        "type": "message",
+                        "type": "message", "role":"assistant",
                         "content": [{"type": "output_text", "text": "PRIVATE_INCOMPLETE_OUTPUT"}],
                     }],
                 },
@@ -5373,9 +5568,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             (
                 "refusal",
                 {
+                    "model": SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"],
                     "status": "completed",
                     "output": [{
-                        "type": "message",
+                        "type": "message", "role":"assistant",
                         "content": [{"type": "refusal", "refusal": "PRIVATE_REFUSAL_BODY"}],
                     }],
                 },
@@ -5385,15 +5581,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         for label, response_data, expected in cases:
             with self.subTest(label=label):
-                log_root = test_temp_root() / f"draft-protected-contract-{label}-{time.time_ns()}"
-                response = mock.MagicMock()
-                response.__enter__.return_value.read.return_value = json.dumps(response_data).encode("utf-8")
+                log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"draft-protected-contract-{label}-{time.time_ns()}"
+                response = FixtureHttpResponse(response_data)
                 with (
                     mock.patch.dict(
                         os.environ,
                         isolated_env(
                             APP_MODE="deploy",
-                            OPENAI_API_KEY="sk-test-observability",
+                            OPENROUTER_API_KEY="sk-test-observability",
                             QUOTE_LOG_ROOT=str(log_root),
                         ),
                         clear=True,
@@ -5430,37 +5625,32 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ),
             (
                 "model_output_json",
-                {"output_text": "PRIVATE_MODEL_OUTPUT_NOT_JSON"},
+                responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], "PRIVATE_MODEL_OUTPUT_NOT_JSON"),
                 "model_output_invalid",
             ),
             (
                 "model_output_contract",
-                {"output_text": json.dumps({
+                responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({
                     "quote_basis_sections": [{
                         "title": "Synthetic section",
                         "lines": [{"tag": "Confirm", "text": "Synthetic line without confidence"}],
                     }],
                     "line_items": [],
-                })},
+                })),
                 "model_output_invalid",
             ),
         )
 
         for boundary, response_value, expected_kind in cases:
             with self.subTest(boundary=boundary):
-                response = mock.MagicMock()
-                response.__enter__.return_value.read.return_value = (
-                    response_value
-                    if isinstance(response_value, bytes)
-                    else json.dumps(response_value).encode("utf-8")
-                )
+                response = FixtureHttpResponse.from_bytes(response_value) if isinstance(response_value, bytes) else FixtureHttpResponse(response_value)
                 with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response):
                     with self.assertRaises(webapp.OpenAIAnalysisError) as error:
                         webapp.request_openai_quote_basis(valid_payload(), "sk-test-observability")
 
                 metadata = webapp.ai_failure_metadata(
                     error.exception,
-                    provider=webapp.AI_PROVIDER_OPENAI,
+                    provider=webapp.AI_PROVIDER_OPENROUTER,
                     error_reference="ERR-ABCDEF12",
                 )
                 self.assertEqual(metadata["failure_boundary"], boundary)
@@ -5472,30 +5662,26 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_protected_draft_malformed_nested_response_content_is_shape_failure(self):
         payload = valid_payload()
         cases = (
-            ("numeric", [{"type": "message", "content": 7}], "PRIVATE_NUMERIC_PROVIDER_CONTENT"),
+            ("numeric", [{"type": "message", "role":"assistant", "content": 7}], "PRIVATE_NUMERIC_PROVIDER_CONTENT"),
             (
                 "mapping",
-                [{"type": "message", "content": {"sentinel": "PRIVATE_MAPPING_PROVIDER_CONTENT"}}],
+                [{"type": "message", "role":"assistant", "content": {"sentinel": "PRIVATE_MAPPING_PROVIDER_CONTENT"}}],
                 "PRIVATE_MAPPING_PROVIDER_CONTENT",
             ),
-            ("string", [{"type": "message", "content": "PRIVATE_STRING_PROVIDER_CONTENT"}], "PRIVATE_STRING_PROVIDER_CONTENT"),
+            ("string", [{"type": "message", "role":"assistant", "content": "PRIVATE_STRING_PROVIDER_CONTENT"}], "PRIVATE_STRING_PROVIDER_CONTENT"),
             ("malformed_output_item", ["PRIVATE_MALFORMED_OUTPUT_ITEM"], "PRIVATE_MALFORMED_OUTPUT_ITEM"),
         )
 
         for label, output_value, private_marker in cases:
             with self.subTest(label=label):
-                log_root = test_temp_root() / f"draft-protected-nested-shape-{label}-{time.time_ns()}"
-                response = mock.MagicMock()
-                response.__enter__.return_value.read.return_value = json.dumps({
-                    "output": output_value,
-                    "untrusted": private_marker,
-                }).encode("utf-8")
+                log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"draft-protected-nested-shape-{label}-{time.time_ns()}"
+                response = FixtureHttpResponse({'output': output_value, 'untrusted': private_marker, 'model': SYNTHETIC_DRAFT_CONFIG['OPENROUTER_DRAFT_MODEL'], 'status': 'completed'})
                 with (
                     mock.patch.dict(
                         os.environ,
                         isolated_env(
                             APP_MODE="deploy",
-                            OPENAI_API_KEY="sk-test-observability",
+                            OPENROUTER_API_KEY="sk-test-observability",
                             QUOTE_LOG_ROOT=str(log_root),
                         ),
                         clear=True,
@@ -5538,16 +5724,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def _run_run410_protected_draft_fixture(self, response_data, label):
         payload = valid_payload()
-        log_root = ROOT / "_logs" / "tests" / f"run-410-{label}-{time.time_ns()}"
+        log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"run-410-{label}-{time.time_ns()}"
         log_root.parent.mkdir(parents=True, exist_ok=True)
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps(response_data).encode("utf-8")
+        response = FixtureHttpResponse(response_data)
         with (
             mock.patch.dict(
                 os.environ,
                 isolated_env(
                     APP_MODE="deploy",
-                    OPENAI_API_KEY="sk-test-observability",
+                    OPENROUTER_API_KEY="sk-test-observability",
                     QUOTE_LOG_ROOT=str(log_root),
                 ),
                 clear=True,
@@ -5624,9 +5809,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         private_marker = "PRIVATE_NON_OBJECT_CONTENT_MEMBER"
         payload, result, records = self._run_run410_protected_draft_fixture(
             {
-                "status": "completed",
+                "model": SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"],
+                    "status": "completed",
                 "output": [{
-                    "type": "message",
+                    "type": "message", "role":"assistant",
                     "content": [
                         {"type": "output_text", "text": "PRIVATE_CONTENT_TEXT"},
                         private_marker,
@@ -5660,6 +5846,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         }
         response_data = {
             "id": "resp_synthetic_nested_success",
+            "model": SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"],
             "status": "completed",
             "output": [{
                 "id": "msg_synthetic_nested_success",
@@ -5701,20 +5888,19 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_protected_draft_provider_transport_terminal_failure_is_safe(self):
         payload = valid_payload()
-        log_root = test_temp_root() / f"draft-protected-transport-failure-{time.time_ns()}"
+        log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"draft-protected-transport-failure-{time.time_ns()}"
         transport_error = webapp.urllib.error.URLError("PRIVATE_TRANSPORT_REASON")
         with (
             mock.patch.dict(
                 os.environ,
                 isolated_env(
                     APP_MODE="deploy",
-                    OPENAI_API_KEY="sk-test-observability",
+                    OPENROUTER_API_KEY="sk-test-observability",
                     QUOTE_LOG_ROOT=str(log_root),
                 ),
                 clear=True,
             ),
             mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
-            mock.patch.object(webapp, "OPENAI_RETRY_DELAYS_SECONDS", ()),
             mock.patch.object(webapp.urllib.request, "urlopen", side_effect=transport_error),
         ):
             result = webapp.draft_quote_basis(payload)
@@ -5771,15 +5957,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         for label, response_data, expected_boundary in cases:
             with self.subTest(label=label):
-                log_root = test_temp_root() / f"draft-protected-contract-shape-{label}-{time.time_ns()}"
-                response = mock.MagicMock()
-                response.__enter__.return_value.read.return_value = json.dumps(response_data).encode("utf-8")
+                log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"draft-protected-contract-shape-{label}-{time.time_ns()}"
+                response = FixtureHttpResponse(response_data)
                 with (
                     mock.patch.dict(
                         os.environ,
                         isolated_env(
                             APP_MODE="deploy",
-                            OPENAI_API_KEY="sk-test-observability",
+                            OPENROUTER_API_KEY="sk-test-observability",
                             QUOTE_LOG_ROOT=str(log_root),
                         ),
                         clear=True,
@@ -5820,16 +6005,16 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_protected_draft_single_attempt_uses_shared_reference(self):
         payload = valid_payload()
-        log_root = test_temp_root() / f"draft-protected-terminal-retry-{time.time_ns()}"
+        log_root = ROOT / "_logs" / "app" / "protected-draft-fixtures" / f"draft-protected-terminal-retry-{time.time_ns()}"
         first_error = webapp.urllib.error.HTTPError(
-            url=webapp.OPENAI_RESPONSES_URL,
+            url=OPENROUTER_RESPONSES_URL,
             code=500,
             msg="Upstream retryable error",
             hdrs={},
             fp=io.BytesIO(b"retryable"),
         )
         second_error = webapp.urllib.error.HTTPError(
-            url=webapp.OPENAI_RESPONSES_URL,
+            url=OPENROUTER_RESPONSES_URL,
             code=400,
             msg="Bad Request",
             hdrs={},
@@ -5847,13 +6032,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     os.environ,
                     isolated_env(
                         APP_MODE="deploy",
-                        OPENAI_API_KEY="sk-test-observability",
+                        OPENROUTER_API_KEY="sk-test-observability",
                         QUOTE_LOG_ROOT=str(log_root),
                     ),
                     clear=True,
                 ),
                 mock.patch.object(webapp, "read_dotenv_value", side_effect=env_only_dotenv_value),
-                mock.patch.object(webapp, "OPENAI_RETRY_DELAYS_SECONDS", (0.0,)),
                 mock.patch.object(webapp.time, "sleep"),
                 mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[first_error, second_error]),
             ):
@@ -7633,37 +7817,16 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertTrue(webapp.deploy_requires_auth_guard())
             self.assertFalse(webapp.is_allowed_host_header("quote.example"))
 
-    def test_local_internal_google_session_revocation_invalidates_existing_cookie(self):
-        env = {
-            "APP_MODE": "local",
-            "AUTH_REQUIRED": "true",
-            "SQAG_AUTH_MODE": "internal_google",
-            "SQAG_DISABLE_DOTENV": "1",
-            "SESSION_SECRET": "synthetic-local-internal-session-secret",
-            "SQAG_INTERNAL_WORKSPACE_ID": "workspace-internal-alpha",
-            "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON": json.dumps(
-                [{"sub": "synthetic-browser-subject", "email": "alpha-admin@example.test", "role": "admin"}],
-                separators=(",", ":"),
-            ),
-        }
-        webapp.INTERNAL_AUTH_STATE.reset()
-        try:
-            with mock.patch.dict(os.environ, env, clear=True):
-                policy = webapp.internal_auth_policy()
-                session = webapp.INTERNAL_AUTH_STATE.create_session(
-                    google_sub="synthetic-browser-subject",
-                    email="alpha-admin@example.test",
-                    policy=policy,
-                )
-                cookie = webapp.signed_cookie_value(session)
-                cookie_header = f"{webapp.SESSION_COOKIE_NAME}={cookie}"
-
-                accepted = webapp.session_from_cookie_header(cookie_header)
-                self.assertEqual(accepted["session_id"], session["session_id"])
-                self.assertTrue(webapp.INTERNAL_AUTH_STATE.revoke_session(session["session_id"]))
-                self.assertIsNone(webapp.session_from_cookie_header(cookie_header))
-        finally:
-            webapp.INTERNAL_AUTH_STATE.reset()
+    def test_internal_password_session_revocation_invalidates_existing_cookie(self):
+        from tests.test_internal_password_auth_webapp import internal_env
+        from tests.test_internal_password_auth import email, policy_values
+        with mock.patch.dict(os.environ, internal_env(), clear=True):
+            state = webapp.InternalAuthState()
+            cookie_payload = state.authenticate(email=email(), password=policy_values()["admin_password"], policy=webapp.internal_auth_policy())
+            header = webapp.SESSION_COOKIE_NAME+"="+webapp.signed_cookie_value(cookie_payload)
+            self.assertIsNotNone(webapp.session_from_cookie_header(header, auth_state=state))
+            self.assertTrue(state.revoke_session(cookie_payload["session_id"]))
+            self.assertIsNone(webapp.session_from_cookie_header(header, auth_state=state))
 
     def test_local_oidc_component_scaffold_signs_sessions_and_maps_claims(self):
         env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
@@ -8552,6 +8715,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_rate_limit_handlers_reject_duplicate_forwarded_for_fields(self):
         handler = object.__new__(webapp.QuoteRunnerHandler)
+        handler.server = types.SimpleNamespace(internal_auth=webapp.InternalAuthState())
         handler.client_address = ('127.0.0.1', 12345)
         handler.headers = http.client.HTTPMessage()
         handler.headers.add_header('Host', '127.0.0.1:8765')
@@ -8649,6 +8813,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_mutable_route_rate_limit_uses_bounded_normalized_bucket(self):
         handler = object.__new__(webapp.QuoteRunnerHandler)
+        handler.server = types.SimpleNamespace(internal_auth=webapp.InternalAuthState())
         handler.client_address = ("127.0.0.1", 12345)
         handler.headers = http.client.HTTPMessage()
         handler.headers.add_header("Host", "127.0.0.1:8765")
@@ -9182,15 +9347,24 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         backend.readiness_probe.side_effect = RuntimeError(private_provider_error)
         with (
             mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(webapp.DatabaseSqagStorage, "ensure_ready", side_effect=RuntimeError(private_database_value)),
+            mock.patch.object(webapp.DatabaseSqagStorage, "ensure_ready", side_effect=RuntimeError(private_database_value)) as metadata_ready,
+            mock.patch.object(webapp.DatabaseSqagStorage, "ensure_runtime_forensic_ready", side_effect=RuntimeError(private_database_value)) as forensic_ready,
+            mock.patch.object(webapp.DatabaseSqagStorage, "ensure_object_artifact_ready", side_effect=RuntimeError(private_database_value)) as object_metadata_ready,
+            mock.patch.object(webapp.DatabaseSqagStorage, "connection", side_effect=AssertionError("health fixture must not open a database connection")) as connection,
             mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
         ):
             status = webapp.health_status(force_dependency_probe=True)
 
+        metadata_ready.assert_called_once_with()
+        forensic_ready.assert_called_once_with()
+        object_metadata_ready.assert_called_once_with()
+        backend.readiness_probe.assert_called_once_with()
+        connection.assert_not_called()
         serialized = json.dumps(status, sort_keys=True)
         checks = {check["name"]: check["ok"] for check in status["checks"]}
         self.assertEqual(status["status"], "blocked")
         self.assertFalse(checks["database_metadata_schema"])
+        self.assertFalse(checks["forensic_schema"])
         self.assertFalse(checks["object_artifact_metadata_schema"])
         self.assertFalse(checks["object_storage_bucket"])
         self.assertNotIn(private_database_value, serialized)
@@ -10486,6 +10660,33 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     findings,
                 )
 
+    def test_internal_uat_coolify_env_template_requires_exact_zdr_boolean(self):
+        source_text = deploy_template.DEFAULT_TEMPLATE.read_text(encoding="utf-8")
+        values, _ = deploy_template.parse_env_template(deploy_template.DEFAULT_TEMPLATE)
+        self.assertEqual(values["OPENROUTER_ZDR"], "true")
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "sqag.uat.env.example"
+            for value in ("true", "false", None, "", "True", "False", "1", "no"):
+                text = source_text.replace("OPENROUTER_ZDR=true", "" if value is None else f"OPENROUTER_ZDR={value}")
+                template.write_text(text, encoding="utf-8")
+                result = deploy_template.verify_template(template)
+                with self.subTest(zdr=value):
+                    self.assertEqual(result["status"], "ready" if value in ("true", "false") else "blocked")
+                    if value not in ("true", "false"):
+                        self.assertTrue(any(finding.key == "OPENROUTER_ZDR" for finding in result["findings"]))
+                    if value is None:
+                        self.assertTrue(any(finding.key == "OPENROUTER_ZDR" and finding.category == "missing-key" for finding in result["findings"]))
+            for key, invalid in (("OPENROUTER_DATA_COLLECTION", "allow"),
+                                 ("OPENROUTER_REQUIRE_PARAMETERS", "false"),
+                                 ("OPENROUTER_ALLOW_FALLBACKS", "true")):
+                text = source_text.replace("OPENROUTER_ZDR=true", "OPENROUTER_ZDR=false")
+                text = re.sub(rf"(?m)^{key}=.*$", f"{key}={invalid}", text)
+                template.write_text(text, encoding="utf-8")
+                with self.subTest(key=key):
+                    result = deploy_template.verify_template(template)
+                    self.assertEqual(result["status"], "blocked")
+                    self.assertTrue(any(finding.key == key for finding in result["findings"]))
+
     def test_internal_uat_coolify_env_template_rejects_placeholder_or_malformed_tracking_version_without_values(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
         source_text = source.read_text(encoding="utf-8")
@@ -10544,29 +10745,43 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn(secret_value, output)
         self.assertNotIn(malformed_version, output)
 
-    def test_internal_uat_coolify_env_template_rejects_disguised_oidc_client_secret(self):
+    def test_internal_uat_coolify_template_requires_gateway_and_forbids_retired_keys(self):
+        self.assertFalse(set(deploy_template.REQUIRED_KEYS) & deploy_template.FORBIDDEN_KEYS)
+        self.assertIn("OPENROUTER_API_KEY",deploy_template.REQUIRED_KEYS)
+        self.assertIn("OPENAI_API_KEY",deploy_template.FORBIDDEN_KEYS)
+        self.assertIn("DEEPSEEK_API_KEY",deploy_template.FORBIDDEN_KEYS)
+        self.assertEqual(deploy_template.verify_template()["status"],"ready")
+
+    def test_internal_uat_coolify_env_template_rejects_disguised_team_password(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
         source_text = source.read_text(encoding="utf-8")
-        disguised_secret = source_text.replace(
-            "OIDC_CLIENT_SECRET=<host-secret-manager-google-oidc-client-secret>",
-            "OIDC_CLIENT_SECRET=<literal-reusable-service-credential>",
-        )
+        placeholders = {
+            "SQAG_INTERNAL_LOGIN_PASSWORD": "<host-secret-manager-operator-password>",
+            "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "<host-secret-manager-admin-password>",
+        }
+        for key, marker in placeholders.items():
+            with self.subTest(key=key):
+                disguised_secret = source_text.replace(
+                    f"{key}={marker}",
+                    f"{key}=<literal-reusable-service-credential>",
+                )
+                self.assertNotEqual(disguised_secret, source_text)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            template = Path(tmp) / "sqag.uat.env.example"
-            template.write_text(disguised_secret, encoding="utf-8")
-            result = deploy_template.verify_template(template)
+                with tempfile.TemporaryDirectory() as tmp:
+                    template = Path(tmp) / "sqag.uat.env.example"
+                    template.write_text(disguised_secret, encoding="utf-8")
+                    result = deploy_template.verify_template(template)
 
-        findings = [deploy_template.finding_to_dict(finding) for finding in result["findings"]]
-        self.assertEqual(result["status"], "blocked")
-        self.assertIn(
-            {
-                "key": "OIDC_CLIENT_SECRET",
-                "category": "unexpected-placeholder",
-                "message": "security-sensitive placeholder does not match the approved template marker",
-            },
-            findings,
-        )
+                findings = [deploy_template.finding_to_dict(finding) for finding in result["findings"]]
+                self.assertEqual(result["status"], "blocked")
+                self.assertIn(
+                    {
+                        "key": key,
+                        "category": "unexpected-placeholder",
+                        "message": "security-sensitive placeholder does not match the approved template marker",
+                    },
+                    findings,
+                )
 
     def test_internal_uat_coolify_env_template_requires_placeholder_proxy_cidrs(self):
         source = ROOT / 'deploy' / 'internal-uat' / 'coolify' / 'sqag.uat.env.example'
@@ -10613,7 +10828,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             bad_template = Path(tmp) / "sqag.uat.env.example"
             bad_template.write_text(
                 source.read_text(encoding="utf-8")
-                .replace("SQAG_AUTH_MODE=internal_google", "SQAG_AUTH_MODE=local")
+                .replace("SQAG_AUTH_MODE=internal_password", "SQAG_AUTH_MODE=local")
                 .replace("QUOTE_DATA_ROOT=<host-managed-runtime-root>", "QUOTE_DATA_ROOT=C:\\Users\\Private\\runtime")
                 .replace("SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=<host-secret-manager-object-storage-secret-access-key>", "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY=sk-real-looking-token-123456"),
                 encoding="utf-8",
@@ -10636,7 +10851,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertIn("topbarAuthState", html_text)
         self.assertIn("Sign in required for internal UAT", js)
-        self.assertIn("Signed in as approved tester", js)
+        self.assertIn(
+            'state.staffEmail = state.authenticated && typeof data.staff_identity?.email === "string"'
+            ' ? data.staff_identity.email : "";',
+            js,
+        )
+        self.assertIn('const label = state.staffEmail || "approved tester";', js)
+        self.assertIn('topbarAuthText.textContent = role ? `Signed in as ${label} (${role})`', js)
+        self.assertIn('state.authenticated = false;\n  state.staffEmail = "";', js)
         self.assertIn("topbarLogoutLink", js)
         self.assertIn("auth-page", css)
         self.assertNotIn("authUser.email", js)
@@ -10818,7 +11040,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_markdown_pricing_reference_import_without_ai_is_clear_and_not_saved(self):
         raw = b"# Messy catalog\n\n- m run of hanging structure x 1m height"
-        with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
+        with mock.patch.object(webapp, "read_dotenv_value", return_value=""), \
+             mock.patch.object(webapp.urllib.request, "urlopen", side_effect=AssertionError("SEND_FORBIDDEN")) as send, \
+             mock.patch.object(webapp, "write_local_log") as logs:
             result = webapp.pricing_reference_import_preview({
                 "filename": "catalog.md",
                 "data_url": "data:text/markdown;base64," + base64.b64encode(raw).decode("ascii"),
@@ -10828,6 +11052,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertFalse(result["canSave"])
         self.assertIn(webapp.AI_PRICING_IMPORT_NOT_CONFIGURED, result["errors"])
         self.assertEqual(result["layout"], "ai-normalization-required")
+        send.assert_not_called()
+        self.assertTrue(result["error_reference"])
+        self.assertIn(result["error_reference"], " ".join(result["errors"]))
+        self.assertTrue(any(call.args[1].get("error_reference") == result["error_reference"] for call in logs.call_args_list))
 
     def test_messy_pricing_reference_import_uses_ai_normalization(self):
         raw = "Item,Price\nWhite painted walling per sqm,50\n".encode("utf-8")
@@ -10844,7 +11072,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "object_families": ["wall system"],
             }]
         }
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""), \
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
                 mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed) as request_import, \
                 mock.patch.object(webapp, "ai_pricing_reference_metadata_enrichment") as metadata_enrichment:
             result = webapp.pricing_reference_import_preview({
@@ -10879,7 +11107,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             }]
         }
 
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""), \
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
                 mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed), \
                 mock.patch.object(webapp, "ai_pricing_reference_metadata_enrichment") as metadata_enrichment:
             result = webapp.pricing_reference_import_preview({
@@ -10911,7 +11139,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         }
 
         def dotenv(name):
-            return "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""
+            return {**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY": "sk-test-redacted"}.get(name, "")
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv), \
                 mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed):
@@ -10954,7 +11182,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "aliases": ["white wall"],
             }]
         }
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""), \
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
                 mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed):
             result = webapp.pricing_reference_import_preview({
                 "filename": "messy.csv",
@@ -10980,14 +11208,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "aliases": ["white wall"],
             }]
         }
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""), \
-                mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed), \
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
+                mock.patch.object(webapp.urllib.request, "urlopen", return_value=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"], parsed)) as send, \
                 mock.patch.object(webapp, "write_local_log") as write_log:
             result = webapp.pricing_reference_import_preview({
                 "filename": "messy.csv",
                 "data_url": "data:text/csv;base64," + base64.b64encode(raw).decode("ascii"),
             })
 
+        send.assert_called_once()
         self.assertEqual(result["layout"], "ai-normalized-pricing-reference")
         log_calls = {call.args[0]: call.args[1] for call in write_log.call_args_list}
         self.assertIn("server_pricing_reference_import_timing", log_calls)
@@ -11000,8 +11229,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         for key in ("template_validation", "decode_upload", "ai_context_extract", "ai_normalization_total", "total"):
             self.assertIsInstance(server_log["timings_ms"][key], int)
         ai_log = log_calls["ai_pricing_reference_import_timing"]
-        self.assertEqual(ai_log["selected_provider"], webapp.AI_PROVIDER_OPENAI)
-        self.assertEqual(ai_log["completed_provider"], webapp.AI_PROVIDER_OPENAI)
+        self.assertEqual(ai_log["selected_provider"], webapp.AI_PROVIDER_OPENROUTER)
+        self.assertEqual(ai_log["completed_provider"], webapp.AI_PROVIDER_OPENROUTER)
         self.assertEqual(ai_log["operator_stage"], "import_cleanup")
         self.assertEqual(ai_log["raw_item_count"], 1)
         self.assertEqual(ai_log["provider_attempts"][0]["status"], "success")
@@ -11014,12 +11243,13 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         ai_attempt_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
         self.assertEqual(len(ai_attempt_logs), 1)
         self.assertEqual(ai_attempt_logs[0]["feature"], "pricing_reference_import")
-        self.assertEqual(ai_attempt_logs[0]["provider"], webapp.AI_PROVIDER_OPENAI)
+        self.assertEqual(ai_attempt_logs[0]["provider"], webapp.AI_PROVIDER_OPENROUTER)
         self.assertEqual(ai_attempt_logs[0]["status"], "success")
         self.assertEqual(ai_attempt_logs[0]["operator_stage"], "import_cleanup")
         self.assertEqual(ai_attempt_logs[0]["ai_run_id"], ai_log["ai_run_id"])
         self.assertEqual(ai_attempt_logs[0]["attempt_index"], 1)
         self.assertEqual(ai_attempt_logs[0]["attempt_count"], 1)
+        self.assertEqual(ai_attempt_logs[0]["attempt_number"], 1)
         self.assertEqual(ai_attempt_logs[0]["source_file_extension"], "csv")
         self.assertNotIn("filename", ai_attempt_logs[0])
         self.assertIsInstance(ai_attempt_logs[0]["duration_ms"], int)
@@ -11065,7 +11295,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "aliases": ["white wall"],
             }]
         }
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""), \
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
                 mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed) as request_import:
             result = webapp.pricing_reference_import_preview({
                 "filename": "messy-with-required-headers.csv",
@@ -11092,7 +11322,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             }]
         }
 
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""), \
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
                 mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed) as request_import:
             result = webapp.pricing_reference_import_preview({
                 "filename": "synthetic-messy-pricing-reference.xlsx",
@@ -11110,7 +11340,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(result["items"][0]["unit_hint"], "sqm")
 
     def test_ai_import_zero_rows_reports_detection_failure(self):
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""), \
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
                 mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value={"items": []}):
             result = webapp.ai_pricing_reference_import_preview(
                 "empty-ai.xlsx",
@@ -12635,7 +12865,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         }]
 
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(webapp, "DEFAULT_TMP_ROOT", Path(tmp)):
+            with mock.patch.dict(os.environ, {"QUOTE_TMP_ROOT": tmp}):
                 saved = webapp.persist_pdf_page_debug_images(pages, "Client Deck.pdf", "abcdef1234567890")
 
             output_path = Path(saved[0]["path"])
@@ -12653,7 +12883,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         }]
 
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(webapp, "DEFAULT_TMP_ROOT", Path(tmp)):
+            with mock.patch.dict(os.environ, {"QUOTE_TMP_ROOT": tmp}):
                 output_dir = Path(tmp) / "pdf-pages" / "Client-Deck-abcdef123456"
                 output_dir.mkdir(parents=True)
                 stale_path = output_dir / "page-001-old.jpg"
@@ -12755,7 +12985,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             + base64.b64encode(synthetic_distinct_pages_pdf(3)).decode("ascii"),
         }
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(webapp, "DEFAULT_TMP_ROOT", Path(tmp)):
+            with mock.patch.dict(os.environ, {"QUOTE_TMP_ROOT": tmp}):
                 images = webapp.pdf_reference_page_images(entry, max_pages=3)
 
             paths = [Path(image["path"]) for image in images]
@@ -12803,6 +13033,46 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn(created["status"], {"running", "completed"})
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["result"]["source"], "openai")
+
+    def test_ai_requests_batch_through_both_http_entry_points(self):
+        payload = valid_payload()
+        payload["images"] = [{"name": "synthetic-scope.pdf", "data_url": synthetic_pdf(13)}]
+        model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"]
+
+        def send(request, **kwargs):
+            parts = json.loads(request.data)["input"][0]["content"]
+            if parts[0]["text"].startswith("Inspect each attached visual"):
+                result = {"observations": ["Synthetic scope"] * (len(parts) - 1)}
+            else:
+                self.assertIn('"source": "Reference 1, PDF page 13"', parts[0]["text"])
+                result = {"quote_basis_sections": [{"title": "Synthetic Scope", "lines": [{
+                    "tag": "Confirm", "text": "Synthetic booth fascia", "quantity": 1,
+                    "unit": "nos", "confidence_pct": 80,
+                }]}], "line_items": []}
+            return FixtureHttpResponse(responses_envelope(model, json.dumps(result)))
+
+        self.reset_rate_limit_state()
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "user"}),
+            mock.patch.object(webapp.urllib.request, "urlopen", side_effect=send) as provider,
+            LocalRunnerServer() as runner,
+        ):
+            session = self.http_json(runner, "GET", "/api/session")["body"]
+            headers = {session["csrf_header"]: session["csrf_token"]}
+            direct = self.http_json(runner, "POST", "/api/draft", body=payload, headers=headers)
+            self.assertEqual(direct["status"], 200, direct["body"])
+            self.assertEqual(direct["body"]["source"], "openai")
+            self.assertEqual(provider.call_count, 4)
+
+            request = {"type": "draft", "payload": payload, "job_id": "job-pdf-batch-12345678"}
+            queued = self.http_json(runner, "POST", "/api/jobs", body=request, headers=headers)
+            self.assertEqual(queued["status"], 202, queued["body"])
+            completed = wait_for_job(queued["body"]["job_id"], timeout=8)
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["result"]["source"], "openai")
+            replay = self.http_json(runner, "POST", "/api/jobs", body=request, headers=headers)
+            self.assertEqual(replay["body"]["job_id"], queued["body"]["job_id"])
+            self.assertEqual(provider.call_count, 8)
 
     def test_create_job_reuses_client_job_id_without_starting_duplicate_worker(self):
         payload = valid_payload()
@@ -12883,8 +13153,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
-            env_path.write_text("OPENAI_API_KEY=sk-test-redacted\n", encoding="utf-8")
-            with mock.patch.object(webapp, "PROJECT_ROOT", Path(tmp)):
+            env_path.write_text("OPENROUTER_API_KEY=sk-test-redacted\n", encoding="utf-8")
+            with mock.patch.object(webapp, "PROJECT_ROOT", Path(tmp)), mock.patch.dict(os.environ, {"OPENROUTER_API_KEY":"", "SQAG_DISABLE_DOTENV":"0"}):
                 with mock.patch.object(webapp, "request_openai_quote_basis", return_value=ai_draft) as request:
                     result = webapp.draft_quote_basis(payload)
 
@@ -12907,27 +13177,36 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("ai_api_key", webapp.payload_to_brief(payload))
 
     def test_draft_quote_basis_logs_ai_call_attempt_metadata(self):
+        from tests.test_provider_response_admission import draft
+
         payload = valid_payload()
-        ai_draft = {
-            "quote_basis_sections": [
-                {
-                    "id": "surfaces",
-                    "title": "Surfaces / Structures",
-                    "lines": [{"tag": "Confirm", "text": "AI surfaces", "confidence_pct": 88}],
-                },
-            ],
-        }
+        ai_draft = draft()
+        response = json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], ai_draft)
+        catalog_entries = webapp.catalog_visual_image_entries_for_payload
 
-        with mock.patch.object(webapp, "read_dotenv_value", return_value="sk-test-redacted"):
-            with mock.patch.object(webapp, "request_openai_quote_basis", return_value=ai_draft):
-                with mock.patch.object(webapp, "write_local_log") as write_log:
-                    result = webapp.draft_quote_basis(payload)
+        def synthetic_catalog_entries(*args, **kwargs):
+            return [{**entry, "data_url": synthetic_image()} for entry in catalog_entries(*args, **kwargs)]
 
+        with (
+            mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get),
+            mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", side_effect=synthetic_catalog_entries),
+            mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as send,
+            mock.patch.object(webapp, "write_local_log") as write_log,
+        ):
+            result = webapp.draft_quote_basis(payload)
+
+        send.assert_called_once()
+        request = send.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual(request.full_url, OPENROUTER_RESPONSES_URL)
+        self.assertEqual(body["model"], SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"])
+        self.assertEqual(body["reasoning"], {"effort": "high"})
+        self.assertEqual(body["provider"]["only"], json.loads(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_PROVIDER_ONLY"]))
         self.assertEqual(result["source"], "openai")
         ai_attempt_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
         self.assertEqual(len(ai_attempt_logs), 1)
         self.assertEqual(ai_attempt_logs[0]["feature"], "draft_quote_basis")
-        self.assertEqual(ai_attempt_logs[0]["provider"], webapp.AI_PROVIDER_OPENAI)
+        self.assertEqual(ai_attempt_logs[0]["provider"], webapp.AI_PROVIDER_OPENROUTER)
         self.assertEqual(ai_attempt_logs[0]["status"], "success")
         self.assertEqual(ai_attempt_logs[0]["analysis_mode"], webapp.DRAFT_ANALYSIS_MODE_STANDARD)
         self.assertGreaterEqual(ai_attempt_logs[0]["image_count"], 1)
@@ -12935,9 +13214,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(ai_attempt_logs[0]["quote_basis_key_count"], len(result["quote_basis"]))
         self.assertEqual(ai_attempt_logs[0]["quote_basis_section_count"], len(result["quote_basis_sections"]))
         self.assertEqual(ai_attempt_logs[0]["line_item_count"], len(result["line_items"]))
+        self.assertEqual(ai_attempt_logs[0]["attempt_number"], 1)
+        self.assertTrue(ai_attempt_logs[0]["retry_lineage_id"])
+        self.assertEqual(ai_attempt_logs[0]["model"], "")
         completion_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "openai_draft_completed"]
         self.assertEqual(len(completion_logs), 1)
-        self.assertEqual(completion_logs[0]["provider"], webapp.AI_PROVIDER_OPENAI)
+        self.assertEqual(completion_logs[0]["provider"], webapp.AI_PROVIDER_OPENROUTER)
         self.assertTrue(completion_logs[0]["model"])
         self.assertEqual(completion_logs[0]["quote_basis_section_count"], len(result["quote_basis_sections"]))
         self.assertEqual(completion_logs[0]["line_item_count"], len(result["line_items"]))
@@ -12968,7 +13250,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
-        with mock.patch.object(webapp, "read_dotenv_value", return_value="sk-test-redacted"):
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get):
             with mock.patch.object(webapp, "write_local_log"):
                 with mock.patch.object(webapp, "request_openai_quote_basis", return_value=ai_draft):
                     result = webapp.draft_quote_basis(payload)
@@ -12995,7 +13277,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload["project"].pop("booth_depth", None)
         payload["project"]["title"] = "RE: Compact Stand - 4m x 3m"
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(webapp, "PROJECT_ROOT", Path(tmp)):
+            with mock.patch.object(webapp, "PROJECT_ROOT", Path(tmp)), mock.patch.dict(os.environ, {"OPENROUTER_API_KEY":"", "SQAG_DISABLE_DOTENV":"0"}):
                 with mock.patch.object(webapp, "write_local_log") as write_log:
                     with mock.patch.object(webapp, "request_openai_quote_basis") as request:
                         result = webapp.draft_quote_basis(payload)
@@ -13005,14 +13287,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(result["project"]["booth_size"], "6m x 6m")
         self.assertEqual(result["line_items"][0]["quantity"], 12.0)
         self.assertIn("Remote AI is not configured", "\n".join(result["warnings"]))
-        self.assertIn("OPENAI_API_KEY", "\n".join(result["warnings"]))
+        self.assertIn("OPENROUTER_API_KEY", "\n".join(result["warnings"]))
         write_log.assert_called()
         self.assertEqual(write_log.call_args.args[0], "ai_draft_remote_unconfigured")
         request.assert_not_called()
 
     def test_draft_quote_basis_uses_local_fallback_when_openai_fails(self):
         keys = {
-            webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
+            **SYNTHETIC_DRAFT_CONFIG,
+            webapp.OPENROUTER_API_KEY_ENV_NAME: "sk-test-redacted",
         }
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: keys.get(name, "")):
@@ -13029,7 +13312,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload["line_items"] = []
         empty_draft = {"quote_basis": {}, "quote_basis_sections": [], "line_items": []}
         keys = {
-            webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
+            **SYNTHETIC_DRAFT_CONFIG,
+            webapp.OPENROUTER_API_KEY_ENV_NAME: "sk-test-redacted",
         }
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: keys.get(name, "")):
@@ -13070,7 +13354,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_items": [],
         }
         keys = {
-            webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
+            **SYNTHETIC_DRAFT_CONFIG,
+            webapp.OPENROUTER_API_KEY_ENV_NAME: "sk-test-redacted",
         }
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: keys.get(name, "")):
@@ -13095,7 +13380,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload["line_items"] = []
         keys = {
             **SYNTHETIC_DRAFT_CONFIG,
-            webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
+            webapp.OPENROUTER_API_KEY_ENV_NAME: "sk-test-redacted",
         }
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: keys.get(name, "")):
@@ -13121,10 +13406,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(snapshot.reference_id, payload["pricing_reference_id"])
         self.assertEqual(snapshot.source, payload["pricing_reference_source"])
         self.assertEqual(openai.call_args.args[1:], ("sk-test-redacted",))
-        self.assertEqual(openai.call_args.kwargs, {
-            "auth_session": None,
-            "draft_configuration": webapp.OpenAIDraftConfiguration("standard", "gpt-6.1-sol", "high"),
-        })
+        self.assertIsNone(openai.call_args.kwargs["auth_session"])
+        configuration=openai.call_args.kwargs["draft_configuration"]
+        self.assertEqual((configuration.analysis_mode,configuration.model,configuration.reasoning_effort),("standard","openai/gpt-6.1-sol","high"))
+        self.assertIsNotNone(configuration.gateway)
 
     def test_draft_quote_basis_rewrites_default_booth_size_as_confirm_line(self):
         payload = valid_payload()
@@ -13138,7 +13423,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "line_items": [],
         }
 
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""):
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get):
             with mock.patch.object(webapp, "request_openai_quote_basis", return_value=ai_draft):
                 result = webapp.draft_quote_basis(payload)
 
@@ -13174,7 +13459,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         }
 
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "sk-test-redacted" if name == webapp.OPENAI_API_KEY_ENV_NAME else ""):
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get):
             with mock.patch.object(webapp, "request_openai_quote_basis", return_value=ai_draft):
                 result = webapp.draft_quote_basis(payload)
 
@@ -13186,10 +13471,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("Include: Booth size defaults to 6m x 6m", platform_basis)
 
     def test_openai_request_body_omits_temperature_for_explicit_model(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
 
         with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
             with mock.patch.object(webapp, "read_dotenv_value", side_effect=synthetic_draft_dotenv_value):
@@ -13197,17 +13479,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6.1-sol")
+        self.assertEqual(body["model"], "openai/gpt-6.1-sol")
         self.assertNotIn("temperature", body)
         self.assertEqual(body["reasoning"], {"effort": "high"})
 
     def test_openai_request_ignores_client_model_override(self):
         payload = valid_payload()
         payload["ai_model"] = "user-supplied-model"
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
 
         with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
             with mock.patch.object(webapp, "read_dotenv_value", side_effect=synthetic_draft_dotenv_value):
@@ -13215,14 +13494,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6.1-sol")
+        self.assertEqual(body["model"], "openai/gpt-6.1-sol")
         self.assertNotEqual(body["model"], "user-supplied-model")
 
     def test_openai_request_rejects_malformed_model_from_env_before_transport(self):
         payload = valid_payload()
 
         def dotenv(name):
-            if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
+            if name == webapp.OPENROUTER_DRAFT_MODEL_ENV_NAME:
                 return "invalid model"
             return synthetic_draft_dotenv_value(name)
 
@@ -13238,7 +13517,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         payload = valid_payload()
 
         def dotenv(name):
-            if name == webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME:
+            if name == webapp.OPENROUTER_DRAFT_REASONING_EFFORT_ENV_NAME:
                 return "invalid effort"
             return synthetic_draft_dotenv_value(name)
 
@@ -13251,18 +13530,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("invalid effort", str(raised.exception))
 
     def test_openai_request_uses_high_quality_model_and_reasoning_effort_from_env(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["analysis_mode"] = "high_quality"
 
         def dotenv(name):
-            values = {
-                webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: "high",
-                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6.1-sol",
-                webapp.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "max",
+            values = {**synthetic_configuration(credential="synthetic-key"),
+                webapp.OPENROUTER_DRAFT_REASONING_EFFORT_ENV_NAME: "high",
+                webapp.OPENROUTER_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "openai/gpt-6.1-sol",
+                webapp.OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "max",
             }
             return values.get(name, "")
 
@@ -13272,23 +13548,20 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6.1-sol")
+        self.assertEqual(body["model"], "openai/gpt-6.1-sol")
         self.assertEqual(body["reasoning"], {"effort": "max"})
 
     def test_openai_request_uses_high_quality_route_for_high_accuracy_mode(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["analysis_mode"] = "high_accuracy"
 
         def dotenv(name):
-            values = {
-                webapp.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-6.1-sol",
-                webapp.OPENAI_DRAFT_REASONING_EFFORT_ENV_NAME: "high",
-                webapp.OPENAI_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "gpt-6.1-sol",
-                webapp.OPENAI_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "max",
+            values = {**synthetic_configuration(credential="synthetic-key"),
+                webapp.OPENROUTER_DRAFT_MODEL_ENV_NAME: "openai/gpt-6.1-sol",
+                webapp.OPENROUTER_DRAFT_REASONING_EFFORT_ENV_NAME: "high",
+                webapp.OPENROUTER_DRAFT_HIGH_QUALITY_MODEL_ENV_NAME: "openai/gpt-6.1-sol",
+                webapp.OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT_ENV_NAME: "max",
             }
             return values.get(name, "")
 
@@ -13298,17 +13571,14 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6.1-sol")
+        self.assertEqual(body["model"], "openai/gpt-6.1-sol")
         self.assertEqual(body["reasoning"], {"effort": "max"})
 
     def test_openai_request_timeout_uses_env_with_longer_default(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
 
         def dotenv(name):
-            if name == webapp.OPENAI_REQUEST_TIMEOUT_ENV_NAME:
+            if name == "OPENROUTER_REQUEST_TIMEOUT_SECONDS":
                 return "123"
             return synthetic_draft_dotenv_value(name)
 
@@ -13316,14 +13586,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
                 webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
 
-        self.assertEqual(webapp.OPENAI_REQUEST_TIMEOUT_SECONDS, 1800)
+        self.assertEqual(webapp.configured_ai_gateway().configuration.timeout_seconds, 180)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 123)
 
     def test_openai_prompt_requests_quote_takeoff_depth(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["user_feedback"] = "change the quoted green carpet line to red"
 
@@ -13365,10 +13632,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("never as Include", prompt)
 
     def test_openai_prompt_treats_uploads_as_untrusted_and_protects_secrets(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
 
         with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
             webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
@@ -13383,10 +13647,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(body["input"][0]["content"][1]["detail"], "high")
 
     def test_ai_requests_include_up_to_eight_reference_images(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
             {
@@ -13411,11 +13672,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Internal catalog reference images follow", json.dumps(content))
 
     def test_ai_requests_send_pdf_references_as_input_files(self):
-        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
             {
@@ -13440,13 +13697,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(input_files[0]["filename"], "synthetic-deck.pdf")
         self.assertEqual(input_files[0]["file_data"], synthetic_pdf())
-        self.assertEqual(len(uploaded_images), 1)
+        self.assertEqual(len(uploaded_images), 2)
 
     def test_ai_requests_send_rendered_pdf_pages_as_high_detail_images(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
             {
@@ -13468,7 +13722,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         ]
 
         with (
-            mock.patch.object(webapp, "pdf_reference_page_images", return_value=rendered_pages, create=True) as render_pages,
+            mock.patch.object(webapp, "render_pdf_pages_with_pdfium", return_value=rendered_pages) as render_pages,
             mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen,
         ):
             webapp.request_openai_quote_basis(payload, "sk-test-redacted")
@@ -13487,55 +13741,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             ],
         )
         self.assertIn("Rendered PDF page images follow", json.dumps(content))
-        self.assertEqual(render_pages.call_args.kwargs["max_pages"], webapp.MAX_RENDERED_PDF_PAGES)
+        self.assertEqual(render_pages.call_args.args[2], webapp.MAX_DRAFT_PDF_PAGES)
+        self.assertTrue(render_pages.call_args.kwargs["complete"])
 
-    def test_ai_requests_cap_rendered_pdf_pages_separately_from_reference_file_limit(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
-        payload = valid_payload()
-        payload["images"] = [
-            {
-                "name": "long-deck.pdf",
-                "type": "application/pdf",
-                "size": 16,
-                "data_url": synthetic_pdf(),
-            },
-            *[
-                {
-                    "name": f"ref-{index}.jpg",
-                    "type": "image/jpeg",
-                    "size": 4,
-                    "data_url": synthetic_image("JPEG", color="black"),
-                }
-                for index in range(webapp.MAX_REFERENCE_IMAGES - 1)
-            ],
-        ]
-        rendered_pages = [
-            {"name": f"long-deck-page-{index}.jpg", "page": index, "data_url": synthetic_image("JPEG", color="white")}
-            for index in range(webapp.MAX_RENDERED_PDF_PAGES + 4)
-        ]
-
-        with (
-            mock.patch.object(webapp, "pdf_reference_page_images", return_value=rendered_pages, create=True),
-            mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen,
-        ):
-            webapp.request_openai_quote_basis(payload, "sk-test-redacted")
-
-        content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
-        high_detail_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
-        rendered_urls = [item["image_url"] for item in high_detail_images if item["image_url"] == synthetic_image("JPEG", color="white")]
-        uploaded_urls = [item["image_url"] for item in high_detail_images if item["image_url"] == synthetic_image("JPEG", color="black")]
-        self.assertEqual(len(rendered_urls), webapp.MAX_RENDERED_PDF_PAGES)
-        self.assertEqual(len(uploaded_urls), webapp.MAX_REFERENCE_IMAGES - 1)
-
-    def test_ai_requests_send_pdf_only_as_input_file_even_when_type_is_stale(self):
-        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+    def test_ai_requests_send_pdf_and_rendered_page_even_when_type_is_stale(self):
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
             {
@@ -13555,14 +13765,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(len(input_files), 1)
         self.assertEqual(input_files[0]["filename"], "synthetic-deck.pdf")
         self.assertEqual(input_files[0]["file_data"], synthetic_pdf())
-        self.assertEqual(uploaded_images, [])
+        self.assertEqual(len(uploaded_images), 1)
 
     def test_ai_requests_send_pdf_and_images_with_data_url_mime_precedence(self):
-        self.enterContext(mock.patch.object(webapp, "pdf_reference_page_images", return_value=[]))
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["images"] = [
             {
@@ -13587,13 +13793,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         uploaded_images = [item for item in content if item.get("type") == "input_image" and item.get("detail") == "high"]
         self.assertEqual(len(input_files), 1)
         self.assertEqual(input_files[0]["filename"], "synthetic-deck.pdf")
-        self.assertEqual([item["image_url"] for item in uploaded_images], [synthetic_image("JPEG")])
+        self.assertEqual(len(uploaded_images), 2)
+        self.assertEqual(uploaded_images[-1]["image_url"], synthetic_image("JPEG"))
 
     def test_openai_request_ignores_local_catalog_visuals(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         payload = valid_payload()
         payload["pricing_reference"] = {
             "id": payload["pricing_reference_id"],
@@ -13622,10 +13826,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("data:image/png;base64,ZmFrZS1jaGFpcg==", serialized)
 
     def test_openai_request_resolves_bundled_catalog_visual_paths(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"quote_basis": {}, "line_items": []})
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
         with tempfile.TemporaryDirectory() as tmp:
             reference_dir = Path(tmp)
             image_path = reference_dir / "pricing-catalog-images" / "chair.png"
@@ -13683,7 +13884,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_openai_http_error_includes_response_message_without_key(self):
         error_body = b'{"error":{"message":"Unsupported parameter: temperature"}}'
         http_error = webapp.urllib.error.HTTPError(
-            url=webapp.OPENAI_RESPONSES_URL,
+            url=OPENROUTER_RESPONSES_URL,
             code=400,
             msg="Bad Request",
             hdrs={},
@@ -13695,31 +13896,19 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
 
         message = str(error.exception)
-        self.assertIn("HTTP 400", message)
+        self.assertEqual(error.exception.diagnostics["http_status"],400)
         self.assertNotIn("Unsupported parameter: temperature", message)
         self.assertNotIn("sk-test-redacted", message)
 
     def test_openai_transient_http_error_has_one_send_budget(self):
         http_error = webapp.urllib.error.HTTPError(
-            url=webapp.OPENAI_RESPONSES_URL,
+            url=OPENROUTER_RESPONSES_URL,
             code=503,
             msg="Service Unavailable",
             hdrs={},
             fp=io.BytesIO(b"upstream connect error or disconnect/reset before headers"),
         )
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "quote_basis_sections": [
-                    {
-                        "id": "surfaces",
-                        "title": "Surfaces / Structures",
-                        "lines": [{"tag": "Confirm", "text": "AI surfaces after retry", "confidence_pct": 88}],
-                    }
-                ],
-                "line_items": [],
-            })
-        }).encode("utf-8")
+        response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis_sections': [{'id': 'surfaces', 'title': 'Surfaces / Structures', 'lines': [{'tag': 'Confirm', 'text': 'AI surfaces after retry', 'confidence_pct': 88}]}], 'line_items': []})))
 
         with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[http_error, response]) as urlopen:
             with mock.patch.object(webapp.time, "sleep") as sleep:
@@ -13731,7 +13920,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_openai_transient_http_error_message_explains_retry(self):
         http_error = webapp.urllib.error.HTTPError(
-            url=webapp.OPENAI_RESPONSES_URL,
+            url=OPENROUTER_RESPONSES_URL,
             code=503,
             msg="Service Unavailable",
             hdrs={},
@@ -13744,9 +13933,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
 
         message = str(error.exception)
-        self.assertIn("HTTP 503", message)
+        self.assertEqual(error.exception.diagnostics["http_status"],503)
         self.assertNotIn("upstream connect error", message)
-        self.assertEqual(message, "OpenAI analysis failed with HTTP 503.")
+        self.assertEqual(message, "AI request could not be completed.")
 
     def test_openai_socket_timeout_is_not_retried(self):
         with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=TimeoutError("timed out")) as urlopen:
@@ -13756,7 +13945,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(urlopen.call_count, 1)
         sleep.assert_not_called()
-        self.assertIn("network timeout", str(error.exception))
+        self.assertTrue(error.exception.diagnostics["transport_timeout"])
 
     def test_openai_remote_disconnect_is_reported_as_connection_error(self):
         disconnect = http.client.RemoteDisconnected("Remote end closed connection without response")
@@ -13769,7 +13958,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(urlopen.call_count, 1)
         sleep.assert_not_called()
         message = str(error.exception)
-        self.assertIn("OpenAI analysis failed due to connection error", message)
+        self.assertEqual(error.exception.diagnostics["failure_boundary"],"provider_transport")
         self.assertNotIn("Remote end closed connection without response", message)
         self.assertNotIn("sk-test-redacted", message)
 
@@ -14536,860 +14725,143 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertIn("selected quote-basis line", str(context.exception))
 
-    def test_openai_basis_chat_answer_uses_answer_model_env(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "what does this mean?",
-            "field": "platform",
-            "line_index": 0,
-            "line": "Confirm: 100mm raised platform.",
-        }
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({"intent": "answer", "answer": "- **Meaning:** Platform height."})
-        }).encode("utf-8")
-
-        def dotenv(name):
-            if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            return ""
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                result = webapp.request_openai_basis_chat(payload, "sk-test-redacted")
-
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6-luna")
-        self.assertEqual(body["reasoning"], {"effort": "high"})
-        self.assertEqual(body["max_output_tokens"], 1200)
-        self.assertEqual(result["answer"], "- **Meaning:** Platform height.")
-
-    def test_deepseek_defaults_route_flash_for_low_risk_text_routes(self):
-        with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
-            self.assertEqual(webapp.configured_deepseek_model(), "deepseek-v4-pro")
-            self.assertEqual(webapp.configured_deepseek_basis_answer_model(), "deepseek-v4-flash")
-            self.assertEqual(webapp.configured_deepseek_basis_line_model(), "deepseek-v4-flash")
-            self.assertEqual(webapp.configured_deepseek_pricing_import_model(), "deepseek-v4-pro")
-            self.assertEqual(webapp.configured_deepseek_pricing_metadata_model(), "deepseek-v4-flash")
-
-            line_payload = valid_payload()
-            line_payload["basis_chat"] = {
-                "question": "change 100mm to 150mm",
-                "scope": "line",
-                "field": "platform",
-                "line_index": 0,
-                "line": "Confirm: 100mm raised platform.",
-            }
-            answer_payload = valid_payload()
-            answer_payload["basis_chat"] = {
-                "question": "what does this mean?",
-                "scope": "quote",
-                "field": "",
-                "line_index": -1,
-                "line": "",
-            }
-            quote_payload = valid_payload()
-            quote_payload["basis_chat"] = {
-                "question": "include all lighting and electrical lines",
-                "scope": "quote",
-                "field": "",
-                "line_index": -1,
-                "line": "",
-            }
-            self.assertEqual(webapp.deepseek_basis_chat_models(line_payload), ["deepseek-v4-flash", "deepseek-v4-pro"])
-            self.assertEqual(webapp.deepseek_basis_chat_models(answer_payload), ["deepseek-v4-flash", "deepseek-v4-pro"])
-            self.assertEqual(webapp.basis_chat_required_intent(quote_payload), "answer")
-            self.assertEqual(webapp.basis_chat_provider_env_name(quote_payload), webapp.AI_BASIS_ANSWER_PROVIDER_ENV_NAME)
-            self.assertEqual(webapp.deepseek_basis_chat_models(quote_payload), ["deepseek-v4-flash", "deepseek-v4-pro"])
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "deepseek-test-model" if name == webapp.DEEPSEEK_MODEL_ENV_NAME else ""):
-            self.assertEqual(webapp.configured_deepseek_model(), "deepseek-test-model")
-            self.assertEqual(webapp.configured_deepseek_basis_line_model(), "deepseek-test-model")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "deepseek-v4-pro" if name == webapp.DEEPSEEK_MODEL_ENV_NAME else ""):
-            self.assertEqual(webapp.configured_deepseek_basis_answer_model(), "deepseek-v4-flash")
-            self.assertEqual(webapp.configured_deepseek_basis_line_model(), "deepseek-v4-flash")
-            self.assertEqual(webapp.configured_deepseek_pricing_metadata_model(), "deepseek-v4-flash")
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_MODEL_ENV_NAME: "deepseek-global-test",
-                webapp.DEEPSEEK_BASIS_ANSWER_MODEL_ENV_NAME: "deepseek-answer-test",
-                webapp.DEEPSEEK_BASIS_LINE_MODEL_ENV_NAME: "deepseek-line-test",
-                webapp.DEEPSEEK_PRICING_IMPORT_MODEL_ENV_NAME: "deepseek-import-test",
-                webapp.DEEPSEEK_PRICING_METADATA_MODEL_ENV_NAME: "deepseek-metadata-test",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            self.assertEqual(webapp.configured_deepseek_basis_answer_model(), "deepseek-answer-test")
-            self.assertEqual(webapp.configured_deepseek_basis_line_model(), "deepseek-line-test")
-            self.assertEqual(webapp.configured_deepseek_pricing_import_model(), "deepseek-import-test")
-            self.assertEqual(webapp.configured_deepseek_pricing_metadata_model(), "deepseek-metadata-test")
-
-    def test_deepseek_basis_chat_uses_chat_completions_json_mode(self):
-        payload = valid_payload()
-        payload["quote_basis_sections"] = [{
-            "id": "platform",
-            "title": "Platform",
-            "lines": [{"tag": "Confirm", "text": "100mm raised platform with needle punch carpet."}],
-        }]
-        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
-        payload["basis_chat"] = {
-            "question": "change 100mm to 150mm",
-            "scope": "line",
-            "field": "platform",
-            "line_index": 0,
-            "line": "Confirm: 100mm raised platform with needle punch carpet.",
-        }
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps({
-                            "intent": "proposal",
-                            "proposal": {
-                                "message": "Change the platform height to 150mm?",
-                                "replacement_line": {
-                                    "tag": "Confirm",
-                                    "text": "150mm raised platform with needle punch carpet.",
-                                    "confidence_pct": 90,
-                                },
-                            },
-                        })
-                    }
-                }
-            ]
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                result = webapp.answer_basis_chat(payload)
-
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(request.full_url, "https://api.deepseek.com/chat/completions")
-        self.assertEqual(body["model"], "deepseek-v4-flash")
-        self.assertEqual(body["response_format"], {"type": "json_object"})
-        self.assertEqual(body["messages"][0]["role"], "system")
-        self.assertIn("Return exactly one valid JSON object", body["messages"][0]["content"])
-        self.assertEqual(body["messages"][1]["role"], "user")
-        self.assertNotIn("input", body)
-        self.assertEqual(result["type"], "proposal")
-
-    def test_deepseek_pricing_metadata_enrichment_is_first_when_key_exists(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps({
-                            "items": [
-                                {
-                                    "id": "floor.carpet",
-                                    "match_terms": ["needle punch carpet"],
-                                    "object_families": ["flooring"],
-                                }
-                            ]
-                        })
-                    }
-                }
-            ]
-        }).encode("utf-8")
-
-        def dotenv(name):
-            return "ds-test-redacted" if name == webapp.DEEPSEEK_API_KEY_ENV_NAME else ""
-
-        items = [
-            {
-                "id": "floor.carpet",
-                "section": "Floor Design",
-                "description": "sqm needle punch carpet in colour",
-                "unit_hint": "sqm",
-                "internal_cost": 7,
-                "markup_multiplier": 1.5,
-                "match_terms": [],
-                "object_families": [],
-            }
-        ]
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                enriched, errors = webapp.ai_pricing_reference_metadata_enrichment("pricing.xlsx", items)
-
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(errors, [])
-        self.assertEqual(request.full_url, "https://api.deepseek.com/chat/completions")
-        self.assertEqual(body["model"], "deepseek-v4-flash")
-        self.assertEqual(body["response_format"], {"type": "json_object"})
-        self.assertEqual(body["messages"][0]["role"], "system")
-        self.assertEqual(body["messages"][1]["role"], "user")
-        self.assertEqual(enriched[0]["object_families"], ["flooring"])
-
-    def test_openai_pricing_import_uses_basis_line_model(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "currency": "SGD",
-                "items": [
-                    {
-                        "section": "Floor Design",
-                        "description": "sqm needle punch carpet in colour",
-                        "unit_hint": "sqm",
-                        "internal_cost": "0",
-                        "markup_multiplier": "1",
-                        "remarks": "",
-                        "aliases": [],
-                    }
-                ],
-            })
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                "OPENAI_BASIS_LINE_MODEL": "gpt-6-luna",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                result = webapp.request_openai_pricing_catalog_import(
-                    "pricing.xlsx",
-                    {"rows": [{"Item": "sqm needle punch carpet in colour"}]},
-                    {"label": "GST", "rate": 0.09},
-                    "sk-test-redacted",
-                )
-                route_model = webapp.text_ai_provider_model_for_feature(
-                    webapp.AI_PROVIDER_OPENAI,
-                    "pricing_reference_import",
-                )
-
-        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6-luna")
-        self.assertEqual(body["reasoning"], {"effort": "high"})
-        self.assertEqual(route_model, "gpt-6-luna")
-        self.assertEqual(result["currency"], "SGD")
-
-    def test_openai_pricing_metadata_uses_basis_line_model(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "items": [
-                    {
-                        "id": "floor.carpet",
-                        "match_terms": ["needle punch carpet"],
-                        "object_families": ["flooring"],
-                    }
-                ]
-            })
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                "OPENAI_BASIS_LINE_MODEL": "gpt-6-luna",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                result = webapp.request_openai_pricing_catalog_metadata(
-                    "pricing.xlsx",
-                    [
-                        {
-                            "id": "floor.carpet",
-                            "section": "Floor Design",
-                            "description": "sqm needle punch carpet in colour",
-                            "unit_hint": "sqm",
-                        }
-                    ],
-                    "sk-test-redacted",
-                )
-                route_model = webapp.text_ai_provider_model_for_feature(
-                    webapp.AI_PROVIDER_OPENAI,
-                    "pricing_reference_metadata_enrichment",
-                )
-
-        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6-luna")
-        self.assertEqual(body["reasoning"], {"effort": "high"})
-        self.assertEqual(route_model, "gpt-6-luna")
-        self.assertEqual(result["items"][0]["object_families"], ["flooring"])
-
-    def test_deepseek_pricing_import_default_timeout_allows_full_attempt(self):
-        with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
-            self.assertEqual(webapp.configured_deepseek_pricing_import_timeout_seconds(), 120)
-
-    def test_deepseek_pricing_import_uses_configurable_timeout(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps({
-                            "currency": "SGD",
-                            "items": [
-                                {
-                                    "section": "Floor Design",
-                                    "description": "sqm needle punch carpet in colour",
-                                    "unit_hint": "sqm",
-                                    "internal_cost": "0",
-                                    "markup_multiplier": "1",
-                                    "remarks": "",
-                                    "aliases": [],
-                                }
-                            ],
-                        })
-                    }
-                }
-            ]
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_MODEL_ENV_NAME: webapp.DEEPSEEK_PRO_MODEL,
-                webapp.DEEPSEEK_PRICING_IMPORT_TIMEOUT_ENV_NAME: "17",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                result = webapp.request_deepseek_pricing_catalog_import(
-                    "pricing.xlsx",
-                    {"rows": [{"Item": "sqm needle punch carpet in colour"}]},
-                    {"label": "GST", "rate": 0.09},
-                    "ds-test-redacted",
-                )
-
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 17)
-        self.assertEqual(body["model"], webapp.DEEPSEEK_PRO_MODEL)
-        self.assertEqual(body["response_format"], {"type": "json_object"})
-        self.assertEqual(body["messages"][0]["role"], "system")
-        self.assertEqual(body["messages"][1]["role"], "user")
-        self.assertEqual(result["currency"], "SGD")
-
-    def test_deepseek_pricing_import_request_uses_json_hardening(self):
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {
-                        "content": json.dumps({
-                            "currency": "SGD",
-                            "items": [
-                                {
-                                    "section": "Floor Design",
-                                    "description": "sqm needle punch carpet in colour",
-                                    "unit_hint": "sqm",
-                                    "internal_cost": "0",
-                                    "markup_multiplier": "1",
-                                    "remarks": "",
-                                    "aliases": [],
-                                }
-                            ],
-                        })
-                    },
-                }
-            ]
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.DEEPSEEK_MODEL_ENV_NAME: webapp.DEEPSEEK_PRO_MODEL,
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                result = webapp.request_deepseek_pricing_catalog_import(
-                    "pricing.xlsx",
-                    {"rows": [{"Item": "sqm needle punch carpet in colour"}]},
-                    {"label": "GST", "rate": 0.09},
-                    "ds-test-redacted",
-                )
-
-        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        system_message = body["messages"][0]["content"]
-        self.assertEqual(result["currency"], "SGD")
-        self.assertEqual(body["response_format"], {"type": "json_object"})
-        self.assertEqual(body["thinking"], {"type": "disabled"})
-        self.assertEqual(body["temperature"], 0)
-        self.assertGreaterEqual(body["max_tokens"], 8000)
-        self.assertIn("EXAMPLE JSON OUTPUT", system_message)
-        self.assertIn('"items"', system_message)
-
-    def test_deepseek_pricing_import_timeout_falls_back_to_openai_quickly(self):
-        good_openai = mock.MagicMock()
-        good_openai.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "currency": "SGD",
-                "items": [
-                    {
-                        "section": "Floor Design",
-                        "description": "sqm needle punch carpet in colour",
-                        "unit_hint": "sqm",
-                        "internal_cost": "0",
-                        "markup_multiplier": "1",
-                        "remarks": "",
-                        "aliases": [],
-                    }
-                ],
-            })
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.DEEPSEEK_PRICING_IMPORT_TIMEOUT_ENV_NAME: "12",
-                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[TimeoutError("timed out"), good_openai]) as urlopen:
-                with mock.patch.object(webapp.time, "sleep") as sleep:
-                    result = webapp.ai_pricing_reference_import_preview(
-                        "pricing.xlsx",
-                        {"rows": [{"Item": "sqm needle punch carpet in colour"}]},
-                        {"label": "GST", "rate": 0.09},
-                    )
-
-        self.assertEqual(urlopen.call_count, 2)
-        sleep.assert_not_called()
-        self.assertEqual(urlopen.call_args_list[0].kwargs["timeout"], 12)
-        self.assertEqual(result["layout"], "ai-normalized-pricing-reference")
-        self.assertEqual(result["currency"], "SGD")
-
-    def test_pricing_reference_import_fallback_logs_classified_failure_and_correlation(self):
-        parsed = {
-            "currency": "SGD",
-            "items": [
-                {
-                    "section": "Floor Design",
-                    "description": "sqm needle punch carpet in colour",
-                    "unit_hint": "sqm",
-                    "internal_cost": "0",
-                    "markup_multiplier": "1",
-                    "remarks": "",
-                    "aliases": [],
-                }
-            ],
-        }
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.DEEPSEEK_PRICING_IMPORT_TIMEOUT_ENV_NAME: "12",
-                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-            }
-            return values.get(name, "")
-
-        deepseek_error = webapp.OpenAIAnalysisError(
-            "DeepSeek analysis failed due to network timeout: Secret Customer prompt leaked. Check provider status."
-        )
-        deepseek_error.__cause__ = TimeoutError("timed out with Secret Customer prompt leaked")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp, "request_deepseek_pricing_catalog_import", side_effect=deepseek_error):
-                with mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed):
-                    with mock.patch.object(webapp, "write_local_log") as write_log:
-                        result = webapp.ai_pricing_reference_import_preview(
-                            "Sensitive Customer Pricing.xlsx",
-                            {"rows": [{"Item": "sqm needle punch carpet in colour"}]},
-                            {"label": "GST", "rate": 0.09},
-                        )
-
-        self.assertEqual(result["layout"], "ai-normalized-pricing-reference")
-        ai_attempt_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
-        self.assertEqual([entry["provider"] for entry in ai_attempt_logs], [webapp.AI_PROVIDER_DEEPSEEK, webapp.AI_PROVIDER_OPENAI])
-        self.assertEqual([entry["status"] for entry in ai_attempt_logs], ["failed", "success"])
-        self.assertEqual(ai_attempt_logs[0]["failure_kind"], "timeout")
-        self.assertEqual(ai_attempt_logs[0]["timeout_seconds"], 12)
-        self.assertEqual(ai_attempt_logs[0]["attempt_index"], 1)
-        self.assertEqual(ai_attempt_logs[0]["attempt_count"], 2)
-        self.assertEqual(ai_attempt_logs[1]["fallback_from"], webapp.AI_PROVIDER_DEEPSEEK)
-        self.assertEqual(ai_attempt_logs[1]["attempt_index"], 2)
-        self.assertEqual(ai_attempt_logs[1]["attempt_count"], 2)
-        self.assertEqual(ai_attempt_logs[0]["ai_run_id"], ai_attempt_logs[1]["ai_run_id"])
-        self.assertNotIn("Secret Customer", json.dumps(ai_attempt_logs))
-
-        timing_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_pricing_reference_import_timing"]
-        self.assertEqual(len(timing_logs), 1)
-        self.assertEqual(timing_logs[0]["completed_provider"], webapp.AI_PROVIDER_OPENAI)
-        self.assertEqual(timing_logs[0]["provider_attempts"][0]["failure_kind"], "timeout")
-        self.assertEqual(timing_logs[0]["provider_attempts"][1]["fallback_from"], webapp.AI_PROVIDER_DEEPSEEK)
-        self.assertEqual(timing_logs[0]["source_file_extension"], "xlsx")
-        self.assertNotIn("filename", timing_logs[0])
-        self.assertNotIn("Sensitive Customer", json.dumps(timing_logs[0]))
-
-    def test_deepseek_pricing_import_logs_safe_output_diagnostics(self):
-        bad_deepseek = mock.MagicMock()
-        bad_deepseek.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {"content": ""},
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 123,
-                "completion_tokens": 0,
-                "total_tokens": 123,
-            },
-        }).encode("utf-8")
-        good_openai = mock.MagicMock()
-        good_openai.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "currency": "SGD",
-                "items": [
-                    {
-                        "section": "Floor Design",
-                        "description": "sqm needle punch carpet in colour",
-                        "unit_hint": "sqm",
-                        "internal_cost": "0",
-                        "markup_multiplier": "1",
-                        "remarks": "",
-                        "aliases": [],
-                    }
-                ],
-            })
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[bad_deepseek, good_openai]):
-                with mock.patch.object(webapp, "write_local_log") as write_log:
-                    result = webapp.ai_pricing_reference_import_preview(
-                        "Sensitive Customer Pricing.xlsx",
-                        {"rows": [{"Item": "sqm needle punch carpet in colour"}]},
-                        {"label": "GST", "rate": 0.09},
-                    )
-
-        self.assertEqual(result["layout"], "ai-normalized-pricing-reference")
-        ai_attempt_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
-        self.assertEqual([entry["provider"] for entry in ai_attempt_logs], [webapp.AI_PROVIDER_DEEPSEEK, webapp.AI_PROVIDER_OPENAI])
-        self.assertEqual(ai_attempt_logs[0]["failure_kind"], "model_output_invalid")
-        self.assertEqual(ai_attempt_logs[0]["output_empty"], True)
-        self.assertEqual(ai_attempt_logs[0]["output_length"], 0)
-        self.assertEqual(ai_attempt_logs[0]["output_contains_json_object_bounds"], False)
-        self.assertEqual(ai_attempt_logs[0]["choice_count"], 1)
-        self.assertEqual(ai_attempt_logs[0]["finish_reason"], "stop")
-        self.assertEqual(ai_attempt_logs[0]["input_tokens"], 123)
-        self.assertEqual(ai_attempt_logs[0]["output_tokens"], 0)
-        self.assertEqual(ai_attempt_logs[0]["total_tokens"], 123)
-        self.assertEqual(ai_attempt_logs[1]["fallback_from"], webapp.AI_PROVIDER_DEEPSEEK)
-        self.assertNotIn("Sensitive Customer", json.dumps(ai_attempt_logs))
-        self.assertNotIn("sqm needle punch", json.dumps(ai_attempt_logs))
-
-    def test_deepseek_basis_chat_bad_output_falls_back_to_openai(self):
-        payload = valid_payload()
-        payload["quote_basis_sections"] = [{
-            "id": "platform",
-            "title": "Platform",
-            "lines": [{"tag": "Confirm", "text": "100mm raised platform with needle punch carpet."}],
-        }]
-        payload["quote_basis"] = webapp.quote_basis_from_sections(payload["quote_basis_sections"])
-        payload["basis_chat"] = {
-            "question": "change 100mm to 150mm",
-            "scope": "line",
-            "field": "platform",
-            "line_index": 0,
-            "line": "Confirm: 100mm raised platform with needle punch carpet.",
-        }
-        bad_deepseek = mock.MagicMock()
-        bad_deepseek.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [{"message": {"content": "not valid json"}}]
-        }).encode("utf-8")
-        bad_deepseek_pro = mock.MagicMock()
-        bad_deepseek_pro.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [{"message": {"content": "still not valid json"}}]
-        }).encode("utf-8")
-        good_openai = mock.MagicMock()
-        good_openai.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "intent": "proposal",
-                "proposal": {
-                    "message": "Change the platform height to 150mm?",
-                    "replacement_line": {
-                        "tag": "Confirm",
-                        "text": "150mm raised platform with needle punch carpet.",
-                        "confidence_pct": 90,
-                    },
-                },
-            })
-        }).encode("utf-8")
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
-                webapp.OPENAI_DRAFT_MODEL_ENV_NAME: "gpt-6-luna",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[bad_deepseek, bad_deepseek_pro, good_openai]) as urlopen:
-                result = webapp.answer_basis_chat(payload)
-
-        first_body = json.loads(urlopen.call_args_list[0].args[0].data.decode("utf-8"))
-        second_body = json.loads(urlopen.call_args_list[1].args[0].data.decode("utf-8"))
-        third_body = json.loads(urlopen.call_args_list[2].args[0].data.decode("utf-8"))
-        self.assertEqual(first_body["model"], "deepseek-v4-flash")
-        self.assertEqual(second_body["model"], "deepseek-v4-pro")
-        self.assertEqual(third_body["model"], "gpt-6-luna")
-        self.assertEqual(third_body["reasoning"], {"effort": "high"})
-        self.assertEqual(result["type"], "proposal")
-
-    def test_basis_chat_fallback_logs_ai_call_attempts(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "change 100mm to 150mm",
-            "scope": "line",
-            "field": "platform",
-            "line_index": 0,
-            "line": "Confirm: 100mm raised platform with needle punch carpet.",
-        }
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp, "request_deepseek_basis_chat_with_model", side_effect=webapp.OpenAIAnalysisError("DeepSeek failed")):
-                with mock.patch.object(webapp, "request_openai_basis_chat_with_model", return_value={"type": "proposal"}):
-                    with mock.patch.object(webapp, "write_local_log") as write_log:
-                        result = webapp.answer_basis_chat(payload)
-
-        self.assertEqual(result["type"], "proposal")
-        ai_attempt_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
-        self.assertEqual([entry["provider"] for entry in ai_attempt_logs], [webapp.AI_PROVIDER_DEEPSEEK, webapp.AI_PROVIDER_DEEPSEEK, webapp.AI_PROVIDER_OPENAI])
-        self.assertEqual([entry["status"] for entry in ai_attempt_logs], ["failed", "failed", "success"])
-        self.assertEqual({entry["feature"] for entry in ai_attempt_logs}, {"basis_chat"})
-        self.assertTrue(all(isinstance(entry["duration_ms"], int) for entry in ai_attempt_logs))
-
-    def test_pricing_reference_import_uses_deepseek_then_openai_fallback(self):
-        parsed = {
-            "currency": "SGD",
-            "items": [
-                {
-                    "section": "Floor Design",
-                    "description": "sqm needle punch carpet in colour",
-                    "unit_hint": "sqm",
-                    "internal_cost": "0",
-                    "markup_multiplier": "1",
-                    "remarks": "",
-                    "aliases": [],
-                }
-            ],
-        }
-
-        def dotenv(name):
-            values = {
-                webapp.DEEPSEEK_API_KEY_ENV_NAME: "ds-test-redacted",
-                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-            }
-            return values.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp, "request_deepseek_pricing_catalog_import", side_effect=webapp.OpenAIAnalysisError("DeepSeek failed")) as deepseek:
-                with mock.patch.object(webapp, "request_openai_pricing_catalog_import", return_value=parsed) as openai:
-                    result = webapp.ai_pricing_reference_import_preview("pricing.xlsx", [], {"label": "GST", "rate": 0.09})
-
-        deepseek.assert_called_once()
-        openai.assert_called_once()
-        self.assertEqual(result["layout"], "ai-normalized-pricing-reference")
-        self.assertEqual(result["currency"], "SGD")
-
-    def test_openai_quote_scope_edit_uses_answer_model_env(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "include all lighting and electrical lines",
-            "scope": "quote",
-            "field": "",
-            "line_index": -1,
-            "line": "",
-        }
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "intent": "answer",
-                "answer": "Select a specific quote-basis line and use Re to edit it.",
-            })
-        }).encode("utf-8")
-
-        def dotenv(name):
-            if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            return ""
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                result = webapp.request_openai_basis_chat(payload, "sk-test-redacted")
-
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6-luna")
-        self.assertEqual(body["reasoning"], {"effort": "high"})
-        self.assertEqual(result["type"], "answer")
-
-    def test_basis_chat_facade_preserves_request_validation_diagnostics_and_redacts_model(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "what does this mean?",
-            "scope": "quote",
-            "field": "",
-            "line_index": -1,
-            "line": "",
-        }
-
-        def dotenv(name):
-            return {
-                webapp.OPENAI_API_KEY_ENV_NAME: "sk-test-redacted",
-                webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME: "PRIVATE_CANARY/model.invalid",
-                webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME: "gpt-6-luna",
-            }.get(name, "")
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen") as urlopen:
-                with mock.patch.object(webapp, "write_local_log") as write_log:
-                    with self.assertRaises(webapp.OpenAIAnalysisError) as caught:
-                        webapp.answer_basis_chat(payload)
-
-        urlopen.assert_not_called()
-        self.assertEqual(caught.exception.diagnostics["failure_boundary"], "request_validation")
-        self.assertEqual(caught.exception.diagnostics["attempt_number"], 0)
-        logged_text = json.dumps([call.args for call in write_log.call_args_list], default=str)
-        self.assertNotIn("PRIVATE_CANARY/model.invalid", str(caught.exception) + logged_text)
-        self.assertFalse(any(call.args[0] == "basis_chat_model_retry" for call in write_log.call_args_list))
-        attempts = [
-            call.args[1]
-            for call in write_log.call_args_list
-            if call.args[0] == "ai_call_attempt"
-        ]
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(attempts[0]["model"], "")
-        self.assertEqual(attempts[0]["failure_boundary"], "request_validation")
-        self.assertEqual(attempts[0]["attempt_number"], 0)
-
-    def test_openai_line_basis_chat_does_not_retry_draft_model_after_invalid_basis_line_output(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "change 100mm to 150mm",
-            "scope": "line",
-            "field": "platform",
-            "line_index": 0,
-            "line": "Confirm: 100mm raised platform with needle punch carpet.",
-        }
-        bad_response = mock.MagicMock()
-        bad_response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": "not valid json"
-        }).encode("utf-8")
-        good_response = mock.MagicMock()
-        good_response.__enter__.return_value.read.return_value = json.dumps({
-            "output_text": json.dumps({
-                "intent": "proposal",
-                "proposal": {
-                    "message": "Change the platform height to 150mm?",
-                    "replacement_line": {
-                        "tag": "Confirm",
-                        "text": "150mm raised platform with needle punch carpet.",
-                        "confidence_pct": 90,
-                    },
-                },
-            })
-        }).encode("utf-8")
-
-        def dotenv(name):
-            if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            return ""
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[bad_response, good_response]) as urlopen:
-                with self.assertRaises(webapp.OpenAIAnalysisError):
-                    webapp.request_openai_basis_chat(payload, "sk-test-redacted")
-
-        self.assertEqual(urlopen.call_count, 1)
-        first_body = json.loads(urlopen.call_args_list[0].args[0].data.decode("utf-8"))
-        self.assertEqual(first_body["model"], "gpt-6-luna")
-        self.assertEqual(first_body["reasoning"], {"effort": "high"})
-
-    def test_openai_line_basis_chat_http_error_does_not_retry_draft_model(self):
-        payload = valid_payload()
-        payload["basis_chat"] = {
-            "question": "change 100mm to 150mm",
-            "scope": "line",
-            "field": "platform",
-            "line_index": 0,
-            "line": "Confirm: 100mm raised platform with needle punch carpet.",
-        }
-        http_error = webapp.urllib.error.HTTPError(
-            url=webapp.OPENAI_RESPONSES_URL,
-            code=401,
-            msg="Unauthorized",
-            hdrs={},
-            fp=io.BytesIO(b'{"error":{"message":"Invalid API key"}}'),
-        )
-
-        def dotenv(name):
-            if name == webapp.OPENAI_DRAFT_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            if name == webapp.OPENAI_BASIS_LINE_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            if name == webapp.OPENAI_BASIS_ANSWER_MODEL_ENV_NAME:
-                return "gpt-6-luna"
-            return ""
-
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv):
-            with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=http_error) as urlopen:
-                with self.assertRaises(webapp.OpenAIAnalysisError) as context:
-                    webapp.request_openai_basis_chat(payload, "sk-test-redacted")
-
-        self.assertEqual(urlopen.call_count, 1)
-        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(body["model"], "gpt-6-luna")
-        self.assertEqual(body["reasoning"], {"effort": "high"})
-        self.assertIn("HTTP 401", str(context.exception))
+    def _gateway_chat_payload(self, *, line=False, question="What does this mean?"):
+        payload=valid_payload()
+        payload["quote_basis_sections"]=[{"id":"platform", "title":"Platform", "lines":[{"tag":"Confirm", "text":"100mm raised platform with needle punch carpet."}]}]
+        payload["quote_basis"]=webapp.quote_basis_from_sections(payload["quote_basis_sections"])
+        payload["basis_chat"]={"question":question, "scope":"line" if line else "quote", "field":"platform" if line else "", "line_index":0 if line else -1, "line":"Confirm: 100mm raised platform with needle punch carpet." if line else ""}
+        return payload
+
+    def _gateway_import_output(self):
+        return {"currency":"SGD", "items":[{"section":"Floor Design", "description":"sqm needle punch carpet in colour", "unit_hint":"sqm", "internal_cost":"0", "markup_multiplier":"1", "remarks":"", "aliases":[]}]}
+
+    def test_gateway_answer_and_quote_edit_use_explicit_answer_route(self):
+        for question in ("What does this mean?", "Include all lighting and electrical lines"):
+            payload=self._gateway_chat_payload(question=question)
+            answer="Select a specific quote-basis line and use Re to edit it."
+            response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_ANSWER_MODEL"], {"intent":"answer", "answer":answer})
+            with self.subTest(question=question), mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
+                result=webapp.request_configured_basis_chat(payload)
+            send.assert_called_once()
+            request=send.call_args.args[0]; body=json.loads(request.data)
+            self.assertEqual(request.full_url,OPENROUTER_RESPONSES_URL)
+            self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_ANSWER_MODEL"])
+            self.assertEqual(body["reasoning"],{"effort":"high"})
+            self.assertEqual(body["max_output_tokens"],1200)
+            self.assertEqual(result["type"],"answer"); self.assertEqual(result["answer"],answer)
+
+    def test_gateway_selected_line_preserves_proposal_and_json_prompt(self):
+        payload=self._gateway_chat_payload(line=True,question="change 100mm to 150mm")
+        parsed={"intent":"proposal","proposal":{"message":"Change the platform height to 150mm?", "replacement_line":{"tag":"Confirm", "text":"150mm raised platform with needle punch carpet.", "confidence_pct":90}}}
+        response=json_response(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"],parsed)
+        with mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send:
+            result=webapp.answer_basis_chat(payload)
+        send.assert_called_once(); body=json.loads(send.call_args.args[0].data)
+        self.assertEqual(body["model"],SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"])
+        self.assertEqual(body["input"][0]["role"],"user")
+        self.assertIn("JSON",body["input"][0]["content"][0]["text"])
+        self.assertEqual(result["type"],"proposal")
+        self.assertIn("150mm",json.dumps(result["proposal"]))
+
+    def test_gateway_has_no_defaults_key_selection_or_cross_route_substitution(self):
+        values=synthetic_configuration(credential="synthetic-key")
+        for operation,suffix in ROUTE_KEYS.items():
+            for part in ("MODEL","REASONING_EFFORT","PROVIDER_ONLY"):
+                missing="OPENROUTER_"+suffix+"_"+part
+                incomplete=values.copy(); incomplete.pop(missing)
+                incomplete.update(OPENAI_API_KEY="synthetic-old-key",DEEPSEEK_API_KEY="synthetic-old-key")
+                with self.subTest(operation=operation,setting=part), mock.patch.object(webapp,"read_dotenv_value",side_effect=incomplete.get), mock.patch.object(webapp.urllib.request,"urlopen") as send:
+                    with self.assertRaises(webapp.OpenAIAnalysisError): webapp.configured_ai_gateway()
+                    send.assert_not_called()
+        for name in ("request_deepseek_basis_chat", "request_deepseek_pricing_catalog_import", "request_openai_basis_chat", "configured_deepseek_model"):
+            self.assertFalse(hasattr(webapp,name))
+
+    def test_gateway_pricing_routes_preserve_schema_and_separate_models(self):
+        cases=(("PRICING_IMPORT",webapp.request_openai_pricing_catalog_import,("pricing.xlsx",{"rows":[{"Item":"sqm needle punch carpet in colour"}]},{"label":"GST","rate":0.09}),self._gateway_import_output()),
+               ("PRICING_METADATA",webapp.request_openai_pricing_catalog_metadata,("pricing.xlsx",[{"id":"floor.carpet","description":"sqm needle punch carpet in colour","unit_hint":"sqm"}]),{"items":[{"id":"floor.carpet","match_terms":["needle punch carpet"],"object_families":["flooring"]}]}))
+        for suffix,call,args,parsed in cases:
+            model=SYNTHETIC_DRAFT_CONFIG["OPENROUTER_"+suffix+"_MODEL"]
+            with self.subTest(suffix=suffix),mock.patch.object(webapp.urllib.request,"urlopen",return_value=json_response(model,parsed)) as send:
+                result=call(*args)
+            send.assert_called_once(); body=json.loads(send.call_args.args[0].data)
+            self.assertEqual(send.call_args.args[0].full_url,OPENROUTER_RESPONSES_URL)
+            self.assertEqual(body["model"],model);self.assertEqual(body["reasoning"],{"effort":"high"})
+            self.assertEqual(body["input"][0]["role"],"user")
+            self.assertIn("JSON",body["input"][0]["content"][0]["text"])
+            self.assertEqual(result,parsed)
+
+    def test_gateway_pricing_timeout_is_explicit_and_failure_does_not_fallback(self):
+        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_REQUEST_TIMEOUT_SECONDS":"17"})
+        model=values["OPENROUTER_PRICING_IMPORT_MODEL"]
+        with mock.patch.object(webapp,"read_dotenv_value",side_effect=values.get),mock.patch.object(webapp.urllib.request,"urlopen",return_value=json_response(model,self._gateway_import_output())) as send:
+            result=webapp.request_openai_pricing_catalog_import("pricing.xlsx",[],{"label":"GST","rate":0.09})
+        self.assertEqual(send.call_args.kwargs["timeout"],17);self.assertEqual(result["currency"],"SGD")
+        for failure in (TimeoutError("PRIVATE_TIMEOUT"),webapp.urllib.error.URLError("PRIVATE_CONNECTION")):
+            with self.subTest(kind=type(failure).__name__),mock.patch.object(webapp,"read_dotenv_value",side_effect=values.get),mock.patch.object(webapp.urllib.request,"urlopen",side_effect=failure) as send,mock.patch.object(webapp.time,"sleep") as sleep,mock.patch.object(webapp,"write_local_log") as logs:
+                result=webapp.ai_pricing_reference_import_preview("PRIVATE_FILENAME.xlsx",[],{"label":"GST","rate":0.09})
+            send.assert_called_once();sleep.assert_not_called()
+            self.assertEqual(result["layout"],"ai-normalization-failed");self.assertTrue(result["error_reference"])
+            attempts=[call.args[1] for call in logs.call_args_list if call.args[0]=="ai_call_attempt"]
+            timing=[call.args[1] for call in logs.call_args_list if call.args[0]=="ai_pricing_reference_import_timing"]
+            self.assertEqual(len(attempts),1);self.assertEqual(len(timing),1)
+            self.assertEqual(attempts[0]["provider"],"openrouter");self.assertEqual(attempts[0]["status"],"failed")
+            self.assertEqual(attempts[0]["attempt_number"],1)
+            self.assertEqual(timing[0]["error_reference"],result["error_reference"])
+            self.assertEqual(timing[0]["failure_kind"],"timeout" if isinstance(failure,TimeoutError) else "network_error")
+            self.assertEqual(result["sourceName"],"PRIVATE_FILENAME.xlsx")
+            self.assertEqual(result["errors"],[f"{GENERIC_REFERENCED_FAILURE_MESSAGE} Reference: {result['error_reference']}."])
+            self.assertNotIn("PRIVATE",json.dumps({key:value for key,value in result.items() if key!="sourceName"}))
+            self.assertNotIn("PRIVATE",json.dumps([call.args for call in logs.call_args_list],default=str))
+
+    def test_gateway_pricing_empty_output_keeps_safe_usage_without_fallback(self):
+        model=SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
+        response=FixtureHttpResponse(responses_envelope(model,"",usage={"input_tokens":123,"output_tokens":0,"total_tokens":123}))
+        with mock.patch.object(webapp.urllib.request,"urlopen",return_value=response) as send,mock.patch.object(webapp,"write_local_log") as logs:
+            result=webapp.ai_pricing_reference_import_preview("PRIVATE_FILENAME.xlsx",[],{"label":"GST","rate":0.09})
+        send.assert_called_once();self.assertEqual(result["layout"],"ai-normalization-failed")
+        attempts=[call.args[1] for call in logs.call_args_list if call.args[0]=="ai_call_attempt"]
+        self.assertEqual(len(attempts),1)
+        entry=attempts[0]
+        self.assertEqual(entry["output_empty"],True);self.assertEqual(entry["output_length"],0)
+        self.assertEqual(entry["output_contains_json_object_bounds"],False)
+        self.assertEqual((entry["input_tokens"],entry["output_tokens"],entry["total_tokens"]),(123,0,123))
+        self.assertNotIn("PRIVATE",json.dumps([call.args for call in logs.call_args_list],default=str))
+
+    def test_gateway_invalid_line_output_and_unauthorised_http_never_switch_model(self):
+        payload=self._gateway_chat_payload(line=True,question="change 100mm to 150mm")
+        model=SYNTHETIC_DRAFT_CONFIG["OPENROUTER_BASIS_LINE_MODEL"]
+        error=webapp.urllib.error.HTTPError(OPENROUTER_RESPONSES_URL,401,"PRIVATE_HTTP",{},io.BytesIO(b'{"error":{"message":"PRIVATE_BODY"}}'))
+        for response in (FixtureHttpResponse(responses_envelope(model,"not valid json")),error):
+            with self.subTest(kind=type(response).__name__),mock.patch.object(webapp.urllib.request,"urlopen",side_effect=[response]) as send,mock.patch.object(webapp,"write_local_log") as logs,mock.patch.object(webapp.time,"sleep") as sleep:
+                with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.answer_basis_chat(payload)
+            send.assert_called_once();sleep.assert_not_called()
+            body=json.loads(send.call_args.args[0].data)
+            self.assertEqual(body["model"],model);self.assertEqual(body["reasoning"],{"effort":"high"})
+            attempts=[call.args[1] for call in logs.call_args_list if call.args[0]=="ai_call_attempt"]
+            self.assertEqual(len(attempts),1);self.assertEqual(attempts[0]["attempt_number"],1)
+            self.assertNotIn("PRIVATE",str(caught.exception)+json.dumps([call.args for call in logs.call_args_list],default=str))
+
+    def test_gateway_basis_facade_validation_keeps_zero_send_and_model_privacy(self):
+        values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_BASIS_ANSWER_MODEL":"PRIVATE_CANARY/model.invalid"})
+        with mock.patch.object(webapp,"read_dotenv_value",side_effect=values.get),mock.patch.object(webapp.urllib.request,"urlopen") as send,mock.patch.object(webapp,"write_local_log") as logs:
+            with self.assertRaises(webapp.OpenAIAnalysisError) as caught:webapp.answer_basis_chat(self._gateway_chat_payload())
+        send.assert_not_called()
+        self.assertEqual(caught.exception.diagnostics["failure_boundary"],"request_validation")
+        self.assertEqual(caught.exception.diagnostics["attempt_number"],0)
+        attempts=[call.args[1] for call in logs.call_args_list if call.args[0]=="ai_call_attempt"]
+        self.assertEqual(len(attempts),1);self.assertEqual(attempts[0]["attempt_number"],0);self.assertEqual(attempts[0]["model"],"")
+        self.assertNotIn("PRIVATE_CANARY",str(caught.exception)+json.dumps([call.args for call in logs.call_args_list],default=str))
+
+    def test_gateway_pricing_preview_success_uses_one_route(self):
+        model=SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
+        with mock.patch.object(webapp.urllib.request,"urlopen",return_value=json_response(model,self._gateway_import_output())) as send:
+            result=webapp.ai_pricing_reference_import_preview("pricing.xlsx",[],{"label":"GST","rate":0.09})
+        send.assert_called_once();self.assertEqual(result["layout"],"ai-normalized-pricing-reference");self.assertEqual(result["currency"],"SGD")
 
     def test_basis_chat_without_provider_does_not_use_local_fallback(self):
-        with mock.patch.object(webapp, "read_dotenv_value", return_value=""):
-            with self.assertRaises(webapp.OpenAIAnalysisError) as context:
-                webapp.answer_basis_chat(valid_payload())
-
-        self.assertIn("AI basis chat is not configured", str(context.exception))
+        with mock.patch.object(webapp,"read_dotenv_value",side_effect=synthetic_configuration().get),mock.patch.object(webapp.urllib.request,"urlopen") as send:
+            with self.assertRaises(webapp.OpenAIAnalysisError):webapp.answer_basis_chat(self._gateway_chat_payload())
+        send.assert_not_called()
 
     def test_safe_error_messages_redacts_keys_headers_and_env_assignments(self):
         messages = webapp.safe_error_messages([
@@ -15480,7 +14952,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         with tempfile.TemporaryDirectory() as tmp:
             logged = webapp.log_ai_call_attempt(
                 feature="basis_chat",
-                provider=webapp.AI_PROVIDER_OPENAI,
+                provider="openai",
                 model="gpt-6-luna",
                 status="success",
                 duration_ms=1234,
@@ -15504,7 +14976,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(log_record["event"], "ai_call_attempt")
         self.assertEqual(log_record["details"]["feature"], "basis_chat")
-        self.assertEqual(log_record["details"]["provider"], webapp.AI_PROVIDER_OPENAI)
+        self.assertEqual(log_record["details"]["provider"], "openai")
         self.assertEqual(log_record["details"]["model"], "gpt-6-luna")
         self.assertEqual(log_record["details"]["status"], "success")
         self.assertEqual(log_record["details"]["duration_ms"], 1234)
@@ -15515,7 +14987,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(log_record["simple"], {
             "run": "test",
             "task": "Quote basis chat",
-            "provider": webapp.AI_PROVIDER_OPENAI,
+            "provider": "openai",
             "model": "gpt-6-luna",
             "status": "success",
             "ok": True,
@@ -15637,7 +15109,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "ai_call_attempt",
                 {
                     "feature": "draft_quote_basis",
-                    "provider": webapp.AI_PROVIDER_OPENAI,
+                    "provider": "openai",
                     "model": "gpt-6-luna",
                     "status": "success",
                     "duration_ms": 390797,
@@ -15681,7 +15153,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 with webapp.ai_log_tracking_scope(tracking):
                     logged = webapp.log_ai_call_attempt(
                         feature="basis_chat",
-                        provider=webapp.AI_PROVIDER_OPENAI,
+                        provider=webapp.AI_PROVIDER_OPENROUTER,
                         model="gpt-test",
                         status="success",
                         duration_ms=42,
@@ -15727,7 +15199,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         def fake_basis_chat(_payload, auth_session=None):
             webapp.log_ai_call_attempt(
                 feature="basis_chat",
-                provider=webapp.AI_PROVIDER_OPENAI,
+                provider=webapp.AI_PROVIDER_OPENROUTER,
                 model="gpt-test",
                 status="success",
                 duration_ms=5,
@@ -20631,7 +20103,11 @@ const state = {
   pricingReferenceId: "reference-a",
   pricingReferenceSource: "bundled",
 };
-const elements = { profileSelect: { value: "local::reference-b" } };
+const elements = {
+  profileSelect: { value: "local::reference-b" },
+  selectedPricingReferenceSummary: { textContent: "" },
+  pricingReferenceSourceBadge: { textContent: "" },
+};
 const currencyNode = { textContent: "" };
 const taxNode = { textContent: "" };
 const document = {
@@ -20657,6 +20133,11 @@ eval([
   "pricingReferenceFromSelectionValue",
   "pendingPricingReference",
   "pricingReferenceBasisValues",
+  "pricingReferenceSourceLabel",
+  "selectedPricingReferenceTax",
+  "selectedPricingReferenceCurrency",
+  "selectedPricingReferenceTaxText",
+  "renderSelectedPricingReferenceSummary",
   "syncPricingReferenceContextPills",
   "renderPendingPricingReferenceBasis",
   "resetPendingPricingReferenceSelection",
@@ -20667,12 +20148,16 @@ handleProfileSelectionChange();
 assert.strictEqual(state.pricingReferenceId, "reference-a");
 assert.strictEqual(state.pricingReferenceSource, "bundled");
 assert.strictEqual(currencyNode.textContent, "USD");
+assert.strictEqual(elements.selectedPricingReferenceSummary.textContent, "Selected. Continue to apply this pricing reference.");
+assert.strictEqual(elements.pricingReferenceSourceBadge.textContent, "Local catalog");
 assert.strictEqual(taxNode.textContent, "VAT 20%");
 
 assert.strictEqual(resetPendingPricingReferenceSelection(), true);
 assert.strictEqual(elements.profileSelect.value, "bundled::reference-a");
 assert.strictEqual(currencyNode.textContent, "SGD");
 assert.strictEqual(taxNode.textContent, "GST 9%");
+assert.strictEqual(elements.selectedPricingReferenceSummary.textContent, "Managed in Settings.");
+assert.strictEqual(elements.pricingReferenceSourceBadge.textContent, "Repo catalog");
 assert.strictEqual(navUpdates, 2);
 """
         completed = subprocess.run(
@@ -25018,7 +24503,7 @@ assert.notStrictEqual(pricingReferenceExportBlockReason(bundled), "");
 assert.strictEqual(pricingReferenceSourceLabel(company), "Workspace catalog");
 assert.strictEqual(pricingReferenceSourceLabel(local), "Local catalog");
 assert.strictEqual(pricingReferenceSourceLabel(bundled), "Repo catalog");
-const summaryBody = source.split("function renderSelectedPricingReferenceSummary()")[1].split("function todayDateInputValue")[0];
+const summaryBody = source.split("function renderSelectedPricingReferenceSummary(")[1].split("function todayDateInputValue")[0];
 assert.ok(summaryBody.includes("elements.pricingReferenceSourceBadge.textContent = pricingReferenceSourceLabel(reference);"));
 
 state.pricingReferences = [];
@@ -25229,7 +24714,6 @@ eval([
             "imageCapacity",
             "setImageUploadStatus",
             "duplicate file",
-            "state.images = [...state.images, ...unique]",
             "reference files reached",
         ):
             self.assertIn(expected, js)
@@ -27755,6 +27239,7 @@ function extractFunction(name) {
   throw new Error(`Unclosed function ${name}`);
 }
 
+const MISSING_PRICING_REFERENCES_MESSAGE = "No pricing references.";
 const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
@@ -27769,6 +27254,10 @@ const elements = {
   quoteCurrency: { value: "SGD" },
   quoteCurrencyCustom: { value: "", hidden: true, required: false },
   profileSelect: { value: "" },
+  pricingReferenceSourceBadge: { textContent: "Pricing reference unavailable" },
+  selectedPricingReferenceSummary: { textContent: "Select a pricing reference." },
+  selectedPricingReferenceCurrency: { textContent: "-" },
+  selectedPricingReferenceTax: { textContent: "-" },
   quoteExchangeRate: { value: "1" },
   quoteExchangeRateField: { hidden: true },
   quoteTaxLabel: { value: "GST" },
@@ -27798,7 +27287,8 @@ const state = {
   pricingReferenceSelectionIntent: null,
   profiles: [{ id: "default", default_pricing_reference: "koncept-eq" }],
   pricingReferences: [
-    { id: "koncept-eq", source: "local", label: "Koncept EQ", currency: "SGD", tax: { label: "GST", rate: 0.09 } },
+    { id: "alternate", source: "company", label: "Alternate", currency: "USD", tax: { label: "Sales Tax", rate: 0.05 } },
+    { id: "koncept-eq", source: "local", label: "Synthetic reference", currency: "EUR", tax: { label: "VAT", rate: 0.20 } },
   ],
   quoteCommercialTouched: {
     quoteCurrency: false,
@@ -27826,6 +27316,7 @@ function saveSessionState() {}
 function resetQuoteFlowScroll() {}
 function syncPricingReferenceContextPills() {}
 function updateOutputHeader() {}
+function updatePricingReferenceDeleteButton() {}
 function setInputValue(element, value = "") { if (element) element.value = String(value || ""); }
 
 eval([
@@ -27863,11 +27354,17 @@ eval([
   "syncQuoteCommercialContextPills",
   "applyPricingReferenceCommercialDefaults",
   "resetQuoteCommercialFieldsToSelectedPricingReference",
+  "pricingReferenceSourceLabel",
+  "selectedPricingReferenceTaxText",
+  "renderSelectedPricingReferenceSummary",
   "initializeFreshPricingReferenceForCustomer",
   "activeSidePanelIndex",
   "setSidePanel",
 ].map(extractFunction).join("\n"));
 
+let defaultApplications = 0;
+const applyDefaults = applyPricingReferenceCommercialDefaults;
+applyPricingReferenceCommercialDefaults = () => { defaultApplications += 1; return applyDefaults(); };
 assert.strictEqual(setSidePanel("customer", { notify: true }), true);
 assert.strictEqual(state.activeSidePanel, "customer");
 assert.strictEqual(state.pricingReferenceId, "koncept-eq");
@@ -27876,12 +27373,41 @@ assert.strictEqual(elements.profileSelect.value, "local::koncept-eq");
 assert.strictEqual(state.quoteCommercialLifecycle, "NEW_UNINITIALISED");
 assert.strictEqual(state.quoteCommercialSnapshot, null);
 assert.strictEqual(state.pricingReferenceSelectionIntent, null);
-assert.strictEqual(elements.quoteCurrency.value, "SGD");
+assert.strictEqual(elements.quoteCurrency.value, "EUR");
 assert.strictEqual(elements.quoteExchangeRate.value, "1");
-assert.strictEqual(elements.quoteTaxLabel.value, "GST");
-assert.strictEqual(elements.quoteTaxRate.value, "9");
-assert.strictEqual(elements.taxLabel.value, "GST");
-assert.strictEqual(elements.taxRate.value, "9");
+assert.strictEqual(elements.quoteTaxLabel.value, "VAT");
+assert.strictEqual(elements.quoteTaxRate.value, "20");
+assert.strictEqual(elements.taxLabel.value, "VAT");
+assert.strictEqual(elements.taxRate.value, "20");
+assert.strictEqual(elements.pricingReferenceSourceBadge.textContent, "Local catalog");
+assert.strictEqual(elements.selectedPricingReferenceSummary.textContent, "Managed in Settings.");
+assert.strictEqual(elements.selectedPricingReferenceCurrency.textContent, "EUR");
+assert.strictEqual(elements.selectedPricingReferenceTax.textContent, "VAT 20%");
+assert.strictEqual(defaultApplications, 0, "refresh must not apply commercial defaults again");
+state.activeSidePanel = "images";
+assert.strictEqual(setSidePanel("customer", { notify: true }), true);
+assert.strictEqual(elements.selectedPricingReferenceCurrency.textContent, "EUR");
+assert.strictEqual(state.pricingReferenceSelectionIntent, null);
+
+// Saved ownership, pending selection and touched fields forbid fresh defaults.
+for (const mutation of [
+  () => { state.quoteCommercialLifecycle = "EXISTING"; },
+  () => { state.quoteCommercialLifecycle = "RECOVERED"; },
+  () => { state.quoteCommercialSnapshot = { pricing_basis: { id: "alternate", source: "company" } }; },
+  () => { state.quoteSessionRestoredSessionId = "saved-quote"; },
+  () => { state.pricingReferenceSelectionIntent = { id: "alternate", source: "company" }; },
+  () => { state.quoteCommercialTouched.quoteTaxRate = true; },
+]) {
+  const originalState = JSON.parse(JSON.stringify(state));
+  mutation();
+  elements.quoteTaxRate.value = "7";
+  elements.quoteCurrency.value = "USD";
+  const before = JSON.stringify({ state, elements });
+  assert.strictEqual(initializeFreshPricingReferenceForCustomer(), false);
+  assert.strictEqual(JSON.stringify({ state, elements }), before);
+  Object.assign(state, originalState);
+}
+assert.strictEqual(defaultApplications, 0);
 assert.deepStrictEqual(state.quoteCommercialTouched, {
   quoteCurrency: false,
   quoteExchangeRate: false,
@@ -27909,6 +27435,18 @@ assert.strictEqual(setSidePanel("customer", { force: true }), true);
 assert.strictEqual(state.pricingReferenceId, "missing-saved-reference");
 assert.strictEqual(state.pricingReferenceSource, "local");
 assert.strictEqual(elements.profileSelect.value, "local::missing-saved-reference");
+state.pricingReferenceId = "";
+state.pricingReferenceSource = "";
+for (const references of [
+  [],
+  [{ id: "", source: "local" }],
+  [{ id: "invalid-source", source: "unknown" }],
+]) {
+  state.pricingReferences = references;
+  const before = JSON.stringify({ state, elements });
+  assert.strictEqual(initializeFreshPricingReferenceForCustomer(), false);
+  assert.strictEqual(JSON.stringify({ state, elements }), before, "unavailable authority changed");
+}
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -29221,7 +28759,13 @@ const effects = { anchor_clicks: 0, location_fallbacks: 0, artifact_requests: 0,
 function element() { return { hidden: false, dataset: {}, classList: { add() {}, remove() {} },
   addEventListener: (type, callback) => listeners.set(type, callback), getAttribute: () => "false" }; }
 const elements = {};
-const document = { body: { appendChild() {}, classList: { remove() {} } }, createElement: () => ({
+const spendNodes = new Map();
+const document = {
+  getElementById(id) {
+    if (!spendNodes.has(id)) spendNodes.set(id, element());
+    return spendNodes.get(id);
+  },
+  body: { appendChild() {}, classList: { remove() {} } }, createElement: () => ({
   click() { effects.anchor_clicks += 1; effects.artifact_requests += 1; if (scenario.anchorThrows) throw Error("Synthetic anchor failure"); }, remove() {} }) };
 window.location = { set href(value) { effects.location_fallbacks += 1; effects.artifact_requests += 1; } };
 const outputRowsValid = () => ({ valid: true, errors: [] });
@@ -29235,6 +28779,7 @@ const waitForUiPaint = async () => {};
 const logs = [];
 const messages = [];
 const state = {
+  quoteAiSpendRequest: 0, quoteSessions: [],
   quoteSessionId: scenario.path === "initial" ? "" : "quote-synthetic-a",
   quoteSessionRestoredSessionId: scenario.path === "restored" ? "quote-synthetic-a" : "",
   quoteSessionDraftSaveStarted: true, quoteSessionLoadError: "OLD-REFERENCE-CANARY",
@@ -29432,6 +28977,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
   "newClientErrorReference", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
   "refreshSessionToken", "postJson", "logClientEvent", "ensureClientQuoteSessionId", "mergeDashboardQuoteSession",
+  "quoteAiSpendText", "renderQuoteAiSpend", "refreshQuoteAiSpend",
   "currentQuoteSessionPayload", "currentQuoteSessionDraftState", "quoteSessionDraftComparisonKey",
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
@@ -30010,6 +29556,36 @@ async function act() {
                     finally:
                         connection.close()
                     self.assertEqual(writer.return_value.create_or_update_quote_session.call_count - before, 1 if size <= limit else 0)
+
+    def test_quote_session_expanded_budget_applies_only_to_reference_pdf_bytes(self):
+        pdf = synthetic_pdf()
+        reference = {"name": "synthetic.pdf", "session_file_key": "fixture",
+                     "file_role": "reference", "data_url": pdf}
+        base = {"draft_files": [reference], "synthetic": ""}
+        wire_size = len(json.dumps(base).encode("utf-8"))
+        pdf_size = len(pdf.partition(",")[2])
+        limit = wire_size - pdf_size
+
+        with LocalRunnerServer() as runner:
+            session = self.http_json(runner, "GET", "/api/session")["body"]
+            headers = {"Origin": runner.base_url, session["csrf_header"]: session["csrf_token"]}
+            with (
+                mock.patch.object(webapp, "MAX_REQUEST_BYTES", limit),
+                mock.patch.object(webapp, "MAX_JOB_REQUEST_BYTES", wire_size + 1),
+                mock.patch.object(webapp, "quote_session_storage_for_auth_session") as writer,
+            ):
+                writer.return_value.create_or_update_quote_session.return_value = {"session_id": "quote-synthetic-boundary"}
+                for body, expected in (
+                    (base, 200),
+                    ({**base, "synthetic": "x"}, 413),
+                    ({**base, "draft_files": [{**reference, "file_role": "logo"}]}, 413),
+                    ({**base, "draft_files": [{**reference, "data_url": "data:application/pdf;base64," + "A" * pdf_size}]}, 413),
+                    ({**base, "draft_files": [], "synthetic": pdf}, 413),
+                ):
+                    with self.subTest(expected=expected):
+                        result = self.http_json(runner, "POST", "/api/quote-sessions", body=body, headers=headers)
+                        self.assertEqual(result["status"], expected)
+                writer.return_value.create_or_update_quote_session.assert_called_once()
 
     def test_sqag212_invalid_success_acknowledgement_blocks_actual_consumers(self):
         for consumer in ("analyse", "generate", "resume", "duplicate"):
@@ -33002,7 +32578,7 @@ assert.strictEqual(state.basisChat.completionNotice, null);
         ):
             self.assertIn(expected, js)
         for forbidden_secret_name in (
-            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
             "OIDC_CLIENT_SECRET",
             "SESSION_SECRET",
@@ -33538,8 +33114,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 "model_hash": "PRIVATE_CANARY",
                 "nested": {
                     "provider": "deepseek",
-                    "model": webapp.DEEPSEEK_PRO_MODEL,
-                    "model_candidates": [webapp.DEEPSEEK_FLASH_MODEL, "PRIVATE_CANARY"],
+                    "model": "deepseek-v4-pro",
+                    "model_candidates": ["deepseek-v4-flash", "PRIVATE_CANARY"],
                     "model_summary": "PRIVATE_CANARY",
                 },
             },
@@ -33556,8 +33132,8 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                 "model_hash": "",
                 "nested": {
                     "provider": "deepseek",
-                    "model": webapp.DEEPSEEK_PRO_MODEL,
-                    "model_candidates": [webapp.DEEPSEEK_FLASH_MODEL, ""],
+                    "model": "deepseek-v4-pro",
+                    "model_candidates": ["deepseek-v4-flash", ""],
                     "model_summary": "",
                 },
             },
@@ -33628,7 +33204,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
             data_root = root / "data"
 
             def read_value(name):
-                return model_value if name == "OPENAI_MODEL" else ""
+                return {**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_DRAFT_MODEL":model_value}.get(name, "")
 
             def synthetic_generator(command, **_kwargs):
                 output_dir = Path(command[command.index("--out") + 1])
@@ -33737,11 +33313,11 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
                         evidence_sha256,
                     )
                     expected_model = webapp.validated_provider_model_label(
-                        webapp.AI_PROVIDER_OPENAI, model_value
+                        webapp.AI_PROVIDER_OPENROUTER, model_value
                     )
                     expected_configuration = {
                         "pdf_mode": "none",
-                        "provider": "",
+                        "provider": "openrouter",
                         "model": expected_model,
                         "app_revision": "",
                     }
@@ -41807,8 +41383,10 @@ main().catch((error) => {
             ]
         }
 
-        with mock.patch.object(webapp, "read_dotenv_value", side_effect=lambda name: "ds-test-redacted" if name == webapp.DEEPSEEK_API_KEY_ENV_NAME else ""):
-            with mock.patch.object(webapp, "request_deepseek_pricing_catalog_metadata", return_value=parsed):
+        configuration = synthetic_configuration(credential="synthetic-key")
+        model = configuration["OPENROUTER_PRICING_METADATA_MODEL"]
+        with mock.patch.object(webapp, "read_dotenv_value", side_effect=configuration.get):
+            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=json_response(model, parsed)) as send:
                 with mock.patch.object(webapp, "write_local_log") as write_log:
                     enriched, errors = webapp.ai_pricing_reference_metadata_enrichment(
                         "Sensitive Customer Pricing.xlsx",
@@ -41816,10 +41394,15 @@ main().catch((error) => {
                         reference_id="async-ref",
                     )
 
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0].full_url, OPENROUTER_RESPONSES_URL)
+        self.assertEqual(json.loads(send.call_args.args[0].data)["model"], model)
         self.assertEqual(errors, [])
         self.assertEqual(enriched[0]["object_families"], ["illuminated_graphics"])
         call_logs = [call.args[1] for call in write_log.call_args_list if call.args[0] == "ai_call_attempt"]
         self.assertEqual(len(call_logs), 1)
+        self.assertEqual(call_logs[0]["status"], "success")
+        self.assertEqual(call_logs[0]["attempt_number"], 1)
         self.assertEqual(call_logs[0]["reference_id"], "async-ref")
         self.assertEqual(call_logs[0]["operator_stage"], "post_save_matching_metadata")
         self.assertRegex(call_logs[0]["ai_run_id"], r"^ai_[a-f0-9]{16}$")
@@ -41836,7 +41419,7 @@ main().catch((error) => {
         self.assertEqual(rollup_logs[0]["status"], "success")
         self.assertEqual(rollup_logs[0]["reference_id"], "async-ref")
         self.assertEqual(rollup_logs[0]["operator_stage"], "post_save_matching_metadata")
-        self.assertEqual(rollup_logs[0]["completed_provider"], webapp.AI_PROVIDER_DEEPSEEK)
+        self.assertEqual(rollup_logs[0]["completed_provider"], webapp.AI_PROVIDER_OPENROUTER)
         self.assertEqual(rollup_logs[0]["row_count"], 1)
         self.assertEqual(rollup_logs[0]["rows_enriched"], 1)
         self.assertEqual(rollup_logs[0]["ai_run_id"], call_logs[0]["ai_run_id"])
@@ -43082,9 +42665,11 @@ main().catch((error) => {
             ("m-to-m-length", "Floors", "Synthetic floor trim along the booth edge", 6, "m", "synthetic-floors-synthetic-floor-trim", True),
             ("pcs-to-nos", "Structures", "Synthetic rigging point above the stand", 3, "pcs", "synthetic-structures-synthetic-rigging-point", True),
         ]
-        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), _PricingLedgerTimeoutProbe(self, LocalRunnerServer(), sink=_ledger_timeout_diagnostic_sink) as diagnostic:
+            runner = diagnostic.runner
             headers = self._ledger_runner_headers(runner)
-            for label, section, text, quantity, unit, item_id, priced in cases:
+            for case_ordinal, (label, section, text, quantity, unit, item_id, priced) in enumerate(cases, 1):
+                diagnostic.set_case(case_ordinal)
                 with self.subTest(case=label):
                     request, _ = self._ledger_analysis([("unit-row", section, text, quantity, unit, None)],
                                                        session_id=f"quote-ledger-m3-{label}")
@@ -43152,10 +42737,14 @@ main().catch((error) => {
 
     def _ledger_draft(self, runner, headers, payload, provider_raw):
         """POST /api/draft with the provider's raw JSON fed through the real normaliser (no network, no paid AI)."""
+        saved = self._ledger_post(runner, headers, "/api/quote-sessions", {
+            "quote_session": {"session_id": payload["quote_session"]["session_id"]},
+        })
+        self.assertEqual(saved["status"], 200, saved["text"][-800:])
         original = webapp.read_dotenv_value
 
         def dotenv(name, *args, **kwargs):
-            return "sk-test-redacted" if name == "OPENAI_API_KEY" else original(name, *args, **kwargs)
+            return "sk-test-redacted" if name == "OPENROUTER_API_KEY" else original(name, *args, **kwargs)
 
         def provider(provider_payload, _key, auth_session=None, *, draft_configuration):
             self.assertIsInstance(draft_configuration, webapp.OpenAIDraftConfiguration)
@@ -46292,6 +45881,19 @@ eval([
   "outputRowFxMultiplier",
   "applyPricingAuthorityProjection",
 ].map(extractFunction).join("\n"));
+// Execute the maintained smoke's actual compound assertion, including its UTF-8 fixtures.
+const smokeSource = fs.readFileSync("scripts/playwright-smoke.mjs", "utf8");
+const compound = smokeSource.match(/if \(\s*pricingAuthorityVersionIsValid\(true\)[\s\S]*?throw new Error\("Browser authority schema, decimal, or whitespace contract diverged\."\);\s*\}/);
+assert(compound, "Maintained browser authority assertion is missing");
+const verifySmokeAuthority = new Function("pricingAuthorityVersionIsValid", "pricingAuthorityNumber", "canonicalPricingAuthorityText", compound[0]);
+verifySmokeAuthority(pricingAuthorityVersionIsValid, pricingAuthorityNumber, canonicalPricingAuthorityText);
+for (const altered of [
+  [() => true, pricingAuthorityNumber, canonicalPricingAuthorityText],
+  [pricingAuthorityVersionIsValid, value => value === "1\u0662" ? 12 : pricingAuthorityNumber(value), canonicalPricingAuthorityText],
+  [pricingAuthorityVersionIsValid, value => value === "77%" ? 77 : pricingAuthorityNumber(value), canonicalPricingAuthorityText],
+  ...["a\u001cb", "a\ufeffb", "e\u0301  item"].map(invalid => [pricingAuthorityVersionIsValid, pricingAuthorityNumber, value => value === invalid ? invalid : canonicalPricingAuthorityText(value)]),
+]) assert.throws(() => verifySmokeAuthority(...altered), /Browser authority schema/);
+
 
 assert.strictEqual(pricingAuthorityVersionIsValid(1), true);
 assert.strictEqual(pricingAuthorityVersionIsValid(true), false);

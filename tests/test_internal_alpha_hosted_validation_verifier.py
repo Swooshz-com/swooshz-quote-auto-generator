@@ -3,7 +3,7 @@ import io
 import json
 import shutil
 import sys
-import time
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,7 +42,7 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
             "private-code",
             "private-state",
         }
-        work_dir = test_temp_root() / f"internal-alpha-hosted-validation-{time.time_ns()}"
+        work_dir = Path(tempfile.mkdtemp(prefix="iav-", dir=test_temp_root()))
         self.addCleanup(lambda: shutil.rmtree(work_dir, ignore_errors=True))
 
         report = verifier.run_verification(work_dir=work_dir)
@@ -79,7 +79,7 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
             self.assertNotIn(value, text)
 
     def test_cli_output_is_json_metadata_only(self):
-        work_dir = test_temp_root() / f"internal-alpha-hosted-validation-cli-{time.time_ns()}"
+        work_dir = Path(tempfile.mkdtemp(prefix="iav-", dir=test_temp_root()))
         self.addCleanup(lambda: shutil.rmtree(work_dir, ignore_errors=True))
 
         stdout = io.StringIO()
@@ -94,6 +94,88 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
         self.assertNotIn("sqlite:///", output)
         self.assertNotIn("/var/lib/sqag", output)
         self.assertNotIn("Set-Cookie", output)
+
+    def projected_fixture(self):
+        with contextlib.ExitStack() as stack:
+            for dependency in (verifier.verify_database_backup_restore, verifier.verify_hosted_observability, verifier.verify_hosted_smoke):
+                stack.enter_context(mock.patch.object(dependency, "run_verification", return_value={"status": "passed"}))
+            stack.enter_context(mock.patch.object(verifier.webapp, "production_readiness_status", return_value={
+                "internal_alpha_ready": False, "production_ready": False,
+                "blockers": [{"id": "database_blob_artifact_storage_not_launch_ready"}],
+                "production_blockers": [{"id": "object_storage_missing"}],
+            }))
+            return verifier.run_verification(work_dir=ROOT / "_logs" / "server" / "synthetic-projection")
+
+    def test_closed_projection_retains_only_typed_public_metadata(self):
+        report = self.projected_fixture()
+        self.assertEqual(verifier.public_report_metadata(report), report)
+        self.assertEqual(report["status"], "passed")
+        self.assertIn("SESSION_SECRET", report["host_secret_manager_only_env_names"])
+        for stage in ("exception", "privacy_guard", "metadata_projection"):
+            expected = verifier.safe_failure_report(stage)
+            self.assertEqual(verifier.public_report_metadata(expected), expected)
+
+    def test_auth_environment_metadata_matches_the_current_server_contract(self):
+        report = verifier.public_report_metadata(self.projected_fixture())
+        names = {
+            verifier.webapp.AUTH_REQUIRED_ENV_NAME, verifier.webapp.AUTH_MODE_ENV_NAME,
+            verifier.webapp.SESSION_SECRET_ENV_NAME, verifier.webapp.INTERNAL_WORKSPACE_ID_ENV_NAME,
+            verifier.webapp.INTERNAL_ALLOWED_EMAILS_ENV_NAME, verifier.webapp.INTERNAL_LOGIN_PASSWORD_ENV_NAME,
+            verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
+        }
+        self.assertTrue(names <= set(report["required_env_names"]))
+        private_names = {
+            verifier.webapp.SESSION_SECRET_ENV_NAME, verifier.webapp.INTERNAL_ALLOWED_EMAILS_ENV_NAME,
+            verifier.webapp.INTERNAL_LOGIN_PASSWORD_ENV_NAME, verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
+        }
+        self.assertTrue(private_names <= set(report["host_secret_manager_only_env_names"]))
+
+    def test_cli_projection_refuses_canaries_at_every_string_leaf(self):
+        import copy
+        canary = "synthetic-private-projection-canary"
+        def leaves(value, path=()):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    yield from leaves(child, path + (key,))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    yield from leaves(child, path + (index,))
+            elif isinstance(value, str):
+                yield path
+        for report in (self.projected_fixture(), verifier.safe_failure_report("exception")):
+            for path in leaves(report):
+                candidate = copy.deepcopy(report)
+                target = candidate
+                for key in path[:-1]: target = target[key]
+                target[path[-1]] = canary
+                stdout = io.StringIO()
+                with self.subTest(path=path), mock.patch.object(verifier, "run_verification", return_value=candidate), contextlib.redirect_stdout(stdout):
+                    self.assertEqual(verifier.main([]), 1)
+                output = stdout.getvalue()
+                self.assertNotIn(canary, output)
+                self.assertEqual(json.loads(output)["failed_stage"], "metadata_projection")
+
+    def test_projection_rejects_extra_keys_wrong_types_and_missing_fields(self):
+        import copy
+        report = self.projected_fixture()
+        cases = [None, [], report | {"unexpected": "synthetic-canary"},
+                 report | {"synthetic_only": 1}, report | {"status": "PASSED"},
+                 report | {"required_env_names": ["UNREVIEWED_CONFIGURATION_VALUE"]},
+                 report | {"evidence": report["evidence"] | {"extra": "synthetic-canary"}}]
+        missing = copy.deepcopy(report); del missing["privacy"]; cases.append(missing)
+        for candidate in cases:
+            with self.subTest(kind=type(candidate).__name__), self.assertRaisesRegex(ValueError, "^Unsafe verification metadata[.]$"):
+                verifier.public_report_metadata(candidate)
+
+    def test_existing_prohibited_value_guard_remains_before_projection(self):
+        with contextlib.ExitStack() as stack:
+            for dependency in (verifier.verify_database_backup_restore, verifier.verify_hosted_observability, verifier.verify_hosted_smoke):
+                stack.enter_context(mock.patch.object(dependency, "run_verification", return_value={"status": "passed"}))
+            stack.enter_context(mock.patch.object(verifier.webapp, "production_readiness_status", return_value={
+                "blockers": [{"id": "private-code"}], "production_blockers": []}))
+            report = verifier.run_verification(work_dir=ROOT / "_logs" / "server" / "synthetic-projection")
+        self.assertEqual(report, verifier.safe_failure_report("privacy_guard"))
+        self.assertEqual(verifier.public_report_metadata(report), report)
 
     def test_cli_failure_output_remains_metadata_only(self):
         private_path = "C:/Users/Private/Koncept Runtime/sqag-storage.sqlite3"

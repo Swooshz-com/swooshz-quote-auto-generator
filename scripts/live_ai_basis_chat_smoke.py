@@ -200,19 +200,13 @@ def smoke_cases(include_injection: bool, selected_cases: set[str] | None = None)
 
 
 def configured_provider() -> str:
-    providers = {
-        webapp.configured_text_ai_provider(webapp.AI_BASIS_LINE_PROVIDER_ENV_NAME),
-        webapp.configured_text_ai_provider(webapp.AI_BASIS_ANSWER_PROVIDER_ENV_NAME),
-        webapp.configured_text_ai_provider(webapp.AI_BASIS_PROPOSAL_PROVIDER_ENV_NAME),
-    }
-    configured = [
-        provider
-        for provider in sorted(providers)
-        if webapp.text_ai_provider_api_key(provider)
-    ]
-    if webapp.read_dotenv_value(webapp.OPENAI_API_KEY_ENV_NAME) and "openai" not in configured:
-        configured.append("openai")
-    return ",".join(configured)
+    try:
+        gateway = webapp.configured_ai_gateway()
+        for operation in ("basis_line", "basis_answer"):
+            gateway.configuration.route(operation)
+        return "openrouter" if webapp.read_dotenv_value(webapp.OPENROUTER_API_KEY_ENV_NAME) else ""
+    except webapp.OpenAIAnalysisError:
+        return ""
 
 
 def result_summary(result: dict[str, Any]) -> str:
@@ -255,7 +249,7 @@ def run_case(case: dict[str, Any]) -> dict[str, Any]:
         "status": "ok" if ok else "failed",
         "expected": case["expect_type"],
         "actual": actual_type if actual_type in {"answer", "proposal"} else "unknown",
-        "source": source if isinstance(source, str) and source in {"openai", "deepseek", "local"} else "unknown",
+        "source": source if isinstance(source, str) and source in {"openrouter"} else "unknown",
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         "forbidden_output": forbidden_output,
     }
@@ -271,7 +265,7 @@ def main() -> int:
     if not provider:
         print(json.dumps({
             "status": "blocked",
-            "error": f"Configure {webapp.DEEPSEEK_API_KEY_ENV_NAME} or {webapp.OPENAI_API_KEY_ENV_NAME} in the local environment.",
+            "error": "Configure all six OpenRouter operation routes and OPENROUTER_API_KEY in the local environment.",
         }, indent=2))
         return 2
 

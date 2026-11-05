@@ -118,6 +118,7 @@ class FakeLivePostgresConnection:
         self.profiles = {}
         self.pricing_references = {}
         self.quote_sessions = {}
+        self.quote_ai_spend = {}
         self.object_artifacts = {}
         self.object_artifact_insert_snapshots = []
         self._tombstone_pending = False
@@ -302,6 +303,14 @@ class FakeLivePostgresConnection:
             return FakeLivePostgresCursor(
                 self._rows_for_workspace(self.quote_sessions, workspace_id)
             )
+        if normalized.startswith(
+            "select session_id, incarnation, category, attempts_json from public.sqag_quote_ai_spend"
+        ):
+            workspace_id, *session_ids = params
+            return FakeLivePostgresCursor([
+                row for row in self._rows_for_workspace(self.quote_ai_spend, workspace_id)
+                if row["session_id"] in session_ids
+            ])
         if normalized.startswith("select 1 from sqag_quote_sessions"):
             row = self.quote_sessions.get((params[0], params[1]))
             return FakeLivePostgresCursor([{"present": 1}] if row else [])
@@ -725,6 +734,22 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
             else:
                 self.assertNotIn(db_blob_table, verifier.REQUIRED_METADATA_TABLES)
 
+    def test_metadata_definitions_accept_public_create_and_reject_other_relations(self):
+        for qualifier in ("", "public."):
+            for existence_clause in ("", "if not exists "):
+                with self.subTest(qualifier=qualifier, existence_clause=existence_clause):
+                    sql = (
+                        f"create table {existence_clause}{qualifier}sqag_quote_ai_spend "
+                        "(workspace_id text, attempts_json text);"
+                    )
+                    body = verifier._metadata_table_definition(sql, "sqag_quote_ai_spend")
+                    self.assertIn("attempts_json", body)
+        for relation in ("private.sqag_quote_ai_spend", "public.sqag_quote_ai_spend_extra"):
+            with self.subTest(relation=relation):
+                self.assertIsNone(verifier._metadata_table_definition(
+                    f"create table {relation} (workspace_id text);", "sqag_quote_ai_spend",
+                ))
+
     def test_metadata_migration_status_uses_runtime_required_columns(self):
         status = verifier.metadata_migration_status()
 
@@ -856,6 +881,7 @@ class ProductionDatabaseProviderVerifierTest(unittest.TestCase):
         );
 
         """
+        sql += (ROOT / "migrations" / "011_quote_ai_spend_postgres.sql").read_text(encoding="utf-8")
         status = migration_status_for_sql(sql)
 
         self.assertFalse(status["metadata_tables_declared"])

@@ -1,3 +1,4 @@
+import { signIn, browserAuthority, assertBrowserAuthorityUnchanged } from "./internal-password-browser-test.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -475,15 +476,15 @@ try {
   anonymousApi = await request.newContext();
   const anonymousStatus=(await anonymousApi.get(baseUrl + "/api/quote-sessions")).status(); assert(anonymousStatus === 401, "Anonymous quote-session access was not denied.");
   phase='synthetic_auth_and_fresh_customer'; await writeJson('progress.json',{phase,completedChecks});
-  await page.goto(baseUrl + "/login", { waitUntil: "domcontentloaded" });
+  await signIn(page, baseUrl);
   const auth = await waitFor(async () => page.evaluate(async () => { const r=await fetch("/api/session"); return {status:r.status,body:await r.json()}; }).then((x) => x.status === 200 && x.body.authenticated ? x : false), "synthetic local auth");
-  assert(auth.body.user?.subject === "synthetic-browser-subject" && auth.body.user?.account === "workspace-internal-alpha", "Unexpected synthetic identity/workspace.");
+  assert(auth.body.user === null && auth.body.authenticated === true && Boolean(auth.body.browser_recovery_scope), "Unexpected synthetic identity/workspace.");
   assert(auth.body.permissions?.canGenerateQuote === true, "Synthetic user cannot generate quotes.");
   api = await request.newContext({ storageState: await context.storageState() });
   const profileResponse = await api.get(baseUrl + "/api/profiles");
   assert(profileResponse.status() === 200, "Authenticated profile lookup failed.");
   const profileData = await profileResponse.json();
-  assert(profileData.workspace?.workspace?.id === "workspace-internal-alpha", "Profile lookup returned a different authenticated workspace.");
+  const initialAuthority = browserAuthority(auth.body, profileData);
   assert(profileData.pricing_references?.some((item) => item.id === fixtureId && item.source === "local"), "Selected local pricing reference is missing.");
   assert(profileData.pricing_references.find(item=>item.id===fixtureId&&item.source==="local")?.label===referenceConfig.label,"Authenticated UI reference label differs from the selected fixture.");
 
@@ -566,7 +567,10 @@ try {
   const createdAuthResponse=await api.get(baseUrl+"/api/session");
   assert(createdAuthResponse.status()===200,"Authenticated session disappeared after fresh quote creation.");
   const createdAuth=await createdAuthResponse.json();
-  assert(createdAuth.authenticated&&createdAuth.user?.account==="workspace-internal-alpha","Authenticated workspace changed after fresh quote creation.");
+  const createdProfilesResponse = await api.get(baseUrl + "/api/profiles");
+  assert(createdProfilesResponse.status() === 200, "Authenticated workspace lookup failed after fresh quote creation.");
+  const createdAuthority = browserAuthority(createdAuth, await createdProfilesResponse.json());
+  assertBrowserAuthorityUnchanged(initialAuthority, createdAuthority);
   await writeJson('customer-checkpoint-proof.json', { checkpoint, protectedDetail: checkpointDetail, status: 'PASS', manualSaveOrStateRepair: false });
   completedChecks.push('customer_next_committed_profile_reference_checkpoint'); phase = 'normal_mock_analysis'; await writeJson('progress.json', {phase,completedChecks});
   // Fresh company-step Next opens the existing Normal Analyse confirmation.

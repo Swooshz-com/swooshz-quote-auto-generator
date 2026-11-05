@@ -1,3 +1,4 @@
+import { signIn } from "./internal-password-browser-test.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -19,7 +20,7 @@ for (let i = appSource.indexOf("{", logoutStart); i < appSource.length; i++) {
   if (appSource[i] === "}" && --logoutDepth === 0) { logoutEnd = i + 1; break; }
 }
 const logoutCallbackSource = appSource.slice(logoutStart, logoutEnd);
-const harness = spawn(process.env.PYTHON || "python", ["tests/internal_google_browser_harness.py"], {
+const harness = spawn(process.env.PYTHON || "python", ["tests/internal_password_browser_harness.py"], {
   cwd: root, env: { ...process.env, PYTHONUNBUFFERED: "1" }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
 });
 // Harness output can contain synthetic protocol parameters: retain only readiness.
@@ -40,7 +41,7 @@ async function freshPage() {
   await page.route("**/api/log", route => route.fulfill({ status: 204, body: "" }));
   if (appOverride) await page.route("**/static/app.js*", route => route.fulfill({ status: 200, contentType: "text/javascript", body: appOverride }));
   await page.route("**/api/quote-sessions", route => route.fulfill({ status: 200, contentType: "application/json", body: '{"quote_sessions":[]}' }));
-  await page.goto(base + "/login");
+  await signIn(page, base);
   await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
   await page.waitForFunction(() => !state.quoteSessionDashboardBusy);
   return { page, context };
@@ -272,7 +273,7 @@ async function runAdditionalCases() {
     await page.unroute("**/login");
     await page.unroute("**/api/quote-sessions");
     await page.route("**/api/quote-sessions", route => route.fulfill({ status: 200, contentType: "application/json", body: '{"quote_sessions":[]}' }));
-    await page.goto(base + "/login");
+    await signIn(page, base);
     await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
     assert.equal(await page.evaluate(() => state.images.length === 1 && Boolean(state.images[0].data_url)), true);
     cases.push({ id: "current-quote-dashboard-save401-no-replay", result: "PASS", originalPosts: posts });
@@ -548,7 +549,7 @@ async function runAdditionalCases() {
       if (route.request().method() === "POST" && !route.request().url().endsWith("/api/log")) { replayPosts++; return route.fulfill({ status: 500, contentType: "application/json", body: '{"status":"failed"}' }); }
       return route.fallback();
     });
-    await page.goto(base + "/login");
+    await signIn(page, base);
     await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && !state.quoteSessionDashboardBusy);
     const recovered = await page.evaluate(() => ({ scope: currentBrowserRecoveryScope(), job: state.activeJob, stage: state.workflowStage, customer: elements.clientName.value, operation: state.dashboardOperation, marker: localStorage.getItem("swooshz_auth_recovery_v1") }));
     assert.equal(recovered.scope, scope);
@@ -641,7 +642,7 @@ try {
     await page.unroute("**/login");
     await page.unroute("**/api/quote-sessions");
     await page.route("**/api/quote-sessions", route => route.fulfill({ status: 200, contentType: "application/json", body: '{"quote_sessions":[]}' }));
-    await page.goto(base + "/login");
+    await signIn(page, base);
     await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
     assert.equal(await page.locator("#clientName").inputValue(), "Synthetic unsaved customer");
     assert.equal(await page.evaluate(() => currentBrowserRecoveryScope()), scope);

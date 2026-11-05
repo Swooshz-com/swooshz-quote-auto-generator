@@ -6,14 +6,14 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 
 ## Source Map
 
-Recorded against source `292eb58769085d43831b278715f35b3749101290`.
-The quote-module maintainers own these entry points; programme issue #143
-and delivery child #212 track the current work. Update this map when an entry
-point or source of truth moves.
+Recorded against source `8fa9439`, with entry points updated for the maintained
+staff-login and gateway modules. The quote-module maintainers own these sources.
+Update this map when an entry point or source of truth moves.
 
 | Part | Entry points and sources of truth |
 | --- | --- |
-| Web requests, saved quotes and access | `webapp/server.py`; browser behaviour in `webapp/static/app.js`; Google admission in `webapp/internal_google_auth.py` |
+| Web requests, saved quotes and access | `webapp/server.py`; browser behaviour in `webapp/static/app.js`; Password admission in `webapp/internal_password_auth.py` |
+| Inference | `webapp/ai_gateway.py`; [gateway contract](ai-gateway.md) |
 | Artifact persistence and forensics | `webapp/object_storage.py`, `webapp/forensics.py` and the storage contracts listed below |
 | Workbook generation | `scripts/generate_quote.py` and `templates/`; selected profile/reference authority is defined by `AGENTS.md` |
 | Database evolution | `migrations/`, `webapp/postgres_migrations.py` and [migration runbook](postgres-migration-runbook.md) |
@@ -35,8 +35,7 @@ point or source of truth moves.
 - `docs/internal-uat-deploy-auth-readiness.md`: existing gated single-instance
   internal UAT deploy/auth readiness notes, boundaries, smoke checks, and
   non-production limitations.
-- `docs/internal-google-auth-mode.md`: canonical temporary exact-allowlist
-  Google OIDC mode, admission, session revocation, and readiness contract.
+- `docs/internal-password-auth-mode.md`: canonical temporary staff password mode, admission, session revocation, and readiness contract.
 - `docs/internal-uat-coolify-deploy.md`: SQAG-specific historical hosted
   validation notes; the DB/BLOB artifact path is now documented as blocked for
   hosted/protected/deploy/production readiness.

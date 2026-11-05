@@ -2,12 +2,11 @@
 
 ## Temporary internal-alpha authentication
 
-The committed env template now describes `SQAG_AUTH_MODE=internal_google`, not
-an enabled Platform launch. Its subject-bound identity JSON, fixed workspace,
-Google OIDC endpoints, client identifier, and client secret must be populated
-only in a separately authorised host secret/configuration manager. The mode is
-single-instance and private-alpha only; it cannot satisfy public production
-readiness. See `docs/internal-google-auth-mode.md`.
+The committed template describes server-only staff password access with an exact
+semicolon allowlist, stable identity bindings and one fixed workspace. Configure
+actual values only through a separately approved host secret-manager operation.
+The single-instance contract is in [staff password access](internal-password-auth-mode.md)
+and inference configuration is in [the gateway contract](ai-gateway.md).
 
 ## Purpose
 
@@ -33,7 +32,7 @@ storage for generated artifact bytes:
 - The canonical `SQAG_OBJECT_STORAGE_*` names are configured only through the
   host secret manager.
 - Platform/workspace launch context is required for protected hosted use in
-  Platform mode; internal Google uses its fixed configured workspace instead.
+  Platform mode; internal password access uses its fixed configured workspace instead.
 - `SQAG_TRUSTED_PROXY_CIDRS` is configured in the host environment manager with
   only the exact Coolify/Traefik proxy network CIDRs that connect directly to
   SQAG. A trust-all network is not permitted.
@@ -158,13 +157,18 @@ Required names for any future hosted validation environment:
 | App/auth | `APP_MODE`, `AUTH_REQUIRED`, `SQAG_AUTH_MODE`, `SESSION_SECRET` |
 | Security/tracking | secret `SQAG_TRACKING_HMAC_KEY`; non-secret configuration `SQAG_TRACKING_HMAC_KEY_VERSION` |
 | Storage | `SQAG_STORAGE_MODE`, `SQAG_ARTIFACT_STORAGE_MODE`, `SQAG_DATABASE_URL`, `SQAG_OBJECT_STORAGE_PROVIDER`, `SQAG_OBJECT_STORAGE_ENDPOINT_URL`, `SQAG_OBJECT_STORAGE_BUCKET`, `SQAG_OBJECT_STORAGE_REGION`, `SQAG_OBJECT_STORAGE_ACCESS_KEY_ID`, `SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY` |
-| Temporary internal Google | `SQAG_PLATFORM_LAUNCH_MODE=disabled`, `SQAG_PUBLIC_BASE_URL`, `SQAG_INTERNAL_WORKSPACE_ID`, server-only `SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON`, `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL` |
-
-The former three email-list variables are rejected in this mode. Real subject
-enrolment is a separate provider operation and is not performed by repository
-validation.
+| Temporary staff password access | `SQAG_AUTH_MODE=internal_password`, `SQAG_PLATFORM_LAUNCH_MODE=disabled`, `SQAG_PUBLIC_BASE_URL`, `SQAG_INTERNAL_WORKSPACE_ID`, operator and admin settings documented in [Internal staff password access](internal-password-auth-mode.md) |
 | Reverse proxy | `SQAG_TRUSTED_PROXY_CIDRS` |
 | Runtime housekeeping | `QUOTE_DATA_ROOT`, `QUOTE_OUTPUT_ROOT`, `QUOTE_TMP_ROOT`, `QUOTE_LOG_ROOT`, `PORT` |
+
+Password mode ignores retired Google settings and rejects mixed OIDC or Platform
+configuration. Keep the workspace and existing user IDs for continuity. Set
+staff roles in the active password-mode email lists. Actual credentials and identity-continuity
+qualification remain separate host operations, not repository validation. See
+[internal staff password access](internal-password-auth-mode.md) for the exact
+admission and session contract. The independent local OIDC and Platform adapters
+retain their own component contracts; they are not password-mode requirements
+or fallback authentication.
 
 `SQAG_TRUSTED_PROXY_CIDRS` is mandatory in deploy mode. Set it to the exact
 CIDR or comma-separated CIDRs for direct Coolify/Traefik peers, not public

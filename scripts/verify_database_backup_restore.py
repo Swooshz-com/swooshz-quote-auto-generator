@@ -32,6 +32,7 @@ SQAG_TABLES = (
     "sqag_profiles",
     "sqag_pricing_references",
     "sqag_quote_sessions",
+    "sqag_quote_ai_spend",
     "sqag_quote_artifacts",
     "sqag_file_artifacts",
     "sqag_telemetry_source_state",
@@ -203,6 +204,13 @@ def seed_synthetic_database(database_path: Path) -> None:
         connection.execute(
             "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
             ("workspace-alpha", "quote-synthetic-alpha", json.dumps(metadata, sort_keys=True), json.dumps(draft_files), now, now),
+        )
+        connection.execute(
+            "insert into sqag_quote_ai_spend "
+            "(workspace_id, job_id, session_id, actor_id, incarnation, claim_token, category, attempts_json) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("workspace-alpha", "job-synthetic-analysis", "quote-synthetic-alpha", "synthetic-user-alpha",
+             now, "synthetic-claim", "draft", '["0.025", null]'),
         )
         connection.execute(
             "insert into sqag_quote_artifacts (workspace_id, session_id, artifact_kind, filename, content_type, size_bytes, content_blob, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",

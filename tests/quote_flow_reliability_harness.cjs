@@ -10,16 +10,17 @@ function extract(name) {
   return end < 0 ? rest : rest.slice(0, end + 1);
 }
 async function generationOutputCases() {
+  const names = [...source.matchAll(/^(?:async )?function ([A-Za-z_$][\w$]*)\(/gm)].map(match => match[1]);
+  const functions = names.map(name => {
+    const start = new RegExp('^(?:async )?function ' + name + '\\(', 'm').exec(source).index;
+    const rest = source.slice(start);
+    return rest.slice(0, /^\}/m.exec(rest).index + 1);
+  });
+  const constants = source.slice(0, source.indexOf('const state =')) + '\n' + source.match(/^const GENERIC_FAILURE_MESSAGE = .*;$/m)[0];
+  const productionSource = constants + '\n' + functions.join('\n');
   function productionContext() {
-    const names = [...source.matchAll(/^(?:async )?function ([A-Za-z_$][\w$]*)\(/gm)].map(match => match[1]);
-    const functions = names.map(name => {
-      const start = new RegExp('^(?:async )?function ' + name + '\\(', 'm').exec(source).index;
-      const rest = source.slice(start);
-      return rest.slice(0, /^\}/m.exec(rest).index + 1);
-    });
-    const constants = source.slice(0, source.indexOf('const state =')) + '\n' + source.match(/^const GENERIC_FAILURE_MESSAGE = .*;$/m)[0];
     const c = vm.createContext({ console, Set, Map });
-    vm.runInContext(constants + '\n' + functions.join('\n'), c);
+    vm.runInContext(productionSource, c);
     vm.runInContext(`var state = { quoteCommercialLifecycle:'RECOVERED', quoteCommercialSnapshot:{lifecycle:'RECOVERED'},
       activeSidePanel:'output', activeAppView:'quote', basisConfirmed:true, aiFailed:false,
       quoteBasisSections:[], pricingIssues:[], outputSortMode:'pricing_reference', outputRevision:0,
@@ -564,6 +565,48 @@ async function lifecycleCases() {
       assert.equal(requests, 2, "one retry must produce one save");
     }
 
+  } else if (mode === "ai-spend") {
+    const nodes = { basisAiSpend: {}, outputAiSpend: {} };
+    const state = {
+      quoteSessionId: "quote-first", quoteAiSpendRequest: 0,
+      quoteSessions: [
+        { session_id: "quote-first", ai_spend: {
+          draft: { status: "reported", display: "USD 0.00" },
+          basis_chat: { status: "partial", display: "< USD 0.01" },
+          total: { status: "partial", display: "< USD 0.01" },
+        } },
+        { session_id: "quote-second", ai_spend: { total: { status: "unavailable" } } },
+      ],
+    };
+    const context = vm.createContext({
+      state, document: { getElementById: (id) => nodes[id] },
+      safeQuoteSessionId: (id) => id, cleanText: (value) => value || "",
+      safeGenerationRunId: (value) => value || "", elements: {}, renderQuoteDashboard: () => {},
+    });
+    vm.runInContext([
+      "currentGenerationContext", "transitionGenerationContext", "quoteAiSpendText",
+      "renderQuoteAiSpend", "refreshQuoteAiSpend", "mergeDashboardQuoteSession",
+    ].map(extract).join("\n"), context);
+    context.renderQuoteAiSpend();
+    assert.match(nodes.basisAiSpend.textContent, /Analysis \/ Re-Analyse USD 0\.00/);
+    assert.match(nodes.outputAiSpend.textContent, /Basis chat < USD 0\.01 \(partial\)/);
+    let finish;
+    context.getJson = () => new Promise((resolve) => { finish = resolve; });
+    const old = context.refreshQuoteAiSpend("quote-first");
+    context.transitionGenerationContext("quote-second");
+    assert.match(nodes.basisAiSpend.textContent, /AI spend total Unavailable/);
+    context.transitionGenerationContext("quote-first");
+    const quote_sessions = [
+      { session_id: "quote-first", ai_spend: { total: { status: "partial", display: "USD 0.50" } } },
+    ];
+    finish({ ok: true, data: { quote_sessions } });
+    await old;
+    assert.doesNotMatch(nodes.outputAiSpend.textContent, /USD 0\.50/);
+    context.getJson = async () => ({ ok: true, data: { quote_sessions } });
+    await context.refreshQuoteAiSpend("quote-first");
+    assert.match(nodes.outputAiSpend.textContent, /USD 0\.50 \(partial\)/);
+    context.transitionGenerationContext("");
+    assert.equal(nodes.basisAiSpend.hidden, true);
   } else if (mode === "generation-contract") {
     await generationContractCases();
   } else if (mode === "generation-output") {

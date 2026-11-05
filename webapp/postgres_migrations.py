@@ -27,6 +27,7 @@ MIGRATION_FILE_NAMES = (
     "008_quote_session_deletion_hold_authority_postgres.sql",
     "009_telemetry_events_postgres.sql",
     "010_telemetry_attempt_semantics_postgres.sql",
+    "011_quote_ai_spend_postgres.sql",
 )
 
 EXPECTED_TABLES = frozenset(
@@ -34,6 +35,7 @@ EXPECTED_TABLES = frozenset(
         "sqag_profiles",
         "sqag_pricing_references",
         "sqag_quote_sessions",
+        "sqag_quote_ai_spend",
         "sqag_object_artifacts",
         "sqag_generation_runs",
         "sqag_generation_evidence",
@@ -80,6 +82,7 @@ EXPECTED_INDEXES = frozenset(
         "sqag_telemetry_events_retention_idx",
         "sqag_telemetry_events_actor_idx",
         "sqag_telemetry_events_retry_uidx",
+        "sqag_quote_ai_spend_session_idx",
     }
 )
 EXPECTED_TRIGGERS = frozenset(
@@ -360,6 +363,14 @@ _STATUS_VALUES = (
 )
 
 TABLE_SPECS = (
+    TableSpec(
+        "sqag_quote_ai_spend",
+        _cols("workspace_id:text", "job_id:text", "session_id:text", "actor_id:text",
+              "incarnation:text", "claim_token:text", "category:text", "attempts_json:text"),
+        (_c("p", "workspace_id,job_id"),
+         _c("f", "workspace_id,session_id", referenced_table="sqag_quote_sessions",
+            referenced_columns="workspace_id,session_id", on_delete="c")),
+    ),
     TableSpec(
         "sqag_profiles",
         _cols("workspace_id:text", "profile_id:text", "payload_json:text", "created_at:text", "updated_at:text"),
@@ -656,6 +667,7 @@ INDEX_SPECS = (
     _index("sqag_telemetry_events_retention_idx", "sqag_telemetry_events", "workspace_id,deletion_state,retention_expires_at,event_id"),
     _index("sqag_telemetry_events_actor_idx", "sqag_telemetry_events", "workspace_id,actor_tracking_id,occurred_at"),
     _index("sqag_telemetry_events_retry_uidx", "sqag_telemetry_events", "workspace_id,retry_lineage_id,attempt_number", unique=True, predicate="(retry_lineage_id is not null) and (attempt_number is not null)"),
+    _index("sqag_quote_ai_spend_session_idx", "sqag_quote_ai_spend", "workspace_id,session_id"),
 )
 INDEX_SPECS_BY_NAME = MappingProxyType({item.name: item for item in INDEX_SPECS})
 
@@ -821,6 +833,11 @@ MIGRATION_OBJECTS = (
                 TELEMETRY_ATTEMPT_SUCCESSOR_CONSTRAINT,
             ),
         ),
+    ),
+    MigrationObjectSpec(
+        MIGRATION_FILE_NAMES[9],
+        tables=(TABLE_SPECS_BY_NAME["sqag_quote_ai_spend"],),
+        indexes=(INDEX_SPECS[-1],),
     ),
 )
 
