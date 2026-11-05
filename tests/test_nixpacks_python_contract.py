@@ -626,8 +626,10 @@ class NixpacksArchiveProofTests(unittest.TestCase):
 
 def _toml_text(content: str) -> Path:
     """Write content to a temp file and return the path."""
-    path = Path(tempfile.mktemp(suffix=".toml"))
-    path.write_text(content, encoding="utf-8")
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, encoding="utf-8") as handle:
+        path = Path(handle.name)
+        unittest.addModuleCleanup(path.unlink)
+        handle.write(content)
     return path
 
 

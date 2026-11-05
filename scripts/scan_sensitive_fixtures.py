@@ -38,9 +38,9 @@ GENERATED_OUTPUT_DIRS = {"_output", "output", "generated-output", "generated-out
 LOCAL_OUTPUT_ARTIFACT_DIRS = {"screenshots", "_screenshots", "playwright-screenshots", "playwright-report", "test-results"}
 PROFILE_EXPORT_RE = re.compile(r"quote-company-profile", re.IGNORECASE)
 PRIVATE_PRICING_RE = re.compile(r"(private|local|uploaded)[-_ ]?pricing", re.IGNORECASE)
-REAL_COMPANY_RE = re.compile(r"koncept(?:\s+|-)+images?(?:\s+|-)+pte", re.IGNORECASE)
+REAL_COMPANY_RE = re.compile(r"koncept(?:\s|-)+images?(?:\s|-)+pte", re.IGNORECASE)
 WORKSPACE_ID_RE = re.compile(r"koncept-images-pte-ltd", re.IGNORECASE)
-CUSTOMER_SAMPLE_RE = re.compile(r"kent(?:\s+|-)+group", re.IGNORECASE)
+CUSTOMER_SAMPLE_RE = re.compile(r"kent(?:\s|-)+group", re.IGNORECASE)
 INTERNAL_PRICING_RE = re.compile(r"\b(internal_cost|markup_multiplier|supplier_notes?|supplier)\b", re.IGNORECASE)
 SECRET_RE = re.compile(
     r"(BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY|OPENAI_API_KEY|sk-[A-Za-z0-9_-]{16,}|"
