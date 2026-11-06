@@ -1,8 +1,15 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-05
+Last updated: 2026-11-06
 
 Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
+
+Full Python discovery includes `tests.test_libreoffice_workbook_values`: actual
+LibreOffice recalculates a disposable cache-cleared workbook, then each priced,
+Included and total amount is checked in its own row. A missing converter fails in
+CI and explicitly skips locally. Native conversion and browser receipts still
+require an equipped host; no workflow, trigger, required check, secret requirement
+or deployment behaviour changes accompany this test.
 
 ## Active Workflow
 

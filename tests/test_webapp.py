@@ -31174,6 +31174,22 @@ assert.strictEqual(basisTotalLineLabel(3), "Total lines: 3");
 assert.strictEqual(basisTotalLineLabel(1), "Total lines: 1");
 const summaryHtml = renderBasisConfirmSummary(state.quoteBasisSections);
 assert.strictEqual(summaryHtml, "");
+const defaultNote = __DEFAULT_DIMENSION_NOTE__;
+state.quoteBasisSections = [{ id: "default-dimensions", title: "Floor Design", lines: [
+  { tag: "Confirm", text: defaultNote.replace(/^Confirm: /, "") },
+  { tag: "Confirm", text: "sqm needle punch carpet in colour", quantity: 36, unit: "sqm",
+    pricing_keyword: "synthetic-priced-scope" },
+]}];
+const defaultNoteHtml = renderQuoteBasisMessage(state.quoteBasis, "edited");
+const boothDetails = defaultNoteHtml.match(/<div class="basis-visual-display"[\s\S]*?<\/div>/)?.[0] || "";
+const displayedNote = defaultNote.replace(/^Confirm: /, "");
+assert.ok(boothDetails.includes("Booth Details"), "Default note lost Booth Details");
+assert.strictEqual(boothDetails.split(displayedNote).length - 1, 1, "Default note missing from Booth Details");
+assert.strictEqual(defaultNoteHtml.split(displayedNote).length - 1, 1, "Default note duplicated as review row");
+assert.ok(!defaultNoteHtml.includes('data-basis-line-index="0"'), "Default note became an editable review row");
+assert.ok(defaultNoteHtml.includes('data-basis-line-index="1"'), "Ordinary scope lost its review row");
+assert.ok(defaultNoteHtml.includes("sqm needle punch carpet in colour"));
+assert.ok(!boothDetails.includes("sqm needle punch carpet in colour"), "Ordinary scope leaked into Booth Details");
 state.quoteBasisSections = [{
   id: "floor-design",
   title: "Floor Design",
@@ -31385,6 +31401,7 @@ assert.strictEqual(state.quoteBasis.graphics, "Custom: manual graphic panel\nInc
 assert.ok(rendered >= 3);
 assert.ok(synced >= 3);
 """
+        script = script.replace("__DEFAULT_DIMENSION_NOTE__", json.dumps(webapp.default_booth_dimension_confirmation_line({})))
         completed = subprocess.run(
             [node, "-e", script],
             cwd=str(ROOT),

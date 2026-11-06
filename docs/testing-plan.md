@@ -780,6 +780,44 @@ does not invoke those two checks. No server rate limit is loosened.
 Run both full browser commands in an environment with Playwright Chromium and,
 for the native alpha smoke, LibreOffice and the declared Python PDF dependencies.
 Missing local dependencies are a test gap, not a passing browser result.
+
+Exact company signatory and title expectations come from entered company fields,
+independently of the saved/readback and generation request. Run
+`tests.test_alpha_workbook_request` and `tests.test_current_workbook_receipt` to
+execute both actual collection expressions and reject swapped, blank or replaced
+company-side footer values even when both strings remain elsewhere. The workbook
+library accepts an explicit `template_path`; the smoke CLI checks only the bundled
+`templates/quote-layout/quotation-layout.xlsx` geometry. Alternative library geometry
+and CLI default success/foreign-geometry rejection run in
+`tests.test_workbook_anchor_bounds`.
+
+`tests.test_smoke_wiring` executes the actual terminal helper and G3 runner with
+synthetic browser/server I/O. It requires four ordered case receipts, one start,
+multiple polls, visible status/overlay waits, retained interruption identity, no
+navigation after dispatch, fatal throttling and page errors, and cleanup on failure.
+Context response observers cover the main page, other tabs and popups in both
+lifecycles. The same module pins both workbook receipt invocations and the two-request
+normalisation count. These VM checks complement the real terminal and alpha browser
+commands; they do not prove browser rendering. Authority continuity tests execute
+alpha's actual before/after fetch and helper calls with changed opaque scopes,
+workspaces and permissions. The owner harness lifecycle tests use recording DNS and
+connect sentinels so denial controls cannot contact an external host.
+
+The executable renderer method
+`tests.test_webapp.WebappServerTest.test_static_quote_basis_footer_confirmation_requires_resolved_confirm_lines`
+uses the server-produced default dimension note. It requires that note exactly once
+in Booth Details, excludes it from editable review rows and retains ordinary scope
+as a review row outside Booth Details. Existing explicit dimensions stay covered.
+
+Run `tests.test_libreoffice_workbook_values` for native recalculated priced/Included
+amounts and subtotal/tax/grand total. It clears formula caches only in a disposable
+copy, converts with actual LibreOffice using an isolated profile, and binds computed
+numeric values to their own description/total rows. Missing converter skips locally
+but fails in CI. Preserve wrong-tax-expression, converted-row corruption and missing
+conversion receipt/output controls. Cached-value/formula-text verification alone
+does not establish recalculation. Native alpha proves its completed generation and
+owning-server/on-disk/native-download receipt; runtime profile identity and the
+owner carrier's LEFT/RIGHT price-cell assertions require their browser receipts.
 Run `python -m unittest tests.test_workbook_anchor_bounds tests.test_smoke_wiring`
 for oversized drawing rows, jointly shifted anchors, selected-template geometry,
 field-specific failures, recovery invocation sites, protected readback calls,

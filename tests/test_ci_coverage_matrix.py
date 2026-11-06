@@ -50,7 +50,7 @@ def validate_commands(document, workflow, package):
     header, steps = job.split('    steps:\n')
     if re.findall(r'^    if: (.+)$', header, re.M) != [JOB_CONDITION]:
         raise ValueError('Validate job condition changed')
-    if re.search(r'^\s+(?:defaults|continue-on-error|SQAG_VALIDATION_SCOPE):', header):
+    if re.search(r'^\s+(?:defaults|continue-on-error|SQAG_VALIDATION_SCOPE):', header, re.M):
         raise ValueError('Unexpected job-wide execution or scope override')
     chunks = re.split(r'^      - name: ', steps, flags=re.M)
     if chunks[0].strip():
@@ -168,7 +168,7 @@ class CoverageMatrixTests(unittest.TestCase):
             ('run: npm run playwright:alpha-smoke\n', 'run: npm run playwright:alpha-smoke -- --pricing-startup\n'),
             ('--recovery-only', '--pricing-startup'),
             ('npm run playwright:ai-stress', 'npm run playwright:ai-stress || true'),
-            ('      - name: Run Python tests\n', '      - name: Run Python tests\n        env:\n          SQAG_VALIDATION_SCOPE: narrowed'),
+            ('      - name: Run Python tests\n', '      - name: Run Python tests\n        env:\n          SQAG_VALIDATION_SCOPE: narrowed\n'),
             ('--terminal-only', '--pricing-startup'),
             ('id: runtime_prerequisites', 'id: renamed_prerequisites'),
             (f'if: {PREREQUISITES}', 'if: false'),
@@ -181,6 +181,17 @@ class CoverageMatrixTests(unittest.TestCase):
                 self.assertIn(old, self.workflow)
                 with self.assertRaises(ValueError):
                     validate_commands(self.document, self.workflow.replace(old, new), self.package)
+
+    def test_valid_multiline_job_overrides_reject_at_header_guard(self):
+        for override in ('    defaults:\n      run:\n        shell: bash\n',
+                         '    continue-on-error: true\n',
+                         '    env:\n      SQAG_VALIDATION_SCOPE: narrowed\n'):
+            with self.subTest(override=override):
+                jobs = self.workflow.split('  validate:\n')
+                self.assertEqual(len(jobs), 2)
+                changed = jobs[0] + '  validate:\n' + jobs[1].replace('    steps:\n', override + '    steps:\n', 1)
+                with self.assertRaisesRegex(ValueError, 'Unexpected job-wide execution or scope override'):
+                    validate_commands(self.document, changed, self.package)
 
     def test_missing_ci_step_is_detected(self):
         changed = re.sub(r'      - name: Run minimum internal alpha browser smoke\n.*', '',

@@ -46,6 +46,43 @@ def browser_request_line_items(rows):
 
 
 class AlphaWorkbookRequestTest(unittest.TestCase):
+    def test_both_actual_signature_collection_expressions_keep_exact_fields(self):
+        source = (ROOT / "webapp/static/app.js").read_text(encoding="utf-8")
+        expressions = __import__('re').findall(
+            r'company_signatory: (elements\.[^\n]+),\n\s*company_title: (elements\.[^\n]+),', source)
+        self.assertEqual(len(expressions), 2)
+        script = "const assert = require('node:assert/strict');\n" + r'''
+const elements = {companySignatory: {value: ' Synthetic Authorized Signatory '},
+  companyTitle: {value: ' Project Manager '}};
+''' + '\n'.join(
+            "assert.deepEqual(({company_signatory: " + signatory + ", company_title: " + title +
+            "}), {company_signatory: 'Synthetic Authorized Signatory', company_title: 'Project Manager'});"
+            for signatory, title in expressions)
+        result = subprocess.run(['node', '-e', script], cwd=ROOT, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_alpha_exact_signature_guard_rejects_combined_swaps(self):
+        source = (ROOT / 'scripts/playwright-alpha-smoke.mjs').read_text(encoding='utf-8')
+        start = source.index('    const expectedSignature = {')
+        end = source.index('    requireExactSignature({', start)
+        script = "const assert = require('node:assert/strict');\n" + r'''
+const companyFields = [['#companySignatoryEditor', 'Synthetic Authorized Signatory'],
+  ['#companyTitleEditor', 'Project Manager']];
+''' + source[start:end] + r'''
+requireExactSignature({company_signatory: 'Synthetic Authorized Signatory', company_title: 'Project Manager'});
+assert.throws(() => requireExactSignature({company_signatory: 'Project Manager',
+  company_title: 'Synthetic Authorized Signatory'}), /signature field differs/);
+'''
+        # Alpha's assert is the product smoke predicate, not node's object API.
+        script = script.replace("const assert = require('node:assert/strict');",
+                                "const nodeAssert = require('node:assert/strict');\n"
+                                "function assert(ok, message) {nodeAssert.ok(ok, message);}\n"
+                                "assert.throws = nodeAssert.throws;")
+        result = subprocess.run(['node', '-e', script], cwd=ROOT, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_request_row_variants_match_generator_normalisation(self):
         variants = [
             {"description": description, "quantity": quantity, "unit": unit, "price_mode": mode,
@@ -177,7 +214,9 @@ for (const result of ['strictXlsx', 'strictCurrentXlsx']) {
             "const expectedProject = " + json.dumps(payload["project"]["title"]) + ";\n" + \
             "const expectedProjectNumber = " + json.dumps(payload["project_number"]) + ";\n" + \
             "const companyFields = " + json.dumps([["#quoteCompanyNameEditor", payload["company"]["name"]],
-                                                     ["#headerDetailsEditor", payload["company"]["header_details"]]]) + ";\n" + \
+                                                     ["#headerDetailsEditor", payload["company"]["header_details"]],
+                                                     ["#companySignatoryEditor", payload["signature"]["company_signatory"]],
+                                                     ["#companyTitleEditor", payload["signature"]["company_title"]]]) + ";\n" + \
             "const logoBuffer = Buffer.from(" + json.dumps(base64.b64encode(logo).decode("ascii")) + ", 'base64');\n" + \
             "function expectations(xlsxJobRequest) {\n" + expression + "\nreturn expectedWorkbook; }\n" + r'''
 const expectedWorkbook = expectations(xlsxJobRequest);
@@ -185,7 +224,8 @@ const expectedWorkbook = expectations(xlsxJobRequest);
 // reference config. Its expectations must not follow those stale request fields.
 for (const [key, wrong] of Object.entries({quote_currency: 'XXX', quote_tax: {label: 'WRONG', rate: 0.5},
   client: {name: 'Wrong buyer'}, project: {title: 'Wrong project'}, project_number: 'Wrong number',
-  company: {name: 'Wrong company', header_details: 'Wrong header'}})) {
+  company: {name: 'Wrong company', header_details: 'Wrong header'},
+  signature: {company_signatory: 'Wrong signer', company_title: 'Wrong title'}})) {
   assert.deepEqual(expectations({...xlsxJobRequest, [key]: wrong}), expectedWorkbook,
     'Workbook expectations followed request echo: ' + key);
 }

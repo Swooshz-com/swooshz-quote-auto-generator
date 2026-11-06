@@ -804,7 +804,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
         && state.activeSidePanel === "output"
         && !saved.activeJob;
     }, null, { timeout: 15000 });
-    if (normalizeCount !== (2)) {
+    if (normalizeCount !== 2) {
       throw new Error("Confirm Basis refresh should resume exactly once; requests observed: " + normalizeCount + ".");
     }
   } finally {
@@ -4511,6 +4511,9 @@ async function runG3PricingScope() {
         await page.evaluate(async () => { if (!await loadProfiles()) throw new Error("Live terminal metadata was not loaded."); });
         await verifyFreshGenerationTerminalStates(page, [options.terminalStatus]);
         requireNoQuoteSessionRateLimits(networkProblems);
+        if (consoleProblems.length || networkProblems.length) {
+          throw new Error(`G3 browser diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);
+        }
         browserBoundary.assertClean();
         console.log(JSON.stringify({ status: "ok", mode: "terminal-only" }));
         return;

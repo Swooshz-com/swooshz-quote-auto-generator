@@ -1,4 +1,4 @@
-import { signIn } from "./internal-password-browser-test.mjs";
+import { signIn, browserAuthority, assertBrowserAuthorityUnchanged } from "./internal-password-browser-test.mjs";
 import { LocalWorkbookReceipt } from "./workbook-receipt.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -455,6 +455,7 @@ async function main() {
 
     api = await request.newContext({ storageState: await context.storageState() });
     const profileData = await getJson(await api.get(`${baseUrl}/api/profiles`), "Authenticated profile/workspace context");
+    const authorityBeforeQuote = browserAuthority(authState.body, profileData);
     assert(profileData.workspace?.workspace?.id === workspaceId, "Temporary local alpha storage did not resolve the synthetic authenticated workspace.");
     const selectedReference = profileData.pricing_references?.find((item) => item.id === referenceConfig.id && item.source === "local");
     assert(selectedReference?.label === referenceConfig.label, "Synthetic local pricing reference is not available to the authenticated UI.");
@@ -509,6 +510,17 @@ async function main() {
         collected: { headerDetails: details.company?.header_details || "", companyName: details.company?.name || "", signatory: details.signature?.company_signatory || "", signatoryTitle: details.signature?.company_title || "" },
       };
     });
+    const expectedSignature = {
+      company_signatory: companyFields.find(([selector]) => selector === "#companySignatoryEditor")[1],
+      company_title: companyFields.find(([selector]) => selector === "#companyTitleEditor")[1],
+    };
+    const requireExactSignature = (signature) => {
+      for (const key of Object.keys(expectedSignature)) {
+        assert(signature?.[key] === expectedSignature[key], "Quote Company signature field differs: " + key);
+      }
+    };
+    requireExactSignature({ company_signatory: enteredCompanyDetails.collected.signatory,
+      company_title: enteredCompanyDetails.collected.signatoryTitle });
     const createSaveBeforeDashboard = trace.quoteSaveRequests.length;
     await page.locator("#topbarBrandButton").click();
     await page.locator("#quoteDashboardPanel.is-active").waitFor({ state: "visible", timeout: 20000 });
@@ -531,6 +543,7 @@ async function main() {
     const authSession = await getJson(await api.get(`${baseUrl}/api/session`), "Authenticated session continuity before fixture setup");
     assert(authSession.authenticated, "Authenticated session disappeared after quote creation.");
     const createdProfileData = await getJson(await api.get(`${baseUrl}/api/profiles`), "Authenticated workspace continuity after quote creation");
+    assertBrowserAuthorityUnchanged(authorityBeforeQuote, browserAuthority(authSession, createdProfileData));
     assert(createdProfileData.workspace?.workspace?.id === workspaceId, "Authenticated workspace changed after quote creation.");
     const beforeSeed = await quoteSessionDetail(api, baseUrl, sessionId);
     assert(beforeSeed.session_id === sessionId && beforeSeed.customer_summary?.customer_name === expectedCustomer, "Created quote identity or customer context is incorrect.");
@@ -582,6 +595,8 @@ async function main() {
     const requestDetails = createdSave.payload?.draft_state?.quoteDetails || {};
     const requestCompany = requestDetails.company || {};
     const requestSignature = requestDetails.signature || {};
+    requireExactSignature(savedSignature);
+    requireExactSignature(requestSignature);
     const requestPresence = { draftState: Boolean(createdSave.payload?.draft_state), logo: Boolean(requestCompany.logo_session_file_key || requestCompany.logo_data_url), headerDetails: Boolean(String(requestCompany.header_details || "").trim()), companyName: Boolean(String(requestCompany.name || "").trim()), signatory: Boolean(String(requestSignature.company_signatory || "").trim()), signatoryTitle: Boolean(String(requestSignature.company_title || "").trim()) };
     assert(Object.values(detailPresence).every(Boolean), "UI-entered synthetic Quote Company details did not persist: " + JSON.stringify({ enteredCompanyDetails, readback: detailPresence, request: requestPresence }));
     assert(seededReadback.draft_state?.outputRows?.length === 0, "Fixture setup unexpectedly injected output rows.");
@@ -775,6 +790,7 @@ async function main() {
     assert(downloadedXlsxBytes.equals(protectedFirstXlsx.bytes), "Native browser and protected HTTP workbook bytes differ.");
     // Match payload_to_brief/prepare_lines and customer_quote_description.
     // Output edits retain editor.value strings until server normalisation.
+    requireExactSignature(xlsxJobRequest.signature);
     const workbookRow = (item) => {
       const text = (value) => String(value || "").replace(/\s+/g, " ").trim().normalize("NFC");
       const rawDescription = text(item.description);
@@ -807,6 +823,10 @@ async function main() {
         client: { name: expectedCustomer }, project: { title: expectedProject },
         company: { name: companyFields.find(([selector]) => selector === "#quoteCompanyNameEditor")[1],
           header_details: companyFields.find(([selector]) => selector === "#headerDetailsEditor")[1] },
+        signature: {
+          company_signatory: companyFields.find(([selector]) => selector === "#companySignatoryEditor")[1],
+          company_title: companyFields.find(([selector]) => selector === "#companyTitleEditor")[1],
+        },
         project_number: expectedProjectNumber, line_items: xlsxJobRequest.line_items.map(workbookRow) },
       rows: fixtureItems.map((item, index) => ({ ...workbookRow({ description: item.description,
         quantity: index === 0 ? 2 : 1, unit: item.unit_hint,
