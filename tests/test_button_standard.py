@@ -52,7 +52,11 @@ class ButtonStandardTest(unittest.TestCase):
         self.assertLess(ready.index(".prepend("), ready.index('classList.add("is-open", "is-ready")'))
 
     def test_profile_icons_keep_their_width(self):
-        self.assertIn("grid-template-columns: minmax(0, 258px) 168px;", self.css)
+        self.assertIn("""@media (min-width: 881px) {
+  .company-preset-card.company-preset-profile-card {
+    grid-template-columns: minmax(0, 258px) 168px;
+  }
+}""", self.rules)
         self.assertIn(""".company-preset-profile-card .company-preset-action-panel > button > svg,
 .company-preset-profile-card .company-preset-more-button > svg {
   flex-shrink: 0;

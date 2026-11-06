@@ -4257,7 +4257,7 @@ h3 {
 
 .company-preset-card.company-preset-profile-card {
   display: grid;
-  grid-template-columns: minmax(0, 258px) 168px;
+  grid-template-columns: minmax(0, 258px) minmax(150px, 158px);
   align-items: center;
   justify-content: center;
   gap: 10px;
@@ -8986,6 +8986,12 @@ body.privacy-page {
 .output-match-table .output-price-switch:disabled { background: #f1f5f9; color: #64748b; border-color: #cbd5e1; cursor: not-allowed; }
 
 /* Shared control sizing for approved quote actions. */
+@media (min-width: 881px) {
+  .company-preset-card.company-preset-profile-card {
+    grid-template-columns: minmax(0, 258px) 168px;
+  }
+}
+
 .basis-line-actions {
   grid-template-columns: repeat(3, 32px);
   gap: 8px;
