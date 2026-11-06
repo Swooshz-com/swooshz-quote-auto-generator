@@ -90,14 +90,34 @@ class ProfileAccessStorageTest(ProfileStorageCase, unittest.TestCase):
                     owner.save_profile({**self.profile(), key: {}}, operation="create")
 
     def test_legacy_visibility_invalid_metadata_and_local_fail_closed(self):
-        with self.stores() as store:
-            admin, staff = store("support", "admin"), store("staff-a")
-            admin._upsert_payload("sqag_profiles", "profile_id", "legacy", {"id": "legacy", "defaults": {}})
-            self.assertIsNotNone(staff.profile_detail("legacy"))
-            self.assertFalse(staff.list_company_profiles()[0]["permissions"]["canDelete"])
-            admin._upsert_payload("sqag_profiles", "profile_id", "invalid", {"id": "invalid", "_access": {}})
-            self.assertIsNone(admin.profile_detail("invalid"))
-            self.assertEqual(len(admin.list_profiles()), 1)
+        for mode in ("database", "object"):
+            with self.subTest(mode=mode), self.stores(mode) as store:
+                admin = store("support", "admin")
+                legacy = {"id": "legacy", "defaults": {}}
+                admin._upsert_payload("sqag_profiles", "profile_id", "legacy", legacy)
+                for actor in (store("staff-a"), store("staff-b"), store("reader", "viewer"), admin):
+                    self.assertIsNotNone(actor.profile_detail("legacy"))
+                    listed = actor.list_company_profiles()
+                    self.assertEqual([item["id"] for item in listed], ["legacy"])
+                    self.assertEqual(listed[0]["revision"], 0)
+                    self.assertEqual(listed[0]["permissions"]["canDelete"], actor is admin)
+                    if actor is not admin:
+                        with self.assertRaises(s.SqagStorageAccessError) as update:
+                            actor.save_profile(legacy, revision=listed[0]["revision"])
+                        self.assertEqual(update.exception.status, 404)
+                        with self.assertRaises(s.SqagStorageAccessError) as delete:
+                            actor.delete_profile("legacy", revision=listed[0]["revision"])
+                        self.assertEqual(delete.exception.status, 404)
+                        self.assertEqual(admin._read_payload("sqag_profiles", "profile_id", "legacy"), legacy)
+                self.assertIsNone(store("staff-a", workspace="workspace-other").profile_detail("legacy"))
+                updated = admin.save_profile(legacy, revision=0)
+                self.assertEqual(updated["revision"], 1)
+                self.assertNotIn("_access", admin._read_payload("sqag_profiles", "profile_id", "legacy"))
+                self.assertIsNotNone(store("staff-b").profile_detail("legacy"))
+                admin._upsert_payload("sqag_profiles", "profile_id", "invalid", {"id": "invalid", "_access": {}})
+                self.assertIsNone(admin.profile_detail("invalid"))
+                self.assertEqual(len(admin.list_profiles()), 1)
+                self.assertTrue(admin.delete_profile("legacy", revision=updated["revision"]))
         with mock.patch.object(s, "internal_password_mode_enabled", return_value=True):
             with self.assertRaises(s.SqagStorageAccessError):
                 s.LocalSqagStorage()

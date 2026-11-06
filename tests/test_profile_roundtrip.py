@@ -108,7 +108,8 @@ console.log(JSON.stringify({cases:6,status:'PASS'}));
                     target.save_profile(webapp.normalize_profile_payload(exported))
                     self.assertEqual(target.profile_layout_artifact(source['id'])['content'], expected)
                     self.assertEqual(target.profile_detail(source['id'])['defaults'], source['defaults'])
-                    self.assertTrue(owner.delete_profile(source['id']))
+                    loaded = next(item for item in owner.list_company_profiles() if item['id'] == source['id'])
+                    self.assertTrue(owner.delete_profile(source['id'], revision=loaded['revision']))
                     self.assertIsNone(owner.company_profile_export_payload(source['id']))
                     self.assertIsNotNone(target.company_profile_export_payload(source['id']))
 
