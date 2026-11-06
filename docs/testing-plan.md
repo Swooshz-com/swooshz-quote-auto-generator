@@ -159,7 +159,11 @@ the owner-approved CI lane.
   The offline transport probe covers single-call and observation/synthesis paths with
   explicit object quantities and units, lossy observations, and unmeasured descriptive
   rows. Prompt checks require object/location associations, separate dimensions,
-  coherent linked measurements and no invented defaults. Fake responses establish
+  coherent linked measurements and no invented defaults. Compact notes keep quantities
+  and units with their object/location within a per-page budget derived from the batch
+  response limit, reserving 20% for JSON overhead and escaping. Check full and partial
+  batches and a changed limit. Synthesis permits floor area derived from stated booth
+  dimensions and services genuinely priced per lot in the catalogue. Fake responses establish
   request and normalisation behaviour, not live model takeoff accuracy.
 - Default booth-dimension reminders: run `python -m unittest tests.test_basis_dimension_contract`. Preserve structured row IDs, measurements, catalogue authority, notes, order and confidence through full Analyse, finalisation and review. Repeated reminder insertion must be stable; distinct physical rows sharing a catalogue item remain separate, and unmeasured rows must not display an invented `1 lot`.
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.

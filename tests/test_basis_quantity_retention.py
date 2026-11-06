@@ -120,7 +120,7 @@ class BasisQuantityRetentionTest(unittest.TestCase):
         _, calls = self.analyse(13)
         batches = [body["input"][0]["content"][0]["text"] for body in calls[:-1]]
         for prompt in batches:
-            self.assertIn("Retain every explicit quantity and unit", prompt)
+            self.assertIn("Retain explicit quantities and units", prompt)
             self.assertIn("object and location", prompt)
             self.assertIn("dimensions separate from billable quantities", prompt)
             self.assertIn("Do not invent measurements", prompt)
@@ -129,10 +129,36 @@ class BasisQuantityRetentionTest(unittest.TestCase):
         self.assertIn("Carry supported quantities and units", synthesis)
         self.assertIn("linked line_items", synthesis)
         self.assertIn("Do not replace missing measurements with 1 lot", synthesis)
+        self.assertIn("Area or length quantities derived from stated booth or object dimensions", synthesis)
+        self.assertIn("including floor area from booth size", synthesis)
+        self.assertIn("except for services genuinely priced per lot in the catalog", synthesis)
+        self.assertIn("Do not invent quantities or units", synthesis)
         observations = json.loads(synthesis[synthesis.index('[{"source":'):])
         self.assertEqual([row["source"] for row in observations],
                          [f"Reference 1, PDF page {page}" for page in range(1, 14)])
         self.assertTrue(all(row["observation"] == MEASURED_NOTE for row in observations))
+
+    def test_page_note_budget_tracks_result_limit_and_actual_batch_size(self):
+        for limit in (server.MAX_DRAFT_BATCH_RESULT_CHARS, server.MAX_DRAFT_BATCH_RESULT_CHARS // 2):
+            with self.subTest(limit=limit), mock.patch.object(server, "MAX_DRAFT_BATCH_RESULT_CHARS", limit):
+                _, calls = self.analyse(13)
+                page_counts = [len(body["input"][0]["content"]) - 1 for body in calls[:-1]]
+                self.assertEqual(sorted(page_counts), [1, server.MAX_DRAFT_BATCH_MEDIA, server.MAX_DRAFT_BATCH_MEDIA])
+                for body, pages in zip(calls[:-1], page_counts):
+                    expected_budget = limit * 4 // (5 * pages)
+                    prompt = body["input"][0]["content"][0]["text"]
+                    self.assertIn(f"Keep each observation within {expected_budget} characters.", prompt)
+                    self.assertLess(expected_budget * pages, limit)
+                    self.assertLess(len(json.dumps({"observations": ["x" * expected_budget] * pages})), limit)
+
+    def test_compact_page_notes_keep_quantity_unit_object_and_location(self):
+        _, calls = self.analyse(13)
+        for body in calls[:-1]:
+            prompt = body["input"][0]["content"][0]["text"]
+            self.assertIn("object at location: value unit", prompt)
+            self.assertIn("measurements first, without repeated prose", prompt)
+            self.assertIn("Retain explicit quantities and units with their object and location", prompt)
+            self.assertIn("visible counts, areas, lengths and dimension labels", prompt)
 
     def test_real_quantity_admission_and_normalisation_matrix(self):
         for unit in ("sqm", "m", "nos"):
