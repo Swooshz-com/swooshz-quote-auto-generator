@@ -89,7 +89,7 @@ class ProfileAccessStorageTest(ProfileStorageCase, unittest.TestCase):
                 with self.assertRaises(ValueError):
                     owner.save_profile({**self.profile(), key: {}}, operation="create")
 
-    def test_legacy_visibility_invalid_metadata_and_local_fail_closed(self):
+    def test_legacy_visibility_and_invalid_metadata(self):
         for mode in ("database", "object"):
             with self.subTest(mode=mode), self.stores(mode) as store:
                 admin = store("support", "admin")
@@ -118,9 +118,67 @@ class ProfileAccessStorageTest(ProfileStorageCase, unittest.TestCase):
                 self.assertIsNone(admin.profile_detail("invalid"))
                 self.assertEqual(len(admin.list_profiles()), 1)
                 self.assertTrue(admin.delete_profile("legacy", revision=updated["revision"]))
-        with mock.patch.object(s, "internal_password_mode_enabled", return_value=True):
-            with self.assertRaises(s.SqagStorageAccessError):
-                s.LocalSqagStorage()
+
+    def test_local_internal_profile_refusal_preserves_other_storage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = s.CompanyConfigStore(Path(directory))
+            with mock.patch.object(s, "company_config_store", return_value=config):
+                local = s.LocalSqagStorage()
+                company = local.company_id()
+                with mock.patch.object(s, "internal_password_mode_enabled", return_value=False):
+                    saved = local.save_profile(self.profile())
+                    self.assertEqual(len(local.list_company_profiles()), 1)
+                    self.assertIsNotNone(local.company_profile_export_payload(saved["id"]))
+                before = {p.relative_to(directory): p.read_bytes() for p in Path(directory).rglob("*") if p.is_file()}
+                with mock.patch.object(s, "internal_password_mode_enabled", return_value=True):
+                    local = s.LocalSqagStorage()
+                    with mock.patch.object(config, "_read_collection", side_effect=AssertionError("Saved profile read")):
+                        self.assertEqual(local.list_company_profiles(), [])
+                        self.assertIsNone(s.load_company_profile_pack(saved["id"], company))
+                        self.assertIsNone(s.workspace_quote_company_profile())
+                    for action in (
+                        lambda: local.save_profile(self.profile()),
+                        lambda: local.save_profile({**self.profile(), "id": saved["id"]}, operation="update", revision=1),
+                        lambda: local.delete_profile(saved["id"]),
+                        lambda: local.company_profile_export_payload(saved["id"]),
+                    ):
+                        with self.assertRaises(s.SqagStorageAccessError) as denied:
+                            action()
+                        self.assertEqual(denied.exception.status, 403)
+                        self.assertEqual(denied.exception.reason, "profile_local_actor_unavailable")
+                    with mock.patch.object(s, "list_profiles", return_value=[{"id": "generic"}]):
+                        self.assertEqual(local.list_profiles(), [{"id": "generic"}])
+                    with mock.patch.object(s, "list_pricing_references", return_value=[{"id": "pricing"}]):
+                        self.assertEqual(local.list_pricing_references(), [{"id": "pricing"}])
+                    with mock.patch.object(s, "list_quote_sessions", return_value=[]):
+                        self.assertEqual(local.list_quote_sessions(), [])
+                self.assertEqual({p.relative_to(directory): p.read_bytes() for p in Path(directory).rglob("*") if p.is_file()}, before)
+                with mock.patch.object(s, "internal_password_mode_enabled", return_value=False):
+                    self.assertTrue(local.delete_profile(saved["id"]))
+
+    def test_member_cannot_change_own_profile_access(self):
+        for mode in ("database", "object"):
+            with self.subTest(mode=mode), self.stores(mode) as store:
+                owner, admin = store("staff-a"), store("support", "admin")
+                saved = owner.save_profile(self.profile(), operation="create")
+                identity = saved["id"]
+                for visibility in ("user", "shared"):
+                    saved = admin.change_profile_access(identity, {
+                        "version": 1, "owner_user_id": "staff-a", "visibility": visibility,
+                    }, revision=saved["revision"])
+                    before = admin._read_payload("sqag_profiles", "profile_id", identity)
+                    for action, access in (
+                        ("share", {"version": 1, "owner_user_id": "staff-a", "visibility": "shared"}),
+                        ("unshare", {"version": 1, "owner_user_id": "staff-a", "visibility": "user"}),
+                        ("transfer", {"version": 1, "owner_user_id": "staff-b", "visibility": "user"}),
+                    ):
+                        with self.subTest(visibility=visibility, action=action):
+                            with mock.patch.object(owner, "_run_storage_transaction", side_effect=AssertionError("Forbidden write")):
+                                with self.assertRaises(s.SqagStorageAccessError) as denied:
+                                    owner.change_profile_access(identity, access, revision=saved["revision"])
+                            self.assertEqual(denied.exception.status, 403)
+                            self.assertEqual(denied.exception.reason, "profile_access_denied")
+                            self.assertEqual(admin._read_payload("sqag_profiles", "profile_id", identity), before)
 
 
 if __name__ == "__main__":

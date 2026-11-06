@@ -13,7 +13,10 @@ shared profiles and export or copy them. Only administrators can mutate shared
 profiles or change ownership. Pricing Reference permissions remain separate.
 Unmapped legacy rows retain workspace reads and administrator writes pending an
 explicit ID-to-owner mapping. Invalid metadata is unavailable, including to admins.
-Internal-password sessions require database storage; the local adapter fails closed.
+Internal-password sessions require database storage for saved company profiles.
+With local JSON storage, saved profile lists are empty and save, delete and export
+are refused; templates, pricing references and quote sessions retain local behaviour.
+Saved default/layout readers also omit local company profiles in this mode.
 
 Run the focused offline suites before the existing profile, auth and publication
 suites. Set `SQAG_DISABLE_DOTENV=1`, `PYTHONDONTWRITEBYTECODE=1` and direct all
@@ -33,6 +36,9 @@ The new suites cover role/state decisions, filtered lists and assets, same-label
 copies, exports/imports, denied effects, stale writes, shared mutation, metadata
 hash exclusion, run-evidence linkage, dry-run purity and reversible offline maps.
 The JS harness checks existing control states and invisible request fields only.
+The profile suites also check local internal-login boot over HTTP and refusal
+without saved-profile reads or writes, plus member share/unshare/transfer denial
+over HTTP and both database artifact adapters, with unchanged persisted access.
 Qualify full saved-quote reopen/download after delete, transfer and unsharing on
 the final installed candidate. Verify changed pricing authority, evidence tampering,
 wrong quote owner/workspace and stale commercial revisions still deny delivery.

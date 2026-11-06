@@ -10961,9 +10961,19 @@ class CompanyConfigStore:
         return self._delete_item(company_id, "pricing-references", reference_id)
 
     def list_profiles(self, company_id: str) -> list[dict[str, Any]]:
+        # Local JSON has no trusted actor boundary, including for defaults/layout reads.
+        if internal_password_mode_enabled():
+            return []
         return self._read_collection(company_id, "profiles")
 
+    @staticmethod
+    def require_profile_actor() -> None:
+        if internal_password_mode_enabled():
+            raise SqagStorageAccessError("Profile storage requires trusted user context.",
+                                         status=403, reason="profile_local_actor_unavailable")
+
     def save_profile(self, company_id: str, profile: dict[str, Any]) -> dict[str, Any]:
+        self.require_profile_actor()
         profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
         if not profile_id:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
@@ -10994,6 +11004,7 @@ class CompanyConfigStore:
         return self._save_item(company_id, "profiles", profile_record)
 
     def delete_profile(self, company_id: str, profile_id: str) -> bool:
+        self.require_profile_actor()
         deleted = self._delete_item(company_id, "profiles", profile_id)
         pack_dir = self.profile_pack_dir(company_id, profile_id)
         if pack_dir.exists():
@@ -11976,12 +11987,6 @@ LOCAL_QUOTE_SPEND_CLAIMS_LOCK = threading.Lock()
 class LocalSqagStorage:
     storage_backend = "local-runtime-json"
 
-    def __init__(self):
-        # This adapter has no per-actor storage boundary. Never use it for staff.
-        if internal_password_mode_enabled():
-            raise SqagStorageAccessError("Profile storage requires trusted user context.",
-                                         status=403, reason="profile_local_actor_unavailable")
-
     @staticmethod
     def _read_spend(path: Path) -> dict[str, Any]:
         if _quote_session_path_is_redirect(path):
@@ -12077,6 +12082,7 @@ class LocalSqagStorage:
         return company_config_store().delete_profile(self.company_id(), profile_id)
 
     def company_profile_export_payload(self, profile_id: str) -> dict[str, Any] | None:
+        CompanyConfigStore.require_profile_actor()
         return company_profile_export_payload(profile_id, self.company_id())
 
     def list_pricing_references(self) -> list[dict[str, Any]]:
@@ -34104,6 +34110,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             profile_id = profile_export_match.group(1)
             try:
                 payload = storage.company_profile_export_payload(profile_id)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             except Exception as exc:  # pragma: no cover - defensive HTTP boundary
                 error_reference = new_error_reference()
                 write_local_log("profile_export_failed", {

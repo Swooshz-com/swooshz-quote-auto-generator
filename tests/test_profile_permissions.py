@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from webapp.profile_access import ProfilePolicy, access_state
 from webapp import server as s
@@ -60,6 +61,20 @@ class ProfilePermissionsTest(unittest.TestCase):
                 saved = json.loads(raw)["profile"]
                 identity = saved["id"]
                 self.assertNotEqual(identity, body["id"])
+                # Owning a profile does not grant authority to change its access.
+                inspection = s.DatabaseSqagStorage(url, os.environ["SQAG_INTERNAL_WORKSPACE_ID"], "admin", "support")
+                before = inspection._read_payload("sqag_profiles", "profile_id", identity)
+                owner_id = before["_access"]["owner_user_id"]
+                for action, access in (
+                    ("share", {"version": 1, "owner_user_id": owner_id, "visibility": "shared"}),
+                    ("unshare", {"version": 1, "owner_user_id": owner_id, "visibility": "user"}),
+                    ("transfer", {"version": 1, "owner_user_id": "another-member", "visibility": "user"}),
+                ):
+                    with self.subTest(action=action):
+                        status, _, raw = host.http("POST", "/api/settings/profiles", member_headers, json.dumps(
+                            {"operation": "access", "id": identity, "revision": saved["revision"], "access": access}))
+                        self.assertEqual(status, 403, raw)
+                        self.assertEqual(inspection._read_payload("sqag_profiles", "profile_id", identity), before)
                 export_route = f"/api/settings/profiles/{identity}/export.json"
                 status, _, raw = host.http("GET", export_route, member_headers)
                 self.assertEqual(status, 200, raw)
@@ -74,13 +89,58 @@ class ProfilePermissionsTest(unittest.TestCase):
                 self.assertEqual(host.http("GET", "/api/settings/pricing-references", member_headers)[0], 403)
                 admin_headers, _ = login(auth_http.email())
                 access = {"operation": "access", "id": identity, "revision": 1,
-                          "access": {"version": 1, "owner_user_id": None, "visibility": "shared"}}
+                          "access": {"version": 1, "owner_user_id": owner_id, "visibility": "shared"}}
                 status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps(access))
                 self.assertEqual(status, 200, raw)
                 revision = json.loads(raw)["profile"]["revision"]
+                before = inspection._read_payload("sqag_profiles", "profile_id", identity)
+                access.update(revision=revision, access={"version": 1, "owner_user_id": owner_id, "visibility": "user"})
+                self.assertEqual(host.http("POST", "/api/settings/profiles", member_headers, json.dumps(access))[0], 403)
+                self.assertEqual(inspection._read_payload("sqag_profiles", "profile_id", identity), before)
                 self.assertEqual(host.http("GET", export_route, member_headers)[0], 200)
                 self.assertEqual(host.http("DELETE", f"/api/settings/profiles/{identity}?revision={revision}", member_headers)[0], 404)
                 self.assertEqual(host.http("DELETE", f"/api/settings/profiles/{identity}?revision={revision}", admin_headers)[0], 200)
+            finally:
+                host.doCleanups()
+
+    def test_http_local_internal_login_boot_and_saved_profile_refusal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = auth_http.InternalPasswordAuthWebappTest()
+            host.setUp({"APP_MODE": "local", "SQAG_STORAGE_MODE": "local", "QUOTE_DATA_ROOT": directory,
+                        "SQAG_PUBLIC_BASE_URL": "http://127.0.0.1",
+                        "TEMP": tempfile.gettempdir(), "TMP": tempfile.gettempdir(), "TMPDIR": tempfile.gettempdir(),
+                        "PYTHONDONTWRITEBYTECODE": "1"})
+            try:
+                host.stack.enter_context(mock.patch.object(auth_http, "ORIGIN", "http://127.0.0.1"))
+                for alias in (auth_http.email(), auth_http.email("operator")):
+                    status, headers, _ = host.login(alias)
+                    self.assertEqual(status, 302)
+                    cookie = s.SESSION_COOKIE_NAME + "=" + host.cookie(headers, s.SESSION_COOKIE_NAME)
+                    status, _, raw = host.http("GET", "/api/session", {"Cookie": cookie})
+                    self.assertEqual(status, 200)
+                    session = json.loads(raw)
+                    headers = {"Cookie": cookie, "Origin": auth_http.ORIGIN, "Content-Type": "application/json",
+                               session["csrf_header"]: session["csrf_token"]}
+                    status, _, raw = host.http("GET", "/api/profiles", headers)
+                    self.assertEqual(status, 200, raw)
+                    self.assertEqual(json.loads(raw)["company_profiles"], [])
+                    self.assertTrue(json.loads(raw)["profiles"])
+                    self.assertEqual(host.http("GET", "/api/quote-sessions", headers)[0], 200)
+                    self.assertEqual(host.http("GET", "/api/settings/profiles", headers)[0], 200)
+                    errors = []
+                    for method, route, body in (
+                        ("POST", "/api/settings/profiles", {"operation": "create", "label": "Synthetic", "defaults": {}}),
+                        ("POST", "/api/settings/profiles", {"operation": "update", "id": "synthetic", "revision": 1, "defaults": {}}),
+                        ("DELETE", "/api/settings/profiles/synthetic?revision=1", None),
+                        ("GET", "/api/settings/profiles/synthetic/export.json", None),
+                    ):
+                        with self.subTest(alias=alias, method=method, route=route):
+                            status, _, raw = host.http(method, route, headers, json.dumps(body) if body else None)
+                            self.assertEqual(status, 403, raw)
+                            error = json.loads(raw)
+                            self.assertTrue(error.pop("error_reference"))
+                            errors.append(error)
+                    self.assertTrue(all(error == errors[0] for error in errors))
             finally:
                 host.doCleanups()
 
