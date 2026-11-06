@@ -43,8 +43,8 @@ and role lists are ignored by the runtime and rejected by the current deployment
 template verifier. They are `SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON`,
 `SQAG_INTERNAL_ADMIN_EMAILS` and `SQAG_INTERNAL_OPERATOR_EMAILS`. Keep them only
 with rollback snapshots that still run the old Google implementation. The
-independent local OIDC and Platform settings remain incompatible with password
-mode.
+retired OIDC settings and independent Platform settings remain incompatible with
+password mode.
 
 ## Request and session behaviour
 
@@ -104,10 +104,10 @@ pricing references, including imports and exports. Operators can select a
 reference and use it to price a quote. Installed qualification is required to
 verify continuity and saved-data access before cutover.
 
-The independent Platform launch/session contracts and explicitly local OIDC
-component adapter remain covered by their existing tests. The local adapter does
-not grant deploy access. Remove it only when its independent component consumers
-are retired; it is not a compatibility route for the removed internal Google mode.
+The independent Platform launch/session contracts remain supported. The local
+OIDC adapter is retired in every mode. Its settings cannot enable provider login;
+they remain recognised only where required to reject mixed configuration. The
+guarded callback refusal and logout cleanup of old state cookies remain intact.
 
 ## Validation and qualification
 
