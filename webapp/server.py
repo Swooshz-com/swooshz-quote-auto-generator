@@ -21438,6 +21438,7 @@ SAFE_AI_FAILURE_DIAGNOSTIC_KEYS = {
     "request_shape_sha256",
     "failure_boundary",
     "response_contract_reason",
+    "response_contract_missing_paths",
     "transport_timeout",
     "http_status",
     "http_status_class",
@@ -21470,6 +21471,18 @@ def safe_ai_output_diagnostics(value: Any) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {}
     for key in SAFE_AI_OUTPUT_DIAGNOSTIC_KEYS | SAFE_AI_FAILURE_DIAGNOSTIC_KEYS:
         item = value.get(key)
+        if key == "response_contract_missing_paths":
+            # Closed field vocabulary only; never admit supplied keys, IDs or text.
+            if isinstance(item, list) and 0 < len(item) <= 32 and all(
+                isinstance(path, str) and re.fullmatch(
+                    r"(?:quote_basis_sections\[[0-9]{1,7}\]\.lines(?:\[[0-9]{1,7}\]\.(?:confidence|text))?"
+                    r"|line_items\[[0-9]{1,7}\]\.description"
+                    r"|analysis_findings\[[0-9]{1,7}\]\.text"
+                    r"|blocking_clarification_questions\[[0-9]{1,7}\]\.question)", path
+                ) for path in item
+            ):
+                diagnostics[key] = list(item)
+            continue
         if key in {"pdf_total_pages", "pdf_total_bytes", "pdf_page_limit", "pdf_byte_limit",
                    "source_byte_limit", "pdf_page_count_complete"}:
             if type(item) is int and 0 <= item <= (1 << 63) - 1:
@@ -25531,10 +25544,11 @@ def pricing_authority_variant_counts(items: list[dict[str, Any]]) -> dict[str, i
     return counts
 
 
-def provider_quote_response_invalid(reason: str) -> None:
+def provider_quote_response_invalid(reason: str, *, missing_path: str = "") -> None:
     # Fixed codes only: no provider text, row IDs, measurements or catalogue values.
     raise AIModelOutputError("AI analysis returned an inconsistent quote response.", diagnostics={
         "failure_boundary": "model_output_contract", "response_contract_reason": reason,
+        **safe_ai_output_diagnostics({"response_contract_missing_paths": [missing_path]}),
     })
 
 
@@ -25593,10 +25607,10 @@ def provider_row_identity(row: dict[str, Any], keys: tuple[str, ...]) -> str:
     return values[0] if values else ""
 
 
-def provider_row_confidence(row: dict[str, Any], *, required: bool = False) -> None:
+def provider_row_confidence(row: dict[str, Any], *, required: bool = False, path: str = "") -> None:
     values = [row[key] for key in ("confidence_pct", "confidence") if key in row]
     if not values and required:
-        provider_quote_response_invalid("confidence_missing")
+        provider_quote_response_invalid("confidence_missing", missing_path=f"{path}.confidence")
     if any(type(value) is not int or not 0 <= value <= 100 for value in values):
         provider_quote_response_invalid("confidence_scale")
     if len(set(values)) > 1:
@@ -25625,13 +25639,15 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool) -> dict
             not isinstance(value, str) for value in result["quote_basis"].values())):
         provider_quote_response_invalid("legacy_basis_shape")
     for field, text_key in (("analysis_findings", "text"), ("blocking_clarification_questions", "question")):
-        for row in result.get(field, []):
+        for row_index, row in enumerate(result.get(field, [])):
             if not isinstance(row, dict) or not isinstance(row.get(text_key), str) or not row[text_key].strip():
-                provider_quote_response_invalid("supplementary_row_shape")
+                provider_quote_response_invalid("supplementary_row_shape", missing_path=(
+                    f"{field}[{row_index}].{text_key}" if isinstance(row, dict) and text_key not in row else ""
+                ))
             provider_row_confidence(row)
     basis_rows = []
     section_ids = set()
-    for section in result.get("quote_basis_sections", []):
+    for section_index, section in enumerate(result.get("quote_basis_sections", [])):
         if not isinstance(section, dict):
             provider_quote_response_invalid("section_shape")
         if "title" in section and not isinstance(section["title"], str):
@@ -25647,17 +25663,23 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool) -> dict
         elif any(isinstance(section.get(key), str) and clean_text(section[key]) for key in ("text", "body")):
             lines = multiline_list(section.get("text") or section.get("body"))
         else:
-            provider_quote_response_invalid("basis_rows_shape")
-        for line in lines:
+            provider_quote_response_invalid("basis_rows_shape", missing_path=(
+                f"quote_basis_sections[{section_index}].lines"
+                if not any(key in section for key in ("lines", "text", "body")) else ""
+            ))
+        for line_index, line in enumerate(lines):
+            path = f"quote_basis_sections[{section_index}].lines[{line_index}]"
             if isinstance(line, str) and line.strip():
                 if require_confidence:
-                    provider_quote_response_invalid("confidence_missing")
+                    provider_quote_response_invalid("confidence_missing", missing_path=f"{path}.confidence")
                 continue
             if not isinstance(line, dict):
                 provider_quote_response_invalid("basis_row_shape")
             texts = [line[key] for key in ("text", "line", "description") if key in line and line[key] not in (None, "")]
             if not texts or any(not isinstance(text, str) or not text.strip() for text in texts):
-                provider_quote_response_invalid("basis_row_text")
+                provider_quote_response_invalid("basis_row_text", missing_path=(
+                    f"{path}.text" if not any(key in line for key in ("text", "line", "description")) else ""
+                ))
             if len({clean_text(text) for text in texts}) != 1:
                 provider_quote_response_invalid("basis_row_text_conflict")
             if len(split_basis_decision_text(texts[0], line.get("tag"))) != 1:
@@ -25665,13 +25687,15 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool) -> dict
             row_id = provider_row_identity(line, ("id", "source_line_item_id", "source_basis_line_id"))
             if row_id:
                 line["id"] = row_id
-            provider_row_confidence(line, required=require_confidence)
+            provider_row_confidence(line, required=require_confidence, path=path)
             basis_rows.append((row_id, provider_row_measurement(line, texts[0])))
     raw_rows = result.get("line_items", [])
     item_rows = []
-    for row in raw_rows:
+    for row_index, row in enumerate(raw_rows):
         if not isinstance(row, dict) or not isinstance(row.get("description"), str) or not row["description"].strip():
-            provider_quote_response_invalid("item_row_shape")
+            provider_quote_response_invalid("item_row_shape", missing_path=(
+                f"line_items[{row_index}].description" if isinstance(row, dict) and "description" not in row else ""
+            ))
         row_id = provider_row_identity(row, ("source_basis_line_id", "id", "source_line_item_id"))
         if row_id:
             row["source_basis_line_id"] = row_id
@@ -26160,16 +26184,24 @@ class DraftSendBudget:
         self.model = model
         self.remaining_batches = batches
         self.final_sent = False
+        self.repair_sent = False
+        self.repair_outcome = "not_attempted"
+        self.contract_diagnostics = {}
         self.by_model = {}
         self._lock = threading.Lock()
         self._local = threading.local()
         self._claimed = 0
         self._pending = 0
 
-    def next_stage(self, *, synthesis=False):
+    def next_stage(self, *, synthesis=False, synthesis_repair=False):
         if getattr(self._local, "stage", None) is not None or getattr(self._local, "pending_model", None) is not None:
             raise DraftBatchError("draft_call_limit")
-        self._local.stage = "final" if synthesis else "batch"
+        if synthesis_repair:
+            with self._lock:
+                if (self._claimed >= MAX_DRAFT_BATCH_CALLS or not self.final_sent or self.repair_sent
+                        or self.remaining_batches or self._pending):
+                    raise DraftBatchError("draft_call_limit")
+        self._local.stage = "repair" if synthesis_repair else "final" if synthesis else "batch"
 
     def claim(self, operation, model):
         with self._lock:
@@ -26182,6 +26214,9 @@ class DraftSendBudget:
                 self.remaining_batches -= 1
             elif stage == "final" and not self.remaining_batches and not self._pending and not self.final_sent:
                 self.final_sent = True
+            elif (stage == "repair" and self.final_sent and not self.repair_sent
+                  and not self.remaining_batches and not self._pending):
+                self.repair_sent = True
             else:
                 raise DraftBatchError("draft_call_limit")
             self._local.stage = None
@@ -26220,7 +26255,9 @@ class DraftSendBudget:
             # Configured model IDs are private; identify the captured route only.
             return {"provider": AI_PROVIDER_OPENROUTER,
                     "by_model": [{"route": self.operation, **row} for row in self.by_model.values()],
-                    "total": total}
+                    "total": total, "synthesis_repair_count": int(self.repair_sent),
+                    "synthesis_repair_outcome": self.repair_outcome,
+                    **safe_ai_output_diagnostics(self.contract_diagnostics)}
 
 
 class DraftBatchRunner:
@@ -26420,7 +26457,51 @@ def send_draft_request(gateway, operation, configuration, content, budget):
         raise type(exc)(str(exc), diagnostics={**exc.diagnostics, "request_shape_sha256": fingerprint}) from None
 
 
-def run_draft_batches(prepared, gateway, operation, configuration, prompt, catalog_parts):
+ENABLE_SYNTHESIS_CONTRACT_REPAIR = True
+
+
+def repair_draft_synthesis(exc, body, send, budget):
+    """One missing-field re-ask; never replay batches or include rejected output."""
+    diagnostics = safe_ai_output_diagnostics(exc.diagnostics)
+    budget.contract_diagnostics = diagnostics
+    paths = diagnostics.get("response_contract_missing_paths")
+    if (not ENABLE_SYNTHESIS_CONTRACT_REPAIR or not paths
+            or diagnostics.get("failure_boundary") != "model_output_contract"
+            or diagnostics.get("response_contract_reason") not in {
+                "confidence_missing", "basis_row_text", "basis_rows_shape",
+                "item_row_shape", "supplementary_row_shape",
+            }):
+        raise exc
+    repair_body = copy.deepcopy(body)
+    repair_body["input"][0]["content"][0]["text"] += (
+        "\\nRequired-field repair. Missing field paths: " + ", ".join(paths) + ". "
+        "Return the complete JSON object again. Each quote_basis_sections section requires id, title, lines. "
+        "Each physical line requires id, tag, text, confidence_pct (or confidence), quantity and unit; "
+        "confidence must be a JSON integer from 0 to 100; supplied aliases must agree. "
+        "Pure informational notes may omit quantity and unit. Each line_items row requires section, quantity, "
+        "unit, description, pricing_keyword, source_basis_line_id. Findings require text; clarification rows "
+        "require question. Keep all original evidence and output rules."
+    )
+    try:
+        budget.next_stage(synthesis_repair=True)
+    except DraftBatchError:
+        budget.repair_outcome = "budget_exhausted"
+        raise exc
+    owner = current_ai_transport_owner()
+    if owner is not None and owner.pending is not None:
+        log_ai_call_attempt(
+            feature="draft_quote_basis", provider=AI_PROVIDER_OPENROUTER, model=budget.model,
+            status="failed", duration_ms=owner.pending["duration_ms"], details=diagnostics,
+            **owner.attempt_metadata,
+        )
+    begin_ai_transport_operation("draft_quote_basis", AI_PROVIDER_OPENROUTER, budget.model)
+    budget.repair_outcome = "failed"
+    result = send(repair_body)
+    budget.repair_outcome = "success"
+    return result
+
+
+def run_draft_batches(prepared, gateway, operation, configuration, prompt, catalog_parts, *, payload, auth_session):
     budget = DraftSendBudget(operation, configuration.model, len(prepared.batches))
     feature = "draft_quote_basis"
     synthesis_prompt = (
@@ -26435,7 +26516,12 @@ def run_draft_batches(prepared, gateway, operation, configuration, prompt, catal
         "Area or length quantities derived from stated booth or object dimensions under the original contract remain supported, "
         "including floor area from booth size. Do not replace missing measurements with 1 lot, "
         "except for services genuinely priced per lot in the catalog. Do not invent quantities or units. "
-        "The observations collectively represent every supplied reference. Follow the original output contract.\\n"
+        "The observations collectively represent every supplied reference. Follow the original output contract. "
+        "Required fields: each quote_basis_sections section has id, title, lines; each physical line has "
+        "id, tag, text, confidence_pct (or confidence), quantity and unit. "
+        "confidence_pct or confidence must be a JSON integer from 0 to 100; supplied aliases must agree. "
+        "Pure informational notes may omit quantity and unit. Each line_items row has section, quantity, unit, "
+        "description, pricing_keyword and source_basis_line_id linked to one physical basis line.\\n"
     )
     batch_effort = gateway.configuration.draft_batch_effort or configuration.reasoning_effort
     batch_configuration = OpenAIDraftConfiguration(
@@ -26479,12 +26565,18 @@ def run_draft_batches(prepared, gateway, operation, configuration, prompt, catal
 
         text = synthesis_prompt + json.dumps(observations, ensure_ascii=False)
         body = draft_request_body(configuration, [{"type": "input_text", "text": text}, *catalog_parts])
-        fingerprint = draft_request_fingerprint(body, configuration, synthesis=True)
+        def send_synthesis(body):
+            fingerprint = draft_request_fingerprint(body, configuration, synthesis=True)
+            try:
+                data = gateway_request(gateway, operation, body, send_budget=budget)
+            except OpenAIAnalysisError as exc:
+                raise DraftBatchError("synthesis_provider_failure") from exc
+            return normalize_draft_response(data, fingerprint, payload, auth_session)
+
         budget.next_stage(synthesis=True)
-        try:
-            return gateway_request(gateway, operation, body, send_budget=budget), fingerprint
-        except OpenAIAnalysisError as exc:
-            raise DraftBatchError("synthesis_provider_failure") from exc
+        return send_synthesis(body)
+    except AIModelOutputError as exc:
+        return repair_draft_synthesis(exc, body, send_synthesis, budget)
     finally:
         write_local_log("draft_batch_usage", budget.summary())
 
@@ -26533,10 +26625,14 @@ def request_openai_quote_basis(
             if budget.by_model:
                 write_local_log("draft_batch_usage", budget.summary())
     else:
-        data, shape_fingerprint = run_draft_batches(
-            prepared, gateway, operation, configuration, prompt, catalog_parts,
+        return run_draft_batches(
+            prepared, gateway, operation, configuration, prompt, catalog_parts, payload=payload, auth_session=auth_session,
         )
 
+    return normalize_draft_response(data, shape_fingerprint, payload, auth_session)
+
+
+def normalize_draft_response(data, shape_fingerprint, payload, auth_session):
     response_diagnostics = openai_response_failure_diagnostics(data)
     for key in ("provider_error_class", "provider_error_code"):
         response_diagnostics.pop(key, None)

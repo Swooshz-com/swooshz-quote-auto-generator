@@ -155,7 +155,7 @@ class DraftBatchParallelismTest(unittest.TestCase):
         self.analyse(transport, pages=24)
         self.assertEqual(completed, [4, 3, 2, 1])
         synthesis = transport.calls[-1]["input"][0]["content"][0]["text"]
-        notes = json.loads(synthesis.split("Follow the original output contract.\\n")[1])
+        notes = json.loads(synthesis[synthesis.index('[{"source":'):])
         self.assertEqual([note["source"] for note in notes], [f"Reference 1, PDF page {page}" for page in range(1, 25)])
         self.assertEqual([note["observation"] for note in notes], [f"Observed batch {index}" for index in range(1, 5) for _ in range(6)])
 
@@ -391,7 +391,12 @@ class DraftBatchParallelismTest(unittest.TestCase):
                 "Area or length quantities derived from stated booth or object dimensions under the original contract remain supported, "
                 "including floor area from booth size. Do not replace missing measurements with 1 lot, "
                 "except for services genuinely priced per lot in the catalog. Do not invent quantities or units. "
-                "The observations collectively represent every supplied reference. Follow the original output contract.\\n"
+                "The observations collectively represent every supplied reference. Follow the original output contract. "
+                "Required fields: each quote_basis_sections section has id, title, lines; each physical line has "
+                "id, tag, text, confidence_pct (or confidence), quantity and unit. "
+                "confidence_pct or confidence must be a JSON integer from 0 to 100; supplied aliases must agree. "
+                "Pure informational notes may omit quantity and unit. Each line_items row has section, quantity, unit, "
+                "description, pricing_keyword and source_basis_line_id linked to one physical basis line.\\n"
             )
             sequential_synthesis = server.draft_request_body(configuration, [
                 {"type": "input_text", "text": synthesis_prompt + json.dumps(observations, ensure_ascii=False)},

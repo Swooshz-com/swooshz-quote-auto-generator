@@ -522,7 +522,7 @@ duplicate keys, array wrappers, extra objects and nested nonfinite numbers. Keep
 the demonstrated fenced/trailing-prose chat consumer until its response contract
 is explicitly changed. All six maintained gateway callers share shape/completion/refusal checks.
 The retained legacy envelope parser tests cover historical consumers only.
-Full analysis and pricing calls send once; text retries stay on the captured
+Single-send analysis and pricing calls send once; text retries stay on the captured
 route and never switch model, provider or response parser.
 Confidence supplied by a fresh response is an integer from 0 to 100, including
 0 and 1; fractions, percent strings and conflicting aliases reject. Saved/user
@@ -589,7 +589,7 @@ socket denial backstop. A six-page synthetic PDF covers High Quality through rea
 local rendering and mocked transport. Gateway admission is followed by the same
 JSON, confidence, quantity, row identity and pricing-authority validators.
 
-Full analysis and pricing failures have a one-send budget. Text calls may retry
+Single-send analysis and pricing failures have a one-send budget. Text calls may retry
 only the existing bounded transient failures on the same captured route; partial
 output, refusal and auth/payment/permission failures never replay. Preserve safe
 HTTP parameter/class/code controls, privacy canaries, usage availability, retry
@@ -647,6 +647,16 @@ pixels, page budgets, and inbound/outbound JSON. Byte/pixel/JSON boundary tests
 use scaled ceilings to exercise exact equality without oversized fixtures.
 Hosted acceptance remains a separate gate requiring explicit live-operation
 authority; deterministic local validation does not establish live acceptance.
+
+Run `python -m unittest tests.test_synthesis_contract_repair` for synthesis
+contract changes. Cover safe nested missing-field paths, the final required-field
+prompt restatement, one same-input synthesis repair and strict second-failure
+rejection with the shared support reference. Verify exact send/token/cost totals,
+one terminal record per send, no repeated page batches, exhausted-budget refusal,
+the repair switch, and no repair for single-send analysis, invalid supplied values,
+JSON failures or refusals. Equivalent absent text/description/lines fields qualify
+only with a structural missing-path diagnostic. Use fake provider responses and
+socket-level network denial; never default confidence or accept a partial basis.
 
 A fix is not complete until the failing behavior has a regression test at the right layer:
 
