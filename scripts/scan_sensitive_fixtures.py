@@ -62,6 +62,8 @@ KNOWN_SYNTHETIC_REVIEW_ALLOWLIST = {
         "tests/fixtures/quote-generator/profiles/synthetic-exhibition-fixture-template/profile.json",
     ),
     ("internal-pricing-field", "docs/pricing-catalog-import.md"),
+    ("internal-pricing-field", "docs/quotation-api-v1.md"),
+    ("internal-pricing-field", "docs/quotation-api-v1.openapi.json"),
     (
         "internal-pricing-field",
         "tests/fixtures/quote-generator/pricing-references/synthetic-exhibition-fixture-pricing/pricing-catalog.json",
