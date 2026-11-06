@@ -4,6 +4,67 @@
 
 Every code change must test the features it can affect. A small edit can use focused checks, but the checks must cover the real affected surfaces instead of only proving a demo fixture still works.
 
+## User-owned company profiles
+
+Saved profile access is enforced by `webapp/profile_access.py` and the database
+storage adapter. New HTTP saves and imports create personal copies with opaque
+IDs; explicit updates and deletes carry the listed revision. Members can read
+shared profiles and export or copy them. Only administrators can mutate shared
+profiles or change ownership. Pricing Reference permissions remain separate.
+Unmapped legacy rows retain workspace reads and administrator writes pending an
+explicit ID-to-owner mapping. Invalid metadata is unavailable, including to admins.
+Internal-password sessions require database storage for saved company profiles.
+With local JSON storage, saved profile lists are empty and save, delete and export
+are refused; templates, pricing references and quote sessions retain local behaviour.
+Saved default/layout readers also omit local company profiles in this mode.
+
+Run the focused offline suites before the existing profile, auth and publication
+suites. Set `SQAG_DISABLE_DOTENV=1`, `PYTHONDONTWRITEBYTECODE=1` and direct all
+temporary files to the approved scratch directory. No provider or live DB is used.
+
+```powershell
+python -m unittest tests.test_profile_permissions tests.test_profile_access_storage tests.test_profile_access_backfill tests.test_profile_publication_continuity tests.test_profile_ui_permissions
+python -m unittest tests.test_profile_roundtrip tests.test_profile_layout_safety tests.test_startup_profile_recovery tests.test_internal_password_auth tests.test_internal_password_auth_webapp tests.test_internal_password_identity_continuity tests.test_quote_publication_projection tests.test_publication_storage_adapters tests.test_publication_proof_reasons tests.test_publication_owner_subjects tests.test_postgres_metadata_storage tests.test_runtime_privilege_contract tests.test_quote_flow_reliability tests.test_pricing_spatial_context tests.test_pricing_import_telemetry
+python scripts/validate_dynamic_pricing_reference_rules.py
+python scripts/scan_sensitive_fixtures.py --fail-on-review
+node .github/scripts/plain-text-check.cjs
+node --check webapp/static/app.js
+git diff --check
+```
+
+The new suites cover role/state decisions, filtered lists and assets, same-label
+copies, exports/imports, denied effects, stale writes, shared mutation, metadata
+hash exclusion, run-evidence linkage, dry-run purity and reversible offline maps.
+The JS harness checks existing control states and invisible request fields only.
+The profile suites also check local internal-login boot over HTTP and refusal
+without saved-profile reads or writes, plus member share/unshare/transfer denial
+over HTTP and both database artifact adapters, with unchanged persisted access.
+Backup/restore cleanup reads each synthetic profile's current revision from the
+public company-profile list before deletion. Run
+`python -m unittest tests.test_live_db_object_backup_restore_verifier` for SQLite
+BLOB/in-memory object cleanup, changed revisions, lookup failure and stale-read
+refusal. Lifecycle fault tests must supply the public revision to reach their
+intended remote-delete/rollback boundary. PostgreSQL fakes include the profile
+payload pre-read; real PostgreSQL privilege/backup coverage still requires CI's
+disposable PostgreSQL service.
+Qualify full saved-quote reopen/download after delete, transfer and unsharing on
+the final installed candidate. Verify changed pricing authority, evidence tampering,
+wrong quote owner/workspace and stale commercial revisions still deny delivery.
+Synthetic unit tests alone do not qualify that full historical journey, real
+PostgreSQL/object storage, installed/browser behaviour or owner acceptance.
+
+The offline mapper accepts an inventory with `workspace_id` and `profiles`, and a
+manifest with the same workspace plus `assignments` containing `profile_id` and
+`access` objects. Access contains `version: 1`, `owner_user_id` and `visibility`
+(`user` or `shared`). Unresolved, malformed or deleted targets block mapping.
+`python scripts/backfill_profile_access.py --inventory inventory.json --manifest mapping.json`
+lists IDs and visibility reductions without writing. Add `--apply --output mapped.json
+--receipt rollback.json` to create separate offline files. Use `--inventory mapped.json
+--rollback rollback.json --apply --output restored.json` to restore access only;
+intervening changes block restoration. Treat inventories and rollback receipts as
+private operational material. The script cannot read or write a database; any live
+inventory, mapping, cutover or rollback requires separate exact owner approval.
+
 ## Required Impact Pass
 
 Before finishing a change:
