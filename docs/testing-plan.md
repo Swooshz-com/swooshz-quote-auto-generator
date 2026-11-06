@@ -143,6 +143,20 @@ the owner-approved CI lane.
 
 ## Feature Coverage Guide
 
+- Quotation API contract proposal: Run
+  `python -m unittest tests.test_quote_api_contract`. The standard-library-only
+  module reads the contract document/spec and uses in-file fake gateway, clock
+  and storage objects. It checks example schemas, recursive closed fields,
+  forged authority/query rejection, estimate wording, decimal money, unresolved
+  nulls and labelled subtotals, optional admin-set tax, safe error shapes,
+  idempotency replay/conflict/expiry, owner isolation, confirmation, closed state
+  transitions, endpoint agreement, JSON/XLSX/PDF contracts and sandbox limits.
+  It imports no app runtime and proves no real HTTP admission, authentication,
+  durable queue/recovery, media limits, artifact privacy/fidelity or retention
+  execution. Those require later implementation tests and independent review.
+  No CI command or required-check setting changes; existing discovery includes
+  this module. Browser and owner UAT are not required for this docs/test slice.
+
 - Pricing-reference startup and first Customer entry: Run
   `python -m unittest tests.test_webapp.WebappServerTest.test_static_next_to_customer_initializes_untouched_commercial_defaults tests.test_webapp.WebappServerTest.test_static_authority_profile_race_discards_late_request_completely`
   and `node scripts/playwright-smoke.mjs --pricing-startup`. The bounded browser

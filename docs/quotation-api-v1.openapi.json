@@ -1,0 +1,2633 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Quotation API v1 contract proposal",
+    "version": "1.0.0",
+    "description": "Contract proposal, not implemented. Offline docs and fake contract tests only."
+  },
+  "security": [
+    {
+      "ServiceCredential": []
+    }
+  ],
+  "paths": {
+    "/api/v1/quote-requests": {
+      "post": {
+        "summary": "Create request and queue analysis",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted durably",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              },
+              "Location": {
+                "schema": {
+                  "$ref": "#/components/schemas/Link"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 2
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedJob"
+                },
+                "example": {
+                  "quote_request_id": "qr-example",
+                  "job_id": "job-example",
+                  "status": "queued",
+                  "links": {
+                    "job": "/api/v1/jobs/job-example",
+                    "request": "/api/v1/quote-requests/qr-example"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateQuoteRequest"
+              },
+              "example": {
+                "design_files": [
+                  {
+                    "name": "render.test.png",
+                    "data_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+                  }
+                ],
+                "notes": "Synthetic booth render; confirm the measured scope.",
+                "client_reference": "design.test-001"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/quote-requests/{id}/drafts": {
+      "post": {
+        "summary": "Queue a new basis revision",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted durably",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              },
+              "Location": {
+                "schema": {
+                  "$ref": "#/components/schemas/Link"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 2
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedJob"
+                },
+                "example": {
+                  "quote_request_id": "qr-example",
+                  "job_id": "job-example",
+                  "status": "queued",
+                  "links": {
+                    "job": "/api/v1/jobs/job-example",
+                    "request": "/api/v1/quote-requests/qr-example"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueueDraftRequest"
+              },
+              "example": {
+                "notes": "Confirm the displayed dimensions before pricing."
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/quote-steps/price": {
+      "post": {
+        "summary": "Confirm basis and queue pricing",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted durably",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              },
+              "Location": {
+                "schema": {
+                  "$ref": "#/components/schemas/Link"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 2
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedJob"
+                },
+                "example": {
+                  "quote_request_id": "qr-example",
+                  "job_id": "job-example",
+                  "status": "queued",
+                  "links": {
+                    "job": "/api/v1/jobs/job-example",
+                    "request": "/api/v1/quote-requests/qr-example"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PriceRequest"
+              },
+              "example": {
+                "quote_request_id": "qr-example",
+                "basis_revision": 1,
+                "confirmed_basis_revision": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/quote-requests/{id}/exports": {
+      "post": {
+        "summary": "Queue estimate exports",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted durably",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              },
+              "Location": {
+                "schema": {
+                  "$ref": "#/components/schemas/Link"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 2
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptedJob"
+                },
+                "example": {
+                  "quote_request_id": "qr-example",
+                  "job_id": "job-example",
+                  "status": "queued",
+                  "links": {
+                    "job": "/api/v1/jobs/job-example",
+                    "request": "/api/v1/quote-requests/qr-example"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExportRequest"
+              },
+              "example": {
+                "basis_revision": 1,
+                "confirmed_basis_revision": 1,
+                "formats": [
+                  "xlsx",
+                  "pdf"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}": {
+      "get": {
+        "summary": "Poll job",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Safe resource view",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                },
+                "example": {
+                  "job_id": "job-example",
+                  "quote_request_id": "qr-example",
+                  "status": "completed",
+                  "request_state": "awaiting_confirmation",
+                  "created_at": "2026-11-06T00:00:00Z",
+                  "updated_at": "2026-11-06T00:00:01Z",
+                  "expires_at": "2026-12-06T00:00:00Z",
+                  "poll_after_seconds": 2,
+                  "error": null,
+                  "links": {
+                    "request": "/api/v1/quote-requests/qr-example"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        }
+      }
+    },
+    "/api/v1/quote-requests/{id}": {
+      "get": {
+        "summary": "Read safe basis",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Safe resource view",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BasisView"
+                },
+                "example": {
+                  "quote_request_id": "qr-example",
+                  "state": "awaiting_confirmation",
+                  "basis_revision": 1,
+                  "basis": [
+                    {
+                      "description": "Synthetic measured surface",
+                      "quantity": 12,
+                      "unit": "sqm",
+                      "measurements": [
+                        "12 sqm"
+                      ],
+                      "materials": [],
+                      "inclusions": [],
+                      "needs_confirmation": [
+                        "Confirm material and measured area."
+                      ]
+                    }
+                  ],
+                  "uploads_expire_at": "2026-11-13T00:00:00Z",
+                  "expires_at": "2026-12-06T00:00:00Z",
+                  "links": {
+                    "request": "/api/v1/quote-requests/qr-example"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        }
+      }
+    },
+    "/api/v1/quote-requests/{id}/result": {
+      "get": {
+        "summary": "Read committed estimate",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Safe resource view",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomerEstimateView"
+                },
+                "example": {
+                  "quote_request_id": "qr-example",
+                  "status": "completed",
+                  "document_type": "estimate",
+                  "notice": "Estimate only. Subject to scope and price confirmation.",
+                  "currency": "SGD",
+                  "currency_decimal_places": 2,
+                  "lines": [
+                    {
+                      "description": "Synthetic measured surface",
+                      "quantity": 12,
+                      "unit": "sqm",
+                      "needs_confirmation": [],
+                      "price": {
+                        "status": "priced",
+                        "unit_price": "10.00",
+                        "amount": "120.00"
+                      }
+                    },
+                    {
+                      "description": "Synthetic custom feature",
+                      "quantity": 1,
+                      "unit": "set",
+                      "needs_confirmation": [],
+                      "price": {
+                        "status": "unresolved",
+                        "unit_price": null,
+                        "amount": null,
+                        "display": "price to be discussed"
+                      }
+                    }
+                  ],
+                  "totals": {
+                    "status": "partial",
+                    "known_subtotal": "120.00",
+                    "subtotal": null,
+                    "total": null,
+                    "unresolved_line_count": 1,
+                    "label": "Known-priced subtotal; excludes unresolved items and tax"
+                  },
+                  "tax": null,
+                  "expires_at": "2026-12-06T00:00:00Z",
+                  "links": {
+                    "xlsx": "/api/v1/quote-requests/qr-example/artifacts/xlsx",
+                    "pdf": "/api/v1/quote-requests/qr-example/artifacts/pdf"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        }
+      }
+    },
+    "/api/v1/quote-requests/{id}/artifacts/{kind}": {
+      "get": {
+        "summary": "Read authenticated estimate artifact",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "xlsx",
+                "pdf"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Verified bytes; same estimate policy as JSON",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "410": {
+            "$ref": "#/components/responses/Error410"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error415"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-reject-unknown-query": true,
+        "x-query-schema": {
+          "$ref": "#/components/schemas/EmptyQuery"
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Id": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])",
+        "maxLength": 128
+      },
+      "Revision": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "IdempotencyKey": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$(?![\\s\\S])"
+      },
+      "Money": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$(?![\\s\\S])"
+      },
+      "Timestamp": {
+        "type": "string",
+        "format": "date-time",
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$(?![\\s\\S])"
+      },
+      "Link": {
+        "type": "string",
+        "maxLength": 512,
+        "pattern": "^/api/v1/[A-Za-z0-9/_-]+$(?![\\s\\S])"
+      },
+      "Links": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "job": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "result": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "xlsx": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "pdf": {
+            "$ref": "#/components/schemas/Link"
+          }
+        },
+        "required": []
+      },
+      "EmptyQuery": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "RequestState": {
+        "type": "string",
+        "enum": [
+          "drafting",
+          "awaiting_confirmation",
+          "pricing",
+          "generating",
+          "completed",
+          "needs_input",
+          "failed",
+          "expired"
+        ]
+      },
+      "JobState": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "completed",
+          "failed"
+        ]
+      },
+      "DesignFile": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "data_url": {
+            "type": "string",
+            "pattern": "^data:(image/(png|jpeg|webp)|application/pdf);base64,[A-Za-z0-9+/]+={0,2}$(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "name",
+          "data_url"
+        ]
+      },
+      "CreateQuoteRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "design_files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DesignFile"
+            },
+            "minItems": 1,
+            "maxItems": 8
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 16384
+          },
+          "client_reference": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "design_files"
+        ],
+        "examples": [
+          {
+            "design_files": [
+              {
+                "name": "render.test.png",
+                "data_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+              }
+            ],
+            "notes": "Synthetic booth render; confirm the measured scope.",
+            "client_reference": "design.test-001"
+          }
+        ]
+      },
+      "QueueDraftRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "notes": {
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "required": [],
+        "examples": [
+          {
+            "notes": "Confirm the displayed dimensions before pricing."
+          }
+        ]
+      },
+      "PriceRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "quote_request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "basis_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "confirmed_basis_revision": {
+            "$ref": "#/components/schemas/Revision"
+          }
+        },
+        "required": [
+          "quote_request_id",
+          "basis_revision",
+          "confirmed_basis_revision"
+        ],
+        "examples": [
+          {
+            "quote_request_id": "qr-example",
+            "basis_revision": 1,
+            "confirmed_basis_revision": 1
+          }
+        ]
+      },
+      "ExportRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "basis_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "confirmed_basis_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "formats": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "xlsx",
+                "pdf"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "basis_revision",
+          "confirmed_basis_revision",
+          "formats"
+        ],
+        "examples": [
+          {
+            "basis_revision": 1,
+            "confirmed_basis_revision": 1,
+            "formats": [
+              "xlsx",
+              "pdf"
+            ]
+          }
+        ]
+      },
+      "AcceptedJob": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "quote_request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued"
+            ]
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "quote_request_id",
+          "job_id",
+          "status",
+          "links"
+        ],
+        "examples": [
+          {
+            "quote_request_id": "qr-example",
+            "job_id": "job-example",
+            "status": "queued",
+            "links": {
+              "job": "/api/v1/jobs/job-example",
+              "request": "/api/v1/quote-requests/qr-example"
+            }
+          }
+        ]
+      },
+      "BasisLine": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32,
+                "pattern": "^(?!m2$).+$(?![\\s\\S])"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "measurements": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 32
+          },
+          "materials": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 32
+          },
+          "inclusions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 32
+          },
+          "needs_confirmation": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 32
+          }
+        },
+        "required": [
+          "description",
+          "quantity",
+          "unit",
+          "measurements",
+          "materials",
+          "inclusions",
+          "needs_confirmation"
+        ]
+      },
+      "BasisView": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "quote_request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RequestState"
+          },
+          "basis_revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Revision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "basis": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BasisLine"
+            },
+            "maxItems": 500
+          },
+          "uploads_expire_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "quote_request_id",
+          "state",
+          "basis_revision",
+          "basis",
+          "uploads_expire_at",
+          "expires_at",
+          "links"
+        ],
+        "examples": [
+          {
+            "quote_request_id": "qr-example",
+            "state": "awaiting_confirmation",
+            "basis_revision": 1,
+            "basis": [
+              {
+                "description": "Synthetic measured surface",
+                "quantity": 12,
+                "unit": "sqm",
+                "measurements": [
+                  "12 sqm"
+                ],
+                "materials": [],
+                "inclusions": [],
+                "needs_confirmation": [
+                  "Confirm material and measured area."
+                ]
+              }
+            ],
+            "uploads_expire_at": "2026-11-13T00:00:00Z",
+            "expires_at": "2026-12-06T00:00:00Z",
+            "links": {
+              "request": "/api/v1/quote-requests/qr-example"
+            }
+          }
+        ]
+      },
+      "PricedPrice": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "priced"
+            ]
+          },
+          "unit_price": {
+            "$ref": "#/components/schemas/Money"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Money"
+          }
+        },
+        "required": [
+          "status",
+          "unit_price",
+          "amount"
+        ]
+      },
+      "UnresolvedPrice": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "unresolved"
+            ]
+          },
+          "unit_price": {
+            "type": "null"
+          },
+          "amount": {
+            "type": "null"
+          },
+          "display": {
+            "const": "price to be discussed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "unit_price",
+          "amount",
+          "display"
+        ]
+      },
+      "EstimateLine": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32,
+                "pattern": "^(?!m2$).+$(?![\\s\\S])"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "needs_confirmation": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "maxItems": 32
+          },
+          "price": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PricedPrice"
+              },
+              {
+                "$ref": "#/components/schemas/UnresolvedPrice"
+              }
+            ]
+          }
+        },
+        "required": [
+          "description",
+          "quantity",
+          "unit",
+          "needs_confirmation",
+          "price"
+        ]
+      },
+      "TaxView": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "rate": {
+            "type": "string",
+            "pattern": "^(0(\\.[0-9]+)?|1(\\.0+)?)$(?![\\s\\S])"
+          },
+          "amount": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Money"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "label",
+          "rate",
+          "amount"
+        ]
+      },
+      "Totals": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial"
+            ]
+          },
+          "known_subtotal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Money"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subtotal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Money"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "total": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Money"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unresolved_line_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 500
+          },
+          "label": {
+            "const": "Known-priced subtotal; excludes unresolved items and tax",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "known_subtotal",
+          "subtotal",
+          "total",
+          "unresolved_line_count",
+          "label"
+        ]
+      },
+      "CustomerEstimateView": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "quote_request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed"
+            ]
+          },
+          "document_type": {
+            "type": "string",
+            "enum": [
+              "estimate"
+            ]
+          },
+          "notice": {
+            "type": "string",
+            "const": "Estimate only. Subject to scope and price confirmation."
+          },
+          "currency": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$(?![\\s\\S])"
+          },
+          "currency_decimal_places": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EstimateLine"
+            },
+            "minItems": 1,
+            "maxItems": 500
+          },
+          "totals": {
+            "$ref": "#/components/schemas/Totals"
+          },
+          "tax": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaxView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "quote_request_id",
+          "status",
+          "document_type",
+          "notice",
+          "currency",
+          "currency_decimal_places",
+          "lines",
+          "totals",
+          "tax",
+          "expires_at",
+          "links"
+        ],
+        "examples": [
+          {
+            "quote_request_id": "qr-example",
+            "status": "completed",
+            "document_type": "estimate",
+            "notice": "Estimate only. Subject to scope and price confirmation.",
+            "currency": "SGD",
+            "currency_decimal_places": 2,
+            "lines": [
+              {
+                "description": "Synthetic measured surface",
+                "quantity": 12,
+                "unit": "sqm",
+                "needs_confirmation": [],
+                "price": {
+                  "status": "priced",
+                  "unit_price": "10.00",
+                  "amount": "120.00"
+                }
+              },
+              {
+                "description": "Synthetic custom feature",
+                "quantity": 1,
+                "unit": "set",
+                "needs_confirmation": [],
+                "price": {
+                  "status": "unresolved",
+                  "unit_price": null,
+                  "amount": null,
+                  "display": "price to be discussed"
+                }
+              }
+            ],
+            "totals": {
+              "status": "partial",
+              "known_subtotal": "120.00",
+              "subtotal": null,
+              "total": null,
+              "unresolved_line_count": 1,
+              "label": "Known-priced subtotal; excludes unresolved items and tax"
+            },
+            "tax": null,
+            "expires_at": "2026-12-06T00:00:00Z",
+            "links": {
+              "xlsx": "/api/v1/quote-requests/qr-example/artifacts/xlsx",
+              "pdf": "/api/v1/quote-requests/qr-example/artifacts/pdf"
+            }
+          }
+        ]
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "INVALID_REQUEST",
+              "AUTH_REQUIRED",
+              "SCOPE_DENIED",
+              "CSRF_INVALID",
+              "NOT_FOUND",
+              "BASIS_STALE",
+              "IDEMPOTENCY_CONFLICT",
+              "RESULT_NOT_READY",
+              "STATE_CONFLICT",
+              "RESULT_EXPIRED",
+              "UPLOAD_LIMIT_EXCEEDED",
+              "UNSUPPORTED_MEDIA",
+              "DESIGN_REQUIRED",
+              "NEEDS_INPUT",
+              "PRICING_REFERENCE_UNAVAILABLE",
+              "RATE_LIMITED",
+              "QUOTA_EXCEEDED",
+              "ANALYSIS_FAILED",
+              "CAPACITY_UNAVAILABLE",
+              "RECOVERY_REQUIRED"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "reference": {
+            "type": "string",
+            "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "reference",
+          "retryable"
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "examples": [
+          {
+            "error": {
+              "code": "PRICING_REFERENCE_UNAVAILABLE",
+              "message": "The selected pricing reference is unavailable.",
+              "reference": "ERR-0123ABCD",
+              "retryable": false
+            }
+          }
+        ]
+      },
+      "JobView": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "job_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "quote_request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "request_state": {
+            "$ref": "#/components/schemas/RequestState"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "poll_after_seconds": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 60
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ErrorDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "job_id",
+          "quote_request_id",
+          "status",
+          "request_state",
+          "created_at",
+          "updated_at",
+          "expires_at",
+          "poll_after_seconds",
+          "error",
+          "links"
+        ],
+        "examples": [
+          {
+            "job_id": "job-example",
+            "quote_request_id": "qr-example",
+            "status": "completed",
+            "request_state": "awaiting_confirmation",
+            "created_at": "2026-11-06T00:00:00Z",
+            "updated_at": "2026-11-06T00:00:01Z",
+            "expires_at": "2026-12-06T00:00:00Z",
+            "poll_after_seconds": 2,
+            "error": null,
+            "links": {
+              "request": "/api/v1/quote-requests/qr-example"
+            }
+          }
+        ]
+      }
+    },
+    "securitySchemes": {
+      "ServiceCredential": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-SQAG-Service-Authorization",
+        "description": "One revocable caller-and-tenant binding; never browser-held."
+      }
+    },
+    "parameters": {
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/IdempotencyKey"
+        }
+      }
+    },
+    "responses": {
+      "Error400": {
+        "description": "INVALID_REQUEST",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "INVALID_REQUEST"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error401": {
+        "description": "AUTH_REQUIRED",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "AUTH_REQUIRED"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error403": {
+        "description": "SCOPE_DENIED, CSRF_INVALID",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "SCOPE_DENIED",
+                        "CSRF_INVALID"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error404": {
+        "description": "NOT_FOUND",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "NOT_FOUND"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error409": {
+        "description": "BASIS_STALE, IDEMPOTENCY_CONFLICT, RESULT_NOT_READY, STATE_CONFLICT",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "BASIS_STALE",
+                        "IDEMPOTENCY_CONFLICT",
+                        "RESULT_NOT_READY",
+                        "STATE_CONFLICT"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error410": {
+        "description": "RESULT_EXPIRED",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "RESULT_EXPIRED"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error413": {
+        "description": "UPLOAD_LIMIT_EXCEEDED",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "UPLOAD_LIMIT_EXCEEDED"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error415": {
+        "description": "UNSUPPORTED_MEDIA",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "UNSUPPORTED_MEDIA"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error422": {
+        "description": "DESIGN_REQUIRED, NEEDS_INPUT, PRICING_REFERENCE_UNAVAILABLE",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "DESIGN_REQUIRED",
+                        "NEEDS_INPUT",
+                        "PRICING_REFERENCE_UNAVAILABLE"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error429": {
+        "description": "RATE_LIMITED, QUOTA_EXCEEDED",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          },
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "RATE_LIMITED",
+                        "QUOTA_EXCEEDED"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error502": {
+        "description": "ANALYSIS_FAILED",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "ANALYSIS_FAILED"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      "Error503": {
+        "description": "CAPACITY_UNAVAILABLE, RECOVERY_REQUIRED",
+        "headers": {
+          "Cache-Control": {
+            "schema": {
+              "type": "string",
+              "const": "private, no-store"
+            }
+          },
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "CAPACITY_UNAVAILABLE",
+                        "RECOVERY_REQUIRED"
+                      ]
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "reference": {
+                      "type": "string",
+                      "pattern": "^ERR-[0-9A-F]{8}$(?![\\s\\S])"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "reference",
+                    "retryable"
+                  ]
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-error-status-codes": {
+    "400": [
+      "INVALID_REQUEST"
+    ],
+    "401": [
+      "AUTH_REQUIRED"
+    ],
+    "403": [
+      "SCOPE_DENIED",
+      "CSRF_INVALID"
+    ],
+    "404": [
+      "NOT_FOUND"
+    ],
+    "409": [
+      "BASIS_STALE",
+      "IDEMPOTENCY_CONFLICT",
+      "RESULT_NOT_READY",
+      "STATE_CONFLICT"
+    ],
+    "410": [
+      "RESULT_EXPIRED"
+    ],
+    "413": [
+      "UPLOAD_LIMIT_EXCEEDED"
+    ],
+    "415": [
+      "UNSUPPORTED_MEDIA"
+    ],
+    "422": [
+      "DESIGN_REQUIRED",
+      "NEEDS_INPUT",
+      "PRICING_REFERENCE_UNAVAILABLE"
+    ],
+    "429": [
+      "RATE_LIMITED",
+      "QUOTA_EXCEEDED"
+    ],
+    "502": [
+      "ANALYSIS_FAILED"
+    ],
+    "503": [
+      "CAPACITY_UNAVAILABLE",
+      "RECOVERY_REQUIRED"
+    ]
+  },
+  "x-request-transitions": {
+    "drafting": [
+      "awaiting_confirmation",
+      "needs_input",
+      "failed",
+      "expired"
+    ],
+    "awaiting_confirmation": [
+      "drafting",
+      "pricing",
+      "generating",
+      "expired"
+    ],
+    "pricing": [
+      "awaiting_confirmation",
+      "needs_input",
+      "failed",
+      "expired"
+    ],
+    "generating": [
+      "completed",
+      "needs_input",
+      "failed",
+      "expired"
+    ],
+    "completed": [
+      "drafting",
+      "expired"
+    ],
+    "needs_input": [
+      "drafting",
+      "expired"
+    ],
+    "failed": [
+      "drafting",
+      "expired"
+    ],
+    "expired": []
+  },
+  "x-job-transitions": {
+    "queued": [
+      "running",
+      "failed"
+    ],
+    "running": [
+      "completed",
+      "failed"
+    ],
+    "completed": [],
+    "failed": []
+  },
+  "x-operation-states": {
+    "draft": [
+      "awaiting_confirmation",
+      "completed",
+      "needs_input",
+      "failed"
+    ],
+    "price": [
+      "awaiting_confirmation"
+    ],
+    "export": [
+      "awaiting_confirmation"
+    ]
+  },
+  "x-limits": {
+    "files": 8,
+    "image_bytes": 12582912,
+    "pdf_bytes": 50331648,
+    "pdf_pages_total": 96,
+    "decoded_bytes_total": 134217728,
+    "notes_utf8_bytes": 16384,
+    "basis_lines": 500,
+    "creates_per_minute_per_tenant": 15,
+    "active_jobs_per_tenant": 2,
+    "accepted_requests_per_utc_day_per_tenant": 100,
+    "polls_per_minute_per_caller": 120
+  },
+  "x-retention-seconds": {
+    "uploads": 604800,
+    "results": 2592000,
+    "replay_receipts": 86400
+  },
+  "x-retention-anchor": {
+    "uploads": "request_admission",
+    "results": "request_admission",
+    "replay_receipts": "mutation_admission",
+    "status": "proposal; confirm before implementation"
+  },
+  "x-money-policy": {
+    "rounding": "ROUND_HALF_UP",
+    "line_amount": "round(quantity * unit_price)",
+    "known_subtotal": "sum priced line amounts; null if none",
+    "unresolved_display": "price to be discussed",
+    "unresolved_unit_price": null,
+    "unresolved_amount": null,
+    "partial_subtotal": null,
+    "partial_total": null,
+    "partial_tax_amount": null,
+    "blank_tax": null,
+    "tax_authority": "tenant_admin",
+    "complete_total": "subtotal + rounded configured tax, or subtotal if tax is blank"
+  },
+  "x-confirmation-policy": {
+    "before_price": true,
+    "revision_fields_must_equal_current": [
+      "basis_revision",
+      "confirmed_basis_revision"
+    ],
+    "export_requires_priced_confirmed_revision": true,
+    "authority_change_invalidates_confirmation": true
+  },
+  "x-idempotency": {
+    "scope": [
+      "tenant",
+      "caller",
+      "method",
+      "path",
+      "key"
+    ],
+    "canonical_body": "sorted validated JSON and decoded file SHA-256",
+    "authority": "captured on first admission; replay uses original revision",
+    "expiry": "reject owned stale key; never silently enqueue"
+  },
+  "x-forbidden-fields": [
+    "internal_override",
+    "role",
+    "tenant_id",
+    "workspace_id",
+    "company_id",
+    "account_id",
+    "grant",
+    "view",
+    "confidence",
+    "scores",
+    "prompt",
+    "proposal",
+    "suggestions",
+    "review_choices",
+    "internal_cost",
+    "gst",
+    "markup",
+    "supplier",
+    "supplier_notes",
+    "ai_spend",
+    "profile",
+    "admin",
+    "audit",
+    "ledger",
+    "seal",
+    "matches",
+    "raw_source",
+    "private_path",
+    "provider_response"
+  ]
+}
