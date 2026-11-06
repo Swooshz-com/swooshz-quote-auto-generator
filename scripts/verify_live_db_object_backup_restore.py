@@ -1559,6 +1559,15 @@ def _object_rows_are_deleted(rows: list[object]) -> bool:
     return True
 
 
+def _delete_current_profile(storage: object, profile_id: str):
+    # The public list carries the revision; profile_detail is content-only.
+    profiles = storage.list_company_profiles()
+    current = next((profile for profile in profiles if profile.get("id") == profile_id), None)
+    if current is None:
+        return False
+    return storage.delete_profile(profile_id, revision=current["revision"])
+
+
 def _cleanup_storage(
     storage: object,
     *,
@@ -1573,7 +1582,7 @@ def _cleanup_storage(
     for operation_name, operation in (
         ("quote_session", lambda: storage.delete_quote_session(session_id)),
         ("pricing_reference", lambda: storage.delete_pricing_reference(pricing_id)),
-        ("profile", lambda: storage.delete_profile(profile_id)),
+        ("profile", lambda: _delete_current_profile(storage, profile_id)),
     ):
         try:
             operation_results[operation_name] = bool(operation())
@@ -2259,7 +2268,8 @@ def _cleanup_owner_resource(
     try:
         result = _with_configured_backend(
             context,
-            lambda: getattr(context.storage, method_name)(identifier),
+            lambda: (_delete_current_profile(context.storage, identifier)
+                     if resource_kind == "profile" else getattr(context.storage, method_name)(identifier)),
         )
     except Exception:
         journal.mark_cleanup_failed(key, f"destructive-cleanup:{resource_kind}-exception")

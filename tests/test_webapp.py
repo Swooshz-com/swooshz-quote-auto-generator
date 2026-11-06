@@ -35791,7 +35791,7 @@ main().catch((error) => {
                 "pricing_reference": {"id": "draft-pricing", "display_name": "Draft Pricing"},
             }
             edited = storage.create_or_update_quote_session(edit_payload)
-            storage.save_profile(webapp.normalize_profile_payload({"id": "stale-profile", "label": "Renamed Current Profile"}))
+            storage.save_profile(webapp.normalize_profile_payload({"id": "stale-profile", "label": "Renamed Current Profile"}), revision=storage.list_company_profiles()[0]["revision"])
             storage.delete_pricing_reference("stale-pricing")
             fetched = storage.get_quote_session("quote-db-stale", include_draft_state=True)
             artifact = storage.quote_session_export_artifact("quote-db-stale", "xlsx")
@@ -36483,6 +36483,7 @@ main().catch((error) => {
             seed_storage.save_profile(
                 profile('Initial Save-First Profile', 'initial-layout.xlsx')
             )
+            revision = seed_storage.list_company_profiles()[0]["revision"]
             save_storage = webapp.app_storage_for_auth_session(
                 self.platform_auth_session(workspace_id)
             )
@@ -36519,7 +36520,7 @@ main().catch((error) => {
                     results,
                     'delete',
                     delete_done,
-                    lambda: delete_storage.delete_profile(profile_id),
+                    lambda: delete_storage.delete_profile(profile_id, revision=revision),
                 )
                 events.put('delete_done')
 
@@ -36533,7 +36534,8 @@ main().catch((error) => {
                         profile(
                             'Replacement Save-First Profile',
                             'replacement-layout.xlsx',
-                        )
+                        ),
+                        revision=revision,
                     ),
                 ),
                 daemon=True,
@@ -36566,9 +36568,12 @@ main().catch((error) => {
             finally:
                 prepare_release.set()
                 delete_commit_gate.set()
-                save_thread.join(timeout=5)
-                delete_thread.join(timeout=5)
+                if save_thread.ident is not None:
+                    save_thread.join(timeout=5)
+                if delete_thread.ident is not None:
+                    delete_thread.join(timeout=5)
 
+            current_revision = seed_storage.list_company_profiles()[0]["revision"]
             owner = seed_storage.profile_detail(profile_id, source='company')
             active_rows = seed_storage._active_object_artifact_rows(
                 'profile',
@@ -36590,11 +36595,17 @@ main().catch((error) => {
         delete_outcome = results.get('delete')
         if isinstance(delete_outcome, Exception):
             self.assertIsInstance(delete_outcome, webapp.SqagStorageAccessError)
-            self.assertEqual(delete_outcome.status, 503)
-            self.assertEqual(
-                str(delete_outcome),
-                webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
-            )
+            if delete_outcome.status == 409:
+                self.assertEqual(delete_outcome.reason, "profile_revision_conflict")
+                self.assertEqual(current_revision, revision + 1)
+                self.assertEqual(owner['label'], 'Replacement Save-First Profile')
+                self.assertEqual(len(active_rows), 1)
+            else:
+                self.assertEqual(delete_outcome.status, 503)
+                self.assertEqual(
+                    str(delete_outcome),
+                    webapp.QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE,
+                )
 
     def test_object_lifecycle_lock_identity_is_workspace_type_and_owner_scoped(self):
         profile_storage = webapp.DatabaseSqagStorage(
@@ -36777,7 +36788,8 @@ main().catch((error) => {
         storage = webapp.DatabaseSqagStorage(
             env['SQAG_DATABASE_URL'],
             'workspace-postgres-lifecycle-order',
-            'owner',
+            'admin',
+            user_id='synthetic-lifecycle-owner',
         )
         profile = webapp.normalize_profile_payload({
             'id': 'postgres-lifecycle-profile',
@@ -36874,6 +36886,9 @@ main().catch((error) => {
             def fetchone(self):
                 return self.row
 
+            def fetchall(self):
+                return []
+
         class RecordingConnection:
             def __init__(self, acquired=True, fail_owner=False):
                 self.acquired = acquired
@@ -36922,10 +36937,13 @@ main().catch((error) => {
                 storage = webapp.DatabaseSqagStorage(
                     env['SQAG_DATABASE_URL'],
                     'workspace-postgres-lock-failure',
-                    'owner',
+                    'admin',
+                    user_id='synthetic-lifecycle-owner',
                 )
+                backend = webapp.InMemoryObjectStorageBackend()
                 with (
                     mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
                     mock.patch.object(
                         storage,
                         'connection',
@@ -36943,6 +36961,11 @@ main().catch((error) => {
                 self.assertNotIn('workspace-postgres-lock-failure', str(raised.exception))
                 self.assertNotIn('postgres-lock-failure-profile', str(raised.exception))
                 self.assertIn(('rollback',), connection.actions)
+                owner_attempts = [action for action in connection.actions
+                                  if action[0] == 'execute' and action[1].startswith('insert into sqag_profiles')]
+                self.assertEqual(bool(owner_attempts), connection.acquired and connection.fail_owner)
+                self.assertNotIn(('commit',), connection.actions)
+                self.assertEqual(backend._objects, {})
 
     def test_object_quote_lifecycle_lock_failure_is_generic_and_retains_staging(self):
         backend = webapp.InMemoryObjectStorageBackend()
@@ -37389,7 +37412,7 @@ main().catch((error) => {
             backend.failing_keys = set(backend._objects)
 
             with self.assertRaises(webapp.SqagStorageAccessError) as profile_delete:
-                storage.delete_profile("protected-profile")
+                storage.delete_profile("protected-profile", revision=storage.list_company_profiles()[0]["revision"])
             with self.assertRaises(webapp.SqagStorageAccessError) as pricing_delete:
                 storage.delete_pricing_reference("protected-pricing")
             with self.assertRaises(webapp.SqagStorageAccessError) as profile_replace:
@@ -37397,7 +37420,7 @@ main().catch((error) => {
                     "id": "protected-profile",
                     "label": "Replacement Profile",
                     "pack": {"quotation_layout": {"filename": "replacement-layout.xlsx", "data_url": layout_data_url}},
-                }))
+                }), revision=storage.list_company_profiles()[0]["revision"])
 
             current_profile_row = storage._object_artifact_row("profile", "protected-profile", "quotation_layout")
             profiles = storage.list_company_profiles()
@@ -38537,7 +38560,7 @@ main().catch((error) => {
                 ),
                 self.assertRaises(webapp.SqagStorageAccessError) as raised,
             ):
-                storage.delete_profile("tombstone-failure-profile")
+                storage.delete_profile("tombstone-failure-profile", revision=storage.list_company_profiles()[0]["revision"])
 
             after_owner = storage._read_payload(
                 "sqag_profiles",
@@ -38552,7 +38575,7 @@ main().catch((error) => {
                 )
             )
             after_objects = copy.deepcopy(backend._objects)
-            retry = storage.delete_profile("tombstone-failure-profile")
+            retry = storage.delete_profile("tombstone-failure-profile", revision=storage.list_company_profiles()[0]["revision"])
 
         self.assertEqual(raised.exception.status, 503)
         self.assertEqual(after_owner, before_owner)
@@ -38742,7 +38765,7 @@ main().catch((error) => {
                 mock.patch.object(storage, "connection", failing_connection),
                 self.assertRaises(webapp.SqagStorageAccessError) as raised,
             ):
-                storage.delete_profile("commit-failure-profile")
+                storage.delete_profile("commit-failure-profile", revision=storage.list_company_profiles()[0]["revision"])
 
             after_row = dict(
                 storage._object_artifact_row(
@@ -38756,7 +38779,7 @@ main().catch((error) => {
                 "commit-failure-profile",
                 source="company",
             )
-            retry = storage.delete_profile("commit-failure-profile")
+            retry = storage.delete_profile("commit-failure-profile", revision=storage.list_company_profiles()[0]["revision"])
 
         self.assertEqual(raised.exception.status, 503)
         self.assertTrue(state["rolled_back"])
@@ -38870,7 +38893,7 @@ main().catch((error) => {
                 ),
                 self.assertRaises(webapp.SqagStorageAccessError) as raised,
             ):
-                storage.delete_profile("restore-validation-profile")
+                storage.delete_profile("restore-validation-profile", revision=storage.list_company_profiles()[0]["revision"])
             owner_after_failure = storage.profile_detail(
                 "restore-validation-profile",
                 source="company",
@@ -38883,7 +38906,7 @@ main().catch((error) => {
                 )
             )
             backend.corrupt_restore = False
-            retry = storage.delete_profile("restore-validation-profile")
+            retry = storage.delete_profile("restore-validation-profile", revision=storage.list_company_profiles()[0]["revision"])
 
         self.assertEqual(raised.exception.status, 503)
         self.assertIsNotNone(owner_after_failure)
@@ -39869,11 +39892,16 @@ main().catch((error) => {
                 result = types.SimpleNamespace(rowcount=1)
                 if "pg_try_advisory_xact_lock" in sql.lower():
                     result.fetchone = lambda: {"lock_acquired": True}
+                elif "select payload_json from sqag_profiles" in sql.lower():
+                    result.fetchone = lambda: {"payload_json": json.dumps({
+                        "id": "postgres-object-profile", "_revision": 1,
+                        "_access": {"version": 1, "owner_user_id": "postgres-delete-user", "visibility": "user"},
+                    })}
                 elif "legal_hold = ?" in sql.lower():
                     result.fetchone = lambda: None
                 else:
                     result.fetchone = lambda: {"active_count": 0}
-                result.fetchall = lambda: []
+                result.fetchall = (lambda: [result.fetchone()]) if "select payload_json from sqag_profiles" in sql.lower() else (lambda: [])
                 return result
 
             def commit(self):
@@ -39885,7 +39913,7 @@ main().catch((error) => {
         storage = webapp.DatabaseSqagStorage(
             "postgresql://sqag-user@db.example.test/sqag",
             "workspace-object-postgres-delete",
-            role="owner",
+            role="admin",
             user_id="postgres-delete-user",
         )
         connection = RecordingConnection()
@@ -39910,7 +39938,7 @@ main().catch((error) => {
             ),
             mock.patch.object(storage, "_quote_session_editable_by_current_user", return_value=True),
         ):
-            self.assertTrue(storage.delete_profile("postgres-object-profile"))
+            self.assertTrue(storage.delete_profile("postgres-object-profile", revision=storage.list_company_profiles()[0]["revision"]))
             self.assertTrue(storage.delete_pricing_reference("postgres-object-pricing"))
             self.assertTrue(storage.delete_quote_session("quote-object-postgres-delete"))
 
@@ -39965,14 +39993,16 @@ main().catch((error) => {
                 output_dir=output_dir,
             )
 
-            self.assertTrue(storage.delete_profile("reusable-database-profile"))
+            self.assertTrue(storage.delete_profile("reusable-database-profile", revision=storage.list_company_profiles()[0]["revision"]))
             self.assertTrue(storage.delete_pricing_reference("reusable-database-pricing"))
             self.assertTrue(storage.delete_quote_session(quote_session["session_id"]))
-            with self.assertRaisesRegex(ValueError, webapp.DELETED_PROFILE_UPDATE_MESSAGE):
+            with self.assertRaises(webapp.SqagStorageAccessError) as deleted:
                 storage.save_profile(webapp.normalize_profile_payload({
                     "id": "reusable-database-profile",
                     "label": "Database Profile After Delete",
                 }))
+            self.assertEqual(deleted.exception.status, 404)
+            self.assertEqual(deleted.exception.reason, "profile_unavailable")
             resurrected_layout = storage.profile_layout_artifact("reusable-database-profile")
             profile_after_delete = storage.profile_detail("reusable-database-profile", source="company")
             profile_export_after_delete = storage.company_profile_export_payload("reusable-database-profile")

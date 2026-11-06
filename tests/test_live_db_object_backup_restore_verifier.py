@@ -135,8 +135,9 @@ class FakeStorage:
     def save_profile(self, profile: dict[str, object]) -> dict[str, object]:
         self.events.append(("storage-write", self.label, "profile", str(profile["id"])))
         self._maybe_fail("write")
-        self.profiles[str(profile["id"])] = dict(profile)
-        return dict(profile)
+        saved = dict(profile, revision=1)
+        self.profiles[str(profile["id"])] = saved
+        return dict(saved)
 
     def save_pricing_reference(self, reference: dict[str, object]) -> dict[str, object]:
         self.events.append(("storage-write", self.label, "pricing_reference", str(reference["id"])))
@@ -232,10 +233,13 @@ class FakeStorage:
             tombstoned += 1
         return tombstoned
 
-    def delete_profile(self, profile_id: str) -> bool:
+    def delete_profile(self, profile_id: str, *, revision) -> bool:
         self.events.append(("storage-delete", self.label, "profile", profile_id))
         self.delete_calls.append(("profile", profile_id))
         self._maybe_fail("cleanup")
+        current = self.profiles.get(profile_id)
+        if current is not None and revision != current["revision"]:
+            raise RuntimeError("synthetic profile revision conflict")
         return self.profiles.pop(profile_id, None) is not None
 
     def delete_pricing_reference(self, reference_id: str, **_kwargs) -> bool:
@@ -1642,6 +1646,45 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         self.assertTrue(report["checks"]["active_object_write_read_verified"])
         self.assertTrue(report["checks"]["metadata_object_pairing_verified"])
 
+    def test_cleanup_uses_current_public_profile_revision_and_fails_closed(self):
+        verifier = load_verifier()
+        webapp = verifier.webapp
+        for mode in ("database", "object"):
+            for fault in ("", "lookup", "stale"):
+                with self.subTest(mode=mode, fault=fault), tempfile.TemporaryDirectory() as directory:
+                    url = "sqlite:///" + (Path(directory) / "cleanup.sqlite3").as_posix()
+                    backend = webapp.InMemoryObjectStorageBackend()
+                    with (
+                        mock.patch.dict("os.environ", {
+                            "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": mode,
+                            "SQAG_DATABASE_URL": url, "SQAG_DISABLE_DOTENV": "1",
+                        }, clear=True),
+                        mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend),
+                    ):
+                        webapp.apply_sqag_storage_migrations(url)
+                        storage = webapp.DatabaseSqagStorage(url, "workspace-cleanup", "admin", "synthetic-owner")
+                        saved = storage.save_profile(webapp.normalize_profile_payload({"id": "cleanup-profile", "label": "Synthetic"}))
+                        # A fresh lookup is necessary after a revision-changing update.
+                        storage.save_profile(webapp.normalize_profile_payload({"id": saved["id"], "label": "Updated"}), revision=saved["revision"])
+                        current = storage.list_company_profiles()
+                        self.assertEqual(current[0]["revision"], saved["revision"] + 1)
+                        before = storage._read_payload("sqag_profiles", "profile_id", saved["id"])
+                        before_objects = dict(backend._objects)
+                        with contextlib.ExitStack() as stack:
+                            if fault == "lookup":
+                                stack.enter_context(mock.patch.object(storage, "list_company_profiles", side_effect=RuntimeError("synthetic lookup failure")))
+                            elif fault == "stale":
+                                stack.enter_context(mock.patch.object(storage, "list_company_profiles", return_value=[saved]))
+                            result = verifier._cleanup_storage(storage, profile_id=saved["id"],
+                                pricing_id="missing-pricing", session_id="missing-session", backend=backend if mode == "object" else None)
+                        self.assertEqual(result, not fault)
+                        if fault:
+                            self.assertEqual(storage._read_payload("sqag_profiles", "profile_id", saved["id"]), before)
+                            self.assertEqual(backend._objects, before_objects)
+                        else:
+                            self.assertIsNone(storage.profile_detail(saved["id"]))
+                            self.assertEqual(backend._objects, {})
+
     def test_postgres_cleanup_never_queries_file_artifacts_relation(self):
         verifier = load_verifier()
 
@@ -2017,11 +2060,11 @@ class LiveDbObjectBackupRestoreVerifierTest(unittest.TestCase):
         verifier = load_verifier()
 
         class FalseProfileDeleteStorage(FakeStorage):
-            def delete_profile(self, _profile_id):
+            def delete_profile(self, _profile_id, *, revision):
                 return False
 
         storage = FalseProfileDeleteStorage(label="active", workspace_id="workspace-a")
-        storage.profiles["profile-a"] = {"id": "profile-a", "label": "residue"}
+        storage.profiles["profile-a"] = {"id": "profile-a", "label": "residue", "revision": 1}
 
         self.assertFalse(
             verifier._cleanup_storage(

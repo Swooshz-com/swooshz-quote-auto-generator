@@ -39,6 +39,14 @@ The JS harness checks existing control states and invisible request fields only.
 The profile suites also check local internal-login boot over HTTP and refusal
 without saved-profile reads or writes, plus member share/unshare/transfer denial
 over HTTP and both database artifact adapters, with unchanged persisted access.
+Backup/restore cleanup reads each synthetic profile's current revision from the
+public company-profile list before deletion. Run
+`python -m unittest tests.test_live_db_object_backup_restore_verifier` for SQLite
+BLOB/in-memory object cleanup, changed revisions, lookup failure and stale-read
+refusal. Lifecycle fault tests must supply the public revision to reach their
+intended remote-delete/rollback boundary. PostgreSQL fakes include the profile
+payload pre-read; real PostgreSQL privilege/backup coverage still requires CI's
+disposable PostgreSQL service.
 Qualify full saved-quote reopen/download after delete, transfer and unsharing on
 the final installed candidate. Verify changed pricing authority, evidence tampering,
 wrong quote owner/workspace and stale commercial revisions still deny delivery.
