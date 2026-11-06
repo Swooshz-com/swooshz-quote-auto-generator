@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlparse
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
@@ -143,7 +143,6 @@ RUNTIME_WORKSPACE_SCHEMA = "swooshz.local-runtime-workspace.v1"
 DEFAULT_COMPANY_ID = "default"
 DEFAULT_COMPANY_DISPLAY_NAME = "Quote Generator Workspace"
 DEFAULT_QUOTE_COMPANY_PROFILE_ID = "default"
-DEFAULT_QUOTE_COMPANY_FALLBACK_PRESET_ID = "synthetic-fixture-default"
 DELETED_PROFILE_MARKER_KEY = "_sqag_deleted"
 DELETED_PROFILE_UPDATE_MESSAGE = "Deleted profiles cannot be updated. Create a new profile with a new id."
 
@@ -495,8 +494,6 @@ PLATFORM_REQUEST_TIMEOUT_SECONDS_MIN = 1
 PLATFORM_REQUEST_TIMEOUT_SECONDS_MAX = 30
 PLATFORM_LAUNCH_MAX_FUTURE_SECONDS = 10 * 60
 PLATFORM_FINALIZATION_TTL_SECONDS = 2 * 60
-RUNTIME_DATABASE_WARM_CONNECT_TIMEOUT_SECONDS = 5
-RUNTIME_DATABASE_WARM_STATEMENT_TIMEOUT_MS = 5000
 RUNTIME_DATABASE_WARM_COOLDOWN_SECONDS = 30.0
 RUNTIME_DATABASE_WARM_LOCK = threading.Lock()
 RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN: object | None = None
@@ -679,7 +676,6 @@ SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENROUTER, "openai", AI_PROVIDER_DEE
 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
 QUOTE_SESSION_RETIRED_MESSAGE = "This quote session is no longer available. Please start a new quote. Contact support if this keeps happening."
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_API_KEY_ENV_NAME = "DEEPSEEK_API_KEY"
 DEFAULT_BOOTH_WIDTH_METRES = 6.0
 DEFAULT_BOOTH_DEPTH_METRES = 6.0
@@ -717,10 +713,7 @@ SENSITIVE_LOG_QUERY_KEYS = {
     "state",
     "token",
 }
-DEEPSEEK_REQUEST_TIMEOUT_SECONDS = 1800
-DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS = 120
 TRANSIENT_OPENAI_HTTP_CODES = {408, 500, 502, 503, 504}
-PROVIDER_CONNECTION_EXCEPTIONS = (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected)
 MAX_PROMPT_CATALOG_ROWS = 180
 MAX_PROMPT_CATALOG_CHARS = 120000
 MAX_PROMPT_CATALOG_DESCRIPTION_CHARS = 180
@@ -19153,21 +19146,6 @@ def basis_chat_has_selected_line(payload: dict[str, Any]) -> bool:
 
 
 
-def configured_timeout_seconds(env_name: str, fallback: int) -> int:
-    raw = read_dotenv_value(env_name)
-    if not raw:
-        return fallback
-    try:
-        value = int(float(raw))
-    except ValueError:
-        return fallback
-    return min(max(value, 10), 1800)
-
-
-def configured_openai_timeout_seconds() -> int:
-    return GatewayConfiguration.capture(os.environ.get if configured_app_mode() == "deploy" else read_dotenv_value).timeout_seconds
-
-
 
 
 
@@ -21318,10 +21296,6 @@ def provider_http_error_message(provider: str, exc: urllib.error.HTTPError) -> s
     return result
 
 
-def openai_http_error_message(exc: urllib.error.HTTPError) -> str:
-    return provider_http_error_message("OpenAI", exc)
-
-
 def is_timeout_exception(exc: BaseException) -> bool:
     reason = getattr(exc, "reason", exc)
     reason_text = clean_text(reason).lower()
@@ -21331,23 +21305,6 @@ def is_timeout_exception(exc: BaseException) -> bool:
         or "timed out" in reason_text
         or "timeout" in reason_text
     )
-
-
-def is_transient_openai_error(exc: BaseException) -> bool:
-    if isinstance(exc, urllib.error.HTTPError):
-        return exc.code in TRANSIENT_OPENAI_HTTP_CODES
-    return isinstance(exc, urllib.error.URLError) and not is_timeout_exception(exc)
-
-
-def provider_connection_error_message(provider: str, exc: BaseException) -> str:
-    reason = getattr(exc, "reason", exc)
-    reason_text = clean_text(reason)
-    if is_timeout_exception(exc):
-        kind = "network timeout"
-    else:
-        kind = "connection error"
-    detail = f": {reason_text}" if reason_text else ""
-    return f"{provider} analysis failed due to {kind}{detail}. Check provider status, model availability, and local network, then retry."
 
 
 def response_output_text(data: dict[str, Any]) -> str:
@@ -21569,40 +21526,6 @@ def openai_response_failure_diagnostics(data: Any) -> dict[str, Any]:
     if incomplete_reason:
         diagnostics["incomplete_reason"] = incomplete_reason
     diagnostics.update(provider_error_diagnostics(data.get("error")))
-    return safe_ai_output_diagnostics(diagnostics)
-
-
-def token_usage_diagnostics(data: dict[str, Any]) -> dict[str, int]:
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    mapping = {
-        "prompt_tokens": "input_tokens",
-        "completion_tokens": "output_tokens",
-        "total_tokens": "total_tokens",
-    }
-    diagnostics: dict[str, int] = {}
-    for source_key, target_key in mapping.items():
-        value = usage.get(source_key)
-        if isinstance(value, int) and value >= 0:
-            diagnostics[target_key] = value
-    return diagnostics
-
-
-def chat_completions_output_diagnostics(data: dict[str, Any], output_text: str) -> dict[str, Any]:
-    cleaned = output_text.strip()
-    choices = data.get("choices") if isinstance(data.get("choices"), list) else []
-    diagnostics: dict[str, Any] = {
-        "choice_count": len(choices),
-        "output_length": len(output_text),
-        "output_empty": not bool(cleaned),
-        "output_starts_with_json_object": cleaned.startswith("{"),
-        "output_contains_json_object_bounds": cleaned.find("{") != -1 and cleaned.rfind("}") > cleaned.find("{"),
-        "output_has_markdown_fence": cleaned.startswith("```"),
-        **token_usage_diagnostics(data),
-    }
-    if choices and isinstance(choices[0], dict):
-        finish_reason = clean_text(choices[0].get("finish_reason")).lower()
-        if re.fullmatch(r"[a-z0-9_-]{1,64}", finish_reason):
-            diagnostics["finish_reason"] = finish_reason
     return safe_ai_output_diagnostics(diagnostics)
 
 
@@ -30716,11 +30639,6 @@ def delete_quote_session(session_id: str) -> bool:
         if session_dir.exists():
             raise OSError("Quote session directory removal did not complete.")
         return True
-
-
-def file_data_url(path: Path) -> str:
-    content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    return f"data:{content_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 
 def utc_timestamp() -> str:
