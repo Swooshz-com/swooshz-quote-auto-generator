@@ -150,7 +150,12 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
             self.assertTrue(session["authenticated"])
             self.assertEqual(self.http("GET","/logout",dict(Cookie=cookie))[0],405)
             self.assertEqual(self.http("POST","/logout",dict(Cookie=cookie,Origin=ORIGIN))[0],403)
-            self.assertEqual(self.http("POST","/logout",dict(Cookie=cookie,Origin=ORIGIN,**{session["csrf_header"]:session["csrf_token"]}))[0],204)
+            status, logout_headers, _ = self.http("POST", "/logout", dict(
+                Cookie=cookie, Origin=ORIGIN, **{session["csrf_header"]: session["csrf_token"]}))
+            self.assertEqual(status, 204)
+            for name in (webapp.SESSION_COOKIE_NAME, webapp.OIDC_STATE_COOKIE_NAME):
+                self.assertTrue(any(value.startswith(name + "=") and "Max-Age=0" in value
+                                    for value in logout_headers.get_all("Set-Cookie", [])))
             self.assertEqual(self.http("GET","/api/session",dict(Cookie=cookie))[0],401)
         status,headers,_=self.login(); first=webapp.SESSION_COOKIE_NAME+"="+self.cookie(headers,webapp.SESSION_COOKIE_NAME)
         status,headers,_=self.login(previous=first); self.assertEqual(status,302)
@@ -231,3 +236,68 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
                     self.assertEqual(self.login(alias, changes[key])[0], 302)
         old=webapp.signed_cookie_value({"auth_mode":"internal_google","user":{"subject":"stable-google-subject"}})
         self.assertEqual(self.http("GET","/api/session",dict(Cookie=webapp.SESSION_COOKIE_NAME+"="+old))[0],401)
+
+    def test_retired_callback_refuses_without_provider_calls_or_session_cookies(self):
+        with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=AssertionError("provider call")) as provider:
+            for target in ("/callback", "/callback?state=old-state&code=old-code", "/callback?error=access_denied"):
+                with self.subTest(target=target):
+                    status, headers, body = self.http("GET", target)
+                    self.assertEqual(status, 404)
+                    self.assertEqual(json.loads(body), {"error": "Not found"})
+                    self.assertFalse(headers.get_all("Set-Cookie"))
+            # The existing host guard refuses invalid deploy configuration first.
+            for changes in ({"SQAG_TRUSTED_PROXY_CIDRS": ""}, {"OIDC_CLIENT_ID": "retired-client"}):
+                with self.subTest(changes=changes), mock.patch.dict(os.environ, changes):
+                    self.assertEqual(self.http("GET", "/callback?code=old-code")[0], 403)
+                    # Exercise the retained callback wrapper after host admission too.
+                    with mock.patch.object(webapp, "is_allowed_host_header", return_value=True):
+                        self.assertEqual(self.http("GET", "/callback?code=old-code")[0], 503)
+        provider.assert_not_called()
+
+    def test_retired_settings_cannot_enable_provider_login(self):
+        retired = {
+            "OIDC_ISSUER_URL": "https://issuer.example.test",
+            "OIDC_CLIENT_ID": "synthetic-client", "OIDC_CLIENT_SECRET": "synthetic-secret",
+            "OIDC_REDIRECT_URI": ORIGIN + "/callback",
+            "OIDC_AUTHORIZE_URL": "https://issuer.example.test/authorize",
+            "OIDC_TOKEN_URL": "https://issuer.example.test/token",
+            "OIDC_USERINFO_URL": "https://issuer.example.test/userinfo",
+            "OIDC_LOGOUT_URL": "https://issuer.example.test/logout",
+            "AUTH_ALLOWED_EMAILS": "synthetic@example.test", "AUTH_ALLOWED_DOMAINS": "example.test",
+            "AUTH_ALLOW_ANY_AUTHENTICATED_USER": "true", "AUTH_APPROVED_TESTER_ROLE": "admin",
+        }
+        with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=AssertionError("provider call")) as provider:
+            for key, value in retired.items():
+                with self.subTest(key=key), mock.patch.dict(os.environ, {key: value}):
+                    self.assertFalse(webapp.internal_password_config_complete())
+                    for route in ("/login", "/callback?state=old&code=old"):
+                        self.assertEqual(self.http("GET", route)[0], 403)
+            local = internal_env() | retired | {"APP_MODE": "local", "SQAG_AUTH_MODE": "local", "USER_TYPE": "ADMIN"}
+            with mock.patch.dict(os.environ, local, clear=True):
+                for route in ("/login", "/callback?state=old&code=old"):
+                    status, headers, body = self.http("GET", route, {"Host": "127.0.0.1"})
+                    self.assertEqual(status, 404)
+                    self.assertEqual(json.loads(body), {"error": "Not found"})
+                    self.assertFalse(headers.get_all("Set-Cookie"))
+        provider.assert_not_called()
+
+    def test_legacy_cookie_identity_and_local_session_boundaries_are_unchanged(self):
+        legacy_user = {"subject": "stable-google-subject", "email": email(),
+                       "name": "Synthetic legacy user", "account": "legacy-account"}
+        for mode in ("internal_google", "internal_password", None):
+            payload = {"user": legacy_user}
+            if mode:
+                payload["auth_mode"] = mode
+            cookie = webapp.SESSION_COOKIE_NAME + "=" + webapp.signed_cookie_value(payload)
+            with self.subTest(mode=mode):
+                self.assertEqual(self.http("GET", "/api/session", {"Cookie": cookie})[0], 401)
+                self.assertIsNone(webapp.session_from_cookie_header(cookie, auth_state=self.server.internal_auth))
+                self.assertEqual(webapp.csrf_token_for_cookie_header(cookie, auth_state=self.server.internal_auth),
+                                 webapp.configured_csrf_token())
+            with mock.patch.dict(os.environ, {"APP_MODE": "local", "SQAG_AUTH_MODE": "local", "USER_TYPE": "ADMIN"}):
+                accepted = webapp.session_from_cookie_header(cookie)
+                if mode:
+                    self.assertIsNone(accepted)
+                else:
+                    self.assertEqual(accepted["user"], legacy_user)
+                    self.assertTrue(webapp.permissions_for_auth_session(accepted)["canGenerateQuote"])

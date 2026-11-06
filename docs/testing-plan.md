@@ -333,14 +333,17 @@ the owner-approved CI lane.
   changed-basis commercial review and supported nested snapshot restoration.
 - Upload intake, PDF/image handling, sample loading, browser refresh persistence, or local file state: run server tests for request validation and a rendered Playwright flow for the affected upload/persistence path.
 - Frontend layout, controls, settings, privacy page, or responsive behavior: run syntax checks and a browser/Playwright visual interaction loop on the changed screen.
-- Auth, permissions, OIDC, cookies, CSRF, file download boundaries, or secret
+- Auth, permissions, retired OIDC refusal, cookies, CSRF, file download boundaries, or secret
   handling: run `tests.test_internal_password_auth`,
-  `tests.test_internal_password_auth_webapp`, focused Platform/session tests, and
+  `tests.test_internal_password_auth_webapp`,
+  `tests.test_internal_password_identity_continuity`, focused Platform/session tests, and
   then the full unit and Playwright suites. Internal identity changes must cover
   strict bounded JSON parsing, bidirectional subject/email substitution,
   role/workspace changes, policy fingerprinting, restart, route denial without
-  a cookie, and browser positive/negative flows. Provider behavior must use
-  local synthetic adapters only.
+  a cookie, and browser positive/negative flows. Retired local login/callback
+  tests must prove safe refusal and no provider calls even with former settings.
+  Retain old-cookie rejection, logout state-cookie cleanup and exact historical
+  owner IDs. Independent Platform behavior must use local synthetic adapters only.
 - CI/CD, package scripts, dependency setup, or workflow files: validate the YAML/script syntax when possible, run the nearest local command, and update `docs/current-cicd-status.md`.
   Run `python -m unittest tests.test_ci_coverage_matrix tests.test_ci_browser_scope tests.test_smoke_wiring` for command selection, trace coverage and executable wiring controls.
   All six browser steps have runtime-prerequisite gates. The full app smoke

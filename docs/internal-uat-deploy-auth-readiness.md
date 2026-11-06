@@ -35,26 +35,17 @@ The deploy/auth surface is already represented in `.env.example` and
 - `AUTH_REQUIRED`: explicit auth gate toggle. In deploy mode, leaving this
   unset still defaults to auth required. Setting it to `false` is treated as an
   incomplete auth boundary and must not be used for hosted UAT.
-- `SESSION_SECRET`: required for signed session and OIDC state cookies when
-  deploy auth is enabled. It must be at least 32 characters. Never print or
-  commit the value.
-- `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`,
-  `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`,
-  `OIDC_USERINFO_URL`, and `OIDC_LOGOUT_URL`: retained OIDC component-test
-  settings for localhost/local mode only. They do not establish a trusted
-  Platform workspace and cannot satisfy deploy startup. `OIDC_AUTHORIZE_URL`,
-  `OIDC_TOKEN_URL`, and
-  `OIDC_USERINFO_URL` are explicit provider endpoints; the app does not guess
-  the authorize endpoint from the issuer. `OIDC_LOGOUT_URL` is optional; the
-  other OIDC fields plus `SESSION_SECRET` are required for a complete auth
-  boundary. OIDC URL fields must use HTTPS, except loopback HTTP is allowed for
-  local smoke-only endpoints.
-- `AUTH_ALLOWED_EMAILS`: comma-separated exact tester email allowlist.
-- `AUTH_ALLOWED_DOMAINS`: comma-separated tester email-domain allowlist.
-- `AUTH_ALLOW_ANY_AUTHENTICATED_USER`: local OIDC component-test escape hatch
-  only. It does not grant deploy or Platform workspace access.
-- `AUTH_APPROVED_TESTER_ROLE`: local OIDC component-test role:
-  `admin`, `management`, `operator`, or `viewer`.
+- `SESSION_SECRET`: required for signed session cookies when deploy auth is
+  enabled. It must be at least 32 characters. Never print or commit the value.
+- The local OIDC adapter is retired. `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`,
+  `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI`, `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`,
+  `OIDC_USERINFO_URL`, `OIDC_LOGOUT_URL`, `AUTH_ALLOWED_EMAILS`,
+  `AUTH_ALLOWED_DOMAINS` and `AUTH_ALLOW_ANY_AUTHENTICATED_USER` cannot enable
+  login. Password mode rejects these settings and `AUTH_APPROVED_TESTER_ROLE`.
+  Platform mode retains its existing rejection of mixed provider settings.
+- `AUTH_APPROVED_TESTER_ROLE` still supplies the separate deploy-side local-role
+  helper. It does not determine password or Platform HTTP session roles. Local
+  development uses `USER_TYPE` and the existing local-role fallback.
 - `SQAG_STORAGE_MODE`: storage mode. Hosted/protected/deploy validation must
   use workspace-owned database rows for SQAG app records.
 - `SQAG_ARTIFACT_STORAGE_MODE`: generated artifact storage mode. Database
@@ -91,8 +82,8 @@ The deploy/auth surface is already represented in `.env.example` and
 - `USER_TYPE`: local role simulation for desktop/internal testing. Deploy mode
   must rely on authenticated session claims rather than local role simulation.
 
-The server also changes cookie behavior in deploy mode: signed session and OIDC
-state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
+Signed session cookies in deploy mode use `Secure`, `HttpOnly`, and
+`SameSite=Lax`. Logout still expires the old OIDC state cookie.
 
 ## Current Implementation Notes
 
@@ -108,7 +99,7 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
   fail closed when the trusted-proxy CIDR boundary is missing or malformed.
   Forwarded headers are not logged and cannot be used by a direct untrusted
   client to select a rate-limit bucket.
-- Deploy request authentication accepts only a signed session containing the
+- Platform deploy request authentication accepts only a signed session containing the
   consumed Platform user, workspace, SQAG app key, supported membership role,
   and non-secret validation grant ID. Every authenticated API request rechecks
   that grant and replaces the role with Platform's current result. A still-valid pre-upgrade OIDC-only cookie is rejected as
@@ -116,11 +107,10 @@ state cookies are emitted with `Secure`, `HttpOnly`, and `SameSite=Lax`.
 - Platform mode does not process the legacy OIDC callback. Logout remains
   available to clear both session and OIDC-state cookies and returns to the
   validated Platform base URL rather than a stale OIDC logout setting.
-- OIDC configuration and route behavior remain testable in local/component
-  checks, but OIDC-only configuration cannot start `APP_MODE=deploy`.
-- In local OIDC component mode, `/login` redirects to `OIDC_AUTHORIZE_URL` with the configured client,
-  redirect URI, response type, scope, and signed state when the auth boundary
-  is complete.
+- The retired callback returns 404 without contacting a provider when the
+  configuration is valid. The existing host guard rejects invalid deploy auth
+  with 403; after host admission, the auth/proxy refusal remains 503. No retired
+  setting can restore local provider login.
 - In `internal_password`, the same-origin form POST consumes a browser-bound
   nonce and checks the shared group password against the exact selected alias.
   The old internal provider callback is unavailable. See the canonical staff
@@ -145,11 +135,12 @@ Use this shape only for local/offline validation of the gated UAT boundary:
 - `SQAG_ARTIFACT_STORAGE_MODE=object` for hosted/protected/deploy readiness
   evidence; `database` is allowed only for local-UAT/synthetic negative tests.
 - `SQAG_DATABASE_URL` set through the host secret manager only.
-- Platform/workspace launch context for every protected hosted/deploy use.
+- The configured internal workspace for password mode, or consumed Platform
+  workspace context for the independent Platform mode.
 - Exact direct Coolify/Traefik proxy CIDRs set through the host environment
   manager only; no trust-all proxy range.
-- No standalone OIDC fallback in the hosted SQAG process. Platform owns login,
-  workspace membership, role, entitlement, and launch authorization.
+- No standalone OIDC fallback. In Platform mode, Platform owns login, workspace
+  membership, role, entitlement and launch authorization.
 - Runtime housekeeping roots outside the repository.
 - Approved tester access only.
 - No public/customer access.
@@ -165,7 +156,7 @@ For an already-prepared Coolify host, use the SQAG-specific adapter in
 SSH, firewall, DNS, TLS, and server maintenance guidance belongs to the
 toolkit/infrastructure workflow, not this repo.
 
-Before a VPS or live OIDC provider exists, use
+Before separately approved hosted qualification, use
 `docs/internal-uat-login-and-pre-vps-dry-run.md` for the approved-tester login
 expectations, offline Coolify env template check, synthetic password and independent Platform route coverage,
 and safe synthetic deploy preflight.
@@ -204,8 +195,8 @@ Pass means:
 - `SESSION_SECRET` is at least 32 characters.
 - Database storage is selected, and database artifact/BLOB mode is not treated
   as hosted/protected/deploy readiness evidence.
-- Required Platform launch settings are present. OIDC-only settings may appear
-  as local component-test diagnostics but never make deploy preflight ready.
+- The selected password or Platform mode has complete configuration. Retired
+  OIDC settings never make deploy preflight ready.
 - `SQAG_TRUSTED_PROXY_CIDRS` contains a valid, nonempty trusted direct-proxy
   boundary.
 - Runtime housekeeping roots are set and outside the repository.

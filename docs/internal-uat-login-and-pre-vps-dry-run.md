@@ -63,7 +63,7 @@ python scripts\verify_internal_alpha_hosted_validation.py --work-dir _tmp\valida
 
 ```powershell
 python -m unittest tests.test_webapp.WebappServerTest.test_platform_launch_registers_header_only_finalization_then_sets_safe_host_cookie
-python -m unittest tests.test_webapp.WebappServerTest.test_deploy_logout_clears_session_and_state_cookies
+python -m unittest tests.test_internal_password_auth_webapp.InternalPasswordAuthWebappTest.test_A06_A09_A10_A11_A13_A14_real_login_rotation_and_logout
 python -m unittest tests.test_webapp.WebappServerTest.test_deploy_rejects_oidc_identity_without_platform_workspace_context
 python -m unittest tests.test_webapp.WebappServerTest.test_internal_uat_coolify_env_template_is_offline_verifiable
 ```
@@ -91,9 +91,9 @@ These checks verify:
 - Missing, replayed, malformed, or denied launch tokens are blocked without
   leaking private values.
 
-Standalone OIDC helpers remain covered as localhost/local component tests only.
-They do not establish Platform workspace authority and cannot start
-`APP_MODE=deploy`.
+The local OIDC adapter is retired. Callback refusal, mixed-setting rejection and
+legacy-cookie boundaries remain covered alongside password and Platform tests.
+No retired setting can establish Platform workspace authority or enable login.
 
 ## What Still Requires Real VPS/Platform
 

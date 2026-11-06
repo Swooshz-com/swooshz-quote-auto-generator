@@ -4,7 +4,7 @@ All maintained inference uses `webapp/ai_gateway.py` and the fixed OpenRouter
 Responses endpoint. The business layer retains the existing prompts, catalogue
 snapshot, PDF rendering, media order, JSON admission and pricing/output rules.
 There is no direct OpenAI or DeepSeek inference transport or provider/model
-fallback. Existing local OIDC and Platform HTTP calls are independent auth flows.
+fallback. Platform HTTP calls belong to the independent Platform auth flow.
 
 ## Explicit route settings
 
