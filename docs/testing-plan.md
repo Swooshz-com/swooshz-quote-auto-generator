@@ -32,13 +32,17 @@ npm run playwright:smoke
 ## Button sizing and placement checks
 
 - Run `python -m unittest tests.test_button_standard tests.test_quote_flow_reliability`
-  for the shared button CSS contract and PDF/Excel ready-dialog order and actions.
+  for the shared button CSS contract and PDF/Excel ready-dialog order and actions,
+  including repeated Excel/PDF/Excel switches with separating whitespace nodes.
 - In a synthetic local browser session, check Quote Basis row check/X/Re controls,
   Company Profile Load/Save New/More Actions, and PDF ready Close/Open PDF at
   1280 px and 390 px. Capture each group before and after; check 32 px review
   squares, 40 px standard controls, 8 px gaps, 14 px standard text, 16 px padding,
-  and 96 px minimum standard widths. At 640 px and below all targets are 44 px
-  high and review controls are 44 px wide. Check 640 px and 641 px boundaries.
+  and 96 px minimum standard widths. Profile action SVGs retain their 15 px width;
+  the desktop action column is 168 px and mobile Load/Save New use 4 px inline
+  padding to keep icons and text inside their buttons. At 640 px and below all
+  targets are 44 px high and review controls are 44 px wide. Check 640 px and
+  641 px boundaries.
 - Use keyboard Tab to verify visible 2 px green focus outlines with 2 px offset,
   no clipped rings or horizontal overflow, and Close before Open PDF in DOM and
   Tab order. Verify PDF open/close, Excel order restoration, row include/exclude

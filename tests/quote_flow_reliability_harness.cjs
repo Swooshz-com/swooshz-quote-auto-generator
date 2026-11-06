@@ -278,9 +278,20 @@ function fixture(names) {
   const calls = [];
   const node = () => ({ hidden: true, textContent: "", dataset: {}, focus() {}, classList: { add() {}, remove() {} } });
   const elements = Object.fromEntries(["excelGeneratingModal", "excelGeneratingSpinner", "excelGeneratingActions", "excelGeneratingActionButton", "excelGeneratingCloseButton", "excelGeneratingEyebrow", "excelGeneratingTitle", "excelGeneratingMessage"].map((name) => [name, node()]));
-  elements.excelGeneratingActions.children = [elements.excelGeneratingActionButton, elements.excelGeneratingCloseButton];
+  // Inline Excel buttons rely on the whitespace text nodes in index.html.
+  const whitespace = () => ({ nodeType: 3, textContent: "\n              " });
+  elements.excelGeneratingActionButton.nodeType = 1;
+  elements.excelGeneratingCloseButton.nodeType = 1;
+  elements.excelGeneratingActions.childNodes = [whitespace(), elements.excelGeneratingActionButton,
+    whitespace(), elements.excelGeneratingCloseButton, whitespace()];
+  Object.defineProperty(elements.excelGeneratingActions, "children", {
+    get() { return this.childNodes.filter(child => child.nodeType === 1); },
+  });
   elements.excelGeneratingActions.prepend = function (child) {
-    this.children = [child, ...this.children.filter(existing => existing !== child)];
+    this.childNodes = [child, ...this.childNodes.filter(existing => existing !== child)];
+  };
+  elements.excelGeneratingActions.append = function (child) {
+    this.childNodes = [...this.childNodes.filter(existing => existing !== child), child];
   };
   elements.sideNextButton = { getAttribute() { return "false"; } };
   const state = { isPreparingOutput: false, activeSidePanel: "customer", quoteSessionLoadError: "" };
@@ -543,10 +554,18 @@ async function lifecycleCases() {
     await freshClick;
     c.downloadFileIsFresh = () => true;
     state.downloadFile = { url: "/api/synthetic.xlsx" };
-    assert.equal(c.showGeneratedExportReadyModal(false), true);
-    assert.deepEqual(elements.excelGeneratingActions.children, [elements.excelGeneratingActionButton, elements.excelGeneratingCloseButton]);
-    assert.equal(c.showGeneratedExportReadyModal(true), true);
-    assert.deepEqual(elements.excelGeneratingActions.children, [elements.excelGeneratingCloseButton, elements.excelGeneratingActionButton]);
+    for (const viewPdf of [false, true, false, true, false, true]) {
+      assert.equal(c.showGeneratedExportReadyModal(viewPdf), true);
+      const action = elements.excelGeneratingActionButton;
+      const close = elements.excelGeneratingCloseButton;
+      assert.deepEqual(elements.excelGeneratingActions.children, viewPdf ? [close, action] : [action, close]);
+      if (!viewPdf) {
+        const nodes = elements.excelGeneratingActions.childNodes;
+        assert(nodes.slice(nodes.indexOf(action) + 1, nodes.indexOf(close))
+          .some(child => child.nodeType === 3 && /\s/.test(child.textContent)),
+        "Excel buttons must retain separating whitespace after every PDF/Excel switch");
+      }
+    }
     c.handleGeneratedExportReadyAction();
     assert.deepEqual(openedUrls, [state.pdfFile.url], "Open PDF opens synchronously within its button click");
     assert(elements.excelGeneratingModal.hidden);

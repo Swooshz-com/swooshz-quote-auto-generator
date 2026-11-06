@@ -4257,7 +4257,7 @@ h3 {
 
 .company-preset-card.company-preset-profile-card {
   display: grid;
-  grid-template-columns: minmax(0, 258px) minmax(150px, 158px);
+  grid-template-columns: minmax(0, 258px) 168px;
   align-items: center;
   justify-content: center;
   gap: 10px;
@@ -9021,6 +9021,11 @@ body.privacy-page {
   align-self: center;
 }
 
+.company-preset-profile-card .company-preset-action-panel > button > svg,
+.company-preset-profile-card .company-preset-more-button > svg {
+  flex-shrink: 0;
+}
+
 .excel-generating-actions:has([data-export-action="pdf"]) {
   display: flex;
   align-items: center;
@@ -9053,5 +9058,9 @@ body.privacy-page {
 
   .basis-line-actions > button {
     width: 44px;
+  }
+
+  .company-preset-profile-card .company-preset-action-panel > button {
+    padding-inline: 4px;
   }
 }

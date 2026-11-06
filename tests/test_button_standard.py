@@ -44,10 +44,23 @@ class ButtonStandardTest(unittest.TestCase):
     def test_pdf_order_and_excel_restoration(self):
         ready = self.js.split("function showGeneratedExportReadyModal(", 1)[1].split(
             "function handleGeneratedExportReadyAction(", 1)[0]
-        self.assertIn("""elements.excelGeneratingActions?.prepend(viewPdf
-    ? elements.excelGeneratingCloseButton
-    : elements.excelGeneratingActionButton);""", ready)
+        self.assertIn("""if (viewPdf) {
+    elements.excelGeneratingActions?.prepend(elements.excelGeneratingCloseButton);
+  } else {
+    elements.excelGeneratingActions?.append(elements.excelGeneratingCloseButton);
+  }""", ready)
         self.assertLess(ready.index(".prepend("), ready.index('classList.add("is-open", "is-ready")'))
+
+    def test_profile_icons_keep_their_width(self):
+        self.assertIn("grid-template-columns: minmax(0, 258px) 168px;", self.css)
+        self.assertIn(""".company-preset-profile-card .company-preset-action-panel > button > svg,
+.company-preset-profile-card .company-preset-more-button > svg {
+  flex-shrink: 0;
+}""", self.rules)
+        mobile = self.rules.split("@media (max-width: 640px)", 1)[1]
+        self.assertIn(""".company-preset-profile-card .company-preset-action-panel > button {
+    padding-inline: 4px;
+  }""", mobile)
 
 
 if __name__ == "__main__":
