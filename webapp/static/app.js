@@ -5164,6 +5164,8 @@ function companyProfilePresets() {
       details: normalized.defaults || {},
       source: "company",
       saved_at: normalized.saved_at || "",
+      permissions: normalized.permissions,
+      revision: normalized.revision ?? normalized._revision ?? 0,
     };
   });
 }
@@ -5487,7 +5489,7 @@ function updatePresetButtons() {
   }
   if (elements.deletePresetButton) {
     const hasPreset = Boolean(preset);
-    const canOpenDeletePrompt = canManage && hasPreset;
+    const canOpenDeletePrompt = canManage && hasPreset && preset?.permissions?.canDelete !== false;
     const canDelete = canOpenDeletePrompt && preset?.source === "company";
     const readOnlyPrompt = canOpenDeletePrompt && !canDelete && !busy;
     const reason = !canManage
@@ -5630,6 +5632,8 @@ function profilePayloadForLabel(label = "", options = {}) {
   const existingProfile = options.existingProfile || null;
   const profileId = safeProfileId(existingProfile?.id || label, sourceProfile?.id || `profile-${Date.now().toString(36)}`);
   const payload = {
+    operation: existingProfile && options.mode !== "import" ? "update" : "create",
+    revision: existingProfile?.revision ?? existingProfile?._revision ?? 0,
     id: profileId,
     label,
     description: sourceProfile?.description || existingProfile?.description || "Saved from the Quote Company panel.",
@@ -5643,10 +5647,12 @@ function profilePayloadForLabel(label = "", options = {}) {
 }
 
 function existingCompanyProfileForLabel(label = "", options = {}) {
+  if (options.mode === "import") return null;
   const safeLabel = safeProfileLabel(label, "");
   const candidateId = safeProfileId(safeLabel, options.profile?.id || "");
   const candidateLabel = safeLabel.toLowerCase();
   return state.companyProfiles.find((profile) => {
+    if (profile?.permissions?.canUpdate === false) return false;
     const profileId = safeProfileId(profile?.id || profile?.label, "");
     const profileLabel = safeProfileLabel(profile?.label || profile?.name || profile?.id, "").toLowerCase();
     return Boolean((candidateId && profileId === candidateId) || (candidateLabel && profileLabel === candidateLabel));
@@ -6160,7 +6166,7 @@ function renderProfileDeleteModal() {
 
 function requestSelectedPresetDelete() {
   const preset = selectedPreset();
-  if (!canManageProfiles()) {
+  if (!canManageProfiles() || preset?.permissions?.canDelete === false) {
     renderPresetStatus(profileNoAccessReason());
     updatePresetButtons();
     return;
@@ -6183,7 +6189,7 @@ function requestSelectedPresetDelete() {
 
 async function deleteSelectedPreset() {
   const preset = profileDeleteConfirmPreset();
-  if (!preset || preset.source !== "company") {
+  if (!preset || preset.source !== "company" || preset.permissions?.canDelete === false) {
     hideProfileDeleteModal({ force: true });
     updatePresetButtons();
     return;
@@ -6195,7 +6201,7 @@ async function deleteSelectedPreset() {
   updatePresetButtons();
   renderProfileDeleteModal();
   try {
-    const response = await fetch(`/api/settings/profiles/${encodeURIComponent(preset.id)}`, {
+    const response = await fetch(`/api/settings/profiles/${encodeURIComponent(preset.id)}?revision=${encodeURIComponent(preset.revision ?? 0)}`, {
       method: "DELETE",
       headers: state.csrfToken ? { [state.csrfHeaderName]: state.csrfToken } : {},
     });

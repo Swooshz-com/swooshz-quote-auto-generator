@@ -63,6 +63,9 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+from webapp.profile_access import ProfilePolicy, content_profile, access_state, historical_profile_authority
+from webapp.forensics import EVIDENCE_SCHEMA_VERSION
+
 import pricing_reference_cleanup
 import pricing_reference_enrichment
 from webapp.forensics import (
@@ -3128,6 +3131,8 @@ def blocked_platform_permissions() -> dict[str, bool]:
         "canManageSettings": False,
         "canManagePricingReferences": False,
         "canManageProfiles": False,
+        "canCreateProfiles": False,
+        "canManageSharedProfiles": False,
         "canImportPricingReferences": False,
         "canSelectPricingReference": False,
         "canGenerateQuote": False,
@@ -3176,7 +3181,11 @@ def permissions_for_auth_session(session: dict[str, Any] | None) -> dict[str, bo
     if configured_auth_mode() == INTERNAL_AUTH_MODE:
         user = session.get("user") if isinstance(session, dict) and session.get("auth_mode") == INTERNAL_AUTH_MODE else {}
         role = user.get("internal_role") if isinstance(user, dict) else ""
-        return role_permissions(role) if role in {"admin", "operator"} else blocked_platform_permissions()
+        permissions = role_permissions(role) if role in {"admin", "operator"} else blocked_platform_permissions()
+        if role in {"admin", "operator"}:
+            permissions.update(canManageProfiles=True, canCreateProfiles=True,
+                               canManageSharedProfiles=role == "admin")
+        return permissions
     if configured_app_mode() == "deploy":
         mode = configured_auth_mode()
         if not platform_auth_session_complete(session):
@@ -9512,6 +9521,8 @@ def profile_payload_from_export(payload: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
     profile_payload = profile_payload_from_export(payload)
+    if any(key in profile_payload or key in payload for key in ("_access", "_revision", "permissions")):
+        raise ValueError("Profile access fields cannot be imported or submitted.")
     profile_id = safe_resource_id(profile_payload.get("id") or profile_payload.get("label"), "")
     if not profile_id:
         raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
@@ -10775,6 +10786,10 @@ def public_database_profile_summary(profile: dict[str, Any]) -> dict[str, Any]:
         "quote_detail_presets": [],
         "source": "company",
     }
+    if isinstance(profile.get("permissions"), dict):
+        summary["permissions"] = copy.deepcopy(profile["permissions"])
+    if "revision" in profile or "_revision" in profile:
+        summary["revision"] = profile.get("revision", profile.get("_revision", 0))
     if defaults:
         summary["quote_detail_presets"] = [{
             "id": "default",
@@ -10826,6 +10841,8 @@ def role_permissions(role: str) -> dict[str, bool]:
         "canManageSettings": can_manage,
         "canManagePricingReferences": can_manage,
         "canManageProfiles": can_manage,
+        "canCreateProfiles": can_manage,
+        "canManageSharedProfiles": can_manage,
         "canImportPricingReferences": can_manage,
         "canSelectPricingReference": normalized in {"admin", "management", "operator", "viewer"},
         "canGenerateQuote": can_generate,
@@ -11959,6 +11976,12 @@ LOCAL_QUOTE_SPEND_CLAIMS_LOCK = threading.Lock()
 class LocalSqagStorage:
     storage_backend = "local-runtime-json"
 
+    def __init__(self):
+        # This adapter has no per-actor storage boundary. Never use it for staff.
+        if internal_password_mode_enabled():
+            raise SqagStorageAccessError("Profile storage requires trusted user context.",
+                                         status=403, reason="profile_local_actor_unavailable")
+
     @staticmethod
     def _read_spend(path: Path) -> dict[str, Any]:
         if _quote_session_path_is_redirect(path):
@@ -12047,10 +12070,10 @@ class LocalSqagStorage:
     def list_company_profiles(self) -> list[dict[str, Any]]:
         return company_config_store().list_profiles(self.company_id())
 
-    def save_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
+    def save_profile(self, profile: dict[str, Any], **_options) -> dict[str, Any]:
         return company_config_store().save_profile(self.company_id(), profile)
 
-    def delete_profile(self, profile_id: str) -> bool:
+    def delete_profile(self, profile_id: str, **_options) -> bool:
         return company_config_store().delete_profile(self.company_id(), profile_id)
 
     def company_profile_export_payload(self, profile_id: str) -> dict[str, Any] | None:
@@ -12895,6 +12918,53 @@ class DatabaseSqagStorage:
             connection.commit()
             return cursor.rowcount > 0
 
+    @property
+    def profile_policy(self) -> ProfilePolicy:
+        return ProfilePolicy(self.user_id, self.role)
+
+    def _public_access_profile(self, profile):
+        result = copy.deepcopy(profile)
+        result["permissions"] = self.profile_policy.capabilities(profile)
+        result["revision"] = profile.get("_revision", 0)
+        result.pop("_access", None)
+        result.pop("_revision", None)
+        return result
+
+    def _profile_change_row(self, connection, profile_id, *, lock=True):
+        if lock:
+            self._begin_object_lifecycle_transaction(connection, "profile", profile_id)
+        row = connection.execute(
+            "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
+            (self.workspace_id, profile_id),
+        ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
+    def _authorize_profile_change(self, existing, *, revision=None, create=False):
+        if create and existing is not None:
+            raise SqagStorageAccessError("Profile operation is unavailable.", status=409, reason="profile_collision")
+        if existing is None:
+            if create and self.profile_policy.can_create:
+                return
+            raise SqagStorageAccessError("Profile operation is unavailable.", status=404, reason="profile_unavailable")
+        if self._is_deleted_profile_payload(existing) or not self.profile_policy.can_update(existing):
+            raise SqagStorageAccessError("Profile operation is unavailable.", status=404, reason="profile_unavailable")
+        if "_access" in existing and type(revision) is not int:
+            raise SqagStorageAccessError("Profile revision is required.", status=409, reason="profile_revision_required")
+        if revision is not None and (type(revision) is not int or revision != existing.get("_revision", 0)):
+            raise SqagStorageAccessError("Profile changed. Reload it before trying again.", status=409, reason="profile_revision_conflict")
+
+    def change_profile_access(self, profile_id, access, *, revision):
+        if not self.profile_policy.admin or type(revision) is not int or access_state({"_access": access}) == "invalid":
+            raise SqagStorageAccessError("Profile operation is unavailable.", status=403, reason="profile_access_denied")
+        def change(connection):
+            existing = self._profile_change_row(connection, profile_id)
+            self._authorize_profile_change(existing, revision=revision)
+            existing["_access"] = copy.deepcopy(access)
+            existing["_revision"] = existing.get("_revision", 0) + 1
+            self._execute_upsert_payload(connection, "sqag_profiles", "profile_id", profile_id, existing)
+            return self._public_access_profile(existing)
+        return self._run_storage_transaction(change)
+
     def list_profiles(self) -> list[dict[str, Any]]:
         profiles = [
             public_database_profile_summary(profile)
@@ -12905,9 +12975,9 @@ class DatabaseSqagStorage:
 
     def list_company_profiles(self) -> list[dict[str, Any]]:
         return [
-            profile
+            self._public_access_profile(profile)
             for profile in self._read_payloads("sqag_profiles", "profile_id")
-            if not self._is_deleted_profile_payload(profile)
+            if not self._is_deleted_profile_payload(profile) and self.profile_policy.can_read(profile)
         ]
 
     def profile_detail(self, profile_id: str, source: str = "") -> dict[str, Any] | None:
@@ -12918,54 +12988,43 @@ class DatabaseSqagStorage:
         if requested_source not in {"", "company"}:
             return None
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None or self._is_deleted_profile_payload(profile):
+        if profile is None or self._is_deleted_profile_payload(profile) or not self.profile_policy.can_read(profile):
             return None
-        detail = copy.deepcopy(profile)
+        detail = content_profile(profile)
         detail["id"] = safe_id
         detail["source"] = "company"
         return detail
 
-    def _assert_profile_can_be_saved(
-        self,
-        profile_id: str,
-        *,
-        connection: Any | None = None,
-    ) -> None:
-        safe_id = safe_resource_id(profile_id, "")
-        if not safe_id:
-            return
-
-        def assert_on_connection(active_connection: Any) -> None:
-            row = active_connection.execute(
-                "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
-                (self.workspace_id, safe_id),
-            ).fetchone()
-            if not row:
-                return
-            try:
-                payload = json.loads(row["payload_json"])
-            except (KeyError, TypeError, json.JSONDecodeError):
-                return
-            if self._is_deleted_profile_payload(payload):
-                raise ValueError(DELETED_PROFILE_UPDATE_MESSAGE)
-
-        if connection is not None:
-            assert_on_connection(connection)
-            return
-        with self.connection() as read_connection:
-            assert_on_connection(read_connection)
-
-    def save_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
+    def save_profile(self, profile: dict[str, Any], *, operation: str | None = None, revision=None) -> dict[str, Any]:
+        if operation not in {None, "create", "update"}:
+            raise ValueError("Invalid profile operation.")
+        if operation == "update" and type(revision) is not int:
+            raise ValueError("Profile revision is required.")
+        if any(key in profile for key in ("_access", "_revision", "permissions")):
+            raise ValueError("Profile access fields cannot be submitted.")
+        if operation == "create":
+            profile = copy.deepcopy(profile)
+            profile["id"] = "profile-" + secrets.token_hex(16)
         profile_id = safe_resource_id(profile.get("id") or profile.get("label"), "")
         if not profile_id:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
         stored = {key: copy.deepcopy(value) for key, value in profile.items() if key not in {"_pack_assets", "pack", "profile_pack"}}
         stored["id"] = profile_id
+        def authorize(connection, *, lock=True):
+            existing = self._profile_change_row(connection, profile_id, lock=lock)
+            create = operation == "create" or (operation is None and existing is None)
+            self._authorize_profile_change(existing, revision=revision, create=create)
+            stored["_access"] = copy.deepcopy(existing["_access"]) if existing and "_access" in existing else (
+                self.profile_policy.new_access() if create else None)
+            if stored["_access"] is None:
+                del stored["_access"]
+            stored["_revision"] = (existing or {}).get("_revision", 0) + 1
+
         artifact_mode = configured_artifact_storage_mode()
         materialize_default_layout = configured_storage_mode() == "database"
         if artifact_mode not in {"database", "object"}:
             def persist_plain_profile(connection: Any) -> None:
-                self._assert_profile_can_be_saved(profile_id, connection=connection)
+                authorize(connection)
                 self._execute_upsert_payload(
                     connection,
                     "sqag_profiles",
@@ -12975,11 +13034,11 @@ class DatabaseSqagStorage:
                 )
 
             self._run_storage_transaction(persist_plain_profile)
-            return stored
+            return self._public_access_profile(stored)
 
         if artifact_mode == 'object':
             def prepare_object_profile(connection: Any):
-                self._assert_profile_can_be_saved(profile_id, connection=connection)
+                authorize(connection, lock=False)
                 item = self._prepare_profile_layout_artifact(profile)
                 profile_layout_item = item
                 if (
@@ -13032,16 +13091,18 @@ class DatabaseSqagStorage:
                     prepare_object_profile,
                     persist_object_profile,
                 )
+            except SqagStorageAccessError:
+                raise
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
                     raise
                 raise self._storage_unavailable_error(exc) from exc
             if object_plan is not None:
                 self._finalize_object_artifact_batch(object_plan)
-            return stored
+            return self._public_access_profile(stored)
 
         def persist_profile(connection: Any) -> None:
-            self._assert_profile_can_be_saved(profile_id, connection=connection)
+            authorize(connection)
             item = self._prepare_profile_layout_artifact(profile)
             profile_layout_item = item
             if (
@@ -13074,19 +13135,23 @@ class DatabaseSqagStorage:
 
         try:
             self._run_storage_transaction(persist_profile)
+        except SqagStorageAccessError:
+            raise
         except Exception as exc:
             if not self._expected_storage_failure(exc):
                 raise
             raise self._storage_unavailable_error(exc) from exc
-        return stored
+        return self._public_access_profile(stored)
 
-    def delete_profile(self, profile_id: str) -> bool:
+    def delete_profile(self, profile_id: str, *, revision=None) -> bool:
         safe_id = safe_resource_id(profile_id, "")
         if not safe_id:
             raise ValueError("Profile id is required and may only contain letters, numbers, dashes, or underscores.")
         artifact_mode = configured_artifact_storage_mode()
         if artifact_mode == "object":
             def authorize_object_profile(connection: Any) -> bool:
+                existing = self._profile_change_row(connection, safe_id, lock=False)
+                self._authorize_profile_change(existing, revision=revision)
                 existing_row = connection.execute(
                     "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
                     (self.workspace_id, safe_id),
@@ -13135,12 +13200,16 @@ class DatabaseSqagStorage:
                     delete_object_profile_owner,
                     authorize=authorize_object_profile,
                 )
+            except SqagStorageAccessError:
+                raise
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
                     raise
                 raise self._storage_unavailable_error(exc) from exc
 
         def delete_profile_owner(connection: Any) -> bool:
+            existing = self._profile_change_row(connection, safe_id)
+            self._authorize_profile_change(existing, revision=revision)
             existing_row = connection.execute(
                 "select payload_json from sqag_profiles where workspace_id = ? and profile_id = ?",
                 (self.workspace_id, safe_id),
@@ -13176,6 +13245,8 @@ class DatabaseSqagStorage:
 
         try:
             return bool(self._run_storage_transaction(delete_profile_owner))
+        except SqagStorageAccessError:
+            raise
         except Exception as exc:
             if not self._expected_storage_failure(exc):
                 raise
@@ -13186,7 +13257,7 @@ class DatabaseSqagStorage:
         if not safe_id:
             return None
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None or self._is_deleted_profile_payload(profile):
+        if profile is None or self._is_deleted_profile_payload(profile) or not self.profile_policy.can_read(profile):
             return None
         payload = {"schema": COMPANY_PROFILE_EXPORT_SCHEMA, "exported_at": utc_timestamp(), "profile": {"id": safe_id, "label": clean_text(profile.get("label")) or safe_id, "description": clean_text(profile.get("description")), "defaults": copy.deepcopy(profile.get("defaults")) if isinstance(profile.get("defaults"), dict) else {}}}
         layout = self.profile_layout_artifact(safe_id)
@@ -14551,7 +14622,7 @@ class DatabaseSqagStorage:
         if not safe_id:
             return None
         profile = self._read_payload("sqag_profiles", "profile_id", safe_id)
-        if profile is None or self._is_deleted_profile_payload(profile):
+        if profile is None or self._is_deleted_profile_payload(profile) or not self.profile_policy.can_read(profile):
             return None
         artifact = (
             self._read_object_file_artifact("profile", safe_id, "quotation_layout")
@@ -14999,6 +15070,55 @@ class DatabaseSqagStorage:
                 quote_session=True,
             )
         return True, pending_artifacts, object_plan
+
+    def historical_publication_profile(self, metadata):
+        """Verify run-bound historical authority without opening the live library.
+
+        Quote-reader admission and every publication/artifact/pricing check stay
+        at their existing boundaries. Missing evidence keeps the old live check.
+        """
+        publication = metadata.get("publication", {})
+        run_id = safe_reference(publication.get("run_id"), "run-")
+        session_id = safe_quote_session_id(metadata.get("session_id"), "")
+        if not run_id or not session_id:
+            return {}
+        with self.connection() as connection:
+            version = self._publication_version_row(run_id, connection)
+            if not version or version["state"] != "published" or version["session_id"] != session_id:
+                return {}
+            try:
+                version_metadata = json.loads(version["metadata_json"])
+            except (TypeError, ValueError):
+                return {}
+            if version_metadata.get("publication", {}).get("proof") != publication.get("proof"):
+                return {}
+            run = connection.execute(
+                "select job_id, quote_session_id from sqag_generation_runs "
+                "where workspace_id = ? and run_id = ? and completed_at is not null and deletion_state = 'active'",
+                (self.workspace_id, run_id),
+            ).fetchone()
+            if not run or run["quote_session_id"] != session_id or run["job_id"] != publication.get("job_id"):
+                return {}
+            rows = connection.execute(
+                "select evidence_type, evidence_json, evidence_sha256 from sqag_generation_evidence "
+                "where workspace_id = ? and run_id = ?",
+                (self.workspace_id, run_id),
+            ).fetchall()
+        manifests = []
+        for row in rows:
+            raw = row["evidence_json"]
+            if not isinstance(raw, str) or hashlib.sha256(raw.encode("utf-8")).hexdigest() != row["evidence_sha256"]:
+                return {}
+            try:
+                evidence = json.loads(raw)
+            except ValueError:
+                return {}
+            if row["evidence_type"] == "generation_manifest":
+                manifests.append(evidence)
+        if len(manifests) != 1 or not isinstance(manifests[0], dict) or manifests[0].get("schema") != EVIDENCE_SCHEMA_VERSION:
+            return {}
+        return historical_profile_authority(manifests[0], run_id=run_id,
+                                            job_id=publication.get("job_id"), workspace_id=self.workspace_id)
 
     def _publication_version_row(
         self,
@@ -28951,6 +29071,7 @@ def local_publication_authority_for_payload(payload: dict[str, Any]) -> dict[str
         return {}
     profile_snapshot = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
     profile_snapshot.pop("pack", None)
+    profile_snapshot = content_profile(profile_snapshot)
     layout_path = profile.quotation_layout_path if isinstance(profile, ProfilePack) else None
     if not isinstance(layout_path, Path) or not layout_path.is_file():
         return {}
@@ -28996,6 +29117,7 @@ def database_publication_authority_for_payload(
     layout_rules = embedded_layout_rules_from_xlsx_bytes(layout_bytes)
     profile_snapshot = copy.deepcopy(profile_detail)
     profile_snapshot.pop("pack", None)
+    profile_snapshot = content_profile(profile_snapshot)
     return {
         "pricing_reference": {
             "id": selection["id"],
@@ -29100,7 +29222,21 @@ def database_current_publication_authority_for_metadata(
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
     payload = quote_session_authority_payload(metadata)
-    return database_current_publication_authority(storage, payload) if payload else {}
+    if not payload:
+        return {}
+    historical_profile = storage.historical_publication_profile(metadata)
+    if not historical_profile:
+        return database_current_publication_authority(storage, payload)
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection.get("ok"):
+        return {}
+    pricing = storage.pricing_reference_detail(selection["id"], source=selection["source"])
+    if not isinstance(pricing, dict):
+        return {}
+    return {"profile": historical_profile, "pricing_reference": {
+        "id": selection["id"], "source": selection["source"],
+        "digest": clean_text(pricing.get("digest_sha256") or pricing_reference_catalog_digest(pricing)).lower().removeprefix("sha256:"),
+    }}
 
 
 class EmptyReferenceFileError(ValueError):
@@ -33055,6 +33191,7 @@ def _run_quote_job(
     }
     profile_snapshot_for_publication = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
     profile_snapshot_for_publication.pop("pack", None)
+    profile_snapshot_for_publication = content_profile(profile_snapshot_for_publication)
     pricing_snapshot_for_publication = load_json_file(pricing_catalog_path)
     layout_bytes_for_publication = layout_template_path.read_bytes()
     layout_rules_for_publication = embedded_layout_rules_from_xlsx_bytes(layout_bytes_for_publication)
@@ -33202,6 +33339,7 @@ def _run_quote_job(
             result.pop("quote_session", None)
     profile_snapshot = copy.deepcopy(profile.config if isinstance(profile, ProfilePack) else profile)
     profile_snapshot.pop("pack", None)
+    profile_snapshot = content_profile(profile_snapshot)
     pricing_bytes = pricing_catalog_path.read_bytes()
     layout_bytes = layout_template_path.read_bytes()
     layout_rules_snapshot = embedded_layout_rules_from_xlsx_bytes(layout_bytes)
@@ -33751,11 +33889,19 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                         clean_text(item.get("id")).casefold(),
                     )
                 )
+            available_profiles = storage.list_profiles()
+            default_profile_id = workspace_profile_pack_id(workspace)
+            if isinstance(storage, DatabaseSqagStorage) and not any(
+                item["id"] == default_profile_id for item in available_profiles
+            ):
+                default_profile_id = ""
+                workspace = copy.deepcopy(workspace)
+                workspace.get("defaults", {}).pop("profile_id", None)
             self.send_json({
-                "profiles": storage.list_profiles(),
+                "profiles": available_profiles,
                 "company_profiles": company_profiles,
                 "pricing_references": storage.list_pricing_references(),
-                "default_profile_id": workspace_profile_pack_id(workspace),
+                "default_profile_id": default_profile_id,
                 "default_pricing_reference_id": workspace_pricing_reference_id(workspace),
                 "company_id": workspace["company"]["id"],
                 "workspace": workspace,
@@ -34042,6 +34188,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 self.send_json(error, status=403)
                 return
             try:
+                operation = payload.get("operation", "create")
+                if operation not in {"create", "update", "access"}:
+                    raise ValueError("Invalid profile operation.")
+                revision = payload.get("revision")
+                if operation in {"update", "access"} and type(revision) is not int:
+                    raise ValueError("Profile revision is required.")
                 profile = normalize_profile_payload(payload)
                 if profile_payload_has_layout_artifact(profile):
                     try:
@@ -34053,7 +34205,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if storage is None:
                     return
                 workspace = storage.workspace()
-                saved = storage.save_profile(profile)
+                if operation == "access":
+                    if not isinstance(storage, DatabaseSqagStorage):
+                        raise ValueError("Access changes require user-scoped storage.")
+                    saved = storage.change_profile_access(profile["id"], payload.get("access"), revision=revision)
+                else:
+                    saved = storage.save_profile(profile, operation=operation, revision=revision)
                 append_runtime_telemetry(
                     auth_session,
                     "profile_change",
@@ -34496,7 +34653,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 storage = self.current_app_storage()
                 if storage is None:
                     return
-                deleted = storage.delete_profile(profile_match.group(1))
+                raw_revision = parse_qs(parsed.query).get("revision", [""])[0]
+                if not raw_revision.isdecimal():
+                    raise ValueError("Profile revision is required.")
+                deleted = storage.delete_profile(profile_match.group(1), revision=int(raw_revision))
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
