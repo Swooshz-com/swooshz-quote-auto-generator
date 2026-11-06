@@ -166,8 +166,8 @@ configuration. Keep the workspace and existing user IDs for continuity. Set
 staff roles in the active password-mode email lists. Actual credentials and identity-continuity
 qualification remain separate host operations, not repository validation. See
 [internal staff password access](internal-password-auth-mode.md) for the exact
-admission and session contract. The independent local OIDC and Platform adapters
-retain their own component contracts; they are not password-mode requirements
+admission and session contract. The local OIDC adapter is retired. The independent
+Platform adapter retains its own contract; it is not a password-mode requirement
 or fallback authentication.
 
 `SQAG_TRUSTED_PROXY_CIDRS` is mandatory in deploy mode. Set it to the exact

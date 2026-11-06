@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlparse
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
@@ -146,7 +146,6 @@ RUNTIME_WORKSPACE_SCHEMA = "swooshz.local-runtime-workspace.v1"
 DEFAULT_COMPANY_ID = "default"
 DEFAULT_COMPANY_DISPLAY_NAME = "Quote Generator Workspace"
 DEFAULT_QUOTE_COMPANY_PROFILE_ID = "default"
-DEFAULT_QUOTE_COMPANY_FALLBACK_PRESET_ID = "synthetic-fixture-default"
 DELETED_PROFILE_MARKER_KEY = "_sqag_deleted"
 DELETED_PROFILE_UPDATE_MESSAGE = "Deleted profiles cannot be updated. Create a new profile with a new id."
 
@@ -477,10 +476,6 @@ MIN_PLATFORM_SERVICE_SECRET_CHARS = 32
 TRUSTED_PROXY_CIDRS_ENV_NAME = 'SQAG_TRUSTED_PROXY_CIDRS'
 MAX_FORWARDED_FOR_HEADER_BYTES = 4096
 MAX_FORWARDED_FOR_HOPS = 32
-OIDC_PROVIDER_TIMEOUT_SECONDS = 15
-OIDC_PROVIDER_MAX_RESPONSE_BYTES = 128 * 1024
-OIDC_CALLBACK_MAX_QUERY_BYTES = 8192
-OIDC_CALLBACK_MAX_FIELDS = 12
 PLATFORM_LAUNCH_ENDPOINT = "/api/platform/launch"
 PLATFORM_FINALIZATION_ENDPOINT = "/api/auth/platform/finalize"
 TELEMETRY_FEED_ENDPOINT = "/api/platform/telemetry/feed"
@@ -498,8 +493,6 @@ PLATFORM_REQUEST_TIMEOUT_SECONDS_MIN = 1
 PLATFORM_REQUEST_TIMEOUT_SECONDS_MAX = 30
 PLATFORM_LAUNCH_MAX_FUTURE_SECONDS = 10 * 60
 PLATFORM_FINALIZATION_TTL_SECONDS = 2 * 60
-RUNTIME_DATABASE_WARM_CONNECT_TIMEOUT_SECONDS = 5
-RUNTIME_DATABASE_WARM_STATEMENT_TIMEOUT_MS = 5000
 RUNTIME_DATABASE_WARM_COOLDOWN_SECONDS = 30.0
 RUNTIME_DATABASE_WARM_LOCK = threading.Lock()
 RUNTIME_DATABASE_WARM_IN_FLIGHT_TOKEN: object | None = None
@@ -682,7 +675,6 @@ SUPPORTED_TEXT_AI_PROVIDERS = {AI_PROVIDER_OPENROUTER, "openai", AI_PROVIDER_DEE
 QUOTE_ARTIFACT_STORAGE_UNAVAILABLE_MESSAGE = "Quote artifact storage is not available in this environment."
 QUOTE_SESSION_STORAGE_UNAVAILABLE_MESSAGE = "Quote session storage is not available in this environment."
 QUOTE_SESSION_RETIRED_MESSAGE = "This quote session is no longer available. Please start a new quote. Contact support if this keeps happening."
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_API_KEY_ENV_NAME = "DEEPSEEK_API_KEY"
 DEFAULT_BOOTH_WIDTH_METRES = 6.0
 DEFAULT_BOOTH_DEPTH_METRES = 6.0
@@ -720,10 +712,7 @@ SENSITIVE_LOG_QUERY_KEYS = {
     "state",
     "token",
 }
-DEEPSEEK_REQUEST_TIMEOUT_SECONDS = 1800
-DEEPSEEK_PRICING_IMPORT_TIMEOUT_SECONDS = 120
 TRANSIENT_OPENAI_HTTP_CODES = {408, 500, 502, 503, 504}
-PROVIDER_CONNECTION_EXCEPTIONS = (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected)
 MAX_PROMPT_CATALOG_ROWS = 180
 MAX_PROMPT_CATALOG_CHARS = 120000
 MAX_PROMPT_CATALOG_DESCRIPTION_CHARS = 180
@@ -750,13 +739,6 @@ class RequestBodyError(ValueError):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
-
-
-class OidcAuthError(RuntimeError):
-    def __init__(self, message: str, *, status: int = 400, reason: str = "oidc_callback_failed") -> None:
-        super().__init__(message)
-        self.status = status
-        self.reason = reason
 
 
 class PlatformLaunchError(RuntimeError):
@@ -2009,11 +1991,6 @@ def postgres_driver_available() -> bool:
     return importlib.util.find_spec("psycopg") is not None
 
 
-def comma_separated_env_values(name: str) -> list[str]:
-    raw = read_dotenv_value(name)
-    return [clean_text(item) for item in raw.split(",") if clean_text(item)]
-
-
 def configured_trusted_proxy_networks() -> tuple[Any, ...]:
     raw = read_dotenv_value(TRUSTED_PROXY_CIDRS_ENV_NAME)
     if not clean_text(raw):
@@ -2037,19 +2014,6 @@ def trusted_proxy_config_complete() -> bool:
     return bool(clean_text(read_dotenv_value(TRUSTED_PROXY_CIDRS_ENV_NAME))) and bool(
         configured_trusted_proxy_networks()
     )
-
-
-def oidc_config() -> dict[str, str]:
-    return {
-        "issuer_url": clean_text(read_dotenv_value(OIDC_ISSUER_URL_ENV_NAME)),
-        "client_id": clean_text(read_dotenv_value(OIDC_CLIENT_ID_ENV_NAME)),
-        "client_secret": clean_text(read_dotenv_value(OIDC_CLIENT_SECRET_ENV_NAME)),
-        "redirect_uri": clean_text(read_dotenv_value(OIDC_REDIRECT_URI_ENV_NAME)),
-        "authorize_url": clean_text(read_dotenv_value(OIDC_AUTHORIZE_URL_ENV_NAME)),
-        "token_url": clean_text(read_dotenv_value(OIDC_TOKEN_URL_ENV_NAME)),
-        "userinfo_url": clean_text(read_dotenv_value(OIDC_USERINFO_URL_ENV_NAME)),
-        "logout_url": clean_text(read_dotenv_value(OIDC_LOGOUT_URL_ENV_NAME)),
-    }
 
 
 def configured_platform_launch_mode() -> str:
@@ -2258,43 +2222,6 @@ def platform_launch_config_complete() -> bool:
     )
 
 
-def allowed_auth_emails() -> set[str]:
-    return {value.lower() for value in comma_separated_env_values(AUTH_ALLOWED_EMAILS_ENV_NAME) if "@" in value}
-
-
-def allowed_auth_domains() -> set[str]:
-    domains = set()
-    for value in comma_separated_env_values(AUTH_ALLOWED_DOMAINS_ENV_NAME):
-        domain = value.lower().removeprefix("@")
-        if re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", domain):
-            domains.add(domain)
-    return domains
-
-
-def auth_allow_any_authenticated_user() -> bool:
-    return configured_bool(AUTH_ALLOW_ANY_AUTHENTICATED_USER_ENV_NAME, False)
-
-
-def auth_allowlist_configured() -> bool:
-    return auth_allow_any_authenticated_user() or bool(allowed_auth_emails() or allowed_auth_domains())
-
-
-def oidc_config_complete() -> bool:
-    config = oidc_config()
-    return bool(
-        deploy_session_secret_ready()
-        and config["issuer_url"]
-        and config["client_id"]
-        and config["client_secret"]
-        and config["redirect_uri"]
-        and config["authorize_url"]
-        and config["token_url"]
-        and config["userinfo_url"]
-        and oidc_config_urls_secure(config)
-        and auth_allowlist_configured()
-    )
-
-
 def auth_required() -> bool:
     if configured_app_mode() == "deploy":
         return configured_bool(AUTH_REQUIRED_ENV_NAME, True)
@@ -2346,24 +2273,6 @@ def deploy_storage_posture_ready() -> bool:
 
 def deploy_requires_storage_guard() -> bool:
     return configured_app_mode() == "deploy" and not deploy_storage_posture_ready()
-
-
-def email_domain(email: str) -> str:
-    normalized = clean_text(email).lower()
-    if "@" not in normalized:
-        return ""
-    return normalized.rsplit("@", 1)[-1]
-
-
-def oidc_claims_allowed(claims: dict[str, Any]) -> bool:
-    if auth_allow_any_authenticated_user():
-        return True
-    email = clean_text(claims.get("email")).lower()
-    if not email:
-        return False
-    if email in allowed_auth_emails():
-        return True
-    return email_domain(email) in allowed_auth_domains()
 
 
 def b64url_encode(raw: bytes) -> str:
@@ -2605,22 +2514,6 @@ def url_uses_https_or_loopback_http(value: str) -> bool:
     return parsed.scheme == "http" and is_loopback_url(value)
 
 
-def oidc_config_urls_secure(
-    config: dict[str, str],
-    *,
-    require_userinfo: bool = True,
-) -> bool:
-    required_urls = [
-        "issuer_url",
-        "redirect_uri",
-        "authorize_url",
-        "token_url",
-    ]
-    if require_userinfo:
-        required_urls.append("userinfo_url")
-    return all(url_uses_https_or_loopback_http(config.get(name, "")) for name in required_urls)
-
-
 def signed_cookie_value(payload: dict[str, Any], *, max_age_seconds: int = SESSION_COOKIE_MAX_AGE_SECONDS) -> str:
     secret = session_secret()
     if not secret:
@@ -2722,102 +2615,6 @@ def cookie_header_value(name: str, value: str, *, max_age: int, path: str = "/",
 
 def clear_cookie_header_value(name: str, path: str = "/") -> str:
     return cookie_header_value(name, "", max_age=0, path=path)
-
-
-def oidc_authorize_url(state: str) -> str:
-    config = oidc_config()
-    authorize_endpoint = config["authorize_url"]
-    params = {
-        "client_id": config["client_id"],
-        "redirect_uri": config["redirect_uri"],
-        "response_type": "code",
-        "scope": "openid email profile",
-        "state": state,
-    }
-    separator = "&" if "?" in authorize_endpoint else "?"
-    return f"{authorize_endpoint}{separator}{urlencode(params)}"
-
-
-def oidc_state_from_cookie(cookie_header: str) -> str:
-    cookies = cookies_from_header(cookie_header)
-    payload = verified_cookie_payload(cookies.get(OIDC_STATE_COOKIE_NAME, ""))
-    return clean_text(payload.get("state")) if payload else ""
-
-
-
-
-def user_from_oidc_claims(claims: dict[str, Any]) -> dict[str, str]:
-    # Retained independent local OIDC component; internal staff login does not use claims.
-    subject = clean_text(claims.get("sub"))
-    return {
-        "subject": subject,
-        "email": clean_text(claims.get("email")),
-        "name": clean_text(claims.get("name")) or clean_text(claims.get("preferred_username")),
-        "account": clean_text(
-            claims.get("account")
-            or claims.get("tenant")
-            or claims.get("tenant_id")
-            or claims.get("organization")
-            or subject
-        ),
-    }
-
-
-def oidc_json_request(request: urllib.request.Request) -> dict[str, Any]:
-    try:
-        with urllib.request.urlopen(request, timeout=OIDC_PROVIDER_TIMEOUT_SECONDS) as response:
-            raw = response.read(OIDC_PROVIDER_MAX_RESPONSE_BYTES + 1)
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError) as exc:
-        raise OidcAuthError("OIDC provider request failed.", status=502, reason="oidc_provider_request_failed") from exc
-    if len(raw) > OIDC_PROVIDER_MAX_RESPONSE_BYTES:
-        raise OidcAuthError("OIDC provider response was too large.", status=502, reason="oidc_provider_response_too_large")
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise OidcAuthError("OIDC provider response was not valid JSON.", status=502, reason="oidc_provider_invalid_json") from exc
-    if not isinstance(payload, dict):
-        raise OidcAuthError("OIDC provider response was not a JSON object.", status=502, reason="oidc_provider_invalid_json")
-    return payload
-
-
-def oidc_exchange_authorization_code(code: str) -> str:
-    config = oidc_config()
-    body = urlencode({
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": config["redirect_uri"],
-        "client_id": config["client_id"],
-        "client_secret": config["client_secret"],
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        config["token_url"],
-        data=body,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        method="POST",
-    )
-    token_response = oidc_json_request(request)
-    access_token = clean_text(token_response.get("access_token"))
-    if not access_token:
-        raise OidcAuthError("OIDC token response did not include an access token.", status=502, reason="oidc_token_missing_access_token")
-    return access_token
-
-
-def oidc_fetch_userinfo(access_token: str) -> dict[str, Any]:
-    request = urllib.request.Request(
-        oidc_config()["userinfo_url"],
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}",
-        },
-        method="GET",
-    )
-    claims = oidc_json_request(request)
-    if not clean_text(claims.get("sub")):
-        raise OidcAuthError("OIDC userinfo response did not include a stable subject.", status=403, reason="oidc_missing_subject")
-    return claims
 
 
 def platform_json_request(
@@ -19279,21 +19076,6 @@ def basis_chat_has_selected_line(payload: dict[str, Any]) -> bool:
 
 
 
-def configured_timeout_seconds(env_name: str, fallback: int) -> int:
-    raw = read_dotenv_value(env_name)
-    if not raw:
-        return fallback
-    try:
-        value = int(float(raw))
-    except ValueError:
-        return fallback
-    return min(max(value, 10), 1800)
-
-
-def configured_openai_timeout_seconds() -> int:
-    return GatewayConfiguration.capture(os.environ.get if configured_app_mode() == "deploy" else read_dotenv_value).timeout_seconds
-
-
 
 
 
@@ -21444,10 +21226,6 @@ def provider_http_error_message(provider: str, exc: urllib.error.HTTPError) -> s
     return result
 
 
-def openai_http_error_message(exc: urllib.error.HTTPError) -> str:
-    return provider_http_error_message("OpenAI", exc)
-
-
 def is_timeout_exception(exc: BaseException) -> bool:
     reason = getattr(exc, "reason", exc)
     reason_text = clean_text(reason).lower()
@@ -21457,23 +21235,6 @@ def is_timeout_exception(exc: BaseException) -> bool:
         or "timed out" in reason_text
         or "timeout" in reason_text
     )
-
-
-def is_transient_openai_error(exc: BaseException) -> bool:
-    if isinstance(exc, urllib.error.HTTPError):
-        return exc.code in TRANSIENT_OPENAI_HTTP_CODES
-    return isinstance(exc, urllib.error.URLError) and not is_timeout_exception(exc)
-
-
-def provider_connection_error_message(provider: str, exc: BaseException) -> str:
-    reason = getattr(exc, "reason", exc)
-    reason_text = clean_text(reason)
-    if is_timeout_exception(exc):
-        kind = "network timeout"
-    else:
-        kind = "connection error"
-    detail = f": {reason_text}" if reason_text else ""
-    return f"{provider} analysis failed due to {kind}{detail}. Check provider status, model availability, and local network, then retry."
 
 
 def response_output_text(data: dict[str, Any]) -> str:
@@ -21695,40 +21456,6 @@ def openai_response_failure_diagnostics(data: Any) -> dict[str, Any]:
     if incomplete_reason:
         diagnostics["incomplete_reason"] = incomplete_reason
     diagnostics.update(provider_error_diagnostics(data.get("error")))
-    return safe_ai_output_diagnostics(diagnostics)
-
-
-def token_usage_diagnostics(data: dict[str, Any]) -> dict[str, int]:
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    mapping = {
-        "prompt_tokens": "input_tokens",
-        "completion_tokens": "output_tokens",
-        "total_tokens": "total_tokens",
-    }
-    diagnostics: dict[str, int] = {}
-    for source_key, target_key in mapping.items():
-        value = usage.get(source_key)
-        if isinstance(value, int) and value >= 0:
-            diagnostics[target_key] = value
-    return diagnostics
-
-
-def chat_completions_output_diagnostics(data: dict[str, Any], output_text: str) -> dict[str, Any]:
-    cleaned = output_text.strip()
-    choices = data.get("choices") if isinstance(data.get("choices"), list) else []
-    diagnostics: dict[str, Any] = {
-        "choice_count": len(choices),
-        "output_length": len(output_text),
-        "output_empty": not bool(cleaned),
-        "output_starts_with_json_object": cleaned.startswith("{"),
-        "output_contains_json_object_bounds": cleaned.find("{") != -1 and cleaned.rfind("}") > cleaned.find("{"),
-        "output_has_markdown_fence": cleaned.startswith("```"),
-        **token_usage_diagnostics(data),
-    }
-    if choices and isinstance(choices[0], dict):
-        finish_reason = clean_text(choices[0].get("finish_reason")).lower()
-        if re.fullmatch(r"[a-z0-9_-]{1,64}", finish_reason):
-            diagnostics["finish_reason"] = finish_reason
     return safe_ai_output_diagnostics(diagnostics)
 
 
@@ -30860,11 +30587,6 @@ def delete_quote_session(session_id: str) -> bool:
         return True
 
 
-def file_data_url(path: Path) -> str:
-    content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    return f"data:{content_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
-
-
 def utc_timestamp() -> str:
     return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
@@ -35369,12 +35091,6 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_auth_page("Platform launch required", "Open this quote runner from an approved workspace.",
                                 action_href=configured_platform_home_url() or "/signed-out", action_label="Back", status=401)
             return
-        if configured_app_mode() == "local" and configured_auth_mode() == "local" and oidc_config_complete():
-            state = secrets.token_urlsafe(24)
-            self.send_redirect(oidc_authorize_url(state), extra_headers=[("Set-Cookie", cookie_header_value(
-                OIDC_STATE_COOKIE_NAME, signed_cookie_value({"state": state}, max_age_seconds=LOGIN_NONCE_TTL_SECONDS),
-                max_age=LOGIN_NONCE_TTL_SECONDS))])
-            return
         if not internal_password_mode_enabled():
             self.send_json({"error": "Not found"}, status=404)
             return
@@ -35475,56 +35191,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if deploy_requires_trusted_proxy_guard() or deploy_requires_auth_guard():
             self.send_json({"status": "blocked", "errors": ["Authentication is not configured."]}, status=503)
             return
-        # Independent local-component contract only; no internal provider callback remains.
-        if configured_app_mode() == "local" and configured_auth_mode() == "local" and oidc_config_complete():
-            self.handle_local_component_oidc_callback(query)
-            return
+        # Retain the guarded refusal for retired callbacks in every auth mode.
         self.send_json({"error": "Not found"}, status=404)
-
-    def handle_local_component_oidc_callback(self, query: str) -> None:
-        params = parse_qs(query, keep_blank_values=True)
-        supplied_state = clean_text((params.get("state") or [""])[0])
-        expected_state = oidc_state_from_cookie(self.headers.get("Cookie", ""))
-        if not supplied_state or not expected_state or not secrets.compare_digest(supplied_state, expected_state):
-            self.send_json({"status": "blocked", "errors": ["OIDC state did not match."]}, status=400)
-            return
-        if params.get("error"):
-            self.send_auth_page(
-                "Sign in was not completed",
-                "OIDC provider returned an error. Try signing in again, or ask the UAT owner to confirm your tester access.",
-                status=400,
-            )
-            return
-        code = clean_text((params.get("code") or [""])[0])
-        if not code:
-            self.send_json({"status": "blocked", "errors": ["OIDC authorization code is missing."]}, status=400)
-            return
-        try:
-            access_token = oidc_exchange_authorization_code(code)
-            claims = oidc_fetch_userinfo(access_token)
-        except OidcAuthError as exc:
-            write_local_log("security_event", {"reason": exc.reason, "path": "/callback", "status": exc.status})
-            self.send_auth_page("Sign in was not completed", str(exc), status=exc.status)
-            return
-        if not oidc_claims_allowed(claims):
-            self.send_auth_page(
-                "Approved tester access required",
-                "Authenticated user is not approved for this internal UAT app.",
-                status=403,
-            )
-            return
-        session_cookie = cookie_header_value(
-            SESSION_COOKIE_NAME,
-            signed_cookie_value({"user": user_from_oidc_claims(claims)}),
-            max_age=SESSION_COOKIE_MAX_AGE_SECONDS,
-        )
-        self.send_redirect(
-            "/",
-            extra_headers=[
-                ("Set-Cookie", session_cookie),
-                ("Set-Cookie", clear_cookie_header_value(OIDC_STATE_COOKIE_NAME)),
-            ],
-        )
 
     def handle_logout(self) -> None:
         session = session_from_cookie_header(self.headers.get("Cookie", ""), auth_state=self.server.internal_auth)
@@ -35928,7 +35596,7 @@ def main() -> int:
         safe_stderr(
             "Refusing deploy mode without Swooshz Platform workspace context. Set "
             "SQAG_PLATFORM_LAUNCH_MODE=platform with an HTTPS SQAG_PLATFORM_BASE_URL and a strong SESSION_SECRET, "
-            "or run APP_MODE=local for localhost-only OIDC component testing.\n"
+            "or run APP_MODE=local for localhost-only use.\n"
         )
         return 2
     if deploy_requires_auth_guard():

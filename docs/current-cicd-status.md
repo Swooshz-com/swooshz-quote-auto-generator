@@ -98,9 +98,9 @@ Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.y
   retrospective job uses its own closed fixture dependency snapshot and does
   not read or install from `requirements.txt`.
 - The retired internal Google verifier no longer adds PyJWT or cryptography
-  to `requirements.txt`. Independent local OIDC and Platform component contracts
-  retain their standard-library HTTP and HMAC session helpers; those helpers do
-  not require the removed packages. Their tests mock identity-provider requests.
+  to `requirements.txt`. The local OIDC provider adapter is retired. Platform
+  contracts retain their standard-library HTTP and HMAC session helpers; those
+  helpers do not require the removed packages. Tests use synthetic dependencies.
 - Installs `pip-audit` and runs `python -m pip_audit -r requirements.txt --strict` against pinned Python dependencies.
 - Installs Playwright Chromium.
 - Starts an isolated disposable PostgreSQL 17 service for migration-ledger

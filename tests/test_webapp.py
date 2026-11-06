@@ -1959,13 +1959,6 @@ class WebappServerTest(unittest.TestCase):
             parsed_body = {}
         return {"status": response.status, "body": parsed_body, "text": text}
 
-    def oidc_login_state(self, runner, opener):
-        with self.assertRaises(urllib.error.HTTPError) as login_redirect:
-            opener.open(f"{runner.base_url}/login", timeout=3)
-        location = login_redirect.exception.headers["Location"]
-        state_cookie = login_redirect.exception.headers["Set-Cookie"]
-        state = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)["state"][0]
-        return state, state_cookie
 
     def test_job_request_limit_covers_documented_reference_upload_capacity(self):
         max_reference_bytes = webapp.MAX_DRAFT_SOURCE_BYTES
@@ -7829,20 +7822,15 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertTrue(state.revoke_session(cookie_payload["session_id"]))
             self.assertIsNone(webapp.session_from_cookie_header(header, auth_state=state))
 
-    def test_local_oidc_component_scaffold_signs_sessions_and_maps_claims(self):
+    def test_local_signed_session_preserves_user_fields(self):
         env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(webapp.SESSION_COOKIE_NAME, "swooshz_quote_session")
             self.assertEqual(webapp.OIDC_STATE_COOKIE_NAME, "swooshz_quote_oidc_state")
-            self.assertTrue(webapp.oidc_config_complete())
+            self.assertEqual(webapp.configured_auth_mode(), "local")
             self.assertFalse(webapp.deploy_requires_auth_guard())
             cookie = webapp.signed_cookie_value({
-                "user": webapp.user_from_oidc_claims({
-                    "sub": "user-123",
-                    "email": "alex@example.com",
-                    "name": "Alex Tan",
-                    "tenant_id": "account-456",
-                })
+                "user": {"subject": "user-123", "email": "alex@example.com", "name": "Alex Tan", "account": "account-456"}
             })
 
             session = webapp.session_from_cookie_header(f"{webapp.SESSION_COOKIE_NAME}={cookie}")
@@ -7862,12 +7850,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             QUOTE_LOG_ROOT=str(runtime_root / "logs"),
         )
         oidc_session = {
-            "user": webapp.user_from_oidc_claims({
-                "sub": "oidc-user-without-platform-workspace",
-                "email": "alex@example.com",
-                "name": "Synthetic OIDC User",
-                "tenant_id": "untrusted-oidc-account",
-            })
+            "user": {"subject": "oidc-user-without-platform-workspace", "email": "alex@example.com", "name": "Synthetic OIDC User", "account": "untrusted-oidc-account"}
         }
 
         with mock.patch.dict(os.environ, env, clear=True):
@@ -7979,13 +7962,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(app['status'], 503)
         self.assertEqual(health['status'], 200)
 
-    def test_local_oidc_component_mode_does_not_require_platform_workspace_launch(self):
+    def test_local_mode_does_not_require_platform_workspace_launch(self):
         with mock.patch.dict(os.environ, self.deploy_auth_env(APP_MODE="local"), clear=True):
             self.assertFalse(webapp.deploy_requires_platform_workspace_guard())
 
     def test_deploy_legacy_oidc_allowlist_escape_hatches_never_satisfy_auth(self):
         with mock.patch.dict(os.environ, self.deploy_auth_env(OIDC_AUTHORIZE_URL=""), clear=True):
-            self.assertFalse(webapp.oidc_config_complete())
             self.assertTrue(webapp.deploy_requires_auth_guard())
 
         base = self.deploy_auth_env(AUTH_ALLOWED_EMAILS="", AUTH_ALLOWED_DOMAINS="")
@@ -8013,14 +7995,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         with mock.patch.dict(os.environ, self.deploy_auth_env(SESSION_SECRET="short"), clear=True):
             status = webapp.deploy_uat_preflight_status()
 
-            self.assertFalse(webapp.oidc_config_complete())
             self.assertTrue(webapp.deploy_requires_auth_guard())
         self.assertTrue(any(check["name"] == "SESSION_SECRET" and not check["ok"] for check in status["checks"]))
 
         with mock.patch.dict(os.environ, self.deploy_auth_env(OIDC_TOKEN_URL="http://identity.example/token"), clear=True):
             status = webapp.deploy_uat_preflight_status()
 
-            self.assertFalse(webapp.oidc_config_complete())
             self.assertTrue(webapp.deploy_requires_auth_guard())
         self.assertTrue(
             any(
@@ -8083,115 +8063,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn(f'href="{platform_url}/">Sign in again</a>', signed_out_html)
         self.assertIn(f'href="{platform_url}/">Back</a>', login_html)
 
-    def test_local_oidc_callback_exchanges_code_fetches_userinfo_and_sets_session_cookie(self):
-        env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
-        opener = self.no_redirect_opener()
-        with mock.patch.dict(os.environ, env, clear=True):
-            with LocalRunnerServer() as runner:
-                state, state_cookie = self.oidc_login_state(runner, opener)
 
-                self.assertNotIn("Secure", state_cookie)
-                self.assertIn("HttpOnly", state_cookie)
-                self.assertIn("SameSite=Lax", state_cookie)
 
-                callback_request = urllib.request.Request(
-                    f"{runner.base_url}/callback?state={urllib.parse.quote(state)}&code=fake-code",
-                    headers={"Cookie": state_cookie.split(";", 1)[0]},
-                )
-                with mock.patch.object(
-                    webapp.urllib.request,
-                    "urlopen",
-                    side_effect=[
-                        JsonResponseMock({"access_token": "access-token-secret", "token_type": "Bearer"}),
-                        JsonResponseMock({"sub": "user-123", "email": "alex@example.com", "name": "Alex Tan"}),
-                    ],
-                ) as provider_urlopen:
-                    with self.assertRaises(urllib.error.HTTPError) as callback_redirect:
-                        opener.open(callback_request, timeout=3)
 
-                self.assertEqual(callback_redirect.exception.code, 302)
-                self.assertEqual(callback_redirect.exception.headers["Location"], "/")
-                set_cookies = callback_redirect.exception.headers.get_all("Set-Cookie")
-                self.assertEqual(provider_urlopen.call_count, 2)
-                token_request = provider_urlopen.call_args_list[0].args[0]
-                token_body = urllib.parse.parse_qs(token_request.data.decode("utf-8"))
-                self.assertEqual(token_request.full_url, env["OIDC_TOKEN_URL"])
-                self.assertEqual(token_body["code"], ["fake-code"])
-                self.assertEqual(token_body["client_secret"], [env["OIDC_CLIENT_SECRET"]])
-                self.assertEqual(provider_urlopen.call_args_list[1].args[0].full_url, env["OIDC_USERINFO_URL"])
-                self.assertIn("Bearer access-token-secret", provider_urlopen.call_args_list[1].args[0].headers["Authorization"])
-                self.assertTrue(any(cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}=") for cookie in set_cookies))
-                self.assertTrue(any(cookie.startswith(f"{webapp.OIDC_STATE_COOKIE_NAME}=") and "Max-Age=0" in cookie for cookie in set_cookies))
-                session_cookie = next(cookie.split(";", 1)[0] for cookie in set_cookies if cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}="))
-                session_request = urllib.request.Request(f"{runner.base_url}/api/session", headers={"Cookie": session_cookie})
-                session_body = json.loads(opener.open(session_request, timeout=3).read().decode("utf-8"))
-
-        self.assertTrue(session_body["authenticated"])
-        self.assertEqual(session_body["user"]["subject"], "user-123")
-        self.assertEqual(session_body["user"]["email"], "alex@example.com")
-        self.assertEqual(session_body["user"]["name"], "Alex Tan")
-        self.assertTrue(session_body["permissions"]["canGenerateQuote"])
-        self.assertTrue(session_body["permissions"]["canManageProfiles"])
-
-    def test_local_oidc_callback_accepts_approved_tester_domain(self):
-        env = self.deploy_auth_env(
-            APP_MODE="local",
-            USER_TYPE="ADMIN",
-            AUTH_ALLOWED_EMAILS="",
-            AUTH_ALLOWED_DOMAINS="example.com",
-        )
-        opener = self.no_redirect_opener()
-        with mock.patch.dict(os.environ, env, clear=True):
-            with LocalRunnerServer() as runner:
-                state, state_cookie = self.oidc_login_state(runner, opener)
-                callback_request = urllib.request.Request(
-                    f"{runner.base_url}/callback?state={urllib.parse.quote(state)}&code=fake-code",
-                    headers={"Cookie": state_cookie.split(";", 1)[0]},
-                )
-                with mock.patch.object(
-                    webapp.urllib.request,
-                    "urlopen",
-                    side_effect=[
-                        JsonResponseMock({"access_token": "access-token-secret", "token_type": "Bearer"}),
-                        JsonResponseMock({"sub": "domain-user-123", "email": "alex@example.com", "name": "Alex Tan"}),
-                    ],
-                ):
-                    with self.assertRaises(urllib.error.HTTPError) as callback_redirect:
-                        opener.open(callback_request, timeout=3)
-                set_cookies = callback_redirect.exception.headers.get_all("Set-Cookie")
-
-        self.assertEqual(callback_redirect.exception.code, 302)
-        self.assertEqual(callback_redirect.exception.headers["Location"], "/")
-        self.assertTrue(any(cookie.startswith(f"{webapp.SESSION_COOKIE_NAME}=") for cookie in set_cookies))
-
-    def test_local_oidc_callback_rejects_missing_userinfo_subject_generically(self):
-        env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
-        opener = self.no_redirect_opener()
-        with mock.patch.dict(os.environ, env, clear=True):
-            with LocalRunnerServer() as runner:
-                state, state_cookie = self.oidc_login_state(runner, opener)
-                callback_request = urllib.request.Request(
-                    f"{runner.base_url}/callback?state={urllib.parse.quote(state)}&code=fake-code",
-                    headers={"Cookie": state_cookie.split(";", 1)[0]},
-                )
-                with mock.patch.object(
-                    webapp.urllib.request,
-                    "urlopen",
-                    side_effect=[
-                        JsonResponseMock({"access_token": "access-token-secret", "token_type": "Bearer"}),
-                        JsonResponseMock({"email": "alex@example.com", "name": "Alex Tan"}),
-                    ],
-                ):
-                    with self.assertRaises(urllib.error.HTTPError) as callback_error:
-                        opener.open(callback_request, timeout=3)
-                body = callback_error.exception.read().decode("utf-8")
-
-        self.assertEqual(callback_error.exception.code, 403)
-        self.assertIn("stable subject", body)
-        for sensitive in ("alex@example.com", "Alex Tan", "access-token-secret", env["OIDC_CLIENT_SECRET"], "fake-code"):
-            self.assertNotIn(sensitive, body)
-
-    def test_local_oidc_authenticated_dashboard_access_works_with_signed_session(self):
+    def test_local_signed_cookie_dashboard_access_works(self):
         env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
         opener = self.no_redirect_opener()
         with mock.patch.dict(os.environ, env, clear=True):
@@ -8209,67 +8084,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Quote List", body)
         self.assertIn("topbarAuthState", body)
 
-    def test_local_oidc_callback_denies_unapproved_tester_without_leaking_claims_or_secrets(self):
-        env = self.deploy_auth_env(
-            APP_MODE="local",
-            USER_TYPE="ADMIN",
-            AUTH_ALLOWED_EMAILS="alex@example.com",
-            AUTH_ALLOWED_DOMAINS="",
-        )
-        opener = self.no_redirect_opener()
-        with mock.patch.dict(os.environ, env, clear=True):
-            with LocalRunnerServer() as runner:
-                state, state_cookie = self.oidc_login_state(runner, opener)
-                callback_request = urllib.request.Request(
-                    f"{runner.base_url}/callback?state={urllib.parse.quote(state)}&code=fake-code",
-                    headers={"Cookie": state_cookie.split(";", 1)[0]},
-                )
-                with mock.patch.object(
-                    webapp.urllib.request,
-                    "urlopen",
-                    side_effect=[
-                        JsonResponseMock({"access_token": "access-token-secret", "token_type": "Bearer"}),
-                        JsonResponseMock({"sub": "user-456", "email": "blocked@example.com", "name": "Blocked User"}),
-                    ],
-                ):
-                    with self.assertRaises(urllib.error.HTTPError) as denied_error:
-                        opener.open(callback_request, timeout=3)
-                body = denied_error.exception.read().decode("utf-8")
 
-        self.assertEqual(denied_error.exception.code, 403)
-        self.assertIn("not approved", body)
-        for sensitive in (
-            "blocked@example.com",
-            "Blocked User",
-            "access-token-secret",
-            env["OIDC_CLIENT_SECRET"],
-            env["SESSION_SECRET"],
-            "fake-code",
-        ):
-            self.assertNotIn(sensitive, body)
-
-    def test_local_oidc_callback_rejects_state_provider_error_and_missing_code_safely(self):
-        env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
-        opener = self.no_redirect_opener()
-        with mock.patch.dict(os.environ, env, clear=True):
-            with LocalRunnerServer() as runner:
-                state, state_cookie = self.oidc_login_state(runner, opener)
-                cases = [
-                    (f"{runner.base_url}/callback?state=wrong&code=fake-code", 400, "OIDC state did not match."),
-                    (f"{runner.base_url}/callback?state={urllib.parse.quote(state)}&error=access_denied", 400, "OIDC provider returned an error."),
-                    (f"{runner.base_url}/callback?state={urllib.parse.quote(state)}", 400, "OIDC authorization code is missing."),
-                ]
-                for url, status, expected_error in cases:
-                    with self.subTest(url=url):
-                        request = urllib.request.Request(url, headers={"Cookie": state_cookie.split(";", 1)[0]})
-                        with self.assertRaises(urllib.error.HTTPError) as callback_error:
-                            opener.open(request, timeout=3)
-                        body = callback_error.exception.read().decode("utf-8")
-                        self.assertEqual(callback_error.exception.code, status)
-                        self.assertIn(expected_error, body)
-                        self.assertNotIn(env["OIDC_CLIENT_SECRET"], body)
-                        self.assertNotIn(env["SESSION_SECRET"], body)
-                        self.assertNotIn("fake-code", body)
 
     def test_deploy_oidc_callback_access_log_redacts_sensitive_query_values(self):
         written: list[str] = []
@@ -8859,12 +8674,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_platform_deploy_rejects_legacy_oidc_session_cookie_and_permissions(self):
         env = self.platform_launch_env(AUTH_APPROVED_TESTER_ROLE="admin")
         legacy_session = {
-            "user": webapp.user_from_oidc_claims({
-                "sub": "legacy-oidc-user",
-                "email": "legacy@example.test",
-                "name": "Legacy OIDC User",
-                "tenant_id": "untrusted-oidc-account",
-            })
+            "user": {"subject": "legacy-oidc-user", "email": "legacy@example.test", "name": "Legacy OIDC User", "account": "untrusted-oidc-account"}
         }
         valid_platform_session = self.platform_auth_session()
 
@@ -8895,11 +8705,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_platform_deploy_legacy_oidc_cookie_cannot_reach_session_or_ai_import_preview(self):
         env = self.platform_launch_env(AUTH_APPROVED_TESTER_ROLE="admin")
         legacy_session = {
-            "user": webapp.user_from_oidc_claims({
-                "sub": "legacy-oidc-user",
-                "email": "legacy@example.test",
-                "name": "Legacy OIDC User",
-            })
+            "user": {"subject": "legacy-oidc-user", "email": "legacy@example.test", "name": "Legacy OIDC User", "account": "legacy-oidc-user"}
         }
         with mock.patch.dict(os.environ, env, clear=True):
             legacy_cookie = (
@@ -8934,14 +8740,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(preview_response["body"]["status"], "auth_required")
         import_preview.assert_not_called()
 
-    def test_local_oidc_component_session_remains_accepted(self):
+    def test_local_legacy_signed_session_remains_accepted(self):
         env = self.deploy_auth_env(APP_MODE="local", USER_TYPE="ADMIN")
         local_session = {
-            "user": webapp.user_from_oidc_claims({
-                "sub": "local-oidc-user",
-                "email": "local@example.test",
-                "name": "Local OIDC User",
-            })
+            "user": {"subject": "local-oidc-user", "email": "local@example.test", "name": "Local OIDC User", "account": "local-oidc-user"}
         }
         with mock.patch.dict(os.environ, env, clear=True):
             cookie = (
@@ -8966,14 +8768,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 f"{webapp.OIDC_STATE_COOKIE_NAME}="
                 f"{webapp.signed_cookie_value({'state': 'legacy-state'}, max_age_seconds=600)}"
             )
-            with (
-                mock.patch.object(webapp, "oidc_exchange_authorization_code", return_value="legacy-access-token") as exchange,
-                mock.patch.object(
-                    webapp,
-                    "oidc_fetch_userinfo",
-                    return_value={"sub": "legacy-user", "email": "alex@example.com"},
-                ) as userinfo,
-            ):
+            with mock.patch.object(
+                webapp.urllib.request, "urlopen", side_effect=AssertionError("provider call")
+            ) as provider_urlopen:
                 with LocalRunnerServer() as runner:
                     request = urllib.request.Request(
                         f"{runner.base_url}/callback?state=legacy-state&code=legacy-code",
@@ -8984,8 +8781,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
         self.assertEqual(callback_error.exception.code, 503)
         self.assertFalse(callback_error.exception.headers.get_all("Set-Cookie"))
-        exchange.assert_not_called()
-        userinfo.assert_not_called()
+        provider_urlopen.assert_not_called()
 
     def test_platform_logout_rejects_legacy_cookie_and_unsafe_get(self):
         env = self.platform_launch_env(

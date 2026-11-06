@@ -20,11 +20,11 @@ details.
 
 `APP_MODE=deploy` with `SQAG_AUTH_MODE=platform` requires a complete Platform launch configuration. A
 standalone OIDC session has no Platform workspace, membership role, or app
-entitlement and therefore cannot start the hosted SQAG process. OIDC helpers
-remain available only for localhost/local component testing; SQAG must not
-manufacture a workspace from OIDC tenant or account claims.
+entitlement and therefore cannot start the hosted SQAG process. The local OIDC
+adapter is retired; SQAG must not manufacture a workspace from OIDC tenant or
+account claims.
 
-Every authenticated deploy request also requires complete signed Platform
+Every authenticated Platform deploy request also requires complete signed Platform
 session provenance: consumed outcome, Platform user id, workspace id, SQAG app
 key, and a supported membership role. Legacy OIDC-only cookies remain
 cryptographically valid only until their original expiry, but deploy mode

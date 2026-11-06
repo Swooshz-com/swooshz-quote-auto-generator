@@ -32,10 +32,11 @@ Recommended app settings:
 - Auth posture: `AUTH_REQUIRED=true`, a host-secret-managed `SESSION_SECRET`
   of at least 32 characters, a dedicated host-secret-managed
   `SQAG_TRACKING_HMAC_KEY`, non-secret `SQAG_TRACKING_HMAC_KEY_VERSION`
-  configuration matching the runtime format,
-  `SQAG_PLATFORM_LAUNCH_MODE=platform`, and an HTTPS `SQAG_PLATFORM_BASE_URL`
-  except for explicit loopback-only local smoke endpoints. Standalone OIDC
-  does not establish a workspace and cannot start deploy mode.
+  configuration matching the runtime format. Internal staff access uses
+  `SQAG_AUTH_MODE=internal_password` with the settings in [staff access](../../../docs/internal-password-auth-mode.md).
+  The independent Platform lane uses `SQAG_PLATFORM_LAUNCH_MODE=platform` and
+  an HTTPS `SQAG_PLATFORM_BASE_URL`. The local OIDC adapter is retired and
+  cannot establish a workspace or satisfy deploy authentication.
 - Proxy posture: `SQAG_TRUSTED_PROXY_CIDRS` contains only the exact CIDR or
   comma-separated CIDRs of the Coolify/Traefik proxy peers that connect
   directly to SQAG. Do not use a trust-all network. Missing or malformed proxy
