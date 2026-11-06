@@ -151,6 +151,13 @@ the owner-approved CI lane.
   nulls and labelled subtotals, optional admin-set tax, safe error shapes,
   idempotency replay/conflict/expiry, owner isolation, confirmation, closed state
   transitions, endpoint agreement, JSON/XLSX/PDF contracts and sandbox limits.
+  Exact service request fields, required confirmation revisions, per-operation
+  authentication, staff-session/CSRF reservations and authenticated staff-row
+  pricing on the shared endpoint are pinned against the actual schemas. Direct
+  boundary tests cover money/rates, units, notes and polling independently of
+  arithmetic. Migration wording, priced revision visibility and response evolution
+  are checked too. Run `python -m unittest tests.test_sensitive_fixture_scan` for
+  the path/category-specific documentation exceptions and secret-marker controls.
   It imports no app runtime and proves no real HTTP admission, authentication,
   durable queue/recovery, media limits, artifact privacy/fidelity or retention
   execution. Those require later implementation tests and independent review.

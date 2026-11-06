@@ -3,11 +3,14 @@
   "info": {
     "title": "Quotation API v1 contract proposal",
     "version": "1.0.0",
-    "description": "Contract proposal, not implemented. Offline docs and fake contract tests only."
+    "description": "Contract proposal, not implemented. Offline docs and fake contract tests only. External schemas and persisted-state policies apply to service callers. Reserved S3a staff contracts retain existing checks and non-persisting pre-save pricing; complete staff mappings before freezing their types."
   },
   "security": [
     {
       "ServiceCredential": []
+    },
+    {
+      "StaffSession": []
     }
   ],
   "paths": {
@@ -118,7 +121,13 @@
               }
             }
           }
-        }
+        },
+        "x-staff-mutation-security": [
+          {
+            "StaffSession": [],
+            "StaffCsrf": []
+          }
+        ]
       }
     },
     "/api/v1/quote-requests/{id}/drafts": {
@@ -229,7 +238,13 @@
               }
             }
           }
-        }
+        },
+        "x-staff-mutation-security": [
+          {
+            "StaffSession": [],
+            "StaffCsrf": []
+          }
+        ]
       }
     },
     "/api/v1/quote-steps/price": {
@@ -325,7 +340,15 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PriceRequest"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PriceRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/StaffPriceRequest"
+                  }
+                ],
+                "description": "Documentation union only, not an authentication discriminator. The server selects exactly one branch from the authenticated credential before validation."
               },
               "example": {
                 "quote_request_id": "qr-example",
@@ -333,6 +356,21 @@
                 "confirmed_basis_revision": 1
               }
             }
+          }
+        },
+        "x-staff-mutation-security": [
+          {
+            "StaffSession": [],
+            "StaffCsrf": []
+          }
+        ],
+        "description": "Staff and service callers must use this same endpoint and QuoteApplicationService for match/normalise/price. Derive the request schema and response view from authenticated credentials, never body fields. Staff edits do not create a saved quote or grant copied authority.",
+        "x-auth-request-schemas": {
+          "ServiceCredential": {
+            "$ref": "#/components/schemas/PriceRequest"
+          },
+          "StaffSession": {
+            "$ref": "#/components/schemas/StaffPriceRequest"
           }
         }
       }
@@ -450,7 +488,13 @@
               }
             }
           }
-        }
+        },
+        "x-staff-mutation-security": [
+          {
+            "StaffSession": [],
+            "StaffCsrf": []
+          }
+        ]
       }
     },
     "/api/v1/jobs/{job_id}": {
@@ -594,7 +638,8 @@
                   "expires_at": "2026-12-06T00:00:00Z",
                   "links": {
                     "request": "/api/v1/quote-requests/qr-example"
-                  }
+                  },
+                  "priced_basis_revision": null
                 }
               }
             }
@@ -1038,7 +1083,8 @@
             "basis_revision": 1,
             "confirmed_basis_revision": 1
           }
-        ]
+        ],
+        "description": "Service-credential requests only: request ID plus persisted basis and confirmation revisions. No rows, prices, grants, price-book selectors, tax, callback or catalog overrides."
       },
       "ExportRequest": {
         "type": "object",
@@ -1232,12 +1278,24 @@
           },
           "links": {
             "$ref": "#/components/schemas/Links"
+          },
+          "priced_basis_revision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Revision"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null until successful pricing; equals the current basis revision once priced. Reset on basis/book/layout changes. Pricing completion can still contain unresolved lines."
           }
         },
         "required": [
           "quote_request_id",
           "state",
           "basis_revision",
+          "priced_basis_revision",
           "basis",
           "uploads_expire_at",
           "expires_at",
@@ -1267,7 +1325,8 @@
             "expires_at": "2026-12-06T00:00:00Z",
             "links": {
               "request": "/api/v1/quote-requests/qr-example"
-            }
+            },
+            "priced_basis_revision": null
           }
         ]
       },
@@ -1738,6 +1797,96 @@
             }
           }
         ]
+      },
+      "StaffBasisRow": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Reserved S3a staff-edited basis row. Selection references are revalidated against existing admitted grants, owner, row and current price-book revision; they grant no authority.",
+        "properties": {
+          "row_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32,
+                "pattern": "^(?!m2$).+$(?![\\s\\S])"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "selections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "maxItems": 32,
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "row_id",
+          "description",
+          "quantity",
+          "unit",
+          "selections"
+        ]
+      },
+      "StaffPriceRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Reserved for S3a, not implemented. Staff only, selected from validated session before body validation. Pre-save normalisation is non-persisting; optional request/revision binds existing work only after owner/edit checks. No copied selection grants authority.",
+        "properties": {
+          "quote_request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "basis_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StaffBasisRow"
+            },
+            "minItems": 1,
+            "maxItems": 500
+          }
+        },
+        "required": [
+          "rows"
+        ],
+        "examples": [
+          {
+            "rows": [
+              {
+                "row_id": "row-example",
+                "description": "Synthetic edited surface",
+                "quantity": 12,
+                "unit": "sqm",
+                "selections": []
+              }
+            ]
+          }
+        ]
       }
     },
     "securitySchemes": {
@@ -1746,6 +1895,18 @@
         "in": "header",
         "name": "X-SQAG-Service-Authorization",
         "description": "One revocable caller-and-tenant binding; never browser-held."
+      },
+      "StaffSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "swooshz_quote_session",
+        "description": "Reserved for S3a, not implemented. Validated staff session; existing role/owner/edit checks select the internal view."
+      },
+      "StaffCsrf": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Swooshz-CSRF",
+        "description": "Reserved for S3a, not implemented. Every staff mutation requires the session-bound CSRF header and same-origin admission; use the existing configured header name."
       }
     },
     "parameters": {
@@ -2629,5 +2790,51 @@
     "raw_source",
     "private_path",
     "provider_response"
-  ]
+  ],
+  "x-auth-projections": {
+    "selector": "authenticated_credential",
+    "client_selector_allowed": false,
+    "mixed_credentials": "reject",
+    "shared_service": "QuoteApplicationService",
+    "shared_steps_required": [
+      "draft",
+      "match",
+      "price",
+      "xlsx",
+      "pdf",
+      "poll",
+      "artifact"
+    ],
+    "ServiceCredential": {
+      "view": "CustomerEstimateView",
+      "request_mode": "closed_service_schema"
+    },
+    "StaffSession": {
+      "view": "staff_internal",
+      "implementation_slice": "S3a",
+      "request_mode": "staff_schema",
+      "preserve_owner_edit_grant_checks": true
+    },
+    "internal_only": [
+      "review_choices",
+      "profiles",
+      "pricing_references",
+      "basis_chat",
+      "saved_sessions",
+      "ai_spend",
+      "admin",
+      "audit",
+      "support",
+      "platform_launch"
+    ]
+  },
+  "x-response-evolution": {
+    "clients_ignore_unknown_response_fields": true,
+    "server_projection_remains_closed": true,
+    "requests_remain_closed": true
+  },
+  "x-result-publication": {
+    "requires_artifact_export": true,
+    "json_only_export": false
+  }
 }

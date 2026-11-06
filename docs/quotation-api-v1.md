@@ -9,7 +9,8 @@ the safe view to the customer's hosted page. Customers never call this API direc
 Start with synthetic sandbox/test tenants. The main platform creates accounts;
 account creation, billing and public exposure are outside this contract slice.
 The [OpenAPI spec](quotation-api-v1.openapi.json) defines the external service
-schemas. Both files are directly maintained; contract tests check their agreement.
+schemas and reserves the staff-authenticated price schema for S3a. Both files are
+directly maintained; contract tests check their agreement.
 Its `x-` extensions record non-schema policies, including unknown-query rejection,
 state transitions, confirmation, money, replay, quotas and retention. A generic
 OpenAPI validator does not enforce those extensions or cross-field arithmetic.
@@ -17,18 +18,45 @@ OpenAPI validator does not enforce those extensions or cross-field arithmetic.
 One future quote application service owns admission, immutable authority snapshots,
 state, worker claims, pricing and publication. HTTP adapters call that service,
 never other HTTP handlers. Inject the clock, queue, storage and AI gateway.
-Later staff-app transport may use this service with an authorised richer projection.
-That change is invisible and preserves the current UI and workflow. Staff sessions,
-CSRF, owner/edit checks and internal-only endpoints remain separate. Settings,
-pricing imports, saved-session management, basis chat and operational tools are
-internal-only. The spec grants service callers none of those capabilities.
+In S3a the staff UI must use the same `/api/v1` endpoints and application service
+as external callers for draft, match, price and XLSX/PDF output, including polling
+and artifact delivery. Transport changes must preserve the current UI and workflow.
+The server derives the caller view from the authenticated credential, never a client
+flag. A validated staff session selects the authorised internal projection; a service
+credential selects only CustomerEstimateView. Staff mutations retain same-origin
+and session-bound CSRF checks, plus current role/owner/edit and grant checks.
+Settings, pricing imports, saved-session management, basis chat, review choices,
+profiles, AI spend, admin, audit and operational tools stay on internal endpoints;
+they are never exposed by the external API.
+
+### Staff UI migration in S3a
+
+Every move below is mandatory and uses the same application service. Existing
+staff payload/response mapping is retained by authenticated adapters, with richer
+staff draft/export/read schemas completed in S3a. There is no second matcher or
+generation engine and no failed-request fallback to legacy routes.
+
+| Staff UI call today | Required destination or retained internal route |
+| --- | --- |
+| Draft `startJob`, recovery `type=draft` via `POST /api/jobs` | Move to `/api/v1/quote-requests/{id}/drafts`, sharing create/draft orchestration. |
+| `generate`/`generate_pdf` jobs and recovery | Move to `/api/v1/quote-requests/{id}/exports`; keep Excel default and explicit PDF. |
+| Quote-job `pollJob`, normal and restored polling via `GET /api/jobs/<id>` | Move to `/api/v1/jobs/{job_id}`; restored job type selects routing. Basis-chat polling stays internal. |
+| All three `/api/line-items/normalize` calls, including duplicate/Modify before first save | Move to `/api/v1/quote-steps/price`; preserve editable rows and grant checks without saving a new quote or granting copied authority. |
+| Output/download/PDF-view anchors, dashboard actions and saved-list/detail output URLs | Move to v1 proof-bound artifact URLs; retain staff PDF inline disposition. These include navigations, not only fetch calls. |
+| `basis_chat` dispatch and lookups via old POST/GET jobs | Stay internal, selected by fixed operation allowlist; no generic external job-type passthrough. |
+| `/api/quote-sessions/pricing-selections` | Stay internal; `apply_pricing_selections` admits authority, then uses the shared pricing service. |
+| `/api/quote-sessions` save/list/detail/delete/retry | Stay internal for autosave, dashboard, restoration, duplicate/Modify and spend; share repositories and publication reader. |
+| `/api/settings/profiles...`, `/api/profiles` save/delete/export/read | Stay internal. |
+| `/api/settings/pricing-references...`, `/api/pricing-reference/template.xlsx` detail/preview/save/delete/import/download | Stay internal. |
+| `/api/feedback...`, `/api/session`, `/api/log`, `/api/health`, `/logout` | Stay internal; health retains its existing public policy. |
+| AI spend/admin/audit/support and Platform launch/finalisation | Stay internal; no new UI fetch is implied. |
 
 ## Authentication and tenant isolation
 
-Require TLS in a later authorised environment and exactly one nonblank
-`X-SQAG-Service-Authorization` header. Reject duplicates, comma combinations,
+Require TLS in a later authorised environment. Service callers supply exactly one
+nonblank `X-SQAG-Service-Authorization` header. Reject duplicates, comma combinations,
 mixed staff/service authentication and browser-origin service requests. Never put
-credentials in a browser, body, URL, artifact link or log. The platform launch
+service credentials in a browser, body, URL, artifact link or log. The platform launch
 credential is not quote authority. Compare fixed-length credential verifiers in
 constant time; absent and unknown credentials follow an equivalent denial path.
 
@@ -38,11 +66,20 @@ the verifier atomically while retaining that subject and ownership; the old
 credential stops working. Revocation blocks admission, polling, replay and downloads.
 No credential is created or changed by this proposal.
 
+The reserved StaffSession and StaffCsrf schemes describe S3a, not implemented
+authentication. Read operations require the staff session; every staff POST also
+requires its bound CSRF header. Global security applies to every operation with no
+anonymous override. Reject mixed staff/service credentials before schema selection.
+The price request's schema union is documentation, not authority: select its branch
+from authenticated identity before validation, never by testing which body fits.
+Staff request/response reservations are completed in S3a before their types freeze;
+the external service schemas cannot be widened by that work.
+
 Derive tenant and caller solely from validated credentials. Scope every request,
 job, receipt and artifact lookup to both tenant and exact service owner. Foreign
 and missing IDs produce the same 404. Staff authority does not grant service
 ownership or vice versa. There is no cross-caller sharing or tenant override.
-The tenant admin picks the active price book and profile. Callers cannot select,
+The tenant admin picks the active price book and profile. Service callers cannot select,
 upload or replace pricing authority. Capture the selected `pricing-catalog.json`,
 `quotation-layout.xlsx` and `layout-rules.json` revisions before analysis.
 Missing or ambiguous configuration blocks work without a bundled/default fallback.
@@ -59,7 +96,9 @@ measurements, materials, inclusions and explicit unknowns. Swooshz Design must
 confirm that basis before pricing, by sending equal current `basis_revision` and
 `confirmed_basis_revision` values to the price step. Confirmation is not inferred
 from successful analysis. Exports require successful pricing of that same confirmed
-revision. A changed basis, book or layout invalidates prior confirmation, prices
+revision. BasisView exposes nullable `priced_basis_revision`: null before pricing,
+then the current revision after success, even when some prices remain unresolved.
+A changed basis, book or layout resets it and invalidates prior confirmation, prices
 and links; stale commands return BASIS_STALE. Revise notes and queue another draft
 to resolve scope; no internal brief file is exposed for user approval.
 
@@ -68,7 +107,9 @@ to resolve scope; no internal brief file is exposed for user approval.
 All paths use `/api/v1`. POST operations return 202 only after durable admission,
 with Location, Retry-After and safe links. Poll first; there are no webhooks.
 No query parameters are accepted, including `view=internal`. Unknown JSON fields
-are rejected recursively. Schema checks supplement, never replace, authorisation.
+are rejected recursively within the selected auth schema. The four external request
+schemas are closed service contracts; richer staff contracts cannot relax them.
+Schema checks supplement, never replace, authorisation.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -81,13 +122,22 @@ are rejected recursively. Schema checks supplement, never replace, authorisation
 | GET | `/api/v1/quote-requests/{id}/result` | Read committed estimate. |
 | GET | `/api/v1/quote-requests/{id}/artifacts/{kind}` | Read authenticated estimate artifact. |
 
-The price step queues pricing; it does not accept editable rows or caller prices.
+For service callers the price step accepts only the request ID and persisted basis
+revision with explicit confirmation, never editable rows, prices, grants or catalog
+overrides. For staff-authenticated callers only, the same endpoint and service must
+accept staff-edited basis rows with quantities, units and selection references via
+StaffPriceRequest. Selection references convey no authority: revalidate previously
+admitted selections and grants against current owner, row and price-book revision.
+Staff pricing before the first save is non-persisting and cannot grant copied
+authority. Full staff field mapping is completed in S3a under existing checks.
 Exports request XLSX, PDF or both; the first external slice offers JSON plus both
 formats. PDF conversion already exists internally, but external estimate safety
 and fidelity still need qualification. Artifact GET is an authenticated byte stream
 with the declared XLSX or PDF media type, not a JSON body. It rechecks owner,
 current publication proof, authority revision, expiry and exact bytes. Links are
 not bearer authority. A result before committed publication returns RESULT_NOT_READY.
+JSON-only use still requires an export requesting at least one XLSX/PDF artifact;
+this is intentional for v1. Result JSON is committed with that publication.
 All JSON, errors and downloads use `Cache-Control: private, no-store`.
 
 ## JSON examples
@@ -96,6 +146,22 @@ All values are reserved synthetic examples. The tiny PNG is a schema fixture,
 not proof of a usable booth design. Each labelled example names its spec schema.
 Headers supply credentials securely outside these bodies, and every POST also
 requires an `Idempotency-Key`, for example `request-example-001`.
+
+### StaffPriceRequest
+
+```json
+{
+  "rows": [
+    {
+      "row_id": "row-example",
+      "description": "Synthetic edited surface",
+      "quantity": 12,
+      "unit": "sqm",
+      "selections": []
+    }
+  ]
+}
+```
 
 ### CreateQuoteRequest
 
@@ -183,7 +249,8 @@ requires an `Idempotency-Key`, for example `request-example-001`.
   "expires_at": "2026-12-06T00:00:00Z",
   "links": {
     "request": "/api/v1/quote-requests/qr-example"
-  }
+  },
+  "priced_basis_revision": null
 }
 ```
 
@@ -351,7 +418,9 @@ publication outcomes; RECOVERY_REQUIRED never triggers a second paid call.
 
 ## States and transitions
 
-Only the following directed edges are allowed; unknown states/edges are rejected.
+The following persisted service-request edges are closed; unknown states/edges
+are rejected. Confirmation and persisted-revision policies describe service callers;
+staff pre-save normalisation remains non-persisting under its existing checks.
 Creation enters drafting with a queued job. Jobs never restart from a terminal state.
 The future application service owns these transitions; test fakes do not implement it.
 
@@ -445,16 +514,20 @@ no promise of complete erasure is made. A later scoped deletion API is required
 before real external retention is offered; DELETE is deliberately absent here.
 
 Freeze v1 types, enums and error meanings. Additive optional fields require
-consumer tests because closed clients reject unknown fields. Breaking changes use
+consumer tests. Clients must ignore unknown response fields; server projection
+schemas remain closed allowlists, including recursively, and request schemas stay
+closed. New fields still need projection/privacy and consumer tests. Breaking changes use
 `/api/v2`. Never fall back silently to unversioned endpoints.
 
 ## Security invariants and qualification boundary
 
 Admission, ownership, quota and publication proof checks precede every success,
 including cached results and replay. Untrusted notes/media/model output never
-grant scope or authority. No default-tenant fallback, forged price, arbitrary row,
-role claim or internal projection flag is admitted. Check publication freshness
-again on download; a post-commit read failure retries the read, not generation.
+grant scope or authority. No default-tenant fallback, forged price, role claim or
+internal projection flag is admitted. Service callers cannot submit arbitrary rows;
+staff-edited rows pass the authenticated staff contract and existing authority checks.
+Check publication freshness again on download; a post-commit read failure retries
+the read, not generation.
 Keep audit events content-free: pseudonymous identity, operation, state/code,
 reference, timings and byte/page/quota counts only. No request or result content,
 credential, cookie or raw error enters ordinary logs.

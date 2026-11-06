@@ -382,6 +382,167 @@ class QuoteApiContractTest(unittest.TestCase):
                 with self.assertRaises(ContractViolation):
                     check(SCHEMAS["EmptyQuery"], {"view": "internal"})
 
+    def test_service_request_properties_and_required_fields_are_exact(self):
+        contracts = {
+            "CreateQuoteRequest": ({"design_files", "notes", "client_reference"}, ["design_files"]),
+            "QueueDraftRequest": ({"notes"}, []),
+            "PriceRequest": ({"quote_request_id", "basis_revision", "confirmed_basis_revision"},
+                             ["quote_request_id", "basis_revision", "confirmed_basis_revision"]),
+            "ExportRequest": ({"basis_revision", "confirmed_basis_revision", "formats"},
+                              ["basis_revision", "confirmed_basis_revision", "formats"]),
+        }
+        for name, (fields, required) in contracts.items():
+            with self.subTest(schema=name):
+                self.assertEqual(set(SCHEMAS[name]["properties"]), fields)
+                self.assertEqual(SCHEMAS[name]["required"], required)
+                # Exercise the actual schema, independently of the reference model.
+                for field in required:
+                    payload = example(name)
+                    del payload[field]
+                    with self.subTest(missing=field), self.assertRaises(ContractViolation):
+                        check(SCHEMAS[name], payload)
+        for name in ("PriceRequest", "ExportRequest"):
+            for field in ("basis_revision", "confirmed_basis_revision"):
+                for value in (0, -1, True, "1", None):
+                    payload = example(name)
+                    payload[field] = value
+                    with self.subTest(schema=name, field=field, value=value), self.assertRaises(ContractViolation):
+                        check(SCHEMAS[name], payload)
+
+    def test_staff_price_rows_use_same_endpoint_but_never_service_authority(self):
+        ref = lambda name: {"$ref": "#/components/schemas/" + name}
+        price = SPEC["paths"]["/api/v1/quote-steps/price"]["post"]
+        self.assertEqual(price["x-auth-request-schemas"], {
+            "ServiceCredential": ref("PriceRequest"), "StaffSession": ref("StaffPriceRequest")})
+        self.assertEqual(price["requestBody"]["content"]["application/json"]["schema"]["oneOf"],
+                         [ref("PriceRequest"), ref("StaffPriceRequest")])
+        policy = SPEC["x-auth-projections"]
+        self.assertEqual(policy, {
+            "selector": "authenticated_credential", "client_selector_allowed": False,
+            "mixed_credentials": "reject", "shared_service": "QuoteApplicationService",
+            "shared_steps_required": ["draft", "match", "price", "xlsx", "pdf", "poll", "artifact"],
+            "ServiceCredential": {"view": "CustomerEstimateView", "request_mode": "closed_service_schema"},
+            "StaffSession": {"view": "staff_internal", "implementation_slice": "S3a",
+                             "request_mode": "staff_schema", "preserve_owner_edit_grant_checks": True},
+            "internal_only": ["review_choices", "profiles", "pricing_references", "basis_chat", "saved_sessions",
+                              "ai_spend", "admin", "audit", "support", "platform_launch"],
+        })
+        staff = SCHEMAS["StaffPriceRequest"]
+        self.assertEqual(set(staff["properties"]), {"quote_request_id", "basis_revision", "rows"})
+        self.assertEqual(staff["required"], ["rows"])  # Pre-save normalise must not create a quote.
+        self.assertEqual(staff["properties"]["rows"]["items"], ref("StaffBasisRow"))
+        self.assertEqual((staff["properties"]["rows"]["minItems"], staff["properties"]["rows"]["maxItems"]),
+                         (1, 500))
+        row_schema = SCHEMAS["StaffBasisRow"]
+        self.assertEqual(set(row_schema["properties"]), {"row_id", "description", "quantity", "unit", "selections"})
+        self.assertEqual(row_schema["required"], ["row_id", "description", "quantity", "unit", "selections"])
+        self.assertEqual(row_schema["properties"]["selections"], {
+            "type": "array", "items": ref("Id"), "maxItems": 32, "uniqueItems": True})
+        body = example("StaffPriceRequest")
+        body["rows"][0].update(quantity=15, unit="sqm", selections=["selection-example"])
+        check(staff, body)
+        with self.assertRaises(ContractViolation):
+            check(SCHEMAS["PriceRequest"], body)
+        forged = example("PriceRequest")
+        forged["rows"] = body["rows"]
+        with self.assertRaises(ContractViolation):
+            check(SCHEMAS["PriceRequest"], forged)
+        for field in ("view", "role", "grant", "catalog", "price", "tax_rate", "price_book_id"):
+            for nested in (False, True):
+                forged = copy.deepcopy(body)
+                (forged["rows"][0] if nested else forged)[field] = "forged.test"
+                with self.subTest(field=field, nested=nested), self.assertRaises(ContractViolation):
+                    check(staff, forged)
+        for field, value in (("quantity", -1), ("quantity", True), ("unit", "m2"), ("selections", ["x", "x"])):
+            forged = copy.deepcopy(body)
+            forged["rows"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ContractViolation):
+                check(staff, forged)
+
+    def test_mandatory_staff_migration_and_credential_selected_view_are_documented(self):
+        prose = " ".join(DOC.split())
+        for requirement in (
+            "In S3a the staff UI must use the same `/api/v1` endpoints and application service",
+            "as external callers for draft, match, price and XLSX/PDF output, including polling and artifact delivery.",
+            "The server derives the caller view from the authenticated credential, never a client flag.",
+            "For staff-authenticated callers only, the same endpoint and service must accept staff-edited basis rows",
+            "Service callers cannot select, upload or replace pricing authority.",
+            "Poll first; there are no webhooks.",
+            "Staff pricing before the first save is non-persisting and cannot grant copied authority.",
+        ):
+            self.assertIn(requirement, prose)
+        migration = DOC.split("### Staff UI migration in S3a\n", 1)[1].split("## Authentication", 1)[0]
+        rows = re.findall(r"^\| ([^|]+) \| ([^|]+) \|$", migration, re.M)
+        moved = [destination for source, destination in rows if destination.startswith("Move to")]
+        self.assertEqual(len(moved), 5)
+        for path in ("/drafts", "/exports", "/api/v1/jobs/{job_id}", "/api/v1/quote-steps/price", "proof-bound artifact"):
+            self.assertTrue(any(path in destination for destination in moved), path)
+        retained = " ".join(source for source, destination in rows if destination.startswith("Stay internal"))
+        for name in ("basis_chat", "pricing-selections", "/api/quote-sessions", "/api/settings/profiles",
+                     "/api/profiles", "/api/settings/pricing-references", "/api/pricing-reference/template.xlsx",
+                     "/api/feedback", "/api/session", "/api/log", "/api/health", "/logout",
+                     "AI spend/admin/audit/support", "Platform launch/finalisation"):
+            self.assertIn(name, retained)
+
+    def test_money_rate_unit_poll_and_notes_constraints_directly(self):
+        for value in ("0", "0.00", "1.00", "10.000", "120"):
+            check(SCHEMAS["Money"], value)
+        for value in ("-1.00", "01.00", "NaN", "Infinity", "1e2", "1.00\n", 1):
+            with self.subTest(money=value), self.assertRaises(ContractViolation):
+                check(SCHEMAS["Money"], value)
+        rate = SCHEMAS["TaxView"]["properties"]["rate"]
+        for value in ("0", "0.09", "1", "1.00"):
+            check(rate, value)
+        for value in ("9", "-0.09", "1.01", "01", "0.09\n", 0.09):
+            with self.subTest(rate=value), self.assertRaises(ContractViolation):
+                check(rate, value)
+        # Every customer/staff row schema owns its actual unit restriction.
+        for name, schema in SCHEMAS.items():
+            unit = schema.get("properties", {}).get("unit")
+            if unit:
+                check(unit, "sqm")
+                with self.subTest(unit_schema=name), self.assertRaises(ContractViolation):
+                    check(unit, "m2")
+        poll = SCHEMAS["JobView"]["properties"]["poll_after_seconds"]
+        self.assertEqual((poll["minimum"], poll["maximum"]), (2, 60))
+        for value in (2, 60):
+            check(poll, value)
+        for value in (1, 61):
+            with self.assertRaises(ContractViolation):
+                check(poll, value)
+        for name in ("CreateQuoteRequest", "QueueDraftRequest"):
+            notes = SCHEMAS[name]["properties"]["notes"]
+            self.assertEqual(notes.get("maxLength"), 16384)
+            check(notes, "a" * 16384)
+            with self.assertRaises(ContractViolation):
+                check(notes, "a" * 16385)
+
+    def test_response_evolution_priced_revision_and_file_publication(self):
+        self.assertEqual(SPEC["x-response-evolution"], {
+            "clients_ignore_unknown_response_fields": True, "server_projection_remains_closed": True,
+            "requests_remain_closed": True})
+        self.assertIn("Clients must ignore unknown response fields", DOC)
+        schema = SCHEMAS["BasisView"]
+        self.assertIn("priced_basis_revision", schema["required"])
+        for value in (None, 1):
+            body = example("BasisView")
+            body["priced_basis_revision"] = value
+            check(schema, body)
+        for value in (0, -1, True, "1"):
+            body["priced_basis_revision"] = value
+            with self.subTest(value=value), self.assertRaises(ContractViolation):
+                check(schema, body)
+        self.assertEqual(SPEC["x-result-publication"], {"requires_artifact_export": True, "json_only_export": False})
+        self.assertIn("JSON-only use still requires an export requesting at least one XLSX/PDF artifact", DOC)
+        for formats in (["xlsx"], ["pdf"], ["xlsx", "pdf"]):
+            payload = example("ExportRequest")
+            payload["formats"] = formats
+            check(SCHEMAS["ExportRequest"], payload)
+        for formats in ([], ["json"], ["xlsx", "xlsx"]):
+            payload["formats"] = formats
+            with self.subTest(formats=formats), self.assertRaises(ContractViolation):
+                check(SCHEMAS["ExportRequest"], payload)
+
     def test_projection_has_no_forbidden_internal_fields_at_any_depth(self):
         # 'price' is a permitted customer line object, not a caller override.
         forbidden = FORBIDDEN - {"price"}
@@ -657,16 +818,26 @@ class QuoteApiContractTest(unittest.TestCase):
         self.assertEqual(spec_endpoints, OPERATIONS)
         self.assertEqual(doc_endpoints, OPERATIONS)
         self.assertEqual(SPEC["openapi"], "3.1.0")
-        self.assertEqual(SPEC["security"], [{"ServiceCredential": []}])
+        self.assertEqual(SPEC["security"], [{"ServiceCredential": []}, {"StaffSession": []}])
         auth = SPEC["components"]["securitySchemes"]["ServiceCredential"]
         self.assertEqual((auth["type"], auth["in"], auth["name"]),
                          ("apiKey", "header", "X-SQAG-Service-Authorization"))
+        schemes = SPEC["components"]["securitySchemes"]
+        self.assertEqual(set(schemes), {"ServiceCredential", "StaffSession", "StaffCsrf"})
+        for name, location, field in (("StaffSession", "cookie", "swooshz_quote_session"),
+                                      ("StaffCsrf", "header", "X-Swooshz-CSRF")):
+            self.assertEqual((schemes[name]["type"], schemes[name]["in"], schemes[name]["name"]),
+                             ("apiKey", location, field))
+            self.assertIn("S3a, not implemented", schemes[name]["description"])
         artifact = SPEC["paths"]["/api/v1/quote-requests/{id}/artifacts/{kind}"]["get"]
         self.assertEqual(artifact["parameters"][1]["schema"]["enum"], ["xlsx", "pdf"])
         self.assertEqual(set(artifact["responses"]["200"]["content"]),
                          {"application/pdf", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
         for methods in SPEC["paths"].values():
-            for op in methods.values():
+            for method, op in methods.items():
+                self.assertNotIn("security", op)  # No operation can silently opt out of authentication.
+                if method == "post":
+                    self.assertEqual(op["x-staff-mutation-security"], [{"StaffSession": [], "StaffCsrf": []}])
                 self.assertLessEqual(SPEC["x-error-status-codes"].keys(), op["responses"].keys())
                 success = op["responses"].get("200", op["responses"].get("202"))
                 self.assertEqual(success["headers"]["Cache-Control"]["schema"]["const"], "private, no-store")
@@ -707,6 +878,10 @@ class QuoteApiContractTest(unittest.TestCase):
     def test_machine_readable_money_policy_and_schema_ref_integrity(self):
         policy = SPEC["x-money-policy"]
         self.assertEqual(policy["unresolved_display"], "price to be discussed")
+        self.assertEqual(SCHEMAS["UnresolvedPrice"]["properties"]["display"]["const"],
+                         policy["unresolved_display"])
+        self.assertEqual(SCHEMAS["Totals"]["properties"]["label"]["const"],
+                         "Known-priced subtotal; excludes unresolved items and tax")
         self.assertEqual(policy["rounding"], "ROUND_HALF_UP")
         self.assertEqual(policy["tax_authority"], "tenant_admin")
         for key in ("unresolved_unit_price", "unresolved_amount", "partial_subtotal", "partial_total", "partial_tax_amount", "blank_tax"):
