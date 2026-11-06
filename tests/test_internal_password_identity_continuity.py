@@ -137,7 +137,7 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         original = self.saved_snapshot(storage, session_id)
         cases = [
             ("operator", None, True, True, True, True),
-            ("peer", None, False, False, False, True),
+            ("peer", None, False, False, False, False),
             ("admin", None, True, False, False, True),
             ("operator", "workspace-identity-other", False, False, False, False),
             ("admin", "workspace-identity-other", False, False, False, False),
@@ -301,16 +301,16 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
             if row["email"] == email("operator"):
                 row["user_id"] = "changed-synthetic-operator-subject"
         cases = [
-            ({"SQAG_INTERNAL_IDENTITY_BINDINGS_JSON": json.dumps(rows)}, True),
+            ({"SQAG_INTERNAL_IDENTITY_BINDINGS_JSON": json.dumps(rows)}, False),
             ({"SQAG_INTERNAL_WORKSPACE_ID": "workspace-identity-changed"}, False),
         ]
-        for changes, shared_profile in cases:
+        for changes, profile_visible in cases:
             with self.subTest(changes=tuple(changes)), mock.patch.dict(os.environ, changes):
                 self.assertEqual(self.get(cookie, "/api/session")[0], 401)
                 with self.http_fixture.fresh_server_if(changes):
                     changed_cookie, changed_session, changed_public = self.admit()
                     self.assertNotEqual(changed_public["browser_recovery_scope"], public["browser_recovery_scope"])
-                    self.assert_actor_access(changed_cookie, changed_session, session_id, job_id, quote=False, early=False, job=False, profile=shared_profile)
+                    self.assert_actor_access(changed_cookie, changed_session, session_id, job_id, quote=False, early=False, job=False, profile=profile_visible)
         old = webapp.signed_cookie_value({"auth_mode": "internal_google", "user": {"subject": "stable-google-operator-subject", "account": policy_values()["workspace_id"]}})
         old_cookie = webapp.SESSION_COOKIE_NAME + "=" + old
         self.assertEqual(self.get(old_cookie, "/api/session")[0], 401)
