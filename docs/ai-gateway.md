@@ -63,7 +63,7 @@ storage and ingress limits still require verification before rollout.
 PDFs above 16 MiB or analyses above 12 PDF pages use rendered-image batches.
 Each batch carries at most six images and 17 MiB of media characters.
 Rendered pages remain bounded to 1 MiB each, so 96 PDF pages fit 16 batches
-plus one synthesis send, within the unchanged 18-send budget, without retries.
+plus one synthesis send, within the unchanged 18-send budget.
 Page-observation batches run in a fixed pool of at most four sends per analysis.
 Results keep source order regardless of completion order. The first failure stops
 new submissions; in-flight sends finish and settle before the lowest failing
@@ -71,6 +71,18 @@ batch number is reported. Synthesis starts only after every batch succeeds.
 Provider rate limits and timeouts fail the whole analysis with the existing
 batch failure reason, with zero retries. Concurrent analyses each have their own
 pool; this does not impose a global provider concurrency limit.
+
+Synthesis restates the required physical-line fields, including integer confidence
+from 0 to 100. A synthesis response missing a required field can receive exactly
+one repair re-ask on the same captured route, within the same 18-send budget.
+The request keeps the original synthesis input and adds only missing field paths
+and required-field instructions; it never includes the rejected output or reruns
+page batches. Only absent fields qualify. Supplied invalid values, invalid JSON,
+refusals and provider failures do not. A second failure follows the existing
+blocked-result and support-reference path. Single-send analysis never repairs.
+`ENABLE_SYNTHESIS_CONTRACT_REPAIR` gates this optional extra send. Batch usage
+records its count and outcome; contract diagnostics contain bounded indexes and
+fixed field names only, with no supplied keys, row IDs or model text.
 
 `OPENROUTER_DRAFT_BATCH_REASONING_EFFORT` is optional. Missing or empty values
 inherit the selected draft route's effort. Set it to `medium` for a separately
@@ -97,7 +109,8 @@ The gateway owns the exact endpoint, HTTPS transport, provider policy, bounded
 body reads and response admission. It refuses redirects, wrong MIME, duplicate
 JSON keys, invalid JSON, body overflow and truncated declared bodies. Requests
 carry `store=false` and no model arrays, tools, plugins or provider conversation
-state. Full analysis and pricing calls send once. Basis line/answer calls retain
+state. Single-send analysis and pricing calls send once; batched synthesis has
+only the missing-field repair described above. Basis line/answer calls retain
 at most two same-route transient retries with the existing two/five-second delays.
 Auth, payment, permission, unsupported input, refusal and partial output are never
 replayed. Closed canonical Responses error types and native machine codes override

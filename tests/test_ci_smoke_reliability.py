@@ -20,7 +20,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync('scripts/playwright-smoke.mjs', 'utf8');
 const start = source.indexOf('async function verifyGenerationLoadingModalSurvivesRefresh(');
 const end = source.indexOf('  const cases = [', start);
-const scope = {alpha1Scope: false};
+const scope = {};
 vm.runInNewContext(source.slice(start, end) + '\n}\nglobalThis.drain = verifyGenerationLoadingModalSurvivesRefresh;', scope);
 (async () => {
   let waited = 0;
@@ -33,7 +33,7 @@ vm.runInNewContext(source.slice(start, end) + '\n}\nglobalThis.drain = verifyGen
     const calls = [];
     const response = {status: () => status, url: () => 'http://127.0.0.1/api/quote-sessions',
       request: () => ({method: () => 'POST'})};
-    const context = {URL, alpha1Scope: false,
+    const context = {URL,
       page: {waitForResponse: (predicate, options) => {
         calls.push('listen'); assert(predicate(response)); assert.equal(options.timeout, 15000);
         assert(!predicate({...response, request: () => ({method: () => 'GET'})}));
@@ -64,7 +64,7 @@ for (const problems of [[], ['400 http://127.0.0.1/api/quote-sessions'], ['429 h
 const main = source.slice(source.indexOf('async function main()'));
 assert.equal(main.split('requireNoQuoteSessionRateLimits(networkProblems);').length - 1, 2);
 const tailStart = source.indexOf('  // Keep real mocked-provider pricing');
-const tailEnd = source.indexOf('  if (alpha1Scope)', tailStart);
+const tailEnd = source.indexOf('\n}', tailStart);
 (async () => {
   for (const screenshots of [false, true]) {
     let calls = 0;

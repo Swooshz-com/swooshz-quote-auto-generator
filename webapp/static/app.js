@@ -9511,6 +9511,11 @@ function showGeneratedExportReadyModal(viewPdf = false) {
     elements.excelGeneratingActionButton.textContent = viewPdf ? "Open PDF" : "Download Excel";
     elements.excelGeneratingActionButton.dataset.exportAction = viewPdf ? "pdf" : "excel";
   }
+  if (viewPdf) {
+    elements.excelGeneratingActions?.prepend(elements.excelGeneratingCloseButton);
+  } else {
+    elements.excelGeneratingActions?.append(elements.excelGeneratingCloseButton);
+  }
   elements.excelGeneratingModal.hidden = false;
   elements.excelGeneratingModal.classList.add("is-open", "is-ready");
   state.restorableOverlay = viewPdf ? "pdf_ready" : "excel_ready";

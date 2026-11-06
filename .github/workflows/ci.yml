@@ -221,11 +221,7 @@ jobs:
         id: runtime_prerequisites
         run: python scripts/validate_runtime_privilege_contract.py
 
-      # Retain the separately tracked Modify/restoration exclusion; browser smokes
-      # below run their maintained full paths without the retired scope.
       - name: Run Python tests
-        env:
-          SQAG_VALIDATION_SCOPE: alpha1
         run: python -m unittest discover -s tests
 
       - name: Run AI basis chat stress smoke
@@ -243,6 +239,10 @@ jobs:
       - name: Run isolated app recovery smoke
         if: always() && steps.runtime_prerequisites.outcome == 'success'
         run: npm run playwright:smoke -- --recovery-only
+
+      - name: Run isolated live generation terminal smoke
+        if: always() && steps.runtime_prerequisites.outcome == 'success'
+        run: npm run playwright:smoke -- --terminal-only
 
       - name: Run minimum internal alpha browser smoke
         if: always() && steps.runtime_prerequisites.outcome == 'success'

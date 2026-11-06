@@ -1,4 +1,4 @@
-"""Keep the CI browser commands on the maintained full paths."""
+"""Check the maintained alpha smoke trace on both normalisation POST routes."""
 from pathlib import Path
 import subprocess
 import unittest
