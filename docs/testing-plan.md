@@ -996,6 +996,10 @@ projection-read warning branch.
 
 ## Quote admission registry source
 
+Run `tests.test_postgres_migration_placeholders` offline to parse every runner
+migration with psycopg's placeholder scanner and empty bind arguments. Its
+percent-pair fallback keeps this guard active when psycopg is unavailable.
+
 Run `tests.test_quote_api_registry`, quote API contract/auth/tenancy, migration
 ledger, runtime privilege contract and internal-password auth/webapp suites.
 Registry fixtures explicitly load SQLite migration 012 and use only synthetic

@@ -337,7 +337,7 @@
     {
       "path": "migrations/012_quote_api_admission_postgres.sql",
       "sequence_no": 11,
-      "sha256": "d7ff30ac433633c3d4cf0c475564280b0526e82ae92d259faed757907a06fc20",
+      "sha256": "b9df02f16d777cd8fd7d57a2df4663a3f393375ab82f68cd435560b56611a4c6",
       "tables": [
         "sqag_quote_api_callers",
         "sqag_quote_api_tenants"

@@ -401,9 +401,9 @@ TABLE_SPECS = (
         _c("c", expression='created_at between 0 and 253402300799'),
         _c("c", expression='expires_at between 1 and 253402300799 and expires_at > created_at'),
         _c("c", expression='revoked_at between 0 and 253402300799'),
-        _c("c", expression='create_minute_start between 0 and 253402300799 and create_minute_start % 60 = 0'),
+        _c("c", expression='create_minute_start between 0 and 253402300799 and mod(create_minute_start, 60) = 0'),
         _c("c", expression='create_minute_count between 0 and 15'),
-        _c("c", expression='create_day_start between 0 and 253402300799 and create_day_start % 86400 = 0'),
+        _c("c", expression='create_day_start between 0 and 253402300799 and mod(create_day_start, 86400) = 0'),
         _c("c", expression='create_day_count between 0 and 100'),
         _c("c", expression='active_jobs between 0 and 2'),
         _c("c", expression='counter_revision between 0 and 9223372036854775806'),
@@ -438,7 +438,7 @@ TABLE_SPECS = (
         _c("c", expression='created_at between 0 and 253402300799'),
         _c("c", expression='expires_at between 1 and 253402300799 and expires_at > created_at'),
         _c("c", expression='revoked_at between 0 and 253402300799'),
-        _c("c", expression='poll_minute_start between 0 and 253402300799 and poll_minute_start % 60 = 0'),
+        _c("c", expression='poll_minute_start between 0 and 253402300799 and mod(poll_minute_start, 60) = 0'),
         _c("c", expression='poll_minute_count between 0 and 120'),
         _c("c", expression='counter_revision between 0 and 9223372036854775806'),
         _c("p", 'tenant_id,caller_id'),
@@ -1390,7 +1390,16 @@ def _bounded_check_tokens(tokens: list[str], types: Mapping[str, str]) -> list[s
                 natural_bigint = target == "bigint" and int(digits) > 2147483647
                 typed_operand = (len(result) >= 2 and result[-1] in {"=", "<>", ">", ">=", "<", "<=", "%"}
                                  and types.get(result[-2]) == target)
-                if bounds[target][0] <= int(digits) <= bounds[target][1] and (natural_bigint or typed_operand):
+                # mod(integer/bigint-column, an in-range integer literal)
+                # resolves both arguments to the column's type. Deparse can
+                # expose that coercion. A smallint column can instead promote
+                # to integer with an uncast literal, so exclude that case.
+                # Do not erase other function, column or type-changing casts.
+                mod_argument = (len(result) >= 4 and result[-4].lower() == "mod"
+                                and result[-3] == "(" and result[-1] == ","
+                                and target in {"integer", "bigint"}
+                                and types.get(result[-2]) == target)
+                if bounds[target][0] <= int(digits) <= bounds[target][1] and (natural_bigint or typed_operand or mod_argument):
                     result.append(digits)
                     index = end
                     continue
