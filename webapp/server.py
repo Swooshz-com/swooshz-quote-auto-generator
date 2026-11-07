@@ -118,6 +118,11 @@ from webapp.internal_password_auth import (
     InternalAuthConfigError, InternalAuthPolicy, InternalAuthState,
     InternalAuthStateError, canonical_email,
 )
+from webapp.quote_api_auth import (
+    AdmissionError, QuoteApiAdmission, SERVICE_HEADER, SERVICE_FLAG, STAFF_FLAG,
+    flag_enabled, quote_operation,
+)
+from webapp.quote_context import QuoteContext, QUOTE_OPERATIONS, QUOTE_READ_OPERATIONS
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -516,6 +521,7 @@ RATE_LIMIT_PRUNE_INTERVAL_SECONDS = 15
 # windows; saturation uses the bounded per-route overflow state below.
 MAX_RATE_LIMIT_BUCKETS = 4096
 POST_RATE_LIMITS = {
+    "/api/v1/admission": 30,  # Bounded attempts, not a qualified service-work quota.
     "/login": 10,
     "/login/nonce": 10,  # Separate GET form issuance budget; no public route.
     PLATFORM_LAUNCH_ENDPOINT: 20,
@@ -551,7 +557,8 @@ RATE_LIMIT_LAST_PRUNE_AT = 0.0
 RATE_LIMIT_LOCK = threading.Lock()
 class ThreadingHTTPServer(_ThreadingHTTPServer):
     """Own authentication state for exactly this running HTTP instance."""
-    def __init__(self, *args, internal_auth=None, **kwargs):
+    def __init__(self, *args, internal_auth=None, quote_api_admission=None, **kwargs):
+        self.quote_api_admission = quote_api_admission if quote_api_admission is not None else QuoteApiAdmission()
         self.internal_auth = internal_auth if internal_auth is not None else InternalAuthState()
         self.internal_policy = (
             internal_auth_policy() if internal_password_config_complete() else None
@@ -902,6 +909,10 @@ def redact_request_target_for_log(target: str) -> str:
         # Preserve no submitted authority, userinfo, query names/values or fragment.
         return "/login"
     parsed = urlparse(submitted)
+    if parsed.path.startswith("/api/v1/"):
+        # Only operation templates enter access logs, never submitted IDs/query.
+        operation = quote_operation("GET", parsed.path) or quote_operation("POST", parsed.path)
+        return "/api/v1/" + (operation or "unmatched")
     if not parsed.query:
         return submitted
     redact_all_callback_values = parsed.path == "/callback"
@@ -33486,6 +33497,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         is_exact_health_get = path == "/api/health"
         if not is_exact_health_get and self.block_untrusted_host():
             return
+        if self.dispatch_quote_admission(parsed):
+            return
         if path == "/login":
             self.handle_login()
             return
@@ -33909,6 +33922,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if self.block_untrusted_host():
             return
         parsed = urlparse(self.path)
+        if self.dispatch_quote_admission(parsed):
+            return
         if parsed.path == PLATFORM_LAUNCH_ENDPOINT:
             self.handle_platform_launch()
             return
@@ -34444,6 +34459,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if self.block_untrusted_host():
             return
         parsed = urlparse(self.path)
+        if self.dispatch_quote_admission(parsed):
+            return
         quote_session_match = re.fullmatch(r"/api/quote-sessions/([A-Za-z0-9_-]+)", parsed.path)
         if quote_session_match:
             self.handle_quote_session_delete(quote_session_match.group(1), parsed.path)
@@ -34514,10 +34531,101 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         if self.block_untrusted_host():
             return
+        if self.dispatch_quote_admission(urlparse(self.path)):
+            return
         if urlparse(self.path).path == PLATFORM_FINALIZATION_ENDPOINT:
             self.handle_platform_finalization_preflight()
             return
         self.send_json({"status": "blocked", "errors": ["CORS preflight is not allowed for this local runner."]}, status=403)
+
+    def dispatch_quote_admission(self, parsed) -> bool:
+        operation = quote_operation(self.command, parsed.path)
+        service_header = bool(self.headers.get_all(SERVICE_HEADER, []))
+        # Platform launch owns its independent secret and existing checks.
+        if self.command == "POST" and parsed.path == PLATFORM_LAUNCH_ENDPOINT:
+            return False
+        if not operation and not service_header:
+            return False
+        reference = new_error_reference()
+        try:
+            # These readiness guards normally run in the session-only gate.
+            # Preserve them before the exact v1 dispatch bypasses that gate.
+            if deploy_requires_trusted_proxy_guard() or deploy_requires_auth_guard():
+                raise AdmissionError("CAPACITY_UNAVAILABLE")
+            if not operation:
+                raise AdmissionError("AUTH_REQUIRED")
+            self.server.quote_api_admission.admit(
+                operation=operation, headers=self.headers,
+                service_enabled=flag_enabled(os.environ.get(SERVICE_FLAG)),
+                staff_enabled=flag_enabled(os.environ.get(STAFF_FLAG)), reference=reference,
+                singleton_header=singleton_http_header,
+                rate_limited=lambda: is_rate_limited(effective_rate_limit_client_id(
+                    self.client_address[0], single_forwarded_for_header_value(self.headers)), "/api/v1/admission"),
+                staff_context=self.current_quote_staff_context,
+                staff_mutation_guard=self.quote_staff_mutation_valid,
+            )
+            if parsed.query or parsed.params or parsed.fragment or "?" in self.path or "#" in self.path:
+                raise AdmissionError("INVALID_REQUEST")
+            # No body, repository, replay, artifact or job engine exists yet.
+            # Successful authentication must never imply accepted work.
+            raise AdmissionError("CAPACITY_UNAVAILABLE")
+        except AdmissionError as exc:
+            write_local_log("security_event", {
+                "reason": "quote_api_admission", "path": "/api/v1/admission",
+                "status": exc.status, "error_reference": reference,
+            })
+            headers = []
+            if exc.status in {429, 503}:
+                headers.append(("Retry-After", "60"))
+            self.send_json(exc.payload(reference), status=exc.status, extra_headers=headers)
+        return True
+
+    def current_quote_staff_context(self, reference: str) -> QuoteContext | None:
+        session = self.current_auth_session()
+        if not session:
+            return None
+        user = session.get("user") or {}
+        if session.get("auth_mode") == INTERNAL_AUTH_MODE:
+            role = user.get("internal_role")
+            revision = session.get("policy_fingerprint")
+            if role not in {"admin", "operator"}:
+                return None
+        elif session.get("auth_mode") == "platform":
+            # current_auth_session revalidates the Platform grant, even locally.
+            if not platform_launch_mode_enabled() or not platform_auth_session_complete(session):
+                return None
+            platform = platform_context_from_auth_session(session)
+            role = platform_membership_role_to_local_role(platform.get("membershipRole"))
+            revision = platform.get("validationGrantId")
+        else:
+            return None
+        subject, workspace = user.get("subject"), user.get("account")
+        if not all(isinstance(value, str) and value for value in (subject, workspace, revision, role)):
+            return None
+        operations = QUOTE_OPERATIONS if role_permissions(role)["canGenerateQuote"] else QUOTE_READ_OPERATIONS
+        return QuoteContext(
+            "staff", subject, workspace, workspace, subject, revision, operations, "staff_internal",
+            revision, (("role", role), ("session_authority", revision)), reference,
+        )
+
+    def quote_staff_mutation_valid(self) -> bool:
+        origin, origin_valid = singleton_http_header(self.headers, "Origin", reject_comma=True)
+        referer, referer_valid = singleton_http_header(self.headers, "Referer", reject_comma=True)
+        if self.headers.get_all("Origin", []) and not origin_valid:
+            return False
+        if self.headers.get_all("Referer", []) and not referer_valid:
+            return False
+        host = self.headers.get("Host", "")
+        if not (origin_valid or referer_valid):
+            return False
+        if (origin_valid and not is_same_origin_request(origin, host)) or (
+                referer_valid and not is_same_origin_request(referer, host)):
+            return False
+        token, valid = singleton_http_header(self.headers, configured_csrf_header_name(), reject_comma=True)
+        if not valid or token != self.headers.get_all(configured_csrf_header_name())[0]:
+            return False
+        expected = csrf_token_for_cookie_header(self.headers.get("Cookie", ""), auth_state=self.server.internal_auth)
+        return hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))
 
     def current_auth_session(self) -> dict[str, Any] | None:
         if hasattr(self, "_validated_auth_session"):
@@ -35371,7 +35479,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_security_headers(self) -> None:
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0, private")
+        cache_control = (
+            "private, no-store" if quote_operation(self.command, urlparse(self.path).path)
+            else "no-store, no-cache, must-revalidate, max-age=0, private"
+        )
+        self.send_header("Cache-Control", cache_control)
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
         self.send_header("X-Content-Type-Options", "nosniff")

@@ -211,6 +211,8 @@ function startServer({ mockProvider = false, dataRoot = quoteDataRoot, logRoot }
         QUOTE_LOG_ROOT: logRoot,
       })
     : { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot };
+  runtimeEnv.SQAG_QUOTE_API_SERVICE_ENABLED = "false";
+  runtimeEnv.SQAG_QUOTE_API_STAFF_TRANSPORT_ENABLED = "false";
   const server = spawn(
     pythonCommand(),
     serverArgs,
@@ -3043,6 +3045,32 @@ async function verifyStaleTabMutationIsRejected(page) {
   }
 }
 
+async function verifyDisabledQuoteAdmission(page) {
+  // Prevent disabled transport from accepting work or promoting service headers.
+  const receipt = await page.evaluate(async () => {
+    const session = await fetch("/api/session");
+    if (!session.ok) throw new Error("Legacy staff session is unavailable.");
+    const results = [];
+    for (const [method, url] of [
+      ["GET", "/api/v1/jobs/job-test"],
+      ["GET", "/api/v1/quote-requests/qr-test/artifacts/xlsx"],
+      ["POST", "/api/v1/quote-requests"],
+    ]) {
+      const response = await fetch(url, { method, ...(method === "POST" ? {
+        headers: { "Content-Type": "application/json" }, body: "{}",
+      } : {}) });
+      results.push(response.status);
+    }
+    const internal = await fetch("/api/session", {
+      headers: { "X-SQAG-Service-Authorization": "synthetic-invalid-test-token" },
+    });
+    return { results, internal: internal.status };
+  });
+  if (receipt.results.some((status) => status !== 404) || receipt.internal !== 401) {
+    throw new Error("Disabled quote admission boundary changed.");
+  }
+}
+
 async function dashboardQuoteSessionDetail(page, sessionId) {
   return page.evaluate(async (safeSessionId) => {
     const response = await fetch(`/api/quote-sessions/${encodeURIComponent(safeSessionId)}`);
@@ -4634,6 +4662,7 @@ async function main() {
     await verifyInitialDraftSaveReservesSessionIdBeforeNetwork(page);
     await verifyDashboardNewQuoteDoesNotSaveHiddenDraft(page);
     await verifyDashboardClearsStaleSessionsBeforeRefresh(page);
+    await verifyDisabledQuoteAdmission(page);
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.getByRole("heading", { name: "Swooshz Quote Generator" }).waitFor();
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible" });

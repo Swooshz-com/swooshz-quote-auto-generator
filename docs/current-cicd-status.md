@@ -1,8 +1,19 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-06
+Last updated: 2026-11-07
 
 Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
+
+Python discovery includes `tests.test_quote_api_auth` and
+`tests.test_quote_api_tenancy` for the disabled admission boundary. The switches
+`SQAG_QUOTE_API_SERVICE_ENABLED` and
+`SQAG_QUOTE_API_STAFF_TRANSPORT_ENABLED` default off; only exact `true` enables
+their independent admission paths. No CI settings or secrets enable them. Tests
+use synthetic in-memory registry injection and loopback HTTP only. The runtime
+has no registry implementation or v1 work engine; valid admission returns 503,
+never accepted work. No job, trigger, required check, migration, secret requirement
+or deployment behaviour changes. Independent security review and installed-host
+qualification are still required before later enablement.
 
 Full Python discovery includes `tests.test_libreoffice_workbook_values`: actual
 LibreOffice recalculates a disposable cache-cleared workbook, then each priced,

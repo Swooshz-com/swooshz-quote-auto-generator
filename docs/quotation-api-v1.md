@@ -84,6 +84,62 @@ upload or replace pricing authority. Capture the selected `pricing-catalog.json`
 `quotation-layout.xlsx` and `layout-rules.json` revisions before analysis.
 Missing or ambiguous configuration blocks work without a bundled/default fallback.
 
+## Disabled admission boundary
+
+The HTTP server implements admission scaffolding only. There is no production
+credential registry, quote engine, resource repository, replay store or queue
+behind v1. Even valid synthetic admission returns 503 CAPACITY_UNAVAILABLE,
+before reading a body or accepting work. Tests alone inject an in-memory registry.
+The remaining endpoint, schema, quota and publication behaviour below is a
+contract proposal, not implemented functionality.
+
+`SQAG_QUOTE_API_SERVICE_ENABLED` and
+`SQAG_QUOTE_API_STAFF_TRANSPORT_ENABLED` are independent switches. Only the exact
+process-setting value `true` enables either admission path; unset, blank and
+all other values mean off. No setting is written by the application. With both
+off, exact v1 operations return 404; existing login and legacy staff transport
+retain their behaviour. The service switch is checked on every service read,
+mutation, replay attempt and artifact attempt. It never enables staff transport.
+Without a service header, enabled staff transport requires a validated session,
+including in local mode. Staff POST admission also checks role, same-origin
+Origin or Referer, and singleton session-bound CSRF. There is no local identity
+fallback. Platform grants retain current server validation.
+
+The reserved machine token spelling is
+`sqagq1.<credential-id>.<secret>`: a canonical unpadded base64url 16-byte opaque
+ID (22 characters) and 32 random secret bytes (43 characters), 73 characters
+overall. There is no whitespace trimming, padding or alternate encoding.
+Random token issuance and secure delivery are separate operator work, not
+provided here. Registry records hold SHA-256 of
+`b"sqag-quote-api-secret-v1\0" + secret_bytes`, not the secret. Verification uses
+one fixed 32-byte `hmac.compare_digest`; unknown IDs use a fixed dummy verifier
+and the same safe AUTH_REQUIRED response. This does not promise constant-time
+registry lookup. No positive credential cache is used. Enabled state, tenant
+state, revocation, expiry (inclusive) and operation scope are checked anew.
+Missing registry returns safe 503 rather than falling back to staff or local data.
+
+Reject duplicate, blank or comma-combined service headers, any Cookie with a
+service header, and service Origin, Referer or Fetch Metadata headers. A service
+header on an internal route is refused even in local mode. The existing exact
+Platform launch POST retains its own independent secret checks; quote tokens
+give it no authority. There is no service CORS, cookie issuance or staff session
+fabrication. Host, deploy-auth and trusted-proxy readiness guards precede v1
+verification. One bounded effective-client admission budget of 30 attempts per
+60 seconds covers enabled v1 operations together, before registry lookup/hash;
+429 includes Retry-After. This process-local abuse budget is not the future
+shared tenant/caller work quota and does not qualify service enablement.
+
+`QuoteContext` is an immutable server-derived value: auth mode, exact owner
+subject, tenant/workspace, stable caller, credential/session revision, operations,
+projection capability, authority revision/snapshot and request reference. Its
+ownership predicate requires all five identity keys, with staff/service disjoint.
+Future repositories must query those keys together with resource ID and recheck
+current resource authority, expiry and proof. Synthetic ownership tests do not
+establish implemented resource isolation. Service contexts can select only
+CustomerEstimateView. No token or verifier belongs in a context, response or log;
+v1 access logs keep operation templates only. All v1 errors carry a safe support
+reference matched to a content-free server event and private, no-store caching.
+
 ## Design and confirmation
 
 Require booth renders as images or render-containing PDFs, not a text-only item list.

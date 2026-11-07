@@ -10296,6 +10296,31 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("raw-launch-token-secret", output)
         self.assertNotIn("other-secret", output)
 
+    def test_quote_admission_flags_off_keep_legacy_and_close_internal_service_headers(self):
+        # Prevent disabled v1 from accepting work or granting local staff authority.
+        env = {"APP_MODE": "local", "SQAG_DISABLE_DOTENV": "1"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            webapp, "create_job", side_effect=AssertionError("disabled accepted work")
+        ), LocalRunnerServer() as runner:
+            before = dict(webapp.JOBS)
+            session = json.loads(urllib.request.urlopen(runner.base_url + "/api/session", timeout=3).read())
+            self.assertFalse(session["authenticated"])
+            self.assertFalse(session["auth_required"])
+            for method, path in (("GET", "/api/v1/jobs/job-test"),
+                                 ("GET", "/api/v1/quote-requests/qr-test/artifacts/pdf"),
+                                 ("POST", "/api/v1/quote-requests")):
+                request = urllib.request.Request(runner.base_url + path,
+                    data=b"{}" if method == "POST" else None, method=method)
+                with self.subTest(method=method, path=path), self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request, timeout=3)
+                self.assertEqual(caught.exception.code, 404)
+            request = urllib.request.Request(runner.base_url + "/api/session",
+                headers={"X-SQAG-Service-Authorization": "synthetic-invalid-test-token"})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=3)
+            self.assertEqual(caught.exception.code, 401)
+            self.assertEqual(before, webapp.JOBS)
+
     def test_platform_launch_mode_disabled_keeps_local_session_behavior(self):
         with mock.patch.dict(os.environ, {"APP_MODE": "local"}, clear=True):
             self.assertFalse(webapp.auth_required())
