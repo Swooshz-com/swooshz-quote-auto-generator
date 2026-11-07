@@ -1046,6 +1046,13 @@ Recording checks ensure the PostgreSQL fixture preserves admission source ACLs,
 restores every dependent immutable trigger and keeps the spend-upgrade test bound
 to migration 011. These checks do not prove PostgreSQL syntax or effective privileges.
 
+The column checks derive observations from both tables' source SELECT and UPDATE
+lists, then run the validator's explicit inventory and effective-privilege checks.
+Run `tests.test_admission_fixture_mutations` for rollback of temporary ACL grants
+without removing original column grants, and a static scan of routine drops across
+tests for admission trigger dependencies and canonical restoration. Mutation controls
+cover both drop probes, missing dependencies, restoration and table-level REVOKE.
+
 Run `tests.test_quote_api_registry`, quote API contract/auth/tenancy, migration
 ledger, runtime privilege contract and internal-password auth/webapp suites.
 Registry fixtures explicitly load SQLite migration 012 and use only synthetic

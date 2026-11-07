@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from webapp import postgres_migrations as migrations
+from scripts import validate_runtime_privilege_contract as privilege_contract
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +105,86 @@ class AdmissionSourceAclTest(unittest.TestCase):
 
     def test_source_grants_and_revokes_exactly_match_closed_json_contract(self):
         assert_source_acl(self.source, self.contract)
+
+    def test_both_source_column_maps_drive_real_validator_inventory_and_effective_checks(self):
+        # Build observations from SQL, independently of the validator's closed map.
+        rows = [dict(table_name=target[7:], column_name=column, grantee=role,
+                     privilege_type=privilege, is_grantable=False)
+                for action, kind, target, role, privilege, columns in parse_acl(self.source)
+                if action == "grant" and kind == "table" for column in columns]
+        self.assertEqual(set(self.contract["runtime_column_privileges"]),
+                         {"sqag_quote_api_tenants", "sqag_quote_api_callers"})
+        privilege_contract.validate_manifest(self.contract)
+
+        class Cursor:
+            def __init__(self, values):
+                self.values = values
+
+            def fetchall(self):
+                return self.values
+
+        class Connection:
+            def __init__(self, inventory, table_select=False):
+                self.inventory = inventory
+                self.table_select = table_select
+                self.checked = set()
+
+            def execute(self, sql, params=()):
+                if "aclexplode(a.attacl)" in sql:
+                    return Cursor(self.inventory)
+                role, table, column, privilege = params[:4]
+                self.checked.add((table[7:], column, role, privilege))
+                # has_column_privilege includes table grants; attacl does not.
+                allowed = any((row["table_name"], row["column_name"], row["grantee"],
+                               row["privilege_type"]) == (table[7:], column, role, privilege)
+                              for row in self.inventory)
+                allowed |= (self.table_select and table == "public.sqag_quote_api_callers"
+                            and role == "sqag_runtime" and privilege == "SELECT")
+                return Cursor([dict(effective=allowed, grantable=False)])
+
+        connection = Connection(rows)
+        errors = []
+        privilege_contract._check_columns(connection, errors)
+        self.assertEqual(errors, [])
+        for table, grants in self.contract["runtime_column_privileges"].items():
+            columns = {column.name for column in migrations.TABLE_SPECS_BY_NAME[table].columns}
+            self.assertEqual(set(grants["SELECT"]), columns - {"verifier"})
+            for column in columns:
+                for role in privilege_contract.RUNTIME_ROLES:
+                    for privilege in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
+                        self.assertIn((table, column, role, privilege), connection.checked)
+            for privilege in ("SELECT", "UPDATE"):
+                with self.subTest(table=table, missing=privilege):
+                    missing = [row for row in rows if (row["table_name"], row["privilege_type"])
+                               != (table, privilege)]
+                    errors = []
+                    privilege_contract._check_columns(Connection(missing), errors)
+                    self.assertIn("column_privilege_inventory_mismatch", errors)
+                    for column in grants[privilege]:
+                        self.assertIn(f"effective_column_privilege:{table}:{column}:sqag_runtime:{privilege}", errors)
+        # Table SELECT must neither replace explicit column SELECT nor expose verifier.
+        missing = [row for row in rows if (row["table_name"], row["privilege_type"])
+                   != ("sqag_quote_api_callers", "SELECT")]
+        errors = []
+        privilege_contract._check_columns(Connection(missing, table_select=True), errors)
+        self.assertIn("column_privilege_inventory_mismatch", errors)
+        self.assertIn("effective_column_privilege:sqag_quote_api_callers:verifier:sqag_runtime:SELECT", errors)
+
+    def test_each_json_select_and_update_list_is_bound_to_source_with_mutation_controls(self):
+        import copy
+
+        for table, grants in self.contract["runtime_column_privileges"].items():
+            for privilege in ("SELECT", "UPDATE"):
+                for change in ("missing", "extra", "duplicate"):
+                    candidate = copy.deepcopy(self.contract)
+                    columns = candidate["runtime_column_privileges"][table][privilege]
+                    if change == "missing":
+                        columns.pop()
+                    else:
+                        columns.append("verifier" if change == "extra" else columns[0])
+                    with self.subTest(table=table, privilege=privilege, mutation=change):
+                        with self.assertRaises(AssertionError):
+                            assert_source_acl(self.source, candidate)
 
     def test_source_acl_mutation_controls_reject_missing_extra_wrong_signature_and_order(self):
         grant = "grant execute on function " + LOOKUP + " to sqag_runtime;"

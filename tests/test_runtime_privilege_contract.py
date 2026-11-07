@@ -1327,15 +1327,23 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                             "delete from public.sqag_quote_api_tenants", "truncate public.sqag_quote_api_callers"):
                     with self.assertRaises(Exception): c.execute(sql)
                     c.rollback()
-        for grant,revoke,label in (
-            ('select on public.sqag_quote_api_callers','select on public.sqag_quote_api_callers','table_acl'),
-            ('select (verifier) on public.sqag_quote_api_callers','select (verifier) on public.sqag_quote_api_callers','column'),
-            ('update (state) on public.sqag_quote_api_callers','update (state) on public.sqag_quote_api_callers','column'),
+        for grant in (
+            'select on public.sqag_quote_api_callers',
+            'select (verifier) on public.sqag_quote_api_callers',
+            'update (state) on public.sqag_quote_api_callers',
         ):
-            self._execute_admin('grant '+grant+' to sqag_runtime')
-            try:
-                with self.assertRaises(contract.RuntimePrivilegeContractError): self._verify()
-            finally: self._execute_admin('revoke '+revoke+' from sqag_runtime')
+            # Table-level REVOKE also removes existing column grants. Roll back
+            # the probe instead, checking its uncommitted ACL on this connection.
+            with self._admin_connection() as raw:
+                raw.execute('begin')
+                try:
+                    raw.execute('grant '+grant+' to sqag_runtime')
+                    with self.assertRaises(contract.RuntimePrivilegeContractError):
+                        contract.verify_postgres_privilege_contract(
+                            webapp.PostgresConnectionAdapter(raw), self.manifest
+                        )
+                finally:
+                    raw.rollback()
             self.assertEqual(self._verify()['status'],'verified')
 
     def test_admission_two_runtime_workers_and_operator_cas_keep_caps_and_committed_revocation(self):
@@ -3699,6 +3707,14 @@ order by object_kind, object_schema, object_name, object_type
                     "on public.sqag_telemetry_events"
                 ),
                 self._execute_admin(
+                    "drop trigger sqag_quote_api_tenants_binding_immutable "
+                    "on public.sqag_quote_api_tenants"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_quote_api_callers_binding_immutable "
+                    "on public.sqag_quote_api_callers"
+                ),
+                self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
                 ),
                 self._execute_admin(
@@ -3731,6 +3747,14 @@ order by object_kind, object_schema, object_name, object_type
                 self._execute_admin(
                     "drop trigger sqag_telemetry_events_guard_delete "
                     "on public.sqag_telemetry_events"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_quote_api_tenants_binding_immutable "
+                    "on public.sqag_quote_api_tenants"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_quote_api_callers_binding_immutable "
+                    "on public.sqag_quote_api_callers"
                 ),
                 self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
