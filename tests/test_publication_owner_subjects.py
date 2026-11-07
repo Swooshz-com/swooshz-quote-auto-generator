@@ -16,6 +16,7 @@ from tests import test_webapp as fixtures
 from tests import test_internal_password_auth as auth_fixtures
 from tests import test_internal_password_auth_webapp as http_fixtures
 from tests import test_publication_proof_reasons as proof_fixtures
+from tests import test_internal_password_identity_continuity as identity_fixtures
 from webapp import internal_password_auth as auth
 from webapp import server as s
 
@@ -128,7 +129,7 @@ class PublicationOwnerSubjectsTest(unittest.TestCase):
 
 
 class PublicationOwnerWorkerTest(unittest.TestCase):
-    def exercise_worker(self, binding=None):
+    def exercise_worker(self, binding=None, artifact_mode="object"):
         data = fixtures.WebappServerTest()
         data.setUp()
         self.addCleanup(data.doCleanups)
@@ -136,7 +137,7 @@ class PublicationOwnerWorkerTest(unittest.TestCase):
             root = Path(temporary)
             database_url = "sqlite:///" + (root / "storage.sqlite3").as_posix()
             output_root, tmp_root = root / "output", root / "scratch"
-            env = data.hosted_storage_env(SQAG_DATABASE_URL=database_url) | {
+            env = data.hosted_storage_env(SQAG_DATABASE_URL=database_url, SQAG_ARTIFACT_STORAGE_MODE=artifact_mode) | {
                 "QUOTE_DATA_ROOT": str(root / "data"), "QUOTE_OUTPUT_ROOT": str(output_root),
                 "QUOTE_TMP_ROOT": str(tmp_root),
                 "QUOTE_LOG_ROOT": str(s.PROJECT_ROOT / "_logs" / "test" / "publication-owners"),
@@ -215,6 +216,35 @@ class PublicationOwnerWorkerTest(unittest.TestCase):
                 self.assertIn("/download/xlsx?publication=", url)
                 cookie = s.SESSION_COOKIE_NAME + "=" + cookie_value
                 self.assertEqual(http.http("GET", url, {"Cookie": cookie})[::2], (200, artifact["content"]))
+                admin_status, admin_headers, _ = http.login(auth_fixtures.email())
+                self.assertEqual(admin_status, 302)
+                admin_cookie_value = http.cookie(admin_headers, s.SESSION_COOKIE_NAME)
+                admin_cookie = s.SESSION_COOKIE_NAME + "=" + admin_cookie_value
+                admin_session = http.server.internal_auth.validate_session(
+                    s.verified_cookie_payload(admin_cookie_value), policy_fingerprint=http.server.internal_policy.fingerprint,
+                    current_mode=s.INTERNAL_AUTH_MODE,
+                )
+                admin = s.app_storage_for_auth_session(admin_session)
+                profile_id = payload["profile_id"]
+                self.assertNotEqual(admin.user_id, storage.user_id)
+                self.assertIsNone(admin.profile_detail(profile_id))
+                self.assertIsNone(admin.company_profile_export_payload(profile_id))
+                self.assertNotIn(profile_id, [p["id"] for p in admin.list_company_profiles()])
+                self.assertEqual(http.http("GET", f"/api/settings/profiles/{profile_id}/export.json", {"Cookie": admin_cookie})[0], 404)
+                # Both quote readers use persisted run evidence, never the live library.
+                with (
+                    mock.patch.object(s.DatabaseSqagStorage, "profile_detail", side_effect=AssertionError("Live profile read")),
+                    mock.patch.object(s.DatabaseSqagStorage, "profile_layout_artifact", side_effect=AssertionError("Live profile layout read")),
+                ):
+                    for reader_cookie in (cookie, admin_cookie):
+                        status, _, raw = http.http("GET", "/api/quote-sessions/quote-owner-worker", {"Cookie": reader_cookie})
+                        self.assertEqual(status, 200, raw)
+                        self.assertEqual(http.http("GET", url, {"Cookie": reader_cookie})[::2], (200, artifact["content"]))
+                    self.assertIsNotNone(admin.quote_session_export_artifact("quote-owner-worker", "xlsx", require_current_proof=True))
+                # Without run evidence, file checks use only the saved quote owner.
+                with mock.patch.object(s.DatabaseSqagStorage, "historical_publication_profile", return_value={}):
+                    self.assertIsNotNone(admin.quote_session_export_artifact("quote-owner-worker", "xlsx", require_current_proof=True))
+                    self.assertIsNotNone(reopened.quote_session_export_artifact("quote-owner-worker", "xlsx", require_current_proof=True))
                 self.assertIn(http.http("GET", url)[0], {401, 403})
                 peer_status, peer_headers, _ = http.login(auth_fixtures.email("peer"))
                 self.assertEqual(peer_status, 302)
@@ -224,8 +254,12 @@ class PublicationOwnerWorkerTest(unittest.TestCase):
                 other["user"]["subject"] = "another-operator"
                 peer = s.app_storage_for_auth_session(other)
                 self.assertIsNone(peer.quote_session_export_artifact("quote-owner-worker", "xlsx", require_current_proof=True))
-                self.assertFalse((output_root / "job-owner-worker").exists())
-                self.assertFalse((tmp_root / "job-owner-worker").exists())
+                if artifact_mode == "object":
+                    self.assertFalse((output_root / "job-owner-worker").exists())
+                    self.assertFalse((tmp_root / "job-owner-worker").exists())
+                else:
+                    # BLOB mode retains local generation scratch; object-only cleanup is unchanged.
+                    self.assertEqual((output_root / "job-owner-worker" / "quotation.xlsx").read_bytes(), artifact["content"])
 
     def test_real_worker_publishes_protected_xlsx_for_unbound_identity(self):
         self.exercise_worker()
@@ -235,6 +269,230 @@ class PublicationOwnerWorkerTest(unittest.TestCase):
 
     def test_real_worker_publishes_protected_xlsx_for_legacy_bound_identity(self):
         self.exercise_worker("bound-operator")
+
+    def test_private_profile_publication_readers_with_database_artifacts(self):
+        self.exercise_worker(artifact_mode="database")
+
+
+class QuoteOnlyPrivateProfileTest(unittest.TestCase):
+    def test_profile_identity_binding_uses_canonical_source_and_id(self):
+        # Same authority boundary for BLOB and object artifacts, owner and admin.
+        for mode in ("database", "object"):
+            with self.subTest(mode=mode):
+                data = identity_fixtures.InternalPasswordIdentityContinuityTest(methodName="runTest")
+                data.setUp()
+                try:
+                    with (
+                        mock.patch.dict(s.os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": mode}),
+                        mock.patch.object(s, "configured_object_storage_backend", return_value=s.InMemoryObjectStorageBackend()),
+                        mock.patch.object(s.urllib.request, "urlopen", side_effect=AssertionError("Provider forbidden")),
+                    ):
+                        owner_cookie, owner_session, _ = data.admit()
+                        admin_cookie, admin_session, _ = data.admit("admin")
+                        owner = s.app_storage_for_auth_session(owner_session)
+                        admin = s.app_storage_for_auth_session(admin_session)
+                        output = data.root / "identity-output"
+                        output.mkdir()
+                        content = fixtures.xlsx_with_rows([["Synthetic canonical identity"]])
+                        (output / "quotation.xlsx").write_bytes(content)
+                        for source, wrong_source in (("company", "profile"),):
+                            session_id = "quote-canonical-" + source
+                            payload, result = fixtures.eligible_database_publication_fixture(owner, session_id, suffix=source)
+                            raw_id = payload["profile_id"]
+                            payload.update(profile_id=source + ":" + raw_id, profile_source=source)
+                            result["_publication_authority"] = s.database_publication_authority_for_payload(owner, payload)
+                            owner.create_or_update_quote_session(payload, result=result, output_dir=output)
+                            metadata, _ = owner._read_quote_session_metadata(session_id)
+                            self.assertEqual(metadata["publication"]["proof"]["profile"]["id"], source + ":" + raw_id)
+                            cases = (
+                                ("bare", raw_id, source, True),
+                                ("prefixed", source + ":" + raw_id, source, True),
+                                ("prefix-only", source + ":" + raw_id, "", True),
+                                ("wrong-source-prefix", wrong_source + ":" + raw_id, wrong_source, False),
+                                ("mismatched-id", source + ":different-profile", source, False),
+                            )
+                            if source == "company":
+                                cases += (("bare-default-source", raw_id, "", True),)
+                            for state, identity, declared_source, allowed in cases:
+                                with self.subTest(source=source, state=state):
+                                    candidate = copy.deepcopy(metadata)
+                                    candidate["quote_company_profile"].update(id=identity, source=declared_source)
+                                    with owner.connection() as connection:
+                                        connection.execute(
+                                            "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ?",
+                                            (json.dumps(candidate), owner.workspace_id, session_id),
+                                        )
+                                        connection.commit()
+                                    for reader, cookie in ((owner, owner_cookie), (admin, admin_cookie)):
+                                        with mock.patch.object(s.DatabaseSqagStorage, "profile_detail", autospec=True,
+                                                               side_effect=s.DatabaseSqagStorage.profile_detail) as reads:
+                                            authority = reader._quote_rendering_authority(candidate)
+                                            self.assertEqual(bool(authority), allowed)
+                                            if allowed:
+                                                self.assertEqual(authority["profile"]["id"], source + ":" + raw_id)
+                                                self.assertTrue(reads.call_args_list)
+                                                for call in reads.call_args_list:
+                                                    self.assertEqual((call.args[0].user_id, call.args[0].role, call.args[1]),
+                                                                     (owner.user_id, "viewer", raw_id))
+                                            else:
+                                                reads.assert_not_called()
+                                        route = "/api/quote-sessions/" + session_id + "/download/xlsx"
+                                        status, _, raw = data.get(cookie, route)
+                                        self.assertEqual(status, 200 if allowed else 404)
+                                        if allowed:
+                                            self.assertEqual(raw, content)
+                        # The database resolver currently supplies company authority.
+                        # Pin profile-source normalisation at the resolver boundary too.
+                        profile_metadata = copy.deepcopy(metadata)
+                        profile_metadata["publication"]["proof"]["profile"].update(id="profile:" + raw_id, source="profile")
+                        authority = {key: copy.deepcopy(profile_metadata["publication"]["proof"][key])
+                                     for key in ("profile", "pricing_reference")}
+                        for identity in (raw_id, "profile:" + raw_id, "company:" + raw_id, "profile:different-profile"):
+                            with self.subTest(source="profile", identity=identity):
+                                profile_metadata["quote_company_profile"].update(id=identity, source="profile")
+                                with (
+                                    mock.patch.object(admin, "_read_quote_session_metadata", return_value=(profile_metadata, None)),
+                                    mock.patch.object(s, "database_current_publication_authority", return_value=authority) as resolve,
+                                ):
+                                    allowed = identity in (raw_id, "profile:" + raw_id)
+                                    self.assertEqual(bool(admin._quote_rendering_authority(profile_metadata)), allowed)
+                                    if allowed:
+                                        self.assertEqual(resolve.call_args.args[1]["profile_id"], "profile:" + raw_id)
+                                        self.assertEqual(resolve.call_args.args[1]["profile_source"], "profile")
+                                    else:
+                                        resolve.assert_not_called()
+                finally:
+                    data.doCleanups()
+
+    def test_evidenceless_quote_delivery_and_profile_isolation(self):
+        for mode in ("database", "object"):
+            with self.subTest(mode=mode):
+                self.exercise_delivery(mode)
+
+    def exercise_delivery(self, mode):
+        data = identity_fixtures.InternalPasswordIdentityContinuityTest(methodName="runTest")
+        data.setUp()
+        try:
+            with (
+                mock.patch.dict(s.os.environ, {"SQAG_ARTIFACT_STORAGE_MODE": mode}),
+                mock.patch.object(s, "configured_object_storage_backend", return_value=s.InMemoryObjectStorageBackend()),
+                mock.patch.object(s.urllib.request, "urlopen", side_effect=AssertionError("Provider forbidden")),
+            ):
+                owner_cookie, owner_session, _ = data.admit()
+                admin_cookie, admin_session, _ = data.admit("admin")
+                peer_cookie, peer_session, _ = data.admit("peer")
+                owner = s.app_storage_for_auth_session(owner_session)
+                admin = s.app_storage_for_auth_session(admin_session)
+                peer = s.app_storage_for_auth_session(peer_session)
+                session_id = "quote-render-only"
+                payload, result = fixtures.eligible_database_publication_fixture(owner, session_id, suffix="render-only")
+                profile_id = payload["profile_id"]
+                private = owner._read_payload("sqag_profiles", "profile_id", profile_id)
+                marker = "Synthetic private library field never present in a quote"
+                private["private_library_note"] = marker
+                owner._upsert_payload("sqag_profiles", "profile_id", profile_id, private)
+                result["_publication_authority"] = s.database_publication_authority_for_payload(owner, payload)
+                output = data.root / "render-output"
+                output.mkdir()
+                expected = {"xlsx": fixtures.xlsx_with_rows([["Synthetic saved quote"]]),
+                            "pdf": b"%PDF-1.4\nSynthetic saved quote\n%%EOF"}
+                for kind, content in expected.items():
+                    (output / ("quotation." + kind)).write_bytes(content)
+                result["files"].append({"name": "quotation.pdf"})
+                owner.create_or_update_quote_session(payload, result=result, output_dir=output)
+                metadata, _ = owner._read_quote_session_metadata(session_id)
+                self.assertEqual(owner.historical_publication_profile(metadata), {})
+                self.assertEqual(private["_access"]["visibility"], "user")
+                self.assertNotEqual(owner.user_id, admin.user_id)
+                original_detail = s.DatabaseSqagStorage.profile_detail
+                reads = []
+
+                def read_profile(reader, identity, source=""):
+                    reads.append((reader.user_id, reader.role, identity))
+                    return original_detail(reader, identity, source)
+
+                quote_route = "/api/quote-sessions/" + session_id
+                with mock.patch.object(s.DatabaseSqagStorage, "profile_detail", read_profile):
+                    # Direct callers must be admitted too, even with exact metadata.
+                    self.assertEqual(peer._quote_rendering_authority(metadata), {})
+                    self.assertEqual(reads, [])
+                    # Pin the final guard independently of downstream proof checks.
+                    authority = s.database_publication_authority_for_payload(owner, payload)
+                    mismatched = copy.deepcopy(authority)
+                    mismatched["profile"]["digest"] = "0" * 64
+                    with mock.patch.object(s, "database_current_publication_authority", return_value=mismatched):
+                        self.assertEqual(admin._quote_rendering_authority(metadata), {})
+                    for cookie in (owner_cookie, admin_cookie):
+                        for kind, content in expected.items():
+                            reads.clear()
+                            status, _, raw = data.get(cookie, quote_route + "/download/" + kind)
+                            self.assertEqual((status, raw), (200, content))
+                            self.assertTrue(reads)
+                            self.assertEqual(set(reads), {(owner.user_id, "viewer", profile_id)})
+                    # Query fields cannot choose a different owner or profile.
+                    override = "?owner_user_id=" + admin.user_id + "&owner=forged&profile_id=missing&profile_source=company"
+                    self.assertEqual(data.get(admin_cookie, quote_route + "/download/xlsx" + override)[::2], (200, expected["xlsx"]))
+                    reads.clear()
+                    for kind in expected:
+                        self.assertEqual(data.get(peer_cookie, quote_route + "/download/" + kind + override)[0], 404)
+                        self.assertIsNone(peer.quote_session_export_artifact(session_id, kind, require_current_proof=True))
+                    self.assertEqual(reads, [])
+
+                # Successful file delivery grants no profile endpoint or response access.
+                for route in ("/api/profiles", "/api/settings", "/api/settings/profiles"):
+                    status, _, raw = data.get(admin_cookie, route)
+                    self.assertEqual(status, 200)
+                    self.assertNotIn(profile_id.encode(), raw)
+                    self.assertNotIn(marker.encode(), raw)
+                export_route = f"/api/settings/profiles/{profile_id}/export.json"
+                self.assertEqual(data.get(admin_cookie, export_route)[0], 404)
+                for operation in (lambda: admin.profile_detail(profile_id),
+                                  lambda: admin.profile_layout_artifact(profile_id),
+                                  lambda: admin.company_profile_export_payload(profile_id)):
+                    self.assertIsNone(operation())
+                for route in (quote_route, "/api/quote-sessions"):
+                    status, _, raw = data.get(admin_cookie, route)
+                    self.assertEqual(status, 200)
+                    self.assertNotIn(marker.encode(), raw)
+                    self.assertNotIn(b'"private_library_note":', raw)
+
+                def write_quote(value):
+                    with owner.connection() as connection:
+                        connection.execute("update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ?",
+                                           (json.dumps(value), owner.workspace_id, session_id))
+                        connection.commit()
+
+                # Every failure state denies both formats, even with client overrides.
+                alternative_id = "different-render-profile"
+                owner.save_profile(fixtures.workspace_profile_with_layout(alternative_id))
+                changed_id = copy.deepcopy(metadata)
+                changed_id["quote_company_profile"]["id"] = "company:" + alternative_id
+                wrong_owner = copy.deepcopy(metadata)
+                wrong_owner["owner"] = {"user_id": admin.user_id}
+                no_owner = copy.deepcopy(metadata)
+                no_owner.pop("owner")
+                for state, value in (("profile-id-mismatch", changed_id), ("owner-mismatch", wrong_owner), ("unknown-owner", no_owner)):
+                    with self.subTest(state=state):
+                        write_quote(value)
+                        reads.clear()
+                        with mock.patch.object(s.DatabaseSqagStorage, "profile_detail", read_profile):
+                            for kind in expected:
+                                self.assertEqual(data.get(admin_cookie, quote_route + "/download/" + kind + override)[0], 404)
+                        self.assertEqual(reads, [])
+                        write_quote(metadata)
+                forged = copy.deepcopy(metadata)
+                forged["owner"] = {"user_id": admin.user_id}
+                self.assertEqual(admin._quote_rendering_authority(forged), {})
+                for state, delta in (("changed-version", {"label": "Synthetic newer version"}),
+                                     ("invalid", {"_access": {}}), ("deleted", {"_sqag_deleted": True})):
+                    with self.subTest(state=state):
+                        owner._upsert_payload("sqag_profiles", "profile_id", profile_id, private | delta)
+                        for kind in expected:
+                            self.assertEqual(data.get(admin_cookie, quote_route + "/download/" + kind + override)[0], 404)
+                        owner._upsert_payload("sqag_profiles", "profile_id", profile_id, private)
+                self.assertEqual(data.get(admin_cookie, quote_route + "/download/xlsx")[::2], (200, expected["xlsx"]))
+        finally:
+            data.doCleanups()
 
 
 if __name__ == "__main__":
