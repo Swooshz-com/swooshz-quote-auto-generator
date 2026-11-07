@@ -686,6 +686,37 @@ material responses, which must reject before any partial success.
 
 ### Full-draft Responses contract
 
+Run `python -m unittest tests.test_ai_response_contracts` with the gateway,
+request, provider-admission, synthesis-repair and batch-parallelism suites below.
+Use synthetic configuration, fake gateway responses, denied outbound sockets,
+`SQAG_DISABLE_DOTENV=1`, disabled bytecode and approved temporary directories.
+The schema setting defaults off; enable it only in explicit fake-gateway tests.
+Keep existing default-off and saved/history compatibility coverage unchanged.
+
+| Strict final-draft state | Required effects |
+| --- | --- |
+| Setting absent, empty or false | Existing wire format; no schema-bearing request. |
+| Exact true, valid standard or High Quality output | Canonical closed schema and strict format; local admission before business normalisation. |
+| Page observations or any other operation | No final-draft schema; mismatched contract identity denied before sending. |
+| Missing or altered request schema, invalid setting, oversized request | No credential read or send; complete schema included in size preflight. |
+| Eligible missing field in batched synthesis | At most one same-route/schema repair within the existing budget; no page replay. |
+| Missing field in single-send, repair disabled or exhausted | Reject without extra send; retain usage and missing-path diagnosis. |
+| Invalid supplied value, extra property, non-object JSON, refusal or second failure | Reject without normalisation, pricing/sealing or a usable draft. |
+| Endpoint/schema rejection, including local mode | Fixed terminal reason, generic referenced error, no retry/repair/fallback or dependent finalisation. |
+
+Independently pin required `confidence_pct`, recursive `additionalProperties:false`,
+`strict:true`, `text.format`, exact provider policy and safe structural fingerprints.
+Mutation controls must detect removing each guard or relaxing
+`require_parameters`. Exercise ignored enforcement, second failures, mixed
+missing/invalid fields, schema-sized boundary preflight, null-to-absence adaptation,
+known/unknown cost settlement and one terminal event per send. Assert support
+reference agreement and no canary prompt/output/provider prose in diagnostics.
+Run the lifecycle, spend, import telemetry, quantity/dimension, basis chat, quote
+flow and API contract regressions too. Existing discovery includes this module;
+no CI policy, command, secret or required-check change is introduced. Real endpoint
+qualification, enabled installed-host/browser acceptance and rollout to other
+operations remain separate holds requiring owner approval.
+
 Run `python -m unittest tests.test_openai_draft_request_contract` for full-draft
 request changes. This suite uses synthetic in-memory JPEG/PNG/WEBP/PDF media,
 mocked transport, and a socket-level outbound-network denial backstop. No live

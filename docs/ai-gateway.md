@@ -50,6 +50,57 @@ route serialisation or diagnostic output. Deployed routing reads process setting
 local development may read its deliberately configured dotenv source. Old
 provider keys and selectors do not select a route or supply a gateway credential.
 
+## Draft synthesis response contract
+
+`OPENROUTER_DRAFT_SCHEMA_ENABLED` defaults off when absent, empty or `false`.
+Only exact `true` opts in; other values reject configuration before sending.
+The immutable gateway snapshot captures this setting. No host configuration is
+changed by the source implementation. Enabling a real endpoint requires separate
+owner approval and eligibility qualification; fake transports prove no endpoint
+capability, Responses schema subset, model accuracy or cost saving.
+
+When enabled, standard and High Quality final drafts, including batched synthesis,
+send `text.format` with `type=json_schema`, `name=draft_synthesis_v1`, `strict=true`
+and the generated schema. Page observations, basis chat, pricing import and
+matching metadata retain their own existing contracts. A trusted contract identity
+is checked separately from the operation and body. Missing, modified or unexpected
+schemas reject before credential access or transport. Both request validators and
+the synthesis size preflight include the schema. The shape fingerprint includes
+only the fixed public contract structure, never catalogue or prompt values.
+
+`webapp/ai_response_contracts.py` owns the field tree that generates the schema,
+field instructions and local structural admission. Objects are recursively closed
+and all properties required; optional values use null, empty arrays use `[]`.
+Fresh basis confidence uses only integer `confidence_pct`. Unmeasured basis
+quantity/unit, optional basis pricing keyword, item price mode/Included label and
+finding identity/confidence can be null and adapt back to absence. Fresh output
+cannot supply amounts, pricing authority, legacy aliases or clarification arrays.
+Saved/history aliases and the other operations' parsers retain compatibility.
+Exact-object JSON parsing, duplicate-key rejection and local shape checks precede
+the existing identity, quantity, coverage, catalogue and sealing guards. Ranges,
+positive values and nonblank text are checked locally; unsupported range/pattern
+schema keywords are not assumed to work at an unqualified endpoint.
+
+For schema-bearing calls, HTTP 400/404/405/415/422 or closed schema parameter/code
+errors terminate as `response_schema_rejected` at `provider_response_schema`.
+This deliberately includes ambiguous request rejections without claiming their
+cause. A successful HTTP envelope carrying a machine schema rejection is terminal
+too. Provider prose never classifies errors. There is no retry, schema removal,
+provider/model switch, repair or local starter fallback for these failures, even
+in local mode. Staff receive the generic blocked error with a matching support
+reference; diagnostics contain fixed codes, contract name and safe usage/counts.
+No prompt, response, upload or upstream error prose is logged.
+Other failures in an opted-in final draft also block local starter recovery;
+their existing fixed failure classifications are preserved.
+
+Local validation also rejects an endpoint that ignores enforcement. Only the
+existing eligible absent-field reasons can reach the one batched-synthesis repair;
+its captured route, schema and original evidence remain identical. Single-send
+drafts never repair. Supplied invalid fields, extra properties, malformed JSON,
+refusal and schema rejection do not qualify. Send reservation/settlement remains
+per attempt, including rejected responses and repairs; unknown usage/cost remains
+unknown. Other operations need their own schemas and separate rollout approval.
+
 ## PDF reference limits
 
 Analysis accepts PDFs up to 48 MiB each, 96 pages in total across PDFs and
