@@ -1,7 +1,8 @@
 """Check the maintained smoke's workbook against independently entered values.
 
-Uses only the standard library. Mechanical cell positions describe the selected
-quotation layout; descriptions, quantities and prices are accepted fixture inputs.
+Uses only the standard library. The library accepts an explicit template_path;
+the CLI checks the bundled templates/quote-layout/quotation-layout.xlsx geometry.
+Descriptions, quantities and prices are accepted fixture inputs.
 Currency/tax come from reference config and header text from entered form values,
 never the generation request echo.
 """
@@ -97,6 +98,14 @@ def verify_workbook(data, payload, expected_rows, logo, *, template_path=None):
         assert cells["A18"]["value"] == payload["project"]["title"], "Project title differs in A18"
         assert any(ref.startswith("B") and cell["value"] == payload["company"]["name"] for ref, cell in cells.items()), "Company name differs in workbook header"
 
+        # The company-side footer follows its signature rule, not arbitrary
+        # whole-sheet occurrences of the entered strings on either party's side.
+        signature_rows = [int(ref[1:]) for ref, cell in cells.items()
+                          if re.fullmatch(r"B\d+", ref) and cell["value"] == "_____________________________"]
+        assert len(signature_rows) == 1, "Missing or ambiguous company signature rule"
+        for offset, key in enumerate(("company_signatory", "company_title"), 1):
+            assert cells.get(f"B{signature_rows[0] + offset}", {}).get("value") == payload["signature"][key], "Company signature field differs: " + key
+
         styles = ET.fromstring(archive.read("xl/styles.xml"))
         xfs, fonts = styles.find("m:cellXfs", NS), styles.find("m:fonts", NS)
         for ref in ("A20", "B20", "C20", "E20"):
@@ -123,7 +132,7 @@ def verify_workbook(data, payload, expected_rows, logo, *, template_path=None):
         embed = picture.find("xdr:pic/xdr:blipFill/a:blip", NS).get("{" + NS["r"] + "}embed")
         relationships = ET.fromstring(archive.read("xl/drawings/_rels/drawing1.xml.rels"))
         relation = next(node for node in relationships if node.get("Id") == embed)
-        assert relation.get("Target") == "../media/header_logo.png"
+        assert relation.get("Target") == "../media/header_logo.png", "Header logo relationship target differs"
         image = archive.read("xl/media/header_logo.png")
         assert len(image) == logo["bytes"] and hashlib.sha256(image).hexdigest() == logo["sha256"], "Embedded logo differs from uploaded bytes"
         headers = [anchor for anchor in drawing if anchor.find("xdr:sp/xdr:txBody", NS) is not None
@@ -131,8 +140,8 @@ def verify_workbook(data, payload, expected_rows, logo, *, template_path=None):
         assert len(headers) == 1, "Missing header details"
         header = headers[0]
         assert "Project No: " + payload["project_number"] in "".join(header.itertext()), "Project number differs in header details"
-        assert header.find("xdr:sp/xdr:txBody/a:bodyPr", NS).get("anchor") == "t"
-        assert all(run.get("sz") == "900" for run in header.findall("xdr:sp/xdr:txBody/a:p/a:r/a:rPr", NS))
+        assert header.find("xdr:sp/xdr:txBody/a:bodyPr", NS).get("anchor") == "t", "Header text vertical anchor differs"
+        assert all(run.get("sz") == "900" for run in header.findall("xdr:sp/xdr:txBody/a:p/a:r/a:rPr", NS)), "Header text run font size differs"
         assert int(header.findtext("xdr:from/xdr:row", namespaces=NS)) > int(picture.findtext("xdr:to/xdr:row", namespaces=NS)), "Header overlaps logo"
         workbook = ET.fromstring(archive.read("xl/workbook.xml"))
         print_area = workbook.find("m:definedNames/m:definedName[@name='_xlnm.Print_Area']", NS).text

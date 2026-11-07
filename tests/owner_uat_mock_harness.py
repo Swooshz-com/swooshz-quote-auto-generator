@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Local browser harness for the synthetic internal-password login adapter."""
+"""Serve synthetic owner scenarios with real admission and loopback-only transport.
+
+The driver supplies local paths and a scenario; every response retains production
+normalisation and pricing admission. Serving failures still close the server.
+"""
 
 from __future__ import annotations
 

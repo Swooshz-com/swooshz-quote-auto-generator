@@ -804,7 +804,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
         && state.activeSidePanel === "output"
         && !saved.activeJob;
     }, null, { timeout: 15000 });
-    if (normalizeCount !== (2)) {
+    if (normalizeCount !== 2) {
       throw new Error("Confirm Basis refresh should resume exactly once; requests observed: " + normalizeCount + ".");
     }
   } finally {
@@ -1258,7 +1258,7 @@ async function prepareTerminalQuote(page) {
   await page.locator("#quoteBasisPanel.is-active").waitFor({state:"visible",timeout:15000});
 }
 
-async function verifyFreshGenerationTerminalStates(page, statuses) {
+async function verifyFreshGenerationTerminalStates(page, statuses, expectedInterruptedPollUrls = new Set()) {
   for (const status of statuses) {
     // Every case starts from its own saved quote. No reload occurs after dispatch.
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -1288,7 +1288,10 @@ async function verifyFreshGenerationTerminalStates(page, statuses) {
     await page.route(getPattern, async route => {
       if (new URL(route.request().url()).pathname.split("/").pop() !== jobId) return route.fallback();
       polls++;
-      if (finish && status === "interrupted") return route.abort("failed");
+      if (finish && status === "interrupted") {
+        expectedInterruptedPollUrls.add(route.request().url());
+        return route.abort("failed");
+      }
       const result = { status: status === "needs_review" ? "needs_confirmation" : status,
         ...(status === "needs_review" ? { output_rows: { schema: "swooshz.quote-output-rows.v1",
           rows: generationRows.map((row, index) => ({ ...row, diagnostic_row_id: "row-" + index,
@@ -4495,7 +4498,12 @@ async function runG3PricingScope() {
       const page = await context.newPage();
       const consoleProblems = [];
       const networkProblems = [];
+      const expectedInterruptedPollUrls = new Set();
       page.on("console", (message) => {
+        // Chromium reports the job polls deliberately aborted by the interrupted case.
+        if (args.includes("--terminal-only") && options.terminalStatus === "interrupted"
+          && message.type() === "error" && message.text() === "Failed to load resource: net::ERR_FAILED"
+          && expectedInterruptedPollUrls.has(message.location().url)) return;
         if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
       });
       page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
@@ -4509,8 +4517,11 @@ async function runG3PricingScope() {
         const saved = await saveG3PricingReference(page, "live-terminal-reference", "Synthetic Terminal Pricing", g3PricingItems(), false);
         if (!saved.ok || saved.data?.status !== "saved") throw new Error("Live terminal reference was not saved.");
         await page.evaluate(async () => { if (!await loadProfiles()) throw new Error("Live terminal metadata was not loaded."); });
-        await verifyFreshGenerationTerminalStates(page, [options.terminalStatus]);
+        await verifyFreshGenerationTerminalStates(page, [options.terminalStatus], expectedInterruptedPollUrls);
         requireNoQuoteSessionRateLimits(networkProblems);
+        if (consoleProblems.length || networkProblems.length) {
+          throw new Error(`G3 browser diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);
+        }
         browserBoundary.assertClean();
         console.log(JSON.stringify({ status: "ok", mode: "terminal-only" }));
         return;
