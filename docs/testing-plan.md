@@ -9,8 +9,24 @@ Every code change must test the features it can affect. A small edit can use foc
 Saved profile access is enforced by `webapp/profile_access.py` and the database
 storage adapter. New HTTP saves and imports create personal copies with opaque
 IDs; explicit updates and deletes carry the listed revision. Members can read
-shared profiles and export or copy them. Only administrators can mutate shared
-profiles or change ownership. Pricing Reference permissions remain separate.
+shared profiles and export or copy them. Personal profiles are visible only to
+their owner, including when the other user is an administrator. Administrators
+manage their own personal profiles and shared profiles; they cannot list, load,
+export, update, delete or change access to another user's personal profile.
+Only administrators can mutate shared profiles or change ownership of profiles
+they can manage. Pricing Reference stays global within the workspace and its
+management remains administrator-only. Quote access is unchanged; published
+quotes with verified run evidence use it without granting live private-profile
+access. Without verified run evidence, file delivery first checks quote access,
+then reads only the quote's saved profile using its recorded owner's identity.
+Profile and layout hashes must match the saved publication proof. This internal
+read returns no profile data and grants no profile endpoint access. Missing
+owners, mismatched profile IDs and changed, invalid or deleted profiles deny
+delivery; client values cannot override the saved owner or profile.
+File authority compares qualified profile identities. Bare saved IDs use their
+recorded source, defaulting to company profiles when none is recorded. A different
+source or ID denies delivery before a profile read. Direct internal calls must also prove
+quote admission and reject otherwise valid authority with different saved hashes.
 Unmapped legacy rows retain workspace reads and administrator writes pending an
 explicit ID-to-owner mapping. Invalid metadata is unavailable, including to admins.
 Internal-password sessions require database storage for saved company profiles.
@@ -39,6 +55,17 @@ The JS harness checks existing control states and invisible request fields only.
 The profile suites also check local internal-login boot over HTTP and refusal
 without saved-profile reads or writes, plus member share/unshare/transfer denial
 over HTTP and both database artifact adapters, with unchanged persisted access.
+Admin cross-user personal-profile denials cover list, load, export, update,
+delete and access changes, with missing-equivalent read responses, no artifact
+effects, all-false record capabilities and positive own/shared/legacy controls.
+Publication tests cover owner and admin reopen/download through verified run
+evidence while live profile readers are blocked, plus tampered evidence refusal.
+Without run evidence, the quote-only tests cover owner/admin XLSX and PDF
+downloads with SQLite BLOB and in-memory object artifacts, exact owner reads,
+profile endpoint and response isolation, unauthorised members, missing or wrong
+owners, mismatched IDs, changed profile versions, invalid/deleted profiles and
+client override attempts. Mutation checks must detect caller-identity reads and
+profile payloads leaked into admin responses.
 Backup/restore cleanup reads each synthetic profile's current revision from the
 public company-profile list before deletion. Run
 `python -m unittest tests.test_live_db_object_backup_restore_verifier` for SQLite

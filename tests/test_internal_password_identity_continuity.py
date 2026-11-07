@@ -138,7 +138,7 @@ class InternalPasswordIdentityContinuityTest(unittest.TestCase):
         cases = [
             ("operator", None, True, True, True, True),
             ("peer", None, False, False, False, False),
-            ("admin", None, True, False, False, True),
+            ("admin", None, True, False, False, False),
             ("operator", "workspace-identity-other", False, False, False, False),
             ("admin", "workspace-identity-other", False, False, False, False),
         ]
