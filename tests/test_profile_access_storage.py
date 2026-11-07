@@ -42,23 +42,39 @@ class ProfileAccessStorageTest(ProfileStorageCase, unittest.TestCase):
                 self.assertNotEqual(identity, "synthetic-profile")
                 self.assertEqual(saved["revision"], 1)
                 self.assertTrue(saved["permissions"]["canDelete"])
-                self.assertEqual(other.list_company_profiles(), [])
+                for denied in (other, admin, store("support", "management")):
+                    self.assertEqual(denied.list_company_profiles(), [])
+                    self.assertEqual(denied.list_profiles(), [])
+                    self.assertIsNone(denied.profile_detail(identity))
+                    self.assertIsNone(denied.profile_layout_artifact(identity))
+                    self.assertIsNone(denied.company_profile_export_payload(identity))
+                    original = owner._read_payload("sqag_profiles", "profile_id", identity)
+                    objects = copy.deepcopy(s.configured_object_storage_backend()._objects)
+                    with mock.patch.object(denied, "_prepare_profile_layout_artifact", side_effect=AssertionError("Forbidden effect")):
+                        for name, action, status in (
+                            ("update", lambda: denied.save_profile({**self.profile(), "id": identity}, operation="update", revision=1), 404),
+                            ("delete", lambda: denied.delete_profile(identity, revision=1), 404),
+                            ("access", lambda: denied.change_profile_access(identity, {
+                                "version": 1, "owner_user_id": "staff-a", "visibility": "shared"}, revision=1),
+                                404 if denied.profile_policy.admin else 403),
+                        ):
+                            with self.subTest(role=denied.role, action=name):
+                                with self.assertRaises(s.SqagStorageAccessError) as caught:
+                                    action()
+                                self.assertEqual(caught.exception.status, status)
+                                self.assertEqual(caught.exception.reason, "profile_access_denied" if status == 403 else "profile_unavailable")
+                    self.assertEqual(owner._read_payload("sqag_profiles", "profile_id", identity), original)
+                    self.assertEqual(s.configured_object_storage_backend()._objects, objects)
                 self.assertEqual(store("staff-a", workspace="workspace-other").list_profiles(), [])
-                self.assertIsNone(other.profile_detail(identity))
-                self.assertIsNone(other.profile_layout_artifact(identity))
-                self.assertIsNone(other.company_profile_export_payload(identity))
                 before = owner.profile_detail(identity)
-                with mock.patch.object(other, "_prepare_profile_layout_artifact", side_effect=AssertionError("Forbidden effect")):
-                    with self.assertRaises(s.SqagStorageAccessError):
-                        other.save_profile({**self.profile(), "id": identity}, operation="update", revision=1)
-                    with self.assertRaises(s.SqagStorageAccessError):
-                        other.delete_profile(identity, revision=1)
-                self.assertEqual(owner.profile_detail(identity), before)
                 exported = owner.company_profile_export_payload(identity)
                 self.assertNotIn("_access", exported["profile"])
                 copied = other.save_profile(s.normalize_profile_payload(exported), operation="create")
                 self.assertNotEqual(copied["id"], identity)
                 self.assertEqual(other.profile_layout_artifact(copied["id"])["content"], owner.profile_layout_artifact(identity)["content"])
+                # Seed shared metadata as fixture setup, never via cross-user admin access.
+                admin._upsert_payload("sqag_profiles", "profile_id", identity, {
+                    **original, "_access": {"version": 1, "owner_user_id": "staff-a", "visibility": "shared"}})
                 shared = admin.change_profile_access(identity, {"version": 1, "owner_user_id": "staff-a", "visibility": "shared"}, revision=1)
                 self.assertFalse(owner.list_company_profiles()[0]["permissions"]["canUpdate"])
                 self.assertIsNotNone(other.company_profile_export_payload(identity))
@@ -88,6 +104,30 @@ class ProfileAccessStorageTest(ProfileStorageCase, unittest.TestCase):
             for key in ("_access", "_revision", "permissions"):
                 with self.assertRaises(ValueError):
                     owner.save_profile({**self.profile(), key: {}}, operation="create")
+
+    def test_admin_own_personal_and_shared_management(self):
+        for mode in ("database", "object"):
+            for role in ("admin", "management"):
+                with self.subTest(mode=mode, role=role), self.stores(mode) as store:
+                    admin, peer = store("support", role), store("staff-a")
+                    saved = admin.save_profile(self.profile(), operation="create")
+                    identity = saved["id"]
+                    self.assertTrue(all(saved["permissions"].values()))
+                    self.assertIsNotNone(admin.profile_detail(identity))
+                    self.assertIsNotNone(admin.company_profile_export_payload(identity))
+                    updated = admin.save_profile({**self.profile(), "id": identity}, operation="update", revision=1)
+                    shared = admin.change_profile_access(identity, {
+                        "version": 1, "owner_user_id": "staff-a", "visibility": "shared"}, revision=updated["revision"])
+                    self.assertTrue(all(shared["permissions"].values()))
+                    self.assertIsNotNone(peer.company_profile_export_payload(identity))
+                    changed = admin.save_profile({**self.profile(), "id": identity}, operation="update", revision=shared["revision"])
+                    private = admin.change_profile_access(identity, {
+                        "version": 1, "owner_user_id": "staff-a", "visibility": "user"}, revision=changed["revision"])
+                    self.assertFalse(any(private["permissions"].values()))
+                    self.assertIsNone(admin.profile_detail(identity))
+                    self.assertTrue(peer.delete_profile(identity, revision=private["revision"]))
+                    own = admin.save_profile(self.profile(), operation="create")
+                    self.assertTrue(admin.delete_profile(own["id"], revision=own["revision"]))
 
     def test_legacy_visibility_and_invalid_metadata(self):
         for mode in ("database", "object"):
@@ -159,7 +199,7 @@ class ProfileAccessStorageTest(ProfileStorageCase, unittest.TestCase):
     def test_member_cannot_change_own_profile_access(self):
         for mode in ("database", "object"):
             with self.subTest(mode=mode), self.stores(mode) as store:
-                owner, admin = store("staff-a"), store("support", "admin")
+                owner, admin = store("staff-a"), store("staff-a", "admin")
                 saved = owner.save_profile(self.profile(), operation="create")
                 identity = saved["id"]
                 for visibility in ("user", "shared"):

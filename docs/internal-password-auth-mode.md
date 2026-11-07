@@ -104,6 +104,23 @@ pricing references, including imports and exports. Operators can select a
 reference and use it to price a quote. Installed qualification is required to
 verify continuity and saved-data access before cutover.
 
+Saved personal company profiles are private to their owner, including from
+admins. Admins can manage their own personal profiles and shared profiles, but
+cannot list, load, export, update, delete or change access to another user's
+personal profile. Shared profiles are readable across the workspace and managed
+by admins. Legacy rows without access metadata retain workspace reads and
+admin-only mutation until an explicitly approved backfill. Pricing Reference
+remains global within the workspace with admin-only management. Quote access
+is unchanged: published quotes with verified run evidence use that evidence for
+profile authority without granting access to the live private profile. Without
+verified run evidence, the server first checks that the caller can open the quote,
+then reads its saved profile using the quote owner's recorded identity, only to
+check the file's profile and layout hashes. The saved profile ID and content must
+match the quote's publication proof. Missing owners, changed, invalid or deleted
+profiles fail closed. This read returns no profile content to admins and grants
+no profile list, load, export, edit or access-change permission. Client-supplied
+owner and profile values cannot override the saved quote.
+
 The independent Platform launch/session contracts remain supported. The local
 OIDC adapter is retired in every mode. Its settings cannot enable provider login;
 they remain recognised only where required to reject mixed configuration. The

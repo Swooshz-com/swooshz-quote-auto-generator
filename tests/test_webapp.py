@@ -38184,26 +38184,34 @@ main().catch((error) => {
 
             peer = webapp.app_storage_for_auth_session(auth_peer)
             revision = storage_a.list_company_profiles()[0]["revision"]
-            self.assertEqual(peer.list_company_profiles(), [])
-            self.assertIsNone(peer.profile_detail(profile_id))
-            self.assertIsNone(peer.profile_layout_artifact(profile_id))
-            self.assertIsNone(peer.company_profile_export_payload(profile_id))
-            with mock.patch.object(peer, "_prepare_profile_layout_artifact", side_effect=AssertionError("Forbidden profile effect")):
-                for mutation in (
-                    lambda: peer.save_profile(profile(original_layout), revision=revision),
-                    lambda: peer.save_profile(profile(label="Forbidden metadata"), revision=revision),
-                    lambda: peer.save_profile(profile(changed_layout), revision=revision),
-                    lambda: peer.delete_profile(profile_id, revision=revision),
-                ):
-                    with self.assertRaises(webapp.SqagStorageAccessError) as denied:
-                        mutation()
-                    self.assertEqual(denied.exception.status, 404)
-                    self.assertEqual(denied.exception.reason, "profile_unavailable")
+            for denied_reader in (peer, storage_b):
+                self.assertEqual(denied_reader.list_company_profiles(), [])
+                self.assertIsNone(denied_reader.profile_detail(profile_id))
+                self.assertIsNone(denied_reader.profile_layout_artifact(profile_id))
+                self.assertIsNone(denied_reader.company_profile_export_payload(profile_id))
+                with mock.patch.object(denied_reader, "_prepare_profile_layout_artifact", side_effect=AssertionError("Forbidden profile effect")):
+                    for mutation in (
+                        lambda: denied_reader.save_profile(profile(original_layout), revision=revision),
+                        lambda: denied_reader.save_profile(profile(label="Forbidden metadata"), revision=revision),
+                        lambda: denied_reader.save_profile(profile(changed_layout), revision=revision),
+                        lambda: denied_reader.delete_profile(profile_id, revision=revision),
+                    ):
+                        with self.assertRaises(webapp.SqagStorageAccessError) as denied:
+                            mutation()
+                        self.assertEqual(denied.exception.status, 404)
+                        self.assertEqual(denied.exception.reason, "profile_unavailable")
             self.assertEqual(object_row(), first_row)
             self.assertEqual(backend._objects, first_objects)
             self.assertEqual((backend.store_calls, backend.delete_calls), first_provider_counts)
             self.assertEqual(dml_counts, first_dml_counts)
             self.assertEqual(storage_a.list_company_profiles()[0]["revision"], revision)
+
+            # Shared fixture setup preserves the cross-user idempotency journey.
+            # A different admin has no support access while the row is personal.
+            shared_payload = storage_a._read_payload("sqag_profiles", "profile_id", profile_id)
+            shared_payload["_access"]["visibility"] = "shared"
+            storage_a._upsert_payload("sqag_profiles", "profile_id", profile_id, shared_payload)
+            self.assertTrue(storage_b.list_company_profiles()[0]["permissions"]["canUpdate"])
 
             self.assertEqual(first_provider_counts, (1, 0))
             self.assertEqual(first_dml_counts["insert"], 1)

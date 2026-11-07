@@ -14874,11 +14874,43 @@ class DatabaseSqagStorage:
             )
         return True, pending_artifacts, object_plan
 
+    def _quote_rendering_authority(self, metadata):
+        """Read only the saved quote's exact profile version for file delivery.
+
+        The caller retains quote admission; the temporary owner reader never
+        leaves this method. Only proof-matching hashes leave, never profile data.
+        """
+        session_id = safe_quote_session_id(metadata.get("session_id"), "")
+        persisted, _ = self._read_quote_session_metadata(session_id)
+        if not persisted or persisted != metadata:
+            return {}
+        owner = persisted.get("owner") if isinstance(persisted.get("owner"), dict) else {}
+        owner_id = publication_subject_id(owner.get("user_id"))
+        publication = persisted.get("publication") if isinstance(persisted.get("publication"), dict) else {}
+        proof = publication.get("proof") if isinstance(publication.get("proof"), dict) else {}
+        subject = proof.get("subject") if isinstance(proof.get("subject"), dict) else {}
+        expected_profile = proof.get("profile") if isinstance(proof.get("profile"), dict) else {}
+        payload = quote_session_authority_payload(persisted)
+        if (
+            not owner_id or subject.get("owner_id") != owner_id
+            or subject.get("workspace_id") != self.workspace_id
+            or subject.get("session_id") != session_id
+            or not payload or expected_profile.get("id") != payload["profile_id"]
+            or expected_profile.get("source") != payload["profile_source"]
+        ):
+            return {}
+        # Viewer policy grants reads only; do not change the caller's identity.
+        owner_reader = copy.copy(self)
+        owner_reader.user_id = owner_id
+        owner_reader.role = "viewer"
+        authority = database_current_publication_authority(owner_reader, payload)
+        return authority if quote_session_publication_authority_matches(persisted, authority) else {}
+
     def historical_publication_profile(self, metadata):
         """Verify run-bound historical authority without opening the live library.
 
         Quote-reader admission and every publication/artifact/pricing check stay
-        at their existing boundaries. Missing evidence keeps the old live check.
+        at their existing boundaries. Missing evidence uses the quote-only check.
         """
         publication = metadata.get("publication", {})
         run_id = safe_reference(publication.get("run_id"), "run-")
@@ -15179,6 +15211,14 @@ class DatabaseSqagStorage:
             require_current_proof = isinstance(publication.get("proof"), dict)
         current_run_id = safe_reference(publication.get("run_id"), "run-")
         publication_id = safe_quote_publication_id(publication.get("active_publication_id"), "") or current_run_id
+        if expected_projection_identity is not None or expected_publication is not None:
+            identity = quote_publication_projection_identity(metadata, self, safe_kind)
+            if (
+                identity is None
+                or (expected_projection_identity is not None and identity != expected_projection_identity)
+                or (expected_publication is not None and quote_publication_binding(identity) != expected_publication)
+            ):
+                return None
         if require_current_proof:
             current_authority = database_current_publication_authority_for_metadata(self, metadata)
             publication_proof = quote_session_current_v2_publication_proof(
@@ -15192,14 +15232,6 @@ class DatabaseSqagStorage:
                 authority=current_authority,
             )
             if publication_proof is None:
-                return None
-        if expected_projection_identity is not None or expected_publication is not None:
-            identity = quote_publication_projection_identity(metadata, self, safe_kind)
-            if (
-                identity is None
-                or (expected_projection_identity is not None and identity != expected_projection_identity)
-                or (expected_publication is not None and quote_publication_binding(identity) != expected_publication)
-            ):
                 return None
         export = metadata.get("exports", {}).get(safe_kind) if metadata else None
         if not isinstance(export, dict) or clean_text(export.get("filename")) != expected_filename:
@@ -29072,7 +29104,7 @@ def database_current_publication_authority_for_metadata(
         return {}
     historical_profile = storage.historical_publication_profile(metadata)
     if not historical_profile:
-        return database_current_publication_authority(storage, payload)
+        return storage._quote_rendering_authority(metadata)
     selection = explicit_pricing_reference_selection(payload)
     if not selection.get("ok"):
         return {}

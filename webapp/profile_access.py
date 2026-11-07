@@ -86,7 +86,7 @@ class ProfilePolicy:
             return True
         if not self.user_id:
             return False
-        return state == "shared" or self.admin or profile["_access"]["owner_user_id"] == self.user_id
+        return state == "shared" or profile["_access"]["owner_user_id"] == self.user_id
 
     def can_update(self, profile):
         state = access_state(profile)

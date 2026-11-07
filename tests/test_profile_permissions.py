@@ -16,17 +16,20 @@ class ProfilePermissionsTest(unittest.TestCase):
         personal = {"_access": {"version": 1, "owner_user_id": "staff-a", "visibility": "user"}}
         shared = {"_access": {"version": 1, "owner_user_id": "staff-a", "visibility": "shared"}}
         actors = [("staff-a", "operator", True, True), ("staff-b", "operator", False, False),
-                  ("staff-a", "admin", True, True), ("support", "admin", True, True),
+                  ("staff-a", "admin", True, True), ("support", "admin", False, False),
+                  ("staff-a", "management", True, True), ("support", "management", False, False),
                   ("staff-a", "viewer", True, False), ("", "blocked", False, False)]
         for user, role, read, update in actors:
             policy = ProfilePolicy(user, role)
             with self.subTest(user=user, role=role):
                 self.assertEqual(policy.can_read(personal), read)
                 self.assertEqual(policy.can_update(personal), update)
+                self.assertEqual(policy.capabilities(personal), {
+                    "canRead": read, "canUpdate": update, "canDelete": update, "canExport": read})
                 self.assertEqual(policy.can_read(shared), bool(user))
-                self.assertEqual(policy.can_update(shared), role == "admin")
+                self.assertEqual(policy.can_update(shared), role in {"admin", "management"})
                 self.assertEqual(policy.can_read({}), role != "blocked")
-                self.assertEqual(policy.can_update({}), role == "admin")
+                self.assertEqual(policy.can_update({}), role in {"admin", "management"})
                 for invalid in ({"_access": None}, {"_access": {}}, {"_sqag_deleted": True},
                                 {"_access": {"version": True, "owner_user_id": user, "visibility": "user"}},
                                 {"_access": {"version": 1, "owner_user_id": user, "visibility": []}}):
@@ -34,12 +37,19 @@ class ProfilePermissionsTest(unittest.TestCase):
                     self.assertFalse(policy.can_update(invalid))
 
     def test_http_member_roundtrip_shared_denial_csrf_and_pricing(self):
+        for mode in ("database", "object"):
+            with self.subTest(mode=mode), mock.patch.object(
+                s, "configured_object_storage_backend", return_value=s.InMemoryObjectStorageBackend()
+            ):
+                self.exercise_http_profile_matrix(mode)
+
+    def exercise_http_profile_matrix(self, mode):
         with tempfile.TemporaryDirectory() as directory:
             url = "sqlite:///" + (Path(directory) / "http.sqlite3").as_posix()
             s.apply_sqag_storage_migrations(url)
             host = auth_http.InternalPasswordAuthWebappTest()
             # The login fixture runs in deploy mode, which also requires audit identity config.
-            host.setUp({"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "database", "SQAG_DATABASE_URL": url,
+            host.setUp({"SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": mode, "SQAG_DATABASE_URL": url,
                         "SQAG_TRACKING_HMAC_KEY": "synthetic-profile-audit-tracking-key",
                         "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1"})
             try:
@@ -88,9 +98,51 @@ class ProfilePermissionsTest(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertEqual(host.http("GET", "/api/settings/pricing-references", member_headers)[0], 403)
                 admin_headers, _ = login(auth_http.email())
-                access = {"operation": "access", "id": identity, "revision": 1,
+                self.assertEqual(host.http("GET", "/api/settings/pricing-references", admin_headers)[0], 200)
+                # Admins cannot discover or operate on another member's personal profile.
+                for route in ("/api/profiles", "/api/settings", "/api/settings/profiles"):
+                    status, _, raw = host.http("GET", route, admin_headers)
+                    self.assertEqual(status, 200, raw)
+                    self.assertNotIn(identity, raw.decode())
+                denied = host.http("GET", export_route, admin_headers)
+                absent = host.http("GET", export_route.replace(identity, "profile-missing"), admin_headers)
+                self.assertEqual(denied[0], 404, denied[2])
+                self.assertEqual(absent[0], 404, absent[2])
+                denied_body, absent_body = json.loads(denied[2]), json.loads(absent[2])
+                self.assertTrue(denied_body.pop("error_reference"))
+                self.assertTrue(absent_body.pop("error_reference"))
+                self.assertEqual(denied_body, absent_body)
+                before = inspection._read_payload("sqag_profiles", "profile_id", identity)
+                for method, route, body in (
+                    ("POST", "/api/settings/profiles", {"operation": "update", "id": identity, "revision": 1, "defaults": {}}),
+                    ("POST", "/api/settings/profiles", {"operation": "access", "id": identity, "revision": 1,
+                        "access": {"version": 1, "owner_user_id": owner_id, "visibility": "shared"}}),
+                    ("DELETE", f"/api/settings/profiles/{identity}?revision=1", None),
+                ):
+                    status, _, raw = host.http(method, route, admin_headers, json.dumps(body) if body else None)
+                    self.assertEqual(status, 404, raw)
+                    self.assertEqual(inspection._read_payload("sqag_profiles", "profile_id", identity), before)
+                # The admin's own copy can still be loaded, exported, updated and shared.
+                body = {"operation": "create", "id": "synthetic-admin-profile", "label": "Synthetic admin profile", "defaults": {}}
+                status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps(body))
+                self.assertEqual(status, 200, raw)
+                own = json.loads(raw)["profile"]
+                identity = own["id"]
+                self.assertTrue(all(own["permissions"].values()))
+                export_route = f"/api/settings/profiles/{identity}/export.json"
+                self.assertEqual(host.http("GET", export_route, admin_headers)[0], 200)
+                status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps({
+                    "operation": "update", "id": identity, "revision": own["revision"], "label": "Synthetic updated profile", "defaults": {}}))
+                self.assertEqual(status, 200, raw)
+                own = json.loads(raw)["profile"]
+                # Sharing can assign ownership; authority is checked on the existing row.
+                access = {"operation": "access", "id": identity, "revision": own["revision"],
                           "access": {"version": 1, "owner_user_id": owner_id, "visibility": "shared"}}
                 status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps(access))
+                self.assertEqual(status, 200, raw)
+                revision = json.loads(raw)["profile"]["revision"]
+                status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps({
+                    "operation": "update", "id": identity, "revision": revision, "label": "Synthetic shared update", "defaults": {}}))
                 self.assertEqual(status, 200, raw)
                 revision = json.loads(raw)["profile"]["revision"]
                 before = inspection._read_payload("sqag_profiles", "profile_id", identity)
@@ -100,6 +152,39 @@ class ProfilePermissionsTest(unittest.TestCase):
                 self.assertEqual(host.http("GET", export_route, member_headers)[0], 200)
                 self.assertEqual(host.http("DELETE", f"/api/settings/profiles/{identity}?revision={revision}", member_headers)[0], 404)
                 self.assertEqual(host.http("DELETE", f"/api/settings/profiles/{identity}?revision={revision}", admin_headers)[0], 200)
+                # An admin can unshare a shared row, then loses access to its new private state.
+                status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps(body))
+                self.assertEqual(status, 200, raw)
+                own = json.loads(raw)["profile"]
+                access.update(id=own["id"], revision=own["revision"], access={
+                    "version": 1, "owner_user_id": owner_id, "visibility": "shared"})
+                status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps(access))
+                self.assertEqual(status, 200, raw)
+                access.update(revision=json.loads(raw)["profile"]["revision"], access={
+                    "version": 1, "owner_user_id": owner_id, "visibility": "user"})
+                status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps(access))
+                self.assertEqual(status, 200, raw)
+                self.assertFalse(any(json.loads(raw)["profile"]["permissions"].values()))
+                self.assertEqual(host.http("GET", f"/api/settings/profiles/{own['id']}/export.json", admin_headers)[0], 404)
+                # Legacy metadata is deliberately unchanged until an approved backfill.
+                legacy = inspection.save_profile(s.normalize_profile_payload({"id": "legacy-profile", "defaults": {}}))
+                legacy_payload = inspection._read_payload("sqag_profiles", "profile_id", legacy["id"])
+                legacy_payload.pop("_access")
+                legacy_payload.pop("_revision")
+                inspection._upsert_payload("sqag_profiles", "profile_id", legacy["id"], legacy_payload)
+                for headers in (member_headers, admin_headers):
+                    status, _, raw = host.http("GET", "/api/settings/profiles", headers)
+                    self.assertEqual(status, 200, raw)
+                    self.assertIn(legacy["id"], [p["id"] for p in json.loads(raw)["company_profiles"]])
+                    self.assertEqual(host.http("GET", f"/api/settings/profiles/{legacy['id']}/export.json", headers)[0], 200)
+                update = {"operation": "update", "id": legacy["id"], "revision": 0, "defaults": {}}
+                self.assertEqual(host.http("POST", "/api/settings/profiles", member_headers, json.dumps(update))[0], 404)
+                self.assertEqual(host.http("DELETE", f"/api/settings/profiles/{legacy['id']}?revision=0", member_headers)[0], 404)
+                status, _, raw = host.http("POST", "/api/settings/profiles", admin_headers, json.dumps(update))
+                self.assertEqual(status, 200, raw)
+                self.assertNotIn("_access", inspection._read_payload("sqag_profiles", "profile_id", legacy["id"]))
+                revision = json.loads(raw)["profile"]["revision"]
+                self.assertEqual(host.http("DELETE", f"/api/settings/profiles/{legacy['id']}?revision={revision}", admin_headers)[0], 200)
             finally:
                 host.doCleanups()
 
