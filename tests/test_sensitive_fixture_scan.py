@@ -27,6 +27,34 @@ IGNORED_LOCAL_ARTIFACT_PATHS = {
 
 
 class SensitiveFixtureScanTest(unittest.TestCase):
+    def test_quote_contract_exceptions_are_path_and_category_specific(self):
+        allowed = ("docs/quotation-api-v1.md", "docs/quotation-api-v1.openapi.json")
+        neighbours = ("docs/quotation-other.md", "fixtures/quotation-api-v1.openapi.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel_path in (*allowed, *neighbours):
+                path = root / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('{"internal_cost": "synthetic"}', encoding="utf-8")
+                self.assertTrue(scan_sensitive_fixtures.in_default_scan_scope(rel_path))
+                findings = scan_sensitive_fixtures.scan_file(path, root)
+                with self.subTest(path=rel_path):
+                    self.assertEqual(findings, set() if rel_path in allowed else {
+                        scan_sensitive_fixtures.Finding(rel_path, "internal-pricing-field", "review")})
+
+                # Construct a synthetic credential-shaped canary, never a real secret.
+                canary = "sk-" + "syntheticFixtureCanary1234"
+                path.write_text('{"internal_cost": "synthetic", "value": "' + canary + '"}',
+                                encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = scan_sensitive_fixtures.main([
+                        "--root", str(root), "--path", rel_path, "--fail-on-review"])
+                with self.subTest(secret_path=rel_path):
+                    self.assertEqual(code, 1)
+                    self.assertIn("secret-credential-marker", output.getvalue())
+                    self.assertNotIn(canary, output.getvalue())
+
     def test_marker_regex_matches_and_rejects_long_whitespace_quickly(self):
         cases = (
             (scan_sensitive_fixtures.REAL_COMPANY_RE, ("koncept", "images", "pte")),
