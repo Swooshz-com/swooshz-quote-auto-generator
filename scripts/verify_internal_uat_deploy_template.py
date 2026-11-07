@@ -39,7 +39,6 @@ REQUIRED_KEYS = ('SQAG_TRUSTED_PROXY_CIDRS',
  'PORT',
  'SQAG_INTERNAL_ALLOWED_EMAILS',
  'SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN',
- 'SQAG_INTERNAL_IDENTITY_BINDINGS_JSON',
  'SQAG_INTERNAL_LOGIN_PASSWORD',
  'SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD',
  'OPENROUTER_API_KEY',
@@ -143,13 +142,13 @@ EXACT_PLACEHOLDERS = {'OPENROUTER_API_KEY': '<host-secret-manager-openrouter-key
  'OPENROUTER_REQUEST_TIMEOUT_SECONDS': '<host-reviewed-request-timeout-seconds>',
  'SQAG_INTERNAL_ALLOWED_EMAILS': '<host-secret-manager-semicolon-operator-email-allowlist>',
  'SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN': '<host-secret-manager-semicolon-admin-email-allowlist>',
- 'SQAG_INTERNAL_IDENTITY_BINDINGS_JSON': '<host-secret-manager-stable-identity-bindings-json>',
  'SQAG_INTERNAL_LOGIN_PASSWORD': '<host-secret-manager-operator-password>',
  'SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD': '<host-secret-manager-admin-password>',
  'SQAG_INTERNAL_WORKSPACE_ID': '<host-configured-fixed-internal-workspace-id>',
  'SQAG_TRACKING_HMAC_KEY': '<host-secret-manager-dedicated-tracking-hmac-key>'}
 
 OPTIONAL_PLACEHOLDERS = {
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON": "<host-secret-manager-stable-identity-bindings-json>",
     "OPENROUTER_DRAFT_BATCH_REASONING_EFFORT": "<host-reviewed-draft-batch-reasoning-effort>",
 }
 

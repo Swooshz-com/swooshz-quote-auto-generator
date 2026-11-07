@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -121,14 +122,43 @@ class InternalAlphaHostedValidationVerifierTest(unittest.TestCase):
             verifier.webapp.AUTH_REQUIRED_ENV_NAME, verifier.webapp.AUTH_MODE_ENV_NAME,
             verifier.webapp.SESSION_SECRET_ENV_NAME, verifier.webapp.INTERNAL_WORKSPACE_ID_ENV_NAME,
             verifier.webapp.INTERNAL_ALLOWED_EMAILS_ENV_NAME, verifier.webapp.INTERNAL_LOGIN_PASSWORD_ENV_NAME,
-            verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
         }
         self.assertTrue(names <= set(report["required_env_names"]))
+        binding_name = verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME
+        self.assertNotIn(binding_name, report["required_env_names"])
+        with self.assertRaisesRegex(ValueError, "^Unsafe verification metadata[.]$"):
+            verifier.public_report_metadata(report | {"required_env_names": report["required_env_names"] + [binding_name]})
         private_names = {
             verifier.webapp.SESSION_SECRET_ENV_NAME, verifier.webapp.INTERNAL_ALLOWED_EMAILS_ENV_NAME,
             verifier.webapp.INTERNAL_LOGIN_PASSWORD_ENV_NAME, verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME,
         }
         self.assertTrue(private_names <= set(report["host_secret_manager_only_env_names"]))
+
+    def test_no_binding_scenario_keeps_synthetic_readiness_blocked(self):
+        original_env = verifier.temporary_env
+        binding_name = verifier.webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME
+
+        @contextlib.contextmanager
+        def without_binding(values):
+            # Keep the explicit legacy fixture in the runner; qualify omission separately.
+            self.assertIn(binding_name, values)
+            with original_env({key: value for key, value in values.items() if key != binding_name}):
+                self.assertNotIn(binding_name, os.environ)
+                self.assertTrue(verifier.webapp.internal_password_config_complete())
+                yield
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"SQAG_DISABLE_DOTENV": "1"}, clear=True))
+            stack.enter_context(mock.patch.object(verifier, "temporary_env", without_binding))
+            for dependency in (verifier.verify_database_backup_restore, verifier.verify_hosted_observability, verifier.verify_hosted_smoke):
+                stack.enter_context(mock.patch.object(dependency, "run_verification", return_value={"status": "passed"}))
+            report = verifier.run_verification(work_dir=ROOT / "_tmp" / "tests" / "no-binding")
+        self.assertEqual(report["status"], "passed")
+        self.assertNotIn(binding_name, report["required_env_names"])
+        self.assertIn(binding_name, report["host_secret_manager_only_env_names"])
+        self.assertFalse(report["readiness"]["internal_alpha_ready"])
+        self.assertFalse(report["readiness"]["production_ready"])
+        self.assertIn("database_blob_artifact_storage_not_launch_ready", report["readiness"]["blocker_ids"])
 
     def test_cli_projection_refuses_canaries_at_every_string_leaf(self):
         import copy

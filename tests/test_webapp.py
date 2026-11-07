@@ -10463,6 +10463,41 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertIn(key, values)
             self.assertTrue(deploy_template.is_placeholder(values[key]), key)
 
+    def test_internal_uat_coolify_env_template_optional_identity_bindings_matrix(self):
+        key = "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON"
+        marker = "<host-secret-manager-stable-identity-bindings-json>"
+        source = deploy_template.DEFAULT_TEMPLATE.read_text(encoding="utf-8")
+        line = f"{key}={marker}"
+        self.assertEqual(source.count(line), 1)
+        raw_json = json.dumps([{"email": "alias@example.test", "user_id": "legacy-subject", "role": "admin"}])
+        cases = (("omitted", None, "ready", None), ("empty", "", "ready", None),
+                 ("approved", marker, "ready", None),
+                 ("other-marker", "<unapproved-binding-marker>", "blocked", "unexpected-placeholder"),
+                 ("empty-array", "[]", "blocked", "non-placeholder-value"),
+                 ("raw-json", raw_json, "blocked", "non-placeholder-value"),
+                 ("secret", "sk-" + "binding-canary-1234567890", "blocked", "real-looking-secret"))
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "sqag.uat.env.example"
+            for label, value, status, category in cases:
+                candidate = source.replace(line + "\n", "" if value is None else f"{key}={value}\n")
+                template.write_text(candidate, encoding="utf-8")
+                with self.subTest(binding=label):
+                    result = deploy_template.verify_template(template)
+                    self.assertEqual(result["status"], status)
+                    if category:
+                        self.assertIn(category, {finding.category for finding in result["findings"]})
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        self.assertEqual(deploy_template.main([str(template)]), 0 if status == "ready" else 1)
+                    if value:
+                        self.assertNotIn(value, stdout.getvalue())
+            # Omission must not bypass any generic scan of the rest of the file.
+            candidate = source.replace(line + "\n", "") + "# sk-" + "omitted-binding-canary-1234567890\n"
+            template.write_text(candidate, encoding="utf-8")
+            result = deploy_template.verify_template(template)
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("real-looking-secret", {finding.category for finding in result["findings"]})
+
     def test_internal_uat_coolify_env_template_requires_tracking_variables(self):
         source = ROOT / "deploy" / "internal-uat" / "coolify" / "sqag.uat.env.example"
         source_text = source.read_text(encoding="utf-8")

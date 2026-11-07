@@ -245,6 +245,13 @@ or deployment behaviour changes accompany this test.
   See [internal staff password access](internal-password-auth-mode.md) for the
   exact settings and limits. Mixed legacy configuration is rejected. It can
   never satisfy public production readiness.
+- The offline internal UAT template check permits an omitted or empty
+  `SQAG_INTERNAL_IDENTITY_BINDINGS_JSON` or its approved placeholder, while
+  retaining generic secret scans and rejecting raw JSON and other markers.
+  Runtime preflight and startup permit omission, empty or `[]`; supplied bindings
+  retain strict validation. Synthetic hosted metadata excludes this optional key
+  from required names and keeps it secret-manager-only if supplied. These checks
+  do not inspect the live host. CI jobs, triggers and required checks are unchanged.
 - Platform deploy requests accept only signed sessions containing the consumed Platform
   user, workspace, app, and supported membership-role context. Pre-existing
   OIDC-only cookies are treated as unauthenticated and cannot inherit a tester

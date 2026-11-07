@@ -9,6 +9,7 @@ import threading
 import unittest
 import urllib.parse
 from unittest import mock
+from types import SimpleNamespace
 from webapp import server as webapp
 from webapp import internal_password_auth as auth
 from tests.test_internal_password_auth import email, policy_values, password_for
@@ -24,6 +25,111 @@ def internal_env():
             "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN":values["allowed_admin_emails"],
             "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD":values["admin_password"],
             "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON":values["bindings_json"], "SQAG_INTERNAL_LOGIN_PASSWORD":values["password"]}
+
+class OptionalIdentityBindingsDeployTest(unittest.TestCase):
+    def deploy_env(self):
+        return internal_env() | {
+            "SQAG_TRACKING_HMAC_KEY": "synthetic-tracking-key",
+            "SQAG_TRACKING_HMAC_KEY_VERSION": "synthetic-v1",
+            "SQAG_STORAGE_MODE": "database", "SQAG_ARTIFACT_STORAGE_MODE": "object",
+            "SQAG_DATABASE_URL": "postgresql://runtime:synthetic@127.0.0.1/sqag_test",
+            "SQAG_OBJECT_STORAGE_PROVIDER": "s3_compatible",
+            "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
+            "SQAG_OBJECT_STORAGE_BUCKET": "synthetic-bucket",
+            "SQAG_OBJECT_STORAGE_REGION": "synthetic-region",
+            "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "synthetic-access-key",
+            "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "synthetic-secret-key",
+            **dict.fromkeys(("QUOTE_DATA_ROOT", "QUOTE_OUTPUT_ROOT", "QUOTE_TMP_ROOT", "QUOTE_LOG_ROOT"),
+                            "synthetic-host-runtime-root"),
+        }
+
+    @contextlib.contextmanager
+    def offline_dependencies(self, env):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            stack.enter_context(mock.patch.object(webapp, "postgres_driver_available", return_value=True))
+            stack.enter_context(mock.patch.object(webapp, "configured_object_storage_status", return_value={
+                "provider": "s3_compatible", "runtime_backend_available": True, "blockers": [],
+            }))
+            stack.enter_context(mock.patch.object(webapp, "path_is_outside_project", return_value=True))
+            yield
+
+    def assert_startup(self, ready):
+        # Exercise main's real auth guard; replace all later dependency/filesystem/server effects.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(webapp, "parse_args", return_value=SimpleNamespace(
+                check_deploy_uat_env=False, check_production_readiness=False, host="127.0.0.1", port=0)))
+            stack.enter_context(mock.patch.object(webapp, "deploy_requires_storage_guard", return_value=False))
+            health = stack.enter_context(mock.patch.object(webapp, "health_status", return_value={"status": "ok"}))
+            for name in ("configured_output_root", "configured_tmp_root", "reconcile_forensic_runs_on_startup",
+                         "safe_stdout", "safe_stderr"):
+                stack.enter_context(mock.patch.object(webapp, name))
+            factory = stack.enter_context(mock.patch.object(webapp, "ThreadingHTTPServer"))
+            self.assertEqual(webapp.main(), 0 if ready else 2)
+            if ready:
+                factory.assert_called_once()
+                factory.return_value.serve_forever.assert_called_once()
+                factory.return_value.server_close.assert_called_once()
+                health.assert_called_once_with(force_dependency_probe=True)
+            else:
+                factory.assert_not_called()
+                health.assert_not_called()
+
+    def test_absent_empty_and_empty_array_bindings_pass_preflight_and_startup(self):
+        fingerprints = set()
+        for label, value in (("absent", None), ("empty", ""), ("empty-array", "[]")):
+            env = self.deploy_env()
+            key = webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME
+            env.pop(key)
+            if value is not None:
+                env[key] = value
+            with self.subTest(binding=label), self.offline_dependencies(env):
+                self.assertEqual(key in os.environ, value is not None)
+                self.assertEqual(webapp.deploy_uat_preflight_status()["status"], "ready")
+                self.assertFalse(webapp.deploy_requires_auth_guard())
+                identities, _ = auth.InternalAuthPolicy.validate_values(**webapp.internal_auth_policy_values())
+                self.assertEqual({i.email: (i.user_id, i.role) for i in identities}, {
+                    email(): (auth.stable_alias_id(env["SQAG_INTERNAL_WORKSPACE_ID"], email()), "admin"),
+                    email("operator"): (auth.stable_alias_id(env["SQAG_INTERNAL_WORKSPACE_ID"], email("operator")), "operator"),
+                })
+                fingerprints.add(auth.InternalAuthPolicy.fingerprint_for_values(**webapp.internal_auth_policy_values()))
+                self.assert_startup(True)
+        self.assertEqual(len(fingerprints), 1)
+
+    def test_supplied_legacy_bindings_keep_ids_and_invalid_bindings_block_startup(self):
+        rows = json.loads(policy_values()["bindings_json"])
+        cases = (("legacy", json.dumps(rows), True), ("malformed", "{", False),
+                 ("duplicate", json.dumps(rows + [rows[0]]), False),
+                 ("oversized", " " * (auth.MAX_INTERNAL_IDENTITIES_JSON_BYTES + 1), False))
+        for label, value, ready in cases:
+            with self.subTest(binding=label), self.offline_dependencies(
+                self.deploy_env() | {webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME: value}
+            ):
+                self.assertEqual(webapp.deploy_uat_preflight_status()["status"], "ready" if ready else "blocked")
+                self.assertEqual(webapp.deploy_requires_auth_guard(), not ready)
+                if ready:
+                    identities, _ = auth.InternalAuthPolicy.validate_values(**webapp.internal_auth_policy_values())
+                    self.assertEqual({i.email: i.user_id for i in identities}, {r["email"]: r["user_id"] for r in rows})
+                self.assert_startup(ready)
+
+    def test_platform_mode_still_rejects_nonempty_internal_bindings(self):
+        env = self.deploy_env()
+        for key in tuple(env):
+            if key.startswith("SQAG_INTERNAL_"):
+                del env[key]
+        env.update(SQAG_AUTH_MODE="platform", SQAG_PLATFORM_LAUNCH_MODE="platform",
+                   SQAG_PUBLIC_BASE_URL=webapp.PRODUCTION_SQAG_ORIGIN,
+                   SQAG_PLATFORM_BASE_URL=webapp.PRODUCTION_PLATFORM_ORIGIN,
+                   SQAG_PLATFORM_SERVICE_SECRET="synthetic-platform-service-secret-with-enough-entropy")
+        for value, ready in ((None, True), ("", True), ("[]", False), (policy_values()["bindings_json"], False)):
+            candidate = dict(env)
+            if value is not None:
+                candidate[webapp.INTERNAL_IDENTITY_BINDINGS_ENV_NAME] = value
+            with self.subTest(binding="absent" if value is None else "supplied"), self.offline_dependencies(candidate):
+                self.assertEqual(webapp.deploy_uat_preflight_status()["status"], "ready" if ready else "blocked")
+                self.assertEqual(webapp.deploy_requires_auth_guard(), not ready)
+                self.assert_startup(ready)
+
 
 class InternalPasswordAuthWebappTest(unittest.TestCase):
     def setUp(self, extra_env=None):
