@@ -1705,7 +1705,16 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                         )
                     )
             connection.execute("revoke all privileges on all sequences in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
-            connection.execute("revoke all privileges on all functions in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
+            for schema, routine, identity_arguments in sorted(routine_keys):
+                if routine == "sqag_quote_api_admission_lookup":
+                    continue  # Preserve the migration's ACL, including missing/extra grants.
+                connection.execute(
+                    self.sql.SQL("revoke all privileges on function {}.{}({}) from PUBLIC, sqag_runtime, sqag_maintenance").format(
+                        self.sql.Identifier(schema),
+                        self.sql.Identifier(routine),
+                        self.sql.SQL(identity_arguments),
+                    )
+                )
             for routine, identity_arguments in contract.EXPECTED_TRIGGER_ROUTINE_KEYS:
                 if ("public", routine, identity_arguments) not in routine_keys:
                     continue
@@ -2342,6 +2351,8 @@ order by object_kind, object_schema, object_name, object_type
             ("sqag_telemetry_source_state_no_delete", "sqag_telemetry_source_state"),
             ("sqag_telemetry_events_no_update", "sqag_telemetry_events"),
             ("sqag_telemetry_events_guard_delete", "sqag_telemetry_events"),
+            ("sqag_quote_api_tenants_binding_immutable", "sqag_quote_api_tenants"),
+            ("sqag_quote_api_callers_binding_immutable", "sqag_quote_api_callers"),
         ):
             self._execute_admin(f"drop trigger if exists {trigger} on public.{table}")
         self._execute_admin("drop routine if exists public.sqag_reject_immutable_change()")
@@ -2373,6 +2384,13 @@ order by object_kind, object_schema, object_name, object_type
             "execute function public.sqag_reject_immutable_change()"
         )
         self._execute_admin("create trigger sqag_telemetry_events_guard_delete before delete on public.sqag_telemetry_events for each row execute function public.sqag_require_retention_delete_authorization()")
+        # Recreate admission dependencies from the canonical source, with exact columns.
+        admission_source = migration_contract.canonical_migration_payload(
+            ROOT / "migrations/012_quote_api_admission_postgres.sql"
+        ).decode("utf-8")
+        for statement in migration_contract._split_sql_statements(admission_source):
+            if statement.startswith("create trigger "):
+                self._execute_admin(statement)
 
     def test_real_pg17_authenticated_and_active_identity_invariant(self):
         for expected_role in (
@@ -3802,10 +3820,10 @@ order by object_kind, object_schema, object_name, object_type
                 backend_factory=lambda _env: backend,
                 test_injected_backend=True,
             )
+            self.assertEqual(report["status"], "passed", report["blockers"])
             with self.assertRaises(webapp.QuoteCommercialStateError):
                 webapp.payload_to_brief(writer_payloads[0])
         write_spy.assert_called_once()
-        self.assertEqual(report["status"], "passed")
         self.assertEqual(report["blockers"], [])
         self.assertTrue(report["checks"]["active_runtime_download_verified"])
         self.assertTrue(report["checks"]["tombstone_metadata_verified"])
@@ -4251,7 +4269,7 @@ order by object_kind, object_schema, object_name, object_type
             active_backend,
             restore_backend,
         )
-        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["status"], "passed", report["blockers"])
         self.assertEqual(report["blockers"], [])
         self.assertTrue(binding_restored)
         self.assertEqual(factory_calls, {"active": 1, "restore": 1})

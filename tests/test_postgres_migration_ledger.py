@@ -957,7 +957,11 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             self.apply(self.manifest, stale_database)
 
     def test_quote_ai_spend_upgrade_and_transactional_cascade(self):
-        self.apply(self.manifest[:-1])
+        spend_index = next(
+            index for index, migration in enumerate(self.manifest)
+            if migration.migration_id == "011_quote_ai_spend_postgres.sql"
+        )
+        self.apply(self.manifest[:spend_index])
         connection = self.connect()
         try:
             connection.execute(
@@ -966,7 +970,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                 "values ('workspace-test', 'quote-test', '{}', 'created', 'updated')"
             )
             connection.commit()
-            applied = self.apply()
+            applied = self.apply(self.manifest[:spend_index + 1])
             self.assertEqual(applied["appliedNow"], ["011_quote_ai_spend_postgres.sql"])
             self.assertEqual(connection.execute(
                 "select count(*) as n from public.sqag_quote_sessions"
