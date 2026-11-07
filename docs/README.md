@@ -22,6 +22,10 @@ Update this map when an entry point or source of truth moves.
 
 ## Current Docs
 
+- [Quotation API contract proposal](quotation-api-v1.md) and
+  [machine-readable spec](quotation-api-v1.openapi.json): proposed server-to-server
+  estimates, confirmation, safe projections and offline fake-backed contract tests;
+  no API runtime is implemented by these documents.
 - `docs/sqag-current-status.md`: current RC verdict plus SQAG namespace cleanup
   update, module boundary, runtime data model, private asset rules, owner smoke
   checklist, audit findings, and docs cleanup summary.
