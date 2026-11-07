@@ -21,6 +21,8 @@ secrets or API keys in source, fixtures, logs, GitHub, evidence or model prompts
   wildcards, domains and malformed or non-ASCII emails. Emails are trimmed and
   casefolded. There is no dot, plus or domain alias inference.
 - `SQAG_INTERNAL_IDENTITY_BINDINGS_JSON` optionally preserves legacy IDs. Keep
+  it omitted, empty or `[]` when no legacy mapping is needed. Unbound allowed
+  aliases receive stable workspace-and-email IDs. If supplied, keep
   the existing exact `email`, `user_id` and `role` record shape, including
   inactive bindings. The legacy role field is validated for format. Only the
   role lists grant access. IDs must be unique after storage projection.
@@ -110,6 +112,14 @@ they remain recognised only where required to reject mixed configuration. The
 guarded callback refusal and logout cleanup of old state cookies remain intact.
 
 ## Validation and qualification
+
+The offline deployment-template verifier checks a placeholder file, not the host
+environment. The binding line may be omitted, empty or use the approved marker;
+populated JSON belongs only in the host secret manager. Runtime preflight and
+startup accept an omitted or empty binding or `[]`, but reject malformed,
+duplicate or oversized supplied bindings. Other auth, proxy and storage checks
+still apply. The synthetic hosted verifier reports the binding as optional and
+secret-manager-only if supplied; it does not inspect host settings.
 
 Run the password policy, actual-HTTP, identity-continuity, ownership, recovery and
 browser suites listed in [the testing plan](testing-plan.md). Synthetic source
