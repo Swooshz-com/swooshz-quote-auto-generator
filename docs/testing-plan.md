@@ -23,6 +23,10 @@ Profile and layout hashes must match the saved publication proof. This internal
 read returns no profile data and grants no profile endpoint access. Missing
 owners, mismatched profile IDs and changed, invalid or deleted profiles deny
 delivery; client values cannot override the saved owner or profile.
+File authority compares qualified profile identities. Bare saved IDs use their
+recorded source, defaulting to company profiles when none is recorded. A different
+source or ID denies delivery before a profile read. Direct internal calls must also prove
+quote admission and reject otherwise valid authority with different saved hashes.
 Unmapped legacy rows retain workspace reads and administrator writes pending an
 explicit ID-to-owner mapping. Invalid metadata is unavailable, including to admins.
 Internal-password sessions require database storage for saved company profiles.

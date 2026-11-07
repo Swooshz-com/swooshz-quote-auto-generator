@@ -14891,14 +14891,19 @@ class DatabaseSqagStorage:
         subject = proof.get("subject") if isinstance(proof.get("subject"), dict) else {}
         expected_profile = proof.get("profile") if isinstance(proof.get("profile"), dict) else {}
         payload = quote_session_authority_payload(persisted)
+        profile = persisted.get("quote_company_profile") if isinstance(persisted.get("quote_company_profile"), dict) else {}
+        profile_source, _ = profile_identity_parts(payload.get("profile_id"), profile.get("source") or "company")
+        profile_id = profile_identity_value(payload.get("profile_id"), profile_source)
         if (
             not owner_id or subject.get("owner_id") != owner_id
             or subject.get("workspace_id") != self.workspace_id
             or subject.get("session_id") != session_id
-            or not payload or expected_profile.get("id") != payload["profile_id"]
-            or expected_profile.get("source") != payload["profile_source"]
+            or not payload or expected_profile.get("id") != profile_id
+            or expected_profile.get("source") != profile_source
         ):
             return {}
+        payload.update(profile_id=profile_id, profile_source=profile_source,
+                       quote_company_profile={"id": profile_id, "source": profile_source})
         # Viewer policy grants reads only; do not change the caller's identity.
         owner_reader = copy.copy(self)
         owner_reader.user_id = owner_id

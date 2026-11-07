@@ -120,6 +120,9 @@ match the quote's publication proof. Missing owners, changed, invalid or deleted
 profiles fail closed. This read returns no profile content to admins and grants
 no profile list, load, export, edit or access-change permission. Client-supplied
 owner and profile values cannot override the saved quote.
+Bare saved profile IDs use the company source when none is recorded; qualified
+IDs keep their source. The source and ID must both match the publication proof
+before the server reads the profile.
 
 The independent Platform launch/session contracts remain supported. The local
 OIDC adapter is retired in every mode. Its settings cannot enable provider login;
