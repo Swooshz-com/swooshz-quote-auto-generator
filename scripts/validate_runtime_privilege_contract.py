@@ -38,6 +38,7 @@ CONTRACT_PATH = ROOT / "docs" / "runtime-privilege-contract.json"
 SOURCE_SQL_FILES = (
     "webapp/server.py",
     "webapp/forensics.py",
+    "webapp/quote_api_registry.py",
     "scripts/enforce_forensic_retention.py",
 )
 UNSUPPORTED_SOURCE_RELATIONS = frozenset({"sqag_file_artifacts", "sqag_quote_artifacts"})
@@ -59,6 +60,8 @@ TABLE_PRIVILEGES = (
     "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
 )
 RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
+    "sqag_quote_api_tenants": (),
+    "sqag_quote_api_callers": (),
     "sqag_profiles": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_pricing_references": ("SELECT", "INSERT", "UPDATE", "DELETE"),
     "sqag_quote_sessions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
@@ -75,6 +78,8 @@ RUNTIME_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sqag_telemetry_source_state": ("SELECT", "INSERT", "UPDATE"),
 }
 MAINTENANCE_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
+    "sqag_quote_api_tenants": (),
+    "sqag_quote_api_callers": (),
     "sqag_quote_sessions": ("SELECT", "DELETE"),
     "sqag_object_artifacts": ("SELECT", "UPDATE"),
     "sqag_generation_runs": ("SELECT", "UPDATE", "DELETE"),
@@ -95,6 +100,44 @@ RUNTIME_FORBIDDEN_TABLES = frozenset({
     "sqag_legal_holds", "sqag_retention_delete_authorizations", "sqag_deletion_receipts",
     "sqag_retention_scan_cursors", LEDGER_TABLE,
 })
+RUNTIME_COLUMN_PRIVILEGES = {'sqag_quote_api_tenants': {'SELECT': ['tenant_id',
+                                       'workspace_id',
+                                       'state',
+                                       'authority_revision',
+                                       'policy_json',
+                                       'created_at',
+                                       'expires_at',
+                                       'revoked_at',
+                                       'create_minute_start',
+                                       'create_minute_count',
+                                       'create_day_start',
+                                       'create_day_count',
+                                       'active_jobs',
+                                       'counter_revision'],
+                            'UPDATE': ['create_minute_start',
+                                       'create_minute_count',
+                                       'create_day_start',
+                                       'create_day_count',
+                                       'active_jobs',
+                                       'counter_revision']},
+ 'sqag_quote_api_callers': {'SELECT': ['tenant_id',
+                                       'caller_id',
+                                       'owner_subject',
+                                       'credential_id',
+                                       'state',
+                                       'credential_revision',
+                                       'authority_revision',
+                                       'operations_mask',
+                                       'created_at',
+                                       'expires_at',
+                                       'revoked_at',
+                                       'poll_minute_start',
+                                       'poll_minute_count',
+                                       'counter_revision'],
+                            'UPDATE': ['poll_minute_start',
+                                       'poll_minute_count',
+                                       'counter_revision']}}
+
 DECLARED_ROLES = ("sqag_runtime", "sqag_migrator", "sqag_maintenance")
 PROVIDER_CONTROLLED_MEMBERSHIP_EDGE_KEYS = frozenset({
     "role", "member", "grantor", "admin_option", "inherit_option", "set_option",
@@ -173,6 +216,7 @@ CALLABLE_ROUTINE_V2_REFERENCED_RELATIONS = (
     "sqag_telemetry_events",
 )
 CALLABLE_ROUTINE_DEFINITIONS = (
+    {"name": "sqag_quote_api_admission_lookup", "identity_arguments": "text", "migration_path": "migrations/012_quote_api_admission_postgres.sql", "referenced_relations": ("sqag_quote_api_callers", "sqag_quote_api_tenants"), "result_type": 'TABLE(credential_id text, verifier bytea, tenant_id text, workspace_id text, caller_id text, owner_subject text, credential_revision bigint, tenant_revision bigint, caller_revision bigint, operations_mask smallint, expires_at bigint, caller_state text, tenant_state text, policy_json text)'},
     {
         "name": CALLABLE_ROUTINE_NAME,
         "identity_arguments": CALLABLE_ROUTINE_IDENTITY_ARGUMENTS,
@@ -238,7 +282,14 @@ EXPECTED_CALLABLE_ROUTINE_DOCUMENT_V2 = {
     "grant_options": False,
     "fail_closed": True,
 }
+EXPECTED_ADMISSION_ROUTINE_DOCUMENT = {
+    **EXPECTED_CALLABLE_ROUTINE_DOCUMENT,
+    "name": "sqag_quote_api_admission_lookup", "identity_arguments": "text",
+    "argument_types": ["text"], "result_type": 'TABLE(credential_id text, verifier bytea, tenant_id text, workspace_id text, caller_id text, owner_subject text, credential_revision bigint, tenant_revision bigint, caller_revision bigint, operations_mask smallint, expires_at bigint, caller_state text, tenant_state text, policy_json text)',
+    "referenced_relations": ["sqag_quote_api_callers", "sqag_quote_api_tenants"],
+}
 EXPECTED_CALLABLE_ROUTINE_DOCUMENTS = (
+    EXPECTED_ADMISSION_ROUTINE_DOCUMENT,
     EXPECTED_CALLABLE_ROUTINE_DOCUMENT,
     EXPECTED_CALLABLE_ROUTINE_DOCUMENT_V2,
 )
@@ -776,6 +827,8 @@ def validate_source_bindings(manifest: Mapping[str, Any], *, source_texts: Mappi
                 continue
         literal = {m.group(1).lower() for m in SQL_RELATION_RE.finditer(texts[path]) if m.group(1).lower().startswith("sqag_")}
         allowed = set(EXPECTED_TABLES) | set(UNSUPPORTED_SOURCE_RELATIONS)
+        if path == "webapp/quote_api_registry.py":
+            allowed.add("sqag_quote_api_admission_lookup")
         unknown = sorted(literal - allowed)
         if unknown:
             errors.append(f"source_binding.unknown_sql_relation:{path}:{','.join(unknown)}")
@@ -792,12 +845,12 @@ def _validate_manifest_document(manifest: Mapping[str, Any]) -> None:
     top = {
         "$schema", "schema_version", "contract_type", "repository", "namespace", "session_authority", "roles", "provider_controlled_memberships", "ownership",
         "production_migrations", "database_privileges", "schema_privileges", "runtime_tables",
-        "maintenance_tables", "runtime_forbidden_tables", "source_binding", "observation", "policy",
+        "maintenance_tables", "runtime_column_privileges", "runtime_forbidden_tables", "source_binding", "observation", "policy",
     }
     _exact_keys(manifest, top, "contract", errors)
     if {"canonical_source_revision", "canonical_source_tree", "implementation_registry", "source_digest", "source_sha256"}.intersection(manifest):
         errors.append("contract:source_identity_or_digest_registry_forbidden")
-    if manifest.get("$schema") != "runtime-privilege-contract-schema-v4" or manifest.get("schema_version") != 4:
+    if manifest.get("$schema") != "runtime-privilege-contract-schema-v5" or manifest.get("schema_version") != 5:
         errors.append("contract:schema_version_unexpected")
     if manifest.get("contract_type") != "runtime_privilege_contract" or manifest.get("repository") != "Swooshz-com/swooshz-quote-auto-generator":
         errors.append("contract:identity_unexpected")
@@ -869,6 +922,8 @@ def _validate_manifest_document(manifest: Mapping[str, Any]) -> None:
     _validate_privilege_maps(manifest, errors)
     _validate_table_map(manifest.get("runtime_tables"), RUNTIME_TABLE_PRIVILEGES, "runtime_tables", errors)
     _validate_table_map(manifest.get("maintenance_tables"), MAINTENANCE_TABLE_PRIVILEGES, "maintenance_tables", errors)
+    if json.dumps(manifest.get("runtime_column_privileges"), sort_keys=True) != json.dumps(RUNTIME_COLUMN_PRIVILEGES, sort_keys=True):
+        errors.append("runtime_column_privileges:unexpected")
     forbidden = manifest.get("runtime_forbidden_tables")
     _exact_keys(forbidden, set(RUNTIME_FORBIDDEN_TABLES), "runtime_forbidden_tables", errors)
     if isinstance(forbidden, Mapping):
@@ -1393,7 +1448,7 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
             _clean(_row_value(row, "schema_name")) != "public"
             or _clean(_row_value(row, "prokind")) != "f"
             or _clean(_row_value(row, "identity_arguments")) != callable_definition["identity_arguments"]
-            or _clean(_row_value(row, "result_type")).lower() != "boolean"
+            or _clean(_row_value(row, "result_type")).lower() != callable_definition.get("result_type", "boolean").lower()
             or _clean(_row_value(row, "language")) != "sql"
             or not bool(_row_value(row, "prosecdef"))
             or _clean(_row_value(row, "owner")) != "sqag_migrator"
@@ -1586,16 +1641,43 @@ def _check_default_acls(connection: Any, errors: list[str]) -> None:
 
 def _check_columns(connection: Any, errors: list[str]) -> None:
     rows = _rows(connection, "select n.nspname as schema_name, c.relname as table_name, a.attname as column_name, case when acl.grantee = 0 then 'PUBLIC' else coalesce(grantee_role.rolname, 'UNKNOWN') end as grantee, acl.privilege_type, acl.is_grantable from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join lateral pg_catalog.aclexplode(a.attacl) acl on true left join pg_catalog.pg_roles grantee_role on grantee_role.oid = acl.grantee and acl.grantee <> 0 where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'sqag_' || chr(37) and a.attnum > 0 and not a.attisdropped and a.attacl is not null order by c.relname, a.attname, grantee, acl.privilege_type")
+    observed = set()
+    expected = {(table, column, "sqag_runtime", privilege)
+                for table, grants in RUNTIME_COLUMN_PRIVILEGES.items()
+                for privilege, columns in grants.items() for column in columns}
     for row in rows:
         table = _clean(_row_value(row, "table_name"))
         column = _clean(_row_value(row, "column_name"))
         grantee = _acl_grantee(row)
         # The migrator owns the declared namespace. Any explicit column ACL
         # outside that owner authority is outside the locked runtime model.
+        key = (table, column, grantee, _acl_privilege(row))
+        if type(_row_value(row, "is_grantable")) is not bool:
+            errors.append(f"column_acl_projection:{table}:{column}")
         if grantee != "sqag_migrator":
-            errors.append(f"column_privilege:{table}:{column}:{grantee}")
+            if key not in expected or key in observed:
+                errors.append(f"column_privilege:{table}:{column}:{grantee}")
+            observed.add(key)
         if _grantable(row) and grantee != "sqag_migrator":
             errors.append(f"column_grant_option:{table}:{column}:{grantee}")
+
+    if observed != expected:
+        errors.append("column_privilege_inventory_mismatch")
+    from webapp.postgres_migrations import TABLE_SPECS_BY_NAME
+    for table, grants in RUNTIME_COLUMN_PRIVILEGES.items():
+        for column in TABLE_SPECS_BY_NAME[table].columns:
+            for role in RUNTIME_ROLES:
+                for privilege in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
+                    row = _rows(connection,
+                        "select has_column_privilege(?, ?, ?, ?) as effective, "
+                        "has_column_privilege(?, ?, ?, ?) as grantable",
+                        (role, "public." + table, column.name, privilege,
+                         role, "public." + table, column.name, privilege + " WITH GRANT OPTION"))[0]
+                    allowed = role == "sqag_runtime" and column.name in grants.get(privilege, ())
+                    if (type(_row_value(row, "effective")) is not bool
+                            or type(_row_value(row, "grantable")) is not bool
+                            or _row_value(row, "effective") != allowed or _row_value(row, "grantable")):
+                        errors.append(f"effective_column_privilege:{table}:{column.name}:{role}:{privilege}")
 
 
 def _check_effective(

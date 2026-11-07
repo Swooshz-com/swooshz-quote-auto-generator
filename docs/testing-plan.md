@@ -1032,3 +1032,43 @@ S3 transport, installed performance, real PDF rendering, native viewer acceptanc
 owner UAT. Direct post-commit warning coverage uses the reachable local publication
 path; database/object generation finalises atomically and has no equivalent later
 projection-read warning branch.
+
+## Quote admission registry source
+
+Run `tests.test_postgres_migration_placeholders` offline to parse every runner
+migration with psycopg's placeholder scanner and empty bind arguments. Its
+percent-pair fallback keeps this guard active when psycopg is unavailable.
+
+Run `tests.test_admission_source_acl` offline to compare migration 012's parsed
+GRANT/REVOKE statements and their order with the closed JSON privilege contract.
+Mutation controls reject missing EXECUTE, extra privileges and incorrect signatures.
+Recording checks ensure the PostgreSQL fixture preserves admission source ACLs,
+restores every dependent immutable trigger and keeps the spend-upgrade test bound
+to migration 011. These checks do not prove PostgreSQL syntax or effective privileges.
+
+The column checks derive observations from both tables' source SELECT and UPDATE
+lists, then run the validator's explicit inventory and effective-privilege checks.
+Run `tests.test_admission_fixture_mutations` for rollback of temporary ACL grants
+without removing original column grants, and a static scan of routine drops across
+tests for admission trigger dependencies and canonical restoration. Mutation controls
+cover both drop probes, missing dependencies, restoration and table-level REVOKE.
+
+Run `tests.test_quote_api_registry`, quote API contract/auth/tenancy, migration
+ledger, runtime privilege contract and internal-password auth/webapp suites.
+Registry fixtures explicitly load SQLite migration 012 and use only synthetic
+identities/verifiers. Snapshot denied paths, audit failures and second-update
+failures. Cover immutable bindings, verifier lengths, unique/FK constraints,
+closed policy, expiry equality, foreign/stale authority, UTC bucket edges,
+every cap/revision ceiling, two connections and operator CAS. Keep disabled
+HTTP admission and legacy staff/Platform/proxy checks in the protected preview.
+
+The existing disposable PostgreSQL 17 CI suite additionally exercises source
+ACLs without fixture repair of new objects, one-ID verifier lookup, every
+column/role/operation, denied authority and table writes, two runtime workers,
+operator races and fresh revocation fences. Existing generic migration tests
+cover fresh/rerun, rollback, prefix/suffix, drift and advisory-lock concurrency.
+Local offline checks must skip all real PostgreSQL fixtures explicitly; SQLite
+and static SQL splitting are not syntax/catalog/ACL/row-lock proof. Required
+PostgreSQL qualification needs zero skips on its disposable target.
+No browser/native UI change is made. Independent security review, production
+audit/retention binding, installed behaviour and later service UAT remain separate.

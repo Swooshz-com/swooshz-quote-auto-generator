@@ -1,7 +1,7 @@
-"""Disabled quote admission boundary. No registry implementation or work engine.
+"""Disabled quote admission boundary. No default registry or work engine.
 
-Only synthetic tests inject a registry. No files, database, positive cache, token
-issuance or deployed fallback live here. Tokens are high-entropy machine secrets,
+Only synthetic tests inject the separate registry adapters. No files, database,
+positive cache, token issuance or deployed fallback live here. Tokens are high-entropy machine secrets,
 not passwords. Admission is not permission to dispatch work.
 """
 
