@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from types import MappingProxyType
 from typing import Any
+from webapp.ai_response_contracts import DRAFT_SYNTHESIS
 
 OPENROUTER_RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 ROUTE_KEYS = MappingProxyType({
@@ -41,6 +42,22 @@ NONRETRY_ERROR_CODES = frozenset({
     "context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "invalid_prompt",
     "image_content_policy_violation", "permission_denied", "invalid_api_key",
 })
+SCHEMA_ERROR_CODES = frozenset({"unsupported_parameter", "unsupported_schema", "invalid_json_schema",
+    "json_schema_not_supported", "unsupported_response_format"})
+SCHEMA_ERROR_PARAMS = frozenset({"text", "text.format", "text.format.type", "text.format.name",
+                                "text.format.strict", "text.format.schema", "response_format"})
+
+
+def schema_rejected(data, diagnostics):
+    """Closed machine fields only. Never classify errors from provider prose."""
+    metadata = draft_provider_error_diagnostics(data)
+    return (diagnostics.get("http_status") in {400, 404, 405, 415, 422}
+            or metadata.get("provider_error_code") in SCHEMA_ERROR_CODES
+            or metadata.get("provider_error_type") in SCHEMA_ERROR_CODES
+            or metadata.get("provider_error_class") in SCHEMA_ERROR_CODES
+            or metadata.get("provider_error_param") in SCHEMA_ERROR_PARAMS
+            or diagnostics.get("provider_error_code") in SCHEMA_ERROR_CODES
+            or diagnostics.get("provider_error_param") in SCHEMA_ERROR_PARAMS)
 
 
 def http_error_retryable(status, value):
@@ -119,6 +136,7 @@ class GatewayConfiguration:
     timeout_seconds: int
     zdr: bool
     draft_batch_effort: str | None = None
+    draft_schema_enabled: bool = False
 
     @classmethod
     def capture(cls, reader):
@@ -151,7 +169,11 @@ class GatewayConfiguration:
         if batch_effort is not None and batch_effort != "" and (
                 not isinstance(batch_effort, str) or batch_effort not in SUPPORTED_REASONING_EFFORTS):
             raise GatewayError("routing_configuration")
-        return cls(tuple(routes),int(raw_timeout),raw_zdr == "true", batch_effort or None)
+        schema_enabled = reader("OPENROUTER_DRAFT_SCHEMA_ENABLED")
+        if schema_enabled not in (None, "", "false", "true"):
+            raise GatewayError("response_schema_configuration")
+        return cls(tuple(routes),int(raw_timeout),raw_zdr == "true", batch_effort or None,
+                   schema_enabled == "true")
 
     def route(self,operation):
         route = next((r for r in self.routes if r.operation == operation),None)
@@ -167,7 +189,7 @@ class GatewayConfiguration:
 def safe_draft_error_param(value: Any) -> str:
     if not isinstance(value, str) or len(value) > 100:
         return ""
-    if value in {"model", "input", "reasoning", "reasoning.effort"}:
+    if value in {"model", "input", "reasoning", "reasoning.effort"} | SCHEMA_ERROR_PARAMS:
         return value
     if re.fullmatch(r"input(?:\[0\]|\.0)(?:\.(?:role|content)(?:(?:\[[0-9]{1,2}\]|\.[0-9]{1,2})(?:\.(?:type|text|image_url|detail|filename|file_data))?)?)?", value):
         return value
@@ -179,14 +201,14 @@ def draft_provider_error_diagnostics(value: Any) -> dict[str, str]:
         return {}
     result = {}
     canonical = value.get("error_type")
-    if isinstance(canonical, str) and canonical in TRANSIENT_ERROR_TYPES | NONRETRY_ERROR_TYPES:
+    if isinstance(canonical, str) and canonical in TRANSIENT_ERROR_TYPES | NONRETRY_ERROR_TYPES | SCHEMA_ERROR_CODES:
         result["provider_error_type"] = canonical
     error = value.get("error")
     if not isinstance(error, dict):
         return result
     for key, allowed in {
-        "type": SUPPORTED_ERROR_CLASSES,
-        "code": NONRETRY_ERROR_CODES | {"server_error"},
+        "type": SUPPORTED_ERROR_CLASSES | SCHEMA_ERROR_CODES,
+        "code": NONRETRY_ERROR_CODES | SCHEMA_ERROR_CODES | {"server_error"},
     }.items():
         if isinstance(error.get(key), str) and error[key] in allowed:
             result["provider_error_class" if key == "type" else "provider_error_code"] = error[key]
@@ -373,7 +395,7 @@ class AiGateway:
         self._telemetry=telemetry
         self._quote_spend = quote_spend
 
-    def request(self,operation,envelope, *, send_budget=None, draft_batch=False):
+    def request(self,operation,envelope, *, send_budget=None, draft_batch=False, response_contract=None):
         route=self.configuration.route(operation)
         if draft_batch:
             if operation not in {"draft", "draft_high_quality"}:
@@ -383,7 +405,14 @@ class AiGateway:
                 if not isinstance(effort, str) or effort not in SUPPORTED_REASONING_EFFORTS:
                     raise GatewayError("routing_configuration")
                 route = dataclasses.replace(route, effort=effort)
-        if not isinstance(envelope,dict) or set(envelope)-{"model","input","reasoning","max_output_tokens"} or envelope.get("model")!=route.model or envelope.get("reasoning")!={"effort":route.effort} or not isinstance(envelope.get("input"),list) or not envelope["input"]:
+        contract = DRAFT_SYNTHESIS if (self.configuration.draft_schema_enabled
+                    and operation in {"draft", "draft_high_quality"} and not draft_batch) else None
+        if response_contract != (contract.name if contract else None):
+            raise GatewayError("envelope_invalid")
+        if not isinstance(envelope,dict) or set(envelope)-{"model","input","reasoning","max_output_tokens","text"} or envelope.get("model")!=route.model or envelope.get("reasoning")!={"effort":route.effort} or not isinstance(envelope.get("input"),list) or not envelope["input"]:
+            raise GatewayError("envelope_invalid")
+        if ((contract is not None and not contract.matches_text_format(envelope.get("text")))
+                or (contract is None and "text" in envelope)):
             raise GatewayError("envelope_invalid")
         body=copy.deepcopy(envelope)
         body["provider"]=self.configuration.provider_policy(operation)
@@ -421,6 +450,12 @@ class AiGateway:
                         spend.settle(ordinal, cost)
                 result=admit_response(data,route)
             except GatewayError as exc:
+                if contract is not None and schema_rejected(data, exc.diagnostics):
+                    exc.reason = "response_schema_rejected"
+                    exc.retryable = False
+                    exc.diagnostics.update(failure_boundary="provider_response_schema",
+                                           response_contract_reason="response_schema_rejected",
+                                           response_contract_name=contract.name)
                 exc.diagnostics.update(safe_response_diagnostics(data))
                 usage = admitted_usage(data.get("usage")) if isinstance(data, dict) else None
                 if usage is not None:
