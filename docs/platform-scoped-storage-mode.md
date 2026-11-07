@@ -383,3 +383,13 @@ SQAG-owned login/auth, fake login, billing, Stripe, deployment, DNS/TLS, public
 signup, live object-storage credentials or provider accounts, private
 profile/pricing files, arbitrary permanent uploads, or generated customer quotes
 in Git.
+
+## Disabled quote service registry
+
+The injected `webapp/quote_api_registry.py` adapters have no default composition,
+configuration discovery, cache, automatic DDL or fallback. PostgreSQL migration
+012 requires separate exact-target application approval; its SQLite counterpart
+is synthetic-fixture-only and is absent from runtime startup migrations.
+Both quote API transport flags retain their default-off behaviour. Registry
+counter primitives do not create jobs, accept requests or dispatch providers.
+See the [migration runbook](postgres-migration-runbook.md) before any database use.

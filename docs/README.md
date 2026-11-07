@@ -16,6 +16,7 @@ Update this map when an entry point or source of truth moves.
 | Inference | `webapp/ai_gateway.py`; [gateway contract](ai-gateway.md) |
 | Artifact persistence and forensics | `webapp/object_storage.py`, `webapp/forensics.py` and the storage contracts listed below |
 | Workbook generation | `scripts/generate_quote.py` and `templates/`; selected profile/reference authority is defined by `AGENTS.md` |
+| Quote service admission, disabled | `webapp/quote_api_auth.py`, `webapp/quote_context.py`, injected `webapp/quote_api_registry.py`; [API contract](quotation-api-v1.md) and [privilege contract](runtime-privilege-contract.md) |
 | Database evolution | `migrations/`, `webapp/postgres_migrations.py` and [migration runbook](postgres-migration-runbook.md) |
 | Validation | `tests/`, browser commands in `package.json`, [testing plan](testing-plan.md) and `.github/workflows/ci.yml` |
 | Agent guidance and tracking | `AGENTS.md`, [playbook index](agent-playbooks/INDEX.md) and `.github/toolkit-programme.json` |

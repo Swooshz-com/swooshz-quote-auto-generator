@@ -993,3 +993,25 @@ S3 transport, installed performance, real PDF rendering, native viewer acceptanc
 owner UAT. Direct post-commit warning coverage uses the reachable local publication
 path; database/object generation finalises atomically and has no equivalent later
 projection-read warning branch.
+
+## Quote admission registry source
+
+Run `tests.test_quote_api_registry`, quote API contract/auth/tenancy, migration
+ledger, runtime privilege contract and internal-password auth/webapp suites.
+Registry fixtures explicitly load SQLite migration 012 and use only synthetic
+identities/verifiers. Snapshot denied paths, audit failures and second-update
+failures. Cover immutable bindings, verifier lengths, unique/FK constraints,
+closed policy, expiry equality, foreign/stale authority, UTC bucket edges,
+every cap/revision ceiling, two connections and operator CAS. Keep disabled
+HTTP admission and legacy staff/Platform/proxy checks in the protected preview.
+
+The existing disposable PostgreSQL 17 CI suite additionally exercises source
+ACLs without fixture repair of new objects, one-ID verifier lookup, every
+column/role/operation, denied authority and table writes, two runtime workers,
+operator races and fresh revocation fences. Existing generic migration tests
+cover fresh/rerun, rollback, prefix/suffix, drift and advisory-lock concurrency.
+Local offline checks must skip all real PostgreSQL fixtures explicitly; SQLite
+and static SQL splitting are not syntax/catalog/ACL/row-lock proof. Required
+PostgreSQL qualification needs zero skips on its disposable target.
+No browser/native UI change is made. Independent security review, production
+audit/retention binding, installed behaviour and later service UAT remain separate.

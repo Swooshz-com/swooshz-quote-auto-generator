@@ -28,6 +28,18 @@ class FakeResources:
 
 
 class QuoteApiTenancyTest(unittest.TestCase):
+    def test_registry_counter_fence_refuses_staff_and_foreign_authority_without_effects(self):
+        from tests import test_quote_api_registry as fixtures
+        from webapp.quote_api_registry import RegistryError
+        fixture=fixtures.RegistryFixture(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        ctx=fixture.ctx()
+        for candidate in (replace(ctx,auth_mode='staff',projection='staff_internal'),
+                          replace(ctx,owner_subject='foreign-owner'),replace(ctx,workspace_id='foreign_workspace')):
+            before=fixture.snapshot()
+            with fixture.transaction() as c:
+                with self.assertRaises(RegistryError): fixture.adapter.reserve(c,candidate,'create')
+            self.assertEqual(before,fixture.snapshot())
+
     def context(self):
         return QuoteContext("service", "owner.test", "tenant.test", "workspace.test", "caller.test",
             "credential-1", QUOTE_OPERATIONS, "CustomerEstimateView", "authority-1",

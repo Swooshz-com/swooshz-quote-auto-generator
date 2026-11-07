@@ -81,9 +81,60 @@ def _sql_grantee(sql_module, name: str):
 
 
 class RuntimePrivilegeContractStaticTest(unittest.TestCase):
+    def test_existing_hold_routine_proof_stays_bound_to_v2_after_admission_is_appended(self):
+        subject=RuntimePrivilegeContractPostgresIntegrationTest('runTest')
+        class Captured(Exception): pass
+        with mock.patch.object(subject,'_admin_row',side_effect=Captured) as query:
+            with self.assertRaises(Captured): subject._assert_causal_callable_catalog_contract('synthetic')
+        self.assertEqual(query.call_args.args[1],('sqag_quote_session_deletion_hold_blocked_v2','text, text'))
+
+    def test_admission_closed_column_contract_rejects_verifier_authority_unknown_and_grant_option_mutants(self):
+        manifest = contract.validate_manifest()
+        for mutate in (
+            lambda m: m["runtime_column_privileges"]["sqag_quote_api_callers"]["SELECT"].append("verifier"),
+            lambda m: m["runtime_column_privileges"]["sqag_quote_api_callers"]["UPDATE"].append("state"),
+            lambda m: m["runtime_column_privileges"]["sqag_quote_api_callers"].update({"INSERT": ["verifier"]}),
+            lambda m: m["runtime_column_privileges"]["sqag_quote_api_tenants"]["UPDATE"].append("unknown"),
+            lambda m: m["runtime_column_privileges"].update({"foreign_table": {}}),
+            lambda m: m["runtime_tables"]["sqag_quote_api_callers"]["privileges"].append("SELECT"),
+            lambda m: m["maintenance_tables"]["sqag_quote_api_callers"]["privileges"].append("SELECT"),
+            lambda m: m["namespace"]["callable_routines"][0].update({"grant_options": True}),
+        ):
+            candidate = copy.deepcopy(manifest)
+            mutate(candidate)
+            with self.assertRaises(contract.RuntimePrivilegeContractError):
+                contract.validate_manifest(candidate)
+
+    def test_admission_explicit_and_effective_column_checks_detect_missing_extra_and_grantable_acl(self):
+        expected = [dict(table_name=table, column_name=column, grantee="sqag_runtime",
+                         privilege_type=privilege, is_grantable=False)
+                    for table, grants in contract.RUNTIME_COLUMN_PRIVILEGES.items()
+                    for privilege, columns in grants.items() for column in columns]
+        class Cursor:
+            def __init__(self, rows): self.rows=rows
+            def fetchall(self): return self.rows
+        class Connection:
+            def __init__(self, rows, effective_mutant=False): self.rows=rows; self.effective_mutant=effective_mutant
+            def execute(self, sql, params=()):
+                if 'aclexplode(a.attacl)' in sql: return Cursor(self.rows)
+                role,table,column,privilege=params[:4]
+                allowed=role=='sqag_runtime' and column in contract.RUNTIME_COLUMN_PRIVILEGES[table[7:]].get(privilege,())
+                if self.effective_mutant and column=='verifier' and role=='sqag_runtime' and privilege=='SELECT': allowed=True
+                return Cursor([dict(effective=allowed,grantable=False)])
+        errors=[]; contract._check_columns(Connection(expected),errors); self.assertEqual(errors,[])
+        variants=[expected[:-1], expected+[dict(table_name='sqag_quote_api_callers',column_name='verifier',grantee='sqag_runtime',privilege_type='SELECT',is_grantable=False)]]
+        for role,column,privilege,grantable in (("sqag_runtime","state","UPDATE",False),
+                ("sqag_maintenance","caller_id","SELECT",False),("PUBLIC","caller_id","SELECT",False),
+                ("unknown","caller_id","SELECT",False),("sqag_runtime","caller_id","SELECT",True)):
+            variants.append(expected+[dict(table_name='sqag_quote_api_callers',column_name=column,grantee=role,privilege_type=privilege,is_grantable=grantable)])
+        for rows in variants:
+            errors=[]; contract._check_columns(Connection(rows),errors); self.assertTrue(errors)
+        errors=[]; contract._check_columns(Connection(expected,True),errors)
+        self.assertIn('effective_column_privilege:sqag_quote_api_callers:verifier:sqag_runtime:SELECT',errors)
+
     def test_manifest_is_strict_a25_contract_without_source_digest_mirrors(self):
         manifest = contract.validate_manifest()
-        self.assertEqual(manifest["schema_version"], 4)
+        self.assertEqual(manifest["schema_version"], 5)
         self.assertNotIn("canonical_source_revision", manifest)
         self.assertNotIn("canonical_source_tree", manifest)
         self.assertNotIn("implementation_registry", manifest)
@@ -96,7 +147,7 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
 
     def test_option_a_provider_control_and_ownership_contract_is_exact(self):
         manifest = contract.validate_manifest()
-        self.assertEqual(manifest["$schema"], "runtime-privilege-contract-schema-v4")
+        self.assertEqual(manifest["$schema"], "runtime-privilege-contract-schema-v5")
         self.assertEqual(
             manifest["provider_controlled_memberships"]["protected_roles"],
             ["sqag_runtime", "sqag_migrator", "sqag_maintenance"],
@@ -176,6 +227,7 @@ class RuntimePrivilegeContractStaticTest(unittest.TestCase):
                 for source in manifest["source_binding"]["callable_routine_sources"]
             ],
             [
+                "public.sqag_quote_api_admission_lookup(text)",
                 "public.sqag_quote_session_deletion_hold_blocked(text, text)",
                 "public.sqag_quote_session_deletion_hold_blocked_v2(text, text)",
             ],
@@ -1176,6 +1228,171 @@ class StructuralSessionAuthorityTest(unittest.TestCase):
     "real disposable PostgreSQL-17 service is not configured",
 )
 class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
+    def test_admission_committed_revoke_waits_for_existing_fence_and_denies_later_fences(self):
+        from tests.test_quote_api_registry import seed, operator_change, context, CID
+        from webapp.quote_api_registry import PostgresCredentialRegistry, RegistryError
+        import contextlib
+        with self._role_connection('sqag_migrator') as raw:
+            seed(webapp.PostgresConnectionAdapter(raw))
+            raw.execute('update public.sqag_quote_api_tenants set expires_at=253402300799')
+            raw.execute('update public.sqag_quote_api_callers set expires_at=253402300799'); raw.commit()
+        @contextlib.contextmanager
+        def runtime():
+            with self._role_connection('sqag_runtime') as raw: yield webapp.PostgresConnectionAdapter(raw)
+        adapter=PostgresCredentialRegistry(connection_factory=runtime)
+        ctx=context(adapter.lookup(CID)); attempting=threading.Event(); done=threading.Event(); errors=[]
+        def revoke():
+            try:
+                with self._role_connection('sqag_migrator') as raw:
+                    attempting.set()
+                    operator_change(webapp.PostgresConnectionAdapter(raw),kind='revoke',postgres=True); raw.commit()
+            except BaseException as e: errors.append(type(e).__name__)
+            finally: done.set()
+        worker=None
+        try:
+            with runtime() as c:
+                adapter.revalidate(c,ctx,'poll')
+                worker=threading.Thread(target=revoke); worker.start()
+                self.assertTrue(attempting.wait(5)); self.assertFalse(done.wait(0.2))
+                c.commit()
+        finally:
+            if worker: worker.join(15); self.assertFalse(worker.is_alive())
+        self.assertEqual(errors,[]); self.assertTrue(adapter.lookup(CID).revoked)
+        with runtime() as c:
+            with self.assertRaises(RegistryError): adapter.revalidate(c,ctx,'poll')
+
+    def test_admission_pg_constraints_bindings_and_audit_failure_prevent_partial_mutation(self):
+        from tests.test_quote_api_registry import seed, CID, context
+        from webapp.quote_api_registry import PostgresCredentialRegistry, RegistryError
+        import contextlib
+        with self._role_connection('sqag_migrator') as raw:
+            seed(webapp.PostgresConnectionAdapter(raw)); raw.commit()
+        denied=(
+            "update public.sqag_quote_api_tenants set workspace_id=workspace_id",
+            "update public.sqag_quote_api_tenants set tenant_id=tenant_id",
+            "update public.sqag_quote_api_callers set tenant_id=tenant_id",
+            "update public.sqag_quote_api_callers set caller_id=caller_id",
+            "update public.sqag_quote_api_callers set owner_subject=owner_subject",
+            "update public.sqag_quote_api_callers set credential_id=credential_id",
+            "update public.sqag_quote_api_tenants set create_minute_count=16",
+            "update public.sqag_quote_api_tenants set create_day_count=101",
+            "update public.sqag_quote_api_tenants set active_jobs=3",
+            "update public.sqag_quote_api_callers set poll_minute_count=121",
+            "update public.sqag_quote_api_callers set operations_mask=256",
+        )
+        for statement in denied:
+            with self._role_connection('sqag_migrator') as raw:
+                with self.assertRaises(Exception): raw.execute(statement)
+                raw.rollback()
+        for size in (31,32,33):
+            with self._role_connection('sqag_migrator') as raw:
+                if size==32: raw.execute('update public.sqag_quote_api_callers set verifier=%s',(bytes(size),))
+                else:
+                    with self.assertRaises(Exception): raw.execute('update public.sqag_quote_api_callers set verifier=%s',(bytes(size),))
+                raw.rollback()
+        with self._role_connection('sqag_migrator') as raw:
+            raw.execute('update public.sqag_quote_api_tenants set expires_at=253402300799')
+            raw.execute('update public.sqag_quote_api_callers set expires_at=253402300799'); raw.commit()
+        @contextlib.contextmanager
+        def runtime():
+            with self._role_connection('sqag_runtime') as raw:
+                yield webapp.PostgresConnectionAdapter(raw)
+        class FailingSink:
+            def stage(self,c,event): raise RuntimeError('synthetic-private-canary')
+        adapter=PostgresCredentialRegistry(connection_factory=runtime,audit_sink=FailingSink())
+        ctx=context(adapter.lookup(CID))
+        with runtime() as c:
+            with self.assertRaisesRegex(RegistryError,'^Quote registry unavailable$'): adapter.reserve(c,ctx,'create')
+            c.commit()  # The failed primitive must not rely on caller rollback.
+        with self._role_connection('sqag_migrator') as raw:
+            row=raw.execute('select create_minute_count,create_day_count,active_jobs,counter_revision from public.sqag_quote_api_tenants').fetchone()
+            self.assertEqual(tuple(row.values()),(0,0,0,0))
+            self.assertEqual(raw.execute('select counter_revision from public.sqag_quote_api_callers').fetchone()['counter_revision'],0)
+
+    def test_admission_source_acl_denies_verifier_authority_and_table_grants_without_fixture_repair(self):
+        self.assertEqual(self._verify()["status"], "verified")
+        for role in ("sqag_runtime", "sqag_maintenance"):
+            with self._role_connection(role) as raw:
+                c=webapp.PostgresConnectionAdapter(raw)
+                for table, grants in contract.RUNTIME_COLUMN_PRIVILEGES.items():
+                    for column in migration_contract.TABLE_SPECS_BY_NAME[table].columns:
+                        for privilege in ("SELECT","INSERT","UPDATE","REFERENCES"):
+                            row=c.execute("select has_column_privilege(?, ?, ?, ?) as effective, has_column_privilege(?, ?, ?, ?) as grantable",
+                                (role,'public.'+table,column.name,privilege,role,'public.'+table,column.name,privilege+' WITH GRANT OPTION')).fetchone()
+                            self.assertEqual(row['effective'],role=='sqag_runtime' and column.name in grants.get(privilege,()))
+                            self.assertFalse(row['grantable'])
+                for sql in ("select verifier from public.sqag_quote_api_callers",
+                            "update public.sqag_quote_api_callers set state='active'",
+                            "insert into public.sqag_quote_api_tenants (tenant_id) values ('forbidden')",
+                            "delete from public.sqag_quote_api_tenants", "truncate public.sqag_quote_api_callers"):
+                    with self.assertRaises(Exception): c.execute(sql)
+                    c.rollback()
+        for grant,revoke,label in (
+            ('select on public.sqag_quote_api_callers','select on public.sqag_quote_api_callers','table_acl'),
+            ('select (verifier) on public.sqag_quote_api_callers','select (verifier) on public.sqag_quote_api_callers','column'),
+            ('update (state) on public.sqag_quote_api_callers','update (state) on public.sqag_quote_api_callers','column'),
+        ):
+            self._execute_admin('grant '+grant+' to sqag_runtime')
+            try:
+                with self.assertRaises(contract.RuntimePrivilegeContractError): self._verify()
+            finally: self._execute_admin('revoke '+revoke+' from sqag_runtime')
+            self.assertEqual(self._verify()['status'],'verified')
+
+    def test_admission_two_runtime_workers_and_operator_cas_keep_caps_and_committed_revocation(self):
+        from tests.test_quote_api_registry import seed, operator_change, context, CID
+        from webapp.quote_api_registry import PostgresCredentialRegistry, RegistryError
+        import contextlib
+        with self._role_connection('sqag_migrator') as raw:
+            c=webapp.PostgresConnectionAdapter(raw); seed(c); raw.commit()
+        @contextlib.contextmanager
+        def runtime():
+            with self._role_connection('sqag_runtime') as raw:
+                yield webapp.PostgresConnectionAdapter(raw)
+        class AuditFake:
+            def stage(self,c,event): c.execute('select 1')
+        adapter=PostgresCredentialRegistry(connection_factory=runtime,audit_sink=AuditFake())
+        # Match current database time, not a client-controlled bucket clock.
+        with self._role_connection('sqag_migrator') as raw:
+            raw.execute("update public.sqag_quote_api_tenants set expires_at=253402300799,active_jobs=1")
+            raw.execute("update public.sqag_quote_api_callers set expires_at=253402300799"); raw.commit()
+        ctx=context(adapter.lookup(CID)); barrier=threading.Barrier(2); outcomes=[]; errors=[]
+        def worker():
+            try:
+                barrier.wait(timeout=5)
+                with runtime() as c: adapter.reserve(c,ctx,'create'); c.commit()
+                outcomes.append('reserved')
+            except RegistryError: outcomes.append('denied')
+            except BaseException as e: errors.append(type(e).__name__)
+        workers=[threading.Thread(target=worker) for _ in range(2)]
+        for w in workers: w.start()
+        for w in workers: w.join(15); self.assertFalse(w.is_alive())
+        self.assertEqual(errors,[]); self.assertCountEqual(outcomes,['reserved','denied'])
+        with self._role_connection('sqag_migrator') as raw:
+            row=raw.execute('select active_jobs,create_minute_count,create_day_count from public.sqag_quote_api_tenants').fetchone()
+            self.assertEqual(tuple(row.values()),(2,1,1))
+        outcomes.clear(); barrier=threading.Barrier(2)
+        def rotate():
+            try:
+                barrier.wait(timeout=5)
+                with self._role_connection('sqag_migrator') as raw:
+                    operator_change(webapp.PostgresConnectionAdapter(raw),kind='rotate',postgres=True); raw.commit()
+                outcomes.append('rotated')
+            except RegistryError: outcomes.append('conflict')
+            except BaseException as e: errors.append(type(e).__name__)
+        workers=[threading.Thread(target=rotate) for _ in range(2)]
+        for w in workers: w.start()
+        for w in workers: w.join(15); self.assertFalse(w.is_alive())
+        self.assertEqual(errors,[]); self.assertCountEqual(outcomes,['rotated','conflict'])
+        self.assertEqual(adapter.lookup(CID).revision,'2')
+        with runtime() as c:
+            with self.assertRaises(RegistryError): adapter.revalidate(c,ctx,'create')
+        fresh=context(adapter.lookup(CID))
+        with self._role_connection('sqag_migrator') as raw:
+            operator_change(webapp.PostgresConnectionAdapter(raw),kind='revoke',expected=2,postgres=True); raw.commit()
+        self.assertTrue(adapter.lookup(CID).revoked)
+        with runtime() as c:
+            with self.assertRaises(RegistryError): adapter.revalidate(c,fresh,'poll')
+
     @classmethod
     def setUpClass(cls):
         import psycopg
@@ -1461,6 +1678,9 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
             connection.execute("grant usage on schema public to sqag_runtime, sqag_maintenance")
             connection.execute("grant usage, create on schema public to sqag_migrator")
             for table in tables:
+                # Migration 012 ACLs must stand without post-apply fixture repair.
+                if table in contract.RUNTIME_COLUMN_PRIVILEGES:
+                    continue
                 identifier = self.sql.Identifier(table)
                 for grantee in ("PUBLIC", "sqag_runtime", "sqag_maintenance"):
                     connection.execute(
@@ -1496,6 +1716,8 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                     )
                 )
             for routine, identity_arguments in contract.EXPECTED_CALLABLE_ROUTINE_KEYS:
+                if routine == "sqag_quote_api_admission_lookup":
+                    continue  # Assert source ACLs, never fixture-repair admission grants.
                 if not include_callable or ("public", routine, identity_arguments) not in routine_keys:
                     continue
                 connection.execute(
@@ -5876,6 +6098,7 @@ order by c.relname, acl.privilege_type
         self.assertFalse(any(row[4] for row in default_acl_rows))
 
     def _assert_causal_callable_catalog_contract(self, database_name: str) -> None:
+        spec = migration_contract.ROUTINE_SPECS_BY_KEY[("public", contract.CALLABLE_ROUTINE_V2_NAME, "text, text")]
         routine = self._admin_row(
             "select n.nspname as schema_name, p.proname as name, "
             "pg_get_function_identity_arguments(p.oid) as identity_arguments, "
@@ -5892,13 +6115,13 @@ order by c.relname, acl.privilege_type
             "where n.nspname = 'public' and p.proname = %s "
             "and pg_get_function_identity_arguments(p.oid) = %s",
             (
-                migration_contract.ROUTINE_SPECS[-1].name,
-                migration_contract.ROUTINE_SPECS[-1].identity_arguments,
+                spec.name,
+                spec.identity_arguments,
             ),
             database_name=database_name,
         )
         self.assertEqual(routine["schema_name"], "public")
-        self.assertEqual(routine["name"], migration_contract.ROUTINE_SPECS[-1].name)
+        self.assertEqual(routine["name"], spec.name)
         self.assertEqual(routine["identity_arguments"], "text, text")
         self.assertEqual(routine["prokind"], "f")
         self.assertEqual(routine["result_type"].lower(), "boolean")
@@ -5926,14 +6149,14 @@ order by c.relname, acl.privilege_type
         }
         self.assertEqual(
             relation_inventory,
-            set(migration_contract.ROUTINE_SPECS[-1].referenced_relations),
+            set(spec.referenced_relations),
         )
         self.assertIsNone(contract.UNQUALIFIED_SQL_RELATION_RE.search(routine["function_definition"]))
         count = self._admin_row(
             "select count(*) as count from pg_catalog.pg_proc p "
             "join pg_catalog.pg_namespace n on n.oid = p.pronamespace "
             "where n.nspname = 'public' and p.proname = %s",
-            (migration_contract.ROUTINE_SPECS[-1].name,),
+            (spec.name,),
             database_name=database_name,
         )
         self.assertEqual(count["count"], 1)
@@ -5951,8 +6174,8 @@ order by c.relname, acl.privilege_type
             "and pg_get_function_identity_arguments(p.oid) = %s "
             "order by grantee, acl.privilege_type",
             (
-                migration_contract.ROUTINE_SPECS[-1].name,
-                migration_contract.ROUTINE_SPECS[-1].identity_arguments,
+                spec.name,
+                spec.identity_arguments,
             ),
             database_name=database_name,
         )

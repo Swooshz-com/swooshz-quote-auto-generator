@@ -10296,6 +10296,19 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("raw-launch-token-secret", output)
         self.assertNotIn("other-secret", output)
 
+    def test_quote_admission_disabled_registry_never_connects_or_applies_migrations(self):
+        # Prevent registry source from becoming startup/request auto-application.
+        with mock.patch.dict(os.environ, {"APP_MODE":"local", "SQAG_DISABLE_DOTENV":"1"}, clear=True), mock.patch.object(
+            webapp, "postgres_storage_connection", side_effect=AssertionError("disabled registry connected")
+        ), mock.patch.object(
+            webapp, "apply_sqag_storage_migrations", side_effect=AssertionError("startup applied schema")
+        ), LocalRunnerServer() as runner:
+            request=urllib.request.Request(runner.base_url + "/api/v1/quote-requests",
+                data=b"{}",method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request,timeout=3)
+            self.assertEqual(caught.exception.code,404)
+
     def test_quote_admission_flags_off_keep_legacy_and_close_internal_service_headers(self):
         # Prevent disabled v1 from accepting work or granting local staff authority.
         env = {"APP_MODE": "local", "SQAG_DISABLE_DOTENV": "1"}

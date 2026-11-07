@@ -93,6 +93,30 @@ class RecordingConnection:
 
 
 class MigrationPayloadCanonicalizationTest(unittest.TestCase):
+    def test_admission_bounds_deparse_does_not_hide_changed_caps_or_boolean_precedence(self):
+        from webapp.postgres_migrations import TABLE_SPECS_BY_NAME
+        table = TABLE_SPECS_BY_NAME["sqag_quote_api_tenants"]
+        pairs = (
+            ("authority_revision between 1 and 9223372036854775806",
+             "((authority_revision >= 1) AND (authority_revision <= '9223372036854775806'::bigint))"),
+            ("create_minute_start between 0 and 253402300799 and create_minute_start % 60 = 0",
+             "((create_minute_start >= 0) AND (create_minute_start <= '253402300799'::bigint) AND ((create_minute_start % (60)::bigint) = 0))"),
+            ("octet_length(policy_json) between 2 and 65536",
+             "((octet_length(policy_json) >= 2) AND (octet_length(policy_json) <= 65536))"),
+        )
+        for source, deparsed in pairs:
+            with self.subTest(source=source):
+                self.assertEqual(canonicalize_check_expression(source,table),
+                                 canonicalize_check_expression(deparsed,table))
+                self.assertNotEqual(canonicalize_check_expression(source,table),
+                                    canonicalize_check_expression(deparsed.replace(" AND "," OR ",1),table))
+        self.assertNotEqual(canonicalize_check_expression("active_jobs between 0 and 2",table),
+                            canonicalize_check_expression("active_jobs between 0 and 3",table))
+        self.assertNotEqual(canonicalize_check_expression("a and (b or c)",table),
+                            canonicalize_check_expression("(a and b) or c",table))
+        self.assertNotEqual(canonicalize_check_expression("2147483647::bigint + 1",table),
+                            canonicalize_check_expression("2147483647 + 1",table))
+
     def test_telemetry_attempt_constraint_is_prefix_aware_and_named_at_010(self):
         final_spec = TABLE_SPECS_BY_NAME["sqag_telemetry_events"]
         before_010 = _effective_table_spec("sqag_telemetry_events", 8)
@@ -509,6 +533,21 @@ class MigrationPayloadCanonicalizationTest(unittest.TestCase):
 
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
+    def test_admission_011_to_012_is_additive_unseeded_and_repeatable(self):
+        self.apply(self.manifest[:10])
+        before=self.inspect()
+        self.assertEqual(before['pendingMigrationIds'],['012_quote_api_admission_postgres.sql'])
+        result=self.apply()
+        self.assertEqual(result['appliedNow'],['012_quote_api_admission_postgres.sql'])
+        self.assertEqual(self.apply()['appliedNow'],[])
+        c=self.connect()
+        try:
+            for table in ('sqag_quote_api_tenants','sqag_quote_api_callers'):
+                self.assertEqual(c.execute('select count(*) as count from public.'+table).fetchone()['count'],0)
+        finally:
+            c.rollback(); c.close()
+        self.assertEqual(self.inspect()['pendingMigrationIds'],[])
+
     @classmethod
     def setUpClass(cls):
         import psycopg
@@ -993,6 +1032,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertEqual(
             EXPECTED_CALLABLE_ROUTINE_KEYS,
             {
+                ("sqag_quote_api_admission_lookup", "text"),
                 ("sqag_quote_session_deletion_hold_blocked", "text, text"),
                 ("sqag_quote_session_deletion_hold_blocked_v2", "text, text"),
             },

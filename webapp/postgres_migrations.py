@@ -28,10 +28,13 @@ MIGRATION_FILE_NAMES = (
     "009_telemetry_events_postgres.sql",
     "010_telemetry_attempt_semantics_postgres.sql",
     "011_quote_ai_spend_postgres.sql",
+    "012_quote_api_admission_postgres.sql",
 )
 
 EXPECTED_TABLES = frozenset(
     {
+        'sqag_quote_api_tenants',
+        'sqag_quote_api_callers',
         "sqag_profiles",
         "sqag_pricing_references",
         "sqag_quote_sessions",
@@ -54,6 +57,9 @@ EXPECTED_TABLES = frozenset(
 )
 EXPECTED_INDEXES = frozenset(
     {
+        'sqag_quote_api_tenants_workspace_idx',
+        'sqag_quote_api_callers_credential_uidx',
+        'sqag_quote_api_callers_subject_uidx',
         "sqag_generation_runs_workspace_job_uidx",
         "sqag_generation_runs_workspace_idempotency_uidx",
         "sqag_legal_holds_active_target_uidx",
@@ -87,6 +93,8 @@ EXPECTED_INDEXES = frozenset(
 )
 EXPECTED_TRIGGERS = frozenset(
     {
+        'sqag_quote_api_tenants_binding_immutable',
+        'sqag_quote_api_callers_binding_immutable',
         "sqag_generation_evidence_no_update",
         "sqag_audit_events_no_update",
         "sqag_generation_evidence_guard_delete",
@@ -99,6 +107,8 @@ EXPECTED_TRIGGERS = frozenset(
 )
 EXPECTED_TRIGGER_KEYS = frozenset(
     {
+        ("public", 'sqag_quote_api_tenants', 'sqag_quote_api_tenants_binding_immutable'),
+        ("public", 'sqag_quote_api_callers', 'sqag_quote_api_callers_binding_immutable'),
         ("public", "sqag_generation_evidence", "sqag_generation_evidence_no_update"),
         ("public", "sqag_audit_events", "sqag_audit_events_no_update"),
         ("public", "sqag_generation_evidence", "sqag_generation_evidence_guard_delete"),
@@ -111,6 +121,7 @@ EXPECTED_TRIGGER_KEYS = frozenset(
 )
 EXPECTED_ROUTINES = frozenset(
     {
+        'sqag_quote_api_admission_lookup',
         "sqag_reject_immutable_change",
         "sqag_require_retention_delete_authorization",
         "sqag_quote_session_deletion_hold_blocked",
@@ -125,6 +136,7 @@ EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
 )
 EXPECTED_CALLABLE_ROUTINE_KEYS = frozenset(
     {
+        ("sqag_quote_api_admission_lookup", "text"),
         ("sqag_quote_session_deletion_hold_blocked", "text, text"),
         ("sqag_quote_session_deletion_hold_blocked_v2", "text, text"),
     }
@@ -133,6 +145,8 @@ EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTIN
 EXPECTED_TRIGGER_ROUTINE_LINKS = {
     "sqag_reject_immutable_change": frozenset(
         {
+            ('sqag_quote_api_tenants_binding_immutable', 'sqag_quote_api_tenants'),
+            ('sqag_quote_api_callers_binding_immutable', 'sqag_quote_api_callers'),
             ("sqag_generation_evidence_no_update", "sqag_generation_evidence"),
             ("sqag_audit_events_no_update", "sqag_audit_events"),
             ("sqag_feedback_linkage_no_update", "sqag_feedback"),
@@ -363,6 +377,75 @@ _STATUS_VALUES = (
 )
 
 TABLE_SPECS = (
+    TableSpec('sqag_quote_api_tenants', (
+        _column('tenant_id', 'text', nullable=False, default_sql=None),
+        _column('workspace_id', 'text', nullable=False, default_sql=None),
+        _column('state', 'text', nullable=False, default_sql="'disabled'"),
+        _column('authority_revision', 'bigint', nullable=False, default_sql='1'),
+        _column('policy_json', 'text', nullable=False, default_sql=None),
+        _column('created_at', 'bigint', nullable=False, default_sql=None),
+        _column('expires_at', 'bigint', nullable=False, default_sql=None),
+        _column('revoked_at', 'bigint', nullable=True, default_sql=None),
+        _column('create_minute_start', 'bigint', nullable=False, default_sql='0'),
+        _column('create_minute_count', 'integer', nullable=False, default_sql='0'),
+        _column('create_day_start', 'bigint', nullable=False, default_sql='0'),
+        _column('create_day_count', 'integer', nullable=False, default_sql='0'),
+        _column('active_jobs', 'integer', nullable=False, default_sql='0'),
+        _column('counter_revision', 'bigint', nullable=False, default_sql='0'),
+    ), (
+        _c("c", expression="tenant_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'"),
+        _c("c", expression="workspace_id ~ '^[A-Za-z0-9_-]{1,128}$'"),
+        _c("c", expression="state in ('active','disabled','revoked')"),
+        _c("c", expression='authority_revision between 1 and 9223372036854775806'),
+        _c("c", expression='octet_length(policy_json) between 2 and 65536'),
+        _c("c", expression='created_at between 0 and 253402300799'),
+        _c("c", expression='expires_at between 1 and 253402300799 and expires_at > created_at'),
+        _c("c", expression='revoked_at between 0 and 253402300799'),
+        _c("c", expression='create_minute_start between 0 and 253402300799 and create_minute_start % 60 = 0'),
+        _c("c", expression='create_minute_count between 0 and 15'),
+        _c("c", expression='create_day_start between 0 and 253402300799 and create_day_start % 86400 = 0'),
+        _c("c", expression='create_day_count between 0 and 100'),
+        _c("c", expression='active_jobs between 0 and 2'),
+        _c("c", expression='counter_revision between 0 and 9223372036854775806'),
+        _c("p", 'tenant_id'),
+        _c("c", expression="(state = 'revoked' and revoked_at is not null and revoked_at >= created_at) or (state <> 'revoked' and revoked_at is null)"),
+    )),
+    TableSpec('sqag_quote_api_callers', (
+        _column('tenant_id', 'text', nullable=False, default_sql=None),
+        _column('caller_id', 'text', nullable=False, default_sql=None),
+        _column('owner_subject', 'text', nullable=False, default_sql=None),
+        _column('credential_id', 'text', nullable=False, default_sql=None),
+        _column('verifier', 'bytea', nullable=False, default_sql=None),
+        _column('state', 'text', nullable=False, default_sql="'disabled'"),
+        _column('credential_revision', 'bigint', nullable=False, default_sql='1'),
+        _column('authority_revision', 'bigint', nullable=False, default_sql='1'),
+        _column('operations_mask', 'smallint', nullable=False, default_sql='0'),
+        _column('created_at', 'bigint', nullable=False, default_sql=None),
+        _column('expires_at', 'bigint', nullable=False, default_sql=None),
+        _column('revoked_at', 'bigint', nullable=True, default_sql=None),
+        _column('poll_minute_start', 'bigint', nullable=False, default_sql='0'),
+        _column('poll_minute_count', 'integer', nullable=False, default_sql='0'),
+        _column('counter_revision', 'bigint', nullable=False, default_sql='0'),
+    ), (
+        _c("c", expression="caller_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'"),
+        _c("c", expression="owner_subject ~ '^service:[A-Za-z0-9_-]{21}[AQgw]$'"),
+        _c("c", expression="credential_id ~ '^[A-Za-z0-9_-]{21}[AQgw]$'"),
+        _c("c", expression='octet_length(verifier) = 32'),
+        _c("c", expression="state in ('active','disabled','revoked')"),
+        _c("c", expression='credential_revision between 1 and 9223372036854775806'),
+        _c("c", expression='authority_revision between 1 and 9223372036854775806'),
+        _c("c", expression='operations_mask between 0 and 255'),
+        _c("c", expression='created_at between 0 and 253402300799'),
+        _c("c", expression='expires_at between 1 and 253402300799 and expires_at > created_at'),
+        _c("c", expression='revoked_at between 0 and 253402300799'),
+        _c("c", expression='poll_minute_start between 0 and 253402300799 and poll_minute_start % 60 = 0'),
+        _c("c", expression='poll_minute_count between 0 and 120'),
+        _c("c", expression='counter_revision between 0 and 9223372036854775806'),
+        _c("p", 'tenant_id,caller_id'),
+        _c("f", "tenant_id", referenced_table="sqag_quote_api_tenants", referenced_columns="tenant_id", on_delete="r", on_update="r"),
+        _c("c", expression="(state = 'revoked' and revoked_at is not null and revoked_at >= created_at) or (state <> 'revoked' and revoked_at is null)"),
+    )),
+
     TableSpec(
         "sqag_quote_ai_spend",
         _cols("workspace_id:text", "job_id:text", "session_id:text", "actor_id:text",
@@ -668,6 +751,9 @@ INDEX_SPECS = (
     _index("sqag_telemetry_events_actor_idx", "sqag_telemetry_events", "workspace_id,actor_tracking_id,occurred_at"),
     _index("sqag_telemetry_events_retry_uidx", "sqag_telemetry_events", "workspace_id,retry_lineage_id,attempt_number", unique=True, predicate="(retry_lineage_id is not null) and (attempt_number is not null)"),
     _index("sqag_quote_ai_spend_session_idx", "sqag_quote_ai_spend", "workspace_id,session_id"),
+    _index('sqag_quote_api_tenants_workspace_idx', 'sqag_quote_api_tenants', ('workspace_id', 'tenant_id'), unique=False),
+    _index('sqag_quote_api_callers_credential_uidx', 'sqag_quote_api_callers', ('credential_id',), unique=True),
+    _index('sqag_quote_api_callers_subject_uidx', 'sqag_quote_api_callers', ('owner_subject',), unique=True),
 )
 INDEX_SPECS_BY_NAME = MappingProxyType({item.name: item for item in INDEX_SPECS})
 
@@ -708,6 +794,8 @@ TRIGGER_SPECS = (
         routine_name="sqag_reject_immutable_change",
     ),
     _trigger("sqag_telemetry_events_guard_delete", "sqag_telemetry_events", ("delete",), routine_name="sqag_require_retention_delete_authorization"),
+    _trigger('sqag_quote_api_tenants_binding_immutable', 'sqag_quote_api_tenants', ("update",), columns=('tenant_id', 'workspace_id'), routine_name="sqag_reject_immutable_change"),
+    _trigger('sqag_quote_api_callers_binding_immutable', 'sqag_quote_api_callers', ("update",), columns=('tenant_id', 'caller_id', 'owner_subject', 'credential_id'), routine_name="sqag_reject_immutable_change"),
 )
 TRIGGER_SPECS_BY_KEY = MappingProxyType(
     {("public", item.table_name, item.name): item for item in TRIGGER_SPECS}
@@ -767,6 +855,7 @@ ROUTINE_SPECS = (
         ),
         (("sqag_runtime", "EXECUTE", False),),
     ),
+    RoutineSpec("public", "sqag_quote_api_admission_lookup", "text", 'TABLE(credential_id text, verifier bytea, tenant_id text, workspace_id text, caller_id text, owner_subject text, credential_revision bigint, tenant_revision bigint, caller_revision bigint, operations_mask smallint, expires_at bigint, caller_state text, tenant_state text, policy_json text)', "sql", "sqag_migrator", True, "s", "u", False, ("search_path=pg_catalog, public",), "012_quote_api_admission_postgres.sql", ("sqag_quote_api_callers", "sqag_quote_api_tenants"), (("sqag_runtime", "EXECUTE", False),)),
 )
 ROUTINE_SPECS_BY_KEY = MappingProxyType({item.key: item for item in ROUTINE_SPECS})
 
@@ -837,7 +926,14 @@ MIGRATION_OBJECTS = (
     MigrationObjectSpec(
         MIGRATION_FILE_NAMES[9],
         tables=(TABLE_SPECS_BY_NAME["sqag_quote_ai_spend"],),
-        indexes=(INDEX_SPECS[-1],),
+        indexes=(next(item for item in INDEX_SPECS if item.name == "sqag_quote_ai_spend_session_idx"),),
+    ),
+    MigrationObjectSpec(
+        MIGRATION_FILE_NAMES[10],
+        tables=tuple(TABLE_SPECS_BY_NAME[name] for name in ("sqag_quote_api_tenants", "sqag_quote_api_callers")),
+        indexes=tuple(item for item in INDEX_SPECS if item.table_name in {"sqag_quote_api_tenants", "sqag_quote_api_callers"}),
+        triggers=tuple(TRIGGER_SPECS[-2:]),
+        routines=(ROUTINE_SPECS[-1],),
     ),
 )
 
@@ -1270,14 +1366,110 @@ def _relabel_is_proven(source_type: str, target_type: str, next_token: str | Non
     return False
 
 
+def _bounded_check_tokens(tokens: list[str], types: Mapping[str, str]) -> list[str]:
+    """Expand integer BETWEEN as PostgreSQL does, without general SQL rewriting."""
+    bounds = {"smallint": (-32768, 32767), "integer": (-2147483648, 2147483647),
+              "bigint": (-9223372036854775808, 9223372036854775807)}
+    # Parentheses around one numeric atom do not change its cast operand.
+    index = 0
+    while index + 2 < len(tokens):
+        if (tokens[index] == "(" and re.fullmatch(r"[0-9]+", tokens[index + 1]) and tokens[index + 2] == ")"
+                and (index == 0 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tokens[index - 1]))):
+            tokens = tokens[:index] + [tokens[index + 1]] + tokens[index + 3:]
+        else:
+            index += 1
+    result: list[str] = []
+    index = 0
+    while index < len(tokens):
+        # pg_get_constraintdef quotes large integral constants and labels casts.
+        if index + 2 < len(tokens) and tokens[index + 1] == "::":
+            target, end = _cast_target(tokens, index + 2)
+            literal = tokens[index]
+            digits = literal[1:-1] if literal.startswith("'") and literal.endswith("'") else literal
+            if target in bounds and re.fullmatch(r"(?:0|[1-9][0-9]*)", digits):
+                natural_bigint = target == "bigint" and int(digits) > 2147483647
+                typed_operand = (len(result) >= 2 and result[-1] in {"=", "<>", ">", ">=", "<", "<=", "%"}
+                                 and types.get(result[-2]) == target)
+                if bounds[target][0] <= int(digits) <= bounds[target][1] and (natural_bigint or typed_operand):
+                    result.append(digits)
+                    index = end
+                    continue
+        result.append(tokens[index])
+        index += 1
+    tokens = result
+    result = []
+    index = 0
+    while index < len(tokens):
+        if (tokens[index].lower() == "between" and result and index + 3 < len(tokens)
+                and re.fullmatch(r"[0-9]+", tokens[index + 1])
+                and tokens[index + 2].lower() == "and"
+                and re.fullmatch(r"[0-9]+", tokens[index + 3])):
+            lhs: list[str] = []
+            if types.get(result[-1]) in bounds:
+                lhs = [result[-1]]
+            elif (len(result) >= 4 and result[-4].lower() == "octet_length"
+                  and result[-3] == "(" and result[-1] == ")" and types.get(result[-2]) in {"text", "bytea"}):
+                lhs = result[-4:]
+            prefix = result[:-len(lhs)] if lhs else result
+            boundary = not prefix or prefix[-1].lower() in {"(", "and", "or", "not"}
+            if lhs and boundary:
+                del result[-len(lhs):]
+                result.extend(["(", "(", *lhs, ">=", tokens[index + 1], ")", "and",
+                               "(", *lhs, "<=", tokens[index + 3], ")", ")"])
+                index += 4
+                continue
+        result.append(tokens[index])
+        index += 1
+    return result
+
+
+def _boolean_check_tree(tokens: list[str]) -> tuple[str, ...]:
+    """Preserve precedence and order while flattening associative AND/OR groups."""
+    tokens = _strip_outer_sql_parentheses(tokens)
+    for operator in ("or", "and"):
+        depth = 0
+        start = 0
+        parts = []
+        between = False
+        for index, token in enumerate(tokens):
+            if token in {"(", "["}:
+                depth += 1
+            elif token in {")", "]"}:
+                depth -= 1
+            elif depth == 0:
+                if token.lower() == "between":
+                    between = True
+                elif token.lower() == "and" and between:
+                    between = False
+                elif token.lower() == operator:
+                    parts.append(tokens[start:index])
+                    start = index + 1
+        if parts:
+            parts.append(tokens[start:])
+            if any(not part for part in parts):
+                return tuple(tokens)  # Unsupported/malformed syntax never repaired.
+            children = []
+            marker = f"<{operator}>"
+            for part in parts:
+                child = _boolean_check_tree(part)
+                children.extend(child[1:-1] if child and child[0] == marker else ("<term>", *child, "</term>"))
+            return (marker, *children, f"</{operator}>")
+    # In a comparison, modulo already binds more tightly than the comparator.
+    if (len(tokens) >= 7 and tokens[0] == "(" and tokens[2] == "%" and tokens[4] == ")"
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tokens[1])
+            and re.fullmatch(r"[0-9]+", tokens[3]) and tokens[5] in {"=", "<>", ">", ">=", "<", "<="}):
+        tokens = tokens[1:4] + tokens[5:]
+    return tuple(_collapse_atom_parentheses(tokens))
+
+
 def canonicalize_check_expression(expression: str | None, table: Any = None) -> tuple[str, ...]:
     """Apply only proven type-aware CHECK deparse no-ops."""
 
     tokens = _sql_tokens(expression)
     if expression and not tokens:
         return ("<invalid_sql>",)
-    tokens = _rewrite_common_sql(tokens)
     types = _column_type_map(table)
+    tokens = _bounded_check_tokens(_rewrite_common_sql(tokens), types)
     result: list[str] = []
     index = 0
     while index < len(tokens):
@@ -1296,7 +1488,7 @@ def canonicalize_check_expression(expression: str | None, table: Any = None) -> 
                     continue
         result.append(_lower_identifier(token))
         index += 1
-    return tuple(_lower_identifier(item) for item in _collapse_atom_parentheses(_strip_outer_sql_parentheses(result)))
+    return _boolean_check_tree([_lower_identifier(item) for item in result])
 
 
 _canonicalize_check_expression = canonicalize_check_expression

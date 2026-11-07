@@ -57,6 +57,30 @@ class FakeRegistry:
         return self.record if self.record and self.record.credential_id == credential_id else None
 
 
+class PersistentRegistryAdmissionTest(unittest.TestCase):
+    def test_injected_registry_committed_rotation_and_revoke_deny_old_tokens_without_cache(self):
+        from tests import test_quote_api_registry as fixtures
+        fixture=fixtures.RegistryFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        admission=auth.QuoteApiAdmission(registry=fixture.adapter,clock=lambda:120)
+        token='sqagq1.'+fixtures.CID+'.'+encoded(SECRET)
+        before=admission._service_context(token,'synthetic-reference')
+        with fixture.transaction() as c:
+            fixtures.operator_change(c,kind='rotate',verifier=auth.secret_verifier(b'z'*32))
+        with self.assertRaises(auth.AdmissionError) as denied:
+            admission._service_context(token,'synthetic-reference')
+        self.assertEqual(denied.exception.code,'AUTH_REQUIRED')
+        token='sqagq1.'+fixtures.CID+'.'+encoded(b'z'*32)
+        after=admission._service_context(token,'synthetic-reference')
+        self.assertEqual(before.owner_subject,after.owner_subject)
+        self.assertNotEqual(before.auth_revision,after.auth_revision)
+        with fixture.transaction() as c: fixtures.operator_change(c,kind='revoke',expected=2)
+        with self.assertRaises(auth.AdmissionError) as denied:
+            admission._service_context(token,'synthetic-reference')
+        self.assertEqual(denied.exception.code,'AUTH_REQUIRED')
+
+
 def http_request(port, method, path, headers=(), body=b"", host=None):
     """Coalesce the small synthetic request, including body, into one write.
 
