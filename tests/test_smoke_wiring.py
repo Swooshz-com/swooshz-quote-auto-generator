@@ -124,19 +124,134 @@ async function exercise(body, variable) {
         self.run_node(r'''
 const assert = require('node:assert/strict'), vm = require('node:vm'), {EventEmitter} = require('node:events');
 const source = require('node:fs').readFileSync(0, 'utf8');
-const main = source.slice(source.indexOf('async function main()'));
-const start = main.indexOf('context.on("response", (response) => {');
-const end = main.indexOf('\n  });', start);
-assert(start >= 0 && end > start, 'Responses must be observed on the whole browser context');
 const guardStart = source.indexOf('function requireNoQuoteSessionRateLimits(');
 const guardEnd = source.indexOf('async function main()', guardStart);
-const context = new EventEmitter(), networkProblems = [];
-const scope = {context, networkProblems};
-vm.runInNewContext(main.slice(start, end + 6) + '\n' + source.slice(guardStart, guardEnd)
+for (const name of ['async function main()', 'async function runG3PricingScope()']) {
+const main = source.slice(source.indexOf(name));
+const match = main.match(/(?:context|page)\.on\("response", \(response\) => \{[\s\S]*?\n\s*\}\);/);
+assert(match, 'Missing lifecycle response observer');
+const context = new EventEmitter(), page = new EventEmitter(), networkProblems = [];
+const scope = {context, page, networkProblems};
+vm.runInNewContext(match[0] + '\n' + source.slice(guardStart, guardEnd)
   + '\nglobalThis.guard = requireNoQuoteSessionRateLimits;', scope);
 for (const tab of ['main', 'other-tab', 'popup']) {
   networkProblems.length = 0;
-  context.emit('response', {status: () => 429, url: () => 'http://127.0.0.1/api/quote-sessions?tab=' + tab});
+  const response = {status: () => 429, url: () => 'http://127.0.0.1/api/quote-sessions?tab=' + tab};
+  if (tab === 'main') page.emit('response', response);
+  context.emit('response', response);
   assert.throws(() => scope.guard(networkProblems), /rate limited/);
+}
+networkProblems.length = 0;
+context.emit('response', {status: () => 200, url: () => 'http://127.0.0.1/api/quote-sessions'});
+context.emit('response', {status: () => 429, url: () => 'http://127.0.0.1/unrelated'});
+scope.guard(networkProblems);
+}
+''', source)
+
+    def test_actual_terminal_helper_and_runner_enforce_work_and_cleanup(self):
+        source = (ROOT/'scripts/playwright-smoke.mjs').read_text(encoding='utf-8')
+        self.run_node(r'''
+const assert = require('node:assert/strict');
+const {terminalRun} = require('./tests/terminal_smoke_vm.cjs');
+const source = require('node:fs').readFileSync(0, 'utf8');
+(async () => {
+  await terminalRun(source);
+  for (const fault of ['duplicate', 'polls', 'navigation']) {
+    await assert.rejects(terminalRun(source, fault), /reloaded, missed polling or duplicated generation/);
+  }
+  await assert.rejects(terminalRun(source, '429'), /rate limited/);
+  await assert.rejects(terminalRun(source, 'dispatch'), /Synthetic dispatch failure/);
+  await assert.rejects(terminalRun(source, 'identity'), /recovery identity differs/);
+})().catch(error => {console.error(error); process.exitCode = 1;});
+''', source)
+
+    def test_terminal_pageerror_rejects_and_cleans_up(self):
+        source = (ROOT/'scripts/playwright-smoke.mjs').read_text(encoding='utf-8')
+        self.run_node(r'''
+const assert = require('node:assert/strict');
+const {terminalRun} = require('./tests/terminal_smoke_vm.cjs');
+const source = require('node:fs').readFileSync(0, 'utf8');
+assert.rejects(terminalRun(source, 'pageerror'), /G3 browser diagnostics were not clean/)
+  .catch(error => {console.error(error); process.exitCode = 1;});
+''', source)
+
+    def test_terminal_blocked_poll_exception_is_narrow_and_mutation_sensitive(self):
+        source = (ROOT/'scripts/playwright-smoke.mjs').read_text(encoding='utf-8')
+        self.run_node(r'''
+const assert = require('node:assert/strict');
+const {terminalRun} = require('./tests/terminal_smoke_vm.cjs');
+const source = require('node:fs').readFileSync(0, 'utf8').replace(/\r\n?/g, '\n');
+const diagnostic = /G3 browser diagnostics were not clean/;
+async function rejectsUnexpected(code) {
+  for (const fault of ['non-interrupted-err-failed', 'other-err-failed', 'other-job-err-failed',
+    'other-origin-err-failed', 'missing-location', 'console-error', 'changed-err-failed',
+    'console-warning', 'before-abort-err-failed', 'pageerror', 'interrupted-pageerror']) {
+    await assert.rejects(terminalRun(code, fault), diagnostic, fault);
+  }
+}
+(async () => {
+  // The unmodified happy path emits the expected Chromium error on each aborted poll.
+  await terminalRun(source);
+  await rejectsUnexpected(source);
+  const exception = /        if \(args\.includes\("--terminal-only"\) && options\.terminalStatus === "interrupted"\n[\s\S]*?return;\n/;
+  assert.equal(source.match(new RegExp(exception.source, 'g'))?.length, 1, 'Missing narrow exception');
+  const removed = source.replace(exception, '');
+  await assert.rejects(terminalRun(removed), diagnostic, 'Removing the exception must break the happy path');
+  const widened = source.replace(exception, '        if (message.text().includes("ERR_FAILED")) return;\n');
+  await terminalRun(widened);
+  for (const fault of ['non-interrupted-err-failed', 'other-err-failed']) {
+    await assert.rejects(assert.rejects(terminalRun(widened, fault), diagnostic), /Missing expected rejection/,
+      'Widening the exception must fail the negative control: ' + fault);
+  }
+  // Retain independent controls for the pageerror listener and terminal diagnostics guard.
+  for (const [before, after] of [
+    ['      page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));', ''],
+    ['if (consoleProblems.length || networkProblems.length)', 'if (networkProblems.length)'],
+    ['throw new Error(`G3 browser diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);', ''],
+  ]) {
+    assert(source.includes(before), 'Missing diagnostics mutation target');
+    const mutant = source.replace(before, after);
+    await assert.rejects(assert.rejects(terminalRun(mutant, 'pageerror'), diagnostic), /Missing expected rejection/,
+      'Removing diagnostics must fail the pageerror control');
+  }
+})().catch(error => {console.error(error); process.exitCode = 1;});
+''', source)
+
+    def test_alpha_invokes_ordered_committed_and_native_download_receipts(self):
+        source = (ROOT/'scripts/playwright-alpha-smoke.mjs').read_text(encoding='utf-8')
+        self.run_node(r'''
+const assert = require('node:assert/strict'), vm = require('node:vm');
+const source = require('node:fs').readFileSync(0, 'utf8');
+const start = source.indexOf('    const committedWorkbook =');
+const end = source.indexOf('    const protectedFirstXlsx =', start);
+assert(start >= 0 && end > start);
+const calls = [], artifact = {publication_id: 'publication-current'}, committed = {receipt: 'owning-server'},
+  download = {native: 'download'}, bytes = Buffer.from('synthetic-workbook');
+const scope = {sessionId: 'owned-session', xlsxJob: {accepted: {job_id: 'accepted-job'}},
+  xlsxReadback: {exports: {xlsx: artifact}}, durableAfterEdit: {exports: {xlsx: {publication_id: 'publication-prior'}}},
+  xlsxDownload: download, downloadedXlsxBytes: bytes, baseUrl: 'http://127.0.0.1:1', workbookReceiptSequence: 17,
+  workbookReceipts: {
+    committed: async (...args) => {assert.deepEqual(args, ['owned-session', 'accepted-job', artifact, 'publication-prior']);
+      calls.push('committed'); return committed;},
+    browserDownload: async (...args) => {assert.deepEqual(calls, ['committed']);
+      assert.deepEqual(args, [committed, download, bytes, 'http://127.0.0.1:1', 17]); calls.push('browserDownload');},
+  }};
+vm.runInNewContext('(async () => {' + source.slice(start, end) + '})()', scope)
+  .then(() => assert.deepEqual(calls, ['committed', 'browserDownload'], 'Missing ordered workbook receipt calls'))
+  .catch(error => {console.error(error); process.exitCode = 1;});
+''', source)
+
+    def test_basis_refresh_requires_two_normalise_requests(self):
+        source = (ROOT/'scripts/playwright-smoke.mjs').read_text(encoding='utf-8')
+        self.run_node(r'''
+const assert = require('node:assert/strict'), vm = require('node:vm');
+const source = require('node:fs').readFileSync(0, 'utf8');
+const start = source.indexOf('    if (normalizeCount !==');
+const end = source.indexOf('\n  } finally', start);
+assert(start >= 0 && end > start);
+for (const normalizeCount of [0, 1, 2, 3]) {
+  const run = () => vm.runInNewContext(source.slice(start, end), {normalizeCount});
+  if (normalizeCount === 2) run();
+  else assert.throws(run, /resume exactly once/);
 }
 ''', source)

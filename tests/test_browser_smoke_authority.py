@@ -7,6 +7,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BrowserSmokeAuthorityTest(unittest.TestCase):
+    def test_alpha_invokes_continuity_on_actual_before_and_after_results(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {browserAuthority, assertBrowserAuthorityUnchanged} from './scripts/internal-password-browser-test.mjs';
+const source = fs.readFileSync('scripts/playwright-alpha-smoke.mjs', 'utf8');
+const before = source.slice(source.indexOf('    const profileData ='), source.indexOf('    const selectedReference ='));
+const after = source.slice(source.indexOf('    const authSession ='), source.indexOf('    const beforeSeed ='));
+// Execute actual fetch/snapshot/comparison statements. Workspace fixture checks
+// are separately retained in alpha; exclude them here to isolate continuity.
+const statements = (before + after).split('\n').filter(line => !line.trim().startsWith('assert(')).join('\n');
+const session = {authenticated: true, user: null, browser_recovery_scope: 'scope-one', permissions: {canGenerateQuote: true}};
+const profiles = {workspace: {workspace: {id: 'workspace-one'}}};
+async function exercise(postSession, postProfiles) {
+  let profileReads = 0, sessionReads = 0;
+  const scope = {browserAuthority, assertBrowserAuthorityUnchanged, authState: {body: session}, baseUrl: 'http://127.0.0.1',
+    getJson: async value => value, api: {get: async url => {
+      if (url.endsWith('/api/session')) {sessionReads++; return postSession;}
+      profileReads++; return profileReads === 1 ? profiles : postProfiles;
+    }}};
+  await vm.runInNewContext('(async () => {' + statements + '})()', scope);
+  assert.equal(profileReads, 2); assert.equal(sessionReads, 1);
+}
+await exercise(session, profiles);
+await assert.rejects(exercise({...session, browser_recovery_scope: 'scope-two'}, profiles), /authority changed/);
+await assert.rejects(exercise(session, {workspace: {workspace: {id: 'workspace-two'}}}), /authority changed/);
+await assert.rejects(exercise({...session, permissions: {canGenerateQuote: false}}, profiles), /authority is incomplete/);
+'''
+        result = subprocess.run(['node', '--input-type=module', '-e', script], cwd=ROOT,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_public_auth_snapshot_preserves_scope_and_workspace(self):
         script = r'''
 import assert from "node:assert/strict";

@@ -76,3 +76,23 @@ class WorkbookAnchorBoundsTest(unittest.TestCase):
         data = self.mutate('xl/drawings/drawing1.xml', move_columns)
         self.assertEqual(verify_workbook(data, self.payload, self.rows, self.logo_receipt,
                                          template_path=template_path)['status'], 'valid')
+        with self.assertRaisesRegex(AssertionError, 'differs from selected template'):
+            verify_workbook(data, self.payload, self.rows, self.logo_receipt)
+
+        # The CLI deliberately uses bundled geometry, even when library callers
+        # provide an alternative template. No CLI selected-profile claim is made.
+        import json
+        import subprocess
+        import sys
+        expected = Path(self.temporary.name) / 'cli-expectations.json'
+        expected.write_bytes(json.dumps({'payload': self.payload, 'rows': self.rows,
+                                        'logo': self.logo_receipt}).encode('utf-8'))
+        workbook = Path(self.temporary.name) / 'cli-workbook.xlsx'
+        for contents, code in ((self.data, 0), (data, 1)):
+            workbook.write_bytes(contents)
+            result = subprocess.run([sys.executable, 'scripts/verify_current_workbook.py',
+                                     str(workbook), str(expected)], cwd=fixture.ROOT,
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, code, result.stderr)
+            if code:
+                self.assertIn('differs from selected template', result.stderr)

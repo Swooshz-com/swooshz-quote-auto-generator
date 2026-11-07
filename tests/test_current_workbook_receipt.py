@@ -106,6 +106,30 @@ class CurrentWorkbookReceiptTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Wrong amount"):
             self.verify(self.mutate("xl/worksheets/sheet1.xml", swap))
 
+    def test_company_signature_fields_are_bound_to_footer_order(self):
+        for mutation, field in (('swap', 'company_signatory'),
+                                ('blank', 'company_signatory'), ('replace', 'company_signatory'),
+                                ('blank', 'company_title'), ('replace', 'company_title')):
+            with self.subTest(mutation=mutation, field=field):
+                def edit(tree):
+                    texts = {key: next(node for cell in tree.findall('.//m:c', NS)
+                                       for node in cell.findall('.//m:t', NS)
+                                       if node.text == value)
+                             for key, value in self.payload['signature'].items()
+                             if key != 'company_date_label'}
+                    signer, title = texts['company_signatory'], texts['company_title']
+                    if mutation == 'swap':
+                        signer.text, title.text = title.text, signer.text
+                    else:
+                        # Preserve the original text elsewhere, so a whole-sheet
+                        # membership search cannot supply the failure verdict.
+                        row = tree.find('.//m:row', NS)
+                        cell = ET.SubElement(row, '{' + NS['m'] + '}c', {'r': 'I1', 't': 'inlineStr'})
+                        ET.SubElement(ET.SubElement(cell, '{' + NS['m'] + '}is'), '{' + NS['m'] + '}t').text = texts[field].text
+                        texts[field].text = '' if mutation == 'blank' else 'Other synthetic footer value'
+                with self.assertRaisesRegex(AssertionError, 'Company signature field differs: ' + field):
+                    self.verify(self.mutate('xl/worksheets/sheet1.xml', edit))
+
     def test_wrong_quantity_in_the_correct_description_row_rejects(self):
         def edit(tree):
             cell = self.row_cell(tree, self.rows[0]["description"], "B")
@@ -131,6 +155,24 @@ class CurrentWorkbookReceiptTest(unittest.TestCase):
             tree.find("m:definedNames/m:definedName[@name='_xlnm.Print_Area']", NS).text = "Quotation!$A$1:$E$20"
         with self.assertRaisesRegex(AssertionError, "Print area"):
             self.verify(self.mutate("xl/workbook.xml", edit))
+
+    def test_drawing_failures_name_only_the_affected_field(self):
+        def relationship(tree):
+            next(node for node in tree if node.get('Target') == '../media/header_logo.png').set('Target', '../media/private-canary.png')
+
+        def vertical(tree):
+            tree.find('.//xdr:sp/xdr:txBody/a:bodyPr', NS).set('anchor', 'b')
+
+        def font(tree):
+            tree.find('.//xdr:sp/xdr:txBody/a:p/a:r/a:rPr', NS).set('sz', '1200')
+
+        for member, edit, message in (
+                ('xl/drawings/_rels/drawing1.xml.rels', relationship, 'Header logo relationship target differs'),
+                ('xl/drawings/drawing1.xml', vertical, 'Header text vertical anchor differs'),
+                ('xl/drawings/drawing1.xml', font, 'Header text run font size differs')):
+            with self.subTest(message=message), self.assertRaises(AssertionError) as caught:
+                self.verify(self.mutate(member, edit))
+            self.assertEqual(str(caught.exception), message)
 
     def test_exposed_internal_columns_reject(self):
         def edit(tree):
