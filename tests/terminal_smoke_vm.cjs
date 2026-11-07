@@ -45,6 +45,9 @@ async function terminalRun(source, fault = '') {
         let active = null, saved = null, terminal = false, count = 0;
         const status = scope.options.terminalStatus;
         const job = 'job-' + status;
+        const pollUrl = () => scope.baseUrl + '/api/jobs/' + job;
+        const consoleError = (url = pollUrl(), text = 'Failed to load resource: net::ERR_FAILED', type = 'error') =>
+          page.emit('console', {type: () => type, text: () => text, location: () => ({url})});
         page.mainFrame = () => page;
         page.goto = async () => {
           count++;
@@ -54,9 +57,27 @@ async function terminalRun(source, fault = '') {
         page.unroute = async pattern => {assert(routes.delete(pattern)); cleanups.push('route');};
         async function poll() {
           const handler = routes.get('**/api/jobs/job-*'); assert(handler, 'Missing terminal poll route');
-          await handler({request: () => ({url: () => 'http://127.0.0.1/api/jobs/' + job}),
-            fallback: () => assert.fail('Unexpected terminal job'), abort: async () => {terminal = true;},
-            fulfill: async ({json}) => {terminal = json.status !== 'running'; if (terminal) saved = null;}});
+          await handler({request: () => ({url: pollUrl}),
+            fallback: () => assert.fail('Unexpected terminal job'), abort: async () => {
+              terminal = true;
+              // Real Chromium emits this for route.abort("failed"). Keep it in the happy path.
+              consoleError();
+              if (fault === 'other-err-failed') consoleError(scope.baseUrl + '/api/unrelated');
+              if (fault === 'other-job-err-failed') consoleError(scope.baseUrl + '/api/jobs/job-unrelated');
+              if (fault === 'other-origin-err-failed') consoleError('http://localhost:2/api/jobs/' + job);
+              if (fault === 'missing-location') consoleError('');
+              if (fault === 'console-error') consoleError(pollUrl(), 'Synthetic unrelated console error');
+              if (fault === 'changed-err-failed') consoleError(pollUrl(), 'Failed to load resource: net::ERR_FAILED extra');
+              if (fault === 'console-warning') consoleError(pollUrl(), undefined, 'warning');
+              if (fault === 'interrupted-pageerror') page.emit('pageerror', new Error('Synthetic interrupted page error'));
+            },
+            fulfill: async ({json}) => {
+              terminal = json.status !== 'running';
+              if (terminal) {
+                saved = null;
+                if (fault === 'non-interrupted-err-failed') consoleError();
+              } else if (status === 'interrupted' && fault === 'before-abort-err-failed') consoleError();
+            }});
         }
         page.locator = selector => ({
           innerText: async () => {checks.push('overlay-title'); return 'Regenerating Excel';},

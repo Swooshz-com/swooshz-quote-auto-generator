@@ -175,6 +175,48 @@ assert.rejects(terminalRun(source, 'pageerror'), /G3 browser diagnostics were no
   .catch(error => {console.error(error); process.exitCode = 1;});
 ''', source)
 
+    def test_terminal_blocked_poll_exception_is_narrow_and_mutation_sensitive(self):
+        source = (ROOT/'scripts/playwright-smoke.mjs').read_text(encoding='utf-8')
+        self.run_node(r'''
+const assert = require('node:assert/strict');
+const {terminalRun} = require('./tests/terminal_smoke_vm.cjs');
+const source = require('node:fs').readFileSync(0, 'utf8').replace(/\r\n?/g, '\n');
+const diagnostic = /G3 browser diagnostics were not clean/;
+async function rejectsUnexpected(code) {
+  for (const fault of ['non-interrupted-err-failed', 'other-err-failed', 'other-job-err-failed',
+    'other-origin-err-failed', 'missing-location', 'console-error', 'changed-err-failed',
+    'console-warning', 'before-abort-err-failed', 'pageerror', 'interrupted-pageerror']) {
+    await assert.rejects(terminalRun(code, fault), diagnostic, fault);
+  }
+}
+(async () => {
+  // The unmodified happy path emits the expected Chromium error on each aborted poll.
+  await terminalRun(source);
+  await rejectsUnexpected(source);
+  const exception = /        if \(args\.includes\("--terminal-only"\) && options\.terminalStatus === "interrupted"\n[\s\S]*?return;\n/;
+  assert.equal(source.match(new RegExp(exception.source, 'g'))?.length, 1, 'Missing narrow exception');
+  const removed = source.replace(exception, '');
+  await assert.rejects(terminalRun(removed), diagnostic, 'Removing the exception must break the happy path');
+  const widened = source.replace(exception, '        if (message.text().includes("ERR_FAILED")) return;\n');
+  await terminalRun(widened);
+  for (const fault of ['non-interrupted-err-failed', 'other-err-failed']) {
+    await assert.rejects(assert.rejects(terminalRun(widened, fault), diagnostic), /Missing expected rejection/,
+      'Widening the exception must fail the negative control: ' + fault);
+  }
+  // Retain independent controls for the pageerror listener and terminal diagnostics guard.
+  for (const [before, after] of [
+    ['      page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));', ''],
+    ['if (consoleProblems.length || networkProblems.length)', 'if (networkProblems.length)'],
+    ['throw new Error(`G3 browser diagnostics were not clean: ${JSON.stringify({ consoleProblems, networkProblems })}`);', ''],
+  ]) {
+    assert(source.includes(before), 'Missing diagnostics mutation target');
+    const mutant = source.replace(before, after);
+    await assert.rejects(assert.rejects(terminalRun(mutant, 'pageerror'), diagnostic), /Missing expected rejection/,
+      'Removing diagnostics must fail the pageerror control');
+  }
+})().catch(error => {console.error(error); process.exitCode = 1;});
+''', source)
+
     def test_alpha_invokes_ordered_committed_and_native_download_receipts(self):
         source = (ROOT/'scripts/playwright-alpha-smoke.mjs').read_text(encoding='utf-8')
         self.run_node(r'''

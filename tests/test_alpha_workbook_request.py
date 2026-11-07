@@ -83,6 +83,55 @@ assert.throws(() => requireExactSignature({company_signatory: 'Project Manager',
                                 capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_alpha_intermediate_signature_calls_reject_swaps_and_removal(self):
+        source = (ROOT / 'scripts/playwright-alpha-smoke.mjs').read_text(encoding='utf-8')
+        script = r'''
+const nodeAssert = require('node:assert/strict'), vm = require('node:vm');
+const source = require('node:fs').readFileSync(0, 'utf8').replace(/\r\n?/g, '\n');
+const correct = {company_signatory: 'Synthetic Authorized Signatory', company_title: 'Project Manager'};
+const swapped = {company_signatory: correct.company_title, company_title: correct.company_signatory};
+function slice(code, left, right) {
+  const start = code.indexOf(left), end = code.indexOf(right, start + left.length);
+  nodeAssert(start >= 0 && end > start, 'Missing maintained signature boundary');
+  return code.slice(start, end);
+}
+function check(code) {
+  const guard = slice(code, '    const expectedSignature = {', '    requireExactSignature({');
+  const intermediate = slice(code, '    const savedDetails =', '    const requestPresence =');
+  const generation = slice(code, '    // Match payload_to_brief/prepare_lines', '    const workbookRow =');
+  function run(body, saved = correct, request = correct, job = correct) {
+    vm.runInNewContext(guard + body, {
+      companyFields: [['#companySignatoryEditor', correct.company_signatory],
+        ['#companyTitleEditor', correct.company_title]],
+      assert: (ok, message) => nodeAssert.ok(ok, message),
+      seededReadback: {draft_state: {quoteDetails: {signature: saved}}},
+      createdSave: {payload: {draft_state: {quoteDetails: {signature: request}}}},
+      xlsxJobRequest: {signature: job},
+    });
+  }
+  run(intermediate); run(generation);
+  nodeAssert.throws(() => run(intermediate, swapped), /signature field differs/, 'Saved signature call missing');
+  nodeAssert.throws(() => run(intermediate, correct, swapped), /signature field differs/, 'Request signature call missing');
+  nodeAssert.throws(() => run(generation, correct, correct, swapped), /signature field differs/, 'Job signature call missing');
+}
+check(source);
+for (const calls of [
+  ['requireExactSignature(savedSignature);'], ['requireExactSignature(requestSignature);'],
+  ['requireExactSignature(savedSignature);', 'requireExactSignature(requestSignature);'],
+  ['requireExactSignature(xlsxJobRequest.signature);'],
+]) {
+  let mutant = source;
+  for (const call of calls) {
+    nodeAssert.equal(mutant.split(call).length - 1, 1, 'Missing signature mutation target');
+    mutant = mutant.replace(call, '');
+  }
+  nodeAssert.throws(() => check(mutant), /Missing expected exception/, 'Signature call deletion survived');
+}
+'''
+        result = subprocess.run(['node', '-e', script], input=source, cwd=ROOT, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_request_row_variants_match_generator_normalisation(self):
         variants = [
             {"description": description, "quantity": quantity, "unit": unit, "price_mode": mode,
