@@ -909,11 +909,12 @@ def redact_request_target_for_log(target: str) -> str:
     if urlparse(effective).path == "/login":
         # Preserve no submitted authority, userinfo, query names/values or fragment.
         return "/login"
-    parsed = urlparse(submitted)
+    parsed = urlparse(effective)
     if parsed.path.startswith("/api/v1/"):
         # Only operation templates enter access logs, never submitted IDs/query.
         operation = quote_operation("GET", parsed.path) or quote_operation("POST", parsed.path)
         return "/api/v1/" + (operation or "unmatched")
+    parsed = urlparse(submitted)
     if not parsed.query:
         return submitted
     redact_all_callback_values = parsed.path == "/callback"

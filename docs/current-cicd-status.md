@@ -5,7 +5,12 @@ Last updated: 2026-11-07
 Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
 
 Python discovery includes `tests.test_quote_api_auth` and
-`tests.test_quote_api_tenancy` for the disabled admission boundary. The switches
+`tests.test_quote_api_tenancy` for the disabled admission boundary.
+`tests.test_quote_api_hardening` adds normalised v1 log canaries, registry ID
+and failure-code guards, duplicate staff cookies, a fixed verifier vector,
+disabled Platform launch mode, role allow-list and missing Origin/Referer checks.
+These run through existing discovery with synthetic data and loopback HTTP.
+The switches
 `SQAG_QUOTE_API_SERVICE_ENABLED` and
 `SQAG_QUOTE_API_STAFF_TRANSPORT_ENABLED` default off; only exact `true` enables
 their independent admission paths. No CI settings or secrets enable them. Tests
