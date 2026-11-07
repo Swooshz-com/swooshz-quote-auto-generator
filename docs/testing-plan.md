@@ -232,11 +232,18 @@ the owner-approved CI lane.
 ## Feature Coverage Guide
 
 - Disabled quote admission: Run
-  `python -m unittest tests.test_quote_api_contract tests.test_quote_api_auth tests.test_quote_api_tenancy`.
+  `python -m unittest tests.test_quote_api_contract tests.test_quote_api_auth tests.test_quote_api_tenancy tests.test_quote_api_hardening`.
   These exercise exact HTTP methods/routes, separate default-off flags, raw
   singleton token grammar, fixed dummy comparisons, scope, rotation/revocation
   and inclusive expiry, shared admission throttling before registry/hash,
   internal/service closure, real staff login/session/CSRF and no accepted work.
+  Hardening regressions cover normalised double/triple-slash and absolute-form
+  v1 access-log canaries through pure projection and actual loopback HTTP,
+  registry record ID cross-checks, closed registry-exception codes, duplicate
+  staff Cookie headers, a fixed domain-separated verifier vector, disabled
+  Platform launch mode, the internal role allow-list and missing Origin/Referer.
+  Each boundary must fail its focused test when its guard is removed in memory;
+  the log canary tests must also fail against the original raw-target check.
   Synthetic context-required consumers cover tenant/workspace/exact-owner/caller
   and staff/service separation across request/job states and resource kinds.
   They do not implement or qualify repositories, durable work, resource expiry,
@@ -245,7 +252,8 @@ the owner-approved CI lane.
   removed, or the dummy comparison is skipped. Keep internal-password auth,
   webapp and identity-continuity, runtime privilege and profile permission packs,
   plus the protected webapp/Platform regression preview. Existing full discovery
-  includes both new modules; there is no new CI job, secret or deployment action.
+  includes the admission, tenancy and hardening modules; there is no new CI job,
+  secret or deployment action.
   Browser/native and installed-host qualification remain separate; no visible UI
   or browser transport changes are made by this admission slice.
 
