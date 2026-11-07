@@ -211,6 +211,17 @@ values into a live host:
 python scripts\verify_internal_uat_deploy_template.py
 ```
 
+This checks the template file, not environment settings on the host.
+`SQAG_INTERNAL_IDENTITY_BINDINGS_JSON` is optional: omit the line, leave it empty
+or retain its approved placeholder. Raw JSON and other markers are rejected in
+the template. On the host, omission, an empty value or `[]` uses stable generated
+IDs for allowed aliases; supplied legacy bindings remain strictly validated.
+Configure populated bindings only in the host secret manager under separate
+live authority. All other required checks remain unchanged.
+The synthetic hosted-validation verifier also omits this binding from required
+names while retaining its secret-manager-only classification. It runs synthetic
+checks and does not establish presence or readiness on a live host.
+
 ## UAT Deploy Smoke Checklist
 
 Use this checklist for the gated internal UAT deploy path. Do not print secrets

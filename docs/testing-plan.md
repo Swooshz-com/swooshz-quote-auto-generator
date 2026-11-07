@@ -272,6 +272,23 @@ the owner-approved CI lane.
   no values are emitted. These checks use synthetic local
   services and do not establish live hosted readiness.
 
+- Optional internal identity bindings: Run the template cases in
+  `tests.test_webapp.WebappServerTest`,
+  `tests.test_internal_alpha_hosted_validation_verifier` and
+  `tests.test_internal_password_auth_webapp.OptionalIdentityBindingsDeployTest`.
+  The template matrix accepts omission, empty and the approved marker, rejecting
+  other markers, raw JSON and secret canaries without echoing values. Retain
+  generic scans even when the binding is absent. Runtime tests mock dependencies
+  and exercise preflight and the actual startup auth guard for absent, empty and
+  `[]` bindings; malformed, duplicate and oversized values still block. Supplied
+  legacy IDs remain unchanged and Platform mixed configuration still fails.
+  Metadata omits the binding from required names but retains both secret-only
+  vocabularies, with the legacy fixture and a separate no-binding scenario.
+  A mutation that requires the key again must fail the omission regression.
+  Also run password policy, HTTP, identity-continuity, publication-owner and
+  production-readiness suites. These offline checks qualify file and synthetic
+  runtime behaviour, not host settings or installed readiness.
+
 - PDF references for quote analysis: run the focused draft request and gateway
   tests, then run the internal-password browser harness to check file admission.
   The app accepts up to 48 MiB per PDF, 128 MiB across reference files and 96 PDF
