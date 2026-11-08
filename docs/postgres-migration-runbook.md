@@ -290,8 +290,10 @@ provider-level rollback point, followed by read-only preflight.
 ## Quote service admission registry
 
 Migration 012 is additive source for the quote-internal database. It creates
-only two registry tables, three indexes, two immutable-binding triggers using
-the existing rejection routine, and `sqag_quote_api_admission_lookup(text)`.
+only two registry tables, three indexes, two immutable-binding triggers, their
+dedicated `sqag_quote_api_reject_binding_change()` invoker function, and
+`sqag_quote_api_admission_lookup(text)`. The dedicated trigger function has
+no PUBLIC, runtime or maintenance EXECUTE grant.
 All objects belong to `sqag_migrator`. Sequence number is 11. No seed, tenant,
 credential, backfill, environment switch or startup application is supplied.
 The SQLite counterpart is loaded explicitly by synthetic fixtures only.
@@ -303,6 +305,8 @@ truncate or delegate privileges. PUBLIC and maintenance receive nothing new.
 The routine is a one-ID lookup with a fixed search path and fully qualified
 relations. Any code holding the shared runtime role can invoke it; this does
 not enforce Python call-site secrecy or database-level tenant isolation.
+Runtime can enumerate credential IDs and invoke the lookup for each, so the
+column restriction does not prevent reading all verifiers through the routine.
 
 Future application order, each step on the separately approved exact target:
 preserve a recovery point and reconcile revocations; bind the reviewed source
@@ -315,8 +319,15 @@ does not authorise any of these database operations.
 
 A failed transaction aborts DDL, ACL and ledger together. After commit retain
 the tables, ledger, counters and revocations. Keep service admission closed and
-revert only disabled code to a compatible version that recognises 012, or fix
-forward. An older strict preflight can reject the extra objects. No DROP, down
+revert disabled code or fix forward. The dedicated binding function leaves all
+pre-012 forensic routine dependencies unchanged: current code can start with
+011 only, and an older app image using that forensic check can start after 012.
+An older strict migration preflight still rejects the additional ledger entry
+and objects; use current migration tooling for inspection. Application startup,
+request and health checks stay scoped to forensic surfaces and never apply DDL.
+The ledger-aware inspector fully verifies 012 only when its ledger entry exists;
+the complete privilege verifier and live verification scripts require the final
+head and will report 012 pending until explicitly applied. No DROP, down
 migration, ledger edit, counter reset or backup restore is a rollback here.
 Credential issuance, tenant provisioning, rotation/revoke execution, audit
 retention binding, provider use, deployment and enablement need separate approvals.

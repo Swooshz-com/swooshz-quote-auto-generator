@@ -121,6 +121,7 @@ EXPECTED_TRIGGER_KEYS = frozenset(
 )
 EXPECTED_ROUTINES = frozenset(
     {
+        'sqag_quote_api_reject_binding_change',
         'sqag_quote_api_admission_lookup',
         "sqag_reject_immutable_change",
         "sqag_require_retention_delete_authorization",
@@ -130,6 +131,7 @@ EXPECTED_ROUTINES = frozenset(
 )
 EXPECTED_TRIGGER_ROUTINE_KEYS = frozenset(
     {
+        ("sqag_quote_api_reject_binding_change", ""),
         ("sqag_reject_immutable_change", ""),
         ("sqag_require_retention_delete_authorization", ""),
     }
@@ -143,10 +145,14 @@ EXPECTED_CALLABLE_ROUTINE_KEYS = frozenset(
 )
 EXPECTED_ROUTINE_KEYS = EXPECTED_TRIGGER_ROUTINE_KEYS | EXPECTED_CALLABLE_ROUTINE_KEYS
 EXPECTED_TRIGGER_ROUTINE_LINKS = {
-    "sqag_reject_immutable_change": frozenset(
+    "sqag_quote_api_reject_binding_change": frozenset(
         {
             ('sqag_quote_api_tenants_binding_immutable', 'sqag_quote_api_tenants'),
             ('sqag_quote_api_callers_binding_immutable', 'sqag_quote_api_callers'),
+        }
+    ),
+    "sqag_reject_immutable_change": frozenset(
+        {
             ("sqag_generation_evidence_no_update", "sqag_generation_evidence"),
             ("sqag_audit_events_no_update", "sqag_audit_events"),
             ("sqag_feedback_linkage_no_update", "sqag_feedback"),
@@ -794,8 +800,8 @@ TRIGGER_SPECS = (
         routine_name="sqag_reject_immutable_change",
     ),
     _trigger("sqag_telemetry_events_guard_delete", "sqag_telemetry_events", ("delete",), routine_name="sqag_require_retention_delete_authorization"),
-    _trigger('sqag_quote_api_tenants_binding_immutable', 'sqag_quote_api_tenants', ("update",), columns=('tenant_id', 'workspace_id'), routine_name="sqag_reject_immutable_change"),
-    _trigger('sqag_quote_api_callers_binding_immutable', 'sqag_quote_api_callers', ("update",), columns=('tenant_id', 'caller_id', 'owner_subject', 'credential_id'), routine_name="sqag_reject_immutable_change"),
+    _trigger('sqag_quote_api_tenants_binding_immutable', 'sqag_quote_api_tenants', ("update",), columns=('tenant_id', 'workspace_id'), routine_name="sqag_quote_api_reject_binding_change"),
+    _trigger('sqag_quote_api_callers_binding_immutable', 'sqag_quote_api_callers', ("update",), columns=('tenant_id', 'caller_id', 'owner_subject', 'credential_id'), routine_name="sqag_quote_api_reject_binding_change"),
 )
 TRIGGER_SPECS_BY_KEY = MappingProxyType(
     {("public", item.table_name, item.name): item for item in TRIGGER_SPECS}
@@ -856,6 +862,7 @@ ROUTINE_SPECS = (
         (("sqag_runtime", "EXECUTE", False),),
     ),
     RoutineSpec("public", "sqag_quote_api_admission_lookup", "text", 'TABLE(credential_id text, verifier bytea, tenant_id text, workspace_id text, caller_id text, owner_subject text, credential_revision bigint, tenant_revision bigint, caller_revision bigint, operations_mask smallint, expires_at bigint, caller_state text, tenant_state text, policy_json text)', "sql", "sqag_migrator", True, "s", "u", False, ("search_path=pg_catalog, public",), "012_quote_api_admission_postgres.sql", ("sqag_quote_api_callers", "sqag_quote_api_tenants"), (("sqag_runtime", "EXECUTE", False),)),
+    _trigger_routine("sqag_quote_api_reject_binding_change", "012_quote_api_admission_postgres.sql"),
 )
 ROUTINE_SPECS_BY_KEY = MappingProxyType({item.key: item for item in ROUTINE_SPECS})
 
@@ -933,7 +940,7 @@ MIGRATION_OBJECTS = (
         tables=tuple(TABLE_SPECS_BY_NAME[name] for name in ("sqag_quote_api_tenants", "sqag_quote_api_callers")),
         indexes=tuple(item for item in INDEX_SPECS if item.table_name in {"sqag_quote_api_tenants", "sqag_quote_api_callers"}),
         triggers=tuple(TRIGGER_SPECS[-2:]),
-        routines=(ROUTINE_SPECS[-1],),
+        routines=tuple(spec for spec in ROUTINE_SPECS if spec.source_migration_id == MIGRATION_FILE_NAMES[10]),
     ),
 )
 

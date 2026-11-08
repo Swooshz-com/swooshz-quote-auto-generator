@@ -124,8 +124,8 @@ class AdmissionFixtureMutationTest(unittest.TestCase):
         sources = {str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
                    for path in sorted((ROOT / "tests").rglob("*.py"))}
         sites = assert_dependency_safe_drops(sources, SOURCE.read_text(encoding="utf-8"))
-        self.assertEqual(len(sites), 4)  # Restore helper, two mutations, empty-target probe.
-        self.assertEqual([site[2] for site in sites].count("empty"), 1)
+        self.assertEqual(len(sites), 2)  # Dedicated restore helper and identity mutation.
+        self.assertEqual([site[2] for site in sites].count("empty"), 0)
 
     def test_dependency_scan_mutants_reject_each_missing_drop_wrong_order_and_restore(self):
         path = ROOT / "tests/test_runtime_privilege_contract.py"
@@ -134,8 +134,8 @@ class AdmissionFixtureMutationTest(unittest.TestCase):
         for table in ("tenants", "callers"):
             fragment = (f'"drop trigger sqag_quote_api_{table}_binding_immutable "\n'
                         f'                    "on public.sqag_quote_api_{table}"')
-            self.assertEqual(source.count(fragment), 2)
-            for occurrence in (0, 1):
+            self.assertEqual(source.count(fragment), 1)
+            for occurrence in (0,):
                 offset = [match.start() for match in re.finditer(re.escape(fragment), source)][occurrence]
                 mutant = source[:offset] + source[offset:].replace(fragment, '"select 1"', 1)
                 with self.subTest(table=table, occurrence=occurrence), self.assertRaises(AssertionError):
@@ -148,27 +148,28 @@ class AdmissionFixtureMutationTest(unittest.TestCase):
                     '                    "drop trigger sqag_quote_api_tenants_binding_immutable "\n'
                     '                    "on public.sqag_quote_api_tenants"\n                ),\n')
         mutant = source.replace(fragment, "", 1)
-        routine = '"drop function public.sqag_reject_immutable_change()"\n                ),\n'
+        routine = '                self._execute_admin("drop function public.sqag_quote_api_reject_binding_change()"),\n'
         mutant = mutant.replace(routine, routine + fragment, 1)
         with self.assertRaises(AssertionError):
             assert_dependency_safe_drops({str(path): mutant}, admission)
-        mutant = source.replace('empty_database = self._create_empty_isolated_database_fixture()',
-                                'empty_database = self._create_isolated_database_fixture()', 1)
-        self.assertNotEqual(mutant, source)
         with self.assertRaises(AssertionError):
-            assert_dependency_safe_drops({str(path): mutant}, admission)
+            assert_dependency_safe_drops({"rogue.py": 'def probe(c):\n    c.execute("drop function public.sqag_quote_api_reject_binding_change()")\n'}, admission)
+        empty = ('def probe(self):\n'
+                 '    target = self._create_empty_isolated_database_fixture()\n'
+                 '    self._execute_admin("drop function public.sqag_quote_api_reject_binding_change()", database_name=target)\n')
+        self.assertEqual(assert_dependency_safe_drops({"empty.py": empty}, admission)[0][2], "empty")
         with self.assertRaises(AssertionError):
-            assert_dependency_safe_drops({"rogue.py": 'def probe(c):\n    c.execute("drop function public.sqag_reject_immutable_change()")\n'}, admission)
+            assert_dependency_safe_drops({"empty.py": empty.replace("_create_empty_isolated_database_fixture", "_create_isolated_database_fixture")}, admission)
         for extra in (" cascade", ""):
             installed_source = ('def probe(self):\n'
                       '    target = self._create_empty_isolated_database_fixture()\n'
                       '    self.apply(target)\n'
-                      '    self._execute_admin("drop function public.sqag_reject_immutable_change()'
+                      '    self._execute_admin("drop function public.sqag_quote_api_reject_binding_change()'
                       + extra + '", database_name=target)\n')
             with self.subTest(extra=extra), self.assertRaises(AssertionError):
                 assert_dependency_safe_drops({"installed.py": installed_source}, admission)
-        mutant = source.replace('self._restore_canonical_forensic_routines,\n            "wrong return type"',
-                                'self._verify,\n            "wrong return type"', 1)
+        mutant = source.replace('self._restore_canonical_forensic_routines,\n            "dedicated binding function identity"',
+                                'self._verify,\n            "dedicated binding function identity"', 1)
         self.assertNotEqual(mutant, source)
         with self.assertRaises(AssertionError):
             assert_dependency_safe_drops({str(path): mutant}, admission)

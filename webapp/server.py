@@ -12428,9 +12428,14 @@ class DatabaseSqagStorage:
             ):
                 canonical_routines = False
             routine_oids[routine_name] = row["function_oid"]
+        # Runtime has no ledger access. Admission is validated by the ledger-aware
+        # migrator/privilege verifier, independently of forensic readiness.
+        forensic_links = {
+            name: EXPECTED_TRIGGER_ROUTINE_LINKS[name] for name in routine_names
+        }
         expected_links = {
             (trigger_name, table_name, routine_oids[routine_name])
-            for routine_name, links in EXPECTED_TRIGGER_ROUTINE_LINKS.items()
+            for routine_name, links in forensic_links.items()
             for trigger_name, table_name in links
             if routine_name in routine_oids
         }
@@ -12443,7 +12448,7 @@ class DatabaseSqagStorage:
             for row in trigger_rows
             if clean_text(row["name"]) in {
                 trigger_name
-                for links in EXPECTED_TRIGGER_ROUTINE_LINKS.values()
+                for links in forensic_links.values()
                 for trigger_name, _table_name in links
             }
             or row["function_oid"] in set(routine_oids.values())

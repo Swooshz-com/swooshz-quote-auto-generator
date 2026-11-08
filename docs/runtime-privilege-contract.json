@@ -65,6 +65,14 @@
     ],
     "routines": [
       {
+        "name": "sqag_quote_api_reject_binding_change",
+        "identity_arguments": "",
+        "owner": "sqag_migrator",
+        "security_mode": "invoker",
+        "direct_execute": false,
+        "trigger_only": true
+      },
+      {
         "name": "sqag_reject_immutable_change",
         "identity_arguments": "",
         "owner": "sqag_migrator",
@@ -337,7 +345,7 @@
     {
       "path": "migrations/012_quote_api_admission_postgres.sql",
       "sequence_no": 11,
-      "sha256": "b9df02f16d777cd8fd7d57a2df4663a3f393375ab82f68cd435560b56611a4c6",
+      "sha256": "8cc40fd92175030db4a2984c679494bffd6e08abbcd66988b82fd1202df7b100",
       "tables": [
         "sqag_quote_api_callers",
         "sqag_quote_api_tenants"

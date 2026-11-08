@@ -25,7 +25,7 @@ The declared set is deliberately bounded to `public.sqag_*` application objects:
 - eleven canonical PostgreSQL migrations and their canonical migration-ledger checksums;
 - the 20 application tables plus `sqag_schema_migrations`;
 - the 32 canonical indexes;
-- the two migrator-owned invoker trigger routines and two migrator-owned,
+- the three migrator-owned invoker trigger routines and two migrator-owned,
   runtime-callable security-definer hold-decision routines: historical v1 from
   migration 008 and telemetry-aware v2 from migration 009, plus the admission
   lookup routine from migration 012;
@@ -241,7 +241,21 @@ The TABLE-returning admission routine has its exact signature, result, body,
 configuration, referenced relations and ACL bound alongside the older hold routines.
 
 Verifier access is bounded to the one-ID routine, not to a Python call site:
-the runtime role is shared, and its counter grants do not provide row isolation.
+the runtime role is shared, can enumerate credential IDs and can read all
+verifiers by calling the lookup for each ID. Its counter grants do not provide
+row isolation. The restriction is on direct column SELECT.
 The unwired registry adapter checks the authenticated/active role pair before
 protected SQL and rejects non-READ-COMMITTED transactions. SQLite has no ACL
 analogue and proves only synthetic data/transaction invariants.
+
+Migration 012 uses the dedicated invoker trigger function
+`sqag_quote_api_reject_binding_change()`, owned by `sqag_migrator`, with no
+PUBLIC/runtime/maintenance EXECUTE. Its body and properties are source-bound;
+its trigger links and ACL are exact. It adds no dependencies to either older
+forensic trigger function. Runtime startup, health and request readiness verify
+only forensic routines and their exact links, so a database at 011 remains
+usable by current code and old runtime checks remain usable after 012. Runtime
+has no ledger privilege. The migrator inspection uses the exact applied prefix
+to check 012 objects only after 012 is applied, rejects premature pending objects,
+and rejects drift after application. The full privilege verifier remains a
+final-head operator check, not an application-startup dependency.

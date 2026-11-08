@@ -42,10 +42,16 @@ alter table public.sqag_quote_api_callers owner to sqag_migrator;
 create index sqag_quote_api_tenants_workspace_idx on public.sqag_quote_api_tenants (workspace_id, tenant_id);
 create unique index sqag_quote_api_callers_credential_uidx on public.sqag_quote_api_callers (credential_id);
 create unique index sqag_quote_api_callers_subject_uidx on public.sqag_quote_api_callers (owner_subject);
+-- Dedicated identity preserves forensic dependencies in older app images.
+create function public.sqag_quote_api_reject_binding_change() returns trigger
+language plpgsql volatile parallel unsafe security invoker
+as $binding$ begin raise exception 'SQAG immutable record cannot be changed'; end $binding$;
+alter function public.sqag_quote_api_reject_binding_change() owner to sqag_migrator;
+revoke all privileges on function public.sqag_quote_api_reject_binding_change() from public, sqag_runtime, sqag_maintenance;
 create trigger sqag_quote_api_tenants_binding_immutable before update of tenant_id, workspace_id
-  on public.sqag_quote_api_tenants for each row execute function public.sqag_reject_immutable_change();
+  on public.sqag_quote_api_tenants for each row execute function public.sqag_quote_api_reject_binding_change();
 create trigger sqag_quote_api_callers_binding_immutable before update of tenant_id, caller_id, owner_subject, credential_id
-  on public.sqag_quote_api_callers for each row execute function public.sqag_reject_immutable_change();
+  on public.sqag_quote_api_callers for each row execute function public.sqag_quote_api_reject_binding_change();
 
 -- SQAG_STATEMENT_BOUNDARY
 create function public.sqag_quote_api_admission_lookup(text)

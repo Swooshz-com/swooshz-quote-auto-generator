@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-07
+Last updated: 2026-11-08
 
 Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
 
@@ -24,6 +24,12 @@ job includes migration, ACL and two-worker/CAS integration controls. Real PG
 tests skip on an offline host and must run without required skips in CI. No
 startup apply, seeded key, default tenant, live apply or flag enablement is supplied. Independent security review and installed-host
 qualification are still required before later enablement.
+
+The disposable PostgreSQL 17 privilege-contract suite also qualifies current
+startup, uncached health and request checks with only migrations 001-011 applied,
+then repeats after explicit 012 application and with the old forensic inventory.
+Dedicated admission-function body, dependency and EXECUTE drift must fail.
+No additional job, service, secret or startup migration is introduced.
 
 Full Python discovery includes `tests.test_libreoffice_workbook_values`: actual
 LibreOffice recalculates a disposable cache-cleared workbook, then each priced,

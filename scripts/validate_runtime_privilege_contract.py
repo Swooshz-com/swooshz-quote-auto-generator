@@ -26,6 +26,8 @@ from webapp.postgres_migrations import (  # noqa: E402
     EXPECTED_TABLES,
     EXPECTED_TRIGGER_ROUTINE_KEYS,
     EXPECTED_TRIGGER_ROUTINE_LINKS,
+    ROUTINE_SPECS_BY_KEY,
+    _canonical_routine_body,
     LEDGER_TABLE,
     MIGRATION_TABLES,
     MigrationSafetyError,
@@ -1436,6 +1438,18 @@ def _check_routines(connection: Any, errors: list[str]) -> None:
             or bool(_row_value(row, "prosecdef"))
         ):
             errors.append(f"routine_properties_mismatch:{key[0]}")
+        if key == ("sqag_quote_api_reject_binding_change", ""):
+            spec = ROUTINE_SPECS_BY_KEY[("public", *key)]
+            expected_body = _canonical_routine_body(spec, migration_manifest(ROOT / "migrations"))
+            if (
+                _clean(_row_value(row, "language")) != spec.language
+                or _clean(_row_value(row, "provolatile")) != spec.volatility
+                or _clean(_row_value(row, "proparallel")) != spec.parallel
+                or bool(_row_value(row, "proleakproof")) != spec.leakproof
+                or _routine_proconfig(_row_value(row, "proconfig")) != list(spec.proconfig)
+                or _semantic_sql_tokens(_row_value(row, "function_body")) != _semantic_sql_tokens(expected_body)
+            ):
+                errors.append(f"routine_properties_mismatch:{key[0]}")
         routine_oids[key] = _row_value(row, "function_oid")
     for key in EXPECTED_CALLABLE_ROUTINE_KEYS:
         candidates = grouped.get(key, [])

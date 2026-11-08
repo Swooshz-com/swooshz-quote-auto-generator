@@ -1051,7 +1051,8 @@ lists, then run the validator's explicit inventory and effective-privilege check
 Run `tests.test_admission_fixture_mutations` for rollback of temporary ACL grants
 without removing original column grants, and a static scan of routine drops across
 tests for admission trigger dependencies and canonical restoration. Mutation controls
-cover both drop probes, missing dependencies, restoration and table-level REVOKE.
+cover the dedicated routine drop probe, missing dependencies, restoration and
+table-level REVOKE. Older forensic-routine probes no longer drop admission triggers.
 
 Run `tests.test_quote_api_registry`, quote API contract/auth/tenancy, migration
 ledger, runtime privilege contract and internal-password auth/webapp suites.
@@ -1061,6 +1062,17 @@ failures. Cover immutable bindings, verifier lengths, unique/FK constraints,
 closed policy, expiry equality, foreign/stale authority, UTC bucket edges,
 every cap/revision ceiling, two connections and operator CAS. Keep disabled
 HTTP admission and legacy staff/Platform/proxy checks in the protected preview.
+
+Run `tests.test_admission_schema_compatibility` for a projected exact 001-011
+ledger against the full manifest, real startup/health/request readiness, applied
+012 drift and a model of the old runtime inventory against 012. Mutants require
+012 links prematurely, reuse the shared function, remove applied objects and
+change the dedicated function body, properties or ACL. The old-image check models
+its forensic inventory; it does not run an old container or old strict preflight.
+The disposable PostgreSQL 17 privilege-contract suite includes an explicit
+011-only boot/health/request case, followed by explicit 012 application and
+the same current/old-inventory runtime checks. These tests run whenever the
+configured disposable service exists; they do not skip on query errors.
 
 The existing disposable PostgreSQL 17 CI suite additionally exercises source
 ACLs without fixture repair of new objects, one-ID verifier lookup, every

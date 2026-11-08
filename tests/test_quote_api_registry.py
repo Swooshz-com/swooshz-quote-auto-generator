@@ -356,10 +356,13 @@ class RegistrySourceControls(unittest.TestCase):
         self.assertEqual(m.MIGRATION_OBJECTS[9].indexes[0].name,"sqag_quote_ai_spend_session_idx")
         self.assertEqual(m.migration_manifest(ROOT/'migrations')[-1].sequence_no,11)
         pg=(ROOT/'migrations/012_quote_api_admission_postgres.sql').read_text()
-        self.assertEqual(len(m._split_sql_statements(pg)),18)
+        self.assertEqual(len(m._split_sql_statements(pg)),21)
         self.assertEqual(len(m.MIGRATION_OBJECTS[-1].tables),2)
         self.assertEqual(len(m.MIGRATION_OBJECTS[-1].indexes),3)
         self.assertEqual(len(m.MIGRATION_OBJECTS[-1].triggers),2)
+        self.assertEqual({spec.name for spec in m.MIGRATION_OBJECTS[-1].routines},
+                         {"sqag_quote_api_admission_lookup", "sqag_quote_api_reject_binding_change"})
+        self.assertNotIn("sqag_reject_immutable_change", pg)
         self.assertNotRegex(pg.lower(),r'\b(?:insert|delete|truncate|drop)\s+(?:into|from|table)')
 
     def test_startup_flags_off_cannot_connect_or_auto_apply_registry(self):

@@ -1714,7 +1714,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                     )
             connection.execute("revoke all privileges on all sequences in schema public from PUBLIC, sqag_runtime, sqag_maintenance")
             for schema, routine, identity_arguments in sorted(routine_keys):
-                if routine == "sqag_quote_api_admission_lookup":
+                if routine in {"sqag_quote_api_admission_lookup", "sqag_quote_api_reject_binding_change"}:
                     continue  # Preserve the migration's ACL, including missing/extra grants.
                 connection.execute(
                     self.sql.SQL("revoke all privileges on function {}.{}({}) from PUBLIC, sqag_runtime, sqag_maintenance").format(
@@ -1724,6 +1724,8 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                     )
                 )
             for routine, identity_arguments in contract.EXPECTED_TRIGGER_ROUTINE_KEYS:
+                if routine == "sqag_quote_api_reject_binding_change":
+                    continue  # Preserve source ACL for the dedicated admission function.
                 if ("public", routine, identity_arguments) not in routine_keys:
                     continue
                 connection.execute(
@@ -1733,7 +1735,7 @@ class RuntimePrivilegeContractPostgresIntegrationTest(unittest.TestCase):
                     )
                 )
             for routine, identity_arguments in contract.EXPECTED_CALLABLE_ROUTINE_KEYS:
-                if routine == "sqag_quote_api_admission_lookup":
+                if routine in {"sqag_quote_api_admission_lookup", "sqag_quote_api_reject_binding_change"}:
                     continue  # Assert source ACLs, never fixture-repair admission grants.
                 if not include_callable or ("public", routine, identity_arguments) not in routine_keys:
                     continue
@@ -2363,6 +2365,7 @@ order by object_kind, object_schema, object_name, object_type
             ("sqag_quote_api_callers_binding_immutable", "sqag_quote_api_callers"),
         ):
             self._execute_admin(f"drop trigger if exists {trigger} on public.{table}")
+        self._execute_admin("drop routine if exists public.sqag_quote_api_reject_binding_change()")
         self._execute_admin("drop routine if exists public.sqag_reject_immutable_change()")
         self._execute_admin("drop routine if exists public.sqag_require_retention_delete_authorization()")
         self._execute_admin("create function public.sqag_reject_immutable_change() returns trigger language plpgsql security invoker as $$ begin return old; end $$;")
@@ -2392,12 +2395,12 @@ order by object_kind, object_schema, object_name, object_type
             "execute function public.sqag_reject_immutable_change()"
         )
         self._execute_admin("create trigger sqag_telemetry_events_guard_delete before delete on public.sqag_telemetry_events for each row execute function public.sqag_require_retention_delete_authorization()")
-        # Recreate admission dependencies from the canonical source, with exact columns.
+        # Recreate the dedicated function, owner, ACL and dependencies from source.
         admission_source = migration_contract.canonical_migration_payload(
             ROOT / "migrations/012_quote_api_admission_postgres.sql"
         ).decode("utf-8")
         for statement in migration_contract._split_sql_statements(admission_source):
-            if statement.startswith("create trigger "):
+            if statement.startswith("create trigger ") or "public.sqag_quote_api_reject_binding_change()" in statement:
                 self._execute_admin(statement)
 
     def test_real_pg17_authenticated_and_active_identity_invariant(self):
@@ -2434,6 +2437,80 @@ order by object_kind, object_schema, object_name, object_type
                     adapter = webapp.PostgresConnectionAdapter(raw)
                     with self.assertRaises(webapp.SqagStorageAccessError):
                         webapp.require_postgres_session_role(adapter, expected_role)
+
+    def test_real_pg17_011_only_boot_health_and_requests_with_current_manifest(self):
+        from tests.test_admission_schema_compatibility import assert_runtime_surfaces, LEGACY_LINKS
+
+        prefix = tuple(m for m in self.migrations if m.sequence_no <= 10)
+        self.assertEqual(prefix[-1].migration_id, "011_quote_ai_spend_postgres.sql")
+        database = self._create_isolated_database_fixture(prefix, configure_acl=False)
+        self._configure_acl_contract(database, migrations=prefix)
+        with self._admin_connection(database) as raw:
+            major = raw.execute("select current_setting('server_version_num') as n").fetchone()["n"]
+        self.assertEqual(int(major) // 10000, 17)
+        report = self._inspect(database)
+        self.assertEqual(report["blockers"], [])
+        self.assertEqual(report["pendingMigrationIds"], ["012_quote_api_admission_postgres.sql"])
+        url = safe_postgres_url("sqag_runtime", database)
+        assert_runtime_surfaces(self, url)
+        # Forward application is explicit and confined to this disposable fixture.
+        with webapp.postgres_storage_connection(safe_postgres_url("sqag_migrator", database),
+                                                expected_role="sqag_migrator") as connection:
+            apply_postgres_migrations(connection, self.migrations)
+            connection.commit()
+        self.assertEqual(self._verify(database)["status"], "verified")
+        assert_runtime_surfaces(self, url)
+        # Model the old image's exact forensic inventories; never an old strict preflight.
+        with mock.patch.object(webapp, "EXPECTED_TRIGGER_ROUTINE_LINKS", LEGACY_LINKS):
+            assert_runtime_surfaces(self, url)
+        with self._admin_connection(database) as raw:
+            links = raw.execute(
+                "select p.proname from pg_catalog.pg_trigger t "
+                "join pg_catalog.pg_proc p on p.oid=t.tgfoid "
+                "where t.tgname in ('sqag_quote_api_tenants_binding_immutable', "
+                "'sqag_quote_api_callers_binding_immutable') and not t.tgisinternal"
+            ).fetchall()
+        self.assertEqual([row["proname"] for row in links],
+                         ["sqag_quote_api_reject_binding_change"] * 2)
+
+    def test_real_pg17_dedicated_binding_routine_drift_and_dependencies(self):
+        name = "sqag_quote_api_reject_binding_change"
+        self.assertEqual(self._verify()["status"], "verified")
+        self._red_then_restore(
+            lambda: self._execute_admin(
+                "create or replace function public.sqag_quote_api_reject_binding_change() "
+                "returns trigger language plpgsql security invoker as $$ begin return old; end $$;"
+            ),
+            self._restore_canonical_forensic_routines,
+            "admission binding function body",
+        )
+        self._red_then_restore(
+            lambda: (
+                self._execute_admin(
+                    "drop trigger sqag_quote_api_tenants_binding_immutable "
+                    "on public.sqag_quote_api_tenants"
+                ),
+                self._execute_admin(
+                    "drop trigger sqag_quote_api_callers_binding_immutable "
+                    "on public.sqag_quote_api_callers"
+                ),
+                self._execute_admin("drop function public.sqag_quote_api_reject_binding_change()"),
+                self._execute_admin(
+                    "create function public.sqag_quote_api_reject_binding_change() returns integer "
+                    "language sql immutable as $$ select 1 $$;"
+                ),
+            ),
+            self._restore_canonical_forensic_routines,
+            "dedicated binding function identity",
+        )
+        for role in ("PUBLIC", "sqag_runtime", "sqag_maintenance"):
+            self._red_then_restore(
+                lambda role=role: self._execute_admin(
+                    f"grant execute on function public.{name}() to {role}"
+                ),
+                self._restore_canonical_forensic_routines,
+                "admission trigger execute escalation " + role,
+            )
 
     def test_real_pg17_canonical_routine_identity_passes(self):
         self.assertEqual(self._verify()["status"], "verified")
@@ -3707,14 +3784,6 @@ order by object_kind, object_schema, object_name, object_type
                     "on public.sqag_telemetry_events"
                 ),
                 self._execute_admin(
-                    "drop trigger sqag_quote_api_tenants_binding_immutable "
-                    "on public.sqag_quote_api_tenants"
-                ),
-                self._execute_admin(
-                    "drop trigger sqag_quote_api_callers_binding_immutable "
-                    "on public.sqag_quote_api_callers"
-                ),
-                self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"
                 ),
                 self._execute_admin(
@@ -3747,14 +3816,6 @@ order by object_kind, object_schema, object_name, object_type
                 self._execute_admin(
                     "drop trigger sqag_telemetry_events_guard_delete "
                     "on public.sqag_telemetry_events"
-                ),
-                self._execute_admin(
-                    "drop trigger sqag_quote_api_tenants_binding_immutable "
-                    "on public.sqag_quote_api_tenants"
-                ),
-                self._execute_admin(
-                    "drop trigger sqag_quote_api_callers_binding_immutable "
-                    "on public.sqag_quote_api_callers"
                 ),
                 self._execute_admin(
                     "drop function public.sqag_reject_immutable_change()"

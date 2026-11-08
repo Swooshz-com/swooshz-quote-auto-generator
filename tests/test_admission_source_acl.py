@@ -56,7 +56,7 @@ def assert_source_acl(source, contract):
                    if item["name"] == "sqag_quote_api_admission_lookup")
     target = "public." + routine["name"] + "(" + routine["identity_arguments"] + ")"
     expected = []
-    for kind, name in [("function", target)] + [
+    for kind, name in [("function", target), ("function", "public.sqag_quote_api_reject_binding_change()")] + [
         ("table", "public." + name) for name in contract["runtime_column_privileges"]
     ]:
         for role in ("public", "sqag_runtime", "sqag_maintenance"):
@@ -224,7 +224,7 @@ class AdmissionSourceAclTest(unittest.TestCase):
         with mock.patch.object(subject, "_admin_connection", return_value=contextlib.nullcontext(Connection())):
             subject._configure_acl_contract()
         self.assertFalse(any("on all functions" in sql for sql in statements))
-        self.assertFalse(any("sqag_quote_api_admission_lookup" in sql for sql in statements))
+        self.assertFalse(any("sqag_quote_api_admission_lookup" in sql or "sqag_quote_api_reject_binding_change" in sql for sql in statements))
         self.assertFalse(any("on public." + table in sql for sql in statements
                              for table in self.contract["runtime_column_privileges"]))
         self.assertIn("grant usage on schema public to sqag_runtime, sqag_maintenance", statements)
@@ -262,16 +262,17 @@ class AdmissionSourceAclTest(unittest.TestCase):
         with mock.patch.object(subject, "_execute_admin") as execute:
             subject._restore_canonical_forensic_routines()
         statements = [call.args[0] for call in execute.call_args_list]
-        drop_routine = statements.index("drop routine if exists public.sqag_reject_immutable_change()")
         specs = [trigger for trigger in migrations.TRIGGER_SPECS
-                 if trigger.routine_key == ("public", "sqag_reject_immutable_change", "")]
+                 if trigger.routine_key[1] in {"sqag_reject_immutable_change", "sqag_quote_api_reject_binding_change"}]
         for trigger in specs:
             drop = "drop trigger if exists " + trigger.name + " on public." + trigger.table_name
             self.assertIn(drop, statements)
-            self.assertLess(statements.index(drop), drop_routine)
+            routine_drop = statements.index("drop routine if exists public." + trigger.routine_key[1] + "()")
+            self.assertLess(statements.index(drop), routine_drop)
             creates = [sql for sql in statements if sql.startswith("create trigger " + trigger.name + " ")]
             self.assertEqual(len(creates), 1)
-        canonical = [sql for sql in migrations._split_sql_statements(self.source) if sql.startswith("create trigger ")]
+        canonical = [sql for sql in migrations._split_sql_statements(self.source)
+                     if sql.startswith("create trigger ") or "public.sqag_quote_api_reject_binding_change()" in sql]
         self.assertEqual([sql for sql in statements if sql in canonical], canonical)
 
 
