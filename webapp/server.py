@@ -20933,10 +20933,8 @@ def quote_detail_missing_fields(payload: dict[str, Any]) -> list[str]:
         ("Acceptance text", bool(clean_text(acceptance.get("text") or quote_text.get("acceptance_text")))),
         ("Company signatory", bool(clean_text(signature.get("company_signatory")))),
         ("Signatory title", bool(clean_text(signature.get("company_title")))),
-        ("Company date label", bool(clean_text(signature.get("company_date_label")))),
         ("Person label", bool(clean_text(acceptance.get("person_label") or quote_text.get("person_label")))),
         ("Stamp label", bool(clean_text(acceptance.get("stamp_label") or quote_text.get("stamp_label")))),
-        ("Date label", bool(clean_text(acceptance.get("date_label") or quote_text.get("date_label")))),
     ]
     missing = [label for label, present in checks if not present]
     return missing

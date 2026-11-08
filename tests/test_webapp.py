@@ -2068,6 +2068,43 @@ class WebappServerTest(unittest.TestCase):
         self.assertTrue(any("Header logo" in error for error in errors))
         self.assertTrue(any("Header details" in error for error in errors))
 
+    def test_company_date_labels_are_optional_and_preserved_in_export_mapping(self):
+        for company_label, acceptance_label in (
+            ("", ""),
+            ("", "Accepted on:"),
+            ("Issued on:", ""),
+            ("Issued on:", "Accepted on:"),
+        ):
+            with self.subTest(company_label=company_label, acceptance_label=acceptance_label):
+                payload = valid_payload()
+                payload["signature"]["company_date_label"] = company_label
+                payload["quote_text"]["date_label"] = acceptance_label
+                rich_labels = {
+                    "companyDateLabel": f"<div><strong>{company_label}</strong></div>" if company_label else "",
+                    "dateLabel": f"<div><em>{acceptance_label}</em></div>" if acceptance_label else "",
+                }
+                payload["rich_text"].update(rich_labels)
+
+                self.assertEqual(webapp.validate_generation_payload(payload), [])
+                brief = webapp.payload_to_brief(payload)
+                self.assertEqual(brief["signature"]["company_date_label"], company_label)
+                self.assertEqual(brief["acceptance"]["date_label"], acceptance_label)
+                for field, html in rich_labels.items():
+                    self.assertEqual(brief["rich_text"].get(field, ""), html)
+
+        payload = valid_payload()
+        payload["signature"]["company_date_label"] = ""
+        payload["quote_text"]["date_label"] = ""
+        payload["signature"]["company_signatory"] = ""
+        payload["quote_date"] = ""
+        self.assertEqual(
+            webapp.validate_generation_payload(payload),
+            [
+                "Fill quote details before generating: Quote date, Company signatory.",
+                "Quote date is required.",
+            ],
+        )
+
     def test_payload_to_brief_maps_confirmed_form_fields(self):
         brief = webapp.payload_to_brief(valid_payload())
 
@@ -20592,6 +20629,16 @@ assert.strictEqual(hasReferenceFilesForNavigation(), true);
 assert.strictEqual(hasReferenceFilesForAnalysis(), false);
 state.images = [{ name: "render.jpg", type: "image/jpeg", size: 12, data_url: "data:image/jpeg;base64,ZmFrZQ==" }];
 assert.strictEqual(startAnalysisBlockReason(), "");
+elements.companyDateLabel.value = "";
+assert.strictEqual(startAnalysisBlockReason(), "");
+elements.dateLabel.value = "";
+assert.strictEqual(startAnalysisBlockReason(), "");
+elements.companyDateLabel.value = "Date:";
+assert.strictEqual(startAnalysisBlockReason(), "");
+elements.companyDateLabel.value = "";
+elements.quoteDate.value = "";
+assert.strictEqual(startAnalysisBlockReason(), "Complete Customer details before starting analysis: Quote date.");
+elements.quoteDate.value = "2026-06-08";
 elements.notesHeading.value = "";
 assert.strictEqual(startAnalysisBlockReason(), "");
 elements.acceptanceText.value = "";
