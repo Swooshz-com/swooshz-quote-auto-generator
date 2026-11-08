@@ -93,6 +93,70 @@ class RecordingConnection:
 
 
 class MigrationPayloadCanonicalizationTest(unittest.TestCase):
+    def test_admission_bounds_deparse_does_not_hide_changed_caps_or_boolean_precedence(self):
+        from webapp.postgres_migrations import TABLE_SPECS_BY_NAME
+        table = TABLE_SPECS_BY_NAME["sqag_quote_api_tenants"]
+        pairs = (
+            ("authority_revision between 1 and 9223372036854775806",
+             "((authority_revision >= 1) AND (authority_revision <= '9223372036854775806'::bigint))"),
+            ("create_minute_start between 0 and 253402300799 and create_minute_start % 60 = 0",
+             "((create_minute_start >= 0) AND (create_minute_start <= '253402300799'::bigint) AND ((create_minute_start % (60)::bigint) = 0))"),
+            ("create_minute_start between 0 and 253402300799 and mod(create_minute_start, 60) = 0",
+             "((create_minute_start >= 0) AND (create_minute_start <= '253402300799'::bigint) AND (mod(create_minute_start, (60)::bigint) = 0))"),
+            ("octet_length(policy_json) between 2 and 65536",
+             "((octet_length(policy_json) >= 2) AND (octet_length(policy_json) <= 65536))"),
+        )
+        for source, deparsed in pairs:
+            with self.subTest(source=source):
+                self.assertEqual(canonicalize_check_expression(source,table),
+                                 canonicalize_check_expression(deparsed,table))
+                self.assertNotEqual(canonicalize_check_expression(source,table),
+                                    canonicalize_check_expression(deparsed.replace(" AND "," OR ",1),table))
+        self.assertNotEqual(canonicalize_check_expression("active_jobs between 0 and 2",table),
+                            canonicalize_check_expression("active_jobs between 0 and 3",table))
+        self.assertNotEqual(canonicalize_check_expression("a and (b or c)",table),
+                            canonicalize_check_expression("(a and b) or c",table))
+        self.assertNotEqual(canonicalize_check_expression("2147483647::bigint + 1",table),
+                            canonicalize_check_expression("2147483647 + 1",table))
+
+    def test_admission_mod_deparse_preserves_divisors_caps_precedence_and_types(self):
+        # Expected PG17 spelling is reasoned offline; the disposable service
+        # must still qualify pg_get_expr against the installed CHECKs.
+        for table_name, column, divisor in (
+            ("sqag_quote_api_tenants", "create_minute_start", 60),
+            ("sqag_quote_api_tenants", "create_day_start", 86400),
+            ("sqag_quote_api_callers", "poll_minute_start", 60),
+        ):
+            table = TABLE_SPECS_BY_NAME[table_name]
+            source = f"{column} between 0 and 253402300799 and mod({column}, {divisor}) = 0"
+            spec = next(item for item in table.constraints if item.expression == source)
+            expected = _constraint_fingerprint(spec, table)
+            deparsed = (f"(({column} >= 0) AND ({column} <= '253402300799'::bigint) "
+                        f"AND (mod({column}, ({divisor})::bigint) = 0))")
+            with self.subTest(column=column):
+                for spelling in (deparsed, deparsed.replace(f"({divisor})::bigint", str(divisor))):
+                    self.assertEqual(expected, _constraint_fingerprint(replace(spec, expression=spelling), table))
+                for mutation in (
+                    deparsed.replace(str(divisor) + ")::bigint", str(divisor + 1) + ")::bigint"),
+                    deparsed.replace("253402300799", "253402300800"),
+                    deparsed.replace(" AND ", " OR ", 1),
+                    deparsed.replace("::bigint) = 0", "::integer) = 0"),
+                    deparsed.replace("::bigint) = 0", "::numeric) = 0"),
+                    deparsed.replace("::bigint) = 0", "::bigint)::numeric = 0"),
+                    deparsed.replace(f"mod({column},", f"mod({column}::numeric,"),
+                    deparsed.replace("mod(", "abs("),
+                    deparsed.replace("= 0", "= 1"),
+                ):
+                    self.assertNotEqual(deparsed, mutation)
+                    self.assertNotEqual(expected, _constraint_fingerprint(replace(spec, expression=mutation), table))
+        table = TABLE_SPECS_BY_NAME["sqag_quote_api_tenants"]
+        self.assertNotEqual(canonicalize_check_expression("mod(create_minute_start, 60) = 0", table),
+                            canonicalize_check_expression("mod(create_minute_start, 60) = 0::numeric", table))
+        # An uncast int4 literal can promote the smallint column; an int2
+        # literal can select another overload. Preserve that type difference.
+        self.assertNotEqual(canonicalize_check_expression("mod(slot, 60) = 0", {"slot": "smallint"}),
+                            canonicalize_check_expression("mod(slot, 60::smallint) = 0", {"slot": "smallint"}))
+
     def test_telemetry_attempt_constraint_is_prefix_aware_and_named_at_010(self):
         final_spec = TABLE_SPECS_BY_NAME["sqag_telemetry_events"]
         before_010 = _effective_table_spec("sqag_telemetry_events", 8)
@@ -509,6 +573,21 @@ class MigrationPayloadCanonicalizationTest(unittest.TestCase):
 
 @unittest.skipUnless(postgres_test_conninfo(), "isolated PostgreSQL test service is not configured")
 class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
+    def test_admission_011_to_012_is_additive_unseeded_and_repeatable(self):
+        self.apply(self.manifest[:10])
+        before=self.inspect()
+        self.assertEqual(before['pendingMigrationIds'],['012_quote_api_admission_postgres.sql'])
+        result=self.apply()
+        self.assertEqual(result['appliedNow'],['012_quote_api_admission_postgres.sql'])
+        self.assertEqual(self.apply()['appliedNow'],[])
+        c=self.connect()
+        try:
+            for table in ('sqag_quote_api_tenants','sqag_quote_api_callers'):
+                self.assertEqual(c.execute('select count(*) as count from public.'+table).fetchone()['count'],0)
+        finally:
+            c.rollback(); c.close()
+        self.assertEqual(self.inspect()['pendingMigrationIds'],[])
+
     @classmethod
     def setUpClass(cls):
         import psycopg
@@ -878,7 +957,11 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
             self.apply(self.manifest, stale_database)
 
     def test_quote_ai_spend_upgrade_and_transactional_cascade(self):
-        self.apply(self.manifest[:-1])
+        spend_index = next(
+            index for index, migration in enumerate(self.manifest)
+            if migration.migration_id == "011_quote_ai_spend_postgres.sql"
+        )
+        self.apply(self.manifest[:spend_index])
         connection = self.connect()
         try:
             connection.execute(
@@ -887,7 +970,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
                 "values ('workspace-test', 'quote-test', '{}', 'created', 'updated')"
             )
             connection.commit()
-            applied = self.apply()
+            applied = self.apply(self.manifest[:spend_index + 1])
             self.assertEqual(applied["appliedNow"], ["011_quote_ai_spend_postgres.sql"])
             self.assertEqual(connection.execute(
                 "select count(*) as n from public.sqag_quote_sessions"
@@ -993,6 +1076,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertEqual(
             EXPECTED_CALLABLE_ROUTINE_KEYS,
             {
+                ("sqag_quote_api_admission_lookup", "text"),
                 ("sqag_quote_session_deletion_hold_blocked", "text, text"),
                 ("sqag_quote_session_deletion_hold_blocked_v2", "text, text"),
             },
@@ -1000,6 +1084,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertEqual(
             EXPECTED_TRIGGER_ROUTINE_KEYS,
             {
+                ("sqag_quote_api_reject_binding_change", ""),
                 ("sqag_reject_immutable_change", ""),
                 ("sqag_require_retention_delete_authorization", ""),
             },

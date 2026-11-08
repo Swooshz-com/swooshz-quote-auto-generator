@@ -22,6 +22,7 @@ chat, logs, screenshots, and command history.
 8. `009_telemetry_events_postgres.sql`
 9. `010_telemetry_attempt_semantics_postgres.sql`
 10. `011_quote_ai_spend_postgres.sql`
+11. `012_quote_api_admission_postgres.sql`
 
 Successful applications are recorded in `public.sqag_schema_migrations` with
 the sequence number, migration ID, SHA-256 source checksum, and database
@@ -107,7 +108,7 @@ reads the catalog and ledger, rolls the transaction back, and prints
 privacy-safe metadata. A ready pre-apply report may have a missing or present
 ledger and may have pending IDs, but applied IDs must be the exact manifest
 prefix and pending IDs the exact manifest suffix. A target with no reserved
-public `sqag_` objects reports all eight IDs pending and is safe for a
+public `sqag_` objects reports the complete manifest pending and is safe for a
 separately approved first application, even when unrelated provider/public
 tables, indexes, routines, or triggers are present. Known premature SQAG
 objects and unknown `sqag_` objects remain fail-closed blockers; existing
@@ -285,3 +286,53 @@ A failed migration transaction rolls back its SQL and ledger rows
 automatically. Do not delete ledger rows, edit checksums, or run ad hoc down
 migrations. Any future live rollback uses a separately approved
 provider-level rollback point, followed by read-only preflight.
+
+## Quote service admission registry
+
+Migration 012 is additive source for the quote-internal database. It creates
+only two registry tables, three indexes, two immutable-binding triggers, their
+dedicated `sqag_quote_api_reject_binding_change()` invoker function, and
+`sqag_quote_api_admission_lookup(text)`. The dedicated trigger function has
+no PUBLIC, runtime or maintenance EXECUTE grant.
+All objects belong to `sqag_migrator`. Sequence number is 11. No seed, tenant,
+credential, backfill, environment switch or startup application is supplied.
+The SQLite counterpart is loaded explicitly by synthetic fixtures only.
+
+Runtime has only the column SELECT/UPDATE matrix in the
+[privilege contract](runtime-privilege-contract.md) and routine EXECUTE.
+It cannot select the verifier directly, change authority, insert, delete,
+truncate or delegate privileges. PUBLIC and maintenance receive nothing new.
+The routine is a one-ID lookup with a fixed search path and fully qualified
+relations. Any code holding the shared runtime role can invoke it; this does
+not enforce Python call-site secrecy or database-level tenant isolation.
+Runtime can enumerate credential IDs and invoke the lookup for each, so the
+column restriction does not prevent reading all verifiers through the routine.
+
+Future application order, each step on the separately approved exact target:
+preserve a recovery point and reconcile revocations; bind the reviewed source
+checksum and target identity; obtain PRE with 011 applied and only 012 pending;
+obtain exact-target owner application approval; invoke the existing forward
+migration CLI once; obtain POST with zero pending IDs/blockers and exact column,
+routine and object projections. Independent security review and disposable
+PostgreSQL 17 qualification must precede application. Source approval alone
+does not authorise any of these database operations.
+
+A failed transaction aborts DDL, ACL and ledger together. After commit retain
+the tables, ledger, counters and revocations. Keep service admission closed and
+revert disabled code or fix forward. The dedicated binding function leaves all
+pre-012 forensic routine dependencies unchanged: current code can start with
+011 only, and an older app image using that forensic check can start after 012.
+An older strict migration preflight still rejects the additional ledger entry
+and objects; use current migration tooling for inspection. Application startup,
+request and health checks stay scoped to forensic surfaces and never apply DDL.
+The ledger-aware inspector fully verifies 012 only when its ledger entry exists;
+the complete privilege verifier and live verification scripts require the final
+head and will report 012 pending until explicitly applied. No DROP, down
+migration, ledger edit, counter reset or backup restore is a rollback here.
+Credential issuance, tenant provisioning, rotation/revoke execution, audit
+retention binding, provider use, deployment and enablement need separate approvals.
+
+CHECK fingerprints also recognise bounded integer BETWEEN expansion, safe
+integral constant labels, modulo comparison parentheses and associative
+AND/OR grouping with precedence preserved. Changed caps, operators, mixed
+precedence and type-changing arithmetic casts remain significant.

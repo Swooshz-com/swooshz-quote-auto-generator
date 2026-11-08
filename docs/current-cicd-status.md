@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-07
+Last updated: 2026-11-08
 
 Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
 
@@ -15,10 +15,21 @@ The switches
 `SQAG_QUOTE_API_STAFF_TRANSPORT_ENABLED` default off; only exact `true` enables
 their independent admission paths. No CI settings or secrets enable them. Tests
 use synthetic in-memory registry injection and loopback HTTP only. The runtime
-has no registry implementation or v1 work engine; valid admission returns 503,
-never accepted work. No job, trigger, required check, migration, secret requirement
-or deployment behaviour changes. Independent security review and installed-host
+has no default registry composition or v1 work engine; valid admission returns 503,
+never accepted work. No job, trigger, required check, secret requirement
+or deployment behaviour changes. Migration 012 is source only: two registry tables,
+column-only runtime grants and a bounded lookup routine. Full Python discovery
+includes its synthetic SQLite controls; the existing disposable PostgreSQL 17
+job includes migration, ACL and two-worker/CAS integration controls. Real PG
+tests skip on an offline host and must run without required skips in CI. No
+startup apply, seeded key, default tenant, live apply or flag enablement is supplied. Independent security review and installed-host
 qualification are still required before later enablement.
+
+The disposable PostgreSQL 17 privilege-contract suite also qualifies current
+startup, uncached health and request checks with only migrations 001-011 applied,
+then repeats after explicit 012 application and with the old forensic inventory.
+Dedicated admission-function body, dependency and EXECUTE drift must fail.
+No additional job, service, secret or startup migration is introduced.
 
 Full Python discovery includes `tests.test_libreoffice_workbook_values`: actual
 LibreOffice recalculates a disposable cache-cleared workbook, then each priced,

@@ -594,3 +594,33 @@ They do not prove HTTP admission, durable recovery, credentials, tenancy, artifa
 privacy/rendering, retention execution or installed behaviour. Those belong to later
 implementation and independent review. This slice authorises no implementation,
 public exposure, provider calls, database, deployment, credentials or UI changes.
+
+## Persisted admission primitives, disabled
+
+The injected registry now has source-only PostgreSQL and synthetic SQLite
+adapters. Nothing composes them into a default path; both transport flags stay
+off and valid admission still returns 503 before quote work. Lookup is fresh,
+with fixed-byte verifiers and canonical ID/subject/revision/policy validation.
+The immutable context contains neither verifier nor policy body.
+
+Counter transactions lock tenant then caller, recheck exact current authority,
+scope, active state and inclusive expiry, and use the PostgreSQL database clock.
+Fixed UTC buckets cap creates at 15/minute and 100/day, jobs at 2 and caller
+polls at 120/minute. Future/regressing buckets and exhausted revisions fail
+closed; active jobs never reset on bucket rollover or credential changes.
+Writes use revision CAS and a savepoint; an injected audit-stage failure rolls
+back both counter rows even if the outer owner catches the error and commits.
+The trusted audit sink must enlist in that same transaction. No production sink
+or retention policy is selected. No release primitive is exposed without a
+future unique durable terminal transition. Durable receipt/outbox acceptance,
+replay charging, resource ownership resolution and dispatch/publication/delivery
+fences remain enablement blockers. Counters alone cannot supply those guarantees.
+
+Separately approved operator transactions must lock tenant then caller and bind
+the expected revision. Rotation updates only verifier and credential revision;
+revoke atomically sets state/time and increments credential/authority revisions.
+Revoked is terminal in that protocol; repeat revoke is an explicit no-op. Policy,
+scope, expiry or tenant state edits increment the relevant authority revision.
+Bindings, service subject and counters are preserved. Only test fixtures model
+these operator operations; no live provisioning/issuance command is supplied.
+An already dispatched provider operation cannot be undone by registry revocation.
