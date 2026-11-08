@@ -4406,7 +4406,7 @@ eval([
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
   "quoteFxMultiplier", "outputRowFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
   "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
-  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "pricingSelectionReviewMessage", "outputRowsValid", "dashboardCommercialsFromState",
+  "outputPricingIsDeferred", "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "pricingSelectionReviewMessage", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
 
@@ -21159,6 +21159,7 @@ eval(extractFunction("pricingAuthorityNumber"));
 eval(extractFunction("unitPriceEditKind"));
 eval(extractFunction("synchronizeOwnedOutputRowPrice"));
 eval(extractFunction("pricingSelectionReviewMessage"));
+eval(extractFunction("outputPricingIsDeferred"));
 eval(extractFunction("outputRowsValid"));
 eval(extractFunction("outputQuantityPartsFromPricingMatch"));
 eval(extractFunction("outputRowFromPricingMatch"));
@@ -25246,7 +25247,12 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn('<strong class="basis-line-pill">AI Confirm</strong>', js)
         self.assertIn("AI proposal needs acceptance or revision", js)
         self.assertNotIn('<strong class="basis-quantity-pill">36 sqm</strong>', js)
-        self.assertNotIn("Matched", js)
+        basis_renderer = js[js.index("function renderQuoteBasisMessage("):]
+        basis_renderer = basis_renderer[:basis_renderer.index("\nfunction ")]
+        self.assertIn('${["Matched", "Review", "Unmatched"].map((group) =>', basis_renderer)
+        self.assertIn('class="basis-review-grid" aria-label="${group}"', basis_renderer)
+        self.assertIn('<h4>${group}</h4>', basis_renderer)
+        self.assertIn('reviewLineEntries.filter((entry) => entry.group === group)', basis_renderer)
         self.assertNotIn("Assumption", js)
         self.assertIn(">Re<", js)
         self.assertNotIn('appendChatMessage("assistant", renderQuoteBasisMessage(state.quoteBasis, data.source)', js)
@@ -25838,6 +25844,7 @@ eval([
   "resetOutputSortModeToPricingReference",
   "refreshOutputRowsFromLineItems",
   "ensureOutputRowsFromLineItems",
+  "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
 ].map(extractFunction).join("\n"));
@@ -26341,6 +26348,7 @@ eval([
   "quoteAmountValue",
   "recalculateOutputRow",
   "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
+  "outputPricingIsDeferred",
   "outputEditorPlaceholder",
   "outputEditorHtml",
   "renderOutputEditCell",
@@ -26555,6 +26563,7 @@ eval([
   "cleanCustomerQuoteLineText",
   "pricingReferenceLineText",
   "orderNumber",
+  "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
   "setDownloadFiles",
@@ -30986,6 +30995,13 @@ function basisLineIsInformationalDimension() { return false; }
 
 eval([
   "normalizeAnalysisMode",
+  "normalizeBasisTag",
+  "normalizeUnit",
+  "numberOrNull",
+  "cleanCustomerQuoteLineText",
+  "basisPricingRow",
+  "basisUnmatchedOffer",
+  "basisPricingGroup",
   "renderQuoteBasisMessage",
 ].map(extractFunction).join("\n"));
 
@@ -31159,6 +31175,9 @@ eval([
   "basisTagLabel",
   "hasPricingReferenceDescription",
   "basisLineAcceptsAsAiProposal",
+  "basisPricingRow",
+  "basisUnmatchedOffer",
+  "basisPricingGroup",
             "basisLinePillLabel",
             "basisQuantityText",
             "basisQuantityDisplayLabel",
@@ -31286,7 +31305,7 @@ assert.ok(!inventedKeywordLineHtml.includes("Pricing reference: printed brand fa
 assert.ok(inventedKeywordLineHtml.includes('<span class="basis-line-pill">Confirm</span>'));
 assert.ok(!inventedKeywordLineHtml.includes("basis-line-ai-confirm"));
 assert.ok(inventedKeywordLineHtml.includes('data-basis-tag="Include"'));
-assert.ok(inventedKeywordLineHtml.includes('<span class="basis-line-text">printed brand fascia graphics with BRASIL artwork</span>'));
+assert.match(inventedKeywordLineHtml, /<span class="basis-line-text">\s*printed brand fascia graphics with BRASIL artwork\s*<\/span>/);
 assert.strictEqual(isCustomPricingBasisLine({ tag: "Exclude", custom_pricing: true }), true);
 assert.strictEqual(basisLineAcceptsAsAiProposal({ tag: "Confirm", text: "invented graphic panel" }), false);
 assert.strictEqual(basisLineAcceptsAsAiProposal({ tag: "Confirm", text: "catalog-backed", pricing_reference_description: "sqm vinyl graphics" }), false);
@@ -31316,13 +31335,13 @@ state.quoteBasisSections = [{ id: "default-dimensions", title: "Floor Design", l
 const defaultNoteHtml = renderQuoteBasisMessage(state.quoteBasis, "edited");
 const boothDetails = defaultNoteHtml.match(/<div class="basis-visual-display"[\s\S]*?<\/div>/)?.[0] || "";
 const displayedNote = defaultNote.replace(/^Confirm: /, "");
-assert.ok(boothDetails.includes("Booth Details"), "Default note lost Booth Details");
-assert.strictEqual(boothDetails.split(displayedNote).length - 1, 1, "Default note missing from Booth Details");
+assert.ok(boothDetails.includes("<strong>Detected booth</strong>"), "Default note lost the Detected booth heading");
+assert.strictEqual(boothDetails.split(displayedNote).length - 1, 1, "Default note missing from Detected booth");
 assert.strictEqual(defaultNoteHtml.split(displayedNote).length - 1, 1, "Default note duplicated as review row");
 assert.ok(!defaultNoteHtml.includes('data-basis-line-index="0"'), "Default note became an editable review row");
 assert.ok(defaultNoteHtml.includes('data-basis-line-index="1"'), "Ordinary scope lost its review row");
 assert.ok(defaultNoteHtml.includes("sqm needle punch carpet in colour"));
-assert.ok(!boothDetails.includes("sqm needle punch carpet in colour"), "Ordinary scope leaked into Booth Details");
+assert.ok(!boothDetails.includes("sqm needle punch carpet in colour"), "Ordinary scope leaked into Detected booth");
 state.quoteBasisSections = [{
   id: "floor-design",
   title: "Floor Design",
@@ -32647,6 +32666,7 @@ eval([
   "renderOutputEditCell",
   "renderOutputPriceCells", "renderPricingMatches",
   "snapshotOutputRows",
+  "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
   "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
@@ -32860,6 +32880,7 @@ eval([
   "outputCatalogDescription",
   "outputRowFromLineItem",
   "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
+  "outputPricingIsDeferred",
   "pricingSelectionReviewMessage", "outputRowsValid",
   "rowNeedsManualInput",
   "matchSummaryStats",

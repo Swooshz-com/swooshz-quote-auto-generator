@@ -33,7 +33,7 @@ def browser_request_line_items(rows):
     source = (ROOT / "webapp/static/app.js").read_text(encoding="utf-8")
     functions = []
     for name in ("normalizeUnit", "cleanCustomerQuoteLineText", "pricingReferenceLineText",
-                 "numberOrNull", "orderNumber", "outputRowsToLineItems"):
+                 "numberOrNull", "orderNumber", "outputPricingIsDeferred", "outputRowsToLineItems"):
         start = source.index("function " + name + "(")
         end = source.index("\nfunction ", start + 1)
         functions.append(source[start:end])
