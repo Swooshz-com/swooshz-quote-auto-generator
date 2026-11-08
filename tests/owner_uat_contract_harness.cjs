@@ -59,6 +59,7 @@ function filteredDashboardSessions(){return state.dashboardSearch?[]:state.quote
 function pagedDashboardSessions(v){return v;}
 function dashboardPageRange(n){return {start:n?1:0,end:n};}
 function dashboardDateFilterSummaryText(){return '';}
+for (const name of ['normalizeBasisTag', 'retainExcludedBasisPricingRows']) eval(extract(name));
 for (const name of ['normalizeUnit','numberOrNull','formatAmount','pricingAuthorityPrice','pricingAuthorityNumber','unitPriceEditKind','roundCommercialCents','quoteFxMultiplier','quoteAmountValue','effectiveOutputUnitPrice','synchronizeOwnedOutputRowPrice','recalculateOutputRow','outputPriceAuthority','outputPriceDenomination','admittedOutputPrice','revokeOutputEditor','resumeBlockedOutputDraftSave','preserveOutputRowIdentity','outputRowIdentity','outputPricingIsDeferred','outputCellDisplayValue','outputEditorPlaceholder','outputEditorHtml','commitOutputEditor','applyPossiblePricingMatch','safeQuoteSessionId','quoteAiSpendText','renderQuoteAiSpend','renderQuoteDashboard']) eval(extract(name));
 if(source.includes('function outputRowFxMultiplier('))eval(extract('outputRowFxMultiplier'));
 if (input.mode==='reopen') {

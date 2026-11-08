@@ -118,7 +118,11 @@ async function run(test = {}) {
     c.logClientEvent=()=>{};
     vm.runInContext(extract('jsonFromResponse')+'\n'+extract('postJson'),c);
   }
-  vm.runInContext(extract('applyOutputReferencePricing'),c);
+  vm.runInContext([
+    'normalizeBasisTag',
+    'retainExcludedBasisPricingRows',
+    'applyOutputReferencePricing',
+  ].map(extract).join('\n'),c);
   const result=await c.applyOutputReferencePricing(button);
   const requests=calls.filter(value=>typeof value==='object'&&value.url==='/api/quote-sessions/pricing-selections');
   const shouldSelect=!test.noReference&&!test.noEditor&&!test.detached&&!test.duplicate&&!test.saveFailure&&test.changeAt!=='save'&&test.changeAt!=='request'&&!test.existingGrant&&!test.normalizeFailure&&!test.badNormalization&&!test.throwRequest;
