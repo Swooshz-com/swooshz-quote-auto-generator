@@ -10554,10 +10554,10 @@ def payload_with_workspace_quote_profile_defaults(payload: dict[str, Any]) -> di
     return payload_with_profile_defaults(payload, profile)
 
 
-def quote_acceptance_date_label(quote_text: dict[str, Any]) -> Any:
+def quote_acceptance_date_label_supplied(quote_text: dict[str, Any]) -> bool:
     acceptance = quote_text.get("acceptance")
     nested_label = acceptance.get("date_label") if isinstance(acceptance, dict) else None
-    return nested_label if nested_label is not None else quote_text.get("date_label")
+    return nested_label is not None or quote_text.get("date_label") is not None
 
 
 def payload_with_profile_defaults(payload: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
@@ -10565,7 +10565,7 @@ def payload_with_profile_defaults(payload: dict[str, Any], profile: dict[str, An
     defaults = profile.get("defaults") if isinstance(profile.get("defaults"), dict) else {}
     quote_text = payload.get("quote_text") if isinstance(payload.get("quote_text"), dict) else {}
     signature = payload.get("signature") if isinstance(payload.get("signature"), dict) else {}
-    acceptance_date_supplied = quote_acceptance_date_label(quote_text) is not None
+    acceptance_date_supplied = quote_acceptance_date_label_supplied(quote_text)
     company_date_supplied = signature.get("company_date_label") is not None
     # Supplied date labels (including blanks) own their text and formatting.
     # Exclude both acceptance aliases so profile defaults cannot shadow either one.
@@ -21125,7 +21125,7 @@ def payload_to_brief(
             "text": paragraph_text(acceptance.get("text") or quote_text.get("acceptance_text")),
             "person_label": paragraph_text(acceptance.get("person_label") or quote_text.get("person_label")),
             "stamp_label": paragraph_text(acceptance.get("stamp_label") or quote_text.get("stamp_label")),
-            "date_label": paragraph_text(quote_acceptance_date_label(quote_text)),
+            "date_label": paragraph_text(acceptance.get("date_label") or quote_text.get("date_label")),
         },
         "signature": {
             "company_signatory": paragraph_text(signature.get("company_signatory")),

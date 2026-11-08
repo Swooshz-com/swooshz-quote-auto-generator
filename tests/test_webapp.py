@@ -2144,6 +2144,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(brief["tax"], {"label": "GST", "rate": 0.09})
 
     def test_recovered_quote_commercial_snapshot_owns_brief_session_and_prices(self):
+        from tests.test_generate_quote import cell_value, find_cell_ref, generate_layout_workbook
+
         payload = valid_payload()
         reference_source = "local"
         saved_details = {
@@ -2181,6 +2183,7 @@ class WebappServerTest(unittest.TestCase):
                 "acceptance_text": "Saved acceptance",
                 "person_label": "Saved person",
                 "stamp_label": "Saved stamp",
+                "acceptance": {"date_label": ""},
                 "date_label": "Saved date:",
                 "cheque_payee": "Saved Quotation Co Pte Ltd",
             },
@@ -2251,7 +2254,8 @@ class WebappServerTest(unittest.TestCase):
         payload["quote_exchange_rate"] = 9
         payload["quote_tax"] = {"label": "VAT", "rate": 0.07}
         payload["company"] = {"name": "Current Profile Co", "header_details": "Current header"}
-        payload["quote_text"] = {"terms_heading": "Current Terms", "acceptance_text": "Current acceptance"}
+        payload["quote_text"] = {"terms_heading": "Current Terms", "acceptance_text": "Current acceptance",
+                                 "date_label": "Current date:"}
         payload["signature"] = {"company_signatory": "Current Signatory"}
         payload["rich_text"] = {"headerDetails": "<div>Current header</div>"}
         payload["pricing_reference"] = {
@@ -2283,7 +2287,8 @@ class WebappServerTest(unittest.TestCase):
             "pricing_catalog_runtime_lookup_for_payload",
             side_effect=AssertionError("recovered quote must not consult the current catalog"),
         ):
-            brief = webapp.payload_to_brief(payload)
+            resolved = webapp.generation_payload_with_profile_defaults(payload)
+            brief = webapp.payload_to_brief(resolved)
             commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
 
         self.assertEqual(brief["currency"], "USD")
@@ -2313,6 +2318,13 @@ class WebappServerTest(unittest.TestCase):
             "grand_total": 298.66,
         })
         self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+        tmp_workbook, path = generate_layout_workbook(brief)
+        with tmp_workbook, zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        stamp_ref = find_cell_ref(sheet, "Saved stamp")
+        self.assertTrue(stamp_ref)
+        self.assertEqual(cell_value(sheet, f"E{int(stamp_ref[1:]) + 1}"), "Saved date:")
 
         saved_details["commercial_snapshot"]["lifecycle"] = "EXISTING"
         saved_details["commercial_snapshot"]["origin"] = "captured"
@@ -40434,7 +40446,9 @@ main().catch((error) => {
 
         cases = (
             ("flat cleared", {"date_label": ""}, "", {"dateLabel": "", "companyDateLabel": ""}, ("", ""), ()),
-            ("nested cleared", {"acceptance": {"date_label": ""}, "date_label": "Stale alias"}, "", {}, ("", ""), ()),
+            ("nested cleared", {"acceptance": {"date_label": ""}}, "", {}, ("", ""), ()),
+            ("legacy flat fallback", {"acceptance": {"date_label": ""}, "date_label": "Quote flat date"},
+             "", {}, ("", "Quote flat date"), ()),
             ("omitted", {}, None, {}, ("Profile company date", "Profile acceptance date"), ("B", "E")),
             ("only company cleared", {}, "", {}, ("", "Profile acceptance date"), ("E",)),
             ("only acceptance cleared", {"date_label": ""}, None, {}, ("Profile company date", ""), ("B",)),
@@ -40445,22 +40459,27 @@ main().catch((error) => {
                                      "companyDateLabel": "<strong>Quote company date</strong>"},
              ("Quote company date", "Quote acceptance date"), ("B", "E")),
         )
-        for mode, profile_nested in itertools.product(("local", "database"), (False, True)):
-            with self.subTest(mode=mode, profile_nested=profile_nested), tempfile.TemporaryDirectory() as tmp:
+        profile_labels = {
+            "flat": {"date_label": "Profile acceptance date"},
+            "nested": {"acceptance": {"date_label": "Profile acceptance date"}, "date_label": "Profile flat alias"},
+            "legacy mixed": {"acceptance": {"date_label": ""}, "date_label": "Profile acceptance date"},
+        }
+        for mode, aliases in itertools.product(("local", "database"), profile_labels):
+            with self.subTest(mode=mode, aliases=aliases), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 database_url = f"sqlite:///{(root / 'profiles.sqlite3').as_posix()}"
-                profile_acceptance = {"date_label": "Profile acceptance date"}
+                profile_rich = {"companyDateLabel": "<strong>Profile company date</strong>"}
+                if aliases != "legacy mixed":
+                    profile_rich["dateLabel"] = "<em>Profile acceptance date</em>"
                 profile = webapp.normalize_profile_payload({
                     "id": "synthetic-date-profile",
                     "defaults": {
                         "quote_text": {
                             "stamp_label": "Profile stamp",
-                            **({"acceptance": profile_acceptance, "date_label": "Profile flat alias"}
-                               if profile_nested else profile_acceptance),
+                            **profile_labels[aliases],
                         },
                         "signature": {"company_date_label": "Profile company date"},
-                        "rich_text": {"dateLabel": "<em>Profile acceptance date</em>",
-                                      "companyDateLabel": "<strong>Profile company date</strong>"},
+                        "rich_text": profile_rich,
                     },
                 })
                 store = webapp.CompanyConfigStore(root / "data")
@@ -40494,16 +40513,16 @@ main().catch((error) => {
                             tmp_workbook, path = generate_layout_workbook(brief)
                             with tmp_workbook, zipfile.ZipFile(path) as archive:
                                 sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
-                            self.assertEqual((brief["signature"]["company_date_label"], brief["acceptance"]["date_label"]), expected)
                             stamp_ref = find_cell_ref(sheet, "Profile stamp")
                             self.assertTrue(stamp_ref)
                             date_row = int(stamp_ref[1:]) + 1
                             for column, label, emphasis in zip(("B", "E"), expected, ("b", "i")):
                                 ref = f"{column}{date_row}"
                                 self.assertEqual(cell_value(sheet, ref), label)
-                                if column in formatted_columns:
+                                if column in formatted_columns and (column == "B" or "dateLabel" in (rich or profile_rich)):
                                     cell = sheet.find(f".//{NS_MAIN}c[@r='{ref}']")
                                     self.assertIsNotNone(cell.find(f".//{NS_MAIN}rPr/{NS_MAIN}{emphasis}"))
+                            self.assertEqual((brief["signature"]["company_date_label"], brief["acceptance"]["date_label"]), expected)
 
     def test_run_quote_job_uses_explicit_profile_and_local_pricing_reference_roots(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
