@@ -25301,7 +25301,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn("quoteBasisSections", js)
         self.assertIn("normalizeQuoteBasisSections", js)
         self.assertIn("quote_basis_sections", js)
-        self.assertNotIn("Matched", js)
+        self.assertIn('${["Matched", "Review", "Unmatched"].map((group) =>', js)
         self.assertNotIn("Assumption", js)
         self.assertIn("Resolve all review lines before confirming quotation basis.", js)
         self.assertNotIn("Ask For Changes", html)
