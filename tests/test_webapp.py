@@ -2068,6 +2068,43 @@ class WebappServerTest(unittest.TestCase):
         self.assertTrue(any("Header logo" in error for error in errors))
         self.assertTrue(any("Header details" in error for error in errors))
 
+    def test_company_date_labels_are_optional_and_preserved_in_export_mapping(self):
+        for company_label, acceptance_label in (
+            ("", ""),
+            ("", "Accepted on:"),
+            ("Issued on:", ""),
+            ("Issued on:", "Accepted on:"),
+        ):
+            with self.subTest(company_label=company_label, acceptance_label=acceptance_label):
+                payload = valid_payload()
+                payload["signature"]["company_date_label"] = company_label
+                payload["quote_text"]["date_label"] = acceptance_label
+                rich_labels = {
+                    "companyDateLabel": f"<div><strong>{company_label}</strong></div>" if company_label else "",
+                    "dateLabel": f"<div><em>{acceptance_label}</em></div>" if acceptance_label else "",
+                }
+                payload["rich_text"].update(rich_labels)
+
+                self.assertEqual(webapp.validate_generation_payload(payload), [])
+                brief = webapp.payload_to_brief(payload)
+                self.assertEqual(brief["signature"]["company_date_label"], company_label)
+                self.assertEqual(brief["acceptance"]["date_label"], acceptance_label)
+                for field, html in rich_labels.items():
+                    self.assertEqual(brief["rich_text"].get(field, ""), html)
+
+        payload = valid_payload()
+        payload["signature"]["company_date_label"] = ""
+        payload["quote_text"]["date_label"] = ""
+        payload["signature"]["company_signatory"] = ""
+        payload["quote_date"] = ""
+        self.assertEqual(
+            webapp.validate_generation_payload(payload),
+            [
+                "Fill quote details before generating: Quote date, Company signatory.",
+                "Quote date is required.",
+            ],
+        )
+
     def test_payload_to_brief_maps_confirmed_form_fields(self):
         brief = webapp.payload_to_brief(valid_payload())
 
@@ -2107,6 +2144,8 @@ class WebappServerTest(unittest.TestCase):
         self.assertEqual(brief["tax"], {"label": "GST", "rate": 0.09})
 
     def test_recovered_quote_commercial_snapshot_owns_brief_session_and_prices(self):
+        from tests.test_generate_quote import cell_value, find_cell_ref, generate_layout_workbook
+
         payload = valid_payload()
         reference_source = "local"
         saved_details = {
@@ -2144,6 +2183,7 @@ class WebappServerTest(unittest.TestCase):
                 "acceptance_text": "Saved acceptance",
                 "person_label": "Saved person",
                 "stamp_label": "Saved stamp",
+                "acceptance": {"date_label": ""},
                 "date_label": "Saved date:",
                 "cheque_payee": "Saved Quotation Co Pte Ltd",
             },
@@ -2214,7 +2254,8 @@ class WebappServerTest(unittest.TestCase):
         payload["quote_exchange_rate"] = 9
         payload["quote_tax"] = {"label": "VAT", "rate": 0.07}
         payload["company"] = {"name": "Current Profile Co", "header_details": "Current header"}
-        payload["quote_text"] = {"terms_heading": "Current Terms", "acceptance_text": "Current acceptance"}
+        payload["quote_text"] = {"terms_heading": "Current Terms", "acceptance_text": "Current acceptance",
+                                 "date_label": "Current date:"}
         payload["signature"] = {"company_signatory": "Current Signatory"}
         payload["rich_text"] = {"headerDetails": "<div>Current header</div>"}
         payload["pricing_reference"] = {
@@ -2246,7 +2287,8 @@ class WebappServerTest(unittest.TestCase):
             "pricing_catalog_runtime_lookup_for_payload",
             side_effect=AssertionError("recovered quote must not consult the current catalog"),
         ):
-            brief = webapp.payload_to_brief(payload)
+            resolved = webapp.generation_payload_with_profile_defaults(payload)
+            brief = webapp.payload_to_brief(resolved)
             commercials = webapp.quote_session_commercials(payload, payload["quote_session"])
 
         self.assertEqual(brief["currency"], "USD")
@@ -2276,6 +2318,13 @@ class WebappServerTest(unittest.TestCase):
             "grand_total": 298.66,
         })
         self.assertEqual(webapp.validate_generation_payload(payload), [])
+
+        tmp_workbook, path = generate_layout_workbook(brief)
+        with tmp_workbook, zipfile.ZipFile(path) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        stamp_ref = find_cell_ref(sheet, "Saved stamp")
+        self.assertTrue(stamp_ref)
+        self.assertEqual(cell_value(sheet, f"E{int(stamp_ref[1:]) + 1}"), "Saved date:")
 
         saved_details["commercial_snapshot"]["lifecycle"] = "EXISTING"
         saved_details["commercial_snapshot"]["origin"] = "captured"
@@ -20592,6 +20641,16 @@ assert.strictEqual(hasReferenceFilesForNavigation(), true);
 assert.strictEqual(hasReferenceFilesForAnalysis(), false);
 state.images = [{ name: "render.jpg", type: "image/jpeg", size: 12, data_url: "data:image/jpeg;base64,ZmFrZQ==" }];
 assert.strictEqual(startAnalysisBlockReason(), "");
+elements.companyDateLabel.value = "";
+assert.strictEqual(startAnalysisBlockReason(), "");
+elements.dateLabel.value = "";
+assert.strictEqual(startAnalysisBlockReason(), "");
+elements.companyDateLabel.value = "Date:";
+assert.strictEqual(startAnalysisBlockReason(), "");
+elements.companyDateLabel.value = "";
+elements.quoteDate.value = "";
+assert.strictEqual(startAnalysisBlockReason(), "Complete Customer details before starting analysis: Quote date.");
+elements.quoteDate.value = "2026-06-08";
 elements.notesHeading.value = "";
 assert.strictEqual(startAnalysisBlockReason(), "");
 elements.acceptanceText.value = "";
@@ -40381,6 +40440,89 @@ main().catch((error) => {
         self.assertIsNone(runtime_profile)
         self.assertEqual(resolved_payload["company"]["name"], "")
         self.assertNotIn("logo_data_url", resolved_payload["company"])
+
+    def test_generation_profile_defaults_preserve_optional_date_labels_in_xlsx(self):
+        from tests.test_generate_quote import NS_MAIN, cell_value, find_cell_ref, generate_layout_workbook
+
+        cases = (
+            ("flat cleared", {"date_label": ""}, "", {"dateLabel": "", "companyDateLabel": ""}, ("", ""), ()),
+            ("nested cleared", {"acceptance": {"date_label": ""}}, "", {}, ("", ""), ()),
+            ("legacy flat fallback", {"acceptance": {"date_label": ""}, "date_label": "Quote flat date"},
+             "", {}, ("", "Quote flat date"), ()),
+            ("omitted", {}, None, {}, ("Profile company date", "Profile acceptance date"), ("B", "E")),
+            ("only company cleared", {}, "", {}, ("", "Profile acceptance date"), ("E",)),
+            ("only acceptance cleared", {"date_label": ""}, None, {}, ("Profile company date", ""), ("B",)),
+            ("plain supplied", {"date_label": "Quote acceptance date"}, "Quote company date", {},
+             ("Quote company date", "Quote acceptance date"), ()),
+            ("rich supplied", {"acceptance": {"date_label": "Quote acceptance date"}, "date_label": "Stale alias"},
+             "Quote company date", {"dateLabel": "<em>Quote acceptance date</em>",
+                                     "companyDateLabel": "<strong>Quote company date</strong>"},
+             ("Quote company date", "Quote acceptance date"), ("B", "E")),
+        )
+        profile_labels = {
+            "flat": {"date_label": "Profile acceptance date"},
+            "nested": {"acceptance": {"date_label": "Profile acceptance date"}, "date_label": "Profile flat alias"},
+            "legacy mixed": {"acceptance": {"date_label": ""}, "date_label": "Profile acceptance date"},
+        }
+        for mode, aliases in itertools.product(("local", "database"), profile_labels):
+            with self.subTest(mode=mode, aliases=aliases), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                database_url = f"sqlite:///{(root / 'profiles.sqlite3').as_posix()}"
+                profile_rich = {"companyDateLabel": "<strong>Profile company date</strong>"}
+                if aliases != "legacy mixed":
+                    profile_rich["dateLabel"] = "<em>Profile acceptance date</em>"
+                profile = webapp.normalize_profile_payload({
+                    "id": "synthetic-date-profile",
+                    "defaults": {
+                        "quote_text": {
+                            "stamp_label": "Profile stamp",
+                            **profile_labels[aliases],
+                        },
+                        "signature": {"company_date_label": "Profile company date"},
+                        "rich_text": profile_rich,
+                    },
+                })
+                store = webapp.CompanyConfigStore(root / "data")
+                auth_session = None
+                with (
+                    mock.patch.dict(os.environ, isolated_env(SQAG_STORAGE_MODE=mode, SQAG_DATABASE_URL=database_url), clear=True),
+                    mock.patch.object(webapp, "company_config_store", return_value=store),
+                ):
+                    if mode == "database":
+                        auth_session = self.platform_auth_session("synthetic-date-workspace")
+                        webapp.apply_sqag_storage_migrations(database_url)
+                        storage = webapp.app_storage_for_auth_session(auth_session)
+                        storage.save_profile(profile)
+                        storage.save_pricing_reference(workspace_pricing_reference())
+                    else:
+                        store.save_profile(webapp.DEFAULT_COMPANY_ID, profile)
+
+                    for case, acceptance, company_date, rich, expected, formatted_columns in cases:
+                        with self.subTest(case=case):
+                            payload = payload_with_workspace_pricing() if mode == "database" else valid_payload()
+                            payload["profile_id"] = profile["id"]
+                            payload["quote_text"].pop("date_label")
+                            payload["quote_text"].update(stamp_label="", **acceptance)
+                            payload["signature"].pop("company_date_label")
+                            if company_date is not None:
+                                payload["signature"]["company_date_label"] = company_date
+                            payload["rich_text"] = rich
+
+                            resolved = webapp.generation_payload_with_profile_defaults(payload, auth_session=auth_session)
+                            brief = webapp.payload_to_brief(resolved, auth_session=auth_session)
+                            tmp_workbook, path = generate_layout_workbook(brief)
+                            with tmp_workbook, zipfile.ZipFile(path) as archive:
+                                sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                            stamp_ref = find_cell_ref(sheet, "Profile stamp")
+                            self.assertTrue(stamp_ref)
+                            date_row = int(stamp_ref[1:]) + 1
+                            for column, label, emphasis in zip(("B", "E"), expected, ("b", "i")):
+                                ref = f"{column}{date_row}"
+                                self.assertEqual(cell_value(sheet, ref), label)
+                                if column in formatted_columns and (column == "B" or "dateLabel" in (rich or profile_rich)):
+                                    cell = sheet.find(f".//{NS_MAIN}c[@r='{ref}']")
+                                    self.assertIsNotNone(cell.find(f".//{NS_MAIN}rPr/{NS_MAIN}{emphasis}"))
+                            self.assertEqual((brief["signature"]["company_date_label"], brief["acceptance"]["date_label"]), expected)
 
     def test_run_quote_job_uses_explicit_profile_and_local_pricing_reference_roots(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:

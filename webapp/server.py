@@ -10548,32 +10548,46 @@ def fill_missing_profile_defaults(target: dict[str, Any], defaults: dict[str, An
 
 
 def payload_with_workspace_quote_profile_defaults(payload: dict[str, Any]) -> dict[str, Any]:
-    resolved = copy.deepcopy(payload)
     profile = workspace_quote_company_profile()
-    if not profile:
-        return resolved
-    if profile.get("source") != "company-store":
-        return resolved
-    defaults = profile.get("defaults") if isinstance(profile.get("defaults"), dict) else {}
-    for section in ("tax", "company", "quote_text", "signature", "rich_text"):
-        section_defaults = defaults.get(section)
-        if not isinstance(section_defaults, dict):
-            continue
-        existing = resolved.get(section)
-        if isinstance(existing, dict):
-            fill_missing_profile_defaults(existing, section_defaults)
-        elif not profile_default_value_present(existing):
-            resolved[section] = copy.deepcopy(section_defaults)
-    return resolved
+    if not profile or profile.get("source") != "company-store":
+        return copy.deepcopy(payload)
+    return payload_with_profile_defaults(payload, profile)
+
+
+def quote_acceptance_date_label_supplied(quote_text: dict[str, Any]) -> bool:
+    acceptance = quote_text.get("acceptance")
+    nested_label = acceptance.get("date_label") if isinstance(acceptance, dict) else None
+    return nested_label is not None or quote_text.get("date_label") is not None
 
 
 def payload_with_profile_defaults(payload: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     resolved = copy.deepcopy(payload)
     defaults = profile.get("defaults") if isinstance(profile.get("defaults"), dict) else {}
+    quote_text = payload.get("quote_text") if isinstance(payload.get("quote_text"), dict) else {}
+    signature = payload.get("signature") if isinstance(payload.get("signature"), dict) else {}
+    acceptance_date_supplied = quote_acceptance_date_label_supplied(quote_text)
+    company_date_supplied = signature.get("company_date_label") is not None
+    # Supplied date labels (including blanks) own their text and formatting.
+    # Exclude both acceptance aliases so profile defaults cannot shadow either one.
     for section in ("tax", "company", "quote_text", "signature", "rich_text"):
         section_defaults = defaults.get(section)
         if not isinstance(section_defaults, dict):
             continue
+        if section == "quote_text" and acceptance_date_supplied:
+            section_defaults = section_defaults.copy()
+            section_defaults.pop("date_label", None)
+            acceptance_defaults = section_defaults.get("acceptance")
+            if isinstance(acceptance_defaults, dict):
+                section_defaults["acceptance"] = {key: value for key, value in acceptance_defaults.items() if key != "date_label"}
+        elif section == "signature" and company_date_supplied:
+            section_defaults = section_defaults.copy()
+            section_defaults.pop("company_date_label", None)
+        elif section == "rich_text":
+            section_defaults = section_defaults.copy()
+            if acceptance_date_supplied:
+                section_defaults.pop("dateLabel", None)
+            if company_date_supplied:
+                section_defaults.pop("companyDateLabel", None)
         existing = resolved.get(section)
         if isinstance(existing, dict):
             fill_missing_profile_defaults(existing, section_defaults)
@@ -20933,10 +20947,8 @@ def quote_detail_missing_fields(payload: dict[str, Any]) -> list[str]:
         ("Acceptance text", bool(clean_text(acceptance.get("text") or quote_text.get("acceptance_text")))),
         ("Company signatory", bool(clean_text(signature.get("company_signatory")))),
         ("Signatory title", bool(clean_text(signature.get("company_title")))),
-        ("Company date label", bool(clean_text(signature.get("company_date_label")))),
         ("Person label", bool(clean_text(acceptance.get("person_label") or quote_text.get("person_label")))),
         ("Stamp label", bool(clean_text(acceptance.get("stamp_label") or quote_text.get("stamp_label")))),
-        ("Date label", bool(clean_text(acceptance.get("date_label") or quote_text.get("date_label")))),
     ]
     missing = [label for label, present in checks if not present]
     return missing

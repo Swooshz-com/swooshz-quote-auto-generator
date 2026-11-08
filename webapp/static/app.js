@@ -13149,10 +13149,8 @@ function missingQuoteCompanyFields() {
   if (!elements.acceptanceText.value.trim()) missing.push("Acceptance text");
   if (!elements.companySignatory.value.trim()) missing.push("Company signatory");
   if (!elements.companyTitle.value.trim()) missing.push("Signatory title");
-  if (!elements.companyDateLabel.value.trim()) missing.push("Company date label");
   if (!elements.personLabel.value.trim()) missing.push("Person label");
   if (!elements.stampLabel.value.trim()) missing.push("Stamp label");
-  if (!elements.dateLabel.value.trim()) missing.push("Date label");
   return missing;
 }
 
