@@ -26352,7 +26352,7 @@ eval([
   "outputEditorPlaceholder",
   "outputEditorHtml",
   "renderOutputEditCell",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
   "appIsBusy", "applyOutputIncludedAction",
   "handleOutputEditorCommit",
 ].map(extractFunction).join("\n"));
@@ -26572,7 +26572,7 @@ eval([
   "downloadFileIsFresh",
   "pdfFileIsFresh",
   "updateDownloadButton",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
   "hideOutputDeleteModal",
   "confirmOutputRowDelete",
 ].map(extractFunction).join("\n"));
@@ -28923,7 +28923,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
-  "quoteSessionDraftSynchronizationFailureMessage", "handleDraftBasis", "handleGenerate",
+  "quoteSessionDraftSynchronizationFailureMessage", "handleDraftBasis", "handleGenerate", "retainExcludedBasisPricingRows",
   "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
@@ -32669,7 +32669,7 @@ eval([
   "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
 ].map(extractFunction).join("\n"));
 
 function selectedPricingReferenceCurrency() { return "SGD"; }
@@ -33011,7 +33011,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertIn("await saveQuoteSessionDraftState({ quoteGenerated: false });", missing_branch)
         self.assertIn("showBlockedBasisAction(", missing_branch)
         self.assertIn("state.outputRows = snapshotOutputRows(state.originalOutputRows);", reset_body)
-        self.assertIn("state.lineItems = outputRowsToLineItems();", reset_body)
+        self.assertIn("state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());", reset_body)
         self.assertNotIn("refreshLineItemsFromServer", reset_body)
         self.assertNotIn("refreshOutputRowsFromLineItems", reset_body)
 

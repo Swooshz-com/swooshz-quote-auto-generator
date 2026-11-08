@@ -15813,7 +15813,10 @@ class DatabaseSqagStorage:
         metadata["customer_summary"] = quote_session_customer_summary(payload, patch)
         metadata["quote_company_profile"] = quote_session_profile_summary(payload, patch)
         metadata["pricing_reference"] = quote_session_pricing_reference_summary(payload, patch)
-        metadata["commercials"] = quote_session_commercials(payload, patch, reference_reader=self.pricing_reference_detail)
+        metadata["commercials"] = quote_session_commercials(
+            payload, patch, reference_reader=self.pricing_reference_detail,
+            storage_scope=pricing_ledger_scope_for_storage(self),
+        )
         if isinstance(patch.get("draft_state"), dict):
             metadata["draft_state"] = quote_session_draft_state(patch)
             apply_pricing_ledger_save(metadata, existing, self)
@@ -16190,7 +16193,10 @@ class DatabaseSqagStorage:
             metadata["pricing_reference"] = (
                 quote_session_pricing_reference_summary(payload, patch)
             )
-            metadata["commercials"] = quote_session_commercials(payload, patch, reference_reader=self.pricing_reference_detail)
+            metadata["commercials"] = quote_session_commercials(
+                payload, patch, reference_reader=self.pricing_reference_detail,
+                storage_scope=pricing_ledger_scope_for_storage(self),
+            )
             status_patch = (
                 patch.get("status")
                 if isinstance(patch.get("status"), dict)
@@ -16485,7 +16491,10 @@ class DatabaseSqagStorage:
         metadata["customer_summary"] = quote_session_customer_summary(payload, patch)
         metadata["quote_company_profile"] = quote_session_profile_summary(payload, patch)
         metadata["pricing_reference"] = quote_session_pricing_reference_summary(payload, patch)
-        metadata["commercials"] = quote_session_commercials(payload, patch, reference_reader=self.pricing_reference_detail)
+        metadata["commercials"] = quote_session_commercials(
+            payload, patch, reference_reader=self.pricing_reference_detail,
+            storage_scope=pricing_ledger_scope_for_storage(self),
+        )
         status_patch = patch.get("status") if isinstance(patch.get("status"), dict) else {}
         if isinstance(status_patch.get("quote_generated"), bool):
             metadata["status"]["quote_generated"] = status_patch["quote_generated"]
@@ -24260,6 +24269,7 @@ def line_items_aligned_to_quote_basis(
 PRICING_LEDGER_SCHEMA = "swooshz.sqag.pricing-ledger.v1"
 PRICING_ANALYSIS_SEAL_SCHEMA = "swooshz.sqag.pricing-analysis-seal.v1"
 PRICING_ANALYSIS_SEAL_PREFIX = b"sqag-pricing-analysis-seal-v1\0"
+PRICING_DEFERRAL_RECEIPT_PREFIX = b"sqag-pricing-deferral-receipt-v1\0"
 PRICING_ANALYSIS_SEAL_MAC_RE = re.compile(r"v1\.[A-Za-z0-9_-]{43}")
 PRICING_ANALYSIS_ID_RE = re.compile(r"analysis-[a-f0-9]{24}")
 # Local single-user mode has no configured secret; seals there last for this process only.
@@ -25163,6 +25173,7 @@ def project_deferred_pricing(
     offer: bool = False,
     source_measurements: dict[str, list[Any]] | None = None,
     reference_reader: Callable[..., dict[str, Any] | None] | None = None,
+    storage_scope: str | None = None,
 ) -> list[dict[str, Any]]:
     """Bind an explicit pricing deferral to the current unpriced physical row and reference."""
     raw_rows = rows if offer else payload.get("line_items")
@@ -25184,8 +25195,14 @@ def project_deferred_pricing(
             requests.setdefault(row_id, []).append(row)
     if not offer and not any(row.get("deferred_pricing") for group in requests.values() for row in group):
         return rows
+    key = pricing_analysis_seal_key()
+    scope = pricing_ledger_scope_for_auth_session(auth_session) if storage_scope is None else storage_scope
+    if not key or not scope:
+        return rows
     if reference_reader is None:
-        reference = exact_pricing_reference_authority(payload, auth_session=auth_session, authoritative_reload=True)
+        reference = exact_pricing_reference_authority(
+            payload, auth_session=auth_session, use_snapshot=offer, authoritative_reload=True,
+        )
         detail = reference.get("detail") or {}
     else:
         reference = explicit_pricing_reference_selection(payload)
@@ -25225,7 +25242,7 @@ def project_deferred_pricing(
         "catalog_description", "pricing_reference_description",
     )
     sections: dict[str, dict[str, Any]] = {}
-    candidates: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, str], float]] = {}
+    candidates: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, str], float, list[str]]] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -25248,6 +25265,7 @@ def project_deferred_pricing(
         if (
             quantity is None or not context["section"] or not context["description"] or not context["unit"]
             or (source_measurements is not None and source_measurements.get(row_id) != [quantity, context["unit"]])
+            or pricing_authority_context(raw) != context
             or quantity != pricing_ledger_quantity(raw.get("quantity"))
             or quantity != pricing_ledger_quantity(line.get("quantity"))
             or section_title != normalize_catalog_section(row.get("section"))
@@ -25271,7 +25289,8 @@ def project_deferred_pricing(
             "id": row_id, "text": context["description"], "tag": "Custom",
             "quantity": quantity, "unit": context["unit"],
         })
-        candidates[row_id] = row, raw, context, quantity
+        basis_identity = [safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")]
+        candidates[row_id] = row, raw, context, quantity, basis_identity
     if not candidates:
         return rows
     unmatched: set[str] = set()
@@ -25281,12 +25300,13 @@ def project_deferred_pricing(
     )
     accepted = {}
     for row_id in unmatched.intersection(candidates):
-        row, raw, context, quantity = candidates[row_id]
-        binding = [session_id, reference["source"], reference["id"], digest, context, quantity]
-        token = hashlib.sha256(json.dumps(binding, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+        row, raw, context, quantity, basis_identity = candidates[row_id]
+        binding = [scope, session_id, reference["source"], reference["id"], digest, context, quantity, basis_identity]
+        claims = json.dumps(binding, sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+        token = hmac.new(key, PRICING_DEFERRAL_RECEIPT_PREFIX + claims.encode("utf-8"), hashlib.sha256).hexdigest()
         if offer:
             accepted[row_id] = {**row, "unmatched_pricing_offer": token}
-        elif raw["deferred_pricing"] == token:
+        elif hmac.compare_digest(raw["deferred_pricing"], token):
             accepted[row_id] = {**row, "deferred_pricing": token}
     return [accepted.get(safe_resource_id(row.get("source_basis_line_id"), ""), row) if isinstance(row, dict) else row for row in rows]
 
@@ -28336,6 +28356,7 @@ def quote_session_commercials(
     patch: dict[str, Any],
     *,
     reference_reader: Callable[..., dict[str, Any] | None] | None = None,
+    storage_scope: str | None = None,
 ) -> dict[str, Any]:
     supplied = patch.get("commercials") if isinstance(patch.get("commercials"), dict) else {}
     commercial_state = quote_commercial_state(payload)
@@ -28379,7 +28400,9 @@ def quote_session_commercials(
         tax_label = clean_text(tax.get("label")).upper()
         rows = canonical.get("line_items") if isinstance(canonical.get("line_items"), list) else []
         if any(isinstance(row, dict) and row.get("deferred_pricing") for row in rows):
-            validated = project_deferred_pricing(canonical, rows, reference_reader=reference_reader)
+            validated = project_deferred_pricing(
+                canonical, rows, reference_reader=reference_reader, storage_scope=storage_scope,
+            )
             deferred_ids = {row["source_basis_line_id"] for row in validated if isinstance(row, dict) and row.get("deferred_pricing")}
         else:
             deferred_ids = set()
@@ -30369,7 +30392,9 @@ def create_or_update_quote_session(
     metadata["customer_summary"] = quote_session_customer_summary(payload, patch)
     metadata["quote_company_profile"] = quote_session_profile_summary(payload, patch)
     metadata["pricing_reference"] = quote_session_pricing_reference_summary(payload, patch)
-    metadata["commercials"] = quote_session_commercials(payload, patch)
+    metadata["commercials"] = quote_session_commercials(
+        payload, patch, storage_scope=pricing_ledger_scope_for_storage(storage),
+    )
     status_patch = patch.get("status") if isinstance(patch.get("status"), dict) else {}
     if isinstance(status_patch.get("quote_generated"), bool):
         metadata["status"]["quote_generated"] = status_patch["quote_generated"]

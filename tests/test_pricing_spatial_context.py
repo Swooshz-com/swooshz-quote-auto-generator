@@ -1,10 +1,12 @@
 """Independent primary-object wording survives spatial catalogue context and ledger checks."""
 import copy
+import hashlib
 import json
 import os
 from tests.rendered_browser_support import owned_browser_evidence_directory
 import subprocess
 import unittest
+from unittest import mock
 from tests import test_webapp as fixtures
 
 webapp = fixtures.webapp
@@ -29,9 +31,10 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         evidence = json.loads(result.stdout)
         self.assertEqual(evidence['status'], 'PASS')
-        self.assertEqual(evidence['selectionStatuses'], [200])
+        self.assertEqual(evidence['selectionStatuses'], [200, 200])
         self.assertEqual(evidence['spatialBeforeConfirm']['price'], None)
         self.assertEqual(evidence['saveReopen'], 'PASS')
+        self.assertEqual(evidence['excludedReopen'], 'PASS')
         self.assertTrue(evidence['deferredReopened'])
         self.assertEqual(evidence['xlsx']['status'], 'PASS')
         self.assertEqual(json.loads(evidence['xlsx']['validator'])['bad'], [])
@@ -192,7 +195,12 @@ class PricingSpatialContextTest(unittest.TestCase):
                 'custom_pricing': True, 'quantity': 2, 'unit': 'nos'}
         payload['quote_basis_sections'] = [{'id': 'special-effects', 'title': 'Special Effects', 'lines': [line]}]
         payload['quote_basis'] = webapp.quote_basis_from_sections(payload['quote_basis_sections'])
-        [offered] = webapp.project_deferred_pricing(payload, [row], offer=True)
+        [offered] = webapp.project_deferred_pricing(
+            payload, [row], offer=True, source_measurements={row['source_basis_line_id']: [2, 'nos']},
+        )
+        self.assertNotIn('unmatched_pricing_offer', webapp.project_deferred_pricing(
+            payload, [row], offer=True, source_measurements={row['source_basis_line_id']: [2, 'sets']},
+        )[0])
         token = offered['unmatched_pricing_offer']
         self.assertNotIn('deferred_pricing', webapp.normalize_line_items_for_final_brief(payload)[0])
         line['custom_confirmed'] = True
@@ -210,14 +218,42 @@ class PricingSpatialContextTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'contradicts the admitted pricing deferral'):
             webapp.generation_output_rows([diagnostic_row], [{**diagnostic, 'status': 'unmatched'}])
 
-        for field, value in (('deferred_pricing', '0' * 64), ('quantity', 3),
+        reference = webapp.exact_pricing_reference_authority(payload)
+        old_binding = [payload['quote_session']['session_id'], reference['source'], reference['id'],
+                       webapp.pricing_reference_catalog_digest(reference['detail']), webapp.pricing_authority_context(row), 2.0]
+        old_digest = hashlib.sha256(json.dumps(old_binding, sort_keys=True, ensure_ascii=True).encode('utf-8')).hexdigest()
+        for field, value in (('deferred_pricing', None), ('deferred_pricing', '0' * 64),
+                             ('deferred_pricing', old_digest), ('quantity', 3),
+                             ('description', 'Synthetic kinetic mobile'), ('unit', 'sets'),
+                             ('source_basis_line_id', 'edited-synthetic'), ('section', 'Structures'),
                              ('unit_price_override', 0), ('pricing_authority', 'none')):
             bad = copy.deepcopy(payload)
             bad['line_items'][0][field] = value
-            self.assertTrue(all('deferred_pricing' not in r for r in webapp.normalize_line_items_for_final_brief(bad)), field)
+            edited_row = bad['line_items'][0]
+            edited_line = bad['quote_basis_sections'][0]['lines'][0]
+            if field in ('quantity', 'description', 'unit', 'source_basis_line_id', 'section'):
+                edited_row['pricing_authority'] = webapp.build_pricing_authority('none', edited_row)
+                if field == 'section':
+                    bad['quote_basis_sections'][0]['title'] = value
+                else:
+                    edited_line[{'description': 'text', 'source_basis_line_id': 'id'}.get(field, field)] = value
+                bad['quote_basis'] = webapp.quote_basis_from_sections(bad['quote_basis_sections'])
+            with self.subTest(field=field, value=value):
+                [rejected] = webapp.normalize_line_items_for_final_brief(bad)
+                self.assertNotIn('deferred_pricing', rejected)
+                if field not in ('unit_price_override', 'pricing_authority'):
+                    self.assertEqual(rejected['pricing_authority']['variant'], 'none')
         copied = copy.deepcopy(payload)
         copied['quote_session']['session_id'] = 'quote-other-synthetic'
         self.assertNotIn('deferred_pricing', webapp.normalize_line_items_for_final_brief(copied)[0])
+        aliased = copy.deepcopy(payload)
+        alias = aliased['quote_basis_sections'][0]['lines'][0]
+        alias.update(id='basis-synthetic', source_line_item_id=row['source_basis_line_id'])
+        [alias_offer] = webapp.project_deferred_pricing(aliased, aliased['line_items'], offer=True)
+        aliased['line_items'][0]['deferred_pricing'] = alias_offer['unmatched_pricing_offer']
+        self.assertIn('deferred_pricing', webapp.project_deferred_pricing(aliased, aliased['line_items'])[0])
+        alias['id'] = 'changed-basis-synthetic'
+        self.assertNotIn('deferred_pricing', webapp.project_deferred_pricing(aliased, aliased['line_items'])[0])
         excluded = copy.deepcopy(payload)
         excluded['quote_basis_sections'][0]['lines'][0]['tag'] = 'Exclude'
         excluded['quote_basis'] = webapp.quote_basis_from_sections(excluded['quote_basis_sections'])
@@ -234,6 +270,25 @@ class PricingSpatialContextTest(unittest.TestCase):
         reader = lambda *_args, **_kwargs: late_catalogue
         self.assertNotIn('unmatched_pricing_offer', webapp.project_deferred_pricing(payload, [row], offer=True, reference_reader=reader)[0])
         self.assertNotIn('deferred_pricing', webapp.project_deferred_pricing(payload, [row], reference_reader=reader)[0])
+        changed_catalogue = copy.deepcopy(reference['detail'])
+        changed_catalogue['currency'] = 'USD'
+        self.assertNotEqual(webapp.pricing_reference_catalog_digest(changed_catalogue), old_binding[3])
+        changed_reader = lambda *_args, **_kwargs: changed_catalogue
+        self.assertNotIn('deferred_pricing', webapp.project_deferred_pricing(payload, [row], reference_reader=changed_reader)[0])
+        self.assertIn('unmatched_pricing_offer', webapp.project_deferred_pricing(
+            payload, [row], offer=True, reference_reader=changed_reader,
+        )[0])
+        other_reference = copy.deepcopy(payload)
+        other_reference['pricing_reference_id'] = 'other-synthetic-reference'
+        other_reference['pricing_reference']['id'] = 'other-synthetic-reference'
+        same_catalogue = {**reference['detail'], 'id': 'other-synthetic-reference'}
+        same_catalogue_reader = lambda *_args, **_kwargs: same_catalogue
+        self.assertIn('unmatched_pricing_offer', webapp.project_deferred_pricing(
+            other_reference, [row], offer=True, reference_reader=same_catalogue_reader,
+        )[0])
+        self.assertNotIn('deferred_pricing', webapp.project_deferred_pricing(
+            other_reference, [row], reference_reader=same_catalogue_reader,
+        )[0])
 
         self.fixture._ledger_sync(payload)
         storage = webapp.LocalSqagStorage()
@@ -250,8 +305,44 @@ class PricingSpatialContextTest(unittest.TestCase):
         draft_state = payload['quote_session']['draft_state']
         draft_state['outputRows'] = [row, priced]
         self.assertEqual(webapp.quote_session_commercials(payload, {})['subtotal'], 50)
-        draft_state['outputRows'][0] = {**row, 'deferred_pricing': '0' * 64}
-        self.assertIsNone(webapp.quote_session_commercials(payload, {})['subtotal'])
+        self.assertIn('deferred_pricing', webapp.payload_to_brief(payload)['line_items'][0])
+        storage.create_or_update_quote_session(payload)
+        self.assertEqual(webapp.read_quote_session_metadata(payload['quote_session']['session_id'])['commercials']['grand_total'], 54.5)
+        for invalid in (None, '0' * 64, old_digest):
+            draft_state['outputRows'][0] = {**row, 'deferred_pricing': invalid}
+            storage.create_or_update_quote_session(payload)
+            saved = webapp.read_quote_session_metadata(payload['quote_session']['session_id'])['commercials']
+            self.assertEqual([saved[key] for key in ('subtotal', 'tax_amount', 'grand_total')], [None, None, None])
+            with self.assertRaises(webapp.QuoteCommercialStateError):
+                webapp.payload_to_brief(payload)
+
+        def actor(workspace, subject):
+            return {'auth_mode': webapp.INTERNAL_AUTH_MODE, 'user': {'account': workspace, 'subject': subject}}
+
+        owner = actor('workspace-synthetic', 'user-synthetic')
+        reference_reader = lambda *_args, **_kwargs: reference['detail']
+        with mock.patch.object(webapp, 'configured_storage_mode', return_value='database'):
+            [scoped] = webapp.project_deferred_pricing(payload, [row], owner, offer=True, reference_reader=reference_reader)
+            self.assertNotEqual(scoped['unmatched_pricing_offer'], token)
+            scoped_row = {**row, 'deferred_pricing': scoped['unmatched_pricing_offer']}
+            payload['line_items'] = [scoped_row]
+            draft_state['outputRows'][0] = scoped_row
+            for auth, allowed in ((owner, True), (actor('other-workspace', 'user-synthetic'), False),
+                                  (actor('workspace-synthetic', 'other-user'), False)):
+                with self.subTest(auth=auth):
+                    [validated] = webapp.project_deferred_pricing(payload, [scoped_row], auth, reference_reader=reference_reader)
+                    self.assertEqual('deferred_pricing' in validated, allowed)
+                    saved = webapp.quote_session_commercials(
+                        payload, {}, reference_reader=reference_reader, storage_scope=webapp.pricing_ledger_scope_for_auth_session(auth),
+                    )
+                    self.assertEqual(saved['subtotal'], 50 if allowed else None)
+            with mock.patch.object(webapp, 'pricing_analysis_seal_key', return_value=None):
+                self.assertNotIn('deferred_pricing', webapp.project_deferred_pricing(
+                    payload, [scoped_row], owner, reference_reader=reference_reader,
+                )[0])
+                self.assertNotIn('unmatched_pricing_offer', webapp.project_deferred_pricing(
+                    payload, [row], owner, offer=True, reference_reader=reference_reader,
+                )[0])
 
 
 if __name__ == '__main__':

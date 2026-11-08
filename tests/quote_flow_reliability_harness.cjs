@@ -43,6 +43,8 @@ async function generationOutputCases() {
     for (const contract of ['current','legacy','invalid','empty-legacy']) for (const prior of [false,true]) {
       const c = productionContext(); const st = c.state;
       vm.runInContext('state.outputRows=originals.map(outputRowFromLineItem);state.lineItems=originals.map(normalizeLineItem);',c);
+      vm.runInContext(`state.quoteBasisSections=[{id:'general',title:'General',lines:[{id:'excluded-row',tag:'Exclude'}]}];
+        state.lineItems.push({source_basis_line_id:'excluded-row',description:'Excluded synthetic row'});`,c);
       const before = JSON.stringify(st.outputRows);
       const data = JSON.parse(JSON.stringify({status:terminal,return_code:terminal==='completed'?0:2,
         pricing_matches:[{status:'matched',unit_price:'999999',amount:'999999'}],
@@ -62,7 +64,7 @@ async function generationOutputCases() {
         missingDetailFields:()=>[],quoteSessionHasFreshOutputExports:()=>prior,normalizeActiveJob:x=>x,
         newClientJobId:()=> 'job-synthetic-output',saveSessionState:noop,setWorkflowStage:noop,
         setResultStatus:label=>statuses.push(label),renderMessages:noop,clearPricingReviewMessages:noop,syncControlStates:noop,
-        ensureQuoteSession:async()=>st.quoteSessionId,buildPayload:()=>({line_items:st.lineItems}),startJob:async()=>{assert.equal(st.activeJob.outputRowsSchema,'swooshz.quote-output-rows.v1');return{ok:true,data:{job_id:'job-synthetic-output'}};},
+        ensureQuoteSession:async()=>st.quoteSessionId,buildPayload:()=>({line_items:c.outputRowsToLineItems()}),startJob:async()=>{assert.equal(st.activeJob.outputRowsSchema,'swooshz.quote-output-rows.v1');return{ok:true,data:{job_id:'job-synthetic-output'}};},
         currentGenerationContext:()=>({session_id:st.quoteSessionId,run_id:''}),transitionGenerationContext:noop,
         pollJob:async()=>{polls++;return{ok:true,data:{status:terminal==='needs_confirmation'?'needs_review':terminal,result:c.resultData}};},
         isInterruptedJobPoll:()=>false,clearActiveJob:()=>{st.activeJob=null;},
@@ -77,6 +79,8 @@ async function generationOutputCases() {
       if (resumed) {st.activeJob={id:'job-synthetic-output',type:'generate',phase:'running',...(['legacy','empty-legacy'].includes(contract)?{}:{outputRowsSchema:'swooshz.quote-output-rows.v1'})};await c.resumeSavedJob();}
       else await c.handleGenerate();
       assert.equal(polls,1);
+      assert(st.lineItems.some(row=>row.source_basis_line_id==='excluded-row'));
+      assert(!st.outputRows.some(row=>row.source_basis_line_id==='excluded-row'));
       if (contract !== 'empty-legacy') {
         if(terminal==='completed'||contract!=='current')assert.equal(JSON.stringify(st.outputRows),before,`${resumed}/${terminal}/${contract}/${prior}`);
         assert.equal(st.outputRows[0].source_basis_line_id,'manual-row');
@@ -337,7 +341,7 @@ async function lifecycleCases() {
   const families = ["images", "customer", "quote_company", "dependency_customer", "dependency_images", "dependency_basis", "basis"];
   let cases = 0;
   for (const family of families) for (const phase of ["ordinary", "cancel_before", "cancel_pending", "pagehide_pending"]) for (const outcome of ["success", "failure", "throw"]) {
-    const f = lifecycleFixture(["withQuoteStepLoading", "advanceCustomerStep", "goToNextSidePanel", "confirmQuoteDependencyChange", "confirmBasis"]);
+    const f = lifecycleFixture(["withQuoteStepLoading", "advanceCustomerStep", "goToNextSidePanel", "confirmQuoteDependencyChange", "confirmBasis", "retainExcludedBasisPricingRows"]);
     const { context: c, state, elements } = f;
     const panel = family.replace("dependency_", "");
     const panels = ["images", "customer", "quote_company", "basis", "output"];
@@ -593,7 +597,7 @@ async function lifecycleCases() {
 
     // Use the real generation/file-attachment path, with transport and final save held.
     vm.runInContext([
-      "handleGenerate", "setDownloadFiles", "clearActiveJob",
+      "handleGenerate", "setDownloadFiles", "clearActiveJob", "retainExcludedBasisPricingRows",
       "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage",
     ].map(extract).join("\n"), c);
     state.activeSidePanel = "output";

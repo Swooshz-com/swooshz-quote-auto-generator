@@ -10529,6 +10529,27 @@ function snapshotOutputRows(rows = state.outputRows) {
   return rows.map((row) => normalizeOutputRow({ ...row }));
 }
 
+function retainExcludedBasisPricingRows(rows) {
+  const excluded = new Set();
+  const active = new Set();
+  for (const section of state.quoteBasisSections || []) {
+    for (const line of section.lines || []) {
+      const ids = normalizeBasisTag(line.tag) === "Exclude" ? excluded : active;
+      if (line.id) ids.add(line.id);
+      if (line.source_line_item_id) ids.add(line.source_line_item_id);
+    }
+  }
+  const retained = (state.lineItems || []).filter((row) =>
+    excluded.has(row.source_basis_line_id) && !active.has(row.source_basis_line_id)
+  ).map(({ deferred_pricing, ...row }) => ({
+    ...row,
+    ...(deferred_pricing && !row.unmatched_pricing_offer ? { unmatched_pricing_offer: deferred_pricing } : {}),
+  }));
+  if (!retained.length) return rows;
+  const retainedIds = new Set(retained.map((row) => row.source_basis_line_id));
+  return [...rows.filter((row) => !retainedIds.has(row.source_basis_line_id)), ...retained];
+}
+
 function outputRowsToLineItems(rows = state.outputRows) {
   const ownedCommercial = ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   return rows.map((inputRow) => {
@@ -10703,7 +10724,7 @@ function confirmOutputRowDelete() {
     return;
   }
   state.outputRows.splice(index, 1);
-  state.lineItems = outputRowsToLineItems();
+  state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
   markOutputRowsDirty();
   hideOutputDeleteModal();
   const validation = outputRowsValid();
@@ -10970,7 +10991,7 @@ function commitOutputEditor(editor) {
   delete nextRow.deferred_pricing;
   revokeOutputEditor();
   state.outputRows[index] = preserveOutputRowIdentity(currentRow, recalculateOutputRow(nextRow));
-  state.lineItems = outputRowsToLineItems();
+  state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
   markOutputRowsDirty();
   const validation = outputRowsValid();
   renderOutputValidationMessages(validation.valid ? [] : validation.errors);
@@ -10997,7 +11018,7 @@ function applyOutputIncludedAction(button) {
   delete next.display_price;
   next.pricing_authority = buildPricingAuthority("included", next);
   state.outputRows[index] = recalculateOutputRow(next);
-  state.lineItems = outputRowsToLineItems();
+  state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
   markOutputRowsDirty();
   renderPricingMatches(state.outputRows);
   renderMatchSummary({ pricing_matches: state.outputRows });
@@ -11060,7 +11081,7 @@ async function applyOutputReferencePricing(button) {
     const rows = state.outputRows.map((entry) => entry === row ? candidate : entry);
     const payload = buildLineItemNormalizePayload();
     payload.line_items = outputRowsToLineItems(rows);
-    payload.quote_session.draft_state.lineItems = payload.line_items;
+    payload.quote_session.draft_state.lineItems = retainExcludedBasisPricingRows(payload.line_items);
     payload.quote_session.draft_state.outputRows = rows;
     const expected = state.pricingLedgerRevisions?.[sessionId]?.[rowId];
     // An existing grant can restore reference pricing after a manual/Included
@@ -11102,7 +11123,7 @@ async function applyOutputReferencePricing(button) {
     if (restored && outputPriceAuthority(row)?.variant === "catalog"
       && JSON.stringify(outputPriceAuthority(row)) === JSON.stringify(selected.pricing_authority)) return "unchanged";
     state.outputRows[index] = preserveOutputRowIdentity(row, selected);
-    state.lineItems = outputRowsToLineItems();
+    state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
     markOutputRowsDirty();
     const validation = outputRowsValid();
     renderOutputValidationMessages(validation.valid ? [] : validation.errors);
@@ -11400,29 +11421,75 @@ function basisLinePillLabel(line = {}, pricingRow = basisPricingRow(line)) {
   return basisTagLabel(tag);
 }
 
-function basisPricingRow(line) {
-  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
-  const rows = (state.outputRows?.length ? state.outputRows : state.lineItems || [])
-    .filter((row) => ids.has(row.source_basis_line_id));
-  return rows.length === 1 ? rows[0] : null;
+function originalBasisLineForPricing(line, section, ids) {
+  const linked = (sections) => (Array.isArray(sections) ? sections : []).flatMap((entry) =>
+    (Array.isArray(entry?.lines) ? entry.lines : [])
+    .filter((candidate) => ids.has(candidate?.id) || ids.has(candidate?.source_line_item_id))
+    .map((candidate) => ({ section: entry, line: candidate })));
+  const current = linked(state.quoteBasisSections);
+  const original = linked(state.originalAnalysisSnapshot?.quote_basis_sections);
+  if (current.length !== 1 || original.length !== 1) return null;
+  const saved = original[0];
+  if (saved.section.id !== section.id || saved.section.title !== section.title
+    || saved.line.id !== line.id || (saved.line.source_line_item_id || "") !== (line.source_line_item_id || "")) return null;
+  return saved.line;
 }
 
-function basisUnmatchedOffer(line, row = basisPricingRow(line)) {
+function basisPricingRow(line, section) {
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  if (!ids.size) return null;
+  const matches = (rows) => (rows || []).filter((row) => ids.has(row?.source_basis_line_id));
+  for (const rows of [state.outputRows, state.lineItems]) {
+    const active = matches(rows);
+    if (active.length) return active.length === 1 ? active[0] : null;
+  }
+  const snapshot = state.originalAnalysisSnapshot;
+  if (!section || !basisAnalysisReferenceIsCurrent() || !Array.isArray(snapshot.line_items)) return null;
+  const original = originalBasisLineForPricing(line, section, ids);
+  const rows = matches(snapshot.line_items);
+  if (!original || rows.length !== 1
+    || original.text !== line.text || (original.pricing_keyword || "") !== (line.pricing_keyword || "")
+    || numberOrNull(original.quantity) !== numberOrNull(line.quantity)
+    || normalizeUnit(original.unit) !== normalizeUnit(line.unit)) return null;
+  const row = normalizeLineItem(rows[0]);
+  const basisDescription = cleanCustomerQuoteLineText(original.text);
+  if (canonicalPricingAuthorityText(row.section) !== canonicalPricingAuthorityText(section.title)
+    || numberOrNull(row.quantity) !== numberOrNull(line.quantity)
+    || normalizeUnit(row.unit) !== normalizeUnit(line.unit)
+    || (row.pricing_keyword || "") !== (original.pricing_keyword || "")
+    || (row.description !== basisDescription && row.description !== outputCatalogDescription(original))) return null;
+  // The original analysis can recover a classification and offer, never a Keep decision.
+  delete row.deferred_pricing;
+  return row;
+}
+
+function basisAnalysisReferenceIsCurrent() {
+  return samePricingReferenceBasis(
+    normalizedDraftPricingReferenceBasis(state.originalAnalysisSnapshot?.pricing_analysis_seal?.reference),
+    pricingReferenceAuthorityBasis(currentPricingReference()),
+  );
+}
+
+function basisUnmatchedOffer(line, row, section) {
   if (!row || row.pricing_authority?.variant !== "none" || line.pricing_keyword
-    || line.possible_pricing_matches?.length) return "";
-  if (cleanCustomerQuoteLineText(line.text) !== row.description
+    || line.possible_pricing_matches?.length || !basisAnalysisReferenceIsCurrent()) return "";
+  if (canonicalPricingAuthorityText(row.section) !== canonicalPricingAuthorityText(section.title)
+    || cleanCustomerQuoteLineText(line.text) !== row.description
     || numberOrNull(line.quantity) !== numberOrNull(row.quantity)
     || normalizeUnit(line.unit) !== normalizeUnit(row.unit)) return "";
-  return row.unmatched_pricing_offer || row.deferred_pricing || "";
+  const receipt = row.unmatched_pricing_offer || row.deferred_pricing || "";
+  if (!/^[0-9a-f]{64}$/.test(receipt)) return "";
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  return originalBasisLineForPricing(line, section, ids) ? receipt : "";
 }
 
-function basisPricingGroup(line) {
-  const row = basisPricingRow(line);
+function basisPricingGroup(line, section) {
+  const row = basisPricingRow(line, section);
   const quantity = numberOrNull(line.quantity ?? row?.quantity);
   const unit = normalizeUnit(line.unit || row?.unit || "");
   const variant = row?.pricing_authority?.variant;
   if (variant === "included" || (quantity > 0 && unit && ["catalog", "manual"].includes(variant))) return "Matched";
-  return basisUnmatchedOffer(line, row) ? "Unmatched" : "Review";
+  return basisUnmatchedOffer(line, row, section) ? "Unmatched" : "Review";
 }
 
 function basisLineAcceptsAsAiProposal(line = {}) {
@@ -11517,7 +11584,7 @@ function renderBasisLine(section, line, index) {
   const tag = normalizeBasisTag(line.tag);
   const customPricing = isCustomPricingBasisLine(line);
   const pendingAiProposal = isPendingAiProposalLine(line);
-  const pricingRow = basisPricingRow(line);
+  const pricingRow = basisPricingRow(line, section);
   const pillLabel = basisLinePillLabel(line, pricingRow);
   const acceptsAsAiProposal = basisLineAcceptsAsAiProposal(line);
   const quantityLabel = basisQuantityDisplayLabel(line);
@@ -11526,7 +11593,7 @@ function renderBasisLine(section, line, index) {
   const lineTitle = basisLineTitle(line);
   const pillTitleAttribute = pillTitle ? ` title="${escapeHtml(pillTitle)}"` : "";
   const lineTitleAttribute = lineTitle ? ` title="${escapeHtml(lineTitle)}"` : "";
-  const unmatchedOffer = tag === "Exclude" ? "" : basisUnmatchedOffer(line, pricingRow);
+  const unmatchedOffer = tag === "Exclude" ? "" : basisUnmatchedOffer(line, pricingRow, section);
   const keptUnmatched = unmatchedOffer && pricingRow.deferred_pricing === unmatchedOffer;
   const rowClasses = [
     "basis-line-row",
@@ -11612,7 +11679,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
       reviewLineEntries: (section.lines || [])
         .map((line, index) => ({ line, index }))
         .filter((entry) => !basisLineIsInformationalDimension(entry.line))
-        .map((entry) => ({ ...entry, group: basisPricingGroup(entry.line) })),
+        .map((entry) => ({ ...entry, group: basisPricingGroup(entry.line, section) })),
     }))
     .map((section) => ({ ...section, lines: section.reviewLineEntries.map((entry) => entry.line) }))
     .filter((section) => section.reviewLineEntries.length);
@@ -13315,9 +13382,9 @@ async function refreshLineItemsFromServer() {
   state.pricingIssues = (Array.isArray(result.data.selections) ? result.data.selections : [])
     .filter((entry) => entry?.status === "refused" && typeof entry.source_basis_line_id === "string" && refusalReasons.has(entry.reason))
     .map((entry) => ({ source_basis_line_id: entry.source_basis_line_id, reason: entry.reason }));
-  state.lineItems = result.data.line_items.map((item) => (
+  state.lineItems = retainExcludedBasisPricingRows(result.data.line_items.map((item) => (
     typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
-  )).map(normalizeLineItem);
+  )).map(normalizeLineItem));
   state.outputRows = [];
   state.outputErrors = [];
   return result;
@@ -13522,7 +13589,7 @@ async function resetOutputDraft() {
   if (commitActiveOutputEditor() === "blocked") return;
   if (appIsBusy() || !state.originalOutputRows.length) return;
   state.outputRows = snapshotOutputRows(state.originalOutputRows);
-  state.lineItems = outputRowsToLineItems();
+  state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
   state.outputErrors = [];
   markOutputRowsDirty();
   renderPricingMatches(state.outputRows);
@@ -16643,7 +16710,7 @@ async function confirmBasis(options = {}) {
     state.basisConfirmed = true;
     refreshOutputRowsFromLineItems();
     state.originalOutputRows = snapshotOutputRows(state.outputRows);
-    state.lineItems = outputRowsToLineItems();
+    state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
     setWorkflowStage("completed");
     await saveQuoteSessionDraftState({ quoteGenerated: true });
     clearActiveJob();
@@ -16741,7 +16808,7 @@ async function handleGenerate(options = {}) {
       syncControlStates();
       return;
     }
-    state.lineItems = outputRowsToLineItems();
+    state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());
   }
   if (!state.basisConfirmed) {
     if (hasSubmittedQuoteBasis()) {
@@ -17088,7 +17155,7 @@ async function resumeSavedJob() {
       return;
     }
     const resumedJob = state.activeJob || activeJob;
-    const generationInputRows = state.lineItems.map((row) => ({ ...row }));
+    const generationInputRows = (state.outputRows.length ? state.outputRows : state.lineItems).map((row) => ({ ...row }));
 
     const polled = await pollJob(resumedJob.id);
     if (polled.aborted) return;
@@ -17588,10 +17655,11 @@ function handleQuoteBasisClick(event) {
     if (appIsBusy()) return;
     const { basisSection, basisLineIndex } = deferButton.dataset;
     const sections = cloneQuoteBasisSections(state.quoteBasisSections);
-    const line = sections.find((section) => section.id === basisSection)?.lines?.[Number(basisLineIndex)];
+    const section = sections.find((entry) => entry.id === basisSection);
+    const line = section?.lines?.[Number(basisLineIndex)];
     if (!line || normalizeBasisTag(line.tag) === "Exclude") return;
-    const row = basisPricingRow(line);
-    const offer = basisUnmatchedOffer(line, row);
+    const row = basisPricingRow(line, section);
+    const offer = basisUnmatchedOffer(line, row, section);
     if (!offer) return;
     line.tag = "Custom";
     line.custom_pricing = true;
@@ -17599,7 +17667,7 @@ function handleQuoteBasisClick(event) {
     row.unmatched_pricing_offer = offer;
     if (line.custom_confirmed) row.deferred_pricing = offer;
     else delete row.deferred_pricing;
-    state.lineItems = state.lineItems.map((item) => item.source_basis_line_id === row.source_basis_line_id ? { ...row } : item);
+    state.lineItems = [...state.lineItems.filter((item) => item.source_basis_line_id !== row.source_basis_line_id), { ...row }];
     state.quoteBasisSections = sections;
     state.quoteBasis = quoteBasisFromSections(sections);
     state.basisConfirmed = false;

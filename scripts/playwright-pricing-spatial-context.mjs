@@ -25,6 +25,7 @@ const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles"
   path.join(["logs", "downloads"].includes(name) ? runRoot : nativeRunRoot, name)]));`);
 replaceOnce('Bar Stool seating around the display', 'Bar Stools at Round Tables.');
 replaceOnce('const cases = [', `const cases = [
+  { id: "u1-excluded-match", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light" },
   { id: "u1-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },`);
 replaceOnce('  // Resolve any remaining server-added review line', `
   const spotlightTick = await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]');
@@ -80,7 +81,107 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   await keep.click();
   assert(await keep.innerText() === "Keep as unpriced", "keep decision could not be undone");
   await keep.click();
+  const sculptureCross = await basisControl(page, "u1-unmatched", '[data-basis-tag="Exclude"]');
+  const floodCross = await basisControl(page, "u1-excluded-match", '[data-basis-tag="Exclude"]');
+  const flood = floodCross.locator("xpath=ancestor::li[1]");
+  await sculptureCross.click();
+  await floodCross.click();
   // Resolve any remaining server-added review line`);
+replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.confirm });', `
+  await writeJson("timings-raw.json", { timings, confirm: result.confirm });
+  const excludedIds = ["u1-unmatched", "u1-excluded-match"];
+  async function assertExcludedOutput() {
+    assert(await page.evaluate((ids) =>
+      state.outputRows.every((row) => !ids.includes(row.source_basis_line_id)), excludedIds),
+      "excluded pricing row reached Output");
+  }
+  async function assertExcludedBasis() {
+    await assertBasisRow(flood, "Matched", "exclude");
+    await assertBasisRow(sculpture, "Unmatched", "exclude");
+    assert(await sculpture.locator('[data-basis-defer-pricing]').count() === 0, "excluded row offers Keep");
+  }
+  const basisTab = page.locator('button[data-side-panel="basis"]').first();
+  await assertExcludedOutput();
+  await basisTab.click();
+  await assertExcludedBasis();
+  const excludedSession = await page.evaluate(() => state.quoteSessionId);
+  await page.waitForFunction(async ({ id, ids }) => {
+    const detail = await fetch("/api/quote-sessions/" + encodeURIComponent(id)).then((response) => response.json());
+    const draft = detail.quote_session?.draft_state;
+    return draft?.basisConfirmed && ids.every((rowId) =>
+      draft.lineItems.some((row) => row.source_basis_line_id === rowId)
+      && !draft.outputRows.some((row) => row.source_basis_line_id === rowId));
+  }, { id: excludedSession, ids: excludedIds }, { timeout: 15000, polling: 500 });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0);
+  await assertExcludedOutput();
+  if (!(await sculpture.isVisible())) await basisTab.click();
+  await assertExcludedBasis();
+  await (await basisControl(page, "u1-excluded-match", '[data-basis-tag="Include"]')).click();
+  await assertBasisRow(flood, "Matched", "include");
+  await floodCross.click();
+  await assertExcludedBasis();
+  // Exercise an older saved shape with no active excluded rows and verify the snapshot
+  // cannot override a current edit, even when the edited row is absent from the active set.
+  const recovery = await page.evaluate((ids) => {
+    const previous = state.lineItems;
+    const section = state.quoteBasisSections.find((entry) => entry.lines.some((line) => line.id === ids[0]));
+    const line = section.lines.find((entry) => entry.id === ids[0]);
+    const matched = section.lines.find((entry) => entry.id === ids[1]);
+    const unpriced = previous.find((row) => row.source_basis_line_id === ids[0]);
+    state.lineItems = previous.map((row) => row === unpriced ? { ...row, description: "Edited active sculpture" } : row);
+    const activeEdit = basisPricingGroup(line, section);
+    state.lineItems = previous.filter((row) => !ids.includes(row.source_basis_line_id));
+    const recovered = [basisPricingGroup(line, section), basisPricingGroup(matched, section)];
+    const stale = [
+      basisPricingGroup({ ...line, id: "edited-sculpture" }, section),
+      basisPricingGroup({ ...line, text: "Edited sculpture" }, section),
+      basisPricingGroup({ ...line, unit: "sets" }, section),
+    ];
+    state.lineItems = previous;
+    return { activeEdit, recovered, stale };
+  }, excludedIds);
+  assert(recovery.activeEdit === "Review" && JSON.stringify(recovery.recovered) === '["Unmatched","Matched"]'
+    && recovery.stale.every((group) => group === "Review"), "snapshot recovery accepted an edit or lost classification", recovery);
+  await (await basisControl(page, "u1-unmatched", '[data-basis-tag]:not([data-basis-tag="Exclude"])')).click();
+  const editedGroups = await page.evaluate(() => {
+    const section = state.quoteBasisSections.find((entry) => entry.lines.some((line) => line.id === "u1-unmatched"));
+    const line = section.lines.find((entry) => entry.id === "u1-unmatched");
+    const original = { ...line };
+    const referenceId = state.pricingReferenceId;
+    const references = state.pricingReferences;
+    const replacement = { ...currentPricingReference(), id: "other-synthetic-reference" };
+    const results = [];
+    for (const edit of [{ id: "edited-sculpture" }, { text: "Edited sculpture" }, { unit: "sets" }, {}]) {
+      Object.assign(line, original, edit);
+      if (!Object.keys(edit).length) {
+        state.pricingReferences = [...references, replacement];
+        state.pricingReferenceId = replacement.id;
+      }
+      updateQuoteBasisCard();
+      const row = [...document.querySelectorAll("#basisReviewSurface .basis-line-row")].find((element) =>
+        element.textContent.includes(line.text));
+      results.push(row?.closest(".basis-review-grid")?.getAttribute("aria-label") === "Review"
+        && !row.querySelector("[data-basis-defer-pricing]"));
+    }
+    Object.assign(line, original);
+    state.pricingReferences = references;
+    state.pricingReferenceId = referenceId;
+    updateQuoteBasisCard();
+    return results;
+  });
+  assert(editedGroups.every(Boolean), "an edited or re-referenced row retained the Keep control", editedGroups);
+  assert(await keep.innerText() === "Keep as unpriced", "re-included row did not offer a fresh Keep decision");
+  await keep.click();
+  assert(await keep.innerText() === "Undo keep", "re-included row could not be kept");
+  await page.locator("#sideNextButton").click();
+  await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
+  await page.waitForFunction(() => !appIsBusy());
+  assert(await page.evaluate(() => state.outputRows.some((row) =>
+    row.source_basis_line_id === "u1-unmatched" && outputPricingIsDeferred(row))
+    && state.outputRows.every((row) => row.source_basis_line_id !== "u1-excluded-match")),
+    "re-included Keep did not reach Output or the other row stopped being excluded");
+  result.excludedReopen = "PASS";`);
 replaceOnce('    result.saveReopen = "PASS";', `
     result.saveReopen = "PASS";
     const deferredAfterReload = await rowFor("u1-unmatched");
