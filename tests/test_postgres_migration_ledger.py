@@ -1084,6 +1084,7 @@ class PostgresMigrationLedgerIntegrationTest(unittest.TestCase):
         self.assertEqual(
             EXPECTED_TRIGGER_ROUTINE_KEYS,
             {
+                ("sqag_quote_api_reject_binding_change", ""),
                 ("sqag_reject_immutable_change", ""),
                 ("sqag_require_retention_delete_authorization", ""),
             },
