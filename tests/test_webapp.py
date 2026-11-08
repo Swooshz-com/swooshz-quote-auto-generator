@@ -40429,6 +40429,82 @@ main().catch((error) => {
         self.assertEqual(resolved_payload["company"]["name"], "")
         self.assertNotIn("logo_data_url", resolved_payload["company"])
 
+    def test_generation_profile_defaults_preserve_optional_date_labels_in_xlsx(self):
+        from tests.test_generate_quote import NS_MAIN, cell_value, find_cell_ref, generate_layout_workbook
+
+        cases = (
+            ("flat cleared", {"date_label": ""}, "", {"dateLabel": "", "companyDateLabel": ""}, ("", ""), ()),
+            ("nested cleared", {"acceptance": {"date_label": ""}, "date_label": "Stale alias"}, "", {}, ("", ""), ()),
+            ("omitted", {}, None, {}, ("Profile company date", "Profile acceptance date"), ("B", "E")),
+            ("only company cleared", {}, "", {}, ("", "Profile acceptance date"), ("E",)),
+            ("only acceptance cleared", {"date_label": ""}, None, {}, ("Profile company date", ""), ("B",)),
+            ("plain supplied", {"date_label": "Quote acceptance date"}, "Quote company date", {},
+             ("Quote company date", "Quote acceptance date"), ()),
+            ("rich supplied", {"acceptance": {"date_label": "Quote acceptance date"}, "date_label": "Stale alias"},
+             "Quote company date", {"dateLabel": "<em>Quote acceptance date</em>",
+                                     "companyDateLabel": "<strong>Quote company date</strong>"},
+             ("Quote company date", "Quote acceptance date"), ("B", "E")),
+        )
+        for mode, profile_nested in itertools.product(("local", "database"), (False, True)):
+            with self.subTest(mode=mode, profile_nested=profile_nested), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                database_url = f"sqlite:///{(root / 'profiles.sqlite3').as_posix()}"
+                profile_acceptance = {"date_label": "Profile acceptance date"}
+                profile = webapp.normalize_profile_payload({
+                    "id": "synthetic-date-profile",
+                    "defaults": {
+                        "quote_text": {
+                            "stamp_label": "Profile stamp",
+                            **({"acceptance": profile_acceptance, "date_label": "Profile flat alias"}
+                               if profile_nested else profile_acceptance),
+                        },
+                        "signature": {"company_date_label": "Profile company date"},
+                        "rich_text": {"dateLabel": "<em>Profile acceptance date</em>",
+                                      "companyDateLabel": "<strong>Profile company date</strong>"},
+                    },
+                })
+                store = webapp.CompanyConfigStore(root / "data")
+                auth_session = None
+                with (
+                    mock.patch.dict(os.environ, isolated_env(SQAG_STORAGE_MODE=mode, SQAG_DATABASE_URL=database_url), clear=True),
+                    mock.patch.object(webapp, "company_config_store", return_value=store),
+                ):
+                    if mode == "database":
+                        auth_session = self.platform_auth_session("synthetic-date-workspace")
+                        webapp.apply_sqag_storage_migrations(database_url)
+                        storage = webapp.app_storage_for_auth_session(auth_session)
+                        storage.save_profile(profile)
+                        storage.save_pricing_reference(workspace_pricing_reference())
+                    else:
+                        store.save_profile(webapp.DEFAULT_COMPANY_ID, profile)
+
+                    for case, acceptance, company_date, rich, expected, formatted_columns in cases:
+                        with self.subTest(case=case):
+                            payload = payload_with_workspace_pricing() if mode == "database" else valid_payload()
+                            payload["profile_id"] = profile["id"]
+                            payload["quote_text"].pop("date_label")
+                            payload["quote_text"].update(stamp_label="", **acceptance)
+                            payload["signature"].pop("company_date_label")
+                            if company_date is not None:
+                                payload["signature"]["company_date_label"] = company_date
+                            payload["rich_text"] = rich
+
+                            resolved = webapp.generation_payload_with_profile_defaults(payload, auth_session=auth_session)
+                            brief = webapp.payload_to_brief(resolved, auth_session=auth_session)
+                            tmp_workbook, path = generate_layout_workbook(brief)
+                            with tmp_workbook, zipfile.ZipFile(path) as archive:
+                                sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                            self.assertEqual((brief["signature"]["company_date_label"], brief["acceptance"]["date_label"]), expected)
+                            stamp_ref = find_cell_ref(sheet, "Profile stamp")
+                            self.assertTrue(stamp_ref)
+                            date_row = int(stamp_ref[1:]) + 1
+                            for column, label, emphasis in zip(("B", "E"), expected, ("b", "i")):
+                                ref = f"{column}{date_row}"
+                                self.assertEqual(cell_value(sheet, ref), label)
+                                if column in formatted_columns:
+                                    cell = sheet.find(f".//{NS_MAIN}c[@r='{ref}']")
+                                    self.assertIsNotNone(cell.find(f".//{NS_MAIN}rPr/{NS_MAIN}{emphasis}"))
+
     def test_run_quote_job_uses_explicit_profile_and_local_pricing_reference_roots(self):
         with tempfile.TemporaryDirectory(dir=str(test_temp_root())) as tmp:
             root = Path(tmp)
