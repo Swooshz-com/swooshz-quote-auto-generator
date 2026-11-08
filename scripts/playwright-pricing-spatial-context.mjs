@@ -25,8 +25,49 @@ const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles"
   path.join(["logs", "downloads"].includes(name) ? runRoot : nativeRunRoot, name)]));`);
 replaceOnce('Bar Stool seating around the display', 'Bar Stools at Round Tables.');
 replaceOnce('const cases = [', `const cases = [
-  { id: "u1-unmatched", kind: "unmatched", section: "Special Effects", text: "Kinetic sculpture", quantity: 2, unit: "nos" },`);
+  { id: "u1-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },`);
 replaceOnce('  // Resolve any remaining server-added review line', `
+  const spotlightTick = await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]');
+  const spotlightCross = await basisControl(page, "u1-confirmed", '[data-basis-tag="Exclude"]');
+  const sectionId = await spotlightTick.getAttribute("data-basis-section");
+  const spotlight = spotlightTick.locator("xpath=ancestor::li[1]");
+  const sculpture = page.locator('.basis-line-row').filter({ hasText: "Kinetic sculpture" });
+  const sectionActions = page.locator('#basisReviewSurface [data-basis-section="' + sectionId + '"][data-basis-section-action]');
+  const tickAll = sectionActions.and(page.locator('[data-basis-section-action="Include"]')).first();
+  const crossAll = sectionActions.and(page.locator('[data-basis-section-action="Exclude"]')).first();
+  async function assertBasisRow(row, group, tag) {
+    assert(await row.isVisible(), group + " row disappeared after a basis action");
+    assert(await row.evaluate((element, expected) =>
+      element.closest(".basis-review-grid").getAttribute("aria-label") === expected.group
+      && element.classList.contains("basis-line-" + expected.tag), { group, tag }),
+      "basis row lost its pricing group or selection styling", { group, tag });
+  }
+  await assertBasisRow(spotlight, "Matched", "include");
+  await tickAll.click();
+  await assertBasisRow(spotlight, "Matched", "include");
+  await crossAll.click();
+  await assertBasisRow(spotlight, "Matched", "exclude");
+  await assertBasisRow(sculpture, "Unmatched", "exclude");
+  assert(await sculpture.locator('[data-basis-defer-pricing]').count() === 0, "excluded row still offers Keep");
+  await tickAll.click();
+  await assertBasisRow(spotlight, "Matched", "include");
+  assert(await sculpture.evaluate((row) => !row.classList.contains("basis-line-exclude")), "Tick all missed the other pricing group");
+  await spotlightCross.click();
+  await assertBasisRow(spotlight, "Matched", "exclude");
+  assert(await sculpture.evaluate((row) => !row.classList.contains("basis-line-exclude")), "single X excluded a different row");
+  await spotlightTick.click();
+  await assertBasisRow(spotlight, "Matched", "include");
+  assert(await sectionActions.count() === 2, "one section rendered duplicate bulk controls across groups");
+  assert(await tickAll.getAttribute("title") === "Accept all review lines"
+    && await crossAll.getAttribute("title") === "Exclude all review lines", "original bulk tooltips missing");
+  const sectionTitle = await tickAll.locator('xpath=ancestor::div[contains(@class, "basis-section-heading")]/h4').innerText();
+  assert(await tickAll.getAttribute("aria-label") === "Accept all review lines in " + sectionTitle
+    && await crossAll.getAttribute("aria-label") === "Exclude all review lines in " + sectionTitle, "bulk labels do not describe section-wide scope");
+  assert(await tickAll.innerText() === await spotlightTick.innerText() && await crossAll.innerText() === await spotlightCross.innerText(),
+    "bulk controls do not use the original row glyphs");
+  assert(await tickAll.locator('xpath=..').locator('.basis-section-action-spacer').count() === 1,
+    "bulk actions lost the alignment spacer for the Re column");
+  result.basisActions = "PASS";
   const keep = await basisControl(page, "u1-unmatched", "[data-basis-defer-pricing]");
   assert(await keep.isVisible(), "unmatched physical row has no Keep control", await page.evaluate(() =>
     state.lineItems.find((row) => row.source_basis_line_id === "u1-unmatched")));

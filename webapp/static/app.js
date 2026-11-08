@@ -11409,7 +11409,7 @@ function basisPricingRow(line) {
 
 function basisUnmatchedOffer(line, row = basisPricingRow(line)) {
   if (!row || row.pricing_authority?.variant !== "none" || line.pricing_keyword
-    || normalizeBasisTag(line.tag) === "Exclude" || line.possible_pricing_matches?.length) return "";
+    || line.possible_pricing_matches?.length) return "";
   if (cleanCustomerQuoteLineText(line.text) !== row.description
     || numberOrNull(line.quantity) !== numberOrNull(row.quantity)
     || normalizeUnit(line.unit) !== normalizeUnit(row.unit)) return "";
@@ -11417,7 +11417,6 @@ function basisUnmatchedOffer(line, row = basisPricingRow(line)) {
 }
 
 function basisPricingGroup(line) {
-  if (normalizeBasisTag(line.tag) === "Exclude") return "Review";
   const row = basisPricingRow(line);
   const quantity = numberOrNull(line.quantity ?? row?.quantity);
   const unit = normalizeUnit(line.unit || row?.unit || "");
@@ -11527,7 +11526,7 @@ function renderBasisLine(section, line, index) {
   const lineTitle = basisLineTitle(line);
   const pillTitleAttribute = pillTitle ? ` title="${escapeHtml(pillTitle)}"` : "";
   const lineTitleAttribute = lineTitle ? ` title="${escapeHtml(lineTitle)}"` : "";
-  const unmatchedOffer = basisUnmatchedOffer(line, pricingRow);
+  const unmatchedOffer = tag === "Exclude" ? "" : basisUnmatchedOffer(line, pricingRow);
   const keptUnmatched = unmatchedOffer && pricingRow.deferred_pricing === unmatchedOffer;
   const rowClasses = [
     "basis-line-row",
@@ -11633,6 +11632,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
     : '<div class="basis-visual-display"><strong>Detected booth</strong></div>';
   const reviewLineCount = basisTotalLineCount(reviewSections);
   const outputLineCount = basisOutputLineCount(sections);
+  const sectionsWithActions = new Set();
   return `
     <div class="assistant-card quote-basis-card ${aiFailed ? "quote-basis-card-failed" : ""}">
       <div class="quote-basis-header">
@@ -11666,21 +11666,27 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
           ${reviewSections.map((section) => ({
             ...section,
             reviewLineEntries: section.reviewLineEntries.filter((entry) => entry.group === group),
-          })).filter((section) => section.reviewLineEntries.length).map((section) => `
+          })).filter((section) => section.reviewLineEntries.length).map((section) => {
+            const showActions = !sectionsWithActions.has(section.id);
+            sectionsWithActions.add(section.id);
+            return `
           <div class="basis-review-item">
             <div class="basis-section-heading">
               <h4>${escapeHtml(section.title)}</h4>
+              ${showActions ? `
               <span class="basis-section-actions">
-                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-group="${group}" data-basis-section-action="Include" aria-label="Accept all ${group.toLowerCase()} lines in ${escapeHtml(section.title)}" title="Accept all visible lines">&#x2713;</button>
-                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-group="${group}" data-basis-section-action="Exclude" aria-label="Exclude all ${group.toLowerCase()} lines in ${escapeHtml(section.title)}" title="Exclude all visible lines">X</button>
+                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-action="Include" aria-label="Accept all review lines in ${escapeHtml(section.title)}" title="Accept all review lines">&#x2713;</button>
+                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-action="Exclude" aria-label="Exclude all review lines in ${escapeHtml(section.title)}" title="Exclude all review lines">X</button>
                 <span class="basis-section-action-spacer" aria-hidden="true"></span>
               </span>
+              ` : ""}
             </div>
             <ul class="basis-line-list">
               ${section.reviewLineEntries.map((entry) => renderBasisLine(section, entry.line, entry.index)).join("")}
             </ul>
           </div>
-          `).join("")}
+          `;
+          }).join("")}
         </div>
         `).join("")}
       ` : ""}
@@ -11814,14 +11820,13 @@ function retagBasisLine(sectionId, lineIndex, nextTag) {
   syncControlStates();
 }
 
-function retagBasisSectionConfirmLines(sectionId, nextTag, group = "") {
+function retagBasisSectionConfirmLines(sectionId, nextTag) {
   if (!sectionId || !["Include", "Exclude"].includes(nextTag)) return;
   const sections = cloneQuoteBasisSections(state.quoteBasisSections);
   const section = sections.find((item) => item.id === sectionId);
   if (!section) return;
   let changed = false;
   section.lines = (section.lines || []).map((line) => {
-    if (group && basisPricingGroup(line) !== group) return line;
     const resolvedTag = nextTag === "Include" && basisLineAcceptsAsAiProposal(line) ? "Custom" : nextTag;
     const customPricing = isCustomPricingBasisLine(line) || resolvedTag === "Custom";
     const customConfirmed = customPricing && nextTag === "Include";
@@ -17584,8 +17589,9 @@ function handleQuoteBasisClick(event) {
     const { basisSection, basisLineIndex } = deferButton.dataset;
     const sections = cloneQuoteBasisSections(state.quoteBasisSections);
     const line = sections.find((section) => section.id === basisSection)?.lines?.[Number(basisLineIndex)];
-    const row = line && basisPricingRow(line);
-    const offer = line && basisUnmatchedOffer(line, row);
+    if (!line || normalizeBasisTag(line.tag) === "Exclude") return;
+    const row = basisPricingRow(line);
+    const offer = basisUnmatchedOffer(line, row);
     if (!offer) return;
     line.tag = "Custom";
     line.custom_pricing = true;
@@ -17609,8 +17615,7 @@ function handleQuoteBasisClick(event) {
   if (sectionAction) {
     retagBasisSectionConfirmLines(
       sectionAction.dataset.basisSection || "",
-      sectionAction.dataset.basisSectionAction || "",
-      sectionAction.dataset.basisGroup || ""
+      sectionAction.dataset.basisSectionAction || ""
     );
     return;
   }
