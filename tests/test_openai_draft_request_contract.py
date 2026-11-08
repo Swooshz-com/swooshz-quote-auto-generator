@@ -1201,6 +1201,33 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.assertEqual(error.exception.diagnostics["batch_number"], 1)
                 self.assertEqual(self.send.call_count, 3)
 
+    def test_encoded_batch_observation_limit_before_synthesis(self):
+        limit = server.MAX_DRAFT_BATCH_RESULT_CHARS
+        for size in (limit - 1, limit, limit + 1):
+            with self.subTest(size=size):
+                self.send.reset_mock()
+                def send(request, **kwargs):
+                    body = json.loads(request.data)
+                    parts = body["input"][0]["content"]
+                    if not parts[0]["text"].startswith("Inspect each attached visual"):
+                        return json_response(body["model"], {})
+                    observations = ["observed"] * (len(parts) - 1)
+                    encoded_length = len(json.dumps({"observations": observations}))
+                    observations[0] += "x" * (size - encoded_length)
+                    return json_response(body["model"], {"observations": observations})
+
+                self.send.side_effect = send
+                payload = self.payload(synthetic_pdf(13))
+                if size <= limit:
+                    self.capture(payload)
+                    self.assertEqual(self.send.call_count, 4)
+                else:
+                    with self.assertRaises(server.DraftBatchError) as error:
+                        self.capture(payload)
+                    self.assertEqual(error.exception.diagnostics["batch_failure_reason"], "batch_output_limit")
+                    self.assertTrue(all("Inspect each attached visual" in json.loads(call.args[0].data)["input"][0]["content"][0]["text"]
+                                        for call in self.send.call_args_list))
+
     def test_invalid_media_never_enters_local_starter_fallback(self):
         with mock.patch.object(server, "default_quote_basis") as fallback:
             with self.assertRaises(server.OpenAIAnalysisError):

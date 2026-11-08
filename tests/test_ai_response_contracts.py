@@ -326,6 +326,10 @@ class StrictSynthesisTest(unittest.TestCase):
         first, repair = transport.calls[-2:]
         self.assertEqual(first['text'], repair['text'])
         self.assertEqual(first['text'], contracts.DRAFT_SYNTHESIS.text_format())
+        prompt = first['input'][0]['content'][0]['text']
+        self.assertIn('Use null quantity and unit for genuinely unmeasured or purely informational lines.', prompt)
+        self.assertIn('Keep unmeasured physical lines in the basis for review.', prompt)
+        self.assertIn('Do not emit line_items for informational lines.', prompt)
         for key in ('model', 'reasoning', 'provider', 'store'):
             self.assertEqual(first[key], repair[key])
         self.assertIn(contracts.DRAFT_SYNTHESIS.field_instructions(), repair['input'][0]['content'][0]['text'])

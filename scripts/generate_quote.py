@@ -908,7 +908,20 @@ def prepare_lines(
             }, price_rows, trusted_reference=trusted_pricing_reference,
                 quote_currency=clean_text(brief.get("currency")))
             variant = clean_text(authority.get("variant") if authority else "").lower()
-            if authority is None or variant not in {"manual", "catalog", "included"}:
+            if (
+                variant == "none"
+                and brief.get("_pricing_authority_enforced") is True
+                and isinstance(item.get("deferred_pricing"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", item["deferred_pricing"])
+                and item.get("source_basis_line_id")
+                and price_mode == "Priced"
+                and not pricing_keyword and not display_price and unit_price_override in (None, "")
+                and clean_text(item.get("description")) and normalized_unit
+                and quantity_num is not None and math.isfinite(quantity_num) and quantity_num > 0
+            ):
+                status = "deferred-pricing"
+                display_price = "Price to be discussed"
+            elif authority is None or variant not in {"manual", "catalog", "included"}:
                 status = "unmatched"
             elif variant == "included":
                 status = "included"
@@ -1000,6 +1013,10 @@ def prepare_lines(
 
 def confirmation_issues(missing: list[str], lines: list[QuoteLine]) -> list[str]:
     issues = [f"Missing required field: {field}" for field in missing]
+    if any(line.match_status == "deferred-pricing" for line in lines) and not any(
+        line.match_status in {"matched", "matched-from-ambiguous", "manual-price", "included"} for line in lines
+    ):
+        issues.append("Resolve pricing for at least one line item before generating Excel.")
     for line in lines:
         if line.match_status == "unmatched":
             issues.append(f"Unmatched pricing: {line.description} / keyword `{line.pricing_keyword}`")
@@ -3422,13 +3439,15 @@ def render_quote_entries(lines: list[QuoteLine], brief: dict[str, Any] | None = 
             active_section_entry["amount"] = round_commercial_cents(
                 float(active_section_entry["amount"] or 0.0) + float(line_amount_value(line, exchange_rate) or 0.0)
             ) or 0.0
-            detail_amount = None
+            if line.match_status != "deferred-pricing":
+                detail_amount = None
         entries.append({
             "kind": "item",
             "number": f"{section_number}.{detail_number}",
             "quantity": quantity_text(line),
             "description_lines": wrapped_description(customer_quote_description(line.description)),
             "amount": detail_amount,
+            "deferred_pricing": line.match_status == "deferred-pricing",
         })
     for index, entry in enumerate(entries):
         if entry["kind"] != "section" or not entry.get("section_grouped"):
@@ -3437,10 +3456,16 @@ def render_quote_entries(lines: list[QuoteLine], brief: dict[str, Any] | None = 
         for follower in entries[index + 1:]:
             if follower["kind"] == "section":
                 break
-            covered_numbers.append(follower["number"])
+            if not follower["deferred_pricing"]:
+                covered_numbers.append(follower["number"])
         if covered_numbers:
             first, last = covered_numbers[0], covered_numbers[-1]
-            entry["coverage"] = f"Covers line items {first} to {last}" if first != last else f"Covers line item {first}"
+            if len(covered_numbers) != int(last.split(".")[-1]) - int(first.split(".")[-1]) + 1:
+                entry["coverage"] = "Covers resolved line items only"
+            else:
+                entry["coverage"] = f"Covers line items {first} to {last}" if first != last else f"Covers line item {first}"
+        else:
+            entry["amount"] = None
     return entries
 
 

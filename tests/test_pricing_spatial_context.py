@@ -32,6 +32,7 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(evidence['selectionStatuses'], [200])
         self.assertEqual(evidence['spatialBeforeConfirm']['price'], None)
         self.assertEqual(evidence['saveReopen'], 'PASS')
+        self.assertTrue(evidence['deferredReopened'])
         self.assertEqual(evidence['xlsx']['status'], 'PASS')
         self.assertEqual(json.loads(evidence['xlsx']['validator'])['bad'], [])
 
@@ -180,6 +181,77 @@ class PricingSpatialContextTest(unittest.TestCase):
                 _, result = self.fixture._owner_server_selection(payload, item, f'quote-spatial-negative-{index}')
                 self.assertEqual(result['selections'][0]['reason'], reason)
                 self.assertIsNone(self.fixture._ledger_price(result['line_items'], 'selected-row'))
+
+    def test_deferred_pricing_binds_scope_measurements_session_and_current_catalogue(self):
+        payload, _ = self.fixture._owner_possible_match_payload(False, 'Synthetic kinetic sculpture')
+        payload['quote_session'] = {'session_id': 'quote-deferred-synthetic'}
+        row = payload['line_items'][0]
+        row.update(section='Special Effects', quantity=2, unit='nos')
+        row['pricing_authority'] = webapp.build_pricing_authority('none', row)
+        line = {'id': row['source_basis_line_id'], 'tag': 'Custom', 'text': row['description'],
+                'custom_pricing': True, 'quantity': 2, 'unit': 'nos'}
+        payload['quote_basis_sections'] = [{'id': 'special-effects', 'title': 'Special Effects', 'lines': [line]}]
+        payload['quote_basis'] = webapp.quote_basis_from_sections(payload['quote_basis_sections'])
+        [offered] = webapp.project_deferred_pricing(payload, [row], offer=True)
+        token = offered['unmatched_pricing_offer']
+        self.assertNotIn('deferred_pricing', webapp.normalize_line_items_for_final_brief(payload)[0])
+        line['custom_confirmed'] = True
+        row['deferred_pricing'] = token
+        payload['quote_basis'] = webapp.quote_basis_from_sections(payload['quote_basis_sections'])
+        for normalizer in (webapp.normalize_line_items_for_quote_basis_review, webapp.normalize_line_items_for_final_brief):
+            [normalised] = normalizer(payload)
+            self.assertEqual(normalised['deferred_pricing'], token)
+            self.assertEqual(normalised['pricing_authority']['variant'], 'none')
+            self.assertNotIn('approved_quote_amount', normalised)
+        diagnostic_row = {**normalised, 'diagnostic_row_id': 'row-0'}
+        diagnostic = {'source_basis_line_id': row['source_basis_line_id'], 'diagnostic_row_id': 'row-0',
+                      'status': 'deferred-pricing'}
+        self.assertEqual(webapp.generation_output_rows([diagnostic_row], [diagnostic])['rows'][0]['deferred_pricing'], token)
+        with self.assertRaisesRegex(ValueError, 'contradicts the admitted pricing deferral'):
+            webapp.generation_output_rows([diagnostic_row], [{**diagnostic, 'status': 'unmatched'}])
+
+        for field, value in (('deferred_pricing', '0' * 64), ('quantity', 3),
+                             ('unit_price_override', 0), ('pricing_authority', 'none')):
+            bad = copy.deepcopy(payload)
+            bad['line_items'][0][field] = value
+            self.assertTrue(all('deferred_pricing' not in r for r in webapp.normalize_line_items_for_final_brief(bad)), field)
+        copied = copy.deepcopy(payload)
+        copied['quote_session']['session_id'] = 'quote-other-synthetic'
+        self.assertNotIn('deferred_pricing', webapp.normalize_line_items_for_final_brief(copied)[0])
+        excluded = copy.deepcopy(payload)
+        excluded['quote_basis_sections'][0]['lines'][0]['tag'] = 'Exclude'
+        excluded['quote_basis'] = webapp.quote_basis_from_sections(excluded['quote_basis_sections'])
+        self.assertNotIn('deferred_pricing', webapp.normalize_line_items_for_final_brief(excluded)[0])
+        selection = webapp.explicit_pricing_reference_selection(payload)
+        late_catalogue = {
+            'id': selection['id'], 'source': selection['source'], 'currency': 'SGD',
+            'items': [{'id': f'test-{index}', 'section': 'Structures', 'description': f'Fixture beam {index}',
+                       'unit_hint': 'nos', 'sale_unit_price': 10} for index in range(499)]
+            + [{'id': 'late-sculpture', 'section': row['section'], 'description': row['description'],
+                'unit_hint': 'nos', 'sale_unit_price': 80}],
+        }
+        self.assertFalse(any(entry['id'] == 'late-sculpture' for entry in webapp.pricing_catalog_prompt_rows_from_reference(late_catalogue)))
+        reader = lambda *_args, **_kwargs: late_catalogue
+        self.assertNotIn('unmatched_pricing_offer', webapp.project_deferred_pricing(payload, [row], offer=True, reference_reader=reader)[0])
+        self.assertNotIn('deferred_pricing', webapp.project_deferred_pricing(payload, [row], reference_reader=reader)[0])
+
+        self.fixture._ledger_sync(payload)
+        storage = webapp.LocalSqagStorage()
+        storage.create_or_update_quote_session(payload)
+        reopened = webapp.read_quote_session_metadata(payload['quote_session']['session_id'])
+        payload['quote_session']['draft_state'] = reopened['draft_state']
+        self.assertEqual(webapp.normalize_line_items_for_final_brief(payload)[0]['deferred_pricing'], token)
+
+        priced = {**row, 'source_basis_line_id': 'manual-synthetic', 'description': 'Manual item',
+                  'quantity': 1, 'unit_price_override': 50}
+        priced.pop('deferred_pricing')
+        priced['pricing_authority'] = webapp.build_pricing_authority(
+            'manual', priced, price=50, reference_authority=webapp.exact_pricing_reference_authority(payload))
+        draft_state = payload['quote_session']['draft_state']
+        draft_state['outputRows'] = [row, priced]
+        self.assertEqual(webapp.quote_session_commercials(payload, {})['subtotal'], 50)
+        draft_state['outputRows'][0] = {**row, 'deferred_pricing': '0' * 64}
+        self.assertIsNone(webapp.quote_session_commercials(payload, {})['subtotal'])
 
 
 if __name__ == '__main__':

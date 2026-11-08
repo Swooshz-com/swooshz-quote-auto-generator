@@ -3506,6 +3506,8 @@ function normalizeLineItem(item = {}) {
     item_order: orderNumber(item.item_order) ?? "",
     basis_order: orderNumber(item.basis_order) ?? "",
     status: item.status || "",
+    ...(item.unmatched_pricing_offer ? { unmatched_pricing_offer: item.unmatched_pricing_offer } : {}),
+    ...(item.deferred_pricing ? { deferred_pricing: item.deferred_pricing } : {}),
     ...(Object.prototype.hasOwnProperty.call(item, "effective_unit_price") ? { effective_unit_price: item.effective_unit_price } : {}),
     ...(Object.prototype.hasOwnProperty.call(item, "pricing_basis_amount") ? { pricing_basis_amount: item.pricing_basis_amount } : {}),
     ...(Object.prototype.hasOwnProperty.call(item, "approved_quote_amount") ? { approved_quote_amount: item.approved_quote_amount } : {}),
@@ -7666,6 +7668,7 @@ function normalizeOutputRow(row = {}) {
     item_order: orderNumber(row.item_order) ?? "",
     basis_order: orderNumber(row.basis_order) ?? "",
     status: row.status || "",
+    ...(row.deferred_pricing ? { deferred_pricing: row.deferred_pricing } : {}),
   });
   const numericFields = ["effective_unit_price", "pricing_basis_amount", "approved_quote_amount"];
   numericFields.forEach((key) => {
@@ -10171,6 +10174,7 @@ function outputRowFromLineItem(item = {}) {
     item_order: normalized.item_order,
     basis_order: normalized.basis_order,
     status: normalized.status || "",
+    ...(normalized.deferred_pricing ? { deferred_pricing: normalized.deferred_pricing } : {}),
     ...(capturedUnitPrice !== null ? {
       effective_unit_price: capturedUnitPrice,
       pricing_basis_amount: capturedBasisAmount,
@@ -10328,6 +10332,7 @@ function outputPriceDenomination(row = {}) {
 }
 
 function outputCellDisplayValue(row = {}, field = "") {
+  if (field === "amount" && outputPricingIsDeferred(row)) return "Price to be discussed";
   if (field === "price_mode") return outputPriceAuthority(row)?.variant === "included" ? "Included" : "Priced";
   if (["unit_price_override", "quoted_unit_price", "amount"].includes(field)) {
     const authority = outputPriceAuthority(row);
@@ -10540,6 +10545,7 @@ function outputRowsToLineItems(rows = state.outputRows) {
       price_mode: row.price_mode === "Included" ? "Included" : "Priced",
       source_basis_line_id: row.source_basis_line_id || "",
       ...(Object.prototype.hasOwnProperty.call(row, "pricing_authority") ? { pricing_authority: row.pricing_authority } : {}),
+      ...(outputPricingIsDeferred(row) ? { deferred_pricing: row.deferred_pricing } : {}),
     };
     if (!next.source_basis_line_id) delete next.source_basis_line_id;
     const catalogUnitPrice = numberOrNull(row.catalog_unit_price);
@@ -10612,6 +10618,13 @@ function pricingSelectionReviewMessage(row, rows) {
   return Object.prototype.hasOwnProperty.call(messages, issues[0].reason) ? messages[issues[0].reason] : "";
 }
 
+function outputPricingIsDeferred(row) {
+  return row?.pricing_authority?.variant === "none"
+    && /^[0-9a-f]{64}$/.test(row.deferred_pricing || "")
+    && !row.pricing_keyword && row.price_mode !== "Included"
+    && (row.unit_price_override === "" || row.unit_price_override == null);
+}
+
 function outputRowsValid(rows = state.outputRows) {
   const ownedCommercial = typeof quoteCommercialStateIsOwned === "function" && quoteCommercialStateIsOwned();
   const errors = [];
@@ -10623,7 +10636,7 @@ function outputRowsValid(rows = state.outputRows) {
     if (row.price_mode !== "Included" && (quantity === null || quantity <= 0)) {
       errors.push(`${label}: Quantity must be greater than 0.`);
     }
-    if (row.price_mode !== "Included") {
+    if (row.price_mode !== "Included" && !outputPricingIsDeferred(row)) {
       const unitPrice = ownedCommercial ? effectiveOutputUnitPrice(row) : numberOrNull(row.unit_price_override);
       const catalogUnitPrice = ownedCommercial ? null : numberOrNull(row.catalog_unit_price);
       const unitPriceKind = unitPriceEditKind(row.unit_price_override);
@@ -10636,6 +10649,9 @@ function outputRowsValid(rows = state.outputRows) {
       }
     }
   });
+  if (rows.length && rows.every(outputPricingIsDeferred)) {
+    errors.push("Resolve pricing for at least one line item before generating Excel.");
+  }
   return { valid: errors.length === 0 && rows.length > 0, errors };
 }
 
@@ -10721,6 +10737,7 @@ function rowNeedsManualInput(row = {}) {
   const hasPricingKeyword = Boolean(String(row.pricing_keyword || "").trim());
   const amountMissing = outputCellDisplayValue(row, "amount") === "???";
   if (quantity === null || quantity <= 0) return true;
+  if (outputPricingIsDeferred(row)) return !String(row.unit || "").trim();
   if (unitPrice === null || unitPrice < 0) return true;
   if (!hasPricingKeyword && numberOrNull(row.unit_price_override) === null) return true;
   return amountMissing;
@@ -10730,7 +10747,7 @@ function matchSummaryStats(rows = []) {
   const safeRows = Array.isArray(rows) ? rows : [];
   const sections = new Set(safeRows.map((row) => String(row.section || "").trim()).filter(Boolean)).size;
   const needsManualInput = safeRows.filter(rowNeedsManualInput).length;
-  const pricedRows = safeRows.filter((row) => row.price_mode === "Included" || !rowNeedsManualInput(row)).length;
+  const pricedRows = safeRows.filter((row) => !outputPricingIsDeferred(row) && (row.price_mode === "Included" || !rowNeedsManualInput(row))).length;
   const ownedCommercial = typeof state !== "undefined"
     && ["EXISTING", "RECOVERED"].includes(String(state.quoteCommercialLifecycle || ""));
   const tax = typeof collectTaxDetails === "function" ? collectTaxDetails() : {};
@@ -10740,7 +10757,7 @@ function matchSummaryStats(rows = []) {
     || commercialTaxRateOrNull(tax?.rate) === null
     || !String(tax?.label || "").trim()
   );
-  const totalPending = needsManualInput > 0 || commercialIncomplete;
+  const totalPending = needsManualInput > 0 || commercialIncomplete || (safeRows.length > 0 && safeRows.every(outputPricingIsDeferred));
   const total = safeRows.reduce((sum, row) => {
     const amount = quoteAmountValue(row.amount, outputRowFxMultiplier(row));
     return Number.isFinite(amount) ? sum + amount : sum;
@@ -10950,6 +10967,7 @@ function commitOutputEditor(editor) {
     if (["source_basis_line_id", "section", "description", "unit", "pricing_keyword"].includes(field)) nextRow.pricing_authority = buildPricingAuthority("historical", nextRow);
   }
   // Consume before rerender, so synchronous focusout/change cannot replay.
+  delete nextRow.deferred_pricing;
   revokeOutputEditor();
   state.outputRows[index] = preserveOutputRowIdentity(currentRow, recalculateOutputRow(nextRow));
   state.lineItems = outputRowsToLineItems();
@@ -10975,6 +10993,7 @@ function applyOutputIncludedAction(button) {
   revokeOutputEditor();
   if (unchanged) { renderPricingMatches(state.outputRows); return "unchanged"; }
   const next = { ...row, price_mode: "Included", unit_price_override: "" };
+  delete next.deferred_pricing;
   delete next.display_price;
   next.pricing_authority = buildPricingAuthority("included", next);
   state.outputRows[index] = recalculateOutputRow(next);
@@ -11001,6 +11020,7 @@ async function applyOutputReferencePricing(button) {
   const rowId = String(row.source_basis_line_id || "");
   if (!rowId || state.outputRows.filter((entry) => entry.source_basis_line_id === rowId).length !== 1) return "unchanged";
   const next = { ...row, pricing_keyword: item.id, price_mode: "Priced" };
+  delete next.deferred_pricing;
   delete next.display_price;
   const authority = normalizeOutputPricingAuthority(
     buildPricingAuthority("catalog", next, { price, reference, catalogItem: item }), next, { reference, catalogItem: item },
@@ -11371,10 +11391,39 @@ function hasPricingReferenceDescription(line = {}) {
   return Boolean(pricingReferenceLineText(line.pricing_reference_description || ""));
 }
 
-function basisLinePillLabel(line = {}) {
+function basisLinePillLabel(line = {}, pricingRow = basisPricingRow(line)) {
   const tag = normalizeBasisTag(line.tag);
+  const variant = pricingRow?.pricing_authority?.variant;
+  if (tag !== "Exclude" && variant === "manual") return "Manual price";
+  if (tag !== "Exclude" && variant === "included") return "Included";
   if (isPendingAiProposalLine(line)) return "AI Confirm";
   return basisTagLabel(tag);
+}
+
+function basisPricingRow(line) {
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  const rows = (state.outputRows?.length ? state.outputRows : state.lineItems || [])
+    .filter((row) => ids.has(row.source_basis_line_id));
+  return rows.length === 1 ? rows[0] : null;
+}
+
+function basisUnmatchedOffer(line, row = basisPricingRow(line)) {
+  if (!row || row.pricing_authority?.variant !== "none" || line.pricing_keyword
+    || normalizeBasisTag(line.tag) === "Exclude" || line.possible_pricing_matches?.length) return "";
+  if (cleanCustomerQuoteLineText(line.text) !== row.description
+    || numberOrNull(line.quantity) !== numberOrNull(row.quantity)
+    || normalizeUnit(line.unit) !== normalizeUnit(row.unit)) return "";
+  return row.unmatched_pricing_offer || row.deferred_pricing || "";
+}
+
+function basisPricingGroup(line) {
+  if (normalizeBasisTag(line.tag) === "Exclude") return "Review";
+  const row = basisPricingRow(line);
+  const quantity = numberOrNull(line.quantity ?? row?.quantity);
+  const unit = normalizeUnit(line.unit || row?.unit || "");
+  const variant = row?.pricing_authority?.variant;
+  if (variant === "included" || (quantity > 0 && unit && ["catalog", "manual"].includes(variant))) return "Matched";
+  return basisUnmatchedOffer(line, row) ? "Unmatched" : "Review";
 }
 
 function basisLineAcceptsAsAiProposal(line = {}) {
@@ -11469,7 +11518,8 @@ function renderBasisLine(section, line, index) {
   const tag = normalizeBasisTag(line.tag);
   const customPricing = isCustomPricingBasisLine(line);
   const pendingAiProposal = isPendingAiProposalLine(line);
-  const pillLabel = basisLinePillLabel(line);
+  const pricingRow = basisPricingRow(line);
+  const pillLabel = basisLinePillLabel(line, pricingRow);
   const acceptsAsAiProposal = basisLineAcceptsAsAiProposal(line);
   const quantityLabel = basisQuantityDisplayLabel(line);
   const confidenceLabel = basisConfidenceLabel(line);
@@ -11477,6 +11527,8 @@ function renderBasisLine(section, line, index) {
   const lineTitle = basisLineTitle(line);
   const pillTitleAttribute = pillTitle ? ` title="${escapeHtml(pillTitle)}"` : "";
   const lineTitleAttribute = lineTitle ? ` title="${escapeHtml(lineTitle)}"` : "";
+  const unmatchedOffer = basisUnmatchedOffer(line, pricingRow);
+  const keptUnmatched = unmatchedOffer && pricingRow.deferred_pricing === unmatchedOffer;
   const rowClasses = [
     "basis-line-row",
     `basis-line-${tag.toLowerCase()}`,
@@ -11495,7 +11547,13 @@ function renderBasisLine(section, line, index) {
         <span class="basis-confidence-pill" title="AI confidence">${escapeHtml(confidenceLabel)}</span>
         <span class="basis-quantity-text">${escapeHtml(quantityLabel)}</span>
       </span>
-      <span class="basis-line-text"${lineTitleAttribute}>${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}</span>
+      <span class="basis-line-text"${lineTitleAttribute}>
+        ${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}
+        ${unmatchedOffer ? `<span class="basis-line-possible-matches">
+          ${keptUnmatched ? "<small>Price to be discussed</small>" : ""}
+          <button class="basis-line-possible-match" type="button" data-basis-defer-pricing data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}">${keptUnmatched ? "Undo keep" : "Keep as unpriced"}</button>
+        </span>` : ""}
+      </span>
       <span class="basis-line-actions">
         ${primaryAction}
         <button class="basis-line-tag-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-tag="Exclude" aria-label="Mark this line as excluded" title="Mark excluded">X</button>
@@ -11554,7 +11612,8 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
       ...section,
       reviewLineEntries: (section.lines || [])
         .map((line, index) => ({ line, index }))
-        .filter((entry) => !basisLineIsInformationalDimension(entry.line)),
+        .filter((entry) => !basisLineIsInformationalDimension(entry.line))
+        .map((entry) => ({ ...entry, group: basisPricingGroup(entry.line) })),
     }))
     .map((section) => ({ ...section, lines: section.reviewLineEntries.map((entry) => entry.line) }))
     .filter((section) => section.reviewLineEntries.length);
@@ -11565,13 +11624,13 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
   const dimensionDisplay = dimensionLines.length
     ? `
       <div class="basis-visual-display" aria-label="Booth display details">
-        <strong>Booth Details</strong>
+        <strong>Detected booth</strong>
         <ul>
           ${dimensionLines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}
         </ul>
       </div>
     `
-    : "";
+    : '<div class="basis-visual-display"><strong>Detected booth</strong></div>';
   const reviewLineCount = basisTotalLineCount(reviewSections);
   const outputLineCount = basisOutputLineCount(sections);
   return `
@@ -11601,14 +11660,19 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
       ${renderBasisTagLegend()}
       ${dimensionDisplay}
       ${reviewSections.length ? `
-        <div class="basis-review-grid">
-          ${reviewSections.map((section) => `
+        ${["Matched", "Review", "Unmatched"].map((group) => `
+        <div class="basis-review-grid" aria-label="${group}">
+          <h4>${group}</h4>
+          ${reviewSections.map((section) => ({
+            ...section,
+            reviewLineEntries: section.reviewLineEntries.filter((entry) => entry.group === group),
+          })).filter((section) => section.reviewLineEntries.length).map((section) => `
           <div class="basis-review-item">
             <div class="basis-section-heading">
               <h4>${escapeHtml(section.title)}</h4>
               <span class="basis-section-actions">
-                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-action="Include" aria-label="Accept all review lines in ${escapeHtml(section.title)}" title="Accept all review lines">&#x2713;</button>
-                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-action="Exclude" aria-label="Exclude all review lines in ${escapeHtml(section.title)}" title="Exclude all review lines">X</button>
+                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-group="${group}" data-basis-section-action="Include" aria-label="Accept all ${group.toLowerCase()} lines in ${escapeHtml(section.title)}" title="Accept all visible lines">&#x2713;</button>
+                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-group="${group}" data-basis-section-action="Exclude" aria-label="Exclude all ${group.toLowerCase()} lines in ${escapeHtml(section.title)}" title="Exclude all visible lines">X</button>
                 <span class="basis-section-action-spacer" aria-hidden="true"></span>
               </span>
             </div>
@@ -11618,6 +11682,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
           </div>
           `).join("")}
         </div>
+        `).join("")}
       ` : ""}
     </div>
   `;
@@ -11749,13 +11814,14 @@ function retagBasisLine(sectionId, lineIndex, nextTag) {
   syncControlStates();
 }
 
-function retagBasisSectionConfirmLines(sectionId, nextTag) {
+function retagBasisSectionConfirmLines(sectionId, nextTag, group = "") {
   if (!sectionId || !["Include", "Exclude"].includes(nextTag)) return;
   const sections = cloneQuoteBasisSections(state.quoteBasisSections);
   const section = sections.find((item) => item.id === sectionId);
   if (!section) return;
   let changed = false;
   section.lines = (section.lines || []).map((line) => {
+    if (group && basisPricingGroup(line) !== group) return line;
     const resolvedTag = nextTag === "Include" && basisLineAcceptsAsAiProposal(line) ? "Custom" : nextTag;
     const customPricing = isCustomPricingBasisLine(line) || resolvedTag === "Custom";
     const customConfirmed = customPricing && nextTag === "Include";
@@ -15282,7 +15348,12 @@ async function modifyDashboardQuote(sessionId, options = {}) {
 }
 
 function copiedQuotePricingRow(row, normalizer = normalizeLineItem) {
-  if (row?.pricing_authority?.variant !== "catalog") return { ...row };
+  if (row?.pricing_authority?.variant !== "catalog") {
+    const copied = { ...row };
+    delete copied.unmatched_pricing_offer;
+    delete copied.deferred_pricing;
+    return copied;
+  }
   const unbound = { ...row, pricing_keyword: "", catalog_description: "", pricing_reference_description: "", status: "unmatched" };
   delete unbound.pricing_authority;
   // Reuse legacy recovery's price demotion. Source prices are evidence only;
@@ -17315,6 +17386,8 @@ function setSidePanel(panelName, options = {}) {
   });
   if (state.activeSidePanel === "basis" && (state.blockingClarificationQuestions || []).length && !state.quoteBasisSections.length && !state.lineItems.length) {
     renderClarificationQuestions();
+  } else if (nextPanel === "basis" && nextPanel !== previousPanel && state.quoteBasisSections.length) {
+    updateQuoteBasisCard(state.basisConfirmed ? state.draftSource : "edited");
   }
   elements.sideWorkspace.setAttribute("aria-hidden", "false");
   updateSidePanelNav();
@@ -17505,11 +17578,39 @@ async function goToNextSidePanel(options = {}) {
 }
 
 function handleQuoteBasisClick(event) {
+  const deferButton = event.target.closest("[data-basis-defer-pricing]");
+  if (deferButton) {
+    if (appIsBusy()) return;
+    const { basisSection, basisLineIndex } = deferButton.dataset;
+    const sections = cloneQuoteBasisSections(state.quoteBasisSections);
+    const line = sections.find((section) => section.id === basisSection)?.lines?.[Number(basisLineIndex)];
+    const row = line && basisPricingRow(line);
+    const offer = line && basisUnmatchedOffer(line, row);
+    if (!offer) return;
+    line.tag = "Custom";
+    line.custom_pricing = true;
+    line.custom_confirmed = row.deferred_pricing !== offer;
+    row.unmatched_pricing_offer = offer;
+    if (line.custom_confirmed) row.deferred_pricing = offer;
+    else delete row.deferred_pricing;
+    state.lineItems = state.lineItems.map((item) => item.source_basis_line_id === row.source_basis_line_id ? { ...row } : item);
+    state.quoteBasisSections = sections;
+    state.quoteBasis = quoteBasisFromSections(sections);
+    state.basisConfirmed = false;
+    state.outputRows = [];
+    state.originalOutputRows = [];
+    markOutputRowsDirty();
+    updateQuoteBasisCard("edited");
+    syncControlStates();
+    queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+    return;
+  }
   const sectionAction = event.target.closest("[data-basis-section-action]");
   if (sectionAction) {
     retagBasisSectionConfirmLines(
       sectionAction.dataset.basisSection || "",
-      sectionAction.dataset.basisSectionAction || ""
+      sectionAction.dataset.basisSectionAction || "",
+      sectionAction.dataset.basisGroup || ""
     );
     return;
   }

@@ -2643,6 +2643,54 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(entries[2]["amount"], None)
         self.assertEqual(entries[0]["coverage"], "Covers line items 1.1 to 1.2")
 
+    def test_deferred_price_is_literal_and_excluded_from_grouped_formula_totals(self):
+        def item(row_id, description, *, price=None, deferred=False):
+            row = {"source_basis_line_id": row_id, "section": "Special Effects",
+                   "description": description, "quantity": 2, "unit": "nos"}
+            row["pricing_authority"] = {
+                "schema": quote.PRICING_AUTHORITY_SCHEMA, "version": 1, "variant": "none" if price is None else "manual",
+                "context": quote.pricing_authority_context(row),
+                **({"price": price, "currency": "SGD"} if price is not None else {}),
+            }
+            if deferred:
+                row["deferred_pricing"] = "a" * 64
+            return row
+
+        brief = {"_pricing_authority_enforced": True, "currency": "SGD", "tax": {"label": "GST", "rate": 0.09},
+                 "_pricing_reference_authority": {"id": "synthetic", "source": "local", "currency": "SGD",
+                                                   "digest": "sha256:" + "b" * 64},
+                 "client": {"name": "Synthetic Client", "attention": "Test Contact"},
+                 "section_pricing": {"Special Effects": "section_total"}, "project": {"title": "Synthetic exhibit"},
+                 "line_items": [item("first", "First priced item", price=50),
+                                item("deferred", "=Deferred synthetic sculpture", deferred=True),
+                                item("last", "Last priced item", price=75)]}
+        lines = quote.prepare_lines(brief, [], False, trusted_pricing_reference=brief["_pricing_reference_authority"])
+        self.assertEqual([line.match_status for line in lines], ["manual-price", "deferred-pricing", "manual-price"])
+        self.assertEqual(quote.confirmation_issues([], lines), [])
+        self.assertTrue(quote.confirmation_issues([], lines[1:2]))
+        self.assertIsNone(lines[1].amount)
+        entries = quote.render_quote_entries(lines, brief)
+        self.assertEqual(entries[0]["coverage"], "Covers resolved line items only")
+        self.assertEqual(entries[0]["amount"], 250)
+        self.assertEqual(entries[2]["amount"], "Price to be discussed")
+        self.assertIsNone(quote.render_quote_entries(lines[1:2], brief)[0]["amount"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
+            with zipfile.ZipFile(path) as workbook:
+                sheet = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+        ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        deferred_ref = find_cell_ref(sheet, "Price to be discussed")
+        self.assertTrue(deferred_ref.startswith("E"))
+        deferred_cell = sheet.find(f".//{ns}c[@r='{deferred_ref}']")
+        self.assertEqual(deferred_cell.get("t"), "inlineStr")
+        self.assertIsNone(deferred_cell.find(ns + "f"))
+        for label, value in (("Total", 250), ("GST 9%", 22.5), ("Total including GST", 272.5)):
+            row_number = quote.parse_cell_ref(find_cell_ref(sheet, label))[0]
+            self.assertEqual(float(cell_value(sheet, f"E{row_number}")), value)
+        self.assertEqual(len(worksheet_formulas(sheet)), 3)
+
     def test_layout_keeps_quantity_column_readable_and_signatory_title_visible(self):
         tmp, path = generate_layout_workbook()
         self.addCleanup(tmp.cleanup)

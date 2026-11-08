@@ -50,7 +50,7 @@ import zipfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlparse
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
@@ -4900,13 +4900,17 @@ def quote_commercial_state_errors(
         for row in rows
     ):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
-    validated_rows = normalize_line_items(canonical, auth_session=auth_session)
+    validated_rows = project_deferred_pricing(
+        canonical, normalize_line_items(canonical, auth_session=auth_session), auth_session,
+    )
     if rows and len(validated_rows) != len(rows):
         errors.append(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
     # Compare captured canonical amounts, not values normalization just recomputed.
     # Explicit valid price edits have already refreshed their derived amounts above.
     for row, captured_row in zip(validated_rows, rows):
         if not isinstance(row, dict):
+            continue
+        if row.get("deferred_pricing"):
             continue
         authority = row.get("pricing_authority") if isinstance(row.get("pricing_authority"), dict) else None
         authority_variant = clean_text(authority.get("variant") if authority else "").lower()
@@ -15809,7 +15813,7 @@ class DatabaseSqagStorage:
         metadata["customer_summary"] = quote_session_customer_summary(payload, patch)
         metadata["quote_company_profile"] = quote_session_profile_summary(payload, patch)
         metadata["pricing_reference"] = quote_session_pricing_reference_summary(payload, patch)
-        metadata["commercials"] = quote_session_commercials(payload, patch)
+        metadata["commercials"] = quote_session_commercials(payload, patch, reference_reader=self.pricing_reference_detail)
         if isinstance(patch.get("draft_state"), dict):
             metadata["draft_state"] = quote_session_draft_state(patch)
             apply_pricing_ledger_save(metadata, existing, self)
@@ -16186,7 +16190,7 @@ class DatabaseSqagStorage:
             metadata["pricing_reference"] = (
                 quote_session_pricing_reference_summary(payload, patch)
             )
-            metadata["commercials"] = quote_session_commercials(payload, patch)
+            metadata["commercials"] = quote_session_commercials(payload, patch, reference_reader=self.pricing_reference_detail)
             status_patch = (
                 patch.get("status")
                 if isinstance(patch.get("status"), dict)
@@ -16481,7 +16485,7 @@ class DatabaseSqagStorage:
         metadata["customer_summary"] = quote_session_customer_summary(payload, patch)
         metadata["quote_company_profile"] = quote_session_profile_summary(payload, patch)
         metadata["pricing_reference"] = quote_session_pricing_reference_summary(payload, patch)
-        metadata["commercials"] = quote_session_commercials(payload, patch)
+        metadata["commercials"] = quote_session_commercials(payload, patch, reference_reader=self.pricing_reference_detail)
         status_patch = patch.get("status") if isinstance(patch.get("status"), dict) else {}
         if isinstance(status_patch.get("quote_generated"), bool):
             metadata["status"]["quote_generated"] = status_patch["quote_generated"]
@@ -21890,6 +21894,10 @@ def pricing_catalog_runtime_lookup_for_payload(
             payload_json = json.loads(pricing_reference_pack_for_payload(payload).pricing_catalog_path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             return {}
+    return pricing_catalog_runtime_lookup(payload_json)
+
+
+def pricing_catalog_runtime_lookup(payload_json: dict[str, Any]) -> dict[str, dict[str, Any]]:
     lookup = {}
     for item in payload_json.get("items") or []:
         if not isinstance(item, dict):
@@ -22604,6 +22612,7 @@ def quote_basis_sections_with_catalog_exact_lines(
     provider_result: bool = False,
     reviewed_selection: bool = False,
     source_units: dict[str, str] | None = None,
+    unmatched_candidates: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     invalid_pricing_keyword_flag = "_invalid_pricing_keyword"
     invalid_pricing_keyword_value_flag = "_invalid_pricing_keyword_value"
@@ -23616,6 +23625,21 @@ def quote_basis_sections_with_catalog_exact_lines(
                 mark_line_custom_for_manual_pricing(line)
     final_sections = merge_duplicate_sections(next_sections)
     attach_possible_pricing_matches(final_sections)
+    if unmatched_candidates is not None:
+        for section in final_sections:
+            for line in section.get("lines") or []:
+                if (
+                    not is_default_dimension_basis_line(line)
+                    and not line_has_exclusion_scope(line.get("text"))
+                    and not clean_text(line.get("pricing_keyword"))
+                    and not item_has_catalog_reference(line)
+                    and not any(
+                        score_possible_catalog_item_for_line(line, item, section)
+                        or score_catalog_item_for_line(line, item, section) >= 3
+                        for item in exact_catalog_items
+                    )
+                ):
+                    unmatched_candidates.add(safe_resource_id(line.get("id"), ""))
     return [
         section for section in final_sections
         if [line for line in (section.get("lines") or []) if isinstance(line, dict) and clean_text(line.get("text"))]
@@ -25131,6 +25155,142 @@ def apply_pricing_selections(
         }
 
 
+def project_deferred_pricing(
+    payload: dict[str, Any],
+    rows: list[dict[str, Any]],
+    auth_session: dict[str, Any] | None = None,
+    *,
+    offer: bool = False,
+    source_measurements: dict[str, list[Any]] | None = None,
+    reference_reader: Callable[..., dict[str, Any] | None] | None = None,
+) -> list[dict[str, Any]]:
+    """Bind an explicit pricing deferral to the current unpriced physical row and reference."""
+    raw_rows = rows if offer else payload.get("line_items")
+    rows = [
+        {key: value for key, value in row.items() if key != "deferred_pricing"}
+        if isinstance(row, dict) and "deferred_pricing" in row else row
+        for row in rows
+    ]
+    if not isinstance(raw_rows, list):
+        return rows
+    session = payload.get("quote_session")
+    session_id = safe_quote_session_id(session.get("session_id") if isinstance(session, dict) else payload.get("session_id"), "")
+    if not session_id:
+        return rows
+    requests: dict[str, list[dict[str, Any]]] = {}
+    for row in raw_rows:
+        if isinstance(row, dict):
+            row_id = safe_resource_id(row.get("source_basis_line_id"), "")
+            requests.setdefault(row_id, []).append(row)
+    if not offer and not any(row.get("deferred_pricing") for group in requests.values() for row in group):
+        return rows
+    if reference_reader is None:
+        reference = exact_pricing_reference_authority(payload, auth_session=auth_session, authoritative_reload=True)
+        detail = reference.get("detail") or {}
+    else:
+        reference = explicit_pricing_reference_selection(payload)
+        detail = reference_reader(reference["id"], source=reference["source"]) if reference["ok"] else None
+        detail = detail or {}
+    digest = pricing_reference_catalog_digest(detail)
+    if not reference.get("ok") or not digest or (detail.get("source"), detail.get("id")) != (reference["source"], reference["id"]):
+        return rows
+    catalog = pricing_catalog_runtime_lookup(pricing_reference_catalog_payload(detail))
+    if not catalog:
+        return rows
+    basis_sections = payload.get("quote_basis_sections")
+    if not isinstance(basis_sections, list):
+        saved_sections = quote_session_draft_state_from_payload(payload).get("quoteBasisSections")
+        basis_sections = saved_sections if isinstance(saved_sections, list) else []
+    basis_lines: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for section in basis_sections:
+        if not isinstance(section, dict) or not isinstance(section.get("lines"), list):
+            continue
+        section_title = normalize_catalog_section(section.get("title"))
+        for line in section["lines"]:
+            if isinstance(line, dict):
+                for line_id in {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}:
+                    basis_lines.setdefault(line_id, []).append((section_title, line))
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_id = safe_resource_id(row.get("source_basis_line_id"), "")
+        if row_id in seen:
+            duplicates.add(row_id)
+        seen.add(row_id)
+    no_price_fields = (
+        "pricing_keyword", "display_price", "unit_price_override", "effective_unit_price",
+        "catalog_unit_price", "pricing_basis_amount", "approved_quote_amount",
+        "catalog_description", "pricing_reference_description",
+    )
+    sections: dict[str, dict[str, Any]] = {}
+    candidates: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, str], float]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        context = pricing_authority_context(row)
+        row_id = context["source_basis_line_id"]
+        raw_group = requests.get(row_id, [])
+        if not row_id or row_id in duplicates or len(raw_group) != 1:
+            continue
+        raw = raw_group[0]
+        if not offer and (not isinstance(raw.get("deferred_pricing"), str) or not re.fullmatch(r"[a-f0-9]{64}", raw["deferred_pricing"])):
+            continue
+        raw_authority = normalize_pricing_authority(raw.get("pricing_authority"), raw)
+        row_authority = row.get("pricing_authority")
+        quantity = pricing_ledger_quantity(row.get("quantity"))
+        linked = basis_lines.get(row_id, [])
+        if len(linked) != 1:
+            continue
+        section_title, line = linked[0]
+        tag = normalize_basis_tag(line.get("tag"))
+        if (
+            quantity is None or not context["section"] or not context["description"] or not context["unit"]
+            or (source_measurements is not None and source_measurements.get(row_id) != [quantity, context["unit"]])
+            or quantity != pricing_ledger_quantity(raw.get("quantity"))
+            or quantity != pricing_ledger_quantity(line.get("quantity"))
+            or section_title != normalize_catalog_section(row.get("section"))
+            or context["unit"] != canonical_pricing_authority_unit(line.get("unit"))
+            or context["description"] != canonical_pricing_authority_text(clean_customer_quote_line_text(line.get("text")))
+            or tag == "Exclude" or clean_text(line.get("pricing_keyword"))
+            or (not offer and not basis_line_allows_quote_output(line))
+            or not raw_authority or raw_authority["variant"] != "none"
+            or not isinstance(row_authority, dict) or row_authority.get("variant") != "none"
+            or raw.get("price_mode") == "Included"
+            or raw.get("_commercial_invalid_unit_price_override") is True
+            or raw.get("status") == "quantity-review"
+            or any(raw.get(key) not in (None, "") or row.get(key) not in (None, "") for key in no_price_fields)
+            or is_informational_dimension_text(context["description"])
+            or line_item_needs_quantity_review(section_title, context["description"], quantity, context["unit"])
+            or infer_catalog_item_for_line_item(row, catalog) is not None
+        ):
+            continue
+        section = sections.setdefault(section_title, {"title": section_title, "lines": []})
+        section["lines"].append({
+            "id": row_id, "text": context["description"], "tag": "Custom",
+            "quantity": quantity, "unit": context["unit"],
+        })
+        candidates[row_id] = row, raw, context, quantity
+    if not candidates:
+        return rows
+    unmatched: set[str] = set()
+    quote_basis_sections_with_catalog_exact_lines(
+        list(sections.values()), [candidate[0] for candidate in candidates.values()],
+        list(catalog.values()), provider_result=True, unmatched_candidates=unmatched,
+    )
+    accepted = {}
+    for row_id in unmatched.intersection(candidates):
+        row, raw, context, quantity = candidates[row_id]
+        binding = [session_id, reference["source"], reference["id"], digest, context, quantity]
+        token = hashlib.sha256(json.dumps(binding, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+        if offer:
+            accepted[row_id] = {**row, "unmatched_pricing_offer": token}
+        elif raw["deferred_pricing"] == token:
+            accepted[row_id] = {**row, "deferred_pricing": token}
+    return [accepted.get(safe_resource_id(row.get("source_basis_line_id"), ""), row) if isinstance(row, dict) else row for row in rows]
+
+
 def normalize_line_items_for_quote_basis_review(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
@@ -25147,6 +25307,7 @@ def normalize_line_items_for_quote_basis_review(
         line_items = normalize_line_items(payload, auth_session=auth_session)
         line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session, ledger_view=ledger_view)
         line_items = line_items_with_pricing_ledger(line_items, ledger_view)
+        line_items = project_deferred_pricing(payload, line_items, auth_session)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
     trusted_input_authorities: dict[str, dict[str, Any]] = {}
     trusted_input_items = normalize_line_items(payload, auth_session=auth_session)
@@ -25163,6 +25324,7 @@ def normalize_line_items_for_quote_basis_review(
     )
     if not sections:
         line_items = line_items_with_pricing_ledger(line_items, ledger_view)
+        line_items = project_deferred_pricing(payload, line_items, auth_session)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
     catalog_lookup = pricing_catalog_runtime_lookup_for_payload(
@@ -25197,6 +25359,7 @@ def normalize_line_items_for_quote_basis_review(
     )
     line_items = line_items_with_confirmed_basis_selections(payload, line_items, auth_session=auth_session, ledger_view=ledger_view)
     line_items = line_items_with_pricing_ledger(line_items, ledger_view)
+    line_items = project_deferred_pricing(payload, line_items, auth_session)
     return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
 
@@ -25215,6 +25378,7 @@ def normalize_line_items_for_final_brief(
     ledger_view = pricing_ledger_view_for_payload(payload, auth_session)
     if commercial_state.get("owned"):
         line_items = line_items_with_pricing_ledger(line_items, ledger_view)
+        line_items = project_deferred_pricing(payload, line_items, auth_session)
         return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
     sections = normalize_quote_basis_sections(
@@ -25229,6 +25393,7 @@ def normalize_line_items_for_final_brief(
         )
         line_items = line_items_with_resolved_basis_catalog(line_items, sections, catalog_lookup)
     line_items = line_items_with_pricing_ledger(line_items, ledger_view)
+    line_items = project_deferred_pricing(payload, line_items, auth_session)
     return sort_line_items_by_pricing_reference_order(payload, line_items, auth_session=auth_session)
 
 
@@ -25810,6 +25975,11 @@ def normalize_ai_draft(
         # Later stages see these rows re-unit to their catalogue items; only this stage still
         # holds the unit the provider measured each row in, so it is carried forward internally.
         result["_pricing_analysis_source_units"] = source_units
+        result["_unmatched_source_measurements"] = {
+            row["source_basis_line_id"]: [pricing_ledger_quantity(row.get("quantity")), canonical_pricing_authority_unit(row.get("unit"))]
+            for row in raw_line_items
+            if isinstance(row, dict) and row.get("source_basis_line_id") and not clean_text(row.get("pricing_keyword"))
+        }
         seal = issue_pricing_analysis_seal(payload, line_items, auth_session=auth_session, source_units=source_units)
         if seal is not None:
             result["pricing_analysis_seal"] = seal
@@ -26475,14 +26645,16 @@ def run_draft_batches(prepared, gateway, operation, configuration, prompt, catal
         "Keep counts, areas and lengths attached to their object when merging repeated views; do not add counts for repeated views. "
         "Flag conflicting measurements as uncertainty instead of choosing a value. "
         + ("Use null quantity and unit for genuinely unmeasured or purely informational lines. " if configuration.response_contract else
-         "Leave quantity absent for genuinely unmeasured or purely informational lines. ") +
+         "Leave quantity and unit absent for genuinely unmeasured or purely informational lines. ") +
+        "Keep unmeasured physical lines in the basis for review. Only emit linked line_items for measured physical lines "
+        "with supported positive quantities and units. Do not emit line_items for informational lines. "
         "Area or length quantities derived from stated booth or object dimensions under the original contract remain supported, "
         "including floor area from booth size. Do not replace missing measurements with 1 lot, "
         "except for services genuinely priced per lot in the catalog. Do not invent quantities or units. "
         "The observations collectively represent every supplied reference. Follow the original output contract. "
         + (("Required fields: " + configuration.response_contract.field_instructions() + "\\n") if configuration.response_contract else
         "Required fields: each quote_basis_sections section has id, title, lines; each physical line has "
-        "id, tag, text, confidence_pct (or confidence), quantity and unit. "
+        "id, tag, text and confidence_pct (or confidence). Measured physical lines also have quantity and unit. "
         "confidence_pct or confidence must be a JSON integer from 0 to 100; supplied aliases must agree. "
         "Pure informational notes may omit quantity and unit. Each line_items row has section, quantity, unit, "
         "description, pricing_keyword and source_basis_line_id linked to one physical basis line.\\n")
@@ -26911,6 +27083,7 @@ def finalized_remote_draft_result(
         "quote_basis_sections": adjusted_sections,
         "line_items": final_line_items,
         "project": project,
+        "_unmatched_source_measurements": ai_basis.get("_unmatched_source_measurements", {}),
         **({"pricing_analysis_seal": seal} if seal is not None else {}),
         **(
             {"_forensic_pricing_counts": copy.deepcopy(ai_basis["_forensic_pricing_counts"])}
@@ -26994,6 +27167,12 @@ def completed_draft_with_pricing_reference_snapshot(
         )
     completed = dict(result)
     completed["pricing_reference_basis"] = pricing_reference_snapshot_basis(snapshot)
+    measurements = completed.pop("_unmatched_source_measurements", {})
+    if completed.get("source") != "local" and completed.get("line_items"):
+        completed["line_items"] = project_deferred_pricing(
+            {**payload, "quote_basis_sections": completed.get("quote_basis_sections", [])},
+            completed["line_items"], auth_session, offer=True, source_measurements=measurements,
+        )
     return completed
 
 
@@ -27383,6 +27562,9 @@ def generation_output_rows(brief_rows: Any, matches: Any) -> dict[str, Any]:
             if (not source_id or source_counts[source_id] != 1
                     or outcome.get("pricing_id") != authority.get("catalog_item_id")):
                 raise ValueError("Generator catalogue identity is ambiguous.")
+        elif variant == "none" and captured.get("deferred_pricing"):
+            if status != "deferred-pricing":
+                raise ValueError("Generator outcome contradicts the admitted pricing deferral.")
         elif ((variant == "manual" and status == "manual-price")
                 or (variant == "included" and status == "included")
                 or (variant in {"none", "historical"} and status in {"unmatched", "quantity-review"})):
@@ -28149,7 +28331,12 @@ def normalized_quote_session_generation_snapshot(value: Any) -> dict[str, Any]:
     return snapshot
 
 
-def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+def quote_session_commercials(
+    payload: dict[str, Any],
+    patch: dict[str, Any],
+    *,
+    reference_reader: Callable[..., dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
     supplied = patch.get("commercials") if isinstance(patch.get("commercials"), dict) else {}
     commercial_state = quote_commercial_state(payload)
     if commercial_state.get("review_required"):
@@ -28191,12 +28378,21 @@ def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) ->
             tax_rate /= 100
         tax_label = clean_text(tax.get("label")).upper()
         rows = canonical.get("line_items") if isinstance(canonical.get("line_items"), list) else []
+        if any(isinstance(row, dict) and row.get("deferred_pricing") for row in rows):
+            validated = project_deferred_pricing(canonical, rows, reference_reader=reference_reader)
+            deferred_ids = {row["source_basis_line_id"] for row in validated if isinstance(row, dict) and row.get("deferred_pricing")}
+        else:
+            deferred_ids = set()
         subtotal = 0.0
         has_invalid_row = not rows
+        has_resolved_row = not deferred_ids
         for row in rows:
             if not isinstance(row, dict):
                 continue
+            if safe_resource_id(row.get("source_basis_line_id"), "") in deferred_ids:
+                continue
             if clean_text(row.get("price_mode")).lower() == "included" or clean_text(row.get("display_price")).lower() == "included":
+                has_resolved_row = True
                 continue
             if row.get("_commercial_invalid_unit_price_override") is True:
                 has_invalid_row = True
@@ -28218,8 +28414,9 @@ def quote_session_commercials(payload: dict[str, Any], patch: dict[str, Any]) ->
             if quote_amount is None:
                 has_invalid_row = True
             else:
+                has_resolved_row = True
                 subtotal += quote_amount
-        if not re.fullmatch(r"[A-Z]{3}", currency) or exchange_rate is None or not rows or has_invalid_row:
+        if not re.fullmatch(r"[A-Z]{3}", currency) or exchange_rate is None or not has_resolved_row or has_invalid_row:
             subtotal_value = None
         else:
             subtotal_value = round_commercial_cents(subtotal)

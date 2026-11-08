@@ -24,6 +24,41 @@ const nativeRunRoot = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-spatial-"));
 const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles", "logs", "downloads"].map((name) => [name,
   path.join(["logs", "downloads"].includes(name) ? runRoot : nativeRunRoot, name)]));`);
 replaceOnce('Bar Stool seating around the display', 'Bar Stools at Round Tables.');
+replaceOnce('const cases = [', `const cases = [
+  { id: "u1-unmatched", kind: "unmatched", section: "Special Effects", text: "Kinetic sculpture", quantity: 2, unit: "nos" },`);
+replaceOnce('  // Resolve any remaining server-added review line', `
+  const keep = await basisControl(page, "u1-unmatched", "[data-basis-defer-pricing]");
+  assert(await keep.isVisible(), "unmatched physical row has no Keep control", await page.evaluate(() =>
+    state.lineItems.find((row) => row.source_basis_line_id === "u1-unmatched")));
+  assert(await page.locator('#basisReviewSurface [aria-label="Unmatched"]').getByText("Kinetic sculpture").isVisible(), "unmatched line rendered in the wrong group");
+  assert(await page.locator('#basisReviewSurface [aria-label="Matched"]').getByText("6 inch Spotlight", { exact: false }).first().isVisible(), "resolved reference not in Matched");
+  assert(await page.locator('#basisReviewSurface [aria-label="Review"]').getByText("Large wall-mounted video display", { exact: false }).first().isVisible(), "unit conflict not in Review");
+  assert(await page.locator('#basisReviewSurface').getByText("Detected booth", { exact: true }).isVisible(), "Detected booth header missing");
+  await keep.click();
+  assert(await keep.innerText() === "Undo keep", "keep decision was not shown");
+  await keep.click();
+  assert(await keep.innerText() === "Keep as unpriced", "keep decision could not be undone");
+  await keep.click();
+  // Resolve any remaining server-added review line`);
+replaceOnce('    result.saveReopen = "PASS";', `
+    result.saveReopen = "PASS";
+    const deferredAfterReload = await rowFor("u1-unmatched");
+    assert(deferredAfterReload?.authority?.variant === "none" && deferredAfterReload.amount === "Price to be discussed",
+      "deferred price did not survive Confirm and reopen", deferredAfterReload);
+    result.deferredReopened = true;`);
+replaceOnce('trusted: pricingAuthorityPrice(outputPriceAuthority(row)) !== null', 'trusted: outputPricingIsDeferred(row) || pricingAuthorityPrice(outputPriceAuthority(row)) !== null');
+replaceOnce('    // The analysis seal is opaque transport', `
+    expectedRows.push({ id: "u1-unmatched", description: "Kinetic sculpture", quantity: "2 nos", amount: "Price to be discussed" });
+    // The analysis seal is opaque transport`);
+replaceOnce("abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005",
+  "(hit[0].get('E') != (e['amount'], None) if isinstance(e['amount'], str) else abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005)");
+replaceOnce("and get(r,'B')!='Quantity']", "and get(r,'B')!='Quantity' and get(r,'E')!='Price to be discussed']");
+replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };', `
+    const workbookTotals = JSON.parse(checkOut).totals;
+    const savedTotals = detail.quote_session.commercials;
+    assert(savedTotals?.subtotal === workbookTotals.Total && savedTotals?.tax_amount === workbookTotals["GST 9%"]
+      && savedTotals?.grand_total === workbookTotals["Total including GST"], "saved and workbook totals disagree", { savedTotals, workbookTotals });
+    result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };`);
 replaceOnce('  // U2: Confirm Quotation Basis must show its preparing state before slow network work completes.', `
   const beforeConfirm = await page.evaluate(() => {
     const row = state.lineItems.find((entry) => entry.source_basis_line_id === "u1-count");
