@@ -11928,8 +11928,8 @@ class LocalSqagStorage:
     def pricing_reference_export_xlsx(self, reference_id: str, source: str = "") -> tuple[str, bytes] | None:
         return pricing_reference_export_xlsx(reference_id, source=source)
 
-    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, committed_metadata: dict[str, Any] | None = None, pricing_selection_draft: PricingSelectionDraft | None = None) -> dict[str, Any]:
-        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id, storage=self, committed_metadata=committed_metadata, pricing_selection_draft=pricing_selection_draft)
+    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, committed_metadata: dict[str, Any] | None = None, draft_precondition: QuoteDraftPrecondition | None = None) -> dict[str, Any]:
+        return create_or_update_quote_session(payload, result=result, output_dir=output_dir, session_id=session_id, storage=self, committed_metadata=committed_metadata, draft_precondition=draft_precondition)
 
     def list_quote_sessions(self) -> list[dict[str, Any]]:
         return list_quote_sessions()
@@ -16137,7 +16137,10 @@ class DatabaseSqagStorage:
             if committed_metadata is None:
                 raise
             raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
-        return current or {"session_id": session_id}
+        receipt = current or {"session_id": session_id}
+        if not publish:
+            receipt["_staged_draft_updated_at"] = state["metadata"]["updated_at"]
+        return receipt
 
     def _create_or_update_object_quote_session(
         self,
@@ -16151,7 +16154,7 @@ class DatabaseSqagStorage:
         generation_run_id: str,
         generation_job_id: str,
         expected_unchanged_drafts: list[dict[str, Any]] | None = None,
-        pricing_selection_draft: PricingSelectionDraft | None = None,
+        draft_precondition: QuoteDraftPrecondition | None = None,
     ) -> dict[str, Any]:
         def prepare_object_quote(connection: Any):
             existing, _draft_files = (
@@ -16166,6 +16169,8 @@ class DatabaseSqagStorage:
                 raise ObjectStorageContractError(
                     "Quote session lifecycle state changed."
                 )
+            if draft_precondition:
+                draft_precondition.require_current(existing)
             if expected_unchanged_drafts is not None and not self._object_draft_files_match_persisted(
                 resolved_session_id,
                 expected_unchanged_drafts,
@@ -16212,7 +16217,7 @@ class DatabaseSqagStorage:
                 ]
             if isinstance(patch.get("draft_state"), dict):
                 metadata["draft_state"] = quote_session_draft_state(patch)
-                apply_pricing_ledger_save(metadata, existing, self, pricing_selection_draft)
+                apply_pricing_ledger_save(metadata, existing, self, draft_precondition)
             (
                 stored_generated_quote,
                 pending_artifacts,
@@ -16352,8 +16357,11 @@ class DatabaseSqagStorage:
                     object_plan,
                     quote_session=state["object_plan_is_quote_export"],
                 )
-            if pricing_selection_draft:
-                pricing_selection_draft.persist_database(connection, self.workspace_id, normalized)
+            if draft_precondition:
+                draft_precondition.persist_database(
+                    connection, self.workspace_id, normalized,
+                    draft_files if "draft_files" in patch else None,
+                )
             else:
                 connection.execute(
                     "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, updated_at = excluded.updated_at",
@@ -16420,16 +16428,18 @@ class DatabaseSqagStorage:
                 raise
             raise PostCommitQuoteSessionProjectionError(committed_metadata) from exc
 
-    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "", pricing_selection_draft: PricingSelectionDraft | None = None) -> dict[str, Any]:
+    def create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "", draft_precondition: QuoteDraftPrecondition | None = None) -> dict[str, Any]:
         patch = quote_session_patch_payload(payload)
         requested_session_id = safe_quote_session_id(session_id or patch.get("session_id") or payload.get("session_id"), "")
         if not requested_session_id:
+            if draft_precondition:
+                raise PricingSelectionConflict([], {})
             return self._create_or_update_quote_session(payload, result, output_dir, session_id, publish=publish, generation_run_id=generation_run_id, generation_job_id=generation_job_id)
         # Saves and pricing selections for one quote apply its ledger one at a time.
         with pricing_ledger_mutation(self, requested_session_id):
-            return self._create_or_update_quote_session(payload, result, output_dir, session_id, publish=publish, generation_run_id=generation_run_id, generation_job_id=generation_job_id, pricing_selection_draft=pricing_selection_draft)
+            return self._create_or_update_quote_session(payload, result, output_dir, session_id, publish=publish, generation_run_id=generation_run_id, generation_job_id=generation_job_id, draft_precondition=draft_precondition)
 
-    def _create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "", pricing_selection_draft: PricingSelectionDraft | None = None) -> dict[str, Any]:
+    def _create_or_update_quote_session(self, payload: dict[str, Any], result: dict[str, Any] | None = None, output_dir: Path | None = None, session_id: str | None = None, *, publish: bool = True, generation_run_id: str = "", generation_job_id: str = "", draft_precondition: QuoteDraftPrecondition | None = None) -> dict[str, Any]:
         persistence_review = quote_commercial_persistence_preflight(payload)
         if persistence_review:
             error = QuoteCommercialStateError(QUOTE_COMMERCIAL_REVIEW_MESSAGE)
@@ -16439,8 +16449,12 @@ class DatabaseSqagStorage:
         resolved_session_id = safe_quote_session_id(session_id or patch.get("session_id") or payload.get("session_id"), "") or new_quote_session_id()
         existing, _draft_files = self._read_quote_session_metadata_for_workspace(resolved_session_id)
         if existing and not self._quote_session_editable_by_current_user(existing):
+            if draft_precondition:
+                raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
             resolved_session_id = new_quote_session_id()
             existing = {}
+        if draft_precondition:
+            draft_precondition.require_current(existing)
         if isinstance(patch.get("draft_files"), list):
             quote_session_draft_files(patch)
         expected_unchanged_drafts = None
@@ -16489,7 +16503,7 @@ class DatabaseSqagStorage:
                 generation_run_id=generation_run_id,
                 generation_job_id=generation_job_id,
                 expected_unchanged_drafts=expected_unchanged_drafts,
-                pricing_selection_draft=pricing_selection_draft,
+                draft_precondition=draft_precondition,
             )
         now = utc_timestamp()
         metadata = normalized_quote_session_metadata(existing) if existing else new_quote_session_metadata(resolved_session_id, now)
@@ -16508,7 +16522,7 @@ class DatabaseSqagStorage:
             metadata["status"]["quote_generated"] = status_patch["quote_generated"]
         if isinstance(patch.get("draft_state"), dict):
             metadata["draft_state"] = quote_session_draft_state(patch)
-            apply_pricing_ledger_save(metadata, existing, self, pricing_selection_draft)
+            apply_pricing_ledger_save(metadata, existing, self, draft_precondition)
         stored_generated_quote = False
         pending_artifacts: list[ArtifactBatchItem] = []
         if (
@@ -16585,8 +16599,11 @@ class DatabaseSqagStorage:
             draft_files = quote_session_draft_files(patch) if isinstance(patch.get("draft_files"), list) else []
 
             def persist_quote(connection: Any) -> None:
-                if pricing_selection_draft:
-                    pricing_selection_draft.persist_database(connection, self.workspace_id, normalized)
+                if draft_precondition:
+                    draft_precondition.persist_database(
+                        connection, self.workspace_id, normalized,
+                        draft_files if "draft_files" in patch else None,
+                    )
                     return
                 if stored_generated_quote:
                     retained_kinds = {
@@ -24796,14 +24813,13 @@ def pricing_ledger_after_save(
 
 def apply_pricing_ledger_save(
     metadata: dict[str, Any], existing: dict[str, Any] | None, storage: Any,
-    selection: PricingSelectionDraft | None = None,
+    precondition: QuoteDraftPrecondition | None = None,
 ) -> None:
     """Hook for every save that writes a draft: the persisted ledger follows the saved draft."""
-    if selection:
-        selection.require_current(existing or {})
-        metadata["pricing_ledger"] = selection.ledger
+    if isinstance(precondition, PricingSelectionDraft):
+        metadata["pricing_ledger"] = precondition.ledger
         for row in metadata["draft_state"].get("lineItems", []):
-            if isinstance(row, dict) and row.get("source_basis_line_id") in selection.row_ids:
+            if isinstance(row, dict) and row.get("source_basis_line_id") in precondition.row_ids:
                 row.pop("reincluded_catalog_selection", None)
         return
     metadata["pricing_ledger"] = pricing_ledger_after_save(
@@ -25232,31 +25248,71 @@ def write_quote_session_pricing_ledger(storage: Any, session_id: str, expected: 
 
 
 @dataclass(frozen=True)
-class PricingSelectionDraft:
-    """The checked draft and grants must commit against the same saved metadata."""
+class QuoteDraftPrecondition:
+    """Commit a draft against the same saved metadata used to admit its version."""
 
     expected: dict[str, Any]
-    ledger: dict[str, Any]
-    row_ids: frozenset[str]
+
+    @classmethod
+    def from_version(cls, metadata: dict[str, Any], scope: str, expected_version: Any) -> QuoteDraftPrecondition:
+        expected = normalized_quote_session_metadata(metadata)
+        version = quote_session_draft_version(expected, scope)
+        if (not version or not isinstance(expected_version, str) or len(expected_version) != len(version)
+                or not expected_version.isascii() or not hmac.compare_digest(expected_version, version)):
+            raise PricingSelectionConflict([], public_pricing_ledger(metadata))
+        return cls(expected)
 
     def require_current(self, metadata: dict[str, Any]) -> None:
         if not metadata or normalized_quote_session_metadata(metadata) != self.expected:
             raise PricingSelectionConflict([], public_pricing_ledger(metadata))
 
-    def persist_database(self, connection: Any, workspace_id: str, metadata: dict[str, Any]) -> None:
+    def persist_database(self, connection: Any, workspace_id: str, metadata: dict[str, Any],
+                         draft_files: list[dict[str, Any]] | None = None) -> None:
         session_id = metadata["session_id"]
         row = connection.execute(
-            "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+            "select metadata_json, draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
             (workspace_id, session_id),
         ).fetchone()
         raw = row["metadata_json"] if row is not None else None
         self.require_current(json.loads(raw) if isinstance(raw, str) else {})
-        cursor = connection.execute(
-            "update sqag_quote_sessions set metadata_json = ?, updated_at = ? where workspace_id = ? and session_id = ? and metadata_json = ?",
-            (json.dumps(metadata, ensure_ascii=True, sort_keys=True), metadata["updated_at"], workspace_id, session_id, raw),
-        )
+        metadata_json = json.dumps(metadata, ensure_ascii=True, sort_keys=True)
+        if draft_files is None:
+            cursor = connection.execute(
+                "update sqag_quote_sessions set metadata_json = ?, updated_at = ? where workspace_id = ? and session_id = ? and metadata_json = ?",
+                (metadata_json, metadata["updated_at"], workspace_id, session_id, raw),
+            )
+        else:
+            cursor = connection.execute(
+                "update sqag_quote_sessions set metadata_json = ?, updated_at = ?, draft_files_json = ? "
+                "where workspace_id = ? and session_id = ? and metadata_json = ? and draft_files_json = ?",
+                (metadata_json, metadata["updated_at"], json.dumps(draft_files, ensure_ascii=True, sort_keys=True),
+                 workspace_id, session_id, raw, row["draft_files_json"]),
+            )
         if cursor.rowcount != 1:
             raise PricingSelectionConflict([], public_pricing_ledger(self.expected))
+
+
+@dataclass(frozen=True)
+class PricingSelectionDraft(QuoteDraftPrecondition):
+    ledger: dict[str, Any]
+    row_ids: frozenset[str]
+
+
+def save_quote_session_from_browser(payload: dict[str, Any], storage: Any) -> dict[str, Any]:
+    if "expected_draft_version" not in payload:
+        return storage.create_or_update_quote_session(payload)
+    patch = quote_session_patch_payload(payload)
+    session_id = safe_quote_session_id(patch.get("session_id"), "")
+    if not session_id or not isinstance(patch.get("draft_state"), dict):
+        raise ValueError("A conditional save requires a saved quote and draft.")
+    with pricing_ledger_mutation(storage, session_id):
+        existing, editable = read_pricing_ledger_record(storage, session_id)
+        if not editable:
+            raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
+        precondition = QuoteDraftPrecondition.from_version(
+            existing, pricing_ledger_scope_for_storage(storage), payload["expected_draft_version"],
+        )
+        return storage.create_or_update_quote_session(payload, draft_precondition=precondition)
 
 
 def plan_pricing_selection_grants(
@@ -25351,8 +25407,8 @@ def apply_pricing_selections(
 ) -> dict[str, Any]:
     """Record operator selections as server grants against the rows' current revisions.
 
-    Re-inclusion checks the incoming draft against saved evidence before committing both the
-    draft and grants. Standalone explicit selections use the existing save and admission path.
+    Versioned selections commit the draft and grants together. Re-inclusion additionally
+    checks the incoming rows against saved evidence and always requires a version.
     """
     session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
     session_id = safe_quote_session_id(session.get("session_id"), "")
@@ -25363,13 +25419,9 @@ def apply_pricing_selections(
         before = effective_pricing_ledger(existing)
         reinclude = any(request.get("reinclude") for request in selections)
         scope = pricing_ledger_scope_for_storage(storage)
-        if reinclude:
-            expected_metadata = normalized_quote_session_metadata(existing)
-            expected_version = payload.get("expected_draft_version")
-            version = quote_session_draft_version(expected_metadata, scope)
-            if (not version or not isinstance(expected_version, str) or len(expected_version) != len(version)
-                    or not expected_version.isascii() or not hmac.compare_digest(expected_version, version)):
-                raise PricingSelectionConflict([], public_pricing_ledger(existing))
+        precondition = QuoteDraftPrecondition.from_version(
+            existing, scope, payload.get("expected_draft_version"),
+        ) if reinclude or "expected_draft_version" in payload else None
         stale = [
             {"source_basis_line_id": request["source_basis_line_id"], "status": "refused", "reason": "stale"}
             for request in selections
@@ -25380,16 +25432,16 @@ def apply_pricing_selections(
         reference = pricing_authority_reference_identity(exact_pricing_reference_authority(payload, auth_session=auth_session))
         lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload), auth_session=auth_session)
         staged = None
-        if reinclude:
+        if precondition:
             patch = quote_session_patch_payload(payload)
             if not isinstance(patch.get("draft_state"), dict) or "draft_files" in patch:
                 raise PricingSelectionConflict([], public_pricing_ledger(existing))
-            for rows in (patch["draft_state"].get("lineItems"), payload.get("line_items")):
-                if not isinstance(rows, list) or len(rows) > QUOTE_SESSION_DRAFT_MAX_LIST_ITEMS:
-                    raise ValueError("Pricing selection draft has invalid line items.")
+            if reinclude and any(not isinstance(rows, list) or len(rows) > QUOTE_SESSION_DRAFT_MAX_LIST_ITEMS
+                                 for rows in (patch["draft_state"].get("lineItems"), payload.get("line_items"))):
+                raise ValueError("Pricing selection draft has invalid line items.")
             draft = quote_session_draft_state(patch)
             refusals = pricing_reinclude_refusals(selections, existing, before, draft, payload, reference, lookup,
-                                                 scope=scope, session_id=session_id)
+                                                 scope=scope, session_id=session_id) if reinclude else {}
             ledger = pricing_ledger_after_save(existing, draft, scope=scope, session_id=session_id)
             outcomes, _changed = plan_pricing_selection_grants(selections, ledger, draft, reference, lookup, refusals)
             rejected = [outcome for request, outcome in zip(selections, outcomes)
@@ -25397,10 +25449,10 @@ def apply_pricing_selections(
             if rejected:
                 raise PricingSelectionConflict(rejected, public_pricing_ledger(existing))
             staged = PricingSelectionDraft(
-                expected_metadata, ledger,
+                precondition.expected, ledger,
                 frozenset(request["source_basis_line_id"] for request in selections if request.get("reinclude")),
             )
-        saved = storage.create_or_update_quote_session(payload, pricing_selection_draft=staged) if staged else storage.create_or_update_quote_session(payload)
+        saved = storage.create_or_update_quote_session(payload, draft_precondition=staged) if staged else storage.create_or_update_quote_session(payload)
         if safe_quote_session_id(saved.get("session_id"), "") != session_id:
             raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
         if staged:
@@ -30638,7 +30690,7 @@ def create_or_update_quote_session(
     *,
     storage: LocalSqagStorage | None = None,
     committed_metadata: dict[str, Any] | None = None,
-    pricing_selection_draft: PricingSelectionDraft | None = None,
+    draft_precondition: QuoteDraftPrecondition | None = None,
 ) -> dict[str, Any]:
     persistence_review = quote_commercial_persistence_preflight(payload)
     if persistence_review:
@@ -30653,6 +30705,8 @@ def create_or_update_quote_session(
         "",
     ) or new_quote_session_id()
     existing = read_quote_session_metadata(resolved_session_id)
+    if draft_precondition:
+        draft_precondition.require_current(existing or {})
     transaction = LocalQuoteSessionTransaction(
         session_id=resolved_session_id,
         session_directory=quote_session_dir(resolved_session_id),
@@ -30675,13 +30729,11 @@ def create_or_update_quote_session(
     draft_file_records: list[dict[str, Any]] | None = None
     if draft_state_supplied:
         metadata["draft_state"] = quote_session_draft_state(patch)
-        apply_pricing_ledger_save(metadata, existing, storage, pricing_selection_draft)
-        if not pricing_selection_draft:
-            draft_file_records = (
-                quote_session_draft_files(patch)
-                if "draft_files" in patch
-                else read_quote_session_draft_files(resolved_session_id, existing)
-            )
+        apply_pricing_ledger_save(metadata, existing, storage, draft_precondition)
+        if "draft_files" in patch:
+            draft_file_records = quote_session_draft_files(patch)
+        elif not draft_precondition:
+            draft_file_records = read_quote_session_draft_files(resolved_session_id, existing)
     elif result_has_generated_quote(result):
         draft_file_records = read_quote_session_draft_files(
             resolved_session_id,
@@ -33718,6 +33770,7 @@ def _run_quote_job(
     publication_storage: DatabaseSqagStorage | None = None
     publication_session_id = ""
     publication_files: list[dict[str, Any]] = []
+    staged_draft_updated_at = ""
     committed_metadata: dict[str, Any] = {}
     if isinstance(payload.get("quote_session"), dict):
         try:
@@ -33743,6 +33796,7 @@ def _run_quote_job(
                     **({"committed_metadata": committed_metadata} if isinstance(storage, LocalSqagStorage) else {}),
                 )
             if atomic_publication:
+                staged_draft_updated_at = result["quote_session"].pop("_staged_draft_updated_at", "")
                 publication_storage = storage
                 publication_session_id = safe_quote_session_id(result["quote_session"].get("session_id"), "")
                 publication_files = storage.quote_session_evidence_files(publication_session_id, generation_run_id)
@@ -33940,6 +33994,13 @@ def _run_quote_job(
         if clean_text(finalized.get("status")) == clean_text(result.get("status")):
             published_session = copy.deepcopy(result.get("quote_session"))
             if isinstance(published_session, dict):
+                # Promotion can preserve a newer tab's draft. A generation
+                # receipt may acknowledge only the draft this job staged.
+                if staged_draft_updated_at and committed_metadata.get("updated_at") == staged_draft_updated_at:
+                    published_session["draft_version"] = quote_session_draft_version(
+                        committed_metadata, pricing_ledger_scope_for_storage(publication_storage),
+                    )
+                    published_session["pricing_ledger"] = public_pricing_ledger(committed_metadata)
                 if not isinstance(published_session.get("status"), dict):
                     published_session["status"] = {}
                 published_session["status"]["quote_generated"] = True
@@ -34860,7 +34921,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 storage = self.current_quote_session_storage()
                 if storage is None:
                     return
-                session = storage.create_or_update_quote_session(payload)
+                session = save_quote_session_from_browser(payload, storage)
                 append_runtime_telemetry(
                     auth_session,
                     "configuration",
@@ -34870,6 +34931,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     operation_route=parsed.path,
                     purpose="quote_session_saved",
                 )
+            except PricingSelectionConflict:
+                self.send_json({"status": "conflict", "reason_code": "quote_draft_stale",
+                                "errors": [PRICING_SELECTION_STALE_MESSAGE]}, status=409)
+                return
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return

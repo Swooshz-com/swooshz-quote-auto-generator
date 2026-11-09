@@ -354,7 +354,73 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
     const savedTotals = detail.quote_session.commercials;
     assert(savedTotals?.subtotal === workbookTotals.Total && savedTotals?.tax_amount === workbookTotals["GST 9%"]
       && savedTotals?.grand_total === workbookTotals["Total including GST"], "saved and workbook totals disagree", { savedTotals, workbookTotals });
-    result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };`);
+    result.xlsx = { status: "PASS", expectedRows, validator: checkOut.trim() };
+
+    // A real second tab saves after re-inclusion, while Confirm's next write is held.
+    const raceQuote = "/api/quote-sessions/" + encodeURIComponent(sessionId);
+    await basisTab.click();
+    await floodCross.click();
+    await page.locator("#sideNextButton").click();
+    await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible" });
+    await page.waitForFunction(() => !appIsBusy());
+    const otherTab = await context.newPage();
+    await otherTab.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await otherTab.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+    const title = "Synthetic project saved during Confirm";
+    let selectionVersion;
+    let newer;
+    let followup;
+    const watchSelection = async (route) => {
+      const response = await route.fetch({ maxRedirects: 0 });
+      if (response.ok()) selectionVersion = (await response.json()).quote_session.draft_version;
+      await route.fulfill({ response });
+    };
+    const holdFollowup = async (route) => {
+      if (route.request().method() !== "POST" || !selectionVersion || followup) return route.fallback();
+      const pending = route.request().postDataJSON();
+      newer = await otherTab.evaluate(async ({ url, title }) => {
+        const before = (await fetch(url).then((response) => response.json())).quote_session;
+        const { session_id, customer_summary, draft_state, quote_company_profile, pricing_reference, commercials, status } = before;
+        draft_state.quoteDetails.project.title = title;
+        const response = await fetchPostJsonResponse("/api/quote-sessions", {
+          session_id, customer_summary: { ...customer_summary, project_name: title },
+          draft_state, quote_company_profile, pricing_reference, commercials, status,
+          expected_draft_version: before.draft_version,
+        });
+        return { status: response.status, base: before.draft_version, version: (await response.json()).quote_session?.draft_version };
+      }, { url: raceQuote, title });
+      const response = await route.fetch({ maxRedirects: 0 });
+      followup = { status: response.status(), version: pending.expected_draft_version };
+      await route.fulfill({ response });
+    };
+    await page.route("**/api/quote-sessions/pricing-selections", watchSelection);
+    await page.route("**/api/quote-sessions", holdFollowup);
+    try {
+      await basisTab.click();
+      await (await basisControl(page, "u1-excluded-match", '[data-basis-tag="Include"]')).click();
+      await page.locator("#sideNextButton").click();
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible" });
+      await page.waitForFunction(() => !appIsBusy());
+      assert(newer?.status === 200 && newer.base === selectionVersion && followup?.status === 409
+        && followup.version === selectionVersion, "Confirm follow-up did not reject the committed newer draft");
+      assert(await page.getByText(/This quote changed in another tab or session/).first().isVisible(),
+        "Confirm did not ask the user to reopen");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+      assert(await page.evaluate(async () => {
+        queueQuoteSessionDraftStateSave({ delay: 0 });
+        return state.pricingDraftVersion === false && state.outputRows.length > 0
+          && !(await saveQuoteSessionDraftState()) && (await refreshLineItemsFromServer()).data.status === "conflict";
+      }), "reloading or retrying released the stale recovery draft");
+      const saved = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
+      assert(saved.draft_version === newer.version && saved.draft_state.quoteDetails.project.title === title,
+        "the stale follow-up or a recovery retry changed the newer draft");
+      result.confirmFollowupConflict = "PASS";
+    } finally {
+      await page.unroute("**/api/quote-sessions", holdFollowup);
+      await page.unroute("**/api/quote-sessions/pricing-selections", watchSelection);
+      await otherTab.close();
+    }`);
 replaceOnce('  // U2: Confirm Quotation Basis must show its preparing state before slow network work completes.', `
   const beforeConfirm = await page.evaluate(() => {
     const row = state.lineItems.find((entry) => entry.source_basis_line_id === "u1-count");

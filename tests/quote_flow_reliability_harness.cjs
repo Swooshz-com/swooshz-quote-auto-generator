@@ -251,7 +251,8 @@ async function resumedPdfStatusCases() {
       updateDownloadButton: () => { calls.updateDownload++; },
       showGeneratedExportReadyModal: () => { calls.modalAttempt++; const ready = !!state.pdfFile; if (ready) calls.readyShown++; return ready; },
     });
-    vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
+    vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'validQuoteDraftVersion', 'acknowledgeGeneratedQuoteDraft',
+      'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
     await context.resumeSavedJob();
     assert.equal(calls.resumedStart, 1); assert.equal(calls.poll, 1);
     assert.equal(state.isGenerating, false); assert.equal(state.activeJob, null);
@@ -597,7 +598,8 @@ async function lifecycleCases() {
 
     // Use the real generation/file-attachment path, with transport and final save held.
     vm.runInContext([
-      "handleGenerate", "setDownloadFiles", "clearActiveJob", "retainExcludedBasisPricingRows",
+      "handleGenerate", "validQuoteDraftVersion", "acknowledgeGeneratedQuoteDraft",
+      "setDownloadFiles", "clearActiveJob", "retainExcludedBasisPricingRows",
       "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage",
     ].map(extract).join("\n"), c);
     state.activeSidePanel = "output";

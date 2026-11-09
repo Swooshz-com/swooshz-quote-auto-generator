@@ -43497,10 +43497,10 @@ main().catch((error) => {
                 commit = webapp.PricingSelectionDraft.persist_database
                 concurrent = []
 
-                def save_before_commit(staged, connection, workspace_id, metadata):
+                def save_before_commit(staged, connection, workspace_id, metadata, draft_files=None):
                     owner_storage.create_or_update_quote_session(newer)
                     concurrent.append(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"))
-                    return commit(staged, connection, workspace_id, metadata)
+                    return commit(staged, connection, workspace_id, metadata, draft_files)
 
                 with mock.patch.object(webapp.PricingSelectionDraft, "persist_database", autospec=True, side_effect=save_before_commit):
                     with self.assertRaises(webapp.PricingSelectionConflict):

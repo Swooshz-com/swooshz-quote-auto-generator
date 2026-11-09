@@ -91,7 +91,8 @@ if (input.mode==='reopen') {
   })().catch(e=>{console.error(e);process.exitCode=1;});
 } else if (input.mode==='selection-ordering') {
   const vm = require('node:vm');
-  const code = ['refreshLineItemsFromServer', 'saveQuoteSessionDraftState', 'queueQuoteSessionDraftStateSave',
+  const code = ['validQuoteDraftVersion', 'requireQuoteDraftReopen', 'refreshLineItemsFromServer',
+    'saveQuoteSessionDraftState', 'queueQuoteSessionDraftStateSave',
     'clearQuoteSessionDraftSaveTimer', 'resumeBlockedOutputDraftSave'].map(extract).join('\n');
   const turn = () => new Promise(resolve => setImmediate(resolve));
   async function check({ inflight, outcome, queueWhileSelecting = false, blockRetry = false, replacementKind }) {
@@ -107,6 +108,7 @@ if (input.mode==='reopen') {
       state: { quoteSessionId: 'synthetic-quote', pricingLedgerRevisions: { 'synthetic-quote': { row: 4 } },
         lineItems: [{ price: null }], value: 1, outputRows: [] },
       quoteSessionDraftSaveTimer: null, quoteSessionDraftSavePromise: null,
+      browserRecoveryEpoch: 0,
       blockedOutputDraftSaveOptions: null, blocked: false,
       waitForUiPaint: () => new Promise(resolve => { releasePaint = resolve; }),
       commitActiveOutputEditor: () => c.blocked ? 'blocked' : 'unchanged', quoteSessionDraftStateCanSave: () => true,

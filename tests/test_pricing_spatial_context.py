@@ -1,11 +1,13 @@
 """Independent primary-object wording survives spatial catalogue context and ledger checks."""
 import copy
+import contextlib
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 from tests.rendered_browser_support import owned_browser_evidence_directory
@@ -39,12 +41,13 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         evidence = json.loads(result.stdout)
         self.assertEqual(evidence['status'], 'PASS')
-        self.assertEqual(evidence['selectionStatuses'], [200, 409, 200])
+        self.assertEqual(evidence['selectionStatuses'], [200, 409, 200, 200])
         self.assertEqual(evidence['spatialBeforeConfirm']['price'], None)
         self.assertEqual(evidence['saveReopen'], 'PASS')
         self.assertEqual(evidence['excludedReopen'], 'PASS')
         self.assertEqual(evidence['reincludedPricing'], 'PASS')
         self.assertEqual(evidence['staleRecovery'], 'PASS')
+        self.assertEqual(evidence['confirmFollowupConflict'], 'PASS')
         self.assertEqual(evidence['spatialPartialRefusal']['mixedStatus'], 200)
         self.assertEqual(evidence['spatialPartialRefusal']['resolvedVideo']['quoted'], '12.00')
         self.assertEqual(evidence['tickOnlyDeferred'], 'PASS')
@@ -181,6 +184,113 @@ class PricingSpatialContextTest(unittest.TestCase):
                 bad['quote_basis_sections'][0]['lines'][0]['text'] = '[ ' + item['description'] + ' ] - Synthetic round tables with synthetic cafe chairs'
                 self.fixture._ledger_sync(bad)
                 self.assertIsNone(self.fixture._ledger_price(webapp.normalize_line_items_for_final_brief(bad), 'selected-row'))
+
+    def test_versioned_ordinary_selection_rejects_unrelated_draft_changes(self):
+        with mock.patch.dict(os.environ, self.fixture._ledger_env()), fixtures.LocalRunnerServer() as runner:
+            headers = self.fixture._ledger_runner_headers(runner)
+            post = lambda path, body: self.fixture._ledger_post(runner, headers, path, body)
+            for unit, expected_status in (("nos", "selected"), ("sqm", "refused")):
+                with self.subTest(outcome=expected_status):
+                    payload, item = self.selection_payload("Synthetic cafe chairs at the synthetic round tables", unit=unit)
+                    session_id = f"quote-ordinary-version-{expected_status}"
+                    payload["quote_session"] = {"session_id": session_id}
+                    self.fixture._ledger_sync(payload)
+                    initial = post("/api/quote-sessions", payload)["body"]["quote_session"]
+                    request = {**payload, "expected_draft_version": initial["draft_version"], "pricing_selections": [{
+                        "source_basis_line_id": "selected-row", "catalog_item_id": item["id"],
+                        "expected_revision": initial["pricing_ledger"]["rows"]["selected-row"],
+                    }]}
+                    newer = copy.deepcopy(payload)
+                    newer["quote_session"]["customer_summary"] = {"project_name": "Synthetic newer tab"}
+                    newer["expected_draft_version"] = initial["draft_version"]
+                    saved = post("/api/quote-sessions", newer)
+                    self.assertEqual(saved["status"], 200)
+                    persisted = webapp.read_quote_session_metadata(session_id)
+                    stale = post("/api/quote-sessions/pricing-selections", request)
+                    self.assertEqual(stale["status"], 409)
+                    self.assertEqual(webapp.read_quote_session_metadata(session_id), persisted)
+                    current_request = {**request, "quote_session": newer["quote_session"],
+                                       "expected_draft_version": saved["body"]["quote_session"]["draft_version"]}
+                    current = post("/api/quote-sessions/pricing-selections", current_request)
+                    self.assertEqual(current["status"], 200, current["text"][-600:])
+                    self.assertEqual(current["body"]["selections"][0]["status"], expected_status)
+                    receipt = current["body"]["quote_session"]
+                    detail = self.fixture.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                    self.assertEqual(receipt["draft_version"], detail["body"]["quote_session"]["draft_version"])
+
+    def test_conditional_draft_commit_preserves_newer_metadata_ledger_and_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database_url = f"sqlite:///{(Path(tmp) / 'draft-cas.sqlite3').as_posix()}"
+            for artifact_mode in ("database", "object"):
+                backend = webapp.InMemoryObjectStorageBackend()
+                backend_context = (mock.patch.object(webapp, "configured_object_storage_backend", return_value=backend)
+                                   if artifact_mode == "object" else contextlib.nullcontext())
+                with self.subTest(artifact_mode=artifact_mode), backend_context, mock.patch.dict(os.environ, {
+                    "APP_MODE": "local", webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: artifact_mode,
+                }):
+                    webapp.apply_sqag_storage_migrations(database_url)
+                    storage = webapp.DatabaseSqagStorage(database_url, "workspace-draft-cas", "operator", "synthetic-owner")
+                    session_id = f"quote-draft-cas-{artifact_mode}"
+
+                    def payload(title, file_key):
+                        return {"session_id": session_id, "customer_summary": {"project_name": title},
+                                "draft_state": {"workflowStage": "basis_review"},
+                                "draft_files": [{"session_file_key": file_key, "name": file_key + ".png",
+                                                 "type": "image/png", "data_url": fixtures.SANITIZED_LOGO_DATA_URL}]}
+
+                    initial = webapp.save_quote_session_from_browser(payload("Synthetic initial", "initial"), storage)
+                    newer = {**payload("Synthetic newer", "newer"), "expected_draft_version": initial["draft_version"]}
+                    saved = webapp.save_quote_session_from_browser(newer, storage)
+                    before = storage._read_quote_session_metadata_for_workspace(session_id)
+                    self.assertEqual(before[1][0]["session_file_key"], "newer")
+                    self.assertEqual(saved["draft_version"], storage.get_quote_session(session_id, include_draft_state=True)["draft_version"])
+                    with self.assertRaises(webapp.PricingSelectionConflict):
+                        webapp.save_quote_session_from_browser({**newer, "draft_files": []}, storage)
+                    self.assertEqual(storage._read_quote_session_metadata_for_workspace(session_id), before)
+                    without_files = {key: value for key, value in newer.items() if key != "draft_files"}
+                    saved = webapp.save_quote_session_from_browser({
+                        **without_files, "expected_draft_version": saved["draft_version"],
+                        "draft_state": {"workflowStage": "details_review"},
+                    }, storage)
+                    after = storage._read_quote_session_metadata_for_workspace(session_id)
+                    self.assertEqual(after[0]["draft_state"]["workflowStage"], "details_review")
+                    self.assertEqual(after[1], before[1])
+                    before = after
+                    if artifact_mode == "object":
+                        continue
+
+                    commit = webapp.QuoteDraftPrecondition.persist_database
+                    competing = []
+
+                    def interleave_after_read(precondition, connection, workspace, metadata, draft_files):
+                        def execute(sql, params):
+                            cursor = connection.execute(sql, params)
+                            if sql.startswith("select metadata_json, draft_files_json"):
+                                previous = cursor.fetchone()
+                                with storage.connection() as other:
+                                    replacement = copy.deepcopy(before[0])
+                                    replacement["customer_summary"]["project_name"] = "Synthetic competing tab"
+                                    other.execute(
+                                        "update sqag_quote_sessions set metadata_json = ? where workspace_id = ? and session_id = ?",
+                                        (json.dumps(replacement), workspace, session_id),
+                                    )
+                                    other.commit()
+                                competing.append(storage._read_quote_session_metadata_for_workspace(session_id))
+                                return mock.Mock(fetchone=lambda: previous)
+                            return cursor
+
+                        return commit(precondition, mock.Mock(execute=execute), workspace, metadata, draft_files)
+
+                    with mock.patch.object(webapp.QuoteDraftPrecondition, "persist_database", autospec=True,
+                                           side_effect=interleave_after_read):
+                        with self.assertRaises(webapp.PricingSelectionConflict):
+                            webapp.save_quote_session_from_browser({
+                                **payload("Synthetic stale follow-up", "stale"), "expected_draft_version": saved["draft_version"],
+                            }, storage)
+                    self.assertEqual(len(competing), 1)
+                    self.assertEqual(storage._read_quote_session_metadata_for_workspace(session_id), competing[0])
+                    self.assertEqual(competing[0][0]["pricing_ledger"], before[0]["pricing_ledger"])
+                    self.assertEqual(competing[0][1], before[1])
 
     def test_reinclude_requires_current_revision_unchanged_row_and_a_prior_grant(self):
         storage = webapp.LocalSqagStorage()
@@ -372,6 +482,7 @@ const fs = require("node:fs");
 const app = fs.readFileSync("webapp/static/app.js", "utf8");
 let state, response, calls, recoveryCopies, quoteSessionDraftSaveTimer;
 const quoteSessionDraftSavePromise = null;
+const browserRecoveryEpoch = 0;
 const sessionId = "quote-synthetic";
 const baseline = "a".repeat(64);
 const acknowledged = "b".repeat(64);
@@ -397,7 +508,7 @@ function extract(start, end) {
   assert(first >= 0 && last > first);
   return app.slice(first, last);
 }
-eval(extract("async function refreshLineItemsFromServer", "function captureOriginalAnalysisSnapshot")
+eval(extract("function validQuoteDraftVersion", "function captureOriginalAnalysisSnapshot")
   + extract("function pendingPricingSelections", "function openBlockingClarifications"));
 function setup(count, ordinary = 0, version = baseline) {
   const ids = Array.from({length: count}, (_, index) => "synthetic-row-" + index);
