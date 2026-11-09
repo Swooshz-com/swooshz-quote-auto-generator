@@ -227,6 +227,53 @@ replaceOnce('    result.saveReopen = "PASS";', `
       "deferred price did not survive Confirm and reopen", deferredAfterReload);
     result.deferredReopened = true;`);
 replaceOnce('trusted: pricingAuthorityPrice(outputPriceAuthority(row)) !== null', 'trusted: outputPricingIsDeferred(row) || pricingAuthorityPrice(outputPriceAuthority(row)) !== null');
+replaceOnce('    // Protected XLSX: generated workbook carries the admitted amounts.', `
+    const deferredRow = page.locator('tr[data-output-row]').filter({ hasText: 'Kinetic sculpture' });
+    const deferredCell = deferredRow.locator('[data-output-price-entry="quote"]');
+    const deferredEditor = deferredCell.locator('[data-output-editor-field="unit_price_override"]');
+    const deferredAmount = deferredRow.locator('[data-output-label="Amount"]');
+    const beforeDismissal = await page.evaluateHandle(() => ({
+      revision: state.outputRevision,
+      rows: JSON.stringify(state.outputRows),
+      lineItems: JSON.stringify(state.lineItems),
+    }));
+    async function assertDeferredEditorState(open) {
+      assert(await deferredEditor.isVisible() === open, open ? 'deferred editor did not open' : 'deferred editor stayed open');
+      assert(await deferredAmount.innerText() === 'Price to be discussed', 'deferred amount changed');
+      if (!open) assert(await deferredCell.innerText() === '-', 'deferred dash was not restored');
+      assert(await page.evaluate((before) => state.outputRevision === before.revision
+        && JSON.stringify(state.outputRows) === before.rows && JSON.stringify(state.lineItems) === before.lineItems,
+        beforeDismissal), 'dismissal changed quote rows, receipt or revision');
+    }
+    await deferredCell.click();
+    await assertDeferredEditorState(true);
+    assert(await deferredEditor.inputValue() === '', 'deferred editor is not empty');
+    assert(await page.evaluate(() => commitActiveOutputEditor({ commit: false })) === 'unchanged', 'blank deferred editor blocked preflight');
+    await assertDeferredEditorState(true);
+    await deferredEditor.press('Enter');
+    await assertDeferredEditorState(false);
+    await deferredCell.click();
+    await deferredAmount.click();
+    await assertDeferredEditorState(false);
+    await deferredCell.click();
+    await deferredEditor.fill('1.005');
+    await deferredEditor.press('Enter');
+    assert(await deferredEditor.getAttribute('aria-invalid') === 'true', 'invalid typed price was admitted');
+    assert(await page.evaluate(() => commitActiveOutputEditor({ commit: false })) === 'blocked', 'invalid typed price passed preflight');
+    await assertDeferredEditorState(true);
+    await deferredEditor.press('Escape');
+    await assertDeferredEditorState(false);
+    await deferredCell.click();
+    await assertDeferredEditorState(true);
+    await beforeDismissal.dispose();
+    // Download directly with the blank editor still open.
+    // Protected XLSX: generated workbook carries the admitted amounts.`);
+replaceOnce('    const download = await downloadPromise;', `
+    const download = await downloadPromise;
+    assert(!await deferredEditor.isVisible() && await deferredCell.innerText() === '-'
+      && await deferredAmount.innerText() === 'Price to be discussed', 'Download did not dismiss the blank deferred editor');
+    result.deferredEditorDismissal = 'PASS';
+`);
 replaceOnce('    // The analysis seal is opaque transport', `
     expectedRows.push({ id: "u1-unmatched", description: "Kinetic sculpture", quantity: "2 nos", amount: "Price to be discussed" });
     expectedRows.push({ id: "u1-excluded-match", description: byName("LED Flood Light").description,

@@ -10967,7 +10967,7 @@ function handleOutputRowEdit(event) {
   commitOutputEditor(input);
 }
 
-function commitOutputEditor(editor) {
+function commitOutputEditor(editor, { commit = true } = {}) {
   const pending = activeOutputEditor;
   if (!pending || pending.editor !== editor || editor.dataset.outputCommitSuperseded === "true") return "unchanged";
   if (editor.isConnected === false || !state.outputRows.includes(pending.row) || pending.revision !== state.outputRevision) {
@@ -10976,15 +10976,22 @@ function commitOutputEditor(editor) {
   }
   const index = state.outputRows.indexOf(pending.row);
   const field = editor.dataset.outputEditorField;
+  if (!commit && field !== "unit_price_override") return "unchanged";
   const currentRow = pending.row;
   let nextRow = { ...currentRow, [field]: editor.value };
   if (field === "unit_price_override") {
     const value = String(editor.value).trim();
-    if (value.toLowerCase() === "included") return applyOutputIncludedAction(editor);
+    if (value.toLowerCase() === "included") return commit ? applyOutputIncludedAction(editor) : "unchanged";
+    const unchangedDeferredPrice = !value && !pending.staged && outputPricingIsDeferred(currentRow);
     const price = admittedOutputPrice(value);
-    if (price === null) return blockOutputEditor(editor, "Enter a nonnegative price with exact cent precision, or cancel with Escape.");
+    if (price === null && !unchangedDeferredPrice) {
+      return blockOutputEditor(editor, commit
+        ? "Enter a nonnegative price with exact cent precision, or cancel with Escape."
+        : "Resolve this price or cancel with Escape before continuing.");
+    }
+    if (!commit) return "unchanged";
     const authority = outputPriceAuthority(currentRow);
-    if (!pending.staged && authority && authority.variant !== "included" && authority.price === price && outputPriceDenomination(currentRow) === pending.denomination) {
+    if (unchangedDeferredPrice || (!pending.staged && authority && authority.variant !== "included" && authority.price === price && outputPriceDenomination(currentRow) === pending.denomination)) {
       revokeOutputEditor();
       renderPricingMatches(state.outputRows);
       resumeBlockedOutputDraftSave();
@@ -11172,7 +11179,8 @@ function openOutputCellEditor(cell, options = {}) {
   const row = state.outputRows[index];
   if (!cell || !row || !field) return;
   const denomination = entryDenomination || outputPriceDenomination(row);
-  const staged = options.staged === true || (field === "unit_price_override" && (denomination !== outputPriceDenomination(row) || outputPriceAuthority(row)?.variant === "included"));
+  const staged = options.staged === true || (field === "unit_price_override" && !outputPricingIsDeferred(row)
+    && (denomination !== outputPriceDenomination(row) || outputPriceAuthority(row)?.variant === "included"));
   if (field === "unit_price_override") {
     cell.parentElement.querySelectorAll('[data-output-edit-field="unit_price_override"]').forEach((other) => {
       other.classList.remove("output-edit-cell");
@@ -11268,17 +11276,9 @@ function handleOutputEditorCommit(event) {
 }
 
 function commitActiveOutputEditor(options = {}) {
-  let outcome = "unchanged";
-  if (activeOutputEditor && options.commit === false) {
-    const editor = activeOutputEditor.editor;
-    if (editor.dataset.outputEditorField === "unit_price_override"
-      && String(editor.value).trim().toLowerCase() !== "included"
-      && admittedOutputPrice(editor.value) === null) {
-      outcome = blockOutputEditor(editor, "Resolve this price or cancel with Escape before continuing.");
-    }
-  } else if (activeOutputEditor) {
-    outcome = commitOutputEditor(activeOutputEditor.editor);
-  }
+  const outcome = activeOutputEditor
+    ? commitOutputEditor(activeOutputEditor.editor, { commit: options.commit !== false })
+    : "unchanged";
   if (outcome === "blocked") return outcome;
   if (!options.currencyChange && committedOutputCurrency && quoteCurrencyControlValue() !== committedOutputCurrency) {
     elements.quoteCurrency?.setCustomValidity("Complete or cancel the prospective quote currency before continuing.");
@@ -13399,27 +13399,48 @@ function applyDraftLineItems(lineItems = []) {
   state.outputErrors = [];
 }
 
-async function refreshLineItemsFromServer() {
+async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
   if (!state.lineItems.length) {
     state.pricingIssues = [];
     return { ok: true, data: { status: "normalized", line_items: [] } };
   }
   let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
-  if (selections.length && quoteSessionDraftSavePromise) {
-    // The selection request saves this draft itself; let any earlier save land first, then read the
-    // row revisions that save returned, so this tab's own save is never taken for another tab's.
-    await quoteSessionDraftSavePromise.catch(() => null);
-    selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
-  }
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  const isSessionCurrent = () => safeQuoteSessionId(state.quoteSessionId || "") === sessionId;
+  // Selection checks revisions before saving its draft. Let it carry any queued draft,
+  // and read the revisions from saves already sent before building the selection request.
+  const hold = selections.length && sessionId
+    ? { kind: "selection", sessionId, options: clearQuoteSessionDraftSaveTimer() } : null;
+  if (hold) quoteSessionDraftSaveTimer = hold;
+  const isCurrent = () => isSessionCurrent() && quoteSessionDraftSaveTimer === hold;
   let result;
-  if (selections.length && safeQuoteSessionId(state.quoteSessionId || "")) {
-    result = await postJson("/api/quote-sessions/pricing-selections", {
-      ...buildLineItemNormalizePayload(),
-      pricing_selections: selections,
-    });
-    const session = isPlainObject(result.data?.quote_session) ? result.data.quote_session : null;
-    if (result.ok && isPlainObject(session?.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [safeQuoteSessionId(state.quoteSessionId || "")]: session.pricing_ledger.rows };
-  } else {
+  try {
+    if (waitForPaint) await waitForUiPaint();
+    if (hold) {
+      while (quoteSessionDraftSavePromise && isCurrent()) await quoteSessionDraftSavePromise.catch(() => null);
+      if (!isCurrent()) return { ok: false, data: { status: "conflict", request_superseded: true } };
+      selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+      if (selections.length) {
+        result = await postJson("/api/quote-sessions/pricing-selections", {
+          ...buildLineItemNormalizePayload(),
+          pricing_selections: selections,
+        }, { isCurrent });
+        const session = isPlainObject(result.data?.quote_session) ? result.data.quote_session : null;
+        if (result.ok && isPlainObject(session?.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [sessionId]: session.pricing_ledger.rows };
+      }
+    }
+  } finally {
+    if (hold && quoteSessionDraftSaveTimer === hold) {
+      quoteSessionDraftSaveTimer = null;
+      // The browser recovery draft already contains the edits. On conflict, keep the newer server draft intact.
+      if (hold.options && !result?.ok && result?.status !== 409 && result?.data?.status !== "conflict"
+        && isSessionCurrent() && !state.isPageUnloading) {
+        if (commitActiveOutputEditor({ commit: false }) === "blocked") blockedOutputDraftSaveOptions = hold.options;
+        else queueQuoteSessionDraftStateSave(hold.options);
+      }
+    }
+  }
+  if (!result) {
     result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
   }
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
@@ -14576,9 +14597,11 @@ function quoteSessionDraftSynchronizationFailureMessage(failure = null) {
 }
 
 function clearQuoteSessionDraftSaveTimer() {
-  if (!quoteSessionDraftSaveTimer) return;
-  window.clearTimeout(quoteSessionDraftSaveTimer);
+  const pending = quoteSessionDraftSaveTimer;
+  if (pending?.kind !== "timer") return;
+  window.clearTimeout(pending.id);
   quoteSessionDraftSaveTimer = null;
+  return pending.options;
 }
 
 function queueQuoteSessionDraftStateSave(options = {}) {
@@ -14586,9 +14609,16 @@ function queueQuoteSessionDraftStateSave(options = {}) {
   blockedOutputDraftSaveOptions = null;
   if (!quoteSessionDraftStateCanSave()) return;
   saveSessionState();
+  const pending = quoteSessionDraftSaveTimer;
+  if (pending?.kind === "selection" && pending.sessionId === safeQuoteSessionId(state.quoteSessionId || "")) {
+    pending.options = options;
+    return;
+  }
   clearQuoteSessionDraftSaveTimer();
   const delay = Number.isFinite(Number(options.delay)) ? Math.max(0, Number(options.delay)) : 650;
-  quoteSessionDraftSaveTimer = window.setTimeout(() => {
+  const scheduled = { kind: "timer", id: null, options };
+  scheduled.id = window.setTimeout(() => {
+    if (quoteSessionDraftSaveTimer !== scheduled) return;
     quoteSessionDraftSaveTimer = null;
     if (commitActiveOutputEditor({ commit: false }) === "blocked") {
       blockedOutputDraftSaveOptions = options;
@@ -14596,6 +14626,7 @@ function queueQuoteSessionDraftStateSave(options = {}) {
     }
     saveQuoteSessionDraftState({ ...options, commitEditor: false }).catch(() => {});
   }, delay);
+  quoteSessionDraftSaveTimer = scheduled;
 }
 
 function quoteCommercialFieldChanged(target = null) {
@@ -16744,9 +16775,8 @@ async function confirmBasis(options = {}) {
     message: "Building the pricing review rows. Excel download will be available after this finishes.",
   });
   syncControlStates();
-  await waitForUiPaint();
   try {
-    const refreshed = await refreshLineItemsFromServer();
+    const refreshed = await refreshLineItemsFromServer({ waitForPaint: true });
     if (!refreshed.ok) {
       if (refreshed.data?.page_unloading) {
         return;

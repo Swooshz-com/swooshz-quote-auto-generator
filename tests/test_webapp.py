@@ -33074,7 +33074,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertIn("quote_session: currentQuoteSessionPayload({", normalize_body)
         self.assertIn("includeDraftState: true", normalize_body)
         self.assertLess(
-            confirm_body.index("const refreshed = await refreshLineItemsFromServer();"),
+            confirm_body.index("const refreshed = await refreshLineItemsFromServer({ waitForPaint: true });"),
             confirm_body.index("refreshOutputRowsFromLineItems();"),
         )
         self.assertIn("if (!refreshed.ok)", confirm_body)

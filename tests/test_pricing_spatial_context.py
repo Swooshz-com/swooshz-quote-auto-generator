@@ -46,6 +46,7 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(evidence['reincludedPricing'], 'PASS')
         self.assertEqual(evidence['tickOnlyDeferred'], 'PASS')
         self.assertTrue(evidence['deferredReopened'])
+        self.assertEqual(evidence['deferredEditorDismissal'], 'PASS')
         self.assertEqual(evidence['xlsx']['status'], 'PASS')
         self.assertEqual(json.loads(evidence['xlsx']['validator'])['bad'], [])
 

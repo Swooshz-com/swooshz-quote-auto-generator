@@ -89,6 +89,136 @@ if (input.mode==='reopen') {
     }
     console.log(JSON.stringify({status:'FXUI_ASYNC_DISPATCH_ADMISSION_PASS',paths:['generate','generate_pdf','draft','basis_chat'],negativePosts:0,positivePostsPerPath:1}));
   })().catch(e=>{console.error(e);process.exitCode=1;});
+} else if (input.mode==='selection-ordering') {
+  const vm = require('node:vm');
+  const code = ['refreshLineItemsFromServer', 'saveQuoteSessionDraftState', 'queueQuoteSessionDraftStateSave',
+    'clearQuoteSessionDraftSaveTimer', 'resumeBlockedOutputDraftSave'].map(extract).join('\n');
+  const turn = () => new Promise(resolve => setImmediate(resolve));
+  async function check({ inflight, outcome, queueWhileSelecting = false, blockRetry = false, replacementKind }) {
+    const timers = new Map(), writes = [], releases = [], selections = [];
+    let nextTimer = 0, serverRevision = 4, releasePaint, releaseSelection;
+    function fireTimers() {
+      const pending = [...timers.values()];
+      timers.clear();
+      for (const timer of pending) timer();
+      return pending.length;
+    }
+    const c = {
+      state: { quoteSessionId: 'synthetic-quote', pricingLedgerRevisions: { 'synthetic-quote': { row: 4 } },
+        lineItems: [{ price: null }], value: 1, outputRows: [] },
+      quoteSessionDraftSaveTimer: null, quoteSessionDraftSavePromise: null,
+      blockedOutputDraftSaveOptions: null, blocked: false,
+      waitForUiPaint: () => new Promise(resolve => { releasePaint = resolve; }),
+      commitActiveOutputEditor: () => c.blocked ? 'blocked' : 'unchanged', quoteSessionDraftStateCanSave: () => true,
+      saveSessionState: () => {}, currentQuoteSessionDraftState: () => ({ value: c.state.value }),
+      sessionFileRecordsFromDraft: () => [], quoteSessionDraftComparisonKey: JSON.stringify,
+      quoteSessionDraftFileComparisonKey: JSON.stringify, quoteSessionDraftIsConfirmed: () => false,
+      quoteSessionDraftFilesAreConfirmed: () => true, safeQuoteSessionId: value => value || '',
+      ensureClientQuoteSessionId: () => c.state.quoteSessionId,
+      isPlainObject: value => Boolean(value && typeof value === 'object'),
+      normalizeLineItem: row => row, retainExcludedBasisPricingRows: rows => rows,
+      pendingPricingSelections: () => [{ source_basis_line_id: 'row', expected_revision: c.state.pricingLedgerRevisions['synthetic-quote'].row }],
+      buildLineItemNormalizePayload: () => ({ draft: c.state.value }),
+      saveCurrentQuoteSession: async options => {
+        writes.push({ draft: options.draftState.value, generated: options.quoteGenerated });
+        await new Promise(resolve => releases.push(resolve));
+        c.state.pricingLedgerRevisions['synthetic-quote'].row = ++serverRevision;
+        return { session_id: c.state.quoteSessionId };
+      },
+      postJson: async (url, payload, { isCurrent }) => {
+        assert.equal(url, '/api/quote-sessions/pricing-selections');
+        selections.push({ draft: payload.draft, expected: payload.pricing_selections[0].expected_revision });
+        await new Promise(resolve => { releaseSelection = resolve; });
+        if (!isCurrent()) return { ok: false, status: 409, data: { status: 'conflict', request_superseded: true } };
+        if (selections[0].expected !== serverRevision) return { ok: false, status: 409, data: { status: 'conflict' } };
+        if (outcome === 'failed') return { ok: false, status: 503, data: { status: 'failed' } };
+        return { ok: true, status: 200, data: { line_items: [{ price: 12 }],
+          quote_session: { pricing_ledger: { rows: { row: ++serverRevision } } } } };
+      },
+      window: { setTimeout: fn => { timers.set(++nextTimer, fn); return nextTimer; }, clearTimeout: id => timers.delete(id) },
+    };
+    vm.createContext(c);
+    vm.runInContext(code, c);
+    const sentSave = inflight ? c.saveQuoteSessionDraftState({ quoteGenerated: false }) : null;
+    c.state.value = 2;
+    c.queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+    assert.equal(timers.size, 1, 'the autosave must be queued before Confirm');
+    const cancelledTimer = [...timers.values()][0];
+    const refresh = c.refreshLineItemsFromServer({ waitForPaint: true });
+    await turn();
+    assert.equal(fireTimers(), 0, 'queued autosave can fire while Confirm owns selection');
+    assert.equal(selections.length, 0, 'selection started before the preparing state could paint');
+    const activeHold = c.quoteSessionDraftSaveTimer;
+    c.clearQuoteSessionDraftSaveTimer();
+    cancelledTimer();
+    assert.equal(c.quoteSessionDraftSaveTimer, activeHold, 'timer cleanup disturbed the selection hold');
+    releasePaint();
+    await turn();
+    if (sentSave) {
+      assert.equal(selections.length, 0, 'Confirm sent selection before save acknowledgement');
+      releases.shift()();
+      await sentSave;
+      await turn();
+    }
+    assert.deepEqual(selections, [{ draft: 2, expected: inflight ? 5 : 4 }]);
+    assert.equal(writes.length, inflight ? 1 : 0, 'Confirm wrote a redundant draft before selection');
+    if (queueWhileSelecting) {
+      c.state.value = 3;
+      c.queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+    }
+    assert.equal(fireTimers(), 0, 'autosave can fire while selection is in flight');
+    if (replacementKind === 'timer') {
+      c.state.quoteSessionId = 'replacement-quote';
+      c.queueQuoteSessionDraftStateSave({ quoteGenerated: true });
+    } else if (replacementKind === 'selection') {
+      c.quoteSessionDraftSaveTimer = { kind: 'selection', sessionId: c.state.quoteSessionId, options: { quoteGenerated: true } };
+    }
+    const replacement = c.quoteSessionDraftSaveTimer;
+    if (outcome === 'stale') serverRevision++;
+    c.blocked = blockRetry;
+    releaseSelection();
+    const result = await refresh;
+    if (replacementKind) {
+      assert.equal(result.data.request_superseded, true);
+      assert.equal(c.quoteSessionDraftSaveTimer, replacement, 'stale selection cleared the replacement slot');
+      assert.deepEqual(replacement.options, { quoteGenerated: true }, 'stale selection restored its own options');
+      assert.equal(timers.size, replacementKind === 'timer' ? 1 : 0);
+      assert.equal(writes.length, 0);
+    } else if (outcome === 'selected') {
+      assert.equal(result.ok, true);
+      assert.equal(c.state.lineItems[0].price, 12);
+      assert.equal(c.state.pricingLedgerRevisions['synthetic-quote'].row, serverRevision);
+      assert.equal(timers.size, 0, 'selected draft was scheduled for a duplicate save');
+    } else if (outcome === 'stale') {
+      assert.equal(result.status, 409);
+      assert.equal(c.state.lineItems[0].price, null);
+      assert.equal(c.state.pricingLedgerRevisions['synthetic-quote'].row, 4);
+      assert.equal(timers.size, 0, 'stale local draft can overwrite the newer server revision');
+    } else {
+      assert.equal(result.status, 503);
+      if (blockRetry) {
+        assert.equal(fireTimers(), 0, 'failed selection bypassed the editor guard');
+        assert.equal(c.blockedOutputDraftSaveOptions?.quoteGenerated, queueWhileSelecting);
+        c.blocked = false;
+        c.resumeBlockedOutputDraftSave();
+      }
+      assert.equal(fireTimers(), 1, 'failed selection dropped pending draft persistence');
+      assert.deepEqual(writes, [{ draft: queueWhileSelecting ? 3 : 2, generated: queueWhileSelecting }]);
+      const retry = c.quoteSessionDraftSavePromise;
+      releases.shift()();
+      await retry;
+    }
+  }
+  (async () => {
+    await check({ outcome: 'selected' });
+    await check({ inflight: true, outcome: 'selected' });
+    await check({ outcome: 'stale' });
+    await check({ outcome: 'failed' });
+    await check({ outcome: 'failed', queueWhileSelecting: true, blockRetry: true });
+    await check({ outcome: 'failed', replacementKind: 'timer' });
+    await check({ outcome: 'failed', replacementKind: 'selection' });
+    console.log(JSON.stringify({ status: 'CONFIRM_DRAFT_ORDERING_PASS' }));
+  })().catch(error => { console.error(error); process.exitCode = 1; });
 } else if (input.mode==='temporal') {
   const vm=require('node:vm');
   const code=['saveQuoteSessionDraftState','queueQuoteSessionDraftStateSave','clearQuoteSessionDraftSaveTimer','resumeBlockedOutputDraftSave'].map(extract).join('\n');
