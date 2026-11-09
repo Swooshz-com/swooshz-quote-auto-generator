@@ -48,6 +48,8 @@ let checkpointRequestArrived = null;
 let savedDraft = null;
 let scope = "synthetic-scope";
 let quoteSessionInitialSavePromise = null;
+let browserRecoveryEpoch = 0;
+let quoteSessionDraftSaveTimer = null;
 let quoteSessionDraftSavePromise = null;
 let quoteSessionConfirmedDraftSessionId = "";
 let quoteSessionConfirmedDraftKey = "";
@@ -126,7 +128,8 @@ async function postJson(url, payload) {
   if (mode === "failure") return {ok: false, status: 500, data: {}};
   savedDraft = clone(payload.draft_state);
   return {ok: true, status: 200, data: {status: mode === "bad_status" ? "unknown" : "saved",
-    quote_session: {session_id: mode === "wrong_session" ? "quote-other" : payload.session_id}}};
+    quote_session: {session_id: mode === "wrong_session" ? "quote-other" : payload.session_id,
+      draft_version: (postCount + 1).toString(16).padStart(64, "0"), pricing_ledger: {revision: 0, rows: {}}}}};
 }
 function hasReferenceFilesForNavigation() {return state.images.length > 0;}
 function hasReferenceFilesForAnalysis() {return hasReferenceFilesForNavigation();}
@@ -172,6 +175,7 @@ const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading",
   "buildSessionSnapshot", "currentQuoteSessionDraftState", "currentQuoteSessionPayload", "buildPayload",
   "quoteSessionDraftComparisonKey", "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft",
   "quoteSessionDraftFilesAreConfirmed", "quoteSessionDraftIsConfirmed", "saveCurrentQuoteSession",
+  "validQuoteDraftVersion", "validPricingLedgerReceipt", "requireQuoteDraftReopen",
   "saveQuoteSessionDraftState", "quoteSessionDraftStateCanSave", "quoteSessionSaveFailureFrom",
   "markQuoteSessionDraftSaveStartedAfterCustomerStep", "quoteSessionDraftReachedCustomerStep",
   "quoteCommercialStrictDataEqual", "customerStepCheckpointForCurrent", "customerStepCheckpointIsCurrent",
@@ -181,7 +185,7 @@ const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading",
   "commitActiveOutputEditor", "goToNextSidePanel", "goToPreviousSidePanel", "furthestQuoteSessionSidePanel", "restoredQuoteSessionSidePanel"];
 eval(functions.map(extract).join("\n"));
 function fresh() {
-  state = {quoteSessionId: "quote-synthetic-checkpoint", activeSidePanel: "customer",
+  state = {quoteSessionId: "quote-synthetic-checkpoint", pricingDraftVersion: "a".repeat(64), activeSidePanel: "customer",
     quoteSessionDraftSaveStarted: true, customerStepCheckpoint: null, customerStepCheckpointSaveBusy: false,
     pricingReferenceId: "reference-a", pricingReferenceSource: "company", quoteCommercialLifecycle: "NEW_UNINITIALISED",
     pricingReferenceSelectionIntent: null, quoteCommercialSnapshot: null, quoteCommercialReview: null,
@@ -194,6 +198,7 @@ function fresh() {
   scope = "synthetic-scope"; saveMode = "success"; savedDraft = null;
   activeOutputEditor = null; blockedEditorCommits = 0;
   quoteSessionInitialSavePromise = null; quoteSessionDraftSavePromise = null;
+  quoteSessionDraftSaveTimer = null;
   quoteSessionConfirmedDraftSessionId = ""; quoteSessionConfirmedDraftKey = ""; quoteSessionConfirmedDraftFileKey = "";
   elements.profileSelect.value = "company::reference-a";
   elements.quoteDate.value = "2026-10-13";

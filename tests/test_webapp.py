@@ -20810,7 +20810,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("viewCurrentPdfFile", js)
         self.assertIn("showExcelGeneratingModal", js)
         self.assertIn("hideExcelGeneratingModal", js)
-        self.assertIn('state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };', js)
+        self.assertIn('state.activeJob = { ...submittedOperation, id: started.data.job_id || operation.id, phase: "running" };', js)
         self.assertIn('const jobType = viewPdf ? "generate_pdf" : "generate";', js)
         self.assertIn('activeJob.type === "generate" || activeJob.type === "generate_pdf"', js)
         self.assertIn('setResultStatus(viewPdf ? "Checking PDF" : "Checking Excel", "is-warn")', js)
@@ -24025,6 +24025,7 @@ function finishDashboardOperation() {}
 function appIsBusy() { return false; }
 function clearQuoteSessionDraftSaveTimer() {}
 function syncControlStates() { controlsSynced += 1; }
+function isPlainObject(value) { return !!value && typeof value === "object" && !Array.isArray(value); }
 function quoteDraftShouldPersistToDashboard() { return true; }
 function currentQuoteSessionDraftState() { throw new Error("Server draft state should be used."); }
 function mergeDashboardQuoteSession() {}
@@ -27799,6 +27800,8 @@ eval([
 ].map((name) => extractFunction(name)).join("\n"));
 eval(extractFunction("setQuoteCommercialReview"));
 eval(extractFunction("quoteSessionSnapshotForRestoration"));
+eval(extractFunction("validQuoteDraftVersion"));
+eval(extractFunction("validPricingLedgerReceipt"));
 eval(extractFunction("applyQuoteSessionSnapshot", true));
 
 const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
@@ -28089,6 +28092,8 @@ eval([
   "syncSelectedPricingReference",
   "renderProfileOptions",
   "quoteSessionSnapshotForRestoration",
+  "validQuoteDraftVersion",
+  "validPricingLedgerReceipt",
   "applyQuoteSessionSnapshot",
   "applyPendingPricingReferenceSelection",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28338,6 +28343,8 @@ eval([
   "quoteCommercialRestorationReviewReason",
   "setQuoteCommercialReview",
   "quoteSessionSnapshotForRestoration",
+  "validQuoteDraftVersion",
+  "validPricingLedgerReceipt",
   "applyQuoteSessionSnapshot",
   "mergeDashboardDraftSummaryDetails",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28658,7 +28665,7 @@ function extractFunction(name) {
   }
   throw new Error(`Unclosed production function ${name}`);
 }
-const constantNames = ["CSRF_HEADER_NAME", "GENERIC_FAILURE_MESSAGE", "QUOTE_COMMERCIAL_REVIEW_SCHEMA",
+const constantNames = ["CSRF_HEADER_NAME", "GENERIC_FAILURE_MESSAGE", "PRICING_SELECTION_STALE_MESSAGE", "QUOTE_COMMERCIAL_REVIEW_SCHEMA",
   "QUOTE_COMMERCIAL_REVIEW_VERSION", "QUOTE_COMMERCIAL_REVIEW_STATUS", "QUOTE_COMMERCIAL_REVIEW_MESSAGE",
   "QUOTE_COMMERCIAL_REVIEW_REASONS", "PRICING_REFERENCE_ID_RE", "PRICING_REFERENCE_SOURCES",
   "SERVER_JOB_TYPES", "ACTIVE_JOB_STARTING_MAX_AGE_MS", "ACTIVE_JOB_CLOCK_SKEW_MS",
@@ -28722,6 +28729,7 @@ const messages = [];
 const state = {
   quoteAiSpendRequest: 0, quoteSessions: [],
   quoteSessionId: scenario.path === "initial" ? "" : "quote-synthetic-a",
+  pricingDraftVersion: scenario.path === "initial" ? "" : "a".repeat(64),
   quoteSessionRestoredSessionId: scenario.path === "restored" ? "quote-synthetic-a" : "",
   quoteSessionDraftSaveStarted: true, quoteSessionLoadError: "OLD-REFERENCE-CANARY",
   quoteCommercialLifecycle: "EXISTING", quoteCommercialReview: null,
@@ -28747,7 +28755,10 @@ const generationProfileIdForPayload = () => "synthetic-profile";
 const dashboardCommercialsFromState = () => ({ currency: "SGD" });
 const syntheticQuoteSessionHasFreshOutputExports = () => false;
 const currentGenerationContext = () => ({ session_id: state.quoteSessionId, run_id: "" });
-const transitionGenerationContext = sessionId => { state.quoteSessionId = sessionId; };
+const transitionGenerationContext = sessionId => {
+  if (state.quoteSessionId !== sessionId) state.pricingDraftVersion = sessionId ? false : "";
+  state.quoteSessionId = sessionId;
+};
 const syntheticBuildSessionSnapshot = () => ({ version, quoteSessionDraftSaveStarted: true,
   quoteCommercialLifecycle: state.quoteCommercialLifecycle, quoteCommercialReview: state.quoteCommercialReview,
   images: state.images, quoteDetails: { currency: "SGD" }, outputRows: [], lineItems: [{}],
@@ -28779,7 +28790,9 @@ async function fetch(url, options) {
   if (url === "/api/jobs/job-synthetic-stable") {
     calls.push({ url, method: "GET" });
     return responseFor(200, scenario.excelFault === "poll" ? { status: "failed", result: { status: "failed", error_reference: "ERR-1234ABCD" } } :
-      { status: "completed", result: { status: "completed", output_rows: {schema:"swooshz.quote-output-rows.v1",rows:state.outputRows.map((row,index)=>({...row,diagnostic_row_id:`row-${index}`,source_basis_line_id:String(row.source_basis_line_id||"")}))}, files: [{ name: "quotation.xlsx", url: "/api/synthetic-current.xlsx" }] } });
+      { status: "completed", result: { status: "completed",
+        quote_session: { session_id: persisted.session_id, draft_version: "f".repeat(64), pricing_ledger: { revision: 0, rows: {} } },
+        output_rows: {schema:"swooshz.quote-output-rows.v1",rows:state.outputRows.map((row,index)=>({...row,diagnostic_row_id:`row-${index}`,source_basis_line_id:String(row.source_basis_line_id||"")}))}, files: [{ name: "quotation.xlsx", url: "/api/synthetic-current.xlsx" }] } });
   }
   if (url === "/api/session") {
     calls.push({ url, method: "GET" });
@@ -28806,15 +28819,17 @@ async function fetch(url, options) {
   } else if (scenario.gated) await new Promise(resolve => { releaseResponse = resolve; });
   if (scenario.fetchFailure) throw Error(CANARY);
   const status = (scenario.refresh === "success" || scenario.realRefresh) && !scenario.refreshFault && sequence === 2 ? 200 : (scenario.status ?? 400);
-  let data = status >= 200 && status < 300 ? { status: "saved", quote_session: { session_id: payload.session_id } } : {
+  const savedSession = { session_id: payload.session_id, draft_version: (sequence + 1).toString(16).padStart(64, "0"),
+    pricing_ledger: { revision: 0, rows: {} } };
+  let data = status >= 200 && status < 300 ? { status: "saved", quote_session: savedSession } : {
     status: "blocked", error_reference: scenario.reference ?? "ERR-1234ABCD",
     errors: [CANARY], message: CANARY,
     ...(scenario.review ? { quoteCommercialReview: scenario.invalidReview ? { ...review, version: 99 } : review } : {}),
   };
   if (scenario.invalidAck === "null") data = null;
   if (scenario.invalidAck === "missing") data = { status: "saved" };
-  if (scenario.invalidAck === "mismatch") data = { status: "saved", quote_session: { session_id: "quote-different-identity" } };
-  if (scenario.invalidAck === "status") data = { status: "failed", quote_session: { session_id: payload.session_id } };
+  if (scenario.invalidAck === "mismatch") data = { status: "saved", quote_session: { ...savedSession, session_id: "quote-different-identity" } };
+  if (scenario.invalidAck === "status") data = { status: "failed", quote_session: savedSession };
   if (status === 200 && !scenario.invalidAck) persisted = structuredClone(payload);
   return responseFor(status, data);
 }
@@ -28933,7 +28948,8 @@ if (scenario.kind === "dashboard-failure") required.push("returnToDashboard", "r
 if (scenario.kind === "excel") { constantNames.push(); required.push("downloadCurrentExcelFile", "downloadFileIsFresh", "pdfFileIsFresh", "quoteSessionHasFreshOutputExports", "markOutputRowsDirty", "revisionNumber", "setDownloadFiles", "pollJob", "isInterruptedJobPoll", "handleInterruptedJobPoll", "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage", "handleGeneratedExportReadyAction"); }
 if (scenario.kind === "dashboard-order") required.push("returnToDashboard", "restoredQuoteSessionHasChanged");
 // Optional only so the SAME regression executes against the unchanged baseline.
-for (const name of ["quoteSessionSaveFailureFrom", "safeQuoteSessionErrorReference"]) {
+for (const name of ["quoteSessionSaveFailureFrom", "safeQuoteSessionErrorReference", "validQuoteDraftVersion",
+  "validPricingLedgerReceipt", "requireQuoteDraftReopen", "acknowledgeGeneratedQuoteDraft", "rememberPricingSelectionAcknowledgement"]) {
   if (source.includes(`function ${name}(`)) required.push(name);
 }
 // These adapters supply only synthetic projection inputs and DOM/file effects.
@@ -29096,6 +29112,17 @@ async function act() {
     assert(state.quoteSessionLoadError.includes("ERR-")); assert.strictEqual(state.quoteSessionDashboardBusy, false);
     assert.deepStrictEqual(currentQuoteSessionDraftState(), before); assert.deepStrictEqual(sessionFileRecordsFromDraft(), files);
     assert(!quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));
+    if (scenario.rejectAck && source.includes("function validQuoteDraftVersion(")) {
+      assert.strictEqual(state.pricingDraftVersion, false, "An uncertain save needs an authoritative reopen");
+      const posts = calls.filter(c => c.url === "/api/quote-sessions" && c.method !== "GET").length;
+      await settle(listeners.get("click")()); await tick();
+      assert.strictEqual(calls.filter(c => c.url === "/api/quote-sessions" && c.method !== "GET").length, posts,
+        "Dashboard retried a save with an unknown commit");
+      assert.deepStrictEqual(currentQuoteSessionDraftState(), before);
+      assert.deepStrictEqual(sessionFileRecordsFromDraft(), files);
+      console.log(JSON.stringify({ scenario, calls, messages, files_retained: true }));
+      return;
+    }
     scenario.status = 200; scenario.invalidAck = false;
     await settle(listeners.get("click")()); await tick();
     assert.strictEqual(state.activeAppView, "dashboard");
@@ -29653,6 +29680,7 @@ let draftVersion = 1;
 let fileVersion = 1;
 const state = {
   quoteSessionId: "quote-browser-sync",
+  pricingDraftVersion: "a".repeat(64),
   basisConfirmed: true,
   outputRows: [],
 };
@@ -29692,7 +29720,9 @@ async function saveCurrentQuoteSession(options) {
     ? quoteSessionDraftFileComparisonKey(options.draftFiles)
     : null;
   rememberConfirmedQuoteSessionDraft(state.quoteSessionId, draftKey, fileKey);
-  return { session_id: state.quoteSessionId };
+  state.pricingDraftVersion = calls.indexOf(options).toString(16).padStart(64, "0");
+  return { session_id: state.quoteSessionId, draft_version: state.pricingDraftVersion,
+    pricing_ledger: { revision: 0, rows: {} } };
 }
 
 eval([
@@ -29706,6 +29736,7 @@ eval([
   "clearQuoteSessionDraftSaveTimer",
   "saveQuoteSessionDraftState",
   "ensureQuoteSession",
+  "validQuoteDraftVersion",
 ].map(extractFunction).join("\n"));
 
 (async () => {

@@ -91,7 +91,9 @@ if (input.mode==='reopen') {
   })().catch(e=>{console.error(e);process.exitCode=1;});
 } else if (input.mode==='selection-ordering') {
   const vm = require('node:vm');
-  const code = ['validQuoteDraftVersion', 'requireQuoteDraftReopen', 'refreshLineItemsFromServer',
+  const code = ['validQuoteDraftVersion', 'validPricingLedgerReceipt', 'pricingSelectionRefusalReason',
+    'selectedCatalogueAuthorityMatches', 'pricingSelectionAcknowledgement', 'rememberPricingSelectionAcknowledgement',
+    'requireQuoteDraftReopen', 'refreshLineItemsFromServer',
     'saveQuoteSessionDraftState', 'queueQuoteSessionDraftStateSave',
     'clearQuoteSessionDraftSaveTimer', 'resumeBlockedOutputDraftSave'].map(extract).join('\n');
   const turn = () => new Promise(resolve => setImmediate(resolve));
@@ -106,7 +108,7 @@ if (input.mode==='reopen') {
     }
     const c = {
       state: { quoteSessionId: 'synthetic-quote', pricingLedgerRevisions: { 'synthetic-quote': { row: 4 } },
-        lineItems: [{ price: null }], value: 1, outputRows: [] },
+        pricingDraftVersion: 'a'.repeat(64), lineItems: [{ price: null }], value: 1, outputRows: [] },
       quoteSessionDraftSaveTimer: null, quoteSessionDraftSavePromise: null,
       browserRecoveryEpoch: 0,
       blockedOutputDraftSaveOptions: null, blocked: false,
@@ -119,7 +121,9 @@ if (input.mode==='reopen') {
       ensureClientQuoteSessionId: () => c.state.quoteSessionId,
       isPlainObject: value => Boolean(value && typeof value === 'object'),
       normalizeLineItem: row => row, retainExcludedBasisPricingRows: rows => rows,
-      pendingPricingSelections: () => [{ source_basis_line_id: 'row', expected_revision: c.state.pricingLedgerRevisions['synthetic-quote'].row }],
+      pricingAuthorityPrice: authority => authority?.price ?? null,
+      pendingPricingSelections: () => [{ source_basis_line_id: 'row', catalog_item_id: 'item',
+        expected_revision: c.state.pricingLedgerRevisions['synthetic-quote'].row }],
       buildLineItemNormalizePayload: () => ({ draft: c.state.value }),
       saveCurrentQuoteSession: async options => {
         writes.push({ draft: options.draftState.value, generated: options.quoteGenerated });
@@ -134,8 +138,11 @@ if (input.mode==='reopen') {
         if (!isCurrent()) return { ok: false, status: 409, data: { status: 'conflict', request_superseded: true } };
         if (selections[0].expected !== serverRevision) return { ok: false, status: 409, data: { status: 'conflict' } };
         if (outcome === 'failed') return { ok: false, status: 503, data: { status: 'failed' } };
-        return { ok: true, status: 200, data: { line_items: [{ price: 12 }],
-          quote_session: { pricing_ledger: { rows: { row: ++serverRevision } } } } };
+        return { ok: true, status: 200, data: { status: 'normalized',
+          line_items: [{ source_basis_line_id: 'row', price: 12, pricing_authority: { variant: 'catalog', catalog_item_id: 'item', price: 12 } }],
+          selections: [{ source_basis_line_id: 'row', status: 'selected' }],
+          quote_session: { session_id: 'synthetic-quote', draft_version: 'b'.repeat(64),
+            pricing_ledger: { revision: 8, rows: { row: ++serverRevision } } } } };
       },
       window: { setTimeout: fn => { timers.set(++nextTimer, fn); return nextTimer; }, clearTimeout: id => timers.delete(id) },
     };
@@ -171,6 +178,7 @@ if (input.mode==='reopen') {
     assert.equal(fireTimers(), 0, 'autosave can fire while selection is in flight');
     if (replacementKind === 'timer') {
       c.state.quoteSessionId = 'replacement-quote';
+      c.state.pricingDraftVersion = 'c'.repeat(64);
       c.queueQuoteSessionDraftStateSave({ quoteGenerated: true });
     } else if (replacementKind === 'selection') {
       c.quoteSessionDraftSaveTimer = { kind: 'selection', sessionId: c.state.quoteSessionId, options: { quoteGenerated: true } };
@@ -198,17 +206,12 @@ if (input.mode==='reopen') {
       assert.equal(timers.size, 0, 'stale local draft can overwrite the newer server revision');
     } else {
       assert.equal(result.status, 503);
-      if (blockRetry) {
-        assert.equal(fireTimers(), 0, 'failed selection bypassed the editor guard');
-        assert.equal(c.blockedOutputDraftSaveOptions?.quoteGenerated, queueWhileSelecting);
-        c.blocked = false;
-        c.resumeBlockedOutputDraftSave();
-      }
-      assert.equal(fireTimers(), 1, 'failed selection dropped pending draft persistence');
-      assert.deepEqual(writes, [{ draft: queueWhileSelecting ? 3 : 2, generated: queueWhileSelecting }]);
-      const retry = c.quoteSessionDraftSavePromise;
-      releases.shift()();
-      await retry;
+      c.blocked = false;
+      c.resumeBlockedOutputDraftSave();
+      assert.equal(fireTimers(), 0, 'an unknown commit must not cause a retry');
+      assert.equal(c.state.pricingDraftVersion, false);
+      assert.equal(c.state.value, queueWhileSelecting ? 3 : 2, 'retain local edits for recovery');
+      assert.deepEqual(writes, []);
     }
   }
   (async () => {

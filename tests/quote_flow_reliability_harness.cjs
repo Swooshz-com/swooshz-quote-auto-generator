@@ -222,6 +222,10 @@ async function resumedPdfStatusCases() {
   for (const scenario of ['current_pdf', 'missing_pdf', 'download_without_view', 'stale_no_entry', 'postcommit_warning', 'pricing_review', 'excel', 'workbook_unavailable', 'no_files']) {
     const calls = { resumedStart: 0, poll: 0, persistentSave: 0, localSave: 0, updateDownload: 0, modalAttempt: 0, readyShown: 0, statuses: [], messages: [] };
     const state = { activeJob: { id: 'job-synthetic-resume', type: scenario === 'excel' ? 'generate' : 'generate_pdf', phase: 'running', viewPdf: scenario !== 'excel' }, outputRevision: 5, outputRows: [{price_mode:'Priced',description:'Synthetic saved row',quantity:1,unit:'nos',pricing_authority:{variant:'manual'}}], lineItems:[], pdfFile: null };
+    const submittedVersion = 'a'.repeat(64), anotherVersion = 'b'.repeat(64), committedVersion = 'c'.repeat(64);
+    state.quoteSessionId = 'quote-synthetic';
+    state.pricingDraftVersion = scenario === 'stale_no_entry' ? anotherVersion : submittedVersion;
+    state.activeJob.submittedDraftVersion = submittedVersion;
     const xlsx = { name: 'quotation.xlsx', url: '/api/quote-sessions/quote-synthetic/download/xlsx' };
     const pdf = { name: 'quotation.pdf', url: '/api/quote-sessions/quote-synthetic/download/pdf' };
     const current = scenario === 'current_pdf';
@@ -229,6 +233,8 @@ async function resumedPdfStatusCases() {
     const data = { status: scenario === 'pricing_review' ? 'needs_confirmation' : 'completed',
       files: scenario === 'no_files' ? [] : [xlsx, ...(['current_pdf', 'download_without_view'].includes(scenario) ? [pdf] : [])],
       quote_session: { session_id: 'quote-synthetic', exports: { xlsx: { url: xlsx.url }, pdf: { url: current ? pdf.url : null, view_url: current ? '/api/quote-sessions/quote-synthetic/view/pdf' : null } } } };
+    data.quote_session.draft_version = committedVersion;
+    if (scenario !== 'postcommit_warning') data.quote_session.pricing_ledger = { revision: 4, rows: { synthetic: 3 } };
     if (scenario === 'workbook_unavailable') data.export_status = { pdf_status: 'workbook_export_unavailable' };
     if (scenario === 'postcommit_warning') {
       data.post_commit_projection = { code: 'post_commit_projection_failed', retryable: true, message: 'Generation completed, but the session view could not be refreshed. Refresh to retry.' };
@@ -252,8 +258,11 @@ async function resumedPdfStatusCases() {
       showGeneratedExportReadyModal: () => { calls.modalAttempt++; const ready = !!state.pdfFile; if (ready) calls.readyShown++; return ready; },
     });
     vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'validQuoteDraftVersion', 'acknowledgeGeneratedQuoteDraft',
+      'validPricingLedgerReceipt', 'rememberPricingSelectionAcknowledgement',
       'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
     await context.resumeSavedJob();
+    assert.equal(state.pricingDraftVersion, scenario === 'stale_no_entry' ? anotherVersion
+      : scenario === 'postcommit_warning' ? submittedVersion : committedVersion, 'Generation can only acknowledge its submitted draft');
     assert.equal(calls.resumedStart, 1); assert.equal(calls.poll, 1);
     assert.equal(state.isGenerating, false); assert.equal(state.activeJob, null);
     if (scenario === 'postcommit_warning') {

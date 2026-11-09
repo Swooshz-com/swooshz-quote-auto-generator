@@ -559,7 +559,12 @@ async function main() {
     }));
     const referenceSignature = await page.evaluate(() => referenceFilesDependencySignature());
     assert(await page.evaluate((value) => referenceFileSignatureIsStrong(value), referenceSignature), "Synthetic booth image has no stable analysis signature.");
-    const seedPayload = structuredClone(createdSave.payload);
+    assert(/^[a-f0-9]{64}$/.test(beforeSeed.draft_version), "Synthetic basis seed has no current saved draft version.");
+    const { session_id, customer_summary, quote_company_profile, pricing_reference, commercials, status, draft_state } = beforeSeed;
+    const seedPayload = structuredClone({
+      session_id, customer_summary, quote_company_profile, pricing_reference, commercials, status, draft_state,
+      expected_draft_version: beforeSeed.draft_version,
+    });
     seedPayload.draft_state.quoteBasisSections = basisSections;
     seedPayload.draft_state.lineItems = fixtureItems.map((item, index) => ({
       section: item.section, description: item.description, quantity: 1, unit: item.unit_hint, pricing_keyword: item.id,
@@ -869,7 +874,11 @@ async function main() {
     const pdfJob = trace.jobs.slice(pdfJobIndex).find((job) => job.type === "generate_pdf");
     await waitUntil(() => pdfJob.polls.some((poll) => ["completed", "failed", "needs_review"].includes(poll.body?.status)), "terminal PDF generation result", 90000);
     const pdfTerminal = [...pdfJob.polls].reverse().find((poll) => ["completed", "failed", "needs_review"].includes(poll.body?.status)).body;
-    assert(pdfTerminal.status === "completed" && pdfTerminal.result?.status === "completed", "Real application PDF generation did not complete.");
+    assert(pdfTerminal.status === "completed" && pdfTerminal.result?.status === "completed",
+      "Real application PDF generation did not complete: " + safeErrorText(JSON.stringify({
+        jobStatus: pdfTerminal.status, resultStatus: pdfTerminal.result?.status,
+        pdfStatus: pdfTerminal.result?.export_status?.pdf_status, errors: pdfTerminal.result?.errors,
+      })));
     assert(pdfTerminal.result?.quote_session?.session_id === sessionId, "PDF result belongs to a different quote.");
     const resultRunIdPdf = requireGenerationRunIdBinding(pdfJob?.accepted, pdfTerminal, "PDF");
     const afterPdf = await quoteSessionDetail(api, baseUrl, sessionId);

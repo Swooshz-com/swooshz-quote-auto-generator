@@ -367,6 +367,11 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
     await otherTab.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await otherTab.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
     const title = "Synthetic project saved during Confirm";
+    const legacySnapshot = await page.evaluate(() => {
+      const snapshot = buildSessionSnapshot();
+      delete snapshot.pricingDraftVersion;
+      return snapshot;
+    });
     let selectionVersion;
     let newer;
     let followup;
@@ -378,17 +383,16 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
     const holdFollowup = async (route) => {
       if (route.request().method() !== "POST" || !selectionVersion || followup) return route.fallback();
       const pending = route.request().postDataJSON();
-      newer = await otherTab.evaluate(async ({ url, title }) => {
-        const before = (await fetch(url).then((response) => response.json())).quote_session;
-        const { session_id, customer_summary, draft_state, quote_company_profile, pricing_reference, commercials, status } = before;
-        draft_state.quoteDetails.project.title = title;
-        const response = await fetchPostJsonResponse("/api/quote-sessions", {
-          session_id, customer_summary: { ...customer_summary, project_name: title },
-          draft_state, quote_company_profile, pricing_reference, commercials, status,
-          expected_draft_version: before.draft_version,
-        });
-        return { status: response.status, base: before.draft_version, version: (await response.json()).quote_session?.draft_version };
-      }, { url: raceQuote, title });
+      const saveResponse = otherTab.waitForResponse((response) => response.request().method() === "POST"
+        && new URL(response.url()).pathname === "/api/quote-sessions");
+      const receipt = await otherTab.evaluate(async ({ id, title }) => {
+        if (!await modifyDashboardQuote(id)) throw new Error("Second tab could not reopen the current draft");
+        const base = state.pricingDraftVersion;
+        setInputValue(elements.projectTitle, title);
+        const saved = await saveQuoteSessionDraftState();
+        return { base, version: saved?.draft_version };
+      }, { id: sessionId, title });
+      newer = { ...receipt, status: (await saveResponse).status() };
       const response = await route.fetch({ maxRedirects: 0 });
       followup = { status: response.status(), version: pending.expected_draft_version };
       await route.fulfill({ response });
@@ -416,6 +420,55 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
       assert(saved.draft_version === newer.version && saved.draft_state.quoteDetails.project.title === title,
         "the stale follow-up or a recovery retry changed the newer draft");
       result.confirmFollowupConflict = "PASS";
+
+      const saveRequests = [];
+      page.on("request", (request) => {
+        if (request.method() === "POST" && new URL(request.url()).pathname === "/api/quote-sessions") saveRequests.push(request);
+      });
+      for (const missingVersion of [undefined, ""]) {
+        await page.evaluate((snapshot) => localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(snapshot)),
+          { ...legacySnapshot, pricingDraftVersion: missingVersion });
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+        assert(await page.evaluate(async (oldTitle) => {
+          queueQuoteSessionDraftStateSave({ delay: 0 });
+          const failure = {};
+          return elements.projectTitle.value === oldTitle && state.pricingDraftVersion === false
+            && !(await saveQuoteSessionDraftState({ saveFailure: failure })) && failure.failure?.draft_stale
+            && !(await ensureQuoteSession({ synchronizeDraft: true }))
+            && (await refreshLineItemsFromServer()).data.status === "conflict";
+        }, legacySnapshot.quoteDetails.project.title), "old browser recovery was writable or lost its local copy");
+        const readback = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
+        assert(saveRequests.length === 0 && readback.draft_version === saved.draft_version
+          && JSON.stringify(readback.pricing_ledger) === JSON.stringify(saved.pricing_ledger)
+          && JSON.stringify(readback.draft_files) === JSON.stringify(saved.draft_files),
+          "pre-version recovery sent a write or changed the newer saved quote");
+      }
+      await page.locator("#topbarBrandButton").click();
+      await page.waitForFunction(() => state.activeAppView === "dashboard" && !appIsBusy());
+      await page.evaluate(() => {
+        state.images.push({ ...state.images[0], name: "Synthetic unsaved image", session_file_key: "synthetic-unsaved-image" });
+      });
+      const reopened = await page.evaluate(async ({ id, title, version }) => ({
+        opened: await modifyDashboardQuote(id),
+        correctTitle: elements.projectTitle.value === title,
+        correctVersion: state.pricingDraftVersion === version,
+        serverFilesOnly: !state.images.some((image) => image.session_file_key === "synthetic-unsaved-image"),
+      }), { id: sessionId, title, version: newer.version });
+      assert(reopened.opened && reopened.correctTitle && reopened.correctVersion && reopened.serverFilesOnly,
+        "authoritative reopen did not restore the current draft and version together", reopened);
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+      assert(await page.evaluate(async (version) => {
+        if (state.pricingDraftVersion !== version) return false;
+        setInputValue(elements.projectTitle, "Synthetic title after current recovery");
+        const saved = await saveQuoteSessionDraftState();
+        return Boolean(saved && validQuoteDraftVersion(state.pricingDraftVersion) && state.pricingDraftVersion !== version);
+      }, newer.version), "current recovery could not save and advance its version");
+      const continued = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
+      assert(continued.draft_state.quoteDetails.project.title === "Synthetic title after current recovery",
+        "the recovered tab's current title was not saved");
+      result.preVersionRecovery = "PASS";
     } finally {
       await page.unroute("**/api/quote-sessions", holdFollowup);
       await page.unroute("**/api/quote-sessions/pricing-selections", watchSelection);

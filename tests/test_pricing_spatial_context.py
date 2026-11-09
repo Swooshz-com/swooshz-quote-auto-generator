@@ -48,6 +48,7 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(evidence['reincludedPricing'], 'PASS')
         self.assertEqual(evidence['staleRecovery'], 'PASS')
         self.assertEqual(evidence['confirmFollowupConflict'], 'PASS')
+        self.assertEqual(evidence['preVersionRecovery'], 'PASS')
         self.assertEqual(evidence['spatialPartialRefusal']['mixedStatus'], 200)
         self.assertEqual(evidence['spatialPartialRefusal']['resolvedVideo']['quoted'], '12.00')
         self.assertEqual(evidence['tickOnlyDeferred'], 'PASS')
@@ -238,7 +239,14 @@ class PricingSpatialContextTest(unittest.TestCase):
                                 "draft_files": [{"session_file_key": file_key, "name": file_key + ".png",
                                                  "type": "image/png", "data_url": fixtures.SANITIZED_LOGO_DATA_URL}]}
 
-                    initial = webapp.save_quote_session_from_browser(payload("Synthetic initial", "initial"), storage)
+                    create = {**payload("Synthetic initial", "initial"), "expected_draft_version": ""}
+                    initial = webapp.save_quote_session_from_browser(create, storage)
+                    original = storage._read_quote_session_metadata_for_workspace(session_id)
+                    with self.assertRaises(webapp.PricingSelectionConflict):
+                        webapp.save_quote_session_from_browser({
+                            **payload("Synthetic duplicate creation", "other"), "expected_draft_version": "",
+                        }, storage)
+                    self.assertEqual(storage._read_quote_session_metadata_for_workspace(session_id), original)
                     newer = {**payload("Synthetic newer", "newer"), "expected_draft_version": initial["draft_version"]}
                     saved = webapp.save_quote_session_from_browser(newer, storage)
                     before = storage._read_quote_session_metadata_for_workspace(session_id)
@@ -291,6 +299,24 @@ class PricingSpatialContextTest(unittest.TestCase):
                     self.assertEqual(storage._read_quote_session_metadata_for_workspace(session_id), competing[0])
                     self.assertEqual(competing[0][0]["pricing_ledger"], before[0]["pricing_ledger"])
                     self.assertEqual(competing[0][1], before[1])
+
+                    raced_id = "quote-draft-create-race"
+                    first = {**payload("Synthetic first creator", "first"), "session_id": raced_id,
+                             "expected_draft_version": ""}
+                    winner = {**payload("Synthetic winning creator", "winner"), "session_id": raced_id}
+                    winning_rows = []
+
+                    def insert_before_first(precondition, connection, workspace, metadata, draft_files):
+                        storage.create_or_update_quote_session(winner)
+                        winning_rows.append(storage._read_quote_session_metadata_for_workspace(raced_id))
+                        return commit(precondition, connection, workspace, metadata, draft_files)
+
+                    with mock.patch.object(webapp.QuoteDraftPrecondition, "persist_database", autospec=True,
+                                           side_effect=insert_before_first):
+                        with self.assertRaises(webapp.PricingSelectionConflict):
+                            webapp.save_quote_session_from_browser(first, storage)
+                    self.assertEqual(len(winning_rows), 1)
+                    self.assertEqual(storage._read_quote_session_metadata_for_workspace(raced_id), winning_rows[0])
 
     def test_reinclude_requires_current_revision_unchanged_row_and_a_prior_grant(self):
         storage = webapp.LocalSqagStorage()
@@ -493,6 +519,7 @@ const normalizeBasisTag = (tag) => tag;
 const reincludedCatalogueSelectionKey = (_line, _section, row) => row.source_basis_line_id;
 const buildLineItemNormalizePayload = () => ({});
 const normalizeLineItem = (row) => row;
+const pricingAuthorityPrice = (authority) => authority?.price ?? null;
 const retainExcludedBasisPricingRows = (rows) => rows;
 const clearQuoteSessionDraftSaveTimer = () => ({});
 const saveSessionState = () => recoveryCopies.push(structuredClone(state));
@@ -515,7 +542,7 @@ function setup(count, ordinary = 0, version = baseline) {
   const pricing_ledger = {revision: 8, rows: Object.fromEntries(ids.map((id) => [id, 4]))};
   const selections = ids.map((id) => ({source_basis_line_id: id, status: "selected"}));
   const line_items = ids.map((id) => ({source_basis_line_id: id,
-    pricing_authority: {variant: "catalog", catalog_item_id: "synthetic-item"}}));
+    pricing_authority: {variant: "catalog", catalog_item_id: "synthetic-item", price: 12}}));
   response = {ok: true, data: {status: "normalized", line_items, selections,
     quote_session: {session_id: sessionId, draft_version: acknowledged, pricing_ledger}}};
   state = {quoteSessionId: sessionId, pricingDraftVersion: version, pricingLedgerRevisions: {[sessionId]: {}},
@@ -552,7 +579,8 @@ function setup(count, ordinary = 0, version = baseline) {
   assert.deepEqual(state.pricingIssues, [{source_basis_line_id: "synthetic-row-0", reason: "unit_review_required"}]);
   assert.equal(state.lineItems[0].pricing_authority.variant, "none");
   for (const failure of ["stale", "unknown-reason", "refused-reinclude", "wrong-id", "stale-revision",
-    "malformed-revision", "missing-data", "network", "no-baseline", "invalid-batch", "missing-row"]) {
+    "malformed-revision", "missing-data", "network", "no-baseline", "invalid-batch", "missing-row",
+    "ordinary-authority", "ordinary-item", "ordinary-duplicate", "ordinary-refusal-conflicts"]) {
     setup(failure === "invalid-batch" ? 201 : 2, 1, failure === "no-baseline" ? "" : baseline);
     const ledger = response.data.quote_session.pricing_ledger;
     if (failure === "unknown-reason") Object.assign(response.data.selections[0], {status: "refused", reason: "stale"});
@@ -562,6 +590,10 @@ function setup(count, ordinary = 0, version = baseline) {
     if (failure === "malformed-revision") ledger.rows["synthetic-row-0"] = "4";
     if (failure === "missing-data") delete response.data;
     if (failure === "missing-row") response.data.line_items.pop();
+    if (failure === "ordinary-authority") delete response.data.line_items[0].pricing_authority;
+    if (failure === "ordinary-item") response.data.line_items[0].pricing_authority.catalog_item_id = "synthetic-other";
+    if (failure === "ordinary-duplicate") response.data.line_items.push(structuredClone(response.data.line_items[0]));
+    if (failure === "ordinary-refusal-conflicts") Object.assign(response.data.selections[0], {status: "refused", reason: "unit_review_required"});
     if (failure === "stale") response = {ok: false, status: 409, data: {...response.data, status: "conflict"}};
     if (failure === "network") response = {ok: false, data: {fetch_failed: true}};
     if (failure === "invalid-batch") response = {ok: false, status: 400, data: {status: "blocked"}};

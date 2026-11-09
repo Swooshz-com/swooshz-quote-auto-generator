@@ -25263,19 +25263,30 @@ class QuoteDraftPrecondition:
         return cls(expected)
 
     def require_current(self, metadata: dict[str, Any]) -> None:
-        if not metadata or normalized_quote_session_metadata(metadata) != self.expected:
+        if bool(metadata) != bool(self.expected) or normalized_quote_session_metadata(metadata) != self.expected:
             raise PricingSelectionConflict([], public_pricing_ledger(metadata))
 
     def persist_database(self, connection: Any, workspace_id: str, metadata: dict[str, Any],
                          draft_files: list[dict[str, Any]] | None = None) -> None:
         session_id = metadata["session_id"]
+        metadata_json = json.dumps(metadata, ensure_ascii=True, sort_keys=True)
+        if not self.expected:
+            cursor = connection.execute(
+                "insert into sqag_quote_sessions "
+                "(workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) "
+                "values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do nothing",
+                (workspace_id, session_id, metadata_json, json.dumps(draft_files or [], ensure_ascii=True, sort_keys=True),
+                 metadata["created_at"], metadata["updated_at"]),
+            )
+            if cursor.rowcount != 1:
+                raise PricingSelectionConflict([], {})
+            return
         row = connection.execute(
             "select metadata_json, draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
             (workspace_id, session_id),
         ).fetchone()
         raw = row["metadata_json"] if row is not None else None
         self.require_current(json.loads(raw) if isinstance(raw, str) else {})
-        metadata_json = json.dumps(metadata, ensure_ascii=True, sort_keys=True)
         if draft_files is None:
             cursor = connection.execute(
                 "update sqag_quote_sessions set metadata_json = ?, updated_at = ? where workspace_id = ? and session_id = ? and metadata_json = ?",
@@ -25303,15 +25314,19 @@ def save_quote_session_from_browser(payload: dict[str, Any], storage: Any) -> di
         return storage.create_or_update_quote_session(payload)
     patch = quote_session_patch_payload(payload)
     session_id = safe_quote_session_id(patch.get("session_id"), "")
-    if not session_id or not isinstance(patch.get("draft_state"), dict):
-        raise ValueError("A conditional save requires a saved quote and draft.")
+    expected_version = payload["expected_draft_version"]
+    if not session_id or (expected_version != "" and not isinstance(patch.get("draft_state"), dict)):
+        raise ValueError("A conditional save requires a quote and draft.")
     with pricing_ledger_mutation(storage, session_id):
         existing, editable = read_pricing_ledger_record(storage, session_id)
         if not editable:
             raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
-        precondition = QuoteDraftPrecondition.from_version(
-            existing, pricing_ledger_scope_for_storage(storage), payload["expected_draft_version"],
+        # An explicit empty version means create only. Omission remains supported
+        # for existing non-browser callers of this endpoint.
+        precondition = QuoteDraftPrecondition({}) if expected_version == "" else QuoteDraftPrecondition.from_version(
+            existing, pricing_ledger_scope_for_storage(storage), expected_version,
         )
+        precondition.require_current(existing)
         return storage.create_or_update_quote_session(payload, draft_precondition=precondition)
 
 

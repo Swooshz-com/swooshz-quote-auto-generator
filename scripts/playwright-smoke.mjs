@@ -667,7 +667,8 @@ async function prepareRefreshRecoveryQuote(page) {
       size: 68,
       data_url: state.headerLogo.data_url,
     }];
-    state.quoteSessionId = state.quoteSessionId || newClientQuoteSessionId();
+    transitionGenerationContext("", "");
+    ensureClientQuoteSessionId();
     state.quoteSessionDraftSaveStarted = true;
     state.activeAppView = "quote";
     state.aiFailed = false;
@@ -709,7 +710,25 @@ async function prepareRefreshRecoveryQuote(page) {
     setSidePanel("basis", { force: true });
     syncControlStates();
     await persistSessionFiles(sessionFileRecordsFromDraft());
+    const sessionId = await ensureQuoteSession({ synchronizeDraft: true });
+    if (!sessionId || !validQuoteDraftVersion(state.pricingDraftVersion)) {
+      throw new Error("Refresh recovery fixture could not save its initial draft.");
+    }
   });
+}
+
+async function waitForRecoveryRequest(started, label) {
+  let timer;
+  try {
+    await Promise.race([
+      started,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label + " did not start within 15 seconds.")), 15000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
@@ -759,7 +778,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
 
   try {
     await page.evaluate(() => { confirmBasis(); });
-    await firstRequestStarted;
+    await waitForRecoveryRequest(firstRequestStarted, "Initial Confirm Basis request");
     await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
     const savedBeforeRefresh = await page.evaluate(() => JSON.parse(
       window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
@@ -776,7 +795,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
     }
     releaseFirstRequest();
     await reload;
-    await secondRequestStarted;
+    await waitForRecoveryRequest(secondRequestStarted, "Resumed Confirm Basis request");
     await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
     releaseSecondRequest();
 
@@ -938,7 +957,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
       const pagesBeforeExport = page.context().pages().length;
       await page.locator(testCase.button + ":not([disabled])").click();
-      await firstPostStarted;
+      await waitForRecoveryRequest(firstPostStarted, "Initial " + testCase.type + " request");
       if (testCase.viewPdf && page.context().pages().length !== pagesBeforeExport) {
         throw new Error("PDF generation opened a waiting tab before refresh.");
       }
@@ -960,7 +979,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       }
       releaseFirstPost();
       await reload;
-      await secondPostStarted;
+      await waitForRecoveryRequest(secondPostStarted, "Resumed " + testCase.type + " request");
       await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
       const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
       if (restoredTitle !== testCase.title) {
@@ -1755,6 +1774,13 @@ async function installMockProfiles(page) {
           tax: { label: "GST", rate: 0.09 },
           item_count: 1,
           digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+          authority_items: [{
+            id: "synthetic-floor-needle-punch-carpet",
+            section: "Floor Design",
+            description: "Needle punch carpet in colour",
+            unit_hint: "sqm",
+            sale_unit_price: 15,
+          }],
         }],
         default_profile_id: "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
@@ -2202,6 +2228,9 @@ async function verifyServerPricingReferenceReviewDurability(page) {
   try {
     page = await isolatedContext.newPage();
     await installMockProfiles(page);
+    // This check creates a real catalogue and changes its digest. Use its
+    // persisted catalogue details when the browser validates the selection.
+    await page.unroute("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**");
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
     await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
@@ -2218,6 +2247,13 @@ async function verifyServerPricingReferenceReviewDurability(page) {
     await page.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 15000 });
 
     const established = await page.evaluate(async () => {
+      const selected = currentPricingReference();
+      const detail = await fetchPricingReferenceDetail(selected);
+      if (!samePricingReferenceBasis(pricingReferenceAuthorityBasis(selected), pricingReferenceAuthorityBasis(detail))
+        || !pricingReferenceCatalogItem(detail, "synthetic-floor-needle-punch-carpet")) {
+        throw new Error("Catalogue A fixture lacks the current priced catalogue detail.");
+      }
+      state.pricingReferences = state.pricingReferences.map((reference) => reference === selected ? detail : reference);
       // The operator's catalogue selection on a stable row; Confirm records it with the server ledger.
       state.quoteBasisSections = normalizeQuoteBasisSections([{
         id: "smoke-floor",
@@ -2241,6 +2277,10 @@ async function verifyServerPricingReferenceReviewDurability(page) {
         pricing_keyword: "synthetic-floor-needle-punch-carpet",
         source_basis_line_id: "smoke-floor-carpet",
       })];
+      const baselineId = await ensureQuoteSession({ synchronizeDraft: true });
+      if (!baselineId || !validQuoteDraftVersion(state.pricingDraftVersion)) {
+        throw new Error("Catalogue A fixture has no acknowledged draft to select from.");
+      }
       const normalized = await refreshLineItemsFromServer();
       if (!normalized.ok) throw new Error(`Catalogue A normalization failed: ${JSON.stringify(normalized.data)}.`);
       captureOriginalAnalysisSnapshot({ source: "playwright-server-review-durability" });
@@ -2985,17 +3025,19 @@ async function verifyStaleTabMutationIsRejected(page) {
       });
     });
 
-    const staleSessionId = "quote-stale-workspace-a-private";
+    const staleSessionId = await stalePage.evaluate(() => {
+      transitionGenerationContext("", "");
+      return ensureClientQuoteSessionId();
+    });
     const navigation = stalePage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 });
-    await stalePage.evaluate((sessionId) => {
+    await stalePage.evaluate(() => {
       clearQuoteSessionDraftSaveTimer();
       state.activeAppView = "quote";
-      state.quoteSessionId = sessionId;
       state.quoteSessionDraftSaveStarted = true;
       elements.clientName.value = "Workspace A Private Customer";
       saveSessionState();
       void saveQuoteSessionDraftState({ quoteGenerated: false }).catch(() => {});
-    }, staleSessionId);
+    });
     await navigation;
     await stalePage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
     await stalePage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
@@ -3087,9 +3129,7 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     if (!await applySessionData(session)) throw new Error("Session bootstrap state could not be applied.");
 
     clearQuoteSessionDraftSaveTimer();
-    state.quoteSessionId = "";
-    state.lastGenerationRunId = "";
-    state.lastGenerationRunSessionId = "";
+    transitionGenerationContext("", "");
     state.quoteSessionDraftSaveStarted = false;
     state.quoteSessionRestoredSessionId = "";
     state.quoteSessionRestoredDraftKey = "";
@@ -3276,7 +3316,10 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
 
     const candidateSessionId = safeQuoteSessionId(`${safePrefix}-${Date.now()}`);
     const sessionId = candidateSessionId || newClientQuoteSessionId();
-    state.quoteSessionId = sessionId;
+    // This fixture needs a predictable ID for the Dashboard's ID search.
+    // Reserve it as a new quote and let the regular save enforce create-only.
+    transitionGenerationContext(sessionId, "");
+    state.pricingDraftVersion = "create";
     const draftFiles = sessionFileRecordsFromDraft();
     const initialDraftState = currentQuoteSessionDraftState();
     const initialPayload = currentQuoteSessionPayload({
