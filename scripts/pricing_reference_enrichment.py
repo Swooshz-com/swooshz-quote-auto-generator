@@ -6,7 +6,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import pricing_reference_cleanup
+# The web app uses the package import and the catalogue CLI imports from scripts/.
+if __package__:
+    from . import pricing_reference_cleanup
+else:
+    import pricing_reference_cleanup
 
 TEXT_FIXES = pricing_reference_cleanup.import_word_replacements()
 
