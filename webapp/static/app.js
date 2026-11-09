@@ -11169,7 +11169,7 @@ async function applyOutputReferencePricing(button) {
     const selectedRows = Array.isArray(data.line_items) ? data.line_items.filter((entry) => entry?.source_basis_line_id === rowId) : [];
     const selected = restored ? normalizedRow : selectedRows.length === 1 ? normalizeOutputRow(selectedRows[0]) : null;
     const acknowledgement = selectionDraftKey && result.ok
-      ? pricingSelectionAcknowledgement(data, sessionId, expectedVersion, [selection], selected ? [selected] : [])
+      ? pricingSelectionAcknowledgement(data, sessionId, expectedVersion, [selection], selected ? [selected] : [], { requireAdvance: true })
       : null;
     if (acknowledgement) {
       rememberPricingSelectionAcknowledgement(acknowledgement, selectionDraftKey);
@@ -13477,7 +13477,7 @@ function selectedCatalogueAuthorityMatches(row, request) {
     && authority.catalog_item_id === request.catalog_item_id && pricingAuthorityPrice(authority) !== null;
 }
 
-function pricingSelectionAcknowledgement(data, sessionId, submittedVersion, requests, rows) {
+function pricingSelectionAcknowledgement(data, sessionId, submittedVersion, requests, rows, { requireAdvance = false } = {}) {
   const session = data?.quote_session;
   const ledger = session?.pricing_ledger;
   const outcomes = data?.selections;
@@ -13499,7 +13499,8 @@ function pricingSelectionAcknowledgement(data, sessionId, submittedVersion, requ
     const matches = selectedCatalogueAuthorityMatches(row, request);
     if (outcome.status === "selected") {
       return Object.keys(outcome).length === 2 && matches
-        && (!request.reinclude || ledger.rows[id] > request.expected_revision);
+        && (!(request.reinclude || requireAdvance)
+          || (session.draft_version !== submittedVersion && ledger.rows[id] > request.expected_revision));
     }
     return !request.reinclude && outcome.status === "refused" && Object.keys(outcome).length === 3
       && pricingSelectionRefusalReason(outcome.reason) && !matches;

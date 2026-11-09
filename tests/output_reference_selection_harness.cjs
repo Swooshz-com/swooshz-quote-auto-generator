@@ -108,7 +108,7 @@ async function run(test = {}) {
         data.quote_session.draft_version=savedVersion;
         data.quote_session.pricing_ledger.rows={'selected-row':7,'other-row':8};
       }
-      const malformedRevisions={'ledger-string':'invalid','ledger-negative':-1,'ledger-fraction':1.5,'ledger-boolean':true,'ledger-unsafe':Number.MAX_SAFE_INTEGER+1,'ledger-stale':6};
+      const malformedRevisions={'ledger-string':'invalid','ledger-negative':-1,'ledger-fraction':1.5,'ledger-boolean':true,'ledger-unsafe':Number.MAX_SAFE_INTEGER+1,'ledger-stale':6,'new-version-unchanged':7};
       if(Object.hasOwn(malformedRevisions,test.malformed)) data.quote_session.pricing_ledger.rows['selected-row']=malformedRevisions[test.malformed];
       if(test.malformed==='ledger-empty') data.quote_session.pricing_ledger.rows={};
       if(test.malformed==='ledger-other') data.quote_session.pricing_ledger.rows={'other-row':8};
@@ -173,8 +173,9 @@ async function run(test = {}) {
   if(success) {
     assert.equal(state.outputRows.length,2);
     assert.equal(state.outputRows[1].pricing_authority.variant,'catalog');
-    assert.equal(state.pricingLedgerRevisions['quote-selection']['selected-row'],test.existingGrant||test.unchanged?7:8);
-    assert.equal(state.pricingDraftVersion,test.existingGrant||test.unchanged?savedVersion:selectedVersion);
+    assert.equal(state.pricingLedgerRevisions['quote-selection']['selected-row'],test.existingGrant?7:8);
+    assert.equal(state.pricingDraftVersion,test.existingGrant?savedVersion:selectedVersion);
+    if(test.existingGrant) assert.equal(checkpoints.length,0,'Read-only normalisation must not acknowledge a write');
   } else if(!test.changeAt) assert.equal(state.outputRows[1],row,'No adoption on refusal or failure');
   if(!success) assert(!calls.includes('save'),'A failed selection must not queue a promoted draft');
   if(test.malformed) assert.equal(state.pricingLedgerRevisions['quote-selection']['selected-row'],7,'Malformed acknowledgement must not replace the revision cache');
@@ -209,8 +210,8 @@ async function run(test = {}) {
   cases.push({concurrentClick:true},{existingGrant:true},{normalizeFailure:true},{badNormalization:true},{noReference:true},{noEditor:true},{detached:true},{duplicate:true},{saveFailure:true},{throwRequest:true},{missingBaseline:true});
   for(const httpFailure of [401,403,409,500]) cases.push({httpFailure});
   for(const refused of ['unit_review_required','contradiction','not_in_catalogue','reference_changed','ineligible']) cases.push({refused});
-  cases.push({unchanged:true},{unchanged:true,refused:'ineligible'});
-  for(const malformed of ['session','rows','row-id','outcome','authority','missing-authority','wrong-item','missing-price','version','ledger-empty','ledger-string','ledger-other','ledger-negative','ledger-fraction','ledger-boolean','ledger-unsafe','ledger-stale','ledger-global','same-version-advanced','same-version-other-row']) cases.push({malformed});
+  cases.push({unchanged:true,malformed:'same-version-unchanged'},{unchanged:true,refused:'ineligible'});
+  for(const malformed of ['session','rows','row-id','outcome','authority','missing-authority','wrong-item','missing-price','version','ledger-empty','ledger-string','ledger-other','ledger-negative','ledger-fraction','ledger-boolean','ledger-unsafe','ledger-stale','ledger-global','same-version-advanced','same-version-other-row','new-version-unchanged']) cases.push({malformed});
   for(const changeAt of ['save','request','selection']) for(const change of ['scope','epoch','session','revision','row','basis','reference','commercials','unload','auth']) cases.push({changeAt,change});
   cases.push({productionRetry:true});
   for(const change of ['scope','epoch','session','revision','row','basis','reference','commercials','unload','auth']) cases.push({productionRetry:true,changeAt:'refresh',change});
