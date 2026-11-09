@@ -49,6 +49,7 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(evidence['staleRecovery'], 'PASS')
         self.assertEqual(evidence['confirmFollowupConflict'], 'PASS')
         self.assertEqual(evidence['preVersionRecovery'], 'PASS')
+        self.assertEqual(evidence['exportDraftConflict'], 'PASS')
         self.assertEqual(evidence['spatialPartialRefusal']['mixedStatus'], 200)
         self.assertEqual(evidence['spatialPartialRefusal']['resolvedVideo']['quoted'], '12.00')
         self.assertEqual(evidence['tickOnlyDeferred'], 'PASS')
@@ -578,9 +579,14 @@ function setup(count, ordinary = 0, version = baseline) {
   assert.equal(state.pricingDraftVersion, acknowledged);
   assert.deepEqual(state.pricingIssues, [{source_basis_line_id: "synthetic-row-0", reason: "unit_review_required"}]);
   assert.equal(state.lineItems[0].pricing_authority.variant, "none");
+  setup(2, 2);
+  response.data.quote_session.draft_version = baseline;
+  state.pricingLedgerRevisions[sessionId] = structuredClone(response.data.quote_session.pricing_ledger.rows);
+  assert((await refreshLineItemsFromServer()).ok);
+  assert.equal(state.pricingDraftVersion, baseline);
   for (const failure of ["stale", "unknown-reason", "refused-reinclude", "wrong-id", "stale-revision",
     "malformed-revision", "missing-data", "network", "no-baseline", "invalid-batch", "missing-row",
-    "ordinary-authority", "ordinary-item", "ordinary-duplicate", "ordinary-refusal-conflicts"]) {
+    "ordinary-authority", "ordinary-item", "ordinary-duplicate", "ordinary-refusal-conflicts", "same-version-advanced"]) {
     setup(failure === "invalid-batch" ? 201 : 2, 1, failure === "no-baseline" ? "" : baseline);
     const ledger = response.data.quote_session.pricing_ledger;
     if (failure === "unknown-reason") Object.assign(response.data.selections[0], {status: "refused", reason: "stale"});
@@ -588,6 +594,7 @@ function setup(count, ordinary = 0, version = baseline) {
     if (failure === "wrong-id") response.data.selections[0].source_basis_line_id = "synthetic-row-1";
     if (failure === "stale-revision") ledger.rows["synthetic-row-1"] = 0;
     if (failure === "malformed-revision") ledger.rows["synthetic-row-0"] = "4";
+    if (failure === "same-version-advanced") response.data.quote_session.draft_version = baseline;
     if (failure === "missing-data") delete response.data;
     if (failure === "missing-row") response.data.line_items.pop();
     if (failure === "ordinary-authority") delete response.data.line_items[0].pricing_authority;

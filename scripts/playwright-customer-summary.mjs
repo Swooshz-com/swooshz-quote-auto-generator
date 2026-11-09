@@ -2,6 +2,7 @@
 // Run: npm run playwright:customer-summary -- --port 18820
 // No provider, database, installed-service or export qualification is implied.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { chromium } from "playwright";
@@ -123,8 +124,13 @@ class CustomerFixture {
       return json(route, { quote_sessions: [...this.sessions.values()] });
     }
     if (method === "POST" && pathname === "/api/quote-sessions") {
-      const payload = request.postDataJSON();
-      const session = { ...payload, updated_at: "2026-01-01T00:00:00Z", exports: {} };
+      const { expected_draft_version, ...payload } = request.postDataJSON();
+      const previousVersion = this.sessions.get(payload.session_id)?.draft_version ?? "";
+      assert.equal(expected_draft_version, previousVersion, "The save must use this fixture's current draft version.");
+      const pricingLedger = { revision: 0, rows: {} };
+      const draftVersion = createHash("sha256").update(JSON.stringify([payload, pricingLedger])).digest("hex");
+      const session = { ...payload, updated_at: "2026-01-01T00:00:00Z", exports: {},
+        draft_version: draftVersion, pricing_ledger: pricingLedger };
       this.sessions.set(session.session_id, session);
       return json(route, { status: "saved", quote_session: session });
     }

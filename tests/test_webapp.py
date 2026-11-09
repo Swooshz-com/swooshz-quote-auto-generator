@@ -27802,6 +27802,7 @@ eval(extractFunction("setQuoteCommercialReview"));
 eval(extractFunction("quoteSessionSnapshotForRestoration"));
 eval(extractFunction("validQuoteDraftVersion"));
 eval(extractFunction("validPricingLedgerReceipt"));
+eval(extractFunction("unchangedDraftLedgerMatches"));
 eval(extractFunction("applyQuoteSessionSnapshot", true));
 
 const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
@@ -28093,7 +28094,7 @@ eval([
   "renderProfileOptions",
   "quoteSessionSnapshotForRestoration",
   "validQuoteDraftVersion",
-  "validPricingLedgerReceipt",
+  "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
   "applyQuoteSessionSnapshot",
   "applyPendingPricingReferenceSelection",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28344,7 +28345,7 @@ eval([
   "setQuoteCommercialReview",
   "quoteSessionSnapshotForRestoration",
   "validQuoteDraftVersion",
-  "validPricingLedgerReceipt",
+  "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
   "applyQuoteSessionSnapshot",
   "mergeDashboardDraftSummaryDetails",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28949,7 +28950,7 @@ if (scenario.kind === "excel") { constantNames.push(); required.push("downloadCu
 if (scenario.kind === "dashboard-order") required.push("returnToDashboard", "restoredQuoteSessionHasChanged");
 // Optional only so the SAME regression executes against the unchanged baseline.
 for (const name of ["quoteSessionSaveFailureFrom", "safeQuoteSessionErrorReference", "validQuoteDraftVersion",
-  "validPricingLedgerReceipt", "requireQuoteDraftReopen", "acknowledgeGeneratedQuoteDraft", "rememberPricingSelectionAcknowledgement"]) {
+  "validPricingLedgerReceipt", "unchangedDraftLedgerMatches", "requireQuoteDraftReopen", "acknowledgeGeneratedQuoteDraft", "generationFailureMessages", "rememberPricingSelectionAcknowledgement"]) {
   if (source.includes(`function ${name}(`)) required.push(name);
 }
 // These adapters supply only synthetic projection inputs and DOM/file effects.

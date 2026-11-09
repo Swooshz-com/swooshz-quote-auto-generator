@@ -5019,7 +5019,9 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   const recoveredVersion = isOwnedBrowserSnapshot ? savedState.pricingDraftVersion : options.serverDraftVersion;
   state.pricingDraftVersion = targetSessionId ? false : "";
   state.pricingLedgerRevisions = {};
-  if (targetSessionId && (options.createDraft === true || (isOwnedBrowserSnapshot && recoveredVersion === "create"))) {
+  // Old snapshots could reserve an ID before the first save reached the server.
+  if (targetSessionId && (options.createDraft === true || (isOwnedBrowserSnapshot
+    && (recoveredVersion === "create" || recoveredVersion === undefined || recoveredVersion === "")))) {
     state.pricingDraftVersion = "create";
   } else if (targetSessionId && validQuoteDraftVersion(recoveredVersion)) {
     state.pricingDraftVersion = recoveredVersion;
@@ -11167,7 +11169,7 @@ async function applyOutputReferencePricing(button) {
     const selectedRows = Array.isArray(data.line_items) ? data.line_items.filter((entry) => entry?.source_basis_line_id === rowId) : [];
     const selected = restored ? normalizedRow : selectedRows.length === 1 ? normalizeOutputRow(selectedRows[0]) : null;
     const acknowledgement = selectionDraftKey && result.ok
-      ? pricingSelectionAcknowledgement(data, sessionId, [selection], selected ? [selected] : [], true)
+      ? pricingSelectionAcknowledgement(data, sessionId, expectedVersion, [selection], selected ? [selected] : [])
       : null;
     if (acknowledgement) {
       rememberPricingSelectionAcknowledgement(acknowledgement, selectionDraftKey);
@@ -13460,18 +13462,28 @@ function pricingSelectionRefusalReason(reason) {
   return ["unit_review_required", "contradiction", "not_in_catalogue", "reference_changed", "ineligible"].includes(reason);
 }
 
+function unchangedDraftLedgerMatches(session, submittedVersion) {
+  if (session.draft_version !== submittedVersion) return true;
+  const known = state.pricingLedgerRevisions[session.session_id];
+  if (!isPlainObject(known)) return true;
+  const rows = session.pricing_ledger.rows;
+  return Object.keys(rows).length === Object.keys(known).length
+    && Object.entries(known).every(([id, revision]) => Object.hasOwn(rows, id) && rows[id] === revision);
+}
+
 function selectedCatalogueAuthorityMatches(row, request) {
   const authority = row?.pricing_authority;
   return row?.source_basis_line_id === request.source_basis_line_id && authority?.variant === "catalog"
     && authority.catalog_item_id === request.catalog_item_id && pricingAuthorityPrice(authority) !== null;
 }
 
-function pricingSelectionAcknowledgement(data, sessionId, requests, rows, requireAdvance = false) {
+function pricingSelectionAcknowledgement(data, sessionId, submittedVersion, requests, rows) {
   const session = data?.quote_session;
   const ledger = session?.pricing_ledger;
   const outcomes = data?.selections;
   if (data?.status !== "normalized" || session?.session_id !== sessionId || !validQuoteDraftVersion(session.draft_version)
-    || !validPricingLedgerReceipt(ledger) || !Array.isArray(outcomes) || outcomes.length !== requests.length) return null;
+    || !validPricingLedgerReceipt(ledger) || !unchangedDraftLedgerMatches(session, submittedVersion)
+    || !Array.isArray(outcomes) || outcomes.length !== requests.length) return null;
   const byId = new Map();
   for (const row of rows) {
     const id = row.source_basis_line_id;
@@ -13482,11 +13494,12 @@ function pricingSelectionAcknowledgement(data, sessionId, requests, rows, requir
     const outcome = outcomes[index];
     const row = byId.get(id);
     if (!row || !isPlainObject(outcome) || outcome.source_basis_line_id !== id || !Object.hasOwn(ledger.rows, id)
-      || ledger.rows[id] < request.expected_revision) return false;
+      || ledger.rows[id] < request.expected_revision
+      || (session.draft_version === submittedVersion && ledger.rows[id] !== request.expected_revision)) return false;
     const matches = selectedCatalogueAuthorityMatches(row, request);
     if (outcome.status === "selected") {
       return Object.keys(outcome).length === 2 && matches
-        && (!(request.reinclude || requireAdvance) || ledger.rows[id] > request.expected_revision);
+        && (!request.reinclude || ledger.rows[id] > request.expected_revision);
     }
     return !request.reinclude && outcome.status === "refused" && Object.keys(outcome).length === 3
       && pricingSelectionRefusalReason(outcome.reason) && !matches;
@@ -13508,7 +13521,8 @@ function requireQuoteDraftReopen() {
 function acknowledgeGeneratedQuoteDraft(session, submittedVersion) {
   const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
   if (!validQuoteDraftVersion(submittedVersion) || state.pricingDraftVersion !== submittedVersion || session?.session_id !== sessionId
-    || !validQuoteDraftVersion(session.draft_version) || !validPricingLedgerReceipt(session.pricing_ledger)) return;
+    || !validQuoteDraftVersion(session.draft_version) || !validPricingLedgerReceipt(session.pricing_ledger)
+    || !unchangedDraftLedgerMatches(session, submittedVersion)) return;
   rememberPricingSelectionAcknowledgement({ session }, "");
 }
 
@@ -13569,7 +13583,7 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
           const rows = result.data?.line_items;
           if (!Array.isArray(rows) || !rows.every(isPlainObject)) return conflict();
           acknowledgedRows = rows.map(normalizeLineItem);
-          const acknowledgement = pricingSelectionAcknowledgement(result.data, sessionId, selections, acknowledgedRows);
+          const acknowledgement = pricingSelectionAcknowledgement(result.data, sessionId, expectedVersion, selections, acknowledgedRows);
           if (!acknowledgement) return conflict();
           rememberPricingSelectionAcknowledgement(acknowledgement, draftKey);
         }
@@ -14593,7 +14607,8 @@ async function saveCurrentQuoteSession(options = {}) {
     const session = isPlainObject(data) && isPlainObject(data.quote_session) ? data.quote_session : null;
     const validAcknowledgement = Boolean(ok && data?.status === "saved" && session
       && session.session_id === payload.session_id && safeQuoteSessionId(session.session_id)
-      && validQuoteDraftVersion(session.draft_version) && validPricingLedgerReceipt(session.pricing_ledger));
+      && validQuoteDraftVersion(session.draft_version) && validPricingLedgerReceipt(session.pricing_ledger)
+      && unchangedDraftLedgerMatches(session, expectedVersion));
     if (!validAcknowledgement) {
       const failure = quoteSessionSaveFailureFrom(result);
       // A transport interruption retains the last proved baseline. A later
@@ -17160,7 +17175,7 @@ async function handleGenerate(options = {}) {
     return;
   }
   const generationDraftVersion = state.pricingDraftVersion;
-  const generationPayload = buildPayload({ viewPdf });
+  const generationPayload = { ...buildPayload({ viewPdf }), expected_draft_version: generationDraftVersion };
   const generationInputRows = generationPayload.line_items.map((row) => ({ ...row }));
   const submittedOperation = { ...operation, submittedDraftVersion: generationDraftVersion };
   state.activeJob = submittedOperation;
@@ -17174,7 +17189,7 @@ async function handleGenerate(options = {}) {
     clearActiveJob();
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
     setResultStatus(started.data.status || "Failed", "is-bad");
-    renderMessages(started.data.status === "blocked" ? (started.data.errors || ["Generation blocked."]) : genericFailureMessages(started.data), "error");
+    renderMessages(generationFailureMessages(started.data, generationDraftVersion, started.data.status === "blocked"), "error");
     syncControlStates();
     return;
   }
@@ -17203,7 +17218,7 @@ async function handleGenerate(options = {}) {
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
     setResultStatus(data.status || "Failed", "is-bad");
     const blocked = polled.data.status === "blocked" || data.status === "blocked";
-    renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
+    renderMessages(generationFailureMessages(data, generationDraftVersion, blocked), "error");
     renderPricingMatches(state.outputRows);
     renderMatchSummary({ pricing_matches: state.outputRows });
     syncControlStates();
@@ -17259,6 +17274,14 @@ async function handleGenerate(options = {}) {
     : viewPdf ? Boolean(state.pdfFile) : Boolean(state.downloadFile);
 }
 
+function generationFailureMessages(data, submittedVersion, blocked = false) {
+  if (data?.reason_code === "quote_draft_stale") {
+    if (state.pricingDraftVersion === submittedVersion) requireQuoteDraftReopen();
+    return [PRICING_SELECTION_STALE_MESSAGE];
+  }
+  return blocked ? (data?.errors || ["Generation blocked."]) : genericFailureMessages(data);
+}
+
 async function ensureSavedServerJobStarted(activeJob) {
   if (activeJob.phase !== "starting") return { ok: true, data: { job_id: activeJob.id } };
   const isDraft = activeJob.type === "draft";
@@ -17273,12 +17296,17 @@ async function ensureSavedServerJobStarted(activeJob) {
     saveSessionState();
   }
   const saveFailure = {};
-  const synchronizedSessionId = await ensureQuoteSession({
-    quoteGenerated: !isDraft,
-    synchronizeDraft: true,
-    saveFailure,
-  });
+  const submittedVersion = isDraft ? undefined : activeJob.submittedDraftVersion;
+  const alreadySubmitted = submittedVersion !== undefined;
+  const synchronizedSessionId = alreadySubmitted
+    ? (validQuoteDraftVersion(submittedVersion) && state.pricingDraftVersion === submittedVersion ? state.quoteSessionId : "")
+    : await ensureQuoteSession({
+      quoteGenerated: !isDraft,
+      synchronizeDraft: true,
+      saveFailure,
+    });
   if (!synchronizedSessionId) {
+    if (alreadySubmitted) saveFailure.failure = { draft_stale: true };
     return {
       ok: false,
       status: saveFailure.failure?.status ?? 0,
@@ -17300,8 +17328,9 @@ async function ensureSavedServerJobStarted(activeJob) {
       includeDraftContext: activeJob.includeDraftContext === true,
     });
   } else {
-    payload = buildPayload({ viewPdf });
-    activeJob = { ...activeJob, submittedDraftVersion: state.pricingDraftVersion };
+    const expectedVersion = alreadySubmitted ? submittedVersion : state.pricingDraftVersion;
+    payload = { ...buildPayload({ viewPdf }), expected_draft_version: expectedVersion };
+    activeJob = { ...activeJob, submittedDraftVersion: expectedVersion };
     state.activeJob = activeJob;
     saveSessionState();
   }
@@ -17448,6 +17477,7 @@ async function resumeSavedJob() {
     const restarted = await ensureSavedServerJobStarted(activeJob);
     if (!restarted.ok) {
       if (restarted.data?.page_unloading) return;
+      const submittedVersion = state.activeJob?.submittedDraftVersion;
       state.isGenerating = false;
       clearActiveJob();
       hideExcelGeneratingModal();
@@ -17455,7 +17485,7 @@ async function resumeSavedJob() {
       setResultStatus(restarted.data.status || "Failed", "is-bad");
       renderMessages(restarted.data.quote_session_save_failure
         ? [quoteSessionDraftSynchronizationFailureMessage(restarted.data.quote_session_save_failure)]
-        : genericFailureMessages(restarted.data), "error");
+        : generationFailureMessages(restarted.data, submittedVersion), "error");
       syncControlStates();
       return;
     }
@@ -17485,7 +17515,7 @@ async function resumeSavedJob() {
       setWorkflowStage("details_review");
       setResultStatus(data.status || "Failed", "is-bad");
       const blocked = polled.data.status === "blocked" || data.status === "blocked";
-      renderMessages(blocked ? (data.errors || ["Generation blocked."]) : genericFailureMessages(data || polled.data), "error");
+      renderMessages(generationFailureMessages(data, resumedJob.submittedDraftVersion, blocked), "error");
       renderPricingMatches(state.outputRows);
       renderMatchSummary({ pricing_matches: state.outputRows });
       syncControlStates();

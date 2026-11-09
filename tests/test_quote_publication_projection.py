@@ -389,6 +389,107 @@ class PublicationProjectionTest(unittest.TestCase):
         self.assertFalse(exported["verified"])
         self.assertNotIn("quotation.pdf", [item["name"] for item in result["result"].get("files", [])])
 
+    def test_versioned_generation_preserves_winning_draft_and_publication(self):
+        for mode in ("local", "database", "object"):
+            with self.subTest(mode=mode), self.case(mode):
+                def detail():
+                    return self.storage.get_quote_session(self.session_id, include_draft_state=True)
+
+                def save(title, key):
+                    current = detail()
+                    patch = copy.deepcopy(self.payload["quote_session"])
+                    patch["customer_summary"] = {"project_name": title}
+                    patch["draft_files"] = [{
+                        "session_file_key": key, "name": key + ".png", "type": "image/png",
+                        "data_url": existing.SANITIZED_LOGO_DATA_URL,
+                    }]
+                    s.save_quote_session_from_browser({
+                        **self.payload, "quote_session": patch,
+                        "expected_draft_version": current["draft_version"],
+                    }, self.storage)
+                    return self.metadata(), detail()["draft_files"]
+
+                save("Synthetic initial", "initial")
+                self.payload["expected_draft_version"] = detail()["draft_version"]
+                _job_id, current, content = self.publish("versioned")
+                receipt = current["result"]["quote_session"]
+                self.assertNotEqual(receipt["draft_version"], self.payload["expected_draft_version"])
+                self.assertEqual(receipt["draft_version"], detail()["draft_version"])
+                self.assertEqual(receipt["pricing_ledger"], detail()["pricing_ledger"])
+                self.assertEqual(detail()["draft_files"][0]["session_file_key"], "initial")
+                for url, kind in zip(self.links(current), ("xlsx", "pdf", "pdf")):
+                    self.assertEqual(self.request(url), (200, content[kind]))
+
+                # The direct route reaches the same worker with its original version.
+                calls = self.generator.call_count
+                code, body = self.post_generate("job-projection-direct-stale")
+                self.assertEqual(code, 409, body)
+                self.assertEqual(json.loads(body)["reason_code"], "quote_draft_stale")
+                self.assertEqual(self.generator.call_count, calls)
+
+                phases = [("after-admission", "generate")]
+                if mode == "database":
+                    phases.append(("before-stage-cas", "generate"))
+                if mode != "local":
+                    phases.append(("before-promotion", "generate_pdf"))
+                for phase, job_type in phases:
+                    with self.subTest(phase=phase):
+                        self.payload["expected_draft_version"] = detail()["draft_version"]
+                        job_id = "job-projection-" + phase
+                        self.outputs[job_id] = (b"PK-synthetic-stale-xlsx", b"%PDF-synthetic-stale")
+                        with mock.patch.object(s.threading, "Thread") as thread:
+                            accepted = s.create_job(job_type, copy.deepcopy(self.payload), auth_session=self.auth, requested_job_id=job_id)
+                            self.assertEqual(accepted["status"], "running")
+                            replayed = s.create_job(job_type, copy.deepcopy(self.payload), auth_session=self.auth, requested_job_id=job_id)
+                            self.assertEqual(replayed["status"], "running")
+                            incompatible = {**self.payload, "expected_draft_version": "1" * 64}
+                            self.assertEqual(s.create_job(job_type, incompatible, auth_session=self.auth, requested_job_id=job_id)["status"], "blocked")
+                            thread.assert_called_once()
+                            worker = thread.call_args.kwargs
+                        winner = []
+                        before = self.metadata()
+                        original_generator = self.generator.side_effect
+                        original_finish = s.finish_generation_forensics
+
+                        def win():
+                            self.assertEqual(self.metadata(), before, "Staging changed the current draft or publication")
+                            winner.append(save("Synthetic winning " + phase, phase))
+
+                        def generate(*args, **kwargs):
+                            win()
+                            return original_generator(*args, **kwargs)
+
+                        def finish(*args, **kwargs):
+                            if kwargs.get("publication_storage") is not None:
+                                win()
+                            return original_finish(*args, **kwargs)
+
+                        with ExitStack() as stack:
+                            if phase == "after-admission":
+                                self.generator.side_effect = generate
+                                stack.callback(setattr, self.generator, "side_effect", original_generator)
+                            elif phase == "before-stage-cas":
+                                stage = self.storage._execute_stage_publication_version
+
+                                def stage_after_save(_storage, *args, **kwargs):
+                                    win()
+                                    return stage(*args, **kwargs)
+
+                                stack.enter_context(mock.patch.object(type(self.storage), "_execute_stage_publication_version", new=stage_after_save))
+                            else:
+                                stack.enter_context(mock.patch.object(s, "finish_generation_forensics", side_effect=finish))
+                            worker["target"](*worker["args"])
+                        result = s.get_job(job_id, self.auth)
+                        self.assertEqual(result["status"], "failed", result)
+                        self.assertEqual(result["result"].get("reason_code"), "quote_draft_stale", result)
+                        self.assertNotIn("files", result["result"])
+                        self.assertNotIn("quote_session", result["result"])
+                        self.assertEqual(winner, [(self.metadata(), detail()["draft_files"])])
+                        if phase == "before-promotion":
+                            version = self.storage._publication_version_row(result["result"]["generation_run_id"])
+                            self.assertEqual(version["state"], "failed")
+                            self.assertEqual(version["error_code"], "quote_draft_stale")
+
     def test_real_replacement_closes_both_kind_links_and_old_job_surfaces(self):
         for mode in ("local", "database", "object"):
             with self.subTest(mode=mode), self.case(mode):

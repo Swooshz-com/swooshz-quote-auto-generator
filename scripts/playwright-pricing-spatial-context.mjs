@@ -426,23 +426,27 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
         if (request.method() === "POST" && new URL(request.url()).pathname === "/api/quote-sessions") saveRequests.push(request);
       });
       for (const missingVersion of [undefined, ""]) {
+        const previousRequests = saveRequests.length;
         await page.evaluate((snapshot) => localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(snapshot)),
           { ...legacySnapshot, pricingDraftVersion: missingVersion });
         await page.reload({ waitUntil: "domcontentloaded" });
         await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
         assert(await page.evaluate(async (oldTitle) => {
-          queueQuoteSessionDraftStateSave({ delay: 0 });
           const failure = {};
-          return elements.projectTitle.value === oldTitle && state.pricingDraftVersion === false
+          return elements.projectTitle.value === oldTitle && state.pricingDraftVersion === "create"
             && !(await saveQuoteSessionDraftState({ saveFailure: failure })) && failure.failure?.draft_stale
+            && state.pricingDraftVersion === false
             && !(await ensureQuoteSession({ synchronizeDraft: true }))
             && (await refreshLineItemsFromServer()).data.status === "conflict";
         }, legacySnapshot.quoteDetails.project.title), "old browser recovery was writable or lost its local copy");
         const readback = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
-        assert(saveRequests.length === 0 && readback.draft_version === saved.draft_version
+        const request = saveRequests[previousRequests]?.postDataJSON();
+        assert(saveRequests.length === previousRequests + 1 && request?.expected_draft_version === ""
+          && request.session_id === sessionId && readback.draft_version === saved.draft_version
           && JSON.stringify(readback.pricing_ledger) === JSON.stringify(saved.pricing_ledger)
-          && JSON.stringify(readback.draft_files) === JSON.stringify(saved.draft_files),
-          "pre-version recovery sent a write or changed the newer saved quote");
+          && JSON.stringify(readback.draft_files) === JSON.stringify(saved.draft_files)
+          && JSON.stringify(readback.exports) === JSON.stringify(saved.exports),
+          "legacy recovery did not use create-only or changed the newer saved quote");
       }
       await page.locator("#topbarBrandButton").click();
       await page.waitForFunction(() => state.activeAppView === "dashboard" && !appIsBusy());
@@ -469,6 +473,59 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
       assert(continued.draft_state.quoteDetails.project.title === "Synthetic title after current recovery",
         "the recovered tab's current title was not saved");
       result.preVersionRecovery = "PASS";
+
+      // The competing tab saved the Basis checkpoint before Confirm's
+      // follow-up. Reconfirm Customer after the title edit, then finish Basis.
+      await page.locator('button[data-side-panel="customer"]').first().click();
+      await page.locator("#sideNextButton").click();
+      await page.waitForFunction(() => state.activeSidePanel === "quote_company" && !appIsBusy());
+      await basisTab.click();
+      await page.locator("#sideNextButton").click();
+      await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible" });
+      await page.waitForFunction(() => !appIsBusy());
+      const exportReady = await page.evaluate(() => ({
+        confirmed: state.basisConfirmed, validation: outputRowsValid(), missing: missingDetailFields(),
+      }));
+      assert(exportReady.confirmed && exportReady.validation.valid && !exportReady.missing.length,
+        "Recovered quote is not ready for the export race", exportReady);
+      let dispatch, exportWinner, staleJob;
+      const jobsPattern = "**/api/jobs";
+      const competeWithExport = async (route) => {
+        if (route.request().method() !== "POST") return route.fallback();
+        const job = route.request().postDataJSON();
+        if (job.type !== "generate") return route.fallback();
+        const before = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
+        dispatch = { version: job.payload.expected_draft_version, savedVersion: before.draft_version, jobId: job.job_id };
+        await otherTab.evaluate(async (id) => {
+          if (!await modifyDashboardQuote(id)) throw new Error("Export race could not reopen the draft in the other tab.");
+          setInputValue(elements.projectTitle, "Synthetic winner during Excel export");
+          if (!await saveQuoteSessionDraftState()) throw new Error("Export race could not save the competing draft.");
+        }, sessionId);
+        exportWinner = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
+        return route.fallback();
+      };
+      await page.route(jobsPattern, competeWithExport);
+      try {
+        const generated = await page.evaluate(() => handleGenerate());
+        assert(generated !== true && dispatch && dispatch.version === dispatch.savedVersion
+          && dispatch.version !== exportWinner?.draft_version,
+          "Excel export did not submit the previous verified draft version", dispatch);
+        staleJob = (await (await browserBoundary.get(api, baseUrl + "/api/jobs/" + dispatch.jobId)).json());
+        const afterExport = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
+        assert(staleJob.status === "failed" && staleJob.result?.reason_code === "quote_draft_stale"
+          && !staleJob.result?.quote_session && !staleJob.result?.files
+          && afterExport.draft_state.quoteDetails.project.title === "Synthetic winner during Excel export"
+          && afterExport.draft_version === exportWinner.draft_version
+          && JSON.stringify(afterExport.pricing_ledger) === JSON.stringify(exportWinner.pricing_ledger)
+          && JSON.stringify(afterExport.draft_files) === JSON.stringify(exportWinner.draft_files)
+          && JSON.stringify(afterExport.exports) === JSON.stringify(exportWinner.exports),
+          "Stale Excel generation overwrote the winning draft or exposed an artifact");
+        assert(await page.evaluate(() => state.pricingDraftVersion === false),
+          "Stale Excel generation did not require an authoritative reopen");
+        result.exportDraftConflict = "PASS";
+      } finally {
+        await page.unroute(jobsPattern, competeWithExport);
+      }
     } finally {
       await page.unroute("**/api/quote-sessions", holdFollowup);
       await page.unroute("**/api/quote-sessions/pricing-selections", watchSelection);

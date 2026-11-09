@@ -257,8 +257,8 @@ async function resumedPdfStatusCases() {
       updateDownloadButton: () => { calls.updateDownload++; },
       showGeneratedExportReadyModal: () => { calls.modalAttempt++; const ready = !!state.pdfFile; if (ready) calls.readyShown++; return ready; },
     });
-    vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'validQuoteDraftVersion', 'acknowledgeGeneratedQuoteDraft',
-      'validPricingLedgerReceipt', 'rememberPricingSelectionAcknowledgement',
+    vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'validQuoteDraftVersion', 'acknowledgeGeneratedQuoteDraft', 'generationFailureMessages',
+      'validPricingLedgerReceipt', 'unchangedDraftLedgerMatches', 'rememberPricingSelectionAcknowledgement',
       'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
     await context.resumeSavedJob();
     assert.equal(state.pricingDraftVersion, scenario === 'stale_no_entry' ? anotherVersion
@@ -607,7 +607,8 @@ async function lifecycleCases() {
 
     // Use the real generation/file-attachment path, with transport and final save held.
     vm.runInContext([
-      "handleGenerate", "validQuoteDraftVersion", "acknowledgeGeneratedQuoteDraft",
+      "handleGenerate", "validQuoteDraftVersion", "acknowledgeGeneratedQuoteDraft", "generationFailureMessages",
+      "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
       "setDownloadFiles", "clearActiveJob", "retainExcludedBasisPricingRows",
       "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage",
     ].map(extract).join("\n"), c);

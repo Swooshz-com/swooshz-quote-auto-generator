@@ -91,7 +91,7 @@ if (input.mode==='reopen') {
   })().catch(e=>{console.error(e);process.exitCode=1;});
 } else if (input.mode==='selection-ordering') {
   const vm = require('node:vm');
-  const code = ['validQuoteDraftVersion', 'validPricingLedgerReceipt', 'pricingSelectionRefusalReason',
+  const code = ['validQuoteDraftVersion', 'validPricingLedgerReceipt', 'unchangedDraftLedgerMatches', 'pricingSelectionRefusalReason',
     'selectedCatalogueAuthorityMatches', 'pricingSelectionAcknowledgement', 'rememberPricingSelectionAcknowledgement',
     'requireQuoteDraftReopen', 'refreshLineItemsFromServer',
     'saveQuoteSessionDraftState', 'queueQuoteSessionDraftStateSave',

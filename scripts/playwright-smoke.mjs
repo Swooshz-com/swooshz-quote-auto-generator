@@ -855,7 +855,9 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
     const firstPostStarted = new Promise((resolve) => { firstPostStartedResolve = resolve; });
     const secondPostStarted = new Promise((resolve) => { secondPostStartedResolve = resolve; });
     const postedJobIds = [];
+    const postedDraftVersions = [];
     let generationInputRows = null;
+    let savedReceipt;
     const postPattern = "**/api/jobs";
     const getPattern = "**/api/jobs/job-*";
     const savePattern = "**/api/quote-sessions";
@@ -869,11 +871,14 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       postCount += 1;
       const payload = route.request().postDataJSON();
       postedJobIds.push(payload.job_id || "");
+      postedDraftVersions.push(payload.payload?.expected_draft_version);
       if (!Array.isArray(payload.payload?.line_items) || !payload.payload.line_items.length) {
         throw new Error("Synthetic current completion requires captured generation input rows.");
       }
       generationInputRows = structuredClone(payload.payload.line_items);
       if (postCount === 1) {
+        const response = await page.request.get(baseUrl + "/api/quote-sessions/" + quoteSessionId);
+        savedReceipt = (await response.json()).quote_session;
         firstPostStartedResolve();
         await new Promise((resolve) => { releaseFirstPost = resolve; });
         try {
@@ -936,6 +941,9 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
                 },
                 quote_session: {
                   session_id: quoteSessionId,
+                  // This simulated worker leaves the real saved draft unchanged.
+                  draft_version: savedReceipt.draft_version,
+                  pricing_ledger: savedReceipt.pricing_ledger,
                   ...(testCase.viewPdf ? {
                     exports: {
                       pdf: { view_url: `/api/quote-sessions/${quoteSessionId}/view/pdf` },
@@ -970,6 +978,11 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (!postedJobIds[0]) {
         throw new Error("Export click did not send a client-generated job id.");
       }
+      if (!/^[a-f0-9]{64}$/.test(postedDraftVersions[0])
+        || postedDraftVersions[0] !== savedReceipt?.draft_version
+        || postedDraftVersions[0] !== savedBeforeRefresh.activeJob?.submittedDraftVersion) {
+        throw new Error("Export did not dispatch the actual synchronised draft version.");
+      }
 
       // Both scopes exercise the actual resume path for these refresh assertions.
       const reload = page.reload({ waitUntil: "domcontentloaded" });
@@ -985,8 +998,8 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (restoredTitle !== testCase.title) {
         throw new Error("Expected refreshed " + testCase.type + " overlay title " + testCase.title + ", found " + restoredTitle + ".");
       }
-      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1]) {
-        throw new Error("Refresh should retry " + testCase.type + " with one stable idempotency key: " + JSON.stringify(postedJobIds) + ".");
+      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1] || postedDraftVersions[0] !== postedDraftVersions[1]) {
+        throw new Error("Refresh should retry " + testCase.type + " with its original idempotency key and draft version.");
       }
       const activePanel = (await page.locator(".rail-button.is-active").innerText()).trim();
       if (activePanel !== "Output") {
@@ -3469,31 +3482,47 @@ async function verifyInitialDraftSaveReservesSessionIdBeforeNetwork(page) {
     await page.locator("#newQuoteButton:not([disabled])").click();
   }
   await seedQuoteDraftFromTestFixture(page);
-  const reservation = await page.evaluate(async () => {
-    setSidePanel("customer", { force: true });
-    state.quoteSessionId = "";
-    state.quoteSessionDraftSaveStarted = false;
-    saveSessionState();
-    const savePromise = startQuoteSessionDraftSaveAfterCustomerStep();
-    const savedDuringStart = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
-    const reservedSessionId = String(savedDuringStart.quoteSessionId || "");
-    const stateSessionIdDuringStart = String(state.quoteSessionId || "");
-    const session = await savePromise;
-    const createdSessionId = session?.session_id || state.quoteSessionId || "";
-    await deleteQuoteSessionRecord(createdSessionId);
-    window.localStorage.removeItem("swooshz_quote_session_v1");
-    return {
-      reservedSessionId,
-      stateSessionIdDuringStart,
-      createdSessionId,
-    };
-  });
-  if (!reservation.reservedSessionId || !reservation.stateSessionIdDuringStart) {
-    throw new Error(`Initial draft save should reserve a client session id before the network response, found ${JSON.stringify(reservation)}.`);
+  const savePattern = "**/api/quote-sessions";
+  let reservation;
+  const interruptFirstSave = async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    reservation = await page.evaluate(() => JSON.parse(localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "{}"));
+    await route.abort();
+  };
+  await page.route(savePattern, interruptFirstSave);
+  try {
+    await page.locator("#sideNextButton").click();
+    await page.waitForFunction(() => !appIsBusy());
+  } finally {
+    await page.unroute(savePattern, interruptFirstSave);
   }
-  if (reservation.createdSessionId !== reservation.reservedSessionId) {
-    throw new Error(`Initial draft save should use the reserved session id, found ${JSON.stringify(reservation)}.`);
+  if (!reservation?.quoteSessionId || reservation.pricingDraftVersion !== "create" || reservation.activeSidePanel !== "customer") {
+    throw new Error("The interrupted first save did not reserve an identity in browser recovery.");
   }
+  const quoteUrl = baseUrl + "/api/quote-sessions/" + reservation.quoteSessionId;
+  if ((await page.request.get(quoteUrl)).status() !== 404) throw new Error("Interrupted first save reached the server.");
+  delete reservation.pricingDraftVersion;
+  await page.evaluate((snapshot) => localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(snapshot)), reservation);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => !state.isBooting && !appIsBusy());
+  const retriedSave = page.waitForResponse((response) => response.request().method() === "POST"
+    && new URL(response.url()).pathname === "/api/quote-sessions", { timeout: 15000 });
+  await page.locator("#sideNextButton").click();
+  const retried = await retriedSave;
+  const request = retried.request().postDataJSON();
+  if (!retried.ok() || request.session_id !== reservation.quoteSessionId || request.expected_draft_version !== "") {
+    throw new Error("Legacy recovery did not create the same reserved quote.");
+  }
+  await page.waitForFunction(() => validQuoteDraftVersion(state.pricingDraftVersion) && state.activeSidePanel === "customer",
+    null, { timeout: 15000 });
+  const recovered = (await (await page.request.get(quoteUrl)).json()).quote_session;
+  if (!recovered.draft_files.some((file) => file.name === TEST_REFERENCE_FILE_NAME)) {
+    throw new Error("Legacy first-save recovery lost the draft attachment.");
+  }
+  await page.evaluate(async (sessionId) => {
+    await deleteQuoteSessionRecord(sessionId);
+    localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
+  }, reservation.quoteSessionId);
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
   await page.waitForFunction(() => {
@@ -5522,6 +5551,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error.message || error);
+  console.error(error.stack || error.message || error);
   process.exitCode = 1;
 });

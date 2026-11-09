@@ -15869,7 +15869,10 @@ class DatabaseSqagStorage:
         pending_artifacts: list[ArtifactBatchItem],
         object_plan: ObjectArtifactBatchPlan | None,
         now: str,
+        draft_precondition: QuoteDraftPrecondition | None = None,
     ) -> None:
+        if draft_precondition:
+            draft_precondition.lock_database_draft(connection, self.workspace_id, session_id)
         expiry = self._publication_retention_expiry(now)
         connection.execute(
             "update sqag_quote_publication_versions set state = ?, error_code = ?, "
@@ -15919,6 +15922,32 @@ class DatabaseSqagStorage:
                         artifact_checksum(item.content), sqlite3.Binary(item.content), now, now,
                     ),
                 )
+        if not draft_precondition:
+            self._record_pending_quote_publication(connection, session_id, run_id, job_id, draft_files, now)
+        ForensicStore(
+            connection,
+            self.workspace_id,
+            self.user_id or "storage-lifecycle",
+            actor_key_version_value="storage-v1",
+        ).append_telemetry_event(
+            "storage_staging",
+            "staged",
+            event_id=ForensicStore.telemetry_event_id(
+                "telemetry-storage-staging", run_id, now
+            ),
+            action_reference=job_id,
+            run_reference=run_id,
+            session_reference=session_id,
+            operation_route="quote_publication",
+            purpose="quote_publication_staging",
+            occurred_at=now,
+            commit=False,
+        )
+
+    def _record_pending_quote_publication(
+        self, connection: Any, session_id: str, run_id: str, job_id: str,
+        draft_files: list[dict[str, Any]], now: str,
+    ) -> None:
         current, current_drafts = self._read_quote_session_metadata_for_workspace_on_connection(
             connection,
             session_id,
@@ -15954,26 +15983,6 @@ class DatabaseSqagStorage:
                 normalized_visible.get("created_at") or now, now,
             ),
         )
-        ForensicStore(
-            connection,
-            self.workspace_id,
-            self.user_id or "storage-lifecycle",
-            actor_key_version_value="storage-v1",
-        ).append_telemetry_event(
-            "storage_staging",
-            "staged",
-            event_id=ForensicStore.telemetry_event_id(
-                "telemetry-storage-staging", run_id, now
-            ),
-            action_reference=job_id,
-            run_reference=run_id,
-            session_reference=session_id,
-            operation_route="quote_publication",
-            purpose="quote_publication_staging",
-            occurred_at=now,
-            commit=False,
-        )
-
     def _stage_versioned_quote_publication(
         self,
         payload: dict[str, Any],
@@ -15986,6 +15995,7 @@ class DatabaseSqagStorage:
         run_id: str,
         job_id: str,
         expected_unchanged_drafts: list[dict[str, Any]] | None = None,
+        draft_precondition: QuoteDraftPrecondition | None = None,
     ) -> dict[str, Any]:
         def prepare(connection: Any | None = None) -> dict[str, Any]:
             existing, _draft_files = (
@@ -15993,6 +16003,8 @@ class DatabaseSqagStorage:
                 if connection is not None
                 else self._read_quote_session_metadata_for_workspace(session_id)
             )
+            if draft_precondition:
+                draft_precondition.require_current(existing)
             if expected_unchanged_drafts is not None and not self._object_draft_files_match_persisted(
                 session_id,
                 expected_unchanged_drafts,
@@ -16058,6 +16070,7 @@ class DatabaseSqagStorage:
                 pending_artifacts=state["pending_artifacts"],
                 object_plan=state["object_plan"],
                 now=state["now"],
+                draft_precondition=draft_precondition,
             )
             return state
 
@@ -16107,6 +16120,7 @@ class DatabaseSqagStorage:
             self._run_storage_transaction(
                 lambda connection: self.publish_quote_session_forensic_transaction(
                     connection, session_id, run_id, files,
+                    draft_precondition=draft_precondition,
                 )
             )
             try:
@@ -16489,6 +16503,7 @@ class DatabaseSqagStorage:
                 publish=publish, run_id=safe_run_id,
                 job_id=safe_reference(generation_job_id, "job-"),
                 expected_unchanged_drafts=expected_unchanged_drafts,
+                draft_precondition=draft_precondition,
             )
 
 
@@ -16599,12 +16614,6 @@ class DatabaseSqagStorage:
             draft_files = quote_session_draft_files(patch) if isinstance(patch.get("draft_files"), list) else []
 
             def persist_quote(connection: Any) -> None:
-                if draft_precondition:
-                    draft_precondition.persist_database(
-                        connection, self.workspace_id, normalized,
-                        draft_files if "draft_files" in patch else None,
-                    )
-                    return
                 if stored_generated_quote:
                     retained_kinds = {
                         item.artifact_kind
@@ -16622,6 +16631,12 @@ class DatabaseSqagStorage:
                             item,
                             now,
                         )
+                if draft_precondition:
+                    draft_precondition.persist_database(
+                        connection, self.workspace_id, normalized,
+                        draft_files if "draft_files" in patch else None,
+                    )
+                    return
                 connection.execute(
                     "insert into sqag_quote_sessions (workspace_id, session_id, metadata_json, draft_files_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(workspace_id, session_id) do update set metadata_json = excluded.metadata_json, draft_files_json = excluded.draft_files_json, updated_at = excluded.updated_at",
                     (self.workspace_id, normalized["session_id"], json.dumps(normalized, ensure_ascii=True, sort_keys=True), json.dumps(draft_files, ensure_ascii=True, sort_keys=True), normalized.get("created_at") or now, normalized.get("updated_at") or now),
@@ -16689,6 +16704,8 @@ class DatabaseSqagStorage:
         session_id: str,
         run_id: str,
         expected_files: list[dict[str, Any]],
+        *,
+        draft_precondition: QuoteDraftPrecondition | None = None,
     ) -> dict[str, Any]:
         safe_id = safe_quote_session_id(session_id, "")
         safe_run_id = safe_reference(run_id, "run-")
@@ -16703,13 +16720,16 @@ class DatabaseSqagStorage:
         forensic_store._acquire_transaction_locks(
             ("quote_session", safe_id), ("generation_run", safe_run_id)
         )
-        session_row = connection.execute(
-            "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
-            (self.workspace_id, safe_id),
-        ).fetchone()
-        if not session_row:
-            raise ValueError("Staged quote session is not available.")
-        raw_metadata = str(session_row["metadata_json"] or "")
+        if draft_precondition:
+            raw_metadata = draft_precondition.lock_database_draft(connection, self.workspace_id, safe_id)
+        else:
+            session_row = connection.execute(
+                "select metadata_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+                (self.workspace_id, safe_id),
+            ).fetchone()
+            if not session_row:
+                raise ValueError("Staged quote session is not available.")
+            raw_metadata = str(session_row["metadata_json"] or "")
         try:
             current_metadata = json.loads(raw_metadata)
         except json.JSONDecodeError as exc:
@@ -16728,7 +16748,7 @@ class DatabaseSqagStorage:
             and current_run_id == safe_run_id
         ):
             return current_metadata
-        if safe_reference(current_publication.get("pending_run_id"), "run-") != safe_run_id:
+        if not draft_precondition and safe_reference(current_publication.get("pending_run_id"), "run-") != safe_run_id:
             raise ValueError("Staged quote session belongs to another generation run.")
 
         version = self._publication_version_row(safe_run_id, connection)
@@ -16743,7 +16763,7 @@ class DatabaseSqagStorage:
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("Staged quote session is not valid.") from exc
         metadata = normalized_quote_session_metadata(metadata if isinstance(metadata, dict) else {})
-        if clean_text(current_metadata.get("updated_at")) != clean_text(metadata.get("updated_at")):
+        if not draft_precondition and clean_text(current_metadata.get("updated_at")) != clean_text(metadata.get("updated_at")):
             # A save landed after this version was staged (staging stamps both copies with one
             # time; every save, including a pricing selection's, restamps it). Publish the staged
             # outputs but keep that newer save's draft and pricing ledger, so promotion never
@@ -25266,6 +25286,26 @@ class QuoteDraftPrecondition:
         if bool(metadata) != bool(self.expected) or normalized_quote_session_metadata(metadata) != self.expected:
             raise PricingSelectionConflict([], public_pricing_ledger(metadata))
 
+    def current_database_row(self, connection: Any, workspace_id: str, session_id: str) -> tuple[Any, Any]:
+        row = connection.execute(
+            "select metadata_json, draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
+            (workspace_id, session_id),
+        ).fetchone()
+        raw = row["metadata_json"] if row is not None else None
+        self.require_current(json.loads(raw) if isinstance(raw, str) else {})
+        return row, raw
+
+    def lock_database_draft(self, connection: Any, workspace_id: str, session_id: str) -> str:
+        _, raw = self.current_database_row(connection, workspace_id, session_id)
+        # Fence the publication transaction without changing the active version.
+        cursor = connection.execute(
+            "update sqag_quote_sessions set metadata_json = metadata_json where workspace_id = ? and session_id = ? and metadata_json = ?",
+            (workspace_id, session_id, raw),
+        )
+        if cursor.rowcount != 1:
+            raise PricingSelectionConflict([], public_pricing_ledger(self.expected))
+        return raw
+
     def persist_database(self, connection: Any, workspace_id: str, metadata: dict[str, Any],
                          draft_files: list[dict[str, Any]] | None = None) -> None:
         session_id = metadata["session_id"]
@@ -25281,12 +25321,7 @@ class QuoteDraftPrecondition:
             if cursor.rowcount != 1:
                 raise PricingSelectionConflict([], {})
             return
-        row = connection.execute(
-            "select metadata_json, draft_files_json from sqag_quote_sessions where workspace_id = ? and session_id = ?",
-            (workspace_id, session_id),
-        ).fetchone()
-        raw = row["metadata_json"] if row is not None else None
-        self.require_current(json.loads(raw) if isinstance(raw, str) else {})
+        row, raw = self.current_database_row(connection, workspace_id, session_id)
         if draft_files is None:
             cursor = connection.execute(
                 "update sqag_quote_sessions set metadata_json = ?, updated_at = ? where workspace_id = ? and session_id = ? and metadata_json = ?",
@@ -30747,7 +30782,7 @@ def create_or_update_quote_session(
         apply_pricing_ledger_save(metadata, existing, storage, draft_precondition)
         if "draft_files" in patch:
             draft_file_records = quote_session_draft_files(patch)
-        elif not draft_precondition:
+        elif not draft_precondition or result_has_generated_quote(result):
             draft_file_records = read_quote_session_draft_files(resolved_session_id, existing)
     elif result_has_generated_quote(result):
         draft_file_records = read_quote_session_draft_files(
@@ -32565,6 +32600,7 @@ def finish_generation_forensics(
     validated_session_id: str = "",
     publication_session_id: str = "",
     publication_files: list[dict[str, Any]] | None = None,
+    draft_precondition: QuoteDraftPrecondition | None = None,
 ) -> dict[str, Any]:
     if not run_id:
         return result
@@ -32690,6 +32726,7 @@ def finish_generation_forensics(
                         publication_session_id,
                         run_id,
                         publication_files or [],
+                        draft_precondition=draft_precondition,
                     )
                     store.connection.commit()
                     enriched["_committed_quote_metadata"] = committed_metadata
@@ -32698,6 +32735,13 @@ def finish_generation_forensics(
             except Exception:
                 store.connection.rollback()
                 raise
+    except PricingSelectionConflict:
+        if not atomic_publication:
+            raise
+        return finish_generation_forensics(
+            run_id, generation_draft_conflict(enriched.get("job_id", "")), auth_session,
+            error_category="quote_draft_stale", validated_session_id=validated_session,
+        )
     except Exception as exc:
         error_reference = new_error_reference()
         write_local_log("forensic_persistence_failed", unexpected_error_log_details(error_reference, exc, job_id=clean_text(enriched.get("job_id"))))
@@ -33108,6 +33152,11 @@ def create_job(
     payload.pop("_pricing_reference_snapshot", None)
     if normalized_type not in {"draft", "generate", "generate_pdf", "basis_chat"}:
         return {"status": "blocked", "errors": ["Job type must be draft, basis_chat, generate, or generate_pdf."]}
+    expected_draft_version = None
+    if normalized_type in {"generate", "generate_pdf"} and "expected_draft_version" in payload:
+        expected_draft_version = payload["expected_draft_version"]
+        if not isinstance(expected_draft_version, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_draft_version):
+            return {"status": "blocked", "errors": ["Generation draft version is invalid."]}
     if normalized_type == "draft":
         snapshot = capture_pricing_reference_snapshot(payload, auth_session=auth_session)
         if snapshot is None:
@@ -33164,6 +33213,7 @@ def create_job(
             existing.get("type") != normalized_type
             or not job_visible_to_context(existing, visibility_context)
             or existing.get("_quote_spend_identity") != spend_identity
+            or existing.get("_expected_draft_version") != expected_draft_version
         )
 
     if requested_job_id:
@@ -33337,6 +33387,7 @@ def create_job(
         "errors": [],
         "owner": job_owner_context_from_auth_session(auth_session),
         "_quote_spend_identity": spend_identity,
+        "_expected_draft_version": expected_draft_version,
         "generation_run_id": generation_run_id,
     }
     with JOBS_LOCK:
@@ -33376,6 +33427,13 @@ def get_job(job_id: str, auth_session: dict[str, Any] | None = None) -> dict[str
             return None
         snapshot = copy.deepcopy(job) if job else None
     return projected_public_job(snapshot, auth_session) if snapshot else None
+
+
+def generation_draft_conflict(job_id: str) -> dict[str, Any]:
+    return {
+        "job_id": job_id, "status": "failed", "reason_code": "quote_draft_stale",
+        "errors": [PRICING_SELECTION_STALE_MESSAGE],
+    }
 
 
 def _run_quote_job(
@@ -33581,6 +33639,29 @@ def _run_quote_job(
         ensure_quote_artifact_storage_available_for_auth_session(auth_session)
     except SqagStorageAccessError as exc:
         return storage_block(exc)
+
+    draft_precondition = None
+    if "expected_draft_version" in payload:
+        try:
+            session_id = safe_quote_session_id(quote_session_patch_payload(payload).get("session_id"), "")
+            if not quote_session_storage or not session_id:
+                raise PricingSelectionConflict([], {})
+            existing, editable = read_pricing_ledger_record(quote_session_storage, session_id)
+            if not editable:
+                raise SqagStorageAccessError(
+                    "You do not have permission to perform this action.", status=403, reason="quote_session_not_editable",
+                )
+            draft_precondition = QuoteDraftPrecondition.from_version(
+                existing, pricing_ledger_scope_for_storage(quote_session_storage), payload["expected_draft_version"],
+            )
+        except PricingSelectionConflict:
+            return finish_generation_forensics(
+                generation_run_id, generation_draft_conflict(job_id), auth_session,
+                error_category="quote_draft_stale", validated_session_id=validated_session_id,
+                canonical_manifest=terminal_manifest("failed", "quote_draft_stale"),
+            )
+        except SqagStorageAccessError as exc:
+            return storage_block(exc)
 
     output_root = output_root or configured_output_root()
     tmp_root = tmp_root or configured_tmp_root()
@@ -33804,10 +33885,12 @@ def _run_quote_job(
                     publish=False,
                     generation_run_id=generation_run_id,
                     generation_job_id=job_id,
+                    draft_precondition=draft_precondition,
                 )
             else:
                 result["quote_session"] = storage.create_or_update_quote_session(
                     payload, result=result, output_dir=output_dir,
+                    draft_precondition=draft_precondition,
                     **({"committed_metadata": committed_metadata} if isinstance(storage, LocalSqagStorage) else {}),
                 )
             if atomic_publication:
@@ -33864,6 +33947,8 @@ def _run_quote_job(
                     "durable_outcome": "publication_committed",
                 },
             )
+        except PricingSelectionConflict:
+            result = generation_draft_conflict(job_id)
         except SqagStorageAccessError as exc:
             storage_error = storage_access_error_payload(exc)
             result["_forensic_transient_files"] = copy.deepcopy(
@@ -33993,6 +34078,7 @@ def _run_quote_job(
         publication_storage=publication_storage,
         publication_session_id=publication_session_id,
         publication_files=publication_files,
+        draft_precondition=draft_precondition,
     )
     atomic_committed_metadata = finalized.pop("_committed_quote_metadata", None)
     if isinstance(atomic_committed_metadata, dict):
@@ -34051,7 +34137,7 @@ def _run_quote_job(
                 publication_storage.mark_quote_session_publication_failed(
                     publication_session_id,
                     generation_run_id,
-                    "forensic_finalization_failed",
+                    finalized.get("reason_code") or "forensic_finalization_failed",
                 )
             except Exception as exc:
                 compensation_reference = new_error_reference()
@@ -35107,7 +35193,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if result["status"] == "blocked":
                 self.send_json(result, status=400)
                 return
-            self.send_json(result, status=200 if result["status"] != "failed" else 500)
+            status = 409 if result.get("reason_code") == "quote_draft_stale" else 200 if result["status"] != "failed" else 500
+            self.send_json(result, status=status)
             return
 
         if parsed.path == "/api/log":
