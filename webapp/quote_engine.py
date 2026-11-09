@@ -1,11 +1,12 @@
-"""Catalogue matching and row calculations for a resolved pricing reference.
+"""Draft orchestration, catalogue matching and row pricing for quotes.
 
-Callers select the catalogue and validate pricing authority before applying any
-calculated price. This module does not handle requests, grants or persistence.
+Callers admit inputs and supply the draft gateway adapter. They select the
+catalogue and validate pricing authority before applying any calculated price.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import math
 import re
@@ -13,6 +14,38 @@ from typing import Any
 import unicodedata
 
 from scripts import pricing_reference_cleanup, pricing_reference_enrichment
+
+
+@dataclass(frozen=True)
+class PreparedDraftMedia:
+    single_send: list[dict[str, Any]]
+    batches: list[list[tuple[str, dict[str, Any]]]]
+
+
+class QuoteDraftRunner:
+    """Sequence admitted media through the existing draft gateway adapter."""
+
+    def __init__(self, gateway):
+        self.gateway = gateway
+
+    def run(self, prepared: PreparedDraftMedia) -> dict[str, Any]:
+        if prepared.single_send:
+            budget = self.gateway.new_budget(0)
+            budget.next_stage(synthesis=True)
+            try:
+                data, fingerprint = self.gateway.send_single(prepared.single_send, budget)
+            finally:
+                if budget.by_model:
+                    self.gateway.record_usage(budget)
+            return self.gateway.normalize_response(data, fingerprint)
+
+        budget = self.gateway.new_budget(len(prepared.batches))
+        plan = self.gateway.prepare_batches(prepared.batches)
+        try:
+            observations = self.gateway.observe_batches(prepared, plan, budget)
+            return self.gateway.synthesize(plan, observations, budget)
+        finally:
+            self.gateway.record_usage(budget)
 
 
 def clean_text(value: Any) -> str:
