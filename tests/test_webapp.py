@@ -31217,6 +31217,7 @@ eval([
   "applyPossiblePricingMatch",
   "reincludedCatalogueSelectionKey",
   "rememberReincludedCatalogueSelection",
+  "pendingPricingSelections",
   "retagBasisLine",
   "retagBasisSectionConfirmLines",
   "applyBasisTag",
@@ -31628,6 +31629,34 @@ retagBasisLine("objects", 0, "Exclude");
 assert.ok(!hasDeferral() && !hasDeferralStatus(), "legacy deferral survived exclusion");
 retagBasisLine("objects", 0, "Custom");
 assert.ok(hasDeferral() && hasDeferralStatus(), "legacy deferred draft could not be re-included");
+
+function normalizeLineItem(row) { return { ...row }; }
+function outputPriceAuthority(row) { return row.pricing_authority; }
+function safeQuoteSessionId(value) { return value; }
+function isPlainObject(value) { return value && typeof value === "object"; }
+const catalogLine = { ...originalUnmatched, tag: "Confirm", pricing_keyword: "synthetic-reference-item" };
+const catalogRow = { ...unpricedRow, pricing_keyword: catalogLine.pricing_keyword,
+  pricing_authority: { variant: "catalog", catalog_item_id: catalogLine.pricing_keyword,
+    catalog_source: reference.source, catalog_digest: reference.digest_sha256 } };
+for (const tick of [
+  () => retagBasisLine("objects", 0, "Include"),
+  () => retagBasisSectionConfirmLines("objects", "Include"),
+]) {
+  resetUnmatched();
+  state.quoteSessionId = "quote-synthetic";
+  state.pricingLedgerRevisions = { "quote-synthetic": { [catalogLine.id]: 3 } };
+  state.workflowStage = "completed";
+  state.quoteBasisSections = [sectionWith({ ...catalogLine, tag: "Exclude" })];
+  state.originalAnalysisSnapshot.quote_basis_sections = [sectionWith(catalogLine)];
+  state.originalAnalysisSnapshot.line_items = [catalogRow];
+  state.originalOutputRows = [];
+  state.lineItems = [];
+  assert.equal(basisPricingGroup(state.quoteBasisSections[0].lines[0], state.quoteBasisSections[0]), "Matched");
+  tick();
+  assert.deepStrictEqual(pendingPricingSelections(), [{ source_basis_line_id: catalogLine.id,
+    catalog_item_id: catalogLine.pricing_keyword, expected_revision: 3, reinclude: true }]);
+  assert.equal(queuedDraftSaves, 0);
+}
 assert.ok(rendered >= 3);
 assert.ok(synced >= 3);
 """
@@ -43443,6 +43472,54 @@ main().catch((error) => {
                 with self.assertRaises(webapp.PricingSelectionConflict):
                     webapp.write_quote_session_pricing_ledger(owner_storage, "quote-ledger-db", stale, webapp.empty_pricing_ledger("new"))
                 self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")[0]["pricing_ledger"], owner_ledger)
+
+                excluded = copy.deepcopy(confirmed)
+                self._ledger_line(excluded, "carpet-row")["tag"] = "Exclude"
+                owner_storage.create_or_update_quote_session(self._ledger_sync(excluded))
+                saved, files = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")
+                restore = {"source_basis_line_id": "carpet-row", "catalog_item_id": self.LEDGER_CARPET,
+                           "expected_revision": webapp.public_pricing_ledger(saved)["rows"]["carpet-row"], "reinclude": True}
+                newer = copy.deepcopy(excluded)
+                self._ledger_line(newer, "carpet-row")["text"] += " for another position"
+                self._ledger_sync(newer)
+                commit = webapp.PricingSelectionDraft.persist_database
+                concurrent = []
+
+                def save_before_commit(staged, connection, workspace_id, metadata):
+                    owner_storage.create_or_update_quote_session(newer)
+                    concurrent.append(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"))
+                    return commit(staged, connection, workspace_id, metadata)
+
+                with mock.patch.object(webapp.PricingSelectionDraft, "persist_database", autospec=True, side_effect=save_before_commit):
+                    with self.assertRaises(webapp.PricingSelectionConflict):
+                        webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                self.assertEqual(len(concurrent), 1)
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), concurrent[0])
+                with self.assertRaises(webapp.PricingSelectionConflict):
+                    webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), concurrent[0])
+
+                colleague_storage = webapp.app_storage_for_auth_session(colleague)
+                outsider_storage = webapp.app_storage_for_auth_session(outsider)
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    webapp.apply_pricing_selections(confirmed, [restore], colleague_storage, auth_session=colleague)
+                with self.assertRaises(webapp.PricingSelectionConflict):
+                    webapp.apply_pricing_selections(confirmed, [restore], outsider_storage, auth_session=outsider)
+                self.assertEqual(outsider_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), ({}, []))
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), concurrent[0])
+
+                for artifact_mode in ("database", "object"):
+                    with self.subTest(artifact_mode=artifact_mode), mock.patch.dict(os.environ, {
+                        webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: artifact_mode,
+                    }):
+                        excluded_session = owner_storage.create_or_update_quote_session(excluded)
+                        restore["expected_revision"] = excluded_session["pricing_ledger"]["rows"]["carpet-row"]
+                        restored = webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                        self.assertEqual(self._ledger_price(restored["line_items"], "carpet-row"), price)
+                        reopened, reopened_files = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")
+                        self.assertEqual(reopened_files, files)
+                        self.assertEqual(reopened["pricing_ledger"]["rows"]["carpet-row"]["grant"]["state"], "live")
+                        self.assertEqual(reopened["draft_state"]["quoteBasisSections"], confirmed["quote_basis_sections"])
 
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {

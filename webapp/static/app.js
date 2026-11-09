@@ -11891,16 +11891,14 @@ function reincludedCatalogueSelectionKey(line, section, row) {
   ]);
 }
 
-function rememberReincludedCatalogueSelection(line, section, nextTag) {
+function rememberReincludedCatalogueSelection(line, section, nextTag, row) {
   if (normalizeBasisTag(line.tag) !== "Exclude" || nextTag !== "Include" || state.workflowStage !== "completed") return;
   const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
   if (state.originalOutputRows.some((row) => ids.has(row.source_basis_line_id))) return;
-  const rows = state.lineItems.filter((row) => ids.has(row.source_basis_line_id));
-  if (rows.length !== 1) return;
-  const [row] = rows;
+  if (!row) return;
   const key = reincludedCatalogueSelectionKey(line, section, row);
   // This is draft intent. The server checks the saved binding and revision before pricing.
-  if (key) row.reincluded_catalog_selection = key;
+  if (key) return { ...row, reincluded_catalog_selection: key };
 }
 
 function retagBasisLine(sectionId, lineIndex, nextTag) {
@@ -11920,6 +11918,7 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null) {
   const section = sections.find((item) => item.id === sectionId);
   if (!section) return;
   let changed = false;
+  let deferralChanged = false;
   const pricingChanges = new Map();
   section.lines = (section.lines || []).map((line, index) => {
     if (lineIndex !== null && lineIndex !== index) return line;
@@ -11927,13 +11926,20 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null) {
     const offer = nextTag === "Exclude" ? "" : basisUnmatchedOffer(line, row, section);
     if (offer && row.deferred_pricing !== offer) {
       pricingChanges.set(row.source_basis_line_id, { ...row, unmatched_pricing_offer: offer, deferred_pricing: offer });
+      deferralChanged = true;
     } else if (!offer && row?.deferred_pricing) {
       const { deferred_pricing, ...retained } = row;
       pricingChanges.set(row.source_basis_line_id, { ...retained, unmatched_pricing_offer: row.unmatched_pricing_offer || deferred_pricing });
+      deferralChanged = true;
     }
     const acceptsCustom = Boolean(offer) || (nextTag === "Include" && basisLineAcceptsAsAiProposal(line));
     const resolvedTag = acceptsCustom ? "Custom" : nextTag;
-    rememberReincludedCatalogueSelection(line, section, resolvedTag);
+    const reincluded = rememberReincludedCatalogueSelection(line, section, resolvedTag, row);
+    if (reincluded) pricingChanges.set(reincluded.source_basis_line_id, reincluded);
+    if (nextTag === "Exclude" && row?.reincluded_catalog_selection) {
+      const { reincluded_catalog_selection, ...retained } = row;
+      pricingChanges.set(row.source_basis_line_id, retained);
+    }
     const customPricing = isCustomPricingBasisLine(line) || resolvedTag === "Custom";
     const customConfirmed = customPricing && nextTag !== "Exclude";
     const currentTag = normalizeBasisTag(line.tag);
@@ -11948,6 +11954,8 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null) {
   if (!changed && !pricingChanges.size) return;
   if (pricingChanges.size) {
     state.lineItems = [...state.lineItems.filter((row) => !pricingChanges.has(row.source_basis_line_id)), ...pricingChanges.values()];
+  }
+  if (deferralChanged) {
     state.outputRows = [];
     state.originalOutputRows = [];
   }
@@ -11957,7 +11965,9 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null) {
   markOutputRowsDirty();
   updateQuoteBasisCard("edited");
   syncControlStates();
-  if (pricingChanges.size) queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+  if (deferralChanged && !state.lineItems.some((row) => row.reincluded_catalog_selection)) {
+    queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+  }
 }
 
 function basisChatIntroMessage() {
@@ -13405,6 +13415,9 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
     return { ok: true, data: { status: "normalized", line_items: [] } };
   }
   let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+  const reinclusions = state.lineItems.filter((row) => row.reincluded_catalog_selection).length;
+  const reinclusionsReady = () => selections.filter((entry) => entry.reinclude).length === reinclusions;
+  if (!reinclusionsReady()) return { ok: false, data: { status: "conflict" } };
   const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
   const isSessionCurrent = () => safeQuoteSessionId(state.quoteSessionId || "") === sessionId;
   // Selection checks revisions before saving its draft. Let it carry any queued draft,
@@ -13420,6 +13433,7 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
       while (quoteSessionDraftSavePromise && isCurrent()) await quoteSessionDraftSavePromise.catch(() => null);
       if (!isCurrent()) return { ok: false, data: { status: "conflict", request_superseded: true } };
       selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
+      if (!reinclusionsReady()) return { ok: false, data: { status: "conflict" } };
       if (selections.length) {
         result = await postJson("/api/quote-sessions/pricing-selections", {
           ...buildLineItemNormalizePayload(),
@@ -13433,7 +13447,7 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
     if (hold && quoteSessionDraftSaveTimer === hold) {
       quoteSessionDraftSaveTimer = null;
       // The browser recovery draft already contains the edits. On conflict, keep the newer server draft intact.
-      if (hold.options && !result?.ok && result?.status !== 409 && result?.data?.status !== "conflict"
+      if (!reinclusions && hold.options && !result?.ok && result?.status !== 409 && result?.data?.status !== "conflict"
         && isSessionCurrent() && !state.isPageUnloading) {
         if (commitActiveOutputEditor({ commit: false }) === "blocked") blockedOutputDraftSaveOptions = hold.options;
         else queueQuoteSessionDraftStateSave(hold.options);
@@ -13491,14 +13505,14 @@ function pendingPricingSelections() {
     if (!row || ["manual", "included"].includes(row.pricing_authority?.variant) || selections.has(rowId)) return;
     const revision = revisions[rowId];
     const reinclude = Boolean(row.reincluded_catalog_selection) || row.pricing_authority?.variant === "catalog";
-    if (reinclude && (!row.reincluded_catalog_selection || !Number.isSafeInteger(revision) || revision <= 0
+    if (reinclude && (!row.reincluded_catalog_selection || (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 0))
       || row.reincluded_catalog_selection !== reincludedCatalogueSelectionKey(line, section, row))) return;
     selections.set(rowId, { source_basis_line_id: rowId, catalog_item_id: itemId,
       expected_revision: Number.isInteger(revision) && revision >= 0 ? revision : 0,
       ...(reinclude ? { reinclude: true } : {}),
     });
   }));
-  return [...selections.values()].sort((left, right) => Number(Boolean(left.reinclude)) - Number(Boolean(right.reinclude))).slice(0, 100);
+  return [...selections.values()].sort((left, right) => Number(Boolean(right.reinclude)) - Number(Boolean(left.reinclude))).slice(0, 100);
 }
 
 function openBlockingClarifications(questions = [], findings = [], project = {}) {
@@ -14509,6 +14523,9 @@ async function saveQuoteSessionDraftState(options = {}) {
   if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
   saveSessionState();
+  // The selection request owns saving this draft until the server admits the re-inclusion.
+  const hasPendingReinclusion = () => state.lineItems?.some((row) => row.reincluded_catalog_selection);
+  if (hasPendingReinclusion()) return null;
   // Caller snapshots stay immutable while an earlier save is pending.
   let draftState = JSON.parse(JSON.stringify(options.draftState || currentQuoteSessionDraftState()));
   let draftFiles = JSON.parse(JSON.stringify(Array.isArray(options.draftFiles)
@@ -14526,7 +14543,7 @@ async function saveQuoteSessionDraftState(options = {}) {
       await Promise.resolve();
     }
     const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
-    if (currentSessionId !== queuedSessionId) return null;
+    if (currentSessionId !== queuedSessionId || hasPendingReinclusion()) return null;
     if (priorSave && !options.draftState) {
       draftState = JSON.parse(JSON.stringify(currentQuoteSessionDraftState()));
       if (!Array.isArray(options.draftFiles)) {

@@ -173,7 +173,22 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
     return results;
   });
   assert(editedGroups.every(Boolean), "an edited or re-referenced row retained eligibility", editedGroups);
+  // Persist and reopen the legacy shape, so both browser and server must recover
+  // the excluded catalogue row from saved evidence rather than a retained item.
+  assert(await page.evaluate(async (id) => {
+    state.lineItems = state.lineItems.filter((row) => row.source_basis_line_id !== id);
+    const saved = await saveQuoteSessionDraftState({ quoteGenerated: true });
+    return Boolean(saved);
+  }, "u1-excluded-match"), "could not save the legacy excluded draft");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0);
+  if (!(await sculpture.isVisible())) await basisTab.click();
+  assert(await page.evaluate(() => !state.lineItems.some((row) => row.source_basis_line_id === "u1-excluded-match")),
+    "legacy fixture unexpectedly has a retained catalogue row");
+  await assertExcludedBasis();
   await (await basisControl(page, "u1-excluded-match", '[data-basis-tag="Include"]')).click();
+  assert(await page.evaluate(() => pendingPricingSelections().some((entry) =>
+    entry.source_basis_line_id === "u1-excluded-match" && entry.reinclude)), "legacy tick did not request catalogue restoration");
   const editedSelection = await page.evaluate(() => {
     const line = state.quoteBasisSections.flatMap((section) => section.lines).find((entry) => entry.id === "u1-excluded-match");
     const original = line.text;

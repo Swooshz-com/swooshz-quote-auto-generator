@@ -181,7 +181,9 @@ class PricingSpatialContextTest(unittest.TestCase):
 
     def test_reinclude_requires_current_revision_unchanged_row_and_a_prior_grant(self):
         storage = webapp.LocalSqagStorage()
-        for case in ('current', 'stale', 'changed', 'missing', 'reference'):
+        for case in ('current', 'stale', 'changed', 'missing', 'reference', 'other-tab-text',
+                     'other-tab-section', 'other-tab-identity', 'other-tab-quantity', 'other-tab-unit',
+                     'other-tab-item', 'duplicate', 'mixed', 'legacy', 'legacy-no-ledger', 'legacy-forged'):
             with self.subTest(case=case):
                 payload, item = self.selection_payload('Synthetic cafe chairs at the synthetic round tables')
                 row_id = payload['line_items'][0]['source_basis_line_id']
@@ -195,8 +197,24 @@ class PricingSpatialContextTest(unittest.TestCase):
                     payload['line_items'] = selected['line_items']
                 self.fixture._ledger_line(payload, row_id)['tag'] = 'Exclude'
                 self.fixture._ledger_sync(payload)
+                recovered = copy.deepcopy(payload['line_items'])
+                if case.startswith('legacy'):
+                    snapshot = payload['quote_session']['draft_state']['originalAnalysisSnapshot']
+                    snapshot.update(quote_basis_sections=copy.deepcopy(payload['quote_basis_sections']), line_items=recovered)
+                    snapshot['pricing_analysis_seal'] = webapp.issue_pricing_analysis_seal(
+                        payload, recovered, source_units={row_id: recovered[0]['unit']},
+                    )
+                    if case == 'legacy-forged':
+                        snapshot['pricing_analysis_seal']['mac'] = '0' * 64
+                    payload['line_items'] = []
+                    self.fixture._ledger_sync(payload)
                 storage.create_or_update_quote_session(payload)
                 saved = webapp.read_quote_session_metadata(session_id)
+                if case == 'legacy-no-ledger':
+                    saved.pop('pricing_ledger')
+                    webapp.write_quote_session_metadata(saved)
+                    # Recovery authority comes from saved evidence, even if the browser omits it.
+                    payload['quote_session']['draft_state']['originalAnalysisSnapshot'].pop('pricing_analysis_seal')
                 if case == 'reference':
                     ledger = copy.deepcopy(saved['pricing_ledger'])
                     ledger['rows'][row_id]['grant']['catalog_digest'] = 'sha256:' + '0' * 64
@@ -204,31 +222,57 @@ class PricingSpatialContextTest(unittest.TestCase):
                     saved = webapp.read_quote_session_metadata(session_id)
                 payload['line_items'] = copy.deepcopy(saved['draft_state']['lineItems'])
                 payload['quote_basis_sections'] = copy.deepcopy(saved['draft_state']['quoteBasisSections'])
+                if case.startswith('legacy'):
+                    payload['line_items'] = recovered
+                if case.startswith('other-tab'):
+                    newer = copy.deepcopy(payload)
+                    newer_line = self.fixture._ledger_line(newer, row_id)
+                    if case == 'other-tab-section':
+                        newer['quote_basis_sections'][0]['id'] += '-moved'
+                    elif case == 'other-tab-text':
+                        newer_line['text'] += ' for another position'
+                    else:
+                        key, value = {'identity': ('id', 'other-id'), 'quantity': ('quantity', 20),
+                                      'unit': ('unit', 'sets'), 'item': ('pricing_keyword', 'other-item')}[case[10:]]
+                        newer_line[key] = value
+                    storage.create_or_update_quote_session(self.fixture._ledger_sync(newer))
                 line = self.fixture._ledger_line(payload, row_id)
                 line['tag'] = 'Include'
-                if case == 'changed':
+                if case in ('changed', 'mixed'):
                     line['text'] += ' for another position'
                 if case == 'current':
                     payload['line_items'][0]['catalog_unit_price'] = 999
+                if case in ('current', 'legacy', 'legacy-no-ledger'):
+                    payload['line_items'][0]['reincluded_catalog_selection'] = 'synthetic-browser-intent'
+                if case == 'duplicate':
+                    payload['line_items'].append(copy.deepcopy(payload['line_items'][0]))
                 self.fixture._ledger_sync(payload)
                 request = {'source_basis_line_id': row_id, 'catalog_item_id': item['id'], 'reinclude': True,
                            'expected_revision': original_revision if case == 'stale' else
-                           webapp.public_pricing_ledger(saved)['rows'][row_id]}
+                           webapp.public_pricing_ledger(saved)['rows'].get(row_id, 0)}
+                selections = [request]
+                if case == 'mixed':
+                    independent = 'independent-row'
+                    payload['line_items'].append({**payload['line_items'][0], 'source_basis_line_id': independent,
+                                                  'pricing_authority': {'variant': 'none'}})
+                    payload['quote_basis_sections'][0]['lines'].append({**line, 'id': independent})
+                    self.fixture._ledger_sync(payload)
+                    selections.insert(0, {'source_basis_line_id': independent, 'catalog_item_id': item['id'],
+                                          'expected_revision': 0})
                 self.assertIsNone(self.fixture._ledger_price(webapp.normalize_line_items_for_quote_basis_review(payload), row_id))
-                if case == 'stale':
-                    with self.assertRaises(webapp.PricingSelectionConflict):
-                        webapp.apply_pricing_selections(payload, [request], storage)
-                    self.assertTrue(webapp.read_quote_session_metadata(session_id) == saved,
-                                    'stale selection changed the saved quote')
-                    continue
-                result = webapp.apply_pricing_selections(payload, [request], storage)
-                if case == 'current':
+                persisted = webapp.read_quote_session_metadata(session_id)
+                if case in ('current', 'legacy', 'legacy-no-ledger'):
+                    result = webapp.apply_pricing_selections(payload, [request], storage)
                     self.assertEqual(result['selections'], [{'source_basis_line_id': row_id, 'status': 'selected'}])
                     self.assertEqual(self.fixture._ledger_price(result['line_items'], row_id), webapp.pricing_reference_sale_unit_price(item))
+                    committed = webapp.read_quote_session_metadata(session_id)
+                    self.assertNotIn('reincluded_catalog_selection', committed['draft_state']['lineItems'][0])
                 else:
-                    self.assertEqual(result['selections'], [{'source_basis_line_id': row_id, 'status': 'refused',
-                                                            'reason': 'reference_changed' if case == 'reference' else 'ineligible'}])
-                    self.assertIsNone(self.fixture._ledger_price(result['line_items'], row_id))
+                    for _ in range(2):
+                        with self.assertRaises(webapp.PricingSelectionConflict):
+                            webapp.apply_pricing_selections(payload, selections, storage)
+                        self.assertTrue(webapp.read_quote_session_metadata(session_id) == persisted,
+                                        'refused re-inclusion changed the saved quote')
 
     def test_bracket_label_and_client_authority_cannot_supply_primary_evidence(self):
         for index, (detail, unit, reason) in enumerate((
