@@ -33,6 +33,9 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   const sectionId = await spotlightTick.getAttribute("data-basis-section");
   const spotlight = spotlightTick.locator("xpath=ancestor::li[1]");
   const sculpture = page.locator('.basis-line-row').filter({ hasText: "Kinetic sculpture" });
+  const sculptureStatus = sculpture.getByText("Price to be discussed", { exact: true });
+  const sculptureTick = () => basisControl(page, "u1-unmatched", '[data-basis-tag]:not([data-basis-tag="Exclude"])');
+  const sculptureCross = await basisControl(page, "u1-unmatched", '[data-basis-tag="Exclude"]');
   const sectionActions = page.locator('#basisReviewSurface [data-basis-section="' + sectionId + '"][data-basis-section-action]');
   const tickAll = sectionActions.and(page.locator('[data-basis-section-action="Include"]')).first();
   const crossAll = sectionActions.and(page.locator('[data-basis-section-action="Exclude"]')).first();
@@ -44,15 +47,22 @@ replaceOnce('  // Resolve any remaining server-added review line', `
       "basis row lost its pricing group or selection styling", { group, tag });
   }
   await assertBasisRow(spotlight, "Matched", "include");
+  assert(!await sculptureStatus.isVisible() && await page.evaluate(() => state.lineItems.some((row) =>
+    row.source_basis_line_id === "u1-unmatched" && Boolean(row.unmatched_pricing_offer) && !row.deferred_pricing)),
+    "untouched unmatched row already carries a deferral");
+  assert(await sculpture.locator('button').count() === 3, "unmatched row has an extra action");
   await tickAll.click();
   await assertBasisRow(spotlight, "Matched", "include");
+  await assertBasisRow(sculpture, "Unmatched", "custom");
+  assert(await sculptureStatus.isVisible(), "section tick did not defer eligible unmatched row");
   await crossAll.click();
   await assertBasisRow(spotlight, "Matched", "exclude");
   await assertBasisRow(sculpture, "Unmatched", "exclude");
-  assert(await sculpture.locator('[data-basis-defer-pricing]').count() === 0, "excluded row still offers Keep");
+  assert(!await sculptureStatus.isVisible(), "excluded row still shows a deferral");
   await tickAll.click();
   await assertBasisRow(spotlight, "Matched", "include");
-  assert(await sculpture.evaluate((row) => !row.classList.contains("basis-line-exclude")), "Tick all missed the other pricing group");
+  await assertBasisRow(sculpture, "Unmatched", "custom");
+  assert(await sculptureStatus.isVisible(), "section tick did not defer after bulk exclusion");
   await spotlightCross.click();
   await assertBasisRow(spotlight, "Matched", "exclude");
   assert(await sculpture.evaluate((row) => !row.classList.contains("basis-line-exclude")), "single X excluded a different row");
@@ -69,19 +79,14 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   assert(await tickAll.locator('xpath=..').locator('.basis-section-action-spacer').count() === 1,
     "bulk actions lost the alignment spacer for the Re column");
   result.basisActions = "PASS";
-  const keep = await basisControl(page, "u1-unmatched", "[data-basis-defer-pricing]");
-  assert(await keep.isVisible(), "unmatched physical row has no Keep control", await page.evaluate(() =>
-    state.lineItems.find((row) => row.source_basis_line_id === "u1-unmatched")));
   assert(await page.locator('#basisReviewSurface [aria-label="Unmatched"]').getByText("Kinetic sculpture").isVisible(), "unmatched line rendered in the wrong group");
   assert(await page.locator('#basisReviewSurface [aria-label="Matched"]').getByText("6 inch Spotlight", { exact: false }).first().isVisible(), "resolved reference not in Matched");
   assert(await page.locator('#basisReviewSurface [aria-label="Review"]').getByText("Large wall-mounted video display", { exact: false }).first().isVisible(), "unit conflict not in Review");
+  const manualReview = page.locator('#basisReviewSurface [aria-label="Review"] .basis-line-row')
+    .filter({ hasText: "Custom reception desk" });
+  assert(await manualReview.isVisible() && !await manualReview.getByText("Price to be discussed").isVisible(),
+    "ticking a Review row granted a pricing deferral");
   assert(await page.locator('#basisReviewSurface').getByText("Detected booth", { exact: true }).isVisible(), "Detected booth header missing");
-  await keep.click();
-  assert(await keep.innerText() === "Undo keep", "keep decision was not shown");
-  await keep.click();
-  assert(await keep.innerText() === "Keep as unpriced", "keep decision could not be undone");
-  await keep.click();
-  const sculptureCross = await basisControl(page, "u1-unmatched", '[data-basis-tag="Exclude"]');
   const floodCross = await basisControl(page, "u1-excluded-match", '[data-basis-tag="Exclude"]');
   const flood = floodCross.locator("xpath=ancestor::li[1]");
   await sculptureCross.click();
@@ -98,7 +103,7 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
   async function assertExcludedBasis() {
     await assertBasisRow(flood, "Matched", "exclude");
     await assertBasisRow(sculpture, "Unmatched", "exclude");
-    assert(await sculpture.locator('[data-basis-defer-pricing]').count() === 0, "excluded row offers Keep");
+    assert(!await sculptureStatus.isVisible(), "excluded row still shows a deferral");
   }
   const basisTab = page.locator('button[data-side-panel="basis"]').first();
   await assertExcludedOutput();
@@ -143,7 +148,6 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
   }, excludedIds);
   assert(recovery.activeEdit === "Review" && JSON.stringify(recovery.recovered) === '["Unmatched","Matched"]'
     && recovery.stale.every((group) => group === "Review"), "snapshot recovery accepted an edit or lost classification", recovery);
-  await (await basisControl(page, "u1-unmatched", '[data-basis-tag]:not([data-basis-tag="Exclude"])')).click();
   const editedGroups = await page.evaluate(() => {
     const section = state.quoteBasisSections.find((entry) => entry.lines.some((line) => line.id === "u1-unmatched"));
     const line = section.lines.find((entry) => entry.id === "u1-unmatched");
@@ -159,10 +163,8 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
         state.pricingReferenceId = replacement.id;
       }
       updateQuoteBasisCard();
-      const row = [...document.querySelectorAll("#basisReviewSurface .basis-line-row")].find((element) =>
-        element.textContent.includes(line.text));
-      results.push(row?.closest(".basis-review-grid")?.getAttribute("aria-label") === "Review"
-        && !row.querySelector("[data-basis-defer-pricing]"));
+      results.push(basisPricingGroup(line, section) === "Review"
+        && !basisUnmatchedOffer(line, basisPricingRow(line, section), section));
     }
     Object.assign(line, original);
     state.pricingReferences = references;
@@ -170,7 +172,7 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
     updateQuoteBasisCard();
     return results;
   });
-  assert(editedGroups.every(Boolean), "an edited or re-referenced row retained the Keep control", editedGroups);
+  assert(editedGroups.every(Boolean), "an edited or re-referenced row retained eligibility", editedGroups);
   await (await basisControl(page, "u1-excluded-match", '[data-basis-tag="Include"]')).click();
   const editedSelection = await page.evaluate(() => {
     const line = state.quoteBasisSections.flatMap((section) => section.lines).find((entry) => entry.id === "u1-excluded-match");
@@ -181,20 +183,25 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
     return selected;
   });
   assert(!editedSelection, "edited row automatically requested its prior catalogue selection");
-  assert(await keep.innerText() === "Keep as unpriced", "re-included row did not offer a fresh Keep decision");
-  await keep.click();
-  assert(await keep.innerText() === "Undo keep", "re-included row could not be kept");
+  assert(!await sculptureStatus.isVisible(), "reopened row has a deferral before ticking");
+  await (await sculptureTick()).click();
+  await assertBasisRow(sculpture, "Unmatched", "custom");
+  assert(await sculptureStatus.isVisible(), "single tick did not defer the re-included row");
   await page.locator("#sideNextButton").click();
   await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
   await page.waitForFunction(() => !appIsBusy());
   const reopenedOutput = await page.evaluate(() => {
     const matched = state.outputRows.find((row) => row.source_basis_line_id === "u1-excluded-match");
+    const spotlight = state.outputRows.find((row) => row.source_basis_line_id === "u1-confirmed");
     const deferredIndex = state.outputRows.findIndex((row) => row.source_basis_line_id === "u1-unmatched");
     const deferred = state.outputRows[deferredIndex];
     const cell = (selector) => document.querySelector(selector)?.textContent.trim();
     return {
       catalogue: matched?.pricing_authority?.variant === "catalog",
       quoted: outputCellDisplayValue(matched, "quoted_unit_price"), amount: outputCellDisplayValue(matched, "amount"),
+      spotlight: spotlight?.pricing_authority?.variant === "catalog" && [
+        outputCellDisplayValue(spotlight, "quoted_unit_price"), outputCellDisplayValue(spotlight, "amount"),
+      ],
       deferred: outputPricingIsDeferred(deferred),
       deferredUnit: cell('[data-output-price-entry="quote"][data-output-row="' + deferredIndex + '"] .output-cell-text'),
       deferredAmount: document.querySelector('[data-output-price-entry="quote"][data-output-row="' + deferredIndex + '"]')
@@ -206,6 +213,11 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
     && reopenedOutput.amount === cents(3 * floodPrice * fxRate).toFixed(2), "re-included catalogue FX or amount missing", reopenedOutput);
   assert(reopenedOutput.deferred && reopenedOutput.deferredUnit === "-" && reopenedOutput.deferredAmount === "Price to be discussed",
     "re-included deferred price rendered incorrectly", reopenedOutput);
+  const spotlightPrice = byName("6 inch Spotlight").sale_unit_price;
+  assert(reopenedOutput.spotlight?.[0] === cents(spotlightPrice * fxRate).toFixed(2)
+    && reopenedOutput.spotlight?.[1] === cents(7 * spotlightPrice * fxRate).toFixed(2),
+    "catalogue Spotlight price changed after the unmatched tick", reopenedOutput.spotlight);
+  result.tickOnlyDeferred = "PASS";
   result.reincludedPricing = "PASS";
   result.excludedReopen = "PASS";`);
 replaceOnce('    result.saveReopen = "PASS";', `
@@ -220,6 +232,10 @@ replaceOnce('    // The analysis seal is opaque transport', `
     expectedRows.push({ id: "u1-excluded-match", description: byName("LED Flood Light").description,
       quantity: "3 nos", amount: cents(3 * floodPrice * fxRate) });
     // The analysis seal is opaque transport`);
+replaceOnce('[state.originalAnalysisSnapshot?.pricing_analysis_seal?.mac].filter(Boolean)',
+  '[state.originalAnalysisSnapshot?.pricing_analysis_seal?.mac, state.lineItems.find((row) => row.source_basis_line_id === "u1-unmatched")?.deferred_pricing].filter(Boolean)');
+replaceOnce('assert(receipts.length === 1, "analysis seal missing from the browser draft", receipts.length);',
+  'assert(receipts.length === 2, "analysis seal or deferral receipt missing from the browser draft", receipts.length);');
 replaceOnce("abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005",
   "(hit[0].get('E') != (e['amount'], None) if isinstance(e['amount'], str) else abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005)");
 replaceOnce("and get(r,'B')!='Quantity']", "and get(r,'B')!='Quantity' and get(r,'E')!='Price to be discussed']");

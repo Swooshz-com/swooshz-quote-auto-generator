@@ -31101,6 +31101,7 @@ const ANALYSIS_MODE_HIGH_QUALITY = "high_quality";
 const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const GENERIC_FAILURE_MESSAGE = "Failed.";
+const PRICING_AUTHORITY_WHITESPACE_RE = /[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+/gu;
 const BASIS_TAGS = [
   ["Include", "Include", "Confirmed in the draft"],
   ["Exclude", "Exclude", "Not included unless requested"],
@@ -31177,6 +31178,13 @@ eval([
   "hasPricingReferenceDescription",
   "basisLineAcceptsAsAiProposal",
   "basisPricingRow",
+  "currentPricingReference",
+  "pricingReferenceAuthorityBasis",
+  "normalizedDraftPricingReferenceBasis",
+  "samePricingReferenceBasis",
+  "basisAnalysisReferenceIsCurrent",
+  "canonicalPricingAuthorityText",
+  "originalBasisLineForPricing",
   "basisUnmatchedOffer",
   "basisPricingGroup",
             "basisLinePillLabel",
@@ -31211,6 +31219,7 @@ eval([
   "rememberReincludedCatalogueSelection",
   "retagBasisLine",
   "retagBasisSectionConfirmLines",
+  "applyBasisTag",
 ].map(extractFunction).join("\n"));
 
 assert.deepStrictEqual(unresolvedConfirmLines(state.quoteBasisSections), ["Floor Coverings: Finish colour."]);
@@ -31442,6 +31451,9 @@ assert.strictEqual(renderBasisConfirmSummary(state.quoteBasisSections), "");
 
 let rendered = 0;
 let synced = 0;
+let queuedDraftSaves = 0;
+function appIsBusy() { return false; }
+function queueQuoteSessionDraftStateSave() { queuedDraftSaves += 1; }
 function updateQuoteBasisCard(source) {
   assert.strictEqual(source, "edited");
   rendered += 1;
@@ -31553,6 +31565,69 @@ assert.strictEqual(state.quoteBasisSections[0].lines[1].tag, "Include");
 assert.strictEqual(state.quoteBasisSections[0].lines[2].tag, "Include");
 assert.strictEqual(state.quoteBasisSections[0].lines[2].custom_confirmed, false);
 assert.strictEqual(state.quoteBasis.graphics, "Custom: manual graphic panel\nInclude: standard graphic panel\nInclude: invented graphic panel");
+
+const syntheticOffer = "a".repeat(64);
+const reference = { id: "default-ref", source: "local", currency: "SGD", digest_sha256: "sha256:" + "b".repeat(64) };
+const originalUnmatched = { id: "synthetic-sculpture", tag: "Custom", text: "Kinetic sculpture", quantity: 2, unit: "nos" };
+const unpricedRow = { source_basis_line_id: originalUnmatched.id, section: "Objects", description: originalUnmatched.text,
+  quantity: 2, unit: "nos", pricing_authority: { variant: "none" }, unmatched_pricing_offer: syntheticOffer };
+const sectionWith = (line) => ({ id: "objects", title: "Objects", lines: [line] });
+const resetUnmatched = (line = {}, row = {}, snapshotLine = {}, selected = reference) => {
+  state.pricingReferences = [selected];
+  state.quoteBasisSections = [sectionWith({ ...originalUnmatched, ...line })];
+  state.originalAnalysisSnapshot = {
+    quote_basis_sections: [sectionWith({ ...originalUnmatched, ...snapshotLine })],
+    pricing_analysis_seal: { reference: pricingReferenceAuthorityBasis(reference) },
+  };
+  state.lineItems = [{ ...unpricedRow, ...row }];
+  state.outputRows = [];
+  queuedDraftSaves = 0;
+};
+const currentUnmatched = () => state.quoteBasisSections[0].lines[0];
+const hasDeferral = () => state.lineItems[0].deferred_pricing === syntheticOffer;
+const hasDeferralStatus = () => renderBasisLine(state.quoteBasisSections[0], currentUnmatched(), 0).includes("Price to be discussed");
+for (const [name, tick, exclude] of [
+  ["single", () => retagBasisLine("objects", 0, "Custom"), () => retagBasisLine("objects", 0, "Exclude")],
+  ["bulk", () => retagBasisSectionConfirmLines("objects", "Include"), () => retagBasisSectionConfirmLines("objects", "Exclude")],
+]) {
+  resetUnmatched();
+  assert.equal(basisPricingGroup(currentUnmatched(), state.quoteBasisSections[0]), "Unmatched");
+  assert.ok(!hasDeferral() && !hasDeferralStatus() && queuedDraftSaves === 0, name + " untouched");
+  tick();
+  assert.ok(currentUnmatched().custom_confirmed && hasDeferral() && hasDeferralStatus(), name + " tick");
+  assert.equal(queuedDraftSaves, 1);
+  tick();
+  assert.ok(hasDeferral() && queuedDraftSaves === 1, name + " repeated tick");
+  exclude();
+  assert.ok(!hasDeferral() && !hasDeferralStatus() && !currentUnmatched().custom_confirmed, name + " exclude");
+  assert.equal(basisPricingGroup(currentUnmatched(), state.quoteBasisSections[0]), "Unmatched");
+  tick();
+  assert.ok(hasDeferral() && hasDeferralStatus(), name + " reinclude");
+
+  for (const [reason, line, row, snapshotLine, selected] of [
+    ["edited identity", { id: "edited" }, { source_basis_line_id: "edited" }],
+    ["edited text", { text: "Edited object" }, { description: "Edited object" }],
+    ["edited quantity", { quantity: 3 }, { quantity: 3 }],
+    ["edited unit", { unit: "sets" }, { unit: "sets" }],
+    ["missing quantity", { quantity: null }, { quantity: null }, { quantity: null }],
+    ["missing unit", { unit: "" }, { unit: "" }, { unit: "" }],
+    ["possible match", { possible_pricing_matches: [{ pricing_keyword: "other", description: "Other object" }] }],
+    ["no offer", {}, { unmatched_pricing_offer: "" }],
+    ["stale digest", {}, {}, {}, { ...reference, digest_sha256: "sha256:" + "c".repeat(64) }],
+    ["manual", {}, { pricing_authority: { variant: "manual" } }],
+    ["included", {}, { pricing_authority: { variant: "included" } }],
+  ]) {
+    resetUnmatched(line, row, snapshotLine, selected);
+    tick();
+    assert.ok(!hasDeferral() && !hasDeferralStatus() && queuedDraftSaves === 0, name + " granted deferral for " + reason);
+  }
+}
+resetUnmatched({ custom_confirmed: true }, { unmatched_pricing_offer: undefined, deferred_pricing: syntheticOffer });
+assert.ok(hasDeferralStatus(), "legacy deferred draft lost its status");
+retagBasisLine("objects", 0, "Exclude");
+assert.ok(!hasDeferral() && !hasDeferralStatus(), "legacy deferral survived exclusion");
+retagBasisLine("objects", 0, "Custom");
+assert.ok(hasDeferral() && hasDeferralStatus(), "legacy deferred draft could not be re-included");
 assert.ok(rendered >= 3);
 assert.ok(synced >= 3);
 """

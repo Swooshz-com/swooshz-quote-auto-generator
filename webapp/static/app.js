@@ -11459,7 +11459,7 @@ function basisPricingRow(line, section) {
     if (active.length) return active.length === 1 ? active[0] : null;
   }
   const snapshot = state.originalAnalysisSnapshot;
-  if (!section || !basisAnalysisReferenceIsCurrent() || !Array.isArray(snapshot.line_items)) return null;
+  if (!section || !Array.isArray(snapshot?.line_items) || !basisAnalysisReferenceIsCurrent()) return null;
   const original = originalBasisLineForPricing(line, section, ids);
   const rows = matches(snapshot.line_items);
   if (!original || rows.length !== 1
@@ -11473,7 +11473,7 @@ function basisPricingRow(line, section) {
     || normalizeUnit(row.unit) !== normalizeUnit(line.unit)
     || (row.pricing_keyword || "") !== (original.pricing_keyword || "")
     || (row.description !== basisDescription && row.description !== outputCatalogDescription(original))) return null;
-  // The original analysis can recover a classification and offer, never a Keep decision.
+  // The original analysis can recover a classification and offer, never a deferral decision.
   delete row.deferred_pricing;
   return row;
 }
@@ -11488,14 +11488,18 @@ function basisAnalysisReferenceIsCurrent() {
 function basisUnmatchedOffer(line, row, section) {
   if (!row || row.pricing_authority?.variant !== "none" || line.pricing_keyword
     || line.possible_pricing_matches?.length || !basisAnalysisReferenceIsCurrent()) return "";
+  const quantity = numberOrNull(line.quantity);
+  const unit = normalizeUnit(line.unit);
+  if (!(quantity > 0) || !unit) return "";
   if (canonicalPricingAuthorityText(row.section) !== canonicalPricingAuthorityText(section.title)
     || cleanCustomerQuoteLineText(line.text) !== row.description
-    || numberOrNull(line.quantity) !== numberOrNull(row.quantity)
-    || normalizeUnit(line.unit) !== normalizeUnit(row.unit)) return "";
+    || quantity !== numberOrNull(row.quantity) || unit !== normalizeUnit(row.unit)) return "";
   const receipt = row.unmatched_pricing_offer || row.deferred_pricing || "";
   if (!/^[0-9a-f]{64}$/.test(receipt)) return "";
   const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
-  return originalBasisLineForPricing(line, section, ids) ? receipt : "";
+  const original = originalBasisLineForPricing(line, section, ids);
+  return original && original.text === line.text && numberOrNull(original.quantity) === quantity
+    && normalizeUnit(original.unit) === unit ? receipt : "";
 }
 
 function basisPricingGroup(line, section) {
@@ -11608,8 +11612,8 @@ function renderBasisLine(section, line, index) {
   const lineTitle = basisLineTitle(line);
   const pillTitleAttribute = pillTitle ? ` title="${escapeHtml(pillTitle)}"` : "";
   const lineTitleAttribute = lineTitle ? ` title="${escapeHtml(lineTitle)}"` : "";
-  const unmatchedOffer = tag === "Exclude" ? "" : basisUnmatchedOffer(line, pricingRow, section);
-  const keptUnmatched = unmatchedOffer && pricingRow.deferred_pricing === unmatchedOffer;
+  const deferredPricing = tag === "Custom" && line.custom_confirmed && pricingRow?.deferred_pricing
+    && pricingRow.deferred_pricing === basisUnmatchedOffer(line, pricingRow, section);
   const rowClasses = [
     "basis-line-row",
     `basis-line-${tag.toLowerCase()}`,
@@ -11630,10 +11634,7 @@ function renderBasisLine(section, line, index) {
       </span>
       <span class="basis-line-text"${lineTitleAttribute}>
         ${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}
-        ${unmatchedOffer ? `<span class="basis-line-possible-matches">
-          ${keptUnmatched ? "<small>Price to be discussed</small>" : ""}
-          <button class="basis-line-possible-match" type="button" data-basis-defer-pricing data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}">${keptUnmatched ? "Undo keep" : "Keep as unpriced"}</button>
-        </span>` : ""}
+        ${deferredPricing ? "<small>Price to be discussed</small>" : ""}
       </span>
       <span class="basis-line-actions">
         ${primaryAction}
@@ -11905,40 +11906,36 @@ function rememberReincludedCatalogueSelection(line, section, nextTag) {
 function retagBasisLine(sectionId, lineIndex, nextTag) {
   const requestedTag = normalizeBasisTag(nextTag);
   if (!sectionId || !["Include", "Custom", "Exclude"].includes(requestedTag)) return;
-  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
-  const section = sections.find((item) => item.id === sectionId);
-  const index = Number(lineIndex);
-  if (!section || !section.lines[index]) return;
-  const currentLine = section.lines[index];
-  const resolvedTag = requestedTag === "Include" && basisLineAcceptsAsAiProposal(currentLine) ? "Custom" : requestedTag;
-  rememberReincludedCatalogueSelection(currentLine, section, resolvedTag);
-  const customPricing = isCustomPricingBasisLine(currentLine) || resolvedTag === "Custom";
-  const customConfirmed = customPricing && ["Include", "Custom"].includes(requestedTag);
-  section.lines[index] = {
-    ...currentLine,
-    tag: resolvedTag,
-    ...(customPricing ? { custom_pricing: true } : {}),
-    ...(customConfirmed ? { custom_confirmed: true } : { custom_confirmed: false }),
-  };
-  state.quoteBasisSections = sections;
-  state.quoteBasis = quoteBasisFromSections(sections);
-  state.basisConfirmed = false;
-  markOutputRowsDirty();
-  updateQuoteBasisCard("edited");
-  syncControlStates();
+  applyBasisTag(sectionId, requestedTag, Number(lineIndex));
 }
 
 function retagBasisSectionConfirmLines(sectionId, nextTag) {
   if (!sectionId || !["Include", "Exclude"].includes(nextTag)) return;
+  applyBasisTag(sectionId, nextTag);
+}
+
+function applyBasisTag(sectionId, nextTag, lineIndex = null) {
+  if (appIsBusy()) return;
   const sections = cloneQuoteBasisSections(state.quoteBasisSections);
   const section = sections.find((item) => item.id === sectionId);
   if (!section) return;
   let changed = false;
-  section.lines = (section.lines || []).map((line) => {
-    const resolvedTag = nextTag === "Include" && basisLineAcceptsAsAiProposal(line) ? "Custom" : nextTag;
+  const pricingChanges = new Map();
+  section.lines = (section.lines || []).map((line, index) => {
+    if (lineIndex !== null && lineIndex !== index) return line;
+    const row = basisPricingRow(line, section);
+    const offer = nextTag === "Exclude" ? "" : basisUnmatchedOffer(line, row, section);
+    if (offer && row.deferred_pricing !== offer) {
+      pricingChanges.set(row.source_basis_line_id, { ...row, unmatched_pricing_offer: offer, deferred_pricing: offer });
+    } else if (!offer && row?.deferred_pricing) {
+      const { deferred_pricing, ...retained } = row;
+      pricingChanges.set(row.source_basis_line_id, { ...retained, unmatched_pricing_offer: row.unmatched_pricing_offer || deferred_pricing });
+    }
+    const acceptsCustom = Boolean(offer) || (nextTag === "Include" && basisLineAcceptsAsAiProposal(line));
+    const resolvedTag = acceptsCustom ? "Custom" : nextTag;
     rememberReincludedCatalogueSelection(line, section, resolvedTag);
     const customPricing = isCustomPricingBasisLine(line) || resolvedTag === "Custom";
-    const customConfirmed = customPricing && nextTag === "Include";
+    const customConfirmed = customPricing && nextTag !== "Exclude";
     const currentTag = normalizeBasisTag(line.tag);
     if (currentTag === resolvedTag && (!customPricing || Boolean(line.custom_confirmed) === customConfirmed)) return line;
     changed = true;
@@ -11948,13 +11945,19 @@ function retagBasisSectionConfirmLines(sectionId, nextTag) {
       ...(customPricing ? { custom_pricing: true, custom_confirmed: customConfirmed } : { custom_confirmed: false }),
     };
   });
-  if (!changed) return;
+  if (!changed && !pricingChanges.size) return;
+  if (pricingChanges.size) {
+    state.lineItems = [...state.lineItems.filter((row) => !pricingChanges.has(row.source_basis_line_id)), ...pricingChanges.values()];
+    state.outputRows = [];
+    state.originalOutputRows = [];
+  }
   state.quoteBasisSections = sections;
   state.quoteBasis = quoteBasisFromSections(sections);
   state.basisConfirmed = false;
   markOutputRowsDirty();
   updateQuoteBasisCard("edited");
   syncControlStates();
+  if (pricingChanges.size) queueQuoteSessionDraftStateSave({ quoteGenerated: false });
 }
 
 function basisChatIntroMessage() {
@@ -17698,35 +17701,6 @@ async function goToNextSidePanel(options = {}) {
 }
 
 function handleQuoteBasisClick(event) {
-  const deferButton = event.target.closest("[data-basis-defer-pricing]");
-  if (deferButton) {
-    if (appIsBusy()) return;
-    const { basisSection, basisLineIndex } = deferButton.dataset;
-    const sections = cloneQuoteBasisSections(state.quoteBasisSections);
-    const section = sections.find((entry) => entry.id === basisSection);
-    const line = section?.lines?.[Number(basisLineIndex)];
-    if (!line || normalizeBasisTag(line.tag) === "Exclude") return;
-    const row = basisPricingRow(line, section);
-    const offer = basisUnmatchedOffer(line, row, section);
-    if (!offer) return;
-    line.tag = "Custom";
-    line.custom_pricing = true;
-    line.custom_confirmed = row.deferred_pricing !== offer;
-    row.unmatched_pricing_offer = offer;
-    if (line.custom_confirmed) row.deferred_pricing = offer;
-    else delete row.deferred_pricing;
-    state.lineItems = [...state.lineItems.filter((item) => item.source_basis_line_id !== row.source_basis_line_id), { ...row }];
-    state.quoteBasisSections = sections;
-    state.quoteBasis = quoteBasisFromSections(sections);
-    state.basisConfirmed = false;
-    state.outputRows = [];
-    state.originalOutputRows = [];
-    markOutputRowsDirty();
-    updateQuoteBasisCard("edited");
-    syncControlStates();
-    queueQuoteSessionDraftStateSave({ quoteGenerated: false });
-    return;
-  }
   const sectionAction = event.target.closest("[data-basis-section-action]");
   if (sectionAction) {
     retagBasisSectionConfirmLines(

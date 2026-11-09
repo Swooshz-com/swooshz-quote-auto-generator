@@ -3,6 +3,8 @@ import copy
 import hashlib
 import json
 import os
+from pathlib import Path
+import re
 from tests.rendered_browser_support import owned_browser_evidence_directory
 import subprocess
 import unittest
@@ -28,6 +30,12 @@ class PricingSpatialContextTest(unittest.TestCase):
                 env={**os.environ, 'SQAG_OWNER_UAT_EVIDENCE_ROOT': evidence_root},
                 text=True, capture_output=True, cwd=fixtures.ROOT, timeout=180,
             )
+            receipt = re.compile(r'"(?:deferred_pricing|unmatched_pricing_offer|mac)"\s*:\s*"[a-f0-9]{64}"')
+            self.assertFalse(bool(receipt.search(result.stdout + result.stderr)), 'Raw pricing receipt in browser output')
+            for evidence_file in Path(evidence_root).rglob('*'):
+                if evidence_file.suffix in {'.json', '.log'} and evidence_file.is_file():
+                    self.assertFalse(bool(receipt.search(evidence_file.read_text(encoding='utf-8', errors='replace'))),
+                                     f'Raw pricing receipt in {evidence_file.name}')
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         evidence = json.loads(result.stdout)
         self.assertEqual(evidence['status'], 'PASS')
@@ -36,6 +44,7 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(evidence['saveReopen'], 'PASS')
         self.assertEqual(evidence['excludedReopen'], 'PASS')
         self.assertEqual(evidence['reincludedPricing'], 'PASS')
+        self.assertEqual(evidence['tickOnlyDeferred'], 'PASS')
         self.assertTrue(evidence['deferredReopened'])
         self.assertEqual(evidence['xlsx']['status'], 'PASS')
         self.assertEqual(json.loads(evidence['xlsx']['validator'])['bad'], [])
