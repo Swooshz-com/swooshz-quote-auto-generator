@@ -6,13 +6,14 @@ platform concerns belong in `Swooshz-com/swooshz-platform`.
 
 ## Source Map
 
-Recorded against source `8fa9439`, with entry points updated for the maintained
-staff-login and gateway modules. The quote-module maintainers own these sources.
+Recorded against source `3ac9bb1` and updated for the shared pricing module.
+The quote-module maintainers own these sources.
 Update this map when an entry point or source of truth moves.
 
 | Part | Entry points and sources of truth |
 | --- | --- |
 | Web requests, saved quotes and access | `webapp/server.py`; browser behaviour in `webapp/static/app.js`; Password admission in `webapp/internal_password_auth.py` |
+| Catalogue matching and row prices | `webapp/quote_engine.py` builds the lookup from the selected catalogue, ranks matches and calculates line amounts. `webapp/server.py` resolves and checks the catalogue snapshot, applies pricing authority and grants, and maps the results into draft, review and final-brief rows. |
 | Inference | `webapp/ai_gateway.py`; [gateway contract](ai-gateway.md) |
 | Artifact persistence and forensics | `webapp/object_storage.py`, `webapp/forensics.py` and the storage contracts listed below |
 | Workbook generation | `scripts/generate_quote.py` and `templates/`; selected profile/reference authority is defined by `AGENTS.md` |

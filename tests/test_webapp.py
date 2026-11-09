@@ -53,6 +53,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import build_pricing_catalog as pricing_catalog
 import verify_internal_uat_deploy_template as deploy_template
+from webapp import quote_engine
 from webapp import server as webapp
 from webapp import forensics as forensic_module
 from tests.test_openai_draft_request_contract import synthetic_image, synthetic_pdf
@@ -45691,7 +45692,7 @@ process.stdout.write("ok");
             'description': 'sqm synthetic wood floor finish',
         }
         self.assertTrue(webapp.catalog_line_contradicts_item(wood_row['description'], catalog_item))
-        self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(wood_row['description'], catalog_item))
+        self.assertFalse(quote_engine.explicit_catalog_keyword_has_usable_overlap(wood_row['description'], catalog_item))
 
         payload['line_items'] = [wood_row]
         [untrusted] = webapp.normalize_line_items(payload)
@@ -45750,7 +45751,7 @@ process.stdout.write("ok");
             'description': '[ sqm synthetic vinyl floor finish ] - Replace with solid wood floor finish',
         }
         self.assertTrue(webapp.catalog_line_contradicts_item(bracketed_wood_row['description'], catalog_item))
-        self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(bracketed_wood_row['description'], catalog_item))
+        self.assertFalse(quote_engine.explicit_catalog_keyword_has_usable_overlap(bracketed_wood_row['description'], catalog_item))
         payload['line_items'] = [bracketed_wood_row]
         [bracketed_untrusted] = webapp.normalize_line_items(payload)
         self.assertEqual(bracketed_untrusted['pricing_authority']['variant'], 'historical')
@@ -46740,7 +46741,7 @@ process.stdout.write("ok");
                     description,
                 )
                 self.assertFalse(
-                    webapp.explicit_catalog_keyword_has_usable_overlap(
+                    quote_engine.explicit_catalog_keyword_has_usable_overlap(
                         description,
                         wall,
                         catalog_items=catalog_items,
@@ -46750,7 +46751,7 @@ process.stdout.write("ok");
 
         # N5: a shared generic token cannot make a complete competing family compatible.
         self.assertFalse(
-            webapp.catalog_detail_matches_other_catalog_object_family(
+            quote_engine.catalog_detail_matches_other_catalog_object_family(
                 {"light"}, wall, catalog_items,
             )
         )
@@ -46931,7 +46932,7 @@ process.stdout.write("ok");
                     selected_lamp,
                     catalog_items=[selected_lamp, competing_panel],
                 ), description)
-                self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(
+                self.assertFalse(quote_engine.explicit_catalog_keyword_has_usable_overlap(
                     description,
                     selected_lamp,
                     catalog_items=[selected_lamp, competing_panel],
@@ -46960,7 +46961,7 @@ process.stdout.write("ok");
                         description, selected_adapter,
                         catalog_items=[selected_adapter, competing_light],
                     ), description)
-                    self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(
+                    self.assertFalse(quote_engine.explicit_catalog_keyword_has_usable_overlap(
                         description, selected_adapter,
                         catalog_items=[selected_adapter, competing_light],
                     ), description)
@@ -47001,7 +47002,7 @@ process.stdout.write("ok");
                     selected_variant,
                     catalog_items=catalog,
                 ))
-                self.assertFalse(webapp.explicit_catalog_keyword_has_usable_overlap(
+                self.assertFalse(quote_engine.explicit_catalog_keyword_has_usable_overlap(
                     partial_description,
                     selected_variant,
                     catalog_items=catalog,
@@ -47026,7 +47027,7 @@ process.stdout.write("ok");
             reordered_selected,
             catalog_items=[reordered_selected, reordered_competitor],
         ))
-        self.assertTrue(webapp.explicit_catalog_keyword_has_usable_overlap(
+        self.assertTrue(quote_engine.explicit_catalog_keyword_has_usable_overlap(
             selected_detail,
             reordered_selected,
             catalog_items=[reordered_selected, reordered_competitor],
