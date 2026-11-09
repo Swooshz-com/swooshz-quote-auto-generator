@@ -1933,7 +1933,7 @@ class WebappServerTest(unittest.TestCase):
                     self.fail(f'{operation_name} unexpectedly failed: {outcome}')
         return results, first_event
 
-    def http_json(self, runner, method: str, path: str, *, cookie: str = "", body: dict | None = None, headers: dict | None = None) -> dict:
+    def http_json(self, runner, method: str, path: str, *, cookie: str = "", body: dict | None = None, headers: dict | None = None, timeout: int = 10) -> dict:
         parsed = urllib.parse.urlparse(runner.base_url)
         request_headers = {"Accept": "application/json"}
         if cookie:
@@ -1941,7 +1941,7 @@ class WebappServerTest(unittest.TestCase):
         if body is not None:
             request_headers["Content-Type"] = "application/json"
         request_headers.update(headers or {})
-        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
         try:
             connection.request(
                 method,
@@ -4406,7 +4406,7 @@ eval([
   "collectQuoteExchangeRate", "syncQuoteExchangeRateField", "quoteCommercialTaxText", "quoteExchangeRateText",
   "quoteFxMultiplier", "outputRowFxMultiplier", "quoteAmountValue", "roundCommercialCents", "formatAmount", "pricingAuthorityNumber", "unitPriceEditKind", "numberOrNull", "orderNumber",
   "quoteCommercialStateIsOwned", "effectiveOutputUnitPrice", "synchronizeOwnedOutputRowPrice", "recalculateOutputRow", "normalizeOutputRow", "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
-  "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "pricingSelectionReviewMessage", "outputRowsValid", "dashboardCommercialsFromState",
+  "outputPricingIsDeferred", "rowNeedsManualInput", "matchSummaryStats", "outputRowsToLineItems", "pricingSelectionReviewMessage", "outputRowsValid", "dashboardCommercialsFromState",
   "applyQuoteDetails", "applyPricingReferenceCommercialDefaults",
 ].map(extractFunction).join("\n"));
 
@@ -20810,7 +20810,7 @@ assert.strictEqual(hasSubmittedQuoteBasis(), false);
         self.assertIn("viewCurrentPdfFile", js)
         self.assertIn("showExcelGeneratingModal", js)
         self.assertIn("hideExcelGeneratingModal", js)
-        self.assertIn('state.activeJob = { ...operation, id: started.data.job_id || operation.id, phase: "running" };', js)
+        self.assertIn('state.activeJob = { ...submittedOperation, id: started.data.job_id || operation.id, phase: "running" };', js)
         self.assertIn('const jobType = viewPdf ? "generate_pdf" : "generate";', js)
         self.assertIn('activeJob.type === "generate" || activeJob.type === "generate_pdf"', js)
         self.assertIn('setResultStatus(viewPdf ? "Checking PDF" : "Checking Excel", "is-warn")', js)
@@ -21159,6 +21159,7 @@ eval(extractFunction("pricingAuthorityNumber"));
 eval(extractFunction("unitPriceEditKind"));
 eval(extractFunction("synchronizeOwnedOutputRowPrice"));
 eval(extractFunction("pricingSelectionReviewMessage"));
+eval(extractFunction("outputPricingIsDeferred"));
 eval(extractFunction("outputRowsValid"));
 eval(extractFunction("outputQuantityPartsFromPricingMatch"));
 eval(extractFunction("outputRowFromPricingMatch"));
@@ -24024,6 +24025,7 @@ function finishDashboardOperation() {}
 function appIsBusy() { return false; }
 function clearQuoteSessionDraftSaveTimer() {}
 function syncControlStates() { controlsSynced += 1; }
+function isPlainObject(value) { return !!value && typeof value === "object" && !Array.isArray(value); }
 function quoteDraftShouldPersistToDashboard() { return true; }
 function currentQuoteSessionDraftState() { throw new Error("Server draft state should be used."); }
 function mergeDashboardQuoteSession() {}
@@ -25246,7 +25248,12 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn('<strong class="basis-line-pill">AI Confirm</strong>', js)
         self.assertIn("AI proposal needs acceptance or revision", js)
         self.assertNotIn('<strong class="basis-quantity-pill">36 sqm</strong>', js)
-        self.assertNotIn("Matched", js)
+        basis_renderer = js[js.index("function renderQuoteBasisMessage("):]
+        basis_renderer = basis_renderer[:basis_renderer.index("\nfunction ")]
+        self.assertIn('${["Matched", "Review", "Unmatched"].map((group) =>', basis_renderer)
+        self.assertIn('class="basis-review-grid" aria-label="${group}"', basis_renderer)
+        self.assertIn('<h4>${group}</h4>', basis_renderer)
+        self.assertIn('reviewLineEntries.filter((entry) => entry.group === group)', basis_renderer)
         self.assertNotIn("Assumption", js)
         self.assertIn(">Re<", js)
         self.assertNotIn('appendChatMessage("assistant", renderQuoteBasisMessage(state.quoteBasis, data.source)', js)
@@ -25295,7 +25302,7 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
         self.assertIn("quoteBasisSections", js)
         self.assertIn("normalizeQuoteBasisSections", js)
         self.assertIn("quote_basis_sections", js)
-        self.assertNotIn("Matched", js)
+        self.assertIn('${["Matched", "Review", "Unmatched"].map((group) =>', js)
         self.assertNotIn("Assumption", js)
         self.assertIn("Resolve all review lines before confirming quotation basis.", js)
         self.assertNotIn("Ask For Changes", html)
@@ -25838,6 +25845,7 @@ eval([
   "resetOutputSortModeToPricingReference",
   "refreshOutputRowsFromLineItems",
   "ensureOutputRowsFromLineItems",
+  "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
 ].map(extractFunction).join("\n"));
@@ -26341,10 +26349,11 @@ eval([
   "quoteAmountValue",
   "recalculateOutputRow",
   "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
+  "outputPricingIsDeferred",
   "outputEditorPlaceholder",
   "outputEditorHtml",
   "renderOutputEditCell",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
   "appIsBusy", "applyOutputIncludedAction",
   "handleOutputEditorCommit",
 ].map(extractFunction).join("\n"));
@@ -26555,6 +26564,7 @@ eval([
   "cleanCustomerQuoteLineText",
   "pricingReferenceLineText",
   "orderNumber",
+  "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
   "setDownloadFiles",
@@ -26563,7 +26573,7 @@ eval([
   "downloadFileIsFresh",
   "pdfFileIsFresh",
   "updateDownloadButton",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "outputPriceAuthority", "outputPriceDenomination", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
   "hideOutputDeleteModal",
   "confirmOutputRowDelete",
 ].map(extractFunction).join("\n"));
@@ -27790,6 +27800,9 @@ eval([
 ].map((name) => extractFunction(name)).join("\n"));
 eval(extractFunction("setQuoteCommercialReview"));
 eval(extractFunction("quoteSessionSnapshotForRestoration"));
+eval(extractFunction("validQuoteDraftVersion"));
+eval(extractFunction("validPricingLedgerReceipt"));
+eval(extractFunction("unchangedDraftLedgerMatches"));
 eval(extractFunction("applyQuoteSessionSnapshot", true));
 
 const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
@@ -28080,6 +28093,8 @@ eval([
   "syncSelectedPricingReference",
   "renderProfileOptions",
   "quoteSessionSnapshotForRestoration",
+  "validQuoteDraftVersion",
+  "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
   "applyQuoteSessionSnapshot",
   "applyPendingPricingReferenceSelection",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28329,6 +28344,8 @@ eval([
   "quoteCommercialRestorationReviewReason",
   "setQuoteCommercialReview",
   "quoteSessionSnapshotForRestoration",
+  "validQuoteDraftVersion",
+  "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
   "applyQuoteSessionSnapshot",
   "mergeDashboardDraftSummaryDetails",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28649,7 +28666,7 @@ function extractFunction(name) {
   }
   throw new Error(`Unclosed production function ${name}`);
 }
-const constantNames = ["CSRF_HEADER_NAME", "GENERIC_FAILURE_MESSAGE", "QUOTE_COMMERCIAL_REVIEW_SCHEMA",
+const constantNames = ["CSRF_HEADER_NAME", "GENERIC_FAILURE_MESSAGE", "PRICING_SELECTION_STALE_MESSAGE", "QUOTE_COMMERCIAL_REVIEW_SCHEMA",
   "QUOTE_COMMERCIAL_REVIEW_VERSION", "QUOTE_COMMERCIAL_REVIEW_STATUS", "QUOTE_COMMERCIAL_REVIEW_MESSAGE",
   "QUOTE_COMMERCIAL_REVIEW_REASONS", "PRICING_REFERENCE_ID_RE", "PRICING_REFERENCE_SOURCES",
   "SERVER_JOB_TYPES", "ACTIVE_JOB_STARTING_MAX_AGE_MS", "ACTIVE_JOB_CLOCK_SKEW_MS",
@@ -28713,6 +28730,7 @@ const messages = [];
 const state = {
   quoteAiSpendRequest: 0, quoteSessions: [],
   quoteSessionId: scenario.path === "initial" ? "" : "quote-synthetic-a",
+  pricingDraftVersion: scenario.path === "initial" ? "" : "a".repeat(64),
   quoteSessionRestoredSessionId: scenario.path === "restored" ? "quote-synthetic-a" : "",
   quoteSessionDraftSaveStarted: true, quoteSessionLoadError: "OLD-REFERENCE-CANARY",
   quoteCommercialLifecycle: "EXISTING", quoteCommercialReview: null,
@@ -28738,7 +28756,10 @@ const generationProfileIdForPayload = () => "synthetic-profile";
 const dashboardCommercialsFromState = () => ({ currency: "SGD" });
 const syntheticQuoteSessionHasFreshOutputExports = () => false;
 const currentGenerationContext = () => ({ session_id: state.quoteSessionId, run_id: "" });
-const transitionGenerationContext = sessionId => { state.quoteSessionId = sessionId; };
+const transitionGenerationContext = sessionId => {
+  if (state.quoteSessionId !== sessionId) state.pricingDraftVersion = sessionId ? false : "";
+  state.quoteSessionId = sessionId;
+};
 const syntheticBuildSessionSnapshot = () => ({ version, quoteSessionDraftSaveStarted: true,
   quoteCommercialLifecycle: state.quoteCommercialLifecycle, quoteCommercialReview: state.quoteCommercialReview,
   images: state.images, quoteDetails: { currency: "SGD" }, outputRows: [], lineItems: [{}],
@@ -28770,7 +28791,9 @@ async function fetch(url, options) {
   if (url === "/api/jobs/job-synthetic-stable") {
     calls.push({ url, method: "GET" });
     return responseFor(200, scenario.excelFault === "poll" ? { status: "failed", result: { status: "failed", error_reference: "ERR-1234ABCD" } } :
-      { status: "completed", result: { status: "completed", output_rows: {schema:"swooshz.quote-output-rows.v1",rows:state.outputRows.map((row,index)=>({...row,diagnostic_row_id:`row-${index}`,source_basis_line_id:String(row.source_basis_line_id||"")}))}, files: [{ name: "quotation.xlsx", url: "/api/synthetic-current.xlsx" }] } });
+      { status: "completed", result: { status: "completed",
+        quote_session: { session_id: persisted.session_id, draft_version: "f".repeat(64), pricing_ledger: { revision: 0, rows: {} } },
+        output_rows: {schema:"swooshz.quote-output-rows.v1",rows:state.outputRows.map((row,index)=>({...row,diagnostic_row_id:`row-${index}`,source_basis_line_id:String(row.source_basis_line_id||"")}))}, files: [{ name: "quotation.xlsx", url: "/api/synthetic-current.xlsx" }] } });
   }
   if (url === "/api/session") {
     calls.push({ url, method: "GET" });
@@ -28797,15 +28820,17 @@ async function fetch(url, options) {
   } else if (scenario.gated) await new Promise(resolve => { releaseResponse = resolve; });
   if (scenario.fetchFailure) throw Error(CANARY);
   const status = (scenario.refresh === "success" || scenario.realRefresh) && !scenario.refreshFault && sequence === 2 ? 200 : (scenario.status ?? 400);
-  let data = status >= 200 && status < 300 ? { status: "saved", quote_session: { session_id: payload.session_id } } : {
+  const savedSession = { session_id: payload.session_id, draft_version: (sequence + 1).toString(16).padStart(64, "0"),
+    pricing_ledger: { revision: 0, rows: {} } };
+  let data = status >= 200 && status < 300 ? { status: "saved", quote_session: savedSession } : {
     status: "blocked", error_reference: scenario.reference ?? "ERR-1234ABCD",
     errors: [CANARY], message: CANARY,
     ...(scenario.review ? { quoteCommercialReview: scenario.invalidReview ? { ...review, version: 99 } : review } : {}),
   };
   if (scenario.invalidAck === "null") data = null;
   if (scenario.invalidAck === "missing") data = { status: "saved" };
-  if (scenario.invalidAck === "mismatch") data = { status: "saved", quote_session: { session_id: "quote-different-identity" } };
-  if (scenario.invalidAck === "status") data = { status: "failed", quote_session: { session_id: payload.session_id } };
+  if (scenario.invalidAck === "mismatch") data = { status: "saved", quote_session: { ...savedSession, session_id: "quote-different-identity" } };
+  if (scenario.invalidAck === "status") data = { status: "failed", quote_session: savedSession };
   if (status === 200 && !scenario.invalidAck) persisted = structuredClone(payload);
   return responseFor(status, data);
 }
@@ -28914,7 +28939,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
-  "quoteSessionDraftSynchronizationFailureMessage", "handleDraftBasis", "handleGenerate",
+  "quoteSessionDraftSynchronizationFailureMessage", "handleDraftBasis", "handleGenerate", "retainExcludedBasisPricingRows",
   "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
@@ -28924,7 +28949,8 @@ if (scenario.kind === "dashboard-failure") required.push("returnToDashboard", "r
 if (scenario.kind === "excel") { constantNames.push(); required.push("downloadCurrentExcelFile", "downloadFileIsFresh", "pdfFileIsFresh", "quoteSessionHasFreshOutputExports", "markOutputRowsDirty", "revisionNumber", "setDownloadFiles", "pollJob", "isInterruptedJobPoll", "handleInterruptedJobPoll", "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage", "handleGeneratedExportReadyAction"); }
 if (scenario.kind === "dashboard-order") required.push("returnToDashboard", "restoredQuoteSessionHasChanged");
 // Optional only so the SAME regression executes against the unchanged baseline.
-for (const name of ["quoteSessionSaveFailureFrom", "safeQuoteSessionErrorReference"]) {
+for (const name of ["quoteSessionSaveFailureFrom", "safeQuoteSessionErrorReference", "validQuoteDraftVersion",
+  "validPricingLedgerReceipt", "unchangedDraftLedgerMatches", "requireQuoteDraftReopen", "acknowledgeGeneratedQuoteDraft", "generationFailureMessages", "rememberPricingSelectionAcknowledgement"]) {
   if (source.includes(`function ${name}(`)) required.push(name);
 }
 // These adapters supply only synthetic projection inputs and DOM/file effects.
@@ -29087,6 +29113,17 @@ async function act() {
     assert(state.quoteSessionLoadError.includes("ERR-")); assert.strictEqual(state.quoteSessionDashboardBusy, false);
     assert.deepStrictEqual(currentQuoteSessionDraftState(), before); assert.deepStrictEqual(sessionFileRecordsFromDraft(), files);
     assert(!quoteSessionDraftIsConfirmed(state.quoteSessionId, quoteSessionDraftComparisonKey(), quoteSessionDraftFileComparisonKey()));
+    if (scenario.rejectAck && source.includes("function validQuoteDraftVersion(")) {
+      assert.strictEqual(state.pricingDraftVersion, false, "An uncertain save needs an authoritative reopen");
+      const posts = calls.filter(c => c.url === "/api/quote-sessions" && c.method !== "GET").length;
+      await settle(listeners.get("click")()); await tick();
+      assert.strictEqual(calls.filter(c => c.url === "/api/quote-sessions" && c.method !== "GET").length, posts,
+        "Dashboard retried a save with an unknown commit");
+      assert.deepStrictEqual(currentQuoteSessionDraftState(), before);
+      assert.deepStrictEqual(sessionFileRecordsFromDraft(), files);
+      console.log(JSON.stringify({ scenario, calls, messages, files_retained: true }));
+      return;
+    }
     scenario.status = 200; scenario.invalidAck = false;
     await settle(listeners.get("click")()); await tick();
     assert.strictEqual(state.activeAppView, "dashboard");
@@ -29644,6 +29681,7 @@ let draftVersion = 1;
 let fileVersion = 1;
 const state = {
   quoteSessionId: "quote-browser-sync",
+  pricingDraftVersion: "a".repeat(64),
   basisConfirmed: true,
   outputRows: [],
 };
@@ -29683,7 +29721,9 @@ async function saveCurrentQuoteSession(options) {
     ? quoteSessionDraftFileComparisonKey(options.draftFiles)
     : null;
   rememberConfirmedQuoteSessionDraft(state.quoteSessionId, draftKey, fileKey);
-  return { session_id: state.quoteSessionId };
+  state.pricingDraftVersion = calls.indexOf(options).toString(16).padStart(64, "0");
+  return { session_id: state.quoteSessionId, draft_version: state.pricingDraftVersion,
+    pricing_ledger: { revision: 0, rows: {} } };
 }
 
 eval([
@@ -29697,6 +29737,7 @@ eval([
   "clearQuoteSessionDraftSaveTimer",
   "saveQuoteSessionDraftState",
   "ensureQuoteSession",
+  "validQuoteDraftVersion",
 ].map(extractFunction).join("\n"));
 
 (async () => {
@@ -30986,6 +31027,13 @@ function basisLineIsInformationalDimension() { return false; }
 
 eval([
   "normalizeAnalysisMode",
+  "normalizeBasisTag",
+  "normalizeUnit",
+  "numberOrNull",
+  "cleanCustomerQuoteLineText",
+  "basisPricingRow",
+  "basisUnmatchedOffer",
+  "basisPricingGroup",
   "renderQuoteBasisMessage",
 ].map(extractFunction).join("\n"));
 
@@ -31058,6 +31106,7 @@ const state = {
   pricingReferences: [
     { id: "default-ref", source: "local", items: [{ section: "Floor Coverings", description: "Raised platform flooring" }] },
   ],
+  lineItems: [],
   outputRows: [],
   originalOutputRows: [],
   downloadFile: null,
@@ -31084,6 +31133,7 @@ const ANALYSIS_MODE_HIGH_QUALITY = "high_quality";
 const QUOTE_COMMERCIAL_REVIEW_STATUS = "REVIEW_REQUIRED";
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const GENERIC_FAILURE_MESSAGE = "Failed.";
+const PRICING_AUTHORITY_WHITESPACE_RE = /[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+/gu;
 const BASIS_TAGS = [
   ["Include", "Include", "Confirmed in the draft"],
   ["Exclude", "Exclude", "Not included unless requested"],
@@ -31159,6 +31209,16 @@ eval([
   "basisTagLabel",
   "hasPricingReferenceDescription",
   "basisLineAcceptsAsAiProposal",
+  "basisPricingRow",
+  "currentPricingReference",
+  "pricingReferenceAuthorityBasis",
+  "normalizedDraftPricingReferenceBasis",
+  "samePricingReferenceBasis",
+  "basisAnalysisReferenceIsCurrent",
+  "canonicalPricingAuthorityText",
+  "originalBasisLineForPricing",
+  "basisUnmatchedOffer",
+  "basisPricingGroup",
             "basisLinePillLabel",
             "basisQuantityText",
             "basisQuantityDisplayLabel",
@@ -31187,8 +31247,12 @@ eval([
             "possibleMatchBasisDetailText",
             "catalogBackedPossibleMatchText",
   "applyPossiblePricingMatch",
+  "reincludedCatalogueSelectionKey",
+  "rememberReincludedCatalogueSelection",
+  "pendingPricingSelections",
   "retagBasisLine",
   "retagBasisSectionConfirmLines",
+  "applyBasisTag",
 ].map(extractFunction).join("\n"));
 
 assert.deepStrictEqual(unresolvedConfirmLines(state.quoteBasisSections), ["Floor Coverings: Finish colour."]);
@@ -31286,7 +31350,7 @@ assert.ok(!inventedKeywordLineHtml.includes("Pricing reference: printed brand fa
 assert.ok(inventedKeywordLineHtml.includes('<span class="basis-line-pill">Confirm</span>'));
 assert.ok(!inventedKeywordLineHtml.includes("basis-line-ai-confirm"));
 assert.ok(inventedKeywordLineHtml.includes('data-basis-tag="Include"'));
-assert.ok(inventedKeywordLineHtml.includes('<span class="basis-line-text">printed brand fascia graphics with BRASIL artwork</span>'));
+assert.match(inventedKeywordLineHtml, /<span class="basis-line-text">\s*printed brand fascia graphics with BRASIL artwork\s*<\/span>/);
 assert.strictEqual(isCustomPricingBasisLine({ tag: "Exclude", custom_pricing: true }), true);
 assert.strictEqual(basisLineAcceptsAsAiProposal({ tag: "Confirm", text: "invented graphic panel" }), false);
 assert.strictEqual(basisLineAcceptsAsAiProposal({ tag: "Confirm", text: "catalog-backed", pricing_reference_description: "sqm vinyl graphics" }), false);
@@ -31316,13 +31380,13 @@ state.quoteBasisSections = [{ id: "default-dimensions", title: "Floor Design", l
 const defaultNoteHtml = renderQuoteBasisMessage(state.quoteBasis, "edited");
 const boothDetails = defaultNoteHtml.match(/<div class="basis-visual-display"[\s\S]*?<\/div>/)?.[0] || "";
 const displayedNote = defaultNote.replace(/^Confirm: /, "");
-assert.ok(boothDetails.includes("Booth Details"), "Default note lost Booth Details");
-assert.strictEqual(boothDetails.split(displayedNote).length - 1, 1, "Default note missing from Booth Details");
+assert.ok(boothDetails.includes("<strong>Detected booth</strong>"), "Default note lost the Detected booth heading");
+assert.strictEqual(boothDetails.split(displayedNote).length - 1, 1, "Default note missing from Detected booth");
 assert.strictEqual(defaultNoteHtml.split(displayedNote).length - 1, 1, "Default note duplicated as review row");
 assert.ok(!defaultNoteHtml.includes('data-basis-line-index="0"'), "Default note became an editable review row");
 assert.ok(defaultNoteHtml.includes('data-basis-line-index="1"'), "Ordinary scope lost its review row");
 assert.ok(defaultNoteHtml.includes("sqm needle punch carpet in colour"));
-assert.ok(!boothDetails.includes("sqm needle punch carpet in colour"), "Ordinary scope leaked into Booth Details");
+assert.ok(!boothDetails.includes("sqm needle punch carpet in colour"), "Ordinary scope leaked into Detected booth");
 state.quoteBasisSections = [{
   id: "floor-design",
   title: "Floor Design",
@@ -31420,6 +31484,9 @@ assert.strictEqual(renderBasisConfirmSummary(state.quoteBasisSections), "");
 
 let rendered = 0;
 let synced = 0;
+let queuedDraftSaves = 0;
+function appIsBusy() { return false; }
+function queueQuoteSessionDraftStateSave() { queuedDraftSaves += 1; }
 function updateQuoteBasisCard(source) {
   assert.strictEqual(source, "edited");
   rendered += 1;
@@ -31531,6 +31598,97 @@ assert.strictEqual(state.quoteBasisSections[0].lines[1].tag, "Include");
 assert.strictEqual(state.quoteBasisSections[0].lines[2].tag, "Include");
 assert.strictEqual(state.quoteBasisSections[0].lines[2].custom_confirmed, false);
 assert.strictEqual(state.quoteBasis.graphics, "Custom: manual graphic panel\nInclude: standard graphic panel\nInclude: invented graphic panel");
+
+const syntheticOffer = "a".repeat(64);
+const reference = { id: "default-ref", source: "local", currency: "SGD", digest_sha256: "sha256:" + "b".repeat(64) };
+const originalUnmatched = { id: "synthetic-sculpture", tag: "Custom", text: "Kinetic sculpture", quantity: 2, unit: "nos" };
+const unpricedRow = { source_basis_line_id: originalUnmatched.id, section: "Objects", description: originalUnmatched.text,
+  quantity: 2, unit: "nos", pricing_authority: { variant: "none" }, unmatched_pricing_offer: syntheticOffer };
+const sectionWith = (line) => ({ id: "objects", title: "Objects", lines: [line] });
+const resetUnmatched = (line = {}, row = {}, snapshotLine = {}, selected = reference) => {
+  state.pricingReferences = [selected];
+  state.quoteBasisSections = [sectionWith({ ...originalUnmatched, ...line })];
+  state.originalAnalysisSnapshot = {
+    quote_basis_sections: [sectionWith({ ...originalUnmatched, ...snapshotLine })],
+    pricing_analysis_seal: { reference: pricingReferenceAuthorityBasis(reference) },
+  };
+  state.lineItems = [{ ...unpricedRow, ...row }];
+  state.outputRows = [];
+  queuedDraftSaves = 0;
+};
+const currentUnmatched = () => state.quoteBasisSections[0].lines[0];
+const hasDeferral = () => state.lineItems[0].deferred_pricing === syntheticOffer;
+const hasDeferralStatus = () => renderBasisLine(state.quoteBasisSections[0], currentUnmatched(), 0).includes("Price to be discussed");
+for (const [name, tick, exclude] of [
+  ["single", () => retagBasisLine("objects", 0, "Custom"), () => retagBasisLine("objects", 0, "Exclude")],
+  ["bulk", () => retagBasisSectionConfirmLines("objects", "Include"), () => retagBasisSectionConfirmLines("objects", "Exclude")],
+]) {
+  resetUnmatched();
+  assert.equal(basisPricingGroup(currentUnmatched(), state.quoteBasisSections[0]), "Unmatched");
+  assert.ok(!hasDeferral() && !hasDeferralStatus() && queuedDraftSaves === 0, name + " untouched");
+  tick();
+  assert.ok(currentUnmatched().custom_confirmed && hasDeferral() && hasDeferralStatus(), name + " tick");
+  assert.equal(queuedDraftSaves, 1);
+  tick();
+  assert.ok(hasDeferral() && queuedDraftSaves === 1, name + " repeated tick");
+  exclude();
+  assert.ok(!hasDeferral() && !hasDeferralStatus() && !currentUnmatched().custom_confirmed, name + " exclude");
+  assert.equal(basisPricingGroup(currentUnmatched(), state.quoteBasisSections[0]), "Unmatched");
+  tick();
+  assert.ok(hasDeferral() && hasDeferralStatus(), name + " reinclude");
+
+  for (const [reason, line, row, snapshotLine, selected] of [
+    ["edited identity", { id: "edited" }, { source_basis_line_id: "edited" }],
+    ["edited text", { text: "Edited object" }, { description: "Edited object" }],
+    ["edited quantity", { quantity: 3 }, { quantity: 3 }],
+    ["edited unit", { unit: "sets" }, { unit: "sets" }],
+    ["missing quantity", { quantity: null }, { quantity: null }, { quantity: null }],
+    ["missing unit", { unit: "" }, { unit: "" }, { unit: "" }],
+    ["possible match", { possible_pricing_matches: [{ pricing_keyword: "other", description: "Other object" }] }],
+    ["no offer", {}, { unmatched_pricing_offer: "" }],
+    ["stale digest", {}, {}, {}, { ...reference, digest_sha256: "sha256:" + "c".repeat(64) }],
+    ["manual", {}, { pricing_authority: { variant: "manual" } }],
+    ["included", {}, { pricing_authority: { variant: "included" } }],
+  ]) {
+    resetUnmatched(line, row, snapshotLine, selected);
+    tick();
+    assert.ok(!hasDeferral() && !hasDeferralStatus() && queuedDraftSaves === 0, name + " granted deferral for " + reason);
+  }
+}
+resetUnmatched({ custom_confirmed: true }, { unmatched_pricing_offer: undefined, deferred_pricing: syntheticOffer });
+assert.ok(hasDeferralStatus(), "legacy deferred draft lost its status");
+retagBasisLine("objects", 0, "Exclude");
+assert.ok(!hasDeferral() && !hasDeferralStatus(), "legacy deferral survived exclusion");
+retagBasisLine("objects", 0, "Custom");
+assert.ok(hasDeferral() && hasDeferralStatus(), "legacy deferred draft could not be re-included");
+
+function normalizeLineItem(row) { return { ...row }; }
+function outputPriceAuthority(row) { return row.pricing_authority; }
+function safeQuoteSessionId(value) { return value; }
+function isPlainObject(value) { return value && typeof value === "object"; }
+const catalogLine = { ...originalUnmatched, tag: "Confirm", pricing_keyword: "synthetic-reference-item" };
+const catalogRow = { ...unpricedRow, pricing_keyword: catalogLine.pricing_keyword,
+  pricing_authority: { variant: "catalog", catalog_item_id: catalogLine.pricing_keyword,
+    catalog_source: reference.source, catalog_digest: reference.digest_sha256 } };
+for (const tick of [
+  () => retagBasisLine("objects", 0, "Include"),
+  () => retagBasisSectionConfirmLines("objects", "Include"),
+]) {
+  resetUnmatched();
+  state.quoteSessionId = "quote-synthetic";
+  state.pricingLedgerRevisions = { "quote-synthetic": { [catalogLine.id]: 3 } };
+  state.workflowStage = "completed";
+  state.quoteBasisSections = [sectionWith({ ...catalogLine, tag: "Exclude" })];
+  state.originalAnalysisSnapshot.quote_basis_sections = [sectionWith(catalogLine)];
+  state.originalAnalysisSnapshot.line_items = [catalogRow];
+  state.originalOutputRows = [];
+  state.lineItems = [];
+  assert.equal(basisPricingGroup(state.quoteBasisSections[0].lines[0], state.quoteBasisSections[0]), "Matched");
+  tick();
+  assert.deepStrictEqual(pendingPricingSelections(), [{ source_basis_line_id: catalogLine.id,
+    catalog_item_id: catalogLine.pricing_keyword, expected_revision: 3, reinclude: true }]);
+  assert.equal(queuedDraftSaves, 0);
+}
 assert.ok(rendered >= 3);
 assert.ok(synced >= 3);
 """
@@ -32647,9 +32805,10 @@ eval([
   "renderOutputEditCell",
   "renderOutputPriceCells", "renderPricingMatches",
   "snapshotOutputRows",
+  "outputPricingIsDeferred",
   "outputRowsToLineItems",
   "pricingSelectionReviewMessage", "outputRowsValid",
-  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor",
+  "admittedOutputPrice", "revokeOutputEditor", "resumeBlockedOutputDraftSave", "blockOutputEditor", "commitActiveOutputEditor", "preserveOutputRowIdentity", "outputRowIdentity", "commitOutputEditor", "retainExcludedBasisPricingRows",
 ].map(extractFunction).join("\n"));
 
 function selectedPricingReferenceCurrency() { return "SGD"; }
@@ -32860,6 +33019,7 @@ eval([
   "outputCatalogDescription",
   "outputRowFromLineItem",
   "outputPriceAuthority", "outputPriceDenomination", "outputCellDisplayValue",
+  "outputPricingIsDeferred",
   "pricingSelectionReviewMessage", "outputRowsValid",
   "rowNeedsManualInput",
   "matchSummaryStats",
@@ -32975,12 +33135,14 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertIn("quote_session: currentQuoteSessionPayload({", normalize_body)
         self.assertIn("includeDraftState: true", normalize_body)
         self.assertLess(
-            confirm_body.index("const refreshed = await refreshLineItemsFromServer();"),
+            confirm_body.index("const refreshed = await refreshLineItemsFromServer({ waitForPaint: true });"),
             confirm_body.index("refreshOutputRowsFromLineItems();"),
         )
         self.assertIn("if (!refreshed.ok)", confirm_body)
         self.assertIn("state.basisConfirmed = false;", confirm_body)
-        self.assertIn('showBlockedBasisAction(refreshed.data?.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE : genericFailureMessage(refreshed.data));', confirm_body)
+        self.assertIn('refreshed.data?.status === "conflict"', confirm_body)
+        self.assertIn("PRICING_SELECTION_STALE_MESSAGE", confirm_body)
+        self.assertIn("showBlockedBasisAction(message);", confirm_body)
         self.assertNotIn("Pricing refresh unavailable", confirm_body)
         missing_branch = confirm_body.split("if (missing.length)", 1)[1].split("state.isPreparingOutput", 1)[0]
         confirm_block_branch = confirm_body.split("if (confirmBlockReason)", 1)[1].split("if (state.aiFailed)", 1)[0]
@@ -32990,7 +33152,7 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         self.assertIn("await saveQuoteSessionDraftState({ quoteGenerated: false });", missing_branch)
         self.assertIn("showBlockedBasisAction(", missing_branch)
         self.assertIn("state.outputRows = snapshotOutputRows(state.originalOutputRows);", reset_body)
-        self.assertIn("state.lineItems = outputRowsToLineItems();", reset_body)
+        self.assertIn("state.lineItems = retainExcludedBasisPricingRows(outputRowsToLineItems());", reset_body)
         self.assertNotIn("refreshLineItemsFromServer", reset_body)
         self.assertNotIn("refreshOutputRowsFromLineItems", reset_body)
 
@@ -43344,6 +43506,65 @@ main().catch((error) => {
                 with self.assertRaises(webapp.PricingSelectionConflict):
                     webapp.write_quote_session_pricing_ledger(owner_storage, "quote-ledger-db", stale, webapp.empty_pricing_ledger("new"))
                 self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")[0]["pricing_ledger"], owner_ledger)
+
+                excluded = copy.deepcopy(confirmed)
+                self._ledger_line(excluded, "carpet-row")["tag"] = "Exclude"
+                excluded_session = owner_storage.create_or_update_quote_session(self._ledger_sync(excluded))
+                confirmed["expected_draft_version"] = excluded_session["draft_version"]
+                saved, files = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")
+                restore = {"source_basis_line_id": "carpet-row", "catalog_item_id": self.LEDGER_CARPET,
+                           "expected_revision": webapp.public_pricing_ledger(saved)["rows"]["carpet-row"], "reinclude": True}
+                newer = copy.deepcopy(excluded)
+                newer["quote_session"]["customer_summary"] = {"project_name": "Synthetic later project"}
+                self._ledger_sync(newer)
+                owner_storage.create_or_update_quote_session(newer)
+                later, later_files = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")
+                self.assertEqual(later["pricing_ledger"], saved["pricing_ledger"])
+                self.assertEqual(later_files, files)
+                with self.assertRaises(webapp.PricingSelectionConflict):
+                    webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), (later, later_files))
+                excluded_session = owner_storage.create_or_update_quote_session(excluded)
+                confirmed["expected_draft_version"] = excluded_session["draft_version"]
+                commit = webapp.PricingSelectionDraft.persist_database
+                concurrent = []
+
+                def save_before_commit(staged, connection, workspace_id, metadata, draft_files=None):
+                    owner_storage.create_or_update_quote_session(newer)
+                    concurrent.append(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"))
+                    return commit(staged, connection, workspace_id, metadata, draft_files)
+
+                with mock.patch.object(webapp.PricingSelectionDraft, "persist_database", autospec=True, side_effect=save_before_commit):
+                    with self.assertRaises(webapp.PricingSelectionConflict):
+                        webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                self.assertEqual(len(concurrent), 1)
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), concurrent[0])
+                with self.assertRaises(webapp.PricingSelectionConflict):
+                    webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), concurrent[0])
+
+                colleague_storage = webapp.app_storage_for_auth_session(colleague)
+                outsider_storage = webapp.app_storage_for_auth_session(outsider)
+                with self.assertRaises(webapp.SqagStorageAccessError):
+                    webapp.apply_pricing_selections(confirmed, [restore], colleague_storage, auth_session=colleague)
+                with self.assertRaises(webapp.PricingSelectionConflict):
+                    webapp.apply_pricing_selections(confirmed, [restore], outsider_storage, auth_session=outsider)
+                self.assertEqual(outsider_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), ({}, []))
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), concurrent[0])
+
+                for artifact_mode in ("database", "object"):
+                    with self.subTest(artifact_mode=artifact_mode), mock.patch.dict(os.environ, {
+                        webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: artifact_mode,
+                    }):
+                        excluded_session = owner_storage.create_or_update_quote_session(excluded)
+                        confirmed["expected_draft_version"] = excluded_session["draft_version"]
+                        restore["expected_revision"] = excluded_session["pricing_ledger"]["rows"]["carpet-row"]
+                        restored = webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                        self.assertEqual(self._ledger_price(restored["line_items"], "carpet-row"), price)
+                        reopened, reopened_files = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")
+                        self.assertEqual(reopened_files, files)
+                        self.assertEqual(reopened["pricing_ledger"]["rows"]["carpet-row"]["grant"]["state"], "live")
+                        self.assertEqual(reopened["draft_state"]["quoteBasisSections"], confirmed["quote_basis_sections"])
 
     def test_line_item_normalize_endpoint_uses_selected_basis_catalog_match_on_first_confirm(self):
         payload = {

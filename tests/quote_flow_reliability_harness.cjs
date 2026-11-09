@@ -43,6 +43,8 @@ async function generationOutputCases() {
     for (const contract of ['current','legacy','invalid','empty-legacy']) for (const prior of [false,true]) {
       const c = productionContext(); const st = c.state;
       vm.runInContext('state.outputRows=originals.map(outputRowFromLineItem);state.lineItems=originals.map(normalizeLineItem);',c);
+      vm.runInContext(`state.quoteBasisSections=[{id:'general',title:'General',lines:[{id:'excluded-row',tag:'Exclude'}]}];
+        state.lineItems.push({source_basis_line_id:'excluded-row',description:'Excluded synthetic row'});`,c);
       const before = JSON.stringify(st.outputRows);
       const data = JSON.parse(JSON.stringify({status:terminal,return_code:terminal==='completed'?0:2,
         pricing_matches:[{status:'matched',unit_price:'999999',amount:'999999'}],
@@ -62,7 +64,7 @@ async function generationOutputCases() {
         missingDetailFields:()=>[],quoteSessionHasFreshOutputExports:()=>prior,normalizeActiveJob:x=>x,
         newClientJobId:()=> 'job-synthetic-output',saveSessionState:noop,setWorkflowStage:noop,
         setResultStatus:label=>statuses.push(label),renderMessages:noop,clearPricingReviewMessages:noop,syncControlStates:noop,
-        ensureQuoteSession:async()=>st.quoteSessionId,buildPayload:()=>({line_items:st.lineItems}),startJob:async()=>{assert.equal(st.activeJob.outputRowsSchema,'swooshz.quote-output-rows.v1');return{ok:true,data:{job_id:'job-synthetic-output'}};},
+        ensureQuoteSession:async()=>st.quoteSessionId,buildPayload:()=>({line_items:c.outputRowsToLineItems()}),startJob:async()=>{assert.equal(st.activeJob.outputRowsSchema,'swooshz.quote-output-rows.v1');return{ok:true,data:{job_id:'job-synthetic-output'}};},
         currentGenerationContext:()=>({session_id:st.quoteSessionId,run_id:''}),transitionGenerationContext:noop,
         pollJob:async()=>{polls++;return{ok:true,data:{status:terminal==='needs_confirmation'?'needs_review':terminal,result:c.resultData}};},
         isInterruptedJobPoll:()=>false,clearActiveJob:()=>{st.activeJob=null;},
@@ -77,6 +79,8 @@ async function generationOutputCases() {
       if (resumed) {st.activeJob={id:'job-synthetic-output',type:'generate',phase:'running',...(['legacy','empty-legacy'].includes(contract)?{}:{outputRowsSchema:'swooshz.quote-output-rows.v1'})};await c.resumeSavedJob();}
       else await c.handleGenerate();
       assert.equal(polls,1);
+      assert(st.lineItems.some(row=>row.source_basis_line_id==='excluded-row'));
+      assert(!st.outputRows.some(row=>row.source_basis_line_id==='excluded-row'));
       if (contract !== 'empty-legacy') {
         if(terminal==='completed'||contract!=='current')assert.equal(JSON.stringify(st.outputRows),before,`${resumed}/${terminal}/${contract}/${prior}`);
         assert.equal(st.outputRows[0].source_basis_line_id,'manual-row');
@@ -218,6 +222,10 @@ async function resumedPdfStatusCases() {
   for (const scenario of ['current_pdf', 'missing_pdf', 'download_without_view', 'stale_no_entry', 'postcommit_warning', 'pricing_review', 'excel', 'workbook_unavailable', 'no_files']) {
     const calls = { resumedStart: 0, poll: 0, persistentSave: 0, localSave: 0, updateDownload: 0, modalAttempt: 0, readyShown: 0, statuses: [], messages: [] };
     const state = { activeJob: { id: 'job-synthetic-resume', type: scenario === 'excel' ? 'generate' : 'generate_pdf', phase: 'running', viewPdf: scenario !== 'excel' }, outputRevision: 5, outputRows: [{price_mode:'Priced',description:'Synthetic saved row',quantity:1,unit:'nos',pricing_authority:{variant:'manual'}}], lineItems:[], pdfFile: null };
+    const submittedVersion = 'a'.repeat(64), anotherVersion = 'b'.repeat(64), committedVersion = 'c'.repeat(64);
+    state.quoteSessionId = 'quote-synthetic';
+    state.pricingDraftVersion = scenario === 'stale_no_entry' ? anotherVersion : submittedVersion;
+    state.activeJob.submittedDraftVersion = submittedVersion;
     const xlsx = { name: 'quotation.xlsx', url: '/api/quote-sessions/quote-synthetic/download/xlsx' };
     const pdf = { name: 'quotation.pdf', url: '/api/quote-sessions/quote-synthetic/download/pdf' };
     const current = scenario === 'current_pdf';
@@ -225,6 +233,8 @@ async function resumedPdfStatusCases() {
     const data = { status: scenario === 'pricing_review' ? 'needs_confirmation' : 'completed',
       files: scenario === 'no_files' ? [] : [xlsx, ...(['current_pdf', 'download_without_view'].includes(scenario) ? [pdf] : [])],
       quote_session: { session_id: 'quote-synthetic', exports: { xlsx: { url: xlsx.url }, pdf: { url: current ? pdf.url : null, view_url: current ? '/api/quote-sessions/quote-synthetic/view/pdf' : null } } } };
+    data.quote_session.draft_version = committedVersion;
+    if (scenario !== 'postcommit_warning') data.quote_session.pricing_ledger = { revision: 4, rows: { synthetic: 3 } };
     if (scenario === 'workbook_unavailable') data.export_status = { pdf_status: 'workbook_export_unavailable' };
     if (scenario === 'postcommit_warning') {
       data.post_commit_projection = { code: 'post_commit_projection_failed', retryable: true, message: 'Generation completed, but the session view could not be refreshed. Refresh to retry.' };
@@ -247,8 +257,12 @@ async function resumedPdfStatusCases() {
       updateDownloadButton: () => { calls.updateDownload++; },
       showGeneratedExportReadyModal: () => { calls.modalAttempt++; const ready = !!state.pdfFile; if (ready) calls.readyShown++; return ready; },
     });
-    vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
+    vm.runInContext(['adoptGenerationOutputRows', 'resumeSavedJob', 'validQuoteDraftVersion', 'acknowledgeGeneratedQuoteDraft', 'generationFailureMessages',
+      'validPricingLedgerReceipt', 'unchangedDraftLedgerMatches', 'rememberPricingSelectionAcknowledgement',
+      'setDownloadFiles', 'revisionNumber', 'postCommitProjectionWarningFrom', 'postCommitProjectionWarningMessage'].map(extract).join('\n'), context);
     await context.resumeSavedJob();
+    assert.equal(state.pricingDraftVersion, scenario === 'stale_no_entry' ? anotherVersion
+      : scenario === 'postcommit_warning' ? submittedVersion : committedVersion, 'Generation can only acknowledge its submitted draft');
     assert.equal(calls.resumedStart, 1); assert.equal(calls.poll, 1);
     assert.equal(state.isGenerating, false); assert.equal(state.activeJob, null);
     if (scenario === 'postcommit_warning') {
@@ -337,7 +351,7 @@ async function lifecycleCases() {
   const families = ["images", "customer", "quote_company", "dependency_customer", "dependency_images", "dependency_basis", "basis"];
   let cases = 0;
   for (const family of families) for (const phase of ["ordinary", "cancel_before", "cancel_pending", "pagehide_pending"]) for (const outcome of ["success", "failure", "throw"]) {
-    const f = lifecycleFixture(["withQuoteStepLoading", "advanceCustomerStep", "goToNextSidePanel", "confirmQuoteDependencyChange", "confirmBasis"]);
+    const f = lifecycleFixture(["withQuoteStepLoading", "advanceCustomerStep", "goToNextSidePanel", "confirmQuoteDependencyChange", "confirmBasis", "retainExcludedBasisPricingRows"]);
     const { context: c, state, elements } = f;
     const panel = family.replace("dependency_", "");
     const panels = ["images", "customer", "quote_company", "basis", "output"];
@@ -593,7 +607,9 @@ async function lifecycleCases() {
 
     // Use the real generation/file-attachment path, with transport and final save held.
     vm.runInContext([
-      "handleGenerate", "setDownloadFiles", "clearActiveJob",
+      "handleGenerate", "validQuoteDraftVersion", "acknowledgeGeneratedQuoteDraft", "generationFailureMessages",
+      "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
+      "setDownloadFiles", "clearActiveJob", "retainExcludedBasisPricingRows",
       "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage",
     ].map(extract).join("\n"), c);
     state.activeSidePanel = "output";

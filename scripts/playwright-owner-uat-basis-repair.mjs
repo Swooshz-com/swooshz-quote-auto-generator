@@ -96,7 +96,7 @@ const cases = [
   { id: "u1-historical", kind: "historical", section: "Flooring", text: "Blue carpet tile flooring for the lounge zone", quantity: 18, unit: "sqm", claim: "Printed Floor Sticker", select: "Blue Carpet Tile" },
   { id: "u1-legacy", kind: "legacy", section: "Flooring", text: "Needle punch carpet for the storage corner", quantity: 6, unit: "sqm", claim: "Printed Wall Panel" },
   { id: "u1-confirmed", kind: "confirm", section: "Lighting and Electrical", text: "6 inch Spotlight", quantity: 7, unit: "nos", claim: "6 inch Spotlight" },
-  { id: "u1-review", kind: "review", section: "Furniture Rental", text: "Custom reception desk with curved timber cladding", quantity: 1, unit: "lot" },
+  { id: "u1-review", kind: "review", section: "Furniture Rental", text: "Custom reception desk with curved timber cladding", quantity: 1, unit: "lot", rawUnit: "" },
 ];
 const fillerNouns = ["chair", "stool", "table", "counter", "spotlight", "socket point", "carpet tile", "wall graphic", "fabric banner", "floor sticker"];
 for (let index = 0; index < fillerLines; index++) {
@@ -289,7 +289,6 @@ try {
       await new Promise((resolve) => setTimeout(resolve, latencyMs));
     }
     network.push({ at: Date.now(), method: route.request().method(), path: url.pathname });
-    if (["/api/line-items/normalize", "/api/quote-sessions/pricing-selections"].includes(url.pathname)) await fs.writeFile(path.join(runRoot, url.pathname.split("/").pop() + "-request-" + network.length + ".json"), route.request().postData() || "");
     return route.continue();
   });
   await page.addInitScript(() => {
@@ -823,6 +822,8 @@ try {
       const selectionsBefore = result.selectionStatuses.length;
       const index = await page.evaluate(() => state.outputRows.findIndex((row) => row.source_basis_line_id === "u1-count"));
       await page.locator('[data-output-row="' + index + '"][data-output-edit-field="unit_price_override"][data-output-denomination="quote"]').first().click();
+      const outputSelectionResponse = page.waitForResponse((response) => response.request().method() === "POST"
+        && new URL(response.url()).pathname === "/api/quote-sessions/pricing-selections", { timeout: 15000 });
       await page.locator("[data-output-reference-action]").click();
       await page.waitForFunction(() => !appIsBusy());
       const selected = await rowFor("u1-count");
@@ -830,9 +831,18 @@ try {
         "Output reference selection did not obtain target pricing authority", selected);
       assert(result.selectionStatuses.length === selectionsBefore + 1 && result.selectionStatuses.at(-1) === 200,
         "Output action did not make one successful conditional selection", result.selectionStatuses);
+      const outputReceiptResponse = await outputSelectionResponse;
+      const outputRequest = outputReceiptResponse.request().postDataJSON();
+      const outputReceipt = (await outputReceiptResponse.json()).quote_session;
+      const outputRevision = outputReceipt.pricing_ledger.rows["u1-count"];
+      assert(outputReceipt.session_id === targetId && /^[a-f0-9]{64}$/.test(outputReceipt.draft_version)
+        && outputReceipt.draft_version !== outputRequest.expected_draft_version
+        && outputRevision > outputRequest.pricing_selections[0].expected_revision,
+        "A new Output grant did not advance both the draft version and row revision");
       await page.evaluate(() => saveQuoteSessionDraftState({ quoteGenerated: true }));
       const granted = JSON.parse(await fs.readFile(targetPath, "utf8"));
-      assert(granted.pricing_ledger?.rows?.["u1-count"]?.grant?.catalog_item_id === byName("Bar Stool").id,
+      assert(granted.pricing_ledger?.rows?.["u1-count"]?.grant?.catalog_item_id === byName("Bar Stool").id
+        && granted.pricing_ledger.rows["u1-count"].rev === outputRevision,
         "selection was not persisted in the target ledger");
       // A transient reference outage must not admit saved rows against an empty
       // catalogue and persist demoted catalogue/manual authority over recovery.
@@ -993,7 +1003,10 @@ try {
     status: document.querySelector("#resultStatus")?.innerText, messages: [...document.querySelectorAll(".message, .blocked-action, [role=alert]")].map((node) => node.innerText.slice(0, 200)).slice(0, 8),
     busy: typeof appIsBusy === "function" ? appIsBusy() : null, job: typeof state !== "undefined" ? state.activeJob : null,
     pricingIssues: typeof state !== "undefined" ? state.pricingIssues : null, outputErrors: typeof state !== "undefined" ? state.outputErrors : null,
-    unmatched: typeof state !== "undefined" ? (state.pricingMatches || []).filter((row) => !["matched", "manual", "manual-display", "included"].includes(String(row.status || "").toLowerCase())).slice(0, 8) : null,
+    unmatched: typeof state !== "undefined" ? (state.pricingMatches || [])
+      .filter((row) => !["matched", "manual", "manual-display", "included"].includes(String(row.status || "").toLowerCase()))
+      .slice(0, 8).map(({ source_basis_line_id, section, description, quantity, unit, status }) =>
+        ({ source_basis_line_id, section, description, quantity, unit, status })) : null,
     statusBySection: typeof state !== "undefined" ? (state.pricingMatches || []).reduce((acc, row) => { const key = row.section + " | " + row.status; acc[key] = (acc[key] || 0) + 1; return acc; }, {}) : null,
     outputAuthorityBySection: typeof state !== "undefined" ? state.outputRows.reduce((acc, row) => { const key = row.section + " | " + (row.pricing_authority?.variant || "absent"); acc[key] = (acc[key] || 0) + 1; return acc; }, {}) : null,
   })).catch((captureError) => String(captureError));

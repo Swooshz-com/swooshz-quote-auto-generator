@@ -667,7 +667,8 @@ async function prepareRefreshRecoveryQuote(page) {
       size: 68,
       data_url: state.headerLogo.data_url,
     }];
-    state.quoteSessionId = state.quoteSessionId || newClientQuoteSessionId();
+    transitionGenerationContext("", "");
+    ensureClientQuoteSessionId();
     state.quoteSessionDraftSaveStarted = true;
     state.activeAppView = "quote";
     state.aiFailed = false;
@@ -709,7 +710,25 @@ async function prepareRefreshRecoveryQuote(page) {
     setSidePanel("basis", { force: true });
     syncControlStates();
     await persistSessionFiles(sessionFileRecordsFromDraft());
+    const sessionId = await ensureQuoteSession({ synchronizeDraft: true });
+    if (!sessionId || !validQuoteDraftVersion(state.pricingDraftVersion)) {
+      throw new Error("Refresh recovery fixture could not save its initial draft.");
+    }
   });
+}
+
+async function waitForRecoveryRequest(started, label) {
+  let timer;
+  try {
+    await Promise.race([
+      started,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label + " did not start within 15 seconds.")), 15000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
@@ -759,7 +778,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
 
   try {
     await page.evaluate(() => { confirmBasis(); });
-    await firstRequestStarted;
+    await waitForRecoveryRequest(firstRequestStarted, "Initial Confirm Basis request");
     await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
     const savedBeforeRefresh = await page.evaluate(() => JSON.parse(
       window.localStorage.getItem("swooshz_quote_session_v1") || "{}"
@@ -776,7 +795,7 @@ async function verifyConfirmBasisSurvivesImmediateRefresh(page) {
     }
     releaseFirstRequest();
     await reload;
-    await secondRequestStarted;
+    await waitForRecoveryRequest(secondRequestStarted, "Resumed Confirm Basis request");
     await page.locator("#excelGeneratingTitle", { hasText: "Preparing Output" }).waitFor({ state: "visible", timeout: 15000 });
     releaseSecondRequest();
 
@@ -836,7 +855,9 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
     const firstPostStarted = new Promise((resolve) => { firstPostStartedResolve = resolve; });
     const secondPostStarted = new Promise((resolve) => { secondPostStartedResolve = resolve; });
     const postedJobIds = [];
+    const postedDraftVersions = [];
     let generationInputRows = null;
+    let savedReceipt;
     const postPattern = "**/api/jobs";
     const getPattern = "**/api/jobs/job-*";
     const savePattern = "**/api/quote-sessions";
@@ -850,11 +871,14 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       postCount += 1;
       const payload = route.request().postDataJSON();
       postedJobIds.push(payload.job_id || "");
+      postedDraftVersions.push(payload.payload?.expected_draft_version);
       if (!Array.isArray(payload.payload?.line_items) || !payload.payload.line_items.length) {
         throw new Error("Synthetic current completion requires captured generation input rows.");
       }
       generationInputRows = structuredClone(payload.payload.line_items);
       if (postCount === 1) {
+        const response = await page.request.get(baseUrl + "/api/quote-sessions/" + quoteSessionId);
+        savedReceipt = (await response.json()).quote_session;
         firstPostStartedResolve();
         await new Promise((resolve) => { releaseFirstPost = resolve; });
         try {
@@ -917,6 +941,9 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
                 },
                 quote_session: {
                   session_id: quoteSessionId,
+                  // This simulated worker leaves the real saved draft unchanged.
+                  draft_version: savedReceipt.draft_version,
+                  pricing_ledger: savedReceipt.pricing_ledger,
                   ...(testCase.viewPdf ? {
                     exports: {
                       pdf: { view_url: `/api/quote-sessions/${quoteSessionId}/view/pdf` },
@@ -938,7 +965,7 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 15000 });
       const pagesBeforeExport = page.context().pages().length;
       await page.locator(testCase.button + ":not([disabled])").click();
-      await firstPostStarted;
+      await waitForRecoveryRequest(firstPostStarted, "Initial " + testCase.type + " request");
       if (testCase.viewPdf && page.context().pages().length !== pagesBeforeExport) {
         throw new Error("PDF generation opened a waiting tab before refresh.");
       }
@@ -951,6 +978,11 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       if (!postedJobIds[0]) {
         throw new Error("Export click did not send a client-generated job id.");
       }
+      if (!/^[a-f0-9]{64}$/.test(postedDraftVersions[0])
+        || postedDraftVersions[0] !== savedReceipt?.draft_version
+        || postedDraftVersions[0] !== savedBeforeRefresh.activeJob?.submittedDraftVersion) {
+        throw new Error("Export did not dispatch the actual synchronised draft version.");
+      }
 
       // Both scopes exercise the actual resume path for these refresh assertions.
       const reload = page.reload({ waitUntil: "domcontentloaded" });
@@ -960,14 +992,14 @@ async function verifyGenerationLoadingModalSurvivesRefresh(page) {
       }
       releaseFirstPost();
       await reload;
-      await secondPostStarted;
+      await waitForRecoveryRequest(secondPostStarted, "Resumed " + testCase.type + " request");
       await page.locator("#excelGeneratingModal").waitFor({ state: "visible", timeout: 15000 });
       const restoredTitle = (await page.locator("#excelGeneratingTitle").innerText()).trim();
       if (restoredTitle !== testCase.title) {
         throw new Error("Expected refreshed " + testCase.type + " overlay title " + testCase.title + ", found " + restoredTitle + ".");
       }
-      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1]) {
-        throw new Error("Refresh should retry " + testCase.type + " with one stable idempotency key: " + JSON.stringify(postedJobIds) + ".");
+      if (postCount !== 2 || postedJobIds[0] !== postedJobIds[1] || postedDraftVersions[0] !== postedDraftVersions[1]) {
+        throw new Error("Refresh should retry " + testCase.type + " with its original idempotency key and draft version.");
       }
       const activePanel = (await page.locator(".rail-button.is-active").innerText()).trim();
       if (activePanel !== "Output") {
@@ -1755,6 +1787,13 @@ async function installMockProfiles(page) {
           tax: { label: "GST", rate: 0.09 },
           item_count: 1,
           digest_sha256: "sha256:2685fa5d3f208d9df578a3dbed4fc2d14fb44c0d2f5d87b9e991a1409719a9b7",
+          authority_items: [{
+            id: "synthetic-floor-needle-punch-carpet",
+            section: "Floor Design",
+            description: "Needle punch carpet in colour",
+            unit_hint: "sqm",
+            sale_unit_price: 15,
+          }],
         }],
         default_profile_id: "synthetic-exhibition-fixture-template",
         default_pricing_reference_id: "synthetic-exhibition-fixture-pricing",
@@ -2202,6 +2241,9 @@ async function verifyServerPricingReferenceReviewDurability(page) {
   try {
     page = await isolatedContext.newPage();
     await installMockProfiles(page);
+    // This check creates a real catalogue and changes its digest. Use its
+    // persisted catalogue details when the browser validates the selection.
+    await page.unroute("**/api/settings/pricing-references/synthetic-exhibition-fixture-pricing**");
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
     await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
@@ -2218,6 +2260,13 @@ async function verifyServerPricingReferenceReviewDurability(page) {
     await page.waitForFunction(() => Boolean(state.quoteSessionId && state.quoteCommercialSnapshot?.pricing_basis?.digest), null, { timeout: 15000 });
 
     const established = await page.evaluate(async () => {
+      const selected = currentPricingReference();
+      const detail = await fetchPricingReferenceDetail(selected);
+      if (!samePricingReferenceBasis(pricingReferenceAuthorityBasis(selected), pricingReferenceAuthorityBasis(detail))
+        || !pricingReferenceCatalogItem(detail, "synthetic-floor-needle-punch-carpet")) {
+        throw new Error("Catalogue A fixture lacks the current priced catalogue detail.");
+      }
+      state.pricingReferences = state.pricingReferences.map((reference) => reference === selected ? detail : reference);
       // The operator's catalogue selection on a stable row; Confirm records it with the server ledger.
       state.quoteBasisSections = normalizeQuoteBasisSections([{
         id: "smoke-floor",
@@ -2241,6 +2290,10 @@ async function verifyServerPricingReferenceReviewDurability(page) {
         pricing_keyword: "synthetic-floor-needle-punch-carpet",
         source_basis_line_id: "smoke-floor-carpet",
       })];
+      const baselineId = await ensureQuoteSession({ synchronizeDraft: true });
+      if (!baselineId || !validQuoteDraftVersion(state.pricingDraftVersion)) {
+        throw new Error("Catalogue A fixture has no acknowledged draft to select from.");
+      }
       const normalized = await refreshLineItemsFromServer();
       if (!normalized.ok) throw new Error(`Catalogue A normalization failed: ${JSON.stringify(normalized.data)}.`);
       captureOriginalAnalysisSnapshot({ source: "playwright-server-review-durability" });
@@ -2985,17 +3038,19 @@ async function verifyStaleTabMutationIsRejected(page) {
       });
     });
 
-    const staleSessionId = "quote-stale-workspace-a-private";
+    const staleSessionId = await stalePage.evaluate(() => {
+      transitionGenerationContext("", "");
+      return ensureClientQuoteSessionId();
+    });
     const navigation = stalePage.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 });
-    await stalePage.evaluate((sessionId) => {
+    await stalePage.evaluate(() => {
       clearQuoteSessionDraftSaveTimer();
       state.activeAppView = "quote";
-      state.quoteSessionId = sessionId;
       state.quoteSessionDraftSaveStarted = true;
       elements.clientName.value = "Workspace A Private Customer";
       saveSessionState();
       void saveQuoteSessionDraftState({ quoteGenerated: false }).catch(() => {});
-    }, staleSessionId);
+    });
     await navigation;
     await stalePage.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
     await stalePage.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
@@ -3087,9 +3142,7 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
     if (!await applySessionData(session)) throw new Error("Session bootstrap state could not be applied.");
 
     clearQuoteSessionDraftSaveTimer();
-    state.quoteSessionId = "";
-    state.lastGenerationRunId = "";
-    state.lastGenerationRunSessionId = "";
+    transitionGenerationContext("", "");
     state.quoteSessionDraftSaveStarted = false;
     state.quoteSessionRestoredSessionId = "";
     state.quoteSessionRestoredDraftKey = "";
@@ -3276,7 +3329,10 @@ async function createDashboardSmokeSession(page, suffix, options = {}) {
 
     const candidateSessionId = safeQuoteSessionId(`${safePrefix}-${Date.now()}`);
     const sessionId = candidateSessionId || newClientQuoteSessionId();
-    state.quoteSessionId = sessionId;
+    // This fixture needs a predictable ID for the Dashboard's ID search.
+    // Reserve it as a new quote and let the regular save enforce create-only.
+    transitionGenerationContext(sessionId, "");
+    state.pricingDraftVersion = "create";
     const draftFiles = sessionFileRecordsFromDraft();
     const initialDraftState = currentQuoteSessionDraftState();
     const initialPayload = currentQuoteSessionPayload({
@@ -3426,31 +3482,47 @@ async function verifyInitialDraftSaveReservesSessionIdBeforeNetwork(page) {
     await page.locator("#newQuoteButton:not([disabled])").click();
   }
   await seedQuoteDraftFromTestFixture(page);
-  const reservation = await page.evaluate(async () => {
-    setSidePanel("customer", { force: true });
-    state.quoteSessionId = "";
-    state.quoteSessionDraftSaveStarted = false;
-    saveSessionState();
-    const savePromise = startQuoteSessionDraftSaveAfterCustomerStep();
-    const savedDuringStart = JSON.parse(window.localStorage.getItem("swooshz_quote_session_v1") || "{}");
-    const reservedSessionId = String(savedDuringStart.quoteSessionId || "");
-    const stateSessionIdDuringStart = String(state.quoteSessionId || "");
-    const session = await savePromise;
-    const createdSessionId = session?.session_id || state.quoteSessionId || "";
-    await deleteQuoteSessionRecord(createdSessionId);
-    window.localStorage.removeItem("swooshz_quote_session_v1");
-    return {
-      reservedSessionId,
-      stateSessionIdDuringStart,
-      createdSessionId,
-    };
-  });
-  if (!reservation.reservedSessionId || !reservation.stateSessionIdDuringStart) {
-    throw new Error(`Initial draft save should reserve a client session id before the network response, found ${JSON.stringify(reservation)}.`);
+  const savePattern = "**/api/quote-sessions";
+  let reservation;
+  const interruptFirstSave = async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    reservation = await page.evaluate(() => JSON.parse(localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "{}"));
+    await route.abort();
+  };
+  await page.route(savePattern, interruptFirstSave);
+  try {
+    await page.locator("#sideNextButton").click();
+    await page.waitForFunction(() => !appIsBusy());
+  } finally {
+    await page.unroute(savePattern, interruptFirstSave);
   }
-  if (reservation.createdSessionId !== reservation.reservedSessionId) {
-    throw new Error(`Initial draft save should use the reserved session id, found ${JSON.stringify(reservation)}.`);
+  if (!reservation?.quoteSessionId || reservation.pricingDraftVersion !== "create" || reservation.activeSidePanel !== "customer") {
+    throw new Error("The interrupted first save did not reserve an identity in browser recovery.");
   }
+  const quoteUrl = baseUrl + "/api/quote-sessions/" + reservation.quoteSessionId;
+  if ((await page.request.get(quoteUrl)).status() !== 404) throw new Error("Interrupted first save reached the server.");
+  delete reservation.pricingDraftVersion;
+  await page.evaluate((snapshot) => localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(snapshot)), reservation);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => !state.isBooting && !appIsBusy());
+  const retriedSave = page.waitForResponse((response) => response.request().method() === "POST"
+    && new URL(response.url()).pathname === "/api/quote-sessions", { timeout: 15000 });
+  await page.locator("#sideNextButton").click();
+  const retried = await retriedSave;
+  const request = retried.request().postDataJSON();
+  if (!retried.ok() || request.session_id !== reservation.quoteSessionId || request.expected_draft_version !== "") {
+    throw new Error("Legacy recovery did not create the same reserved quote.");
+  }
+  await page.waitForFunction(() => validQuoteDraftVersion(state.pricingDraftVersion) && state.activeSidePanel === "customer",
+    null, { timeout: 15000 });
+  const recovered = (await (await page.request.get(quoteUrl)).json()).quote_session;
+  if (!recovered.draft_files.some((file) => file.name === TEST_REFERENCE_FILE_NAME)) {
+    throw new Error("Legacy first-save recovery lost the draft attachment.");
+  }
+  await page.evaluate(async (sessionId) => {
+    await deleteQuoteSessionRecord(sessionId);
+    localStorage.removeItem(QUOTE_SESSION_STORAGE_KEY);
+  }, reservation.quoteSessionId);
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
   await page.waitForFunction(() => {
@@ -5479,6 +5551,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error.message || error);
+  console.error(error.stack || error.message || error);
   process.exitCode = 1;
 });

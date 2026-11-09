@@ -134,7 +134,7 @@ async function checkSaveCompletionBoundary() {
       saves.push(vm.runInContext('saveQuoteSessionDraftState({quoteGenerated:true})', c));
       if (mode === 'queued') saves.push(vm.runInContext('saveQuoteSessionDraftState({quoteGenerated:true})', c));
     }
-    if (mode.startsWith('timer-')) vm.runInContext('quoteSessionDraftSaveTimer = 7;', c);
+    if (mode.startsWith('timer-')) vm.runInContext('quoteSessionDraftSaveTimer = { kind: "timer", id: 7, options: {} };', c);
     if (mode === 'wrong-target') c.state.quoteSessionId = 'different-session';
     const completionResult = vm.runInContext('(async () => {' + (corrected ? boundary : priorBoundary) + '\n return storageBeforeOutage; })()', c)
       .then(value => ({ value }), error => ({ error }));

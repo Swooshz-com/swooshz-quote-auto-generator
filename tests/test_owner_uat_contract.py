@@ -45,6 +45,9 @@ class OwnerUatContractTest(unittest.TestCase):
     def test_fxui_r05_r10_deferred_save_temporal_contract(self):
         self.browser_contract(dict(mode='temporal'))
 
+    def test_confirm_serializes_draft_saves_before_pricing_selection(self):
+        self.assertEqual(self.browser_contract(dict(mode='selection-ordering'))['status'], 'CONFIRM_DRAFT_ORDERING_PASS')
+
     def test_output_alignment_preserves_stable_row_identity_across_reference_sections(self):
         self.assertEqual(self.browser_contract(dict(mode='alignment'))['status'], 'STABLE_ROW_SECTION_ALIGNMENT_PASS')
 
