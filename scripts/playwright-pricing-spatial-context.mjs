@@ -117,6 +117,7 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
       draft.lineItems.some((row) => row.source_basis_line_id === rowId)
       && !draft.outputRows.some((row) => row.source_basis_line_id === rowId));
   }, { id: excludedSession, ids: excludedIds }, { timeout: 15000, polling: 500 });
+  await page.waitForFunction(() => !quoteSessionDraftSavePromise);
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0);
   await assertExcludedOutput();
@@ -198,11 +199,58 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
     return selected;
   });
   assert(!editedSelection, "edited row automatically requested its prior catalogue selection");
+  const staleRecovery = await page.evaluate(async (rowId) => {
+    const url = "/api/quote-sessions/" + encodeURIComponent(state.quoteSessionId);
+    const before = (await fetch(url).then((response) => response.json())).quote_session;
+    const payload = buildLineItemNormalizePayload();
+    payload.quote_session.draft_state = before.draft_state;
+    payload.quote_session.customer_summary = { ...before.customer_summary, project_name: "Synthetic newer tab project" };
+    const newer = await fetchPostJsonResponse("/api/quote-sessions", payload);
+    if (!newer.ok) throw new Error("Second tab could not save");
+    const newerSession = (await newer.json()).quote_session;
+    const refused = await refreshLineItemsFromServer();
+    const localPending = state.lineItems.some((row) => row.source_basis_line_id === rowId && row.reincluded_catalog_selection);
+    const reread = (await fetch(url).then((response) => response.json())).quote_session;
+    return refused.status === 409 && localPending && state.pricingDraftVersion === false
+      && newerSession.draft_version === reread.draft_version
+      && newerSession.draft_version !== before.draft_version;
+  }, "u1-excluded-match");
+  assert(staleRecovery, "stale browser overwrote a newer unrelated edit or lost the local recovery draft");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
+  assert(await page.evaluate(async () => state.pricingDraftVersion === false
+    && state.lineItems.some((row) => row.reincluded_catalog_selection)
+    && !(await saveQuoteSessionDraftState())
+    && (await refreshLineItemsFromServer()).data.status === "conflict"),
+    "reload resumed a refused save or lost the recovery draft");
+  if (!(await sculpture.isVisible())) await basisTab.click();
+  await floodCross.click();
+  assert(await page.evaluate(async () => !state.lineItems.some((row) => row.reincluded_catalog_selection)
+    && !(await saveQuoteSessionDraftState())), "cancelling the selection released the stale draft for autosave");
+  await page.locator("#topbarBrandButton").click();
+  await page.locator('.dashboard-session-card[data-quote-session-id="' + excludedSession + '"]').click();
+  await page.locator('[data-dashboard-panel-action="modify-session"][data-quote-session-id="' + excludedSession + '"]').click();
+  await page.waitForFunction(() => state.activeAppView === "quote" && !state.quoteSessionRestoreBusy);
+  if (!(await sculpture.isVisible())) await basisTab.click();
+  await assertExcludedBasis();
+  await (await basisControl(page, "u1-excluded-match", '[data-basis-tag="Include"]')).click();
+  result.staleRecovery = "PASS";
   assert(!await sculptureStatus.isVisible(), "reopened row has a deferral before ticking");
   await (await sculptureTick()).click();
   await assertBasisRow(sculpture, "Unmatched", "custom");
   assert(await sculptureStatus.isVisible(), "single tick did not defer the re-included row");
+  const mixedResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === "/api/quote-sessions/pricing-selections");
   await page.locator("#sideNextButton").click();
+  const mixed = await mixedResponse;
+  const outcomes = (await mixed.json()).selections || [];
+  const submitted = mixed.request().postDataJSON().pricing_selections;
+  assert(mixed.status() === 200 && submitted.some((entry) => entry.source_basis_line_id === "u1-excluded-match" && entry.reinclude)
+    && submitted.some((entry) => entry.source_basis_line_id === "u1-video" && !entry.reinclude)
+    && outcomes.some((entry) => entry.source_basis_line_id === "u1-excluded-match" && entry.status === "selected")
+    && outcomes.some((entry) => entry.source_basis_line_id === "u1-video" && entry.status === "refused"
+      && entry.reason === "unit_review_required"), "mixed selection did not return both outcomes", outcomes);
+  result.mixedSelectionStatus = mixed.status();
   await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
   await page.waitForFunction(() => !appIsBusy());
   const reopenedOutput = await page.evaluate(() => {
@@ -323,7 +371,7 @@ replaceOnce('    await writeJson("u1-pricing.json", pricing);', `
       visible: document.querySelector("#pricingReviewMessages").innerText,
     }));
     assert(refusalReview.issues.some((issue) => issue.source_basis_line_id === "u1-video" && issue.reason === "unit_review_required"),
-      "HTTP 200 partial refusal was not retained as a finite row issue", refusalReview);
+      "Mixed HTTP 200 partial refusal was not retained as a finite row issue", refusalReview);
     assert(refusalReview.errors.some((error) => error.includes("different quantity unit")) && refusalReview.visible.includes("different quantity unit"),
       "unit refusal reason was not rendered in the existing review area", refusalReview);
     await page.screenshot({ path: path.join(runRoot, "pricing-refusal.png"), fullPage: true });
@@ -337,16 +385,17 @@ replaceOnce('    await writeJson("u1-pricing.json", pricing);', `
       return { duplicate, unknown };
     });
     assert(finiteControls.duplicate === "" && finiteControls.unknown === "", "ambiguous ids or unknown reasons escaped the finite wording map", finiteControls);
-    const video = await rowFor("u1-video");
-    await page.locator('[data-output-row="' + video.index + '"][data-output-edit-field="unit_price_override"][data-output-denomination="quote"]').first().click();
+    const { index: videoIndex } = await rowFor("u1-video");
+    await page.locator('[data-output-row="' + videoIndex + '"][data-output-edit-field="unit_price_override"][data-output-denomination="quote"]').first().click();
     await page.locator('[data-output-editor-field="unit_price_override"]').fill("12");
     await page.locator('[data-output-editor-field="unit_price_override"]').press("Enter");
+    assert(await page.evaluate(() => !outputRowsValid().errors.some((error) => error.includes("different quantity unit"))),
+      "resolved manual price retained a stale unit refusal");
+    result.spatialPartialRefusal = { refusalReview, mixedStatus: result.mixedSelectionStatus };
     const resolvedVideo = await rowFor("u1-video");
     assert(resolvedVideo.authority?.variant === "manual" && resolvedVideo.quoted === "12.00",
-      "manual review price did not resolve refused selection", resolvedVideo);
-    assert(!(await page.evaluate(() => outputRowsValid().errors)).some((error) => error.includes("different quantity unit")),
-      "resolved manual price retained a stale unit refusal");
-    result.spatialPartialRefusal = { refusalReview, resolvedVideo };
+      "manual review price did not resolve the mixed refusal", resolvedVideo);
+    result.spatialPartialRefusal.resolvedVideo = resolvedVideo;
     await writeJson("u1-pricing.json", pricing);`);
 const runtime = path.join(carrierRoot, 'pricing-spatial-carrier.mjs');
 await fs.writeFile(runtime, code);

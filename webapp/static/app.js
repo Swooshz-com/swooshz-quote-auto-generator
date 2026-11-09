@@ -298,6 +298,7 @@ const state = {
   boothDimensions: { ...DEFAULT_BOOTH_DIMENSIONS },
   originalAnalysisSnapshot: null,
   pricingLedgerRevisions: {},
+  pricingDraftVersion: "",
   pendingQuoteDependencyChanges: [],
   basisConfirmed: false,
   isAnalysisRunning: false,
@@ -792,6 +793,7 @@ function transitionGenerationContext(sessionId = "", runId = "") {
   if (previousContext.session_id !== safeSessionId && state.basisChat) invalidateBasisChatAuthority();
   state.quoteSessionId = safeSessionId;
   if (previousContext.session_id !== safeSessionId) {
+    state.pricingDraftVersion = "";
     state.quoteAiSpendRequest += 1;
     renderQuoteAiSpend();
   }
@@ -4412,6 +4414,7 @@ function buildSessionSnapshot() {
     boothDimensions: state.boothDimensions,
     originalAnalysisSnapshot: state.originalAnalysisSnapshot,
     pricingLedgerRevisions: state.pricingLedgerRevisions,
+    pricingDraftVersion: state.pricingDraftVersion,
     basisConfirmed: state.basisConfirmed,
     aiFailed: state.aiFailed,
     draftSource: state.draftSource,
@@ -4847,12 +4850,12 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   if (isPlainObject(restoredState.originalAnalysisSnapshot)
     && Object.prototype.hasOwnProperty.call(restoredState.originalAnalysisSnapshot, "line_items")
     && !Array.isArray(restoredState.originalAnalysisSnapshot.line_items)) return false;
-  const canRestoreBrowserTransientAuthority = !containerMalformed
-    && options.suppressAutomaticOperations !== true
+  const isOwnedBrowserSnapshot = !containerMalformed
     && !nestedSession
     && draftCandidates.length === 0
     && !options.sessionId
     && savedState.browserRecoveryScope === currentBrowserRecoveryScope();
+  const canRestoreBrowserTransientAuthority = isOwnedBrowserSnapshot && options.suppressAutomaticOperations !== true;
   invalidateAuthorityProfileRequests();
   let rejectedRestoredActiveJob = false;
   state.profileId = typeof restoredState.profileId === "string" ? restoredState.profileId : "";
@@ -5007,6 +5010,8 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
   state.originalAnalysisSnapshot = restoredState.originalAnalysisSnapshot || null;
   state.pricingLedgerRevisions = isPlainObject(restoredState.pricingLedgerRevisions) ? restoredState.pricingLedgerRevisions : {};
+  state.pricingDraftVersion = options.serverDraftVersion
+    || (isOwnedBrowserSnapshot ? savedState.pricingDraftVersion ?? "" : "");
   state.basisConfirmed = Boolean(restoredState.basisConfirmed);
   state.draftSource = restoredState.draftSource || "";
   state.lastAnalysisMode = normalizeAnalysisMode(restoredState.lastAnalysisMode || restoredState.originalAnalysisSnapshot?.analysis_mode);
@@ -11141,7 +11146,10 @@ async function applyOutputReferencePricing(button) {
         : "Reference price could not be confirmed. Review this row before exporting."]);
       return "blocked";
     }
-    if (!restored) state.pricingLedgerRevisions = { [sessionId]: data.quote_session.pricing_ledger.rows };
+    if (!restored) {
+      state.pricingLedgerRevisions = { [sessionId]: data.quote_session.pricing_ledger.rows };
+      state.pricingDraftVersion = data.quote_session.draft_version || "";
+    }
     if (restored && outputPriceAuthority(row)?.variant === "catalog"
       && JSON.stringify(outputPriceAuthority(row)) === JSON.stringify(selected.pricing_authority)) return "unchanged";
     state.outputRows[index] = preserveOutputRowIdentity(row, selected);
@@ -13410,15 +13418,30 @@ function applyDraftLineItems(lineItems = []) {
 }
 
 async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
+  const conflict = (requestSuperseded = false) => ({
+    ok: false,
+    data: { status: "conflict", ...(requestSuperseded ? { request_superseded: true } : {}) },
+  });
+  if (state.pricingDraftVersion === false) return conflict();
   if (!state.lineItems.length) {
     state.pricingIssues = [];
     return { ok: true, data: { status: "normalized", line_items: [] } };
   }
   let selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
   const reinclusions = state.lineItems.filter((row) => row.reincluded_catalog_selection).length;
+  const refusalReasons = new Set(["unit_review_required", "contradiction", "not_in_catalogue", "reference_changed", "ineligible"]);
   const reinclusionsReady = () => selections.filter((entry) => entry.reinclude).length === reinclusions;
-  if (!reinclusionsReady()) return { ok: false, data: { status: "conflict" } };
+  const preserveRecoveryDraft = () => {
+    state.pricingDraftVersion = false;
+    saveSessionState();
+  };
+  const requireReopen = () => {
+    preserveRecoveryDraft();
+    return conflict();
+  };
+  if (!reinclusionsReady()) return requireReopen();
   const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  if (reinclusions && !sessionId) return requireReopen();
   const isSessionCurrent = () => safeQuoteSessionId(state.quoteSessionId || "") === sessionId;
   // Selection checks revisions before saving its draft. Let it carry any queued draft,
   // and read the revisions from saves already sent before building the selection request.
@@ -13431,16 +13454,60 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
     if (waitForPaint) await waitForUiPaint();
     if (hold) {
       while (quoteSessionDraftSavePromise && isCurrent()) await quoteSessionDraftSavePromise.catch(() => null);
-      if (!isCurrent()) return { ok: false, data: { status: "conflict", request_superseded: true } };
+      if (!isCurrent()) return conflict(true);
       selections = quoteSessionDraftStateCanSave() ? pendingPricingSelections() : [];
-      if (!reinclusionsReady()) return { ok: false, data: { status: "conflict" } };
+      if (!reinclusionsReady()) return requireReopen();
       if (selections.length) {
+        const expectedVersion = state.pricingDraftVersion;
+        if (reinclusions) {
+          if (!/^[a-f0-9]{64}$/.test(expectedVersion)) return requireReopen();
+          // Persist the recovery draft before dispatch. A reload during the
+          // request cannot tell whether the server committed it.
+          preserveRecoveryDraft();
+        }
         result = await postJson("/api/quote-sessions/pricing-selections", {
           ...buildLineItemNormalizePayload(),
           pricing_selections: selections,
-        }, { isCurrent });
+          ...(reinclusions ? { expected_draft_version: expectedVersion } : {}),
+        }, reinclusions ? { isCurrent, sessionId, persistSession: false } : { isCurrent });
+        if (!isCurrent()) return conflict(true);
         const session = isPlainObject(result.data?.quote_session) ? result.data.quote_session : null;
-        if (result.ok && isPlainObject(session?.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [sessionId]: session.pricing_ledger.rows };
+        if (reinclusions && result.ok) {
+          const outcomes = result.data?.selections;
+          const ledger = session?.pricing_ledger;
+          if (result.data?.status !== "normalized" || !Array.isArray(result.data.line_items)
+            || session?.session_id !== sessionId || typeof session.draft_version !== "string"
+            || !/^[a-f0-9]{64}$/.test(session.draft_version)
+            || !Number.isSafeInteger(ledger?.revision) || ledger.revision < 0 || !isPlainObject(ledger.rows)
+            || !Object.values(ledger.rows).every((revision) => Number.isSafeInteger(revision) && revision >= 0)
+            || !Array.isArray(outcomes) || outcomes.length !== selections.length
+            || !selections.every((entry, index) => {
+              const outcome = outcomes[index];
+              if (!isPlainObject(outcome) || outcome.source_basis_line_id !== entry.source_basis_line_id
+                || !Object.prototype.hasOwnProperty.call(ledger.rows, entry.source_basis_line_id)) return false;
+              const revision = ledger.rows[entry.source_basis_line_id];
+              if (revision < entry.expected_revision) return false;
+              if (outcome.status === "selected") {
+                return Object.keys(outcome).length === 2 && (!entry.reinclude || revision > entry.expected_revision);
+              }
+              return !entry.reinclude && outcome.status === "refused"
+                && Object.keys(outcome).length === 3 && refusalReasons.has(outcome.reason);
+            })) return conflict();
+          const restoredRows = new Map();
+          for (const row of result.data.line_items) {
+            const id = row?.source_basis_line_id;
+            restoredRows.set(id, restoredRows.has(id) ? null : row);
+          }
+          if (selections.some((entry) => {
+            if (!entry.reinclude) return false;
+            const authority = restoredRows.get(entry.source_basis_line_id)?.pricing_authority;
+            return authority?.variant !== "catalog" || authority.catalog_item_id !== entry.catalog_item_id;
+          })) return conflict();
+        }
+        if (result.ok && isPlainObject(session?.pricing_ledger?.rows)) {
+          state.pricingLedgerRevisions = { [sessionId]: session.pricing_ledger.rows };
+          if (session.session_id === sessionId) state.pricingDraftVersion = session.draft_version || "";
+        }
       }
     }
   } finally {
@@ -13458,7 +13525,6 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
     result = await postJson("/api/line-items/normalize", buildLineItemNormalizePayload());
   }
   if (!result.ok || !Array.isArray(result.data.line_items)) return result;
-  const refusalReasons = new Set(["unit_review_required", "contradiction", "not_in_catalogue", "reference_changed", "ineligible"]);
   state.pricingIssues = (Array.isArray(result.data.selections) ? result.data.selections : [])
     .filter((entry) => entry?.status === "refused" && typeof entry.source_basis_line_id === "string" && refusalReasons.has(entry.reason))
     .map((entry) => ({ source_basis_line_id: entry.source_basis_line_id, reason: entry.reason }));
@@ -13467,6 +13533,7 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
   )).map(normalizeLineItem));
   state.outputRows = [];
   state.outputErrors = [];
+  if (reinclusions) saveSessionState();
   return result;
 }
 
@@ -13512,7 +13579,8 @@ function pendingPricingSelections() {
       ...(reinclude ? { reinclude: true } : {}),
     });
   }));
-  return [...selections.values()].sort((left, right) => Number(Boolean(right.reinclude)) - Number(Boolean(left.reinclude))).slice(0, 100);
+  let ordinaryCount = 0;
+  return [...selections.values()].filter((entry) => entry.reinclude || ordinaryCount++ < 100);
 }
 
 function openBlockingClarifications(questions = [], findings = [], project = {}) {
@@ -14474,6 +14542,7 @@ async function saveCurrentQuoteSession(options = {}) {
     // The server row revisions this tab last saw; a selection is accepted only against them.
     if (isPlainObject(session.pricing_ledger?.rows)) state.pricingLedgerRevisions = { [savedSessionId]: session.pricing_ledger.rows };
     if (payloadDraftKey) {
+      state.pricingDraftVersion = session.draft_version || "";
       rememberConfirmedQuoteSessionDraft(savedSessionId, payloadDraftKey, payloadDraftFileKey);
     }
     if (currentQuoteSessionIsRestoredFromDashboard()) {
@@ -14494,6 +14563,7 @@ async function ensureQuoteSession(options = {}) {
   if (options.saveFailure) options.saveFailure.failure = null;
   if (options.synchronizeDraft === true && quoteSessionDraftStateCanSave()) {
     clearQuoteSessionDraftSaveTimer();
+    if (state.pricingDraftVersion === false) return "";
     while (true) {
       const draftState = currentQuoteSessionDraftState();
       const draftFiles = sessionFileRecordsFromDraft();
@@ -14525,7 +14595,7 @@ async function saveQuoteSessionDraftState(options = {}) {
   saveSessionState();
   // The selection request owns saving this draft until the server admits the re-inclusion.
   const hasPendingReinclusion = () => state.lineItems?.some((row) => row.reincluded_catalog_selection);
-  if (hasPendingReinclusion()) return null;
+  if (state.pricingDraftVersion === false || hasPendingReinclusion()) return null;
   // Caller snapshots stay immutable while an earlier save is pending.
   let draftState = JSON.parse(JSON.stringify(options.draftState || currentQuoteSessionDraftState()));
   let draftFiles = JSON.parse(JSON.stringify(Array.isArray(options.draftFiles)
@@ -14543,7 +14613,7 @@ async function saveQuoteSessionDraftState(options = {}) {
       await Promise.resolve();
     }
     const currentSessionId = safeQuoteSessionId(state.quoteSessionId || "");
-    if (currentSessionId !== queuedSessionId || hasPendingReinclusion()) return null;
+    if (currentSessionId !== queuedSessionId || state.pricingDraftVersion === false || hasPendingReinclusion()) return null;
     if (priorSave && !options.draftState) {
       draftState = JSON.parse(JSON.stringify(currentQuoteSessionDraftState()));
       if (!Array.isArray(options.draftFiles)) {
@@ -14801,6 +14871,12 @@ async function returnToDashboard() {
   if (state.authenticationRecoveryRequested) return recoverRequiredAuthentication(401, { status: "auth_required" });
   if (commitActiveOutputEditor() === "blocked") return false;
   if (appIsBusy()) return;
+  if (state.pricingDraftVersion === false) {
+    clearQuoteSessionDraftSaveTimer();
+    saveSessionState();
+    showDashboard();
+    return;
+  }
   let dashboardLoadStarted = false;
   setDashboardLoadingState(true, {
     title: "Opening dashboard",
@@ -15482,6 +15558,7 @@ async function modifyDashboardQuote(sessionId, options = {}) {
       return false;
     }
     let draftState = detailedSession?.draft_state && typeof detailedSession.draft_state === "object" ? detailedSession.draft_state : {};
+    const serverDraftVersion = Object.keys(draftState).length ? detailedSession.draft_version : "";
     if (!Object.keys(draftState).length && safeSessionId === safeQuoteSessionId(state.quoteSessionId) && quoteDraftShouldPersistToDashboard()) draftState = currentQuoteSessionDraftState();
     if (!Object.keys(draftState).length) {
       mergeDashboardQuoteSession({ ...(detailedSession || {}), session_id: safeSessionId, has_draft_state: false });
@@ -15496,7 +15573,9 @@ async function modifyDashboardQuote(sessionId, options = {}) {
     }
     draftState = mergeDashboardDraftSummaryDetails(draftState, detailedSession || {});
     draftState = hydrateDashboardDraftImagePayloads(draftState, safeSessionId);
-    const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: safeSessionId }, { sessionId: safeSessionId, forceQuoteView: true, restoreFurthestPanel: true });
+    const restored = await applyQuoteSessionSnapshot({ ...draftState, quoteSessionId: safeSessionId }, {
+      sessionId: safeSessionId, forceQuoteView: true, restoreFurthestPanel: true, serverDraftVersion,
+    });
     if (!restored) {
       finishDashboardOperation();
       dashboardRestoreError("This quote session was saved with an incompatible draft format.");
@@ -16802,7 +16881,16 @@ async function confirmBasis(options = {}) {
       state.basisConfirmed = false;
       setWorkflowStage("basis_review");
       setResultStatus("Failed", "is-bad");
-      showBlockedBasisAction(refreshed.data?.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE : genericFailureMessage(refreshed.data));
+      const refused = refreshed.data?.selections;
+      let message = genericFailureMessage(refreshed.data);
+      if (refreshed.data?.reason_code === "pricing_selection_invalid") {
+        message = "The pricing selection could not be saved. A quote can contain up to 200 selections, including up to 100 new matches.";
+      } else if (refreshed.data?.status === "conflict") {
+        message = Array.isArray(refused) && refused.some((entry) => entry?.status === "refused" && entry.reason !== "stale")
+          ? "Some prices could not be confirmed. Reopen the saved quote and review those matches before trying again."
+          : PRICING_SELECTION_STALE_MESSAGE;
+      }
+      showBlockedBasisAction(message);
       return;
     }
     state.basisConfirmed = true;
@@ -17128,6 +17216,10 @@ async function resumeSavedJob() {
   state.activeJob = activeJob;
   if (activeJob.type === "confirm_basis") {
     state.isPreparingOutput = false;
+    if (state.pricingDraftVersion === false || state.lineItems.some((row) => row.reincluded_catalog_selection)) {
+      clearActiveJob();
+      return;
+    }
     await confirmBasis({ resume: true, operation: activeJob });
     return;
   }

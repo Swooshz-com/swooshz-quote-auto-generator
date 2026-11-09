@@ -1933,7 +1933,7 @@ class WebappServerTest(unittest.TestCase):
                     self.fail(f'{operation_name} unexpectedly failed: {outcome}')
         return results, first_event
 
-    def http_json(self, runner, method: str, path: str, *, cookie: str = "", body: dict | None = None, headers: dict | None = None) -> dict:
+    def http_json(self, runner, method: str, path: str, *, cookie: str = "", body: dict | None = None, headers: dict | None = None, timeout: int = 10) -> dict:
         parsed = urllib.parse.urlparse(runner.base_url)
         request_headers = {"Accept": "application/json"}
         if cookie:
@@ -1941,7 +1941,7 @@ class WebappServerTest(unittest.TestCase):
         if body is not None:
             request_headers["Content-Type"] = "application/json"
         request_headers.update(headers or {})
-        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
         try:
             connection.request(
                 method,
@@ -33108,7 +33108,9 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
         )
         self.assertIn("if (!refreshed.ok)", confirm_body)
         self.assertIn("state.basisConfirmed = false;", confirm_body)
-        self.assertIn('showBlockedBasisAction(refreshed.data?.status === "conflict" ? PRICING_SELECTION_STALE_MESSAGE : genericFailureMessage(refreshed.data));', confirm_body)
+        self.assertIn('refreshed.data?.status === "conflict"', confirm_body)
+        self.assertIn("PRICING_SELECTION_STALE_MESSAGE", confirm_body)
+        self.assertIn("showBlockedBasisAction(message);", confirm_body)
         self.assertNotIn("Pricing refresh unavailable", confirm_body)
         missing_branch = confirm_body.split("if (missing.length)", 1)[1].split("state.isPreparingOutput", 1)[0]
         confirm_block_branch = confirm_body.split("if (confirmBlockReason)", 1)[1].split("if (state.aiFailed)", 1)[0]
@@ -43475,13 +43477,23 @@ main().catch((error) => {
 
                 excluded = copy.deepcopy(confirmed)
                 self._ledger_line(excluded, "carpet-row")["tag"] = "Exclude"
-                owner_storage.create_or_update_quote_session(self._ledger_sync(excluded))
+                excluded_session = owner_storage.create_or_update_quote_session(self._ledger_sync(excluded))
+                confirmed["expected_draft_version"] = excluded_session["draft_version"]
                 saved, files = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")
                 restore = {"source_basis_line_id": "carpet-row", "catalog_item_id": self.LEDGER_CARPET,
                            "expected_revision": webapp.public_pricing_ledger(saved)["rows"]["carpet-row"], "reinclude": True}
                 newer = copy.deepcopy(excluded)
-                self._ledger_line(newer, "carpet-row")["text"] += " for another position"
+                newer["quote_session"]["customer_summary"] = {"project_name": "Synthetic later project"}
                 self._ledger_sync(newer)
+                owner_storage.create_or_update_quote_session(newer)
+                later, later_files = owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db")
+                self.assertEqual(later["pricing_ledger"], saved["pricing_ledger"])
+                self.assertEqual(later_files, files)
+                with self.assertRaises(webapp.PricingSelectionConflict):
+                    webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
+                self.assertEqual(owner_storage._read_quote_session_metadata_for_workspace("quote-ledger-db"), (later, later_files))
+                excluded_session = owner_storage.create_or_update_quote_session(excluded)
+                confirmed["expected_draft_version"] = excluded_session["draft_version"]
                 commit = webapp.PricingSelectionDraft.persist_database
                 concurrent = []
 
@@ -43513,6 +43525,7 @@ main().catch((error) => {
                         webapp.SQAG_ARTIFACT_STORAGE_MODE_ENV_NAME: artifact_mode,
                     }):
                         excluded_session = owner_storage.create_or_update_quote_session(excluded)
+                        confirmed["expected_draft_version"] = excluded_session["draft_version"]
                         restore["expected_revision"] = excluded_session["pricing_ledger"]["rows"]["carpet-row"]
                         restored = webapp.apply_pricing_selections(confirmed, [restore], owner_storage, auth_session=owner)
                         self.assertEqual(self._ledger_price(restored["line_items"], "carpet-row"), price)

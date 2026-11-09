@@ -15346,9 +15346,12 @@ class DatabaseSqagStorage:
             )
         )
 
-    def _public_quote_session(self, metadata: dict[str, Any], *, include_draft_state: bool = False, draft_files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _public_quote_session(
+        self, metadata: dict[str, Any], *, include_draft_state: bool = False,
+        draft_files: list[dict[str, Any]] | None = None, include_draft_version: bool = False,
+    ) -> dict[str, Any]:
         return QuotePublicationReadView(self, metadata=metadata).project_saved(
-            include_draft_state=include_draft_state, draft_files=draft_files,
+            include_draft_state=include_draft_state, draft_files=draft_files, include_draft_version=include_draft_version,
         )
 
     def can_view_other_user_quote_sessions(self) -> bool:
@@ -16411,7 +16414,7 @@ class DatabaseSqagStorage:
             else None
         )
         try:
-            return self._public_quote_session(state["normalized"])
+            return self._public_quote_session(state["normalized"], include_draft_version=True)
         except Exception as exc:
             if committed_metadata is None:
                 raise
@@ -16613,7 +16616,7 @@ class DatabaseSqagStorage:
             raise
         committed = copy.deepcopy(normalized) if publish and stored_generated_quote else None
         try:
-            return self._public_quote_session(normalized)
+            return self._public_quote_session(normalized, include_draft_version=True)
         except Exception as exc:
             if committed is None:
                 raise
@@ -24284,7 +24287,8 @@ PRICING_ANALYSIS_ID_RE = re.compile(r"analysis-[a-f0-9]{24}")
 PRICING_ANALYSIS_SEAL_LOCAL_KEY = secrets.token_bytes(32)
 PRICING_LEDGER_MAX_ROWS = 400
 PRICING_LEDGER_MAX_ANALYSES = 20
-PRICING_ANALYSIS_SEAL_MAX_ROWS = 200
+QUOTE_SESSION_DRAFT_MAX_LIST_ITEMS = 200
+PRICING_ANALYSIS_SEAL_MAX_ROWS = QUOTE_SESSION_DRAFT_MAX_LIST_ITEMS
 PRICING_SELECTION_MAX = 100
 PRICING_SELECTION_STALE_MESSAGE = "This quote changed in another tab or session. Reopen it to see the latest version, then select the match again."
 PRICING_LEDGER_LOCKS: dict[tuple[str, str], threading.RLock] = {}
@@ -25018,10 +25022,11 @@ class PricingSelectionConflict(Exception):
 
 
 def pricing_selection_requests(value: Any) -> list[dict[str, Any]] | None:
-    if not isinstance(value, list) or not 1 <= len(value) <= PRICING_SELECTION_MAX:
+    if not isinstance(value, list) or not 1 <= len(value) <= QUOTE_SESSION_DRAFT_MAX_LIST_ITEMS:
         return None
     requests = []
     seen: set[str] = set()
+    ordinary_count = 0
     for entry in value:
         if not isinstance(entry, dict) or set(entry) - {"reinclude"} != {"source_basis_line_id", "catalog_item_id", "expected_revision"}:
             return None
@@ -25029,8 +25034,12 @@ def pricing_selection_requests(value: Any) -> list[dict[str, Any]] | None:
         item_id = clean_text(entry.get("catalog_item_id"))
         revision = entry.get("expected_revision")
         reinclude = entry.get("reinclude", False)
-        if (not row_id or row_id in seen or not item_id or len(item_id) > 200
+        if (not row_id or row_id != entry.get("source_basis_line_id") or row_id in seen
+                or not isinstance(entry.get("catalog_item_id"), str) or not item_id or len(item_id) > 200
                 or type(revision) is not int or revision < 0 or type(reinclude) is not bool):
+            return None
+        ordinary_count += not reinclude
+        if ordinary_count > PRICING_SELECTION_MAX:
             return None
         seen.add(row_id)
         requests.append({"source_basis_line_id": row_id, "catalog_item_id": item_id, "expected_revision": revision,
@@ -25074,22 +25083,35 @@ def pricing_reinclude_view(views: dict[str, dict[str, Any]], row_id: str) -> dic
     aliases = {safe_resource_id(line.get(key), "") for key in ("id", "source_line_item_id")} - {""}
     if any((views.get(alias) or {}).get("line") is not line for alias in aliases):
         return None
-    if sum(views[alias]["row_count"] for alias in aliases) > 1:
+    row_count = sum(views[alias]["row_count"] for alias in aliases)
+    if row_count > 1 or row_count != view["row_count"]:
         return None
     return view
 
 
+def pricing_reinclude_claim_matches(row: dict[str, Any], grant: dict[str, Any]) -> bool:
+    authority = row["pricing_authority"]
+    return all(authority.get(key) == grant[key] for key in PRICING_LEDGER_GRANT_FIELDS if key != "reference_id") and all(
+        claim not in row or row[claim] == grant[key]
+        for claim, key in (("pricing_reference_id", "reference_id"), ("pricing_reference_source", "catalog_source"),
+                           ("pricing_basis_digest", "catalog_digest"))
+    )
+
+
 def saved_pricing_reinclude_proof(
     draft: dict[str, Any], row_id: str, view: dict[str, Any] | None,
-    entry: dict[str, Any], *, legacy: bool, scope: str, session_id: str,
+    entry: dict[str, Any], *, legacy: bool, latest_analysis: dict[str, Any] | None, scope: str, session_id: str,
 ) -> tuple[tuple | None, dict[str, Any] | None, str | None]:
     """Recover an excluded match from saved state and trusted catalogue provenance."""
     line = (view or {}).get("line")
     if not isinstance(line, dict) or normalize_basis_tag(line.get("tag")) != "Exclude":
         return None, None, None
     grant = entry.get("grant")
-    if view["row_count"]:
-        return pricing_reinclude_identity(view), grant, entry.get("source_unit")
+    if view["row_count"] and grant:
+        identity = pricing_reinclude_identity(view)
+        if identity is not None and pricing_reinclude_claim_matches(view["row"], grant):
+            return identity, grant, entry.get("source_unit")
+        return None, None, None
     # Old drafts may have removed the row entirely on Confirm. The snapshot may
     # describe the row, but only the server-issued seal proves its catalogue match.
     if not grant and (entry or not legacy):
@@ -25102,17 +25124,20 @@ def saved_pricing_reinclude_proof(
     }, include_unlinked_lines=True)
     original = pricing_reinclude_view(originals, row_id)
     identity = pricing_reinclude_identity(original)
-    if identity is None or identity != pricing_reinclude_identity({**view, "row": original["row"]}):
+    if identity is None or identity != pricing_reinclude_identity({**view, "row": view["row"] or original["row"]}):
         return None, None, None
     seal = verified_pricing_analysis_seal(
         pricing_analysis_seal_from_draft_state(draft), scope=scope, session_id=session_id,
     )
-    sealed_rows = [row for row in seal["rows"] if isinstance(row, dict) and row.get("id") == row_id] if seal else []
+    if not seal or (latest_analysis and seal["issued_at"] < latest_analysis["issued_at"]):
+        return None, None, None
+    sealed_rows = [row for row in seal["rows"] if isinstance(row, dict) and row.get("id") == row_id]
     if len(sealed_rows) != 1:
         return None, None, None
     [sealed] = sealed_rows
     sealed_quantity = pricing_ledger_quantity(sealed.get("quantity"))
-    if sealed_quantity is None or sealed_quantity != pricing_ledger_quantity(original["row"].get("quantity")):
+    if (sealed_quantity is None or sealed_quantity != pricing_ledger_quantity(original["row"].get("quantity"))
+            or sealed_quantity != pricing_ledger_quantity(line.get("quantity"))):
         return None, None, None
     reference = seal["reference"]
     sealed_grant = normalized_pricing_ledger_grant({
@@ -25120,7 +25145,11 @@ def saved_pricing_reinclude_proof(
         "catalog_unit": sealed.get("catalog_unit"), "catalog_source": reference.get("source"),
         "catalog_digest": reference.get("digest"), "reference_id": reference.get("id"),
     })
-    if not sealed_grant or (grant and any(grant[key] != sealed_grant[key] for key in PRICING_LEDGER_GRANT_FIELDS)):
+    if (not sealed_grant or not pricing_reinclude_claim_matches(original["row"], sealed_grant)
+            or not pricing_units_share_quantity_basis(sealed.get("unit"), sealed_grant["catalog_unit"])
+            or not pricing_units_share_quantity_basis(original["row"].get("unit"), sealed.get("unit"))
+            or not pricing_units_share_quantity_basis(line.get("unit"), sealed.get("unit"))
+            or (grant and any(grant[key] != sealed_grant[key] for key in PRICING_LEDGER_GRANT_FIELDS))):
         return None, None, None
     return identity, sealed_grant, sealed.get("unit")
 
@@ -25268,29 +25297,39 @@ def plan_pricing_selection_grants(
 
 def pricing_reinclude_refusals(
     selections: list[dict[str, Any]], existing: dict[str, Any], before: dict[str, Any],
-    draft: dict[str, Any], reference: tuple, lookup: dict[str, dict[str, Any]],
+    draft: dict[str, Any], payload: dict[str, Any], reference: tuple, lookup: dict[str, dict[str, Any]],
     *, scope: str, session_id: str,
 ) -> dict[str, str]:
     saved_draft = existing.get("draft_state") or {}
     previous = pricing_ledger_draft_rows(saved_draft, include_unlinked_lines=True)
     incoming = pricing_ledger_draft_rows(draft, include_unlinked_lines=True)
+    request_rows = pricing_ledger_draft_rows({
+        "lineItems": payload.get("line_items"), "quoteBasisSections": payload.get("quote_basis_sections"),
+    }, include_unlinked_lines=True)
     refusals = {}
     source, reference_id, digest, _currency = reference
     saved_reference = existing.get("pricing_reference") or {}
-    reference_changed = any(saved_reference.get(key) and saved_reference[key] != value
-                            for key, value in (("source", source), ("id", reference_id)))
+    reference_changed = any(claim and claim != value for claim, value in (
+        (saved_reference.get("source"), source), (saved_reference.get("id"), reference_id),
+        (saved_draft.get("pricingReferenceSource"), source), (saved_draft.get("pricingReferenceId"), reference_id),
+        (draft.get("pricingReferenceSource"), source), (draft.get("pricingReferenceId"), reference_id),
+    ))
     for request in selections:
         if not request.get("reinclude"):
             continue
         row_id, item_id = request["source_basis_line_id"], request["catalog_item_id"]
-        entry = before["rows"].get(row_id) or {}
+        entry = (before["rows"].get(row_id) or {}) if "pricing_ledger" in existing else {}
         identity, prior_grant, source_unit = saved_pricing_reinclude_proof(
             saved_draft, row_id, pricing_reinclude_view(previous, row_id), entry, legacy=before["origin"] == "legacy",
-            scope=scope, session_id=session_id,
+            latest_analysis=before.get("analysis"), scope=scope, session_id=session_id,
         )
         view = pricing_reinclude_view(incoming, row_id)
+        request_view = pricing_reinclude_view(request_rows, row_id)
         catalog_item = lookup.get(item_id)
-        if not prior_grant or identity is None or identity != pricing_reinclude_identity(view):
+        if (not prior_grant or identity is None or identity != pricing_reinclude_identity(view)
+                or not pricing_reinclude_claim_matches(view["row"], prior_grant)
+                or identity != pricing_reinclude_identity(request_view)
+                or not pricing_reinclude_claim_matches(request_view["row"], prior_grant)):
             refusals[row_id] = "ineligible"
         elif reference_changed or tuple(prior_grant[key] for key in PRICING_LEDGER_GRANT_FIELDS) != (
             item_id, canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item or {})),
@@ -25322,6 +25361,15 @@ def apply_pricing_selections(
         if not editable:
             raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
         before = effective_pricing_ledger(existing)
+        reinclude = any(request.get("reinclude") for request in selections)
+        scope = pricing_ledger_scope_for_storage(storage)
+        if reinclude:
+            expected_metadata = normalized_quote_session_metadata(existing)
+            expected_version = payload.get("expected_draft_version")
+            version = quote_session_draft_version(expected_metadata, scope)
+            if (not version or not isinstance(expected_version, str) or len(expected_version) != len(version)
+                    or not expected_version.isascii() or not hmac.compare_digest(expected_version, version)):
+                raise PricingSelectionConflict([], public_pricing_ledger(existing))
         stale = [
             {"source_basis_line_id": request["source_basis_line_id"], "status": "refused", "reason": "stale"}
             for request in selections
@@ -25332,13 +25380,15 @@ def apply_pricing_selections(
         reference = pricing_authority_reference_identity(exact_pricing_reference_authority(payload, auth_session=auth_session))
         lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload), auth_session=auth_session)
         staged = None
-        if any(request.get("reinclude") for request in selections):
+        if reinclude:
             patch = quote_session_patch_payload(payload)
             if not isinstance(patch.get("draft_state"), dict) or "draft_files" in patch:
                 raise PricingSelectionConflict([], public_pricing_ledger(existing))
+            for rows in (patch["draft_state"].get("lineItems"), payload.get("line_items")):
+                if not isinstance(rows, list) or len(rows) > QUOTE_SESSION_DRAFT_MAX_LIST_ITEMS:
+                    raise ValueError("Pricing selection draft has invalid line items.")
             draft = quote_session_draft_state(patch)
-            scope = pricing_ledger_scope_for_storage(storage)
-            refusals = pricing_reinclude_refusals(selections, existing, before, draft, reference, lookup,
+            refusals = pricing_reinclude_refusals(selections, existing, before, draft, payload, reference, lookup,
                                                  scope=scope, session_id=session_id)
             ledger = pricing_ledger_after_save(existing, draft, scope=scope, session_id=session_id)
             outcomes, _changed = plan_pricing_selection_grants(selections, ledger, draft, reference, lookup, refusals)
@@ -25347,19 +25397,26 @@ def apply_pricing_selections(
             if rejected:
                 raise PricingSelectionConflict(rejected, public_pricing_ledger(existing))
             staged = PricingSelectionDraft(
-                normalized_quote_session_metadata(existing), ledger,
+                expected_metadata, ledger,
                 frozenset(request["source_basis_line_id"] for request in selections if request.get("reinclude")),
             )
         saved = storage.create_or_update_quote_session(payload, pricing_selection_draft=staged) if staged else storage.create_or_update_quote_session(payload)
         if safe_quote_session_id(saved.get("session_id"), "") != session_id:
             raise SqagStorageAccessError("You do not have permission to perform this action.", status=403, reason="quote_session_not_editable")
-        persisted, _editable = read_pricing_ledger_record(storage, session_id)
-        if not staged:
+        if staged:
+            persisted = {"pricing_ledger": staged.ledger}
+        else:
+            persisted, _editable = read_pricing_ledger_record(storage, session_id)
+            persisted = normalized_quote_session_metadata(persisted)
+            saved_version = saved.pop("draft_version", None)
+            same_saved_draft = saved_version and saved_version == quote_session_draft_version(persisted, scope)
             ledger = copy.deepcopy(effective_pricing_ledger(persisted))
             outcomes, changed = plan_pricing_selection_grants(selections, ledger, persisted.get("draft_state"), reference, lookup, {})
             if changed:
-                write_quote_session_pricing_ledger(storage, session_id, normalized_quote_session_metadata(persisted), ledger)
-                persisted = {**normalized_quote_session_metadata(persisted), "pricing_ledger": ledger}
+                write_quote_session_pricing_ledger(storage, session_id, persisted, ledger)
+                persisted = {**persisted, "pricing_ledger": normalized_pricing_ledger(ledger)}
+            if same_saved_draft:
+                saved["draft_version"] = quote_session_draft_version(persisted, scope)
         view = PricingLedgerView(effective_pricing_ledger(persisted))
         line_items = normalize_line_items_for_quote_basis_review(payload, auth_session=auth_session, ledger_view=view)
         return {
@@ -28792,7 +28849,7 @@ def quote_session_draft_state_value(value: Any, depth: int = 0) -> Any:
     if isinstance(value, str):
         return dashboard_safe_text(value, 5000)
     if isinstance(value, list):
-        return [quote_session_draft_state_value(item, depth + 1) for item in value[:200]]
+        return [quote_session_draft_state_value(item, depth + 1) for item in value[:QUOTE_SESSION_DRAFT_MAX_LIST_ITEMS]]
     if isinstance(value, dict):
         sanitized: dict[str, Any] = {}
         seen_keys: set[str] = set()
@@ -29951,6 +30008,15 @@ def normalized_quote_session_metadata(metadata: dict[str, Any]) -> dict[str, Any
     return normalized
 
 
+def quote_session_draft_version(normalized_metadata: dict[str, Any], scope: str) -> str:
+    """Opaque comparison value for the same persisted state used by the draft CAS."""
+    key = pricing_analysis_seal_key()
+    if not key or not normalized_metadata:
+        return ""
+    state = json.dumps([scope, normalized_metadata], ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hmac.new(key, b"sqag-quote-draft-version-v1\x00" + state.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def quote_session_is_published(metadata: dict[str, Any]) -> bool:
     publication = metadata.get("publication") if isinstance(metadata.get("publication"), dict) else {}
     state = clean_text(publication.get("state")).lower()
@@ -30677,7 +30743,7 @@ def create_or_update_quote_session(
     if committed_publication is not None and committed_metadata is not None:
         committed_metadata.update(copy.deepcopy(metadata))
     try:
-        return public_quote_session(metadata)
+        return public_quote_session(metadata, include_draft_version=True)
     except Exception as exc:
         if committed_publication is None:
             raise
@@ -30800,7 +30866,10 @@ class QuotePublicationReadView:
                 "view_url": quote_publication_url(metadata["session_id"], kind, identity, inline=True) if kind == "pdf" else None,
             })
 
-    def project_saved(self, *, include_draft_state: bool = False, draft_files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def project_saved(
+        self, *, include_draft_state: bool = False,
+        draft_files: list[dict[str, Any]] | None = None, include_draft_version: bool = False,
+    ) -> dict[str, Any]:
         self._resolve()
         normalized = normalized_quote_session_metadata(self.metadata or {})
         if not normalized:
@@ -30809,6 +30878,8 @@ class QuotePublicationReadView:
         public.pop("publication", None)
         public.pop("owner", None)
         public["pricing_ledger"] = public_pricing_ledger(normalized)
+        if include_draft_state or include_draft_version:
+            public["draft_version"] = quote_session_draft_version(normalized, pricing_ledger_scope_for_storage(self.storage))
         draft = normalized.get("draft_state") if isinstance(normalized.get("draft_state"), dict) else {}
         public["has_draft_state"] = bool(draft)
         progress = quote_session_draft_progress(draft)
@@ -30885,8 +30956,10 @@ class QuotePublicationReadView:
         return public
 
 
-def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool = False) -> dict[str, Any]:
-    return QuotePublicationReadView(LocalSqagStorage(), metadata=metadata).project_saved(include_draft_state=include_draft_state)
+def public_quote_session(metadata: dict[str, Any], *, include_draft_state: bool = False, include_draft_version: bool = False) -> dict[str, Any]:
+    return QuotePublicationReadView(LocalSqagStorage(), metadata=metadata).project_saved(
+        include_draft_state=include_draft_state, include_draft_version=include_draft_version,
+    )
 
 
 def projected_public_job(snapshot: dict[str, Any], auth_session: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -35224,7 +35297,8 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         selections = pricing_selection_requests(payload.get("pricing_selections"))
         session = payload.get("quote_session") if isinstance(payload.get("quote_session"), dict) else {}
         if selections is None or not safe_quote_session_id(session.get("session_id"), ""):
-            self.send_json({"status": "blocked", "errors": ["Pricing selection request is invalid."]}, status=400)
+            self.send_json({"status": "blocked", "reason_code": "pricing_selection_invalid",
+                            "errors": ["Pricing selection request is invalid."]}, status=400)
             return
         commercial_review_block = quote_commercial_review_preflight(payload, auth_session=auth_session)
         if commercial_review_block:
