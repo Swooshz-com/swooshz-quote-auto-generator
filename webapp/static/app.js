@@ -3535,6 +3535,9 @@ function normalizeLineItem(item = {}) {
 
 function normalizeRestoredPricingRow(row = {}, normalizer = normalizeLineItem) {
   const normalized = normalizer(row);
+  if (normalizer === normalizeLineItem && typeof row.reincluded_catalog_selection === "string") {
+    normalized.reincluded_catalog_selection = row.reincluded_catalog_selection;
+  }
   if (Object.prototype.hasOwnProperty.call(row, "pricing_authority")) return normalized;
   const legacyEvidence = normalized.price_mode === "Included"
     || ["unit_price_override", "effective_unit_price", "pricing_basis_amount", "catalog_unit_price"].some((key) => (
@@ -10332,7 +10335,9 @@ function outputPriceDenomination(row = {}) {
 }
 
 function outputCellDisplayValue(row = {}, field = "") {
-  if (field === "amount" && outputPricingIsDeferred(row)) return "Price to be discussed";
+  if (["quoted_unit_price", "amount"].includes(field) && outputPricingIsDeferred(row)) {
+    return field === "amount" ? "Price to be discussed" : "-";
+  }
   if (field === "price_mode") return outputPriceAuthority(row)?.variant === "included" ? "Included" : "Priced";
   if (["unit_price_override", "quoted_unit_price", "amount"].includes(field)) {
     const authority = outputPriceAuthority(row);
@@ -10539,15 +10544,25 @@ function retainExcludedBasisPricingRows(rows) {
       if (line.source_line_item_id) ids.add(line.source_line_item_id);
     }
   }
-  const retained = (state.lineItems || []).filter((row) =>
+  const currentRows = state.lineItems || [];
+  const pendingReincludes = new Map(currentRows.filter((row) => row.reincluded_catalog_selection)
+    .map((row) => [row.source_basis_line_id, row.reincluded_catalog_selection]));
+  // Keep a refused re-inclusion distinct from a new Possible Match on subsequent Confirms.
+  const projected = pendingReincludes.size ? rows.map((row) => {
+    const selection = pendingReincludes.get(row.source_basis_line_id);
+    return selection && ["none", "historical"].includes(row.pricing_authority?.variant)
+      ? { ...row, reincluded_catalog_selection: selection }
+      : row;
+  }) : rows;
+  const retained = currentRows.filter((row) =>
     excluded.has(row.source_basis_line_id) && !active.has(row.source_basis_line_id)
-  ).map(({ deferred_pricing, ...row }) => ({
+  ).map(({ deferred_pricing, reincluded_catalog_selection, ...row }) => ({
     ...row,
     ...(deferred_pricing && !row.unmatched_pricing_offer ? { unmatched_pricing_offer: deferred_pricing } : {}),
   }));
-  if (!retained.length) return rows;
+  if (!retained.length) return projected;
   const retainedIds = new Set(retained.map((row) => row.source_basis_line_id));
-  return [...rows.filter((row) => !retainedIds.has(row.source_basis_line_id)), ...retained];
+  return [...projected.filter((row) => !retainedIds.has(row.source_basis_line_id)), ...retained];
 }
 
 function outputRowsToLineItems(rows = state.outputRows) {
@@ -11821,6 +11836,10 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
   const matches = normalizePossiblePricingMatches(currentLine.possible_pricing_matches || currentLine.possible_catalog_matches || []);
   if (!Number.isInteger(selectedIndex) || !matches[selectedIndex]) return;
   const match = matches[selectedIndex];
+  const ids = new Set([currentLine.id, currentLine.source_line_item_id].filter(Boolean));
+  for (const row of state.lineItems) {
+    if (ids.has(row.source_basis_line_id)) delete row.reincluded_catalog_selection;
+  }
   const reference = pricingReferenceLineText(match.description);
   const nextLine = {
     ...currentLine,
@@ -11862,6 +11881,27 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
   syncControlStates();
 }
 
+function reincludedCatalogueSelectionKey(line, section, row) {
+  const authority = outputPriceAuthority(row);
+  if (authority?.variant !== "catalog" || authority.catalog_item_id !== line.pricing_keyword) return "";
+  return JSON.stringify([
+    section.id, section.title, line.id, line.source_line_item_id || "", line.text, line.quantity, line.unit,
+    authority.context, row.quantity, currentPricingReference()?.id, authority.catalog_source, authority.catalog_digest,
+  ]);
+}
+
+function rememberReincludedCatalogueSelection(line, section, nextTag) {
+  if (normalizeBasisTag(line.tag) !== "Exclude" || nextTag !== "Include" || state.workflowStage !== "completed") return;
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  if (state.originalOutputRows.some((row) => ids.has(row.source_basis_line_id))) return;
+  const rows = state.lineItems.filter((row) => ids.has(row.source_basis_line_id));
+  if (rows.length !== 1) return;
+  const [row] = rows;
+  const key = reincludedCatalogueSelectionKey(line, section, row);
+  // This is draft intent. The server checks the saved binding and revision before pricing.
+  if (key) row.reincluded_catalog_selection = key;
+}
+
 function retagBasisLine(sectionId, lineIndex, nextTag) {
   const requestedTag = normalizeBasisTag(nextTag);
   if (!sectionId || !["Include", "Custom", "Exclude"].includes(requestedTag)) return;
@@ -11871,6 +11911,7 @@ function retagBasisLine(sectionId, lineIndex, nextTag) {
   if (!section || !section.lines[index]) return;
   const currentLine = section.lines[index];
   const resolvedTag = requestedTag === "Include" && basisLineAcceptsAsAiProposal(currentLine) ? "Custom" : requestedTag;
+  rememberReincludedCatalogueSelection(currentLine, section, resolvedTag);
   const customPricing = isCustomPricingBasisLine(currentLine) || resolvedTag === "Custom";
   const customConfirmed = customPricing && ["Include", "Custom"].includes(requestedTag);
   section.lines[index] = {
@@ -11895,6 +11936,7 @@ function retagBasisSectionConfirmLines(sectionId, nextTag) {
   let changed = false;
   section.lines = (section.lines || []).map((line) => {
     const resolvedTag = nextTag === "Include" && basisLineAcceptsAsAiProposal(line) ? "Custom" : nextTag;
+    rememberReincludedCatalogueSelection(line, section, resolvedTag);
     const customPricing = isCustomPricingBasisLine(line) || resolvedTag === "Custom";
     const customConfirmed = customPricing && nextTag === "Include";
     const currentTag = normalizeBasisTag(line.tag);
@@ -13407,7 +13449,7 @@ function captureOriginalAnalysisSnapshot(data = {}) {
 }
 
 
-// Unpriced rows whose basis line the operator bound to a catalogue match (a Possible Match click).
+// Explicit catalogue selections from Possible Match or from re-including a retained priced row.
 function pendingPricingSelections() {
   const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
   const revisions = isPlainObject(state.pricingLedgerRevisions?.[sessionId]) ? state.pricingLedgerRevisions[sessionId] : {};
@@ -13422,11 +13464,17 @@ function pendingPricingSelections() {
     if (!itemId || line.custom_pricing || normalizeBasisTag(line.tag) !== "Include") return;
     const rowId = [line.id, line.source_line_item_id].map((value) => String(value || "")).find((value) => rows.get(value));
     const row = rowId ? rows.get(rowId) : null;
-    if (!row || ["catalog", "manual", "included"].includes(row.pricing_authority?.variant) || selections.has(rowId)) return;
+    if (!row || ["manual", "included"].includes(row.pricing_authority?.variant) || selections.has(rowId)) return;
     const revision = revisions[rowId];
-    selections.set(rowId, { source_basis_line_id: rowId, catalog_item_id: itemId, expected_revision: Number.isInteger(revision) && revision >= 0 ? revision : 0 });
+    const reinclude = Boolean(row.reincluded_catalog_selection) || row.pricing_authority?.variant === "catalog";
+    if (reinclude && (!row.reincluded_catalog_selection || !Number.isSafeInteger(revision) || revision <= 0
+      || row.reincluded_catalog_selection !== reincludedCatalogueSelectionKey(line, section, row))) return;
+    selections.set(rowId, { source_basis_line_id: rowId, catalog_item_id: itemId,
+      expected_revision: Number.isInteger(revision) && revision >= 0 ? revision : 0,
+      ...(reinclude ? { reinclude: true } : {}),
+    });
   }));
-  return [...selections.values()].slice(0, 100);
+  return [...selections.values()].sort((left, right) => Number(Boolean(left.reinclude)) - Number(Boolean(right.reinclude))).slice(0, 100);
 }
 
 function openBlockingClarifications(questions = [], findings = [], project = {}) {

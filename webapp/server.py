@@ -25004,16 +25004,37 @@ def pricing_selection_requests(value: Any) -> list[dict[str, Any]] | None:
     requests = []
     seen: set[str] = set()
     for entry in value:
-        if not isinstance(entry, dict) or set(entry) != {"source_basis_line_id", "catalog_item_id", "expected_revision"}:
+        if not isinstance(entry, dict) or set(entry) - {"reinclude"} != {"source_basis_line_id", "catalog_item_id", "expected_revision"}:
             return None
         row_id = safe_resource_id(entry.get("source_basis_line_id"), "")
         item_id = clean_text(entry.get("catalog_item_id"))
         revision = entry.get("expected_revision")
-        if not row_id or row_id in seen or not item_id or len(item_id) > 200 or type(revision) is not int or revision < 0:
+        reinclude = entry.get("reinclude", False)
+        if (not row_id or row_id in seen or not item_id or len(item_id) > 200
+                or type(revision) is not int or revision < 0 or type(reinclude) is not bool):
             return None
         seen.add(row_id)
-        requests.append({"source_basis_line_id": row_id, "catalog_item_id": item_id, "expected_revision": revision})
+        requests.append({"source_basis_line_id": row_id, "catalog_item_id": item_id, "expected_revision": revision,
+                         "reinclude": reinclude})
     return requests
+
+
+def pricing_reinclude_identity(view: dict[str, Any] | None) -> tuple | None:
+    """Bind the retained catalogue row to its saved physical line across a tag change."""
+    row = (view or {}).get("row")
+    line = (view or {}).get("line")
+    if not isinstance(row, dict) or not isinstance(line, dict):
+        return None
+    authority = row.get("pricing_authority")
+    if not isinstance(authority, dict) or authority.get("variant") != "catalog":
+        return None
+    if normalize_basis_tag(line.get("tag")) not in {"Exclude", "Include", "Confirm"} or line.get("custom_pricing"):
+        return None
+    return (
+        tuple(clean_text(line.get(key)) for key in ("id", "source_line_item_id", "text", "pricing_keyword")),
+        canonical_pricing_authority_unit(line.get("unit")), pricing_ledger_quantity(line.get("quantity")),
+        pricing_authority_context(row), pricing_ledger_quantity(row.get("quantity")),
+    )
 
 
 def pricing_selection_refusal(
@@ -25125,6 +25146,9 @@ def apply_pricing_selections(
         persisted, _editable = read_pricing_ledger_record(storage, session_id)
         ledger = copy.deepcopy(effective_pricing_ledger(persisted))
         views = pricing_ledger_draft_rows(persisted.get("draft_state"))
+        previous_views = pricing_ledger_draft_rows(existing.get("draft_state")) if any(
+            request.get("reinclude") for request in selections
+        ) else {}
         reference = exact_pricing_reference_authority(payload, auth_session=auth_session)
         source, reference_id, digest, _currency = pricing_authority_reference_identity(reference)
         lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload), auth_session=auth_session)
@@ -25136,6 +25160,17 @@ def apply_pricing_selections(
             entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
             catalog_item = lookup.get(item_id)
             reason = pricing_selection_refusal(request, views.get(row_id), entry.get("source_unit"), catalog_item, lookup)
+            if not reason and request.get("reinclude"):
+                # A superseded grant identifies the previous selection. The normal admission
+                # checks and current catalogue above are still required to issue a new grant.
+                prior_grant = (before["rows"].get(row_id) or {}).get("grant")
+                previous_identity = pricing_reinclude_identity(previous_views.get(row_id))
+                if not prior_grant or previous_identity is None or previous_identity != pricing_reinclude_identity(views.get(row_id)):
+                    reason = "ineligible"
+                elif tuple(prior_grant[key] for key in ("catalog_source", "reference_id", "catalog_digest", "catalog_item_id", "catalog_unit")) != (
+                    source, reference_id, digest, item_id, canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)),
+                ):
+                    reason = "reference_changed"
             if not reason and not (source and reference_id and PRICING_REFERENCE_DIGEST_RE.fullmatch(digest)):
                 reason = "reference_changed"
             if reason:

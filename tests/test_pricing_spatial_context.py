@@ -35,6 +35,7 @@ class PricingSpatialContextTest(unittest.TestCase):
         self.assertEqual(evidence['spatialBeforeConfirm']['price'], None)
         self.assertEqual(evidence['saveReopen'], 'PASS')
         self.assertEqual(evidence['excludedReopen'], 'PASS')
+        self.assertEqual(evidence['reincludedPricing'], 'PASS')
         self.assertTrue(evidence['deferredReopened'])
         self.assertEqual(evidence['xlsx']['status'], 'PASS')
         self.assertEqual(json.loads(evidence['xlsx']['validator'])['bad'], [])
@@ -167,6 +168,57 @@ class PricingSpatialContextTest(unittest.TestCase):
                 bad['quote_basis_sections'][0]['lines'][0]['text'] = '[ ' + item['description'] + ' ] - Synthetic round tables with synthetic cafe chairs'
                 self.fixture._ledger_sync(bad)
                 self.assertIsNone(self.fixture._ledger_price(webapp.normalize_line_items_for_final_brief(bad), 'selected-row'))
+
+    def test_reinclude_requires_current_revision_unchanged_row_and_a_prior_grant(self):
+        storage = webapp.LocalSqagStorage()
+        for case in ('current', 'stale', 'changed', 'missing', 'reference'):
+            with self.subTest(case=case):
+                payload, item = self.selection_payload('Synthetic cafe chairs at the synthetic round tables')
+                row_id = payload['line_items'][0]['source_basis_line_id']
+                session_id = f'quote-reinclude-{case}'
+                if case == 'missing':
+                    payload['quote_session'] = {'session_id': session_id}
+                    original_revision = 0
+                else:
+                    payload, selected = self.fixture._owner_server_selection(payload, item, session_id)
+                    original_revision = selected['quote_session']['pricing_ledger']['rows'][row_id]
+                    payload['line_items'] = selected['line_items']
+                self.fixture._ledger_line(payload, row_id)['tag'] = 'Exclude'
+                self.fixture._ledger_sync(payload)
+                storage.create_or_update_quote_session(payload)
+                saved = webapp.read_quote_session_metadata(session_id)
+                if case == 'reference':
+                    ledger = copy.deepcopy(saved['pricing_ledger'])
+                    ledger['rows'][row_id]['grant']['catalog_digest'] = 'sha256:' + '0' * 64
+                    webapp.write_quote_session_pricing_ledger(storage, session_id, saved, ledger)
+                    saved = webapp.read_quote_session_metadata(session_id)
+                payload['line_items'] = copy.deepcopy(saved['draft_state']['lineItems'])
+                payload['quote_basis_sections'] = copy.deepcopy(saved['draft_state']['quoteBasisSections'])
+                line = self.fixture._ledger_line(payload, row_id)
+                line['tag'] = 'Include'
+                if case == 'changed':
+                    line['text'] += ' for another position'
+                if case == 'current':
+                    payload['line_items'][0]['catalog_unit_price'] = 999
+                self.fixture._ledger_sync(payload)
+                request = {'source_basis_line_id': row_id, 'catalog_item_id': item['id'], 'reinclude': True,
+                           'expected_revision': original_revision if case == 'stale' else
+                           webapp.public_pricing_ledger(saved)['rows'][row_id]}
+                self.assertIsNone(self.fixture._ledger_price(webapp.normalize_line_items_for_quote_basis_review(payload), row_id))
+                if case == 'stale':
+                    with self.assertRaises(webapp.PricingSelectionConflict):
+                        webapp.apply_pricing_selections(payload, [request], storage)
+                    self.assertTrue(webapp.read_quote_session_metadata(session_id) == saved,
+                                    'stale selection changed the saved quote')
+                    continue
+                result = webapp.apply_pricing_selections(payload, [request], storage)
+                if case == 'current':
+                    self.assertEqual(result['selections'], [{'source_basis_line_id': row_id, 'status': 'selected'}])
+                    self.assertEqual(self.fixture._ledger_price(result['line_items'], row_id), webapp.pricing_reference_sale_unit_price(item))
+                else:
+                    self.assertEqual(result['selections'], [{'source_basis_line_id': row_id, 'status': 'refused',
+                                                            'reason': 'reference_changed' if case == 'reference' else 'ineligible'}])
+                    self.assertIsNone(self.fixture._ledger_price(result['line_items'], row_id))
 
     def test_bracket_label_and_client_authority_cannot_supply_primary_evidence(self):
         for index, (detail, unit, reason) in enumerate((

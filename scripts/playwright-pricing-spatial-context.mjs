@@ -171,16 +171,42 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
     return results;
   });
   assert(editedGroups.every(Boolean), "an edited or re-referenced row retained the Keep control", editedGroups);
+  await (await basisControl(page, "u1-excluded-match", '[data-basis-tag="Include"]')).click();
+  const editedSelection = await page.evaluate(() => {
+    const line = state.quoteBasisSections.flatMap((section) => section.lines).find((entry) => entry.id === "u1-excluded-match");
+    const original = line.text;
+    line.text += " for another position";
+    const selected = pendingPricingSelections().some((entry) => entry.source_basis_line_id === line.id);
+    line.text = original;
+    return selected;
+  });
+  assert(!editedSelection, "edited row automatically requested its prior catalogue selection");
   assert(await keep.innerText() === "Keep as unpriced", "re-included row did not offer a fresh Keep decision");
   await keep.click();
   assert(await keep.innerText() === "Undo keep", "re-included row could not be kept");
   await page.locator("#sideNextButton").click();
   await page.locator("#outputSidePanel.is-active").waitFor({ state: "visible", timeout: 30000 });
   await page.waitForFunction(() => !appIsBusy());
-  assert(await page.evaluate(() => state.outputRows.some((row) =>
-    row.source_basis_line_id === "u1-unmatched" && outputPricingIsDeferred(row))
-    && state.outputRows.every((row) => row.source_basis_line_id !== "u1-excluded-match")),
-    "re-included Keep did not reach Output or the other row stopped being excluded");
+  const reopenedOutput = await page.evaluate(() => {
+    const matched = state.outputRows.find((row) => row.source_basis_line_id === "u1-excluded-match");
+    const deferredIndex = state.outputRows.findIndex((row) => row.source_basis_line_id === "u1-unmatched");
+    const deferred = state.outputRows[deferredIndex];
+    const cell = (selector) => document.querySelector(selector)?.textContent.trim();
+    return {
+      catalogue: matched?.pricing_authority?.variant === "catalog",
+      quoted: outputCellDisplayValue(matched, "quoted_unit_price"), amount: outputCellDisplayValue(matched, "amount"),
+      deferred: outputPricingIsDeferred(deferred),
+      deferredUnit: cell('[data-output-price-entry="quote"][data-output-row="' + deferredIndex + '"] .output-cell-text'),
+      deferredAmount: document.querySelector('[data-output-price-entry="quote"][data-output-row="' + deferredIndex + '"]')
+        ?.closest('tr')?.querySelector('[data-output-label="Amount"]')?.textContent.trim(),
+    };
+  });
+  const floodPrice = byName("LED Flood Light").sale_unit_price;
+  assert(reopenedOutput.catalogue && reopenedOutput.quoted === cents(floodPrice * fxRate).toFixed(2)
+    && reopenedOutput.amount === cents(3 * floodPrice * fxRate).toFixed(2), "re-included catalogue FX or amount missing", reopenedOutput);
+  assert(reopenedOutput.deferred && reopenedOutput.deferredUnit === "-" && reopenedOutput.deferredAmount === "Price to be discussed",
+    "re-included deferred price rendered incorrectly", reopenedOutput);
+  result.reincludedPricing = "PASS";
   result.excludedReopen = "PASS";`);
 replaceOnce('    result.saveReopen = "PASS";', `
     result.saveReopen = "PASS";
@@ -191,6 +217,8 @@ replaceOnce('    result.saveReopen = "PASS";', `
 replaceOnce('trusted: pricingAuthorityPrice(outputPriceAuthority(row)) !== null', 'trusted: outputPricingIsDeferred(row) || pricingAuthorityPrice(outputPriceAuthority(row)) !== null');
 replaceOnce('    // The analysis seal is opaque transport', `
     expectedRows.push({ id: "u1-unmatched", description: "Kinetic sculpture", quantity: "2 nos", amount: "Price to be discussed" });
+    expectedRows.push({ id: "u1-excluded-match", description: byName("LED Flood Light").description,
+      quantity: "3 nos", amount: cents(3 * floodPrice * fxRate) });
     // The analysis seal is opaque transport`);
 replaceOnce("abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005",
   "(hit[0].get('E') != (e['amount'], None) if isinstance(e['amount'], str) else abs(float(get(hit[0],'E') or 'nan')-e['amount'])>0.005)");

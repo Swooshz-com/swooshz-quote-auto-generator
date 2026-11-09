@@ -31074,6 +31074,7 @@ const state = {
   pricingReferences: [
     { id: "default-ref", source: "local", items: [{ section: "Floor Coverings", description: "Raised platform flooring" }] },
   ],
+  lineItems: [],
   outputRows: [],
   originalOutputRows: [],
   downloadFile: null,
@@ -31206,6 +31207,8 @@ eval([
             "possibleMatchBasisDetailText",
             "catalogBackedPossibleMatchText",
   "applyPossiblePricingMatch",
+  "reincludedCatalogueSelectionKey",
+  "rememberReincludedCatalogueSelection",
   "retagBasisLine",
   "retagBasisSectionConfirmLines",
 ].map(extractFunction).join("\n"));
