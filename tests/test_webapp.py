@@ -43381,7 +43381,9 @@ main().catch((error) => {
                                ("between four and six metres squared", False),
                                ("24 sqm (site note; range is 4 to 6 sqm)", False),
                                ("24 sqm (survey: same measurement)", True),
-                               ("(24 sqm) site record", True), ("6 metres x 4 metres (full coverage)", True)):
+                               ("(24 sqm) (site record)", True), ("6 metres x 4 metres (full coverage)", True),
+                               ("24 sqm to thirty", False), ("(24 sqm) site record", False), ("(24 sqm) to thirty", False),
+                               ("24 sqm (site note) to thirty", False), ("24 sqm,", True)):
             with self.subTest(other=other):
                 sources = {"Quote notes": [statement], "Reference 1, PDF page 1": [f"{label}: {other}"]}
                 record = webapp.admitted_scope_measurements(draft, sources)["floor"]
@@ -43412,6 +43414,7 @@ main().catch((error) => {
             ("grouped", label, label, f"{label}: 1,200 sqm", "", 1200, "observed", True),
             ("grouped-not-decimal", label, label, f"{label}: 1,200 sqm", "", 1.2, "observed", False),
             ("derived", label, label, f"{label}: 1,200 m x 2 m, full coverage", "", 2400, "derived", True),
+            ("derived-wrapped", label, label, f"{label}: 6 m x 4 m, full coverage", "", 24, "derived", True),
             ("generic-west", label + " at west", label + " at west", f"{label}: 24 sqm", f"{label} at west: 4 sqm", 24, "observed", False),
             ("linked-west", label + " at east", label + " at west", f"{label} at east: 24 sqm", "", 24, "observed", False),
             ("contradiction", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm", 24, "observed", False),
@@ -43422,6 +43425,9 @@ main().catch((error) => {
             ("approximation", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: Approximately 4 sqm", 24, "observed", False),
             ("opaque-area", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: the survey estimate is unresolved, in sqm", 24, "observed", False),
             ("wrapped-range", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: site survey\n4 to 6 sqm", 24, "observed", False),
+            ("punctuated-wrap", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: Site survey\nrange: 4 to 6 sqm", 24, "observed", False),
+            ("range-suffix", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: 24 sqm to 30", 24, "observed", False),
+            ("short-pair", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: 6 by 4 m", 24, "observed", False),
             ("same-line-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 4 to 6 sqm", 24, "observed", False),
             ("free-geometry", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: width about 4 m, depth still below 6 m", 24, "observed", False),
             ("annotated-repeat", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24.0 SQM (site measurement)", 24, "observed", True),
@@ -43435,7 +43441,8 @@ main().catch((error) => {
             ("uncertain-extent", label, label, f"{label}: 24 sqm", f"{label}: W 6 m x D 4 m, partial coverage", 24, "observed", False),
             ("duplicate", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24 SQM", 24, "observed", False),
         )
-        west_cases = {"range", "approximation", "opaque-area", "wrapped-range", "same-line-range", "free-geometry"}
+        west_cases = {"range", "approximation", "opaque-area", "wrapped-range", "same-line-range", "free-geometry",
+                      "punctuated-wrap", "range-suffix", "short-pair"}
         config = synthetic_configuration(credential="synthetic")
         with (mock.patch.object(webapp, "read_dotenv_value", side_effect=config.get),
               mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
@@ -43448,6 +43455,8 @@ main().catch((error) => {
                         east_label = "Carpet tile east" if name == "same-line-range" else f"{label} at east"
                         east_statement = f"{east_label}: 10 sqm"
                         sources = [statement, other] if other else [statement]
+                        if name == "derived-wrapped":
+                            sources = [statement.replace(", full coverage", ",\nfull coverage")]
                         if route == "batch":
                             sources.reverse()
                         if name == "annotated-reversed":
@@ -43503,7 +43512,9 @@ main().catch((error) => {
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
                         if name in west_cases:
                             self.assertEqual(entries["east"]["catalog_item_id"], self.LEDGER_CARPET)
-                        workbook_cases = {"approved", "decimal", "grouped", "grouped-not-decimal", "annotated-conflict", "mixed-format", "range", "approximation"}
+                        workbook_cases = {"approved", "decimal", "grouped", "derived-wrapped", "grouped-not-decimal", "annotated-conflict",
+                                          "mixed-format", "range", "approximation", "punctuated-wrap", "range-suffix",
+                                          "short-pair"}
                         if route == "pdf" and name in workbook_cases:
                             include = {"floor", "spot"} if allowed else {"spot"}
                             if name in west_cases:

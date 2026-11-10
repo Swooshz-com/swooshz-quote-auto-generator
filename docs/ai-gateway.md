@@ -90,8 +90,11 @@ Conflicting or reused evidence stays in pricing review. Each measurement record
 starts with its exact scope label followed by a colon. Use separate lines or
 semicolons for separate records. Area units or dimension markers anywhere in
 the record identify a claim, including ranges or prose without a safe amount.
-Wrapped text and unlabelled continuations remain with their preceding record.
-Unresolved claims hold that scope in review. A derived area requires
+Wrapped scope labels and area-bearing continuations remain with their preceding
+record. A colon in a continuation can complete an open record that has yet to
+show an area marker. Keep repeat context in brackets or parentheses so a trailing
+range cannot look like a second exact amount. Unresolved claims hold that scope
+in review. A derived area requires
 both dimensions in metres and full coverage of the same quoted scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.

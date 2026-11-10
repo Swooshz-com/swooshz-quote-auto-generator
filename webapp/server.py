@@ -25595,7 +25595,10 @@ AREA_UNIT_MARKER = re.compile(
     rf"|(?:{SCOPE_LENGTH_UNIT})\s*(?:\^?\s*2|squared))(?![\w^])", re.I,
 )
 AREA_LENGTH_MARKER = re.compile(rf"(?<![^\W\d_])(?:{SCOPE_LENGTH_UNIT})(?![\w^])", re.I)
-AREA_GEOMETRY_MARKER = re.compile(r"(?<![^\W\d_])[x\u00d7](?![^\W\d_])|\bcoverage\b", re.I)
+AREA_GEOMETRY_MARKER = re.compile(
+    r"(?<![^\W\d_])[x\u00d7](?![^\W\d_])|\bcoverage\b|\d\s+by\s+(?=[~+\-\u2212]?\s*\d)", re.I,
+)
+AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
 
 
 @dataclass(frozen=True)
@@ -25675,30 +25678,46 @@ def area_source_fragments(raw: str):
 def area_source_statements(raw: str, scopes: set[str]):
     """Keep wrapped source lines attached to their labelled record."""
     record = []
+    body = ""
     prefix = ""
+
+    def statements():
+        if not record:
+            return
+        if len(record) == 1:
+            yield record[0]
+            return
+        first = area_measurement_claim(record[0], scopes)
+        combined = " ".join(record)
+        if first is None or first.quantity is None:
+            # A wrapped amount or geometry is one claim, including its coverage line.
+            yield combined
+        else:
+            yield record[0]
+            if area_claim_kind(" ".join(record[1:])):
+                yield combined
+
     for line in area_source_fragments(raw):
         if not line:
             continue
         joined = f"{prefix} {line}" if prefix else line
         direct = scoped_area_text(line, scopes)
         wrapped = scoped_area_text(joined, scopes) if prefix and not direct else None
-        if direct or wrapped or any(separator == ":" for _, separator in area_record_separators(line)):
-            if record:
-                yield record[0]
-                if len(record) > 1:
-                    yield " ".join(record)
-            record = [joined if wrapped else line] if direct or wrapped else []
+        scoped = direct or wrapped
+        new_label = any(separator == ":" for _, separator in area_record_separators(line))
+        if scoped or (new_label and (not record or area_claim_kind(body))):
+            yield from statements()
+            record = [joined if wrapped else line] if scoped else []
+            body = scoped[2] if scoped else ""
             prefix = ""
         elif any(scope.startswith(pricing_measurement_scope(joined) + " ") for scope in scopes):
             prefix = joined
         else:
             if record:
                 record.append(joined)
+                body += f" {joined}"
             prefix = ""
-    if record:
-        yield record[0]
-        if len(record) > 1:
-            yield " ".join(record)
+    yield from statements()
 
 
 def area_claim_kind(text: str) -> str:
@@ -25750,11 +25769,17 @@ def area_measurement_claim(statement: str, scopes: set[str]) -> AreaMeasurementC
         quantity = area_evidence_quantity(observed["number"])
         proof_shape = bool(re.fullmatch(rf"{AREA_EVIDENCE_NUMBER}\s+(?:{AREA_CLAIM_UNIT})", measurement, re.I))
 
+    # Delimit context separately from the value so a trailing expression cannot corroborate it.
+    context = annotation
+    if claim_text.startswith("(") and context.startswith(")"):
+        context = context[1:].strip()
+    aside = not context.strip(" .,!?") or AREA_ASIDE.fullmatch(context)
     prefix = leading_quantity_prefix(label)
     if (unit not in AREA_EVIDENCE_UNITS or qualifier or uses_provisional_dimensions(label)
             or uses_provisional_dimensions(annotation, unit) or AREA_PROVISIONAL_QUALIFIER.match(scope)
             or (prefix and (Decimal(str(prefix["quantity"])) != quantity
                             or not pricing_units_share_quantity_basis(prefix["unit"], unit)))
+            or not aside or any(char.isnumeric() for char in annotation)
             or area_claim_kind(annotation) or (derived and re.search(r"\bcoverage\b", annotation, re.I))):
         quantity = None
     eligible = quantity is not None and proof_shape and len(statement) <= 300
