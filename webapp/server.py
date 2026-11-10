@@ -47,7 +47,7 @@ import urllib.request
 import unicodedata
 import warnings
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2))):
+                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3))):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 3
+AREA_EVIDENCE_CLAIM_VERSION = 4
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25599,7 +25599,7 @@ AREA_GEOMETRY_MARKER = re.compile(
     rf"(?<![^\W\d_])[x\u00d7](?![^\W\d_])|\bcoverage\b|"
     rf"(?<![^\W\d_])(?:{SCOPE_LENGTH_UNIT})(?:\s+wide)?\s+by\b", re.I,
 )
-AREA_BY_MARKER = re.compile(r"\d\s+by\s+", re.I)
+AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
 AREA_BODY_BREAK = re.compile(r"[;\r\n]|[.!?](?=\s|$)")
 
@@ -25690,7 +25690,51 @@ def scoped_area_text(statement: str, scopes: set[str]) -> tuple[str, str, str] |
 def area_scope_pattern(scopes: set[str]) -> re.Pattern[str]:
     labels = [re.escape(scope).replace(r"\ ", r"\s+").replace(":", r"\s*:")
               for scope in sorted(scopes, key=lambda scope: (-len(scope), scope))]
-    return re.compile(rf"(?<![\w-])(?P<label>{'|'.join(labels) or '(?!)'})(?:\s*\])?\s*:")
+    return re.compile(rf"(?<![\w-])(?P<label>{'|'.join(labels) or '(?!)'})(?:\s*[)\]}}])*\s*:")
+
+
+def area_standalone_heading(text: str) -> bool:
+    """A heading can bound a completed measurement without naming a quoted scope."""
+    if ":" not in text:
+        return False
+    context, _ = area_bracket_context(text)
+    for delimiter in re.finditer(":", text):
+        if context[delimiter.start()] == -1:
+            heading = text[:delimiter.start()]
+            return any(char.isalpha() for char in heading) and not area_claim_kind(heading)
+    return False
+
+
+def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> AreaMeasurementClaim | None:
+    """Resolve wraps before testing whether a following heading is independent."""
+    prefix = []
+    tail = []
+    claim = None
+    completed = False
+    ambiguous_heading = False
+    for part, separator in parts:
+        heading = bool(prefix) and area_standalone_heading(part)
+        if completed:
+            if heading:
+                break
+            tail.append(part)
+            continue
+
+        ambiguous_heading |= heading
+        # Question marks survive both sentence framing and line-wrap reassembly.
+        value = clean_text(" ".join([*prefix, part + ("?" if separator == "?" else "")]))
+        claim = area_measurement_claim(record.scope, record.label, value)
+        completed = claim is not None and claim.quantity is not None
+        prefix.append(part + separator)
+
+    if claim is None:
+        return None
+    if not record.framed or ambiguous_heading or area_claim_kind(" ".join(tail)):
+        return AreaMeasurementClaim(record.scope, claim.kind, None, "", (), False)
+    if pricing_measurement_scope(record.label) != record.scope:
+        # A newly recognised wrapper can locate a conflict without expanding proof authority.
+        return replace(claim, eligible=False)
+    return claim
 
 
 def area_source_claims(raw: str, pattern: re.Pattern[str]):
@@ -25702,32 +25746,39 @@ def area_source_claims(raw: str, pattern: re.Pattern[str]):
     context, pairs = area_bracket_context(text)
     groups = {}
     for anchor in anchors:
-        group = context[anchor.start()]
-        if group >= 0 and text[group] == "[" and pairs[group] < anchor.end():
+        start, end = anchor.span("label")
+        group = context[start]
+        while (group >= 0 and end <= pairs[group] < anchor.end()
+               and not text[group + 1:start].strip() and not text[end:pairs[group]].strip()):
+            start, end = group, pairs[group] + 1
             group = context[group]
-        groups.setdefault(group, []).append(anchor)
+        if group < 0 or anchor.end() <= pairs[group]:
+            groups.setdefault(group, []).append((anchor, start, end))
 
     masked = list(text)
     for group, labels in sorted(groups.items(), reverse=True):
         end = pairs.get(group, len(text))
         previous = group + 1
         records = []
-        for anchor in labels:
+        for anchor, start, label_end in labels:
             scope = pricing_measurement_scope(anchor["label"])
             prefix_start = previous
-            for boundary in AREA_BODY_BREAK.finditer(text, previous, anchor.start()):
+            for boundary in AREA_BODY_BREAK.finditer(text, previous, start):
                 if context[boundary.start()] == group:
                     prefix_start = boundary.end()
-            prefix = text[prefix_start:anchor.start()].strip().lstrip("-\u2022 ")
-            label = clean_text(prefix + " " + text[anchor.start():anchor.end() - 1])
-            canonical = pricing_measurement_scope(label) == scope
+            prefix = text[prefix_start:start].strip().lstrip("-\u2022 ")
+            raw_label = text[start:anchor.end() - 1]
+            label = clean_text(prefix + " " + raw_label)
+            wrapped = start < anchor.start() and not text[label_end:anchor.end() - 1].strip()
+            comparable_label = anchor["label"] if wrapped else raw_label
+            canonical = pricing_measurement_scope(prefix + " " + comparable_label) == scope
             framed = group == -1 and canonical and (not records or prefix_start > previous or not prefix)
             if group == -1 and records and prefix_start == previous and prefix:
                 prior = records[-1]
-                adjacent = area_measurement_claim(prior.scope, prior.label, clean_text(text[previous:anchor.start()]))
-                framed = bool(adjacent and adjacent.eligible)
-                label = anchor["label"]
-            label_start = prefix_start if framed and prefix and (not records or prefix_start > previous) else anchor.start()
+                adjacent = area_measurement_claim(prior.scope, prior.label, clean_text(text[previous:start]))
+                framed = bool(adjacent and adjacent.eligible and pricing_measurement_scope(comparable_label) == scope)
+                label = clean_text(raw_label)
+            label_start = prefix_start if framed and prefix and (not records or prefix_start > previous) else start
             records.append(AreaScopeSpan(label_start, anchor.end(), scope, label if framed else anchor["label"], framed))
             previous = anchor.end()
 
@@ -25738,29 +25789,15 @@ def area_source_claims(raw: str, pattern: re.Pattern[str]):
             for boundary in AREA_BODY_BREAK.finditer(text, start, limit):
                 if context[boundary.start()] == group:
                     part = clean_text("".join(masked[start:boundary.start()]))
-                    parts.append((part, boundary.group().strip()))
+                    separator = boundary.group().strip()
+                    if not part and separator == "?" and parts and not parts[-1][1]:
+                        parts[-1] = (parts[-1][0], separator)
+                    elif part or separator:
+                        parts.append((part, separator))
                     start = boundary.end()
             parts.append((clean_text("".join(masked[start:limit])), ""))
-            first = area_measurement_claim(record.scope, record.label, parts[0][0])
-            continuation = []
-            for part, separator in parts[1:]:
-                heading, colon, _ = part.partition(":")
-                if (first and first.quantity is not None and colon
-                        and pricing_measurement_scope(heading).startswith(record.scope + " ")):
-                    break
-                continuation.append((part, separator))
-            tail = clean_text(" ".join(part for part, _ in continuation))
-            if first is None or first.quantity is None:
-                # Only line wraps may disappear from a value. Interior punctuation still counts.
-                value = clean_text(" ".join(part + separator for part, separator in [parts[0], *continuation])).rstrip(".!?")
-                claim = area_measurement_claim(record.scope, record.label, value)
-            elif area_claim_kind(tail):
-                claim = AreaMeasurementClaim(record.scope, first.kind, None, "", (), False)
-            else:
-                claim = first
+            claim = area_record_claim(record, parts)
             if claim is not None:
-                if not record.framed:
-                    claim = AreaMeasurementClaim(record.scope, claim.kind, None, "", (), False)
                 yield claim
             if group != -1:
                 masked[record.start:limit] = " " * (limit - record.start)
@@ -25823,7 +25860,7 @@ def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeas
             or uses_provisional_dimensions(annotation, unit) or AREA_PROVISIONAL_QUALIFIER.match(scope)
             or (prefix and (Decimal(str(prefix["quantity"])) != quantity
                             or not pricing_units_share_quantity_basis(prefix["unit"], unit)))
-            or not aside or any(char.isnumeric() for char in annotation)
+            or not aside or "?" in measurement or any(char.isnumeric() for char in annotation)
             or area_claim_kind(annotation) or (derived and re.search(r"\bcoverage\b", annotation, re.I))):
         quantity = None
     eligible = quantity is not None and proof_shape and len(label) + len(measurement) + 2 <= 300

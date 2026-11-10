@@ -90,8 +90,11 @@ Conflicting or reused evidence stays in pricing review. Write each record with
 its exact scope label followed by a colon. Separate records can share a line.
 Area units or dimension markers anywhere in a record identify a claim, including
 ranges and dimensions with uncertain components. Wrapped labels and measurement
-lines stay together. A label inside a bracketed annotation can flag a conflicting
-measurement for that scope, while a rate requires separate, clearly framed proof.
+lines stay together. A question mark keeps a measurement in review. A label
+inside an annotation can flag a conflict for its own scope, while a rate requires
+clearly framed proof. An unrelated heading after a completed measurement starts
+a separate record. If the heading could belong to an unfinished measurement,
+the unfinished scope stays in pricing review and independent scopes can price.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. Unresolved claims hold that scope in review. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
