@@ -43377,11 +43377,25 @@ main().catch((error) => {
         draft = {"quote_basis_sections": [{"lines": [line]}], "line_items": [row]}
         for other, allowed in (("~4 sqm", False), ("estimated 4 sqm", False), ("4 square feet", False),
                                ("6 ft x 4 ft, full coverage", False), ("1 200,0 sqm", False),
+                               ("\uff14\u2013\uff16 \u33a1", False),
+                               ("between four and six metres squared", False),
+                               ("24 sqm (site note; range is 4 to 6 sqm)", False),
+                               ("24 sqm (survey: same measurement)", True),
                                ("(24 sqm) site record", True), ("6 metres x 4 metres (full coverage)", True)):
             with self.subTest(other=other):
                 sources = {"Quote notes": [statement], "Reference 1, PDF page 1": [f"{label}: {other}"]}
                 record = webapp.admitted_scope_measurements(draft, sources)["floor"]
                 self.assertEqual(record["disposition"], "measured" if allowed else "review")
+
+        located = f"{label}: west lower level"
+        line.update(text=located, measurement_evidence={"source": "Quote notes", "kind": "observed", "statement": f"{located}: 24 sqm"})
+        row.update(description=located)
+        sources = {"Quote notes": [f"{located}: 24 sqm"]}
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
+        sources["Quote notes"].append(f"Synthetic carpet tile\nflooring: west lower level: about four to six sqm")
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "review")
+        sources = {"Quote notes": [f"{located}: 24 sqm; approximately 4 sqm"]}
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "review")
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
@@ -43404,6 +43418,12 @@ main().catch((error) => {
             ("annotated-conflict", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm (final: site measurement)", 24, "observed", False),
             ("annotated-reversed", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm (final: site measurement)", 24, "observed", False),
             ("mixed-format", label, label, f"{label}: 1,200 sqm", f"{label}: 1.200,0 sqm", 1200, "observed", False),
+            ("range", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: 4 to 6 sqm (site survey range)", 24, "observed", False),
+            ("approximation", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: Approximately 4 sqm", 24, "observed", False),
+            ("opaque-area", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: the survey estimate is unresolved, in sqm", 24, "observed", False),
+            ("wrapped-range", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: site survey\n4 to 6 sqm", 24, "observed", False),
+            ("same-line-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 4 to 6 sqm", 24, "observed", False),
+            ("free-geometry", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: width about 4 m, depth still below 6 m", 24, "observed", False),
             ("annotated-repeat", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24.0 SQM (site measurement)", 24, "observed", True),
             ("annotated-alone", label, label, f"{label}: 24 sqm (site measurement)", "", 24, "observed", False),
             ("independent-ambiguity", label, label, f"{label}: 24 sqm", f"{label} at west: 1.200,0 sqm", 24, "observed", True),
@@ -43415,6 +43435,7 @@ main().catch((error) => {
             ("uncertain-extent", label, label, f"{label}: 24 sqm", f"{label}: W 6 m x D 4 m, partial coverage", 24, "observed", False),
             ("duplicate", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24 SQM", 24, "observed", False),
         )
+        west_cases = {"range", "approximation", "opaque-area", "wrapped-range", "same-line-range", "free-geometry"}
         config = synthetic_configuration(credential="synthetic")
         with (mock.patch.object(webapp, "read_dotenv_value", side_effect=config.get),
               mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
@@ -43424,18 +43445,24 @@ main().catch((error) => {
             for route in ("notes", "pdf", "batch"):
                 for name, basis, item, statement, other, quantity, kind, allowed in cases:
                     with self.subTest(route=route, name=name):
+                        east_label = "Carpet tile east" if name == "same-line-range" else f"{label} at east"
+                        east_statement = f"{east_label}: 10 sqm"
                         sources = [statement, other] if other else [statement]
                         if route == "batch":
                             sources.reverse()
                         if name == "annotated-reversed":
                             sources.reverse()
+                        if name in west_cases:
+                            sources.append(east_statement)
+                        if name == "same-line-range":
+                            sources = ["; ".join(sources)]
                         source_label = "Quote notes" if route == "notes" else "Reference 1, PDF page 1"
                         payload = self._ledger_draft_payload(f"quote-scope-{route}-{name}")
                         if route == "notes":
                             payload["notes"] = "; ".join(sources)
                         elif route == "pdf":
                             path = root / "survey.pdf"
-                            write_text_pdf(path, "Synthetic survey", sources)
+                            write_text_pdf(path, "Synthetic survey", [line for source in sources for line in source.splitlines()])
                             payload["images"] = [{"name": path.name, "data_url": "data:application/pdf;base64," +
                                                   base64.b64encode(path.read_bytes()).decode("ascii")}]
                         else:
@@ -43446,6 +43473,10 @@ main().catch((error) => {
                         item_row = {"source_basis_line_id": "floor", "section": "Floors", "description": item,
                                     "quantity": quantity, "unit": "sqm", "pricing_keyword": self.LEDGER_CARPET}
                         floors, items = [floor], [item_row]
+                        if name in west_cases:
+                            floors.append({**floor, "id": "east", "text": east_label, "quantity": 10,
+                                           "measurement_evidence": {"kind": "observed", "source": source_label, "statement": east_statement}})
+                            items.append({**item_row, "source_basis_line_id": "east", "description": east_label, "quantity": 10})
                         if name == "duplicate":
                             floors.append({**floor, "id": "copied", "text": basis.upper(),
                                            "measurement_evidence": {**floor["measurement_evidence"], "statement": other}})
@@ -43470,8 +43501,13 @@ main().catch((error) => {
                         if name == "duplicate":
                             self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
-                        if route == "pdf" and name in {"approved", "decimal", "grouped", "grouped-not-decimal", "annotated-conflict", "mixed-format"}:
+                        if name in west_cases:
+                            self.assertEqual(entries["east"]["catalog_item_id"], self.LEDGER_CARPET)
+                        workbook_cases = {"approved", "decimal", "grouped", "grouped-not-decimal", "annotated-conflict", "mixed-format", "range", "approximation"}
+                        if route == "pdf" and name in workbook_cases:
                             include = {"floor", "spot"} if allowed else {"spot"}
+                            if name in west_cases:
+                                include.add("east")
                             sections = copy.deepcopy(final["quote_basis_sections"])
                             for section in sections:
                                 for line in section["lines"]:
@@ -43484,9 +43520,14 @@ main().catch((error) => {
                             [xlsx] = list((root / name).rglob("quotation.xlsx"))
                             values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
                             [total] = [row for row in values if "Total" in row]
+                            priced_area = 10 if name in west_cases else quantity if allowed else 0
                             expected = round(2 * koncept_catalog_sale_unit_price(spot) +
-                                             (quantity * koncept_catalog_sale_unit_price(self.LEDGER_CARPET) if allowed else 0), 2)
+                                             priced_area * koncept_catalog_sale_unit_price(self.LEDGER_CARPET), 2)
                             self.assertIn(expected, total)
+                            if name in west_cases:
+                                self.assertTrue(any("10 sqm" in row and 144 in row for row in values))
+                                self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
+                                self.assertFalse(any("24 sqm" in row for row in values))
 
     def test_ledger_rejects_reused_scope_across_signed_analyses(self):
         label = "Synthetic carpet tile flooring at east"
@@ -43559,7 +43600,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
-                statement, disputed, "Synthetic carpet tile flooring at west: 4 sqm (final site measurement)",
+                statement, disputed, "Synthetic carpet tile flooring at west: 4 to 6 sqm (site survey range)",
             ]})
             self.assertEqual(drafted["pricing_analysis_seal"]["schema"], webapp.PRICING_ANALYSIS_MEASUREMENT_SCHEMA)
             self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
@@ -43593,11 +43634,13 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            earlier["rows"]["floor"]["measurement"].pop("claim_version")
+            earlier["rows"]["floor"]["measurement"]["claim_version"] = 1
             readable = webapp.normalized_pricing_ledger(earlier)
             self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
             self.assertIsNone(readable["rows"]["floor"]["grant"])
             self.assertEqual(readable["rows"]["spot"]["grant"]["state"], "live")
+            earlier["rows"]["floor"]["measurement"].pop("claim_version")
+            self.assertIsNone(webapp.normalized_pricing_ledger(earlier)["rows"]["floor"]["grant"])
             for key in ("scope", "basis_scope", "item_scope"):
                 earlier["rows"]["floor"]["measurement"].pop(key)
             self.assertIsNone(webapp.normalized_pricing_ledger(earlier)["rows"]["floor"]["grant"])

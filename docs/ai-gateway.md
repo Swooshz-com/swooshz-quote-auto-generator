@@ -86,9 +86,12 @@ matching measurement statement from a source known to the server. Direct drafts
 can cite text in the supplied PDF or quote notes. Batch synthesis can also cite
 the earlier observation for a specific visual. The source label, basis line and
 linked item must identify the same physical scope, including location and extent.
-Conflicting or reused evidence stays in pricing review. An identifiable claim
-can conflict with another claim even when an annotation or ambiguous amount
-prevents it from supporting a rate on its own. A derived area requires
+Conflicting or reused evidence stays in pricing review. Each measurement record
+starts with its exact scope label followed by a colon. Use separate lines or
+semicolons for separate records. Area units or dimension markers anywhere in
+the record identify a claim, including ranges or prose without a safe amount.
+Wrapped text and unlabelled continuations remain with their preceding record.
+Unresolved claims hold that scope in review. A derived area requires
 both dimensions in metres and full coverage of the same quoted scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.
