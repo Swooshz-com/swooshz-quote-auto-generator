@@ -86,16 +86,15 @@ matching measurement statement from a source known to the server. Direct drafts
 can cite text in the supplied PDF or quote notes. Batch synthesis can also cite
 the earlier observation for a specific visual. The source label, basis line and
 linked item must identify the same physical scope, including location and extent.
-Conflicting or reused evidence stays in pricing review. Each measurement record
-starts with its exact scope label followed by a colon. Use separate lines or
-semicolons for separate records. Area units or dimension markers anywhere in
-the record identify a claim, including ranges or prose without a safe amount.
-Wrapped scope labels and area-bearing continuations remain with their preceding
-record. A colon in a continuation can complete an open record that has yet to
-show an area marker. Keep repeat context in brackets or parentheses so a trailing
-range cannot look like a second exact amount. Unresolved claims hold that scope
-in review. A derived area requires
-both dimensions in metres and full coverage of the same quoted scope. A comma
+Conflicting or reused evidence stays in pricing review. Write each record with
+its exact scope label followed by a colon. Separate records can share a line.
+Area units or dimension markers anywhere in a record identify a claim, including
+ranges and dimensions with uncertain components. Wrapped labels and measurement
+lines stay together. A label inside a bracketed annotation can flag a conflicting
+measurement for that scope, while a rate requires separate, clearly framed proof.
+Keep repeat context in brackets or parentheses so a trailing range cannot look
+like a second exact amount. Unresolved claims hold that scope in review. A derived
+area requires both dimensions in metres and full coverage of the same scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.
 An image without corroborating measurement text can still suggest an editable

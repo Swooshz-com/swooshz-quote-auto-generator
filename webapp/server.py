@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] == 1)):
+                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2))):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 2
+AREA_EVIDENCE_CLAIM_VERSION = 3
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25596,9 +25596,12 @@ AREA_UNIT_MARKER = re.compile(
 )
 AREA_LENGTH_MARKER = re.compile(rf"(?<![^\W\d_])(?:{SCOPE_LENGTH_UNIT})(?![\w^])", re.I)
 AREA_GEOMETRY_MARKER = re.compile(
-    r"(?<![^\W\d_])[x\u00d7](?![^\W\d_])|\bcoverage\b|\d\s+by\s+(?=[~+\-\u2212]?\s*\d)", re.I,
+    rf"(?<![^\W\d_])[x\u00d7](?![^\W\d_])|\bcoverage\b|"
+    rf"(?<![^\W\d_])(?:{SCOPE_LENGTH_UNIT})(?:\s+wide)?\s+by\b", re.I,
 )
+AREA_BY_MARKER = re.compile(r"\d\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
+AREA_BODY_BREAK = re.compile(r"[;\r\n]|[.!?](?=\s|$)")
 
 
 @dataclass(frozen=True)
@@ -25609,6 +25612,15 @@ class AreaMeasurementClaim:
     unit: str
     dimensions: tuple[Decimal, ...]
     eligible: bool
+
+
+@dataclass(frozen=True)
+class AreaScopeSpan:
+    start: int
+    end: int
+    scope: str
+    label: str
+    framed: bool
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -25639,102 +25651,134 @@ def area_evidence_quantity(token: str) -> Decimal | None:
         return None
 
 
-def area_record_separators(text: str):
-    """Yield separators outside a bracketed scope or parenthesised annotation."""
+def area_bracket_context(text: str) -> tuple[list[int], dict[int, int]]:
+    """Only paired brackets shelter labels. An open bracket cannot swallow later records."""
     groups = {"(": ")", "[": "]", "{": "}"}
-    closing = []
+    opens = []
+    pairs = {}
     for index, char in enumerate(text):
         if char in groups:
-            closing.append(groups[char])
-        elif closing and char == closing[-1]:
-            closing.pop()
-        elif not closing and char in ":;\r\n":
-            yield index, char
+            opens.append((index, groups[char]))
+        elif char in ")]}":
+            if opens and opens[-1][1] == char:
+                pairs[opens.pop()[0]] = index
+            else:
+                opens.clear()
+    context = []
+    opens = []
+    for index in range(len(text)):
+        if opens and pairs[opens[-1]] == index:
+            opens.pop()
+        context.append(opens[-1] if opens else -1)
+        if index in pairs:
+            opens.append(index)
+    return context, pairs
 
 
 def scoped_area_text(statement: str, scopes: set[str]) -> tuple[str, str, str] | None:
     """Identify the exact scope first, including scopes containing a colon."""
     text = clean_text(unicodedata.normalize("NFKC", statement)).rstrip(".")
     matched = None
-    for index, separator in area_record_separators(text):
-        if separator == ":":
-            label = text[:index]
-            scope = pricing_measurement_scope(label)
-            if scope in scopes:
-                matched = (scope, label, text[index + 1:].lstrip())
+    for delimiter in re.finditer(":", text):
+        label = text[:delimiter.start()]
+        scope = pricing_measurement_scope(label)
+        if scope in scopes:
+            matched = (scope, label, text[delimiter.end():].lstrip())
     return matched
 
 
-def area_source_fragments(raw: str):
-    text = unicodedata.normalize("NFKC", raw)
-    start = 0
-    for index, char in area_record_separators(text):
-        if char != ":":
-            yield clean_text(text[start:index])
-            start = index + 1
-    yield clean_text(text[start:])
+def area_scope_pattern(scopes: set[str]) -> re.Pattern[str]:
+    labels = [re.escape(scope).replace(r"\ ", r"\s+").replace(":", r"\s*:")
+              for scope in sorted(scopes, key=lambda scope: (-len(scope), scope))]
+    return re.compile(rf"(?<![\w-])(?P<label>{'|'.join(labels) or '(?!)'})(?:\s*\])?\s*:")
 
 
-def area_source_statements(raw: str, scopes: set[str]):
-    """Keep wrapped source lines attached to their labelled record."""
-    record = []
-    body = ""
-    prefix = ""
+def area_source_claims(raw: str, pattern: re.Pattern[str]):
+    """Discover labels before assigning source framing or interpreting values."""
+    text = unicodedata.normalize("NFKC", raw).casefold()
+    anchors = list(pattern.finditer(text))
+    if not anchors:
+        return
+    context, pairs = area_bracket_context(text)
+    groups = {}
+    for anchor in anchors:
+        group = context[anchor.start()]
+        if group >= 0 and text[group] == "[" and pairs[group] < anchor.end():
+            group = context[group]
+        groups.setdefault(group, []).append(anchor)
 
-    def statements():
-        if not record:
-            return
-        if len(record) == 1:
-            yield record[0]
-            return
-        first = area_measurement_claim(record[0], scopes)
-        combined = " ".join(record)
-        if first is None or first.quantity is None:
-            # A wrapped amount or geometry is one claim, including its coverage line.
-            yield combined
-        else:
-            yield record[0]
-            if area_claim_kind(" ".join(record[1:])):
-                yield combined
+    masked = list(text)
+    for group, labels in sorted(groups.items(), reverse=True):
+        end = pairs.get(group, len(text))
+        previous = group + 1
+        records = []
+        for anchor in labels:
+            scope = pricing_measurement_scope(anchor["label"])
+            prefix_start = previous
+            for boundary in AREA_BODY_BREAK.finditer(text, previous, anchor.start()):
+                if context[boundary.start()] == group:
+                    prefix_start = boundary.end()
+            prefix = text[prefix_start:anchor.start()].strip().lstrip("-\u2022 ")
+            label = clean_text(prefix + " " + text[anchor.start():anchor.end() - 1])
+            canonical = pricing_measurement_scope(label) == scope
+            framed = group == -1 and canonical and (not records or prefix_start > previous or not prefix)
+            if group == -1 and records and prefix_start == previous and prefix:
+                prior = records[-1]
+                adjacent = area_measurement_claim(prior.scope, prior.label, clean_text(text[previous:anchor.start()]))
+                framed = bool(adjacent and adjacent.eligible)
+                label = anchor["label"]
+            label_start = prefix_start if framed and prefix and (not records or prefix_start > previous) else anchor.start()
+            records.append(AreaScopeSpan(label_start, anchor.end(), scope, label if framed else anchor["label"], framed))
+            previous = anchor.end()
 
-    for line in area_source_fragments(raw):
-        if not line:
-            continue
-        joined = f"{prefix} {line}" if prefix else line
-        direct = scoped_area_text(line, scopes)
-        wrapped = scoped_area_text(joined, scopes) if prefix and not direct else None
-        scoped = direct or wrapped
-        new_label = any(separator == ":" for _, separator in area_record_separators(line))
-        if scoped or (new_label and (not record or area_claim_kind(body))):
-            yield from statements()
-            record = [joined if wrapped else line] if scoped else []
-            body = scoped[2] if scoped else ""
-            prefix = ""
-        elif any(scope.startswith(pricing_measurement_scope(joined) + " ") for scope in scopes):
-            prefix = joined
-        else:
-            if record:
-                record.append(joined)
-                body += f" {joined}"
-            prefix = ""
-    yield from statements()
+        for index, record in enumerate(records):
+            limit = records[index + 1].start if index + 1 < len(records) else end
+            parts = []
+            start = record.end
+            for boundary in AREA_BODY_BREAK.finditer(text, start, limit):
+                if context[boundary.start()] == group:
+                    part = clean_text("".join(masked[start:boundary.start()]))
+                    parts.append((part, boundary.group().strip()))
+                    start = boundary.end()
+            parts.append((clean_text("".join(masked[start:limit])), ""))
+            first = area_measurement_claim(record.scope, record.label, parts[0][0])
+            continuation = []
+            for part, separator in parts[1:]:
+                heading, colon, _ = part.partition(":")
+                if (first and first.quantity is not None and colon
+                        and pricing_measurement_scope(heading).startswith(record.scope + " ")):
+                    break
+                continuation.append((part, separator))
+            tail = clean_text(" ".join(part for part, _ in continuation))
+            if first is None or first.quantity is None:
+                # Only line wraps may disappear from a value. Interior punctuation still counts.
+                value = clean_text(" ".join(part + separator for part, separator in [parts[0], *continuation])).rstrip(".!?")
+                claim = area_measurement_claim(record.scope, record.label, value)
+            elif area_claim_kind(tail):
+                claim = AreaMeasurementClaim(record.scope, first.kind, None, "", (), False)
+            else:
+                claim = first
+            if claim is not None:
+                if not record.framed:
+                    claim = AreaMeasurementClaim(record.scope, claim.kind, None, "", (), False)
+                yield claim
+            if group != -1:
+                masked[record.start:limit] = " " * (limit - record.start)
 
 
 def area_claim_kind(text: str) -> str:
     if AREA_UNIT_MARKER.search(text):
         return "observed"
-    lengths = AREA_LENGTH_MARKER.findall(text)
+    lengths = list(AREA_LENGTH_MARKER.finditer(text))
     if len(lengths) > 1 or (lengths and AREA_GEOMETRY_MARKER.search(text)):
+        return "derived"
+    if lengths and AREA_BY_MARKER.search(text, 0, lengths[0].start()):
         return "derived"
     return ""
 
 
-def area_measurement_claim(statement: str, scopes: set[str]) -> AreaMeasurementClaim | None:
+def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeasurementClaim | None:
     """Retain a scoped area expression even when the whole body has no safe amount."""
-    scoped = scoped_area_text(statement, scopes)
-    if scoped is None:
-        return None
-    scope, label, measurement = scoped
     recognised = area_claim_kind(measurement)
     if not recognised:
         return None
@@ -25782,7 +25826,7 @@ def area_measurement_claim(statement: str, scopes: set[str]) -> AreaMeasurementC
             or not aside or any(char.isnumeric() for char in annotation)
             or area_claim_kind(annotation) or (derived and re.search(r"\bcoverage\b", annotation, re.I))):
         quantity = None
-    eligible = quantity is not None and proof_shape and len(statement) <= 300
+    eligible = quantity is not None and proof_shape and len(label) + len(measurement) + 2 <= 300
     return AreaMeasurementClaim(scope, kind, quantity, unit, geometry, eligible)
 
 
@@ -25794,8 +25838,9 @@ def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[
     scopes = {pricing_measurement_scope(line.get("text") or line.get("line") or line.get("description"))
               for section in parsed.get("quote_basis_sections", []) for line in section.get("lines", [])
               if isinstance(line, dict) and line.get("scope_kind") == "physical"} - {""}
-    facts = {source: {fact for raw in texts if isinstance(raw, str) for statement in area_source_statements(raw, scopes)
-                      if (fact := area_measurement_claim(statement, scopes)) is not None} for source, texts in sources.items()}
+    pattern = area_scope_pattern(scopes)
+    facts = {source: {fact for raw in texts if isinstance(raw, str) for fact in area_source_claims(raw, pattern)}
+             for source, texts in sources.items()}
     amounts: dict[str, set[tuple[Decimal, str]]] = {}
     geometries: dict[str, set[tuple[Decimal, ...]]] = {}
     unresolved_scopes = set()
@@ -25834,7 +25879,8 @@ def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[
                 continue
             kind = clean_text(evidence.get("kind"))
             source = clean_text(evidence.get("source"))
-            fact = area_measurement_claim(clean_text(evidence.get("statement")), scopes)
+            scoped = scoped_area_text(clean_text(evidence.get("statement")), scopes)
+            fact = area_measurement_claim(*scoped) if scoped else None
             if fact is None or not fact.eligible or fact not in facts.get(source, ()):
                 continue
             scope = fact.scope
