@@ -11662,14 +11662,16 @@ function renderBasisLine(section, line, index) {
   const pricingRow = basisPricingRow(line, section);
   const pillLabel = basisLinePillLabel(line, pricingRow);
   const acceptsAsAiProposal = basisLineAcceptsAsAiProposal(line);
-  const quantityLabel = basisQuantityDisplayLabel(line);
+  const showDefaultQuantity = tag !== "Exclude" && !String(line.quantity ?? "").trim() && !normalizeUnit(line.unit);
+  const unmatchedOffer = showDefaultQuantity || pricingRow?.deferred_pricing ? basisUnmatchedOffer(line, pricingRow, section) : "";
+  const quantityLabel = showDefaultQuantity && unmatchedOffer ? "1 nos" : basisQuantityDisplayLabel(line);
   const confidenceLabel = basisConfidenceLabel(line);
   const pillTitle = basisPillTitle(line, tag);
   const lineTitle = basisLineTitle(line);
   const pillTitleAttribute = pillTitle ? ` title="${escapeHtml(pillTitle)}"` : "";
   const lineTitleAttribute = lineTitle ? ` title="${escapeHtml(lineTitle)}"` : "";
   const deferredPricing = tag === "Custom" && line.custom_confirmed && pricingRow?.deferred_pricing
-    && pricingRow.deferred_pricing === basisUnmatchedOffer(line, pricingRow, section);
+    && pricingRow.deferred_pricing === unmatchedOffer;
   const rowClasses = [
     "basis-line-row",
     `basis-line-${tag.toLowerCase()}`,

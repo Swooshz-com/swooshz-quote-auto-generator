@@ -54,6 +54,12 @@ replaceOnce('  // Resolve any remaining server-added review line', `
     "untouched unmatched row already carries a deferral");
   assert(await sculpture.locator('button').count() === 3, "unmatched row has an extra action");
   const water = page.locator('.basis-line-row').filter({ hasText: "Choreographed water feature" });
+  assert(await water.locator('.basis-quantity-text').innerText() === "1 nos",
+    "unmatched row did not show the same default quantity as Output and Excel");
+  assert(await page.evaluate(() => {
+    const line = state.quoteBasisSections.flatMap((section) => section.lines).find((entry) => entry.id === "u1-provisional-pair");
+    return !line?.quantity && !line?.unit;
+  }), "displaying the default altered admitted measurement evidence");
   await tickAll.click();
   assert(await water.getByText("Price to be discussed", { exact: true }).isVisible(),
     "section tick did not defer unmeasured scope");
