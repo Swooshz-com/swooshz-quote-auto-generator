@@ -1010,10 +1010,10 @@ each visible terminal label, exactly one generation, polling, zero navigation an
 retained interruption identity on its own server and browser.
 The smoke uses Playwright Chromium locally as well as in CI. Screenshot mode
 runs the broad visual journey without the isolated G3 tail; default CI retains it.
-On Windows, native Excel COM PDF export may rewrite the workbook tax formula's
-expression while preserving its value. The post-PDF exact formula assertion
-still rejects such a rewrite; record it as a local converter qualification gap.
-CI's LibreOffice path and the verifier's formula requirements remain unchanged.
+Native workbook PDF export uses a disposable conversion copy. The four-line
+pagination regression checks for exactly two pages, with the quotation before
+the signature, and requires the XLSX master to remain byte-for-byte identical.
+It runs with LibreOffice in CI and can run with Microsoft Excel on Windows.
 
 Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
 eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity

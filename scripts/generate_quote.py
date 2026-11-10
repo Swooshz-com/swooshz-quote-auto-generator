@@ -3830,9 +3830,6 @@ $repairedWorkbookPath = [System.IO.Path]::Combine(
   [System.IO.Path]::GetDirectoryName($xlsxPath),
   ([System.IO.Path]::GetFileNameWithoutExtension($xlsxPath) + '.excel-repaired.xlsx')
 )
-if (Test-Path -LiteralPath $repairedWorkbookPath) {{
-  Remove-Item -LiteralPath $repairedWorkbookPath -Force
-}}
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
@@ -3848,23 +3845,23 @@ try {{
 }} finally {{
   $excel.Quit()
 }}
-if (Test-Path -LiteralPath $repairedWorkbookPath) {{
-  Move-Item -LiteralPath $repairedWorkbookPath -Destination $xlsxPath -Force
-}}
 """
 
 
 def powershell_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
     if os.name != "nt" or shutil.which("powershell") is None:
         return None
-    script = powershell_export_script(xlsx_path, pdf_path)
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        timeout=120,
-    )
+    with tempfile.TemporaryDirectory(prefix="sqag-excel-") as temp_dir:
+        conversion_path = Path(temp_dir) / xlsx_path.name
+        write_pdf_conversion_workbook(xlsx_path, conversion_path, normalize_fonts=False)
+        script = powershell_export_script(conversion_path, pdf_path)
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=120,
+        )
     return "excel_exported" if result.returncode == 0 and pdf_path.exists() else None
 
 
@@ -3891,8 +3888,82 @@ def libreoffice_candidates() -> list[str]:
     return result
 
 
-def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> None:
-    """Make ambiguous PDF font defaults explicit without changing the master."""
+def pdf_first_page_drawing_end(
+    source: zipfile.ZipFile, sheet: ET.Element, page_end: int,
+) -> int | None:
+    """Return the last drawing row on the first page, or None if unknown."""
+    if any(sheet.find(f"{NS_MAIN}{tag}") is not None for tag in ("legacyDrawing", "oleObjects", "controls")):
+        return None
+    drawing = sheet.find(f"{NS_MAIN}drawing")
+    if drawing is None:
+        return 0
+    rels_name = "xl/worksheets/_rels/sheet1.xml.rels"
+    if rels_name not in source.namelist():
+        return None
+    relationships = ET.fromstring(read_bounded_xlsx_part(source, rels_name))
+    matches = [
+        rel for rel in relationships
+        if rel.get("Id") == drawing.get(f"{NS_REL}id")
+        and rel.get("Type") == f"{NS_REL[1:-1]}/drawing"
+        and rel.get("TargetMode", "Internal") == "Internal"
+    ]
+    if len(matches) != 1:
+        return None
+    target = matches[0].get("Target", "")
+    name = posixpath.normpath(target.lstrip("/") if target.startswith("/") else f"xl/worksheets/{target}")
+    if not name.startswith("xl/drawings/") or name not in source.namelist():
+        return None
+    drawing_root = ET.fromstring(read_bounded_xlsx_part(source, name))
+    last_row = 0
+    for anchor in drawing_root:
+        if anchor.tag != f"{NS_DRAWING}twoCellAnchor":
+            return None
+        start = anchor.findtext(f"{NS_DRAWING}from/{NS_DRAWING}row", "")
+        end = anchor.findtext(f"{NS_DRAWING}to/{NS_DRAWING}row", "")
+        if not start.isdecimal() or not end.isdecimal() or int(end) < int(start):
+            return None
+        # Drawing anchors use zero-based rows. Include the ending row
+        # conservatively, even when the anchor ends at its top edge.
+        if int(start) < page_end:
+            last_row = max(last_row, int(end) + 1)
+    return last_row
+
+
+def pdf_first_page_padding(source: zipfile.ZipFile, sheet: ET.Element) -> set[str]:
+    breaks = sheet.findall(f"{NS_MAIN}rowBreaks/{NS_MAIN}brk")
+    page_end = min((int(brk.attrib["id"]) for brk in breaks if brk.get("man") in {"1", "true"}), default=0)
+    if not page_end:
+        return set()
+    drawing_end = pdf_first_page_drawing_end(source, sheet, page_end)
+    if drawing_end is None:
+        return set()
+    payload = [
+        parse_cell_ref(cell.attrib["r"])
+        for cell in sheet.iter(f"{NS_MAIN}c") if ooxml_cell_has_payload(cell)
+    ]
+    last_occupied = max((row for row, _ in payload if row <= page_end), default=0)
+    for merge in sheet.findall(f"{NS_MAIN}mergeCells/{NS_MAIN}mergeCell"):
+        start, end = merge.attrib["ref"].split(":")
+        first_row, first_col = parse_cell_ref(start)
+        final_row, final_col = parse_cell_ref(end)
+        if first_row <= page_end and final_row > last_occupied and any(
+            first_row <= row <= final_row and first_col <= col <= final_col for row, col in payload
+        ):
+            last_occupied = final_row
+    last_occupied = max(last_occupied, drawing_end)
+    if not last_occupied:
+        return set()
+    # Empty first-page padding can overflow into a blank page before the break.
+    return {
+        row.attrib["r"] for row in sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row")
+        if last_occupied < int(row.attrib["r"]) <= page_end and row.get("hidden") not in {"1", "true"}
+    }
+
+
+def write_pdf_conversion_workbook(
+    xlsx_path: Path, conversion_path: Path, *, normalize_fonts: bool = True,
+) -> None:
+    """Prepare PDF layout and font defaults without changing the master."""
     with zipfile.ZipFile(xlsx_path) as source:
         entries = source.infolist()
         names = [entry.filename for entry in entries]
@@ -3901,7 +3972,7 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
         drawings: dict[str, bytes] = {}
         aliases: set[str] = set()
         for name in names:
-            if not name.startswith("xl/drawings/") or not name.endswith(".xml"):
+            if not normalize_fonts or not name.startswith("xl/drawings/") or not name.endswith(".xml"):
                 continue
             drawing_xml = read_bounded_xlsx_part(source, name)
             drawing = ET.fromstring(drawing_xml)
@@ -3913,12 +3984,23 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
                 drawings[name] = drawing_xml
                 aliases.update(referenced)
         rich_text: dict[str, bytes] = {}
+        padding: set[str] = set()
+        padding_xml = b""
+        quote_sheet_name = "xl/worksheets/sheet1.xml"
         default_font: dict[str, str] = {}
         for name in names:
+            if not normalize_fonts and name != quote_sheet_name:
+                continue
             if name != "xl/sharedStrings.xml" and not (name.startswith("xl/worksheets/") and name.endswith(".xml")):
                 continue
             part_xml = read_bounded_xlsx_part(source, name)
             part = ET.fromstring(part_xml)
+            if name == quote_sheet_name:
+                padding = pdf_first_page_padding(source, part)
+                if padding:
+                    padding_xml = part_xml
+            if not normalize_fonts:
+                continue
             partial = [
                 props for container in part.iter()
                 if container.tag in {f"{NS_MAIN}is", f"{NS_MAIN}si"}
@@ -3987,8 +4069,17 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
                     if alias in fonts:
                         node.setAttribute("typeface", fonts[alias])
                 replacements[name] = drawing.toxml(encoding="utf-8")
+        if padding:
+            rich_text.setdefault(quote_sheet_name, padding_xml)
         for name, part_xml in rich_text.items():
             with minidom.parseString(part_xml) as part:
+                if name == quote_sheet_name and padding:
+                    for row in part.getElementsByTagNameNS(NS_MAIN[1:-1], "row"):
+                        if row.getAttribute("r") in padding:
+                            row.setAttribute("hidden", "1")
+                if not normalize_fonts:
+                    replacements[name] = part.toxml(encoding="utf-8")
+                    continue
                 for container in part.getElementsByTagNameNS(NS_MAIN[1:-1], "is") + part.getElementsByTagNameNS(NS_MAIN[1:-1], "si"):
                     for run in container.childNodes:
                         if run.namespaceURI != NS_MAIN[1:-1] or run.localName != "r":
