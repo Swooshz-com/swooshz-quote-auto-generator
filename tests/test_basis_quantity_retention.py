@@ -36,9 +36,10 @@ def draft(measured=True):
 
 class EvidenceTransport:
     """A deterministic channel probe, not a simulation of model compliance."""
-    def __init__(self, retain=True, provider_result=None):
+    def __init__(self, retain=True, provider_result=None, measurement_note=MEASURED_NOTE):
         self.retain = retain
         self.provider_result = provider_result
+        self.measurement_note = measurement_note
         self.calls = []
         self.lock = threading.Lock()
 
@@ -49,7 +50,7 @@ class EvidenceTransport:
         parts = body["input"][0]["content"]
         text = parts[0]["text"]
         if text.startswith("Inspect each attached visual"):
-            note = MEASURED_NOTE if self.retain else "Floor panel, perimeter rail and visitor chair; measurements unavailable."
+            note = self.measurement_note if self.retain else "Floor panel, perimeter rail and visitor chair; measurements unavailable."
             result = {"observations": [note] * (len(parts) - 1)}
         elif self.provider_result is not None:
             result = self.provider_result

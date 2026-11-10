@@ -177,7 +177,7 @@ class ResponseContract:
             raise ContractViolation("schema_json") from None
 
 
-DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
+DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v2", obj(
     project=obj(booth_width=Field("number", positive=True), booth_depth=Field("number", positive=True)),
     quote_basis_sections=Field("array", item=obj(
         id=Field("string", nonblank=True), title=Field("string", nonblank=True),
@@ -188,6 +188,12 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
                                  missing_reason="confidence_missing", minimum=0, maximum=100),
             quantity=Field("number", nullable=True, positive=True), unit=Field("string", nullable=True, nonblank=True),
             pricing_keyword=Field("string", nullable=True),
+            scope_kind=Field("string", enum=("physical", "informational")),
+            measurement_evidence=Field("object", nullable=True, fields=(
+                ("kind", Field("string", enum=("observed", "derived", "provisional"))),
+                ("source", Field("string", nonblank=True)),
+                ("statement", Field("string", nonblank=True)),
+            )),
         )),
     )),
     line_items=Field("array", item=obj(

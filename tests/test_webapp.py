@@ -43006,7 +43006,7 @@ main().catch((error) => {
             self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
             self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "carpet-row"))
 
-    def _ledger_draft(self, runner, headers, payload, provider_raw):
+    def _ledger_draft(self, runner, headers, payload, provider_raw, *, measurement_sources=None):
         """POST /api/draft with the provider's raw JSON fed through the real normaliser (no network, no paid AI)."""
         saved = self._ledger_post(runner, headers, "/api/quote-sessions", {
             "quote_session": {"session_id": payload["quote_session"]["session_id"]},
@@ -43020,7 +43020,8 @@ main().catch((error) => {
         def provider(provider_payload, _key, auth_session=None, *, draft_configuration):
             self.assertIsInstance(draft_configuration, webapp.OpenAIDraftConfiguration)
             self.assertEqual(draft_configuration.analysis_mode, webapp.draft_analysis_mode(provider_payload))
-            return webapp.normalize_ai_draft(copy.deepcopy(provider_raw), provider_payload, require_confidence=True, auth_session=auth_session)
+            return webapp.normalize_ai_draft(copy.deepcopy(provider_raw), provider_payload, require_confidence=True,
+                                             auth_session=auth_session, measurement_sources=measurement_sources)
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv), \
                 mock.patch.object(webapp, "request_openai_quote_basis", side_effect=provider):
@@ -43056,6 +43057,8 @@ main().catch((error) => {
             ("footprint", "36 sqm Provisional booth footprint: 6m x 6m", ""),
             ("bracketed", "[ Synthetic service ] - 1 lot Clarification note: confirm venue access", ""),
             ("bracketed-footprint", "[ Synthetic support ] - Provisional booth footprint (6m x 4m)", ""),
+            ("bracketed-axis-suffix", "[ Synthetic support ] - Provisional booth footprint (6 m wide x 4 m deep)", ""),
+            ("bracketed-axis-prefix", "[ Synthetic support ] - Provisional booth dimensions (W 6m x D 4m)", ""),
             ("bracketed-link", "Synthetic alias", "[ Synthetic support ] - Provisional booth footprint (6m x 4m)"),
             ("bracketed-item-link", "[ Synthetic support ] - Provisional booth footprint (6m x 4m)", "Synthetic alias"),
             ("linked-basis", "Synthetic alias", "1 lot Confirmation note: confirm venue access"),
@@ -43104,6 +43107,8 @@ main().catch((error) => {
             ("default", "using default booth dimensions 6m x 6m", "sqm", self.LEDGER_CARPET, False),
             ("provisional", "for provisional booth footprint of 6m x 6m", "sqm", self.LEDGER_CARPET, False),
             ("assumed-size", "based on an assumed 6m x 6m booth footprint", "sqm", self.LEDGER_CARPET, False),
+            ("reset-output", "calculated using the booth's assumed 6m x 6m footprint", "sqm", self.LEDGER_CARPET, False),
+            ("reset-analysis", "based on the currently assumed 6m x 6m booth footprint", "sqm", self.LEDGER_CARPET, False),
             ("default-size", "using the default 6m x 6m footprint", "sqm", self.LEDGER_CARPET, False),
             ("preposed-size", "based on the 6m x 6m default booth footprint", "sqm", self.LEDGER_CARPET, False),
             ("proposed-area", "(area estimated from a provisional 36 sqm footprint)", "sqm", self.LEDGER_CARPET, False),
@@ -43141,6 +43146,36 @@ main().catch((error) => {
                         "section": "Lighting and AV", "source_basis_line_id": "spotlight", "description": spot,
                         "quantity": 2, "unit": "nos", "pricing_keyword": spotlight,
                     })
+                    if name.startswith("reset-"):
+                        historical = copy.deepcopy(provider)
+                        historical["quote_basis_sections"][0]["lines"][0]["text"] = "Synthetic carpet tile flooring"
+                        historical["line_items"][0]["description"] = "Synthetic carpet tile flooring"
+                        with mock.patch.object(webapp, "provisional_measurement", return_value=False):
+                            previous = self._ledger_carry_draft(payload, self._ledger_draft(runner, headers, payload, historical))
+                            [area] = [row for row in previous["line_items"] if row["source_basis_line_id"] == "coverage"]
+                            previous_state = previous["quote_session"]["draft_state"]
+                            previous_snapshot = previous_state["originalAnalysisSnapshot"]
+                            if name == "reset-output":
+                                previous_state["originalOutputRows"] = [{**area, "description": scope}]
+                            else:
+                                previous_snapshot["quote_basis_sections"] = copy.deepcopy(previous["quote_basis_sections"])
+                                previous_snapshot["line_items"] = [{**area, "description": scope}]
+                            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, previous), "coverage"), price)
+                            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", previous)["status"], 200)
+                        previous.pop("pricing_analysis_seal")
+                        previous_snapshot.pop("pricing_analysis_seal")
+                        session_id = payload["quote_session"]["session_id"]
+                        reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                        self.assertEqual(reopened["status"], 200)
+                        reopened_state = reopened["body"]["quote_session"]["draft_state"]
+                        self.assertIsNone(self._ledger_price(reopened_state["lineItems"], "coverage"))
+                        reset_rows = (reopened_state["originalOutputRows"] if name == "reset-output" else
+                                      reopened_state["originalAnalysisSnapshot"]["line_items"])
+                        self.assertEqual(len(reset_rows), 1)
+                        self.assertIsNone(self._ledger_price(reset_rows, "coverage"))
+                        normalized = self._ledger_normalize(runner, headers, previous)
+                        self.assertIsNone(self._ledger_price(normalized, "coverage"))
+                        self.assertEqual(self._ledger_price(normalized, "spotlight"), spotlight_price)
                     if name == "assumed-size":
                         # A historical classifier granted this exact evidence.
                         # Persist it before the current saved read and final gate.
@@ -43233,12 +43268,18 @@ main().catch((error) => {
         from tests.test_openai_draft_request_contract import synthetic_pdf
         from webapp import ai_gateway
 
+        vinyl = "synthetic-floors-synthetic-vinyl-floor-finish"
         specs = (
             ("assumed", "Synthetic carpet tile flooring based on an assumed 6m x 6m booth footprint", 36, "sqm", self.LEDGER_CARPET),
+            ("possessive", "Synthetic carpet tile flooring calculated using the booth's assumed 6m x 6m footprint", 36, "sqm", self.LEDGER_CARPET),
+            ("currently-assumed", "Synthetic carpet tile flooring based on the currently assumed 6m x 6m booth footprint", 36, "sqm", self.LEDGER_CARPET),
             ("default", "Synthetic carpet tile flooring using the default 6m x 6m footprint", 36, "sqm", self.LEDGER_CARPET),
             ("estimated", "Synthetic carpet tile flooring (area estimated from a provisional 36 sqm footprint)", 36, "sqm", self.LEDGER_CARPET),
-            ("measured", "Synthetic carpet tile flooring independently measured, not based on provisional booth dimensions", 24, "sqm", self.LEDGER_CARPET),
-            ("note", "[ Synthetic support ] - Provisional booth footprint (6m x 4m)", None, "", ""),
+            ("measured", "Synthetic carpet tile flooring independently measured rather than being based on the provisional booth footprint", 24, "sqm", self.LEDGER_CARPET),
+            ("derived", "Synthetic vinyl floor finish", 24, "sqm", vinyl),
+            ("bad-coverage", "Synthetic carpet tile flooring at entrance", 24, "sqm", self.LEDGER_CARPET),
+            ("bad-area", "Synthetic carpet tile flooring at rear", 25, "sqm", self.LEDGER_CARPET),
+            ("note", "Footprint shown to orient venue review", None, "", ""),
         )
         provider = {"project": {"booth_width": 6, "booth_depth": 6}, "quote_basis_sections": [
             {"title": "Floors", "lines": [
@@ -43252,18 +43293,36 @@ main().catch((error) => {
                 for row_id, text, quantity, unit, keyword in specs
             ],
         }
+        evidence = {
+            "measured": ("observed", "Synthetic carpet tile flooring: 24 sqm"),
+            "derived": ("derived", "Synthetic vinyl floor finish: 6 m x 4 m, full coverage"),
+            "bad-coverage": ("derived", "Synthetic carpet tile flooring at entrance: 6 m x 4 m, partial coverage"),
+            "bad-area": ("derived", "Synthetic carpet tile flooring at rear: 6 m x 4 m, full coverage"),
+            "possessive": ("observed", "Synthetic carpet tile flooring: 36 sqm"),
+        }
+        notes = "; ".join(statement for row_id, (_, statement) in evidence.items() if row_id != "possessive")
         config = synthetic_configuration(credential="synthetic")
         for pages, sends in ((12, 1), (13, 4)):
             with (self.subTest(pages=pages), mock.patch.object(webapp, "read_dotenv_value", side_effect=config.get),
                   mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
                   mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only"))):
-                transport = EvidenceTransport(provider_result=provider)
+                response = copy.deepcopy(provider)
+                for line in response["quote_basis_sections"][0]["lines"]:
+                    row_id = line["id"]
+                    line["scope_kind"] = "informational" if row_id == "note" else "physical"
+                    if row_id in evidence:
+                        kind, statement = evidence[row_id]
+                        source = "Quote notes" if pages <= 12 else "Reference 1, PDF page 1"
+                        line["measurement_evidence"] = {"kind": kind, "statement": statement, "source": source}
+                transport = EvidenceTransport(provider_result=response, measurement_note=notes)
                 with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
                     gateway = webapp.configured_ai_gateway()
                 route = gateway.configuration.route("draft")
                 draft_config = webapp.OpenAIDraftConfiguration("standard", route.model, route.effort, gateway)
                 payload = self._ledger_draft_payload(f"quote-provenance-pages-{pages}")
                 payload["project"] = {"title": "Synthetic provenance review"}
+                if pages <= 12:
+                    payload["notes"] = notes
                 payload["images"] = [{"name": "synthetic.pdf", "data_url": synthetic_pdf(pages)}]
                 draft = webapp.request_openai_quote_basis(payload, "synthetic", draft_configuration=draft_config)
                 final = webapp.finalized_remote_draft_result(
@@ -43272,12 +43331,109 @@ main().catch((error) => {
                 self.assertEqual(len(transport.calls), sends)
                 self.assertEqual(final["project"]["dimension_source"], "default")
                 sealed = {entry["id"]: entry for entry in final["pricing_analysis_seal"]["rows"]}
-                self.assertNotIn("note", sealed)
-                for row_id in ("assumed", "default", "estimated"):
+                self.assertEqual(sealed["note"]["measurement"], {"disposition": "informational"})
+                self.assertNotIn("note", {row["source_basis_line_id"] for row in final["line_items"]})
+                for row_id in ("assumed", "possessive", "currently-assumed", "default", "estimated", "bad-coverage", "bad-area"):
                     self.assertEqual(sealed[row_id]["unit"], "")
+                    self.assertEqual(sealed[row_id]["measurement"], {"disposition": "review"})
                     self.assertNotIn("catalog_item_id", sealed[row_id])
                 self.assertEqual(sealed["measured"]["catalog_item_id"], self.LEDGER_CARPET)
                 self.assertEqual(sealed["measured"]["quantity"], 24)
+                self.assertEqual(sealed["derived"]["measurement"].get("kind"), "derived", sealed["derived"])
+                self.assertEqual(sealed["derived"].get("catalog_item_id"), vinyl, sealed["derived"])
+
+    def test_ledger_admitted_scope_survives_save_selection_and_workbook(self):
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers
+
+        carpet = self.LEDGER_CARPET
+        spot = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        statement = "Synthetic carpet tile flooring: 24 sqm"
+        specifications = (
+            ("floor", "Synthetic carpet tile flooring", 24, "sqm", carpet),
+            ("review", "Synthetic carpet tile flooring", 36, "sqm", carpet),
+            ("spot", "Synthetic spotlight 6 inch", 2, "nos", spot),
+        )
+        lines, rows = [], []
+        for row_id, description, quantity, unit, keyword in specifications:
+            lines.append({"id": row_id, "tag": "Confirm", "text": description, "quantity": quantity, "unit": unit,
+                          "confidence_pct": 90, "pricing_keyword": keyword, "scope_kind": "physical"})
+            rows.append({"source_basis_line_id": row_id, "section": "Lighting and AV" if row_id == "spot" else "Floors", "description": description,
+                         "quantity": quantity, "unit": unit, "pricing_keyword": keyword})
+        lines[0]["measurement_evidence"] = {"kind": "observed", "source": "Quote notes", "statement": statement}
+        lines.append({"id": "info", "tag": "Confirm", "text": "Dimensions for venue orientation", "confidence_pct": 90,
+                      "scope_kind": "informational"})
+        provider = {"quote_basis_sections": [
+            {"id": "floors", "title": "Floors", "lines": [line for line in lines if line["id"] != "spot"]},
+            {"id": "lighting", "title": "Lighting and AV", "lines": [line for line in lines if line["id"] == "spot"]},
+        ], "line_items": rows}
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            session_id = "quote-admitted-scope-ledger"
+            payload = self._ledger_draft_payload(session_id)
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [statement]})
+            self.assertEqual(drafted["pricing_analysis_seal"]["schema"], webapp.PRICING_ANALYSIS_MEASUREMENT_SCHEMA)
+            request = self._ledger_carry_draft(payload, drafted)
+            self._ledger_line(request, "floor")["tag"] = "Include"
+            self._ledger_line(request, "spot")["tag"] = "Include"
+            self._ledger_line(request, "review")["tag"] = "Exclude"
+            request["line_items"] = [row for row in request["line_items"] if row["source_basis_line_id"] != "review"]
+            details = request["quote_session"]["draft_state"]["quoteDetails"]
+            details["company"]["logo_data_url"] = synthetic_image()
+            details["quote_text"].update(payload["quote_text"])
+            details["signature"].update(company_signatory="Synthetic signatory", company_title="Synthetic title")
+            details["commercial_snapshot"]["presence"] = {
+                key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
+            }
+            self._ledger_sync(request)
+            saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+            self.assertEqual(saved["status"], 200)
+            ledger = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]
+            self.assertEqual(ledger["schema"], webapp.PRICING_LEDGER_MEASUREMENT_SCHEMA)
+            self.assertEqual(ledger["rows"]["review"]["measurement"], {"disposition": "review"})
+            self.assertEqual(ledger["rows"]["info"]["measurement"], {"disposition": "informational"})
+            self.assertEqual(ledger["rows"]["floor"]["measurement"]["quantity"], 24)
+            self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
+            request.pop("pricing_analysis_seal")
+            request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+            self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "floor"), koncept_catalog_sale_unit_price(carpet))
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                generation = copy.deepcopy(request)
+                result = webapp.run_quote_job(generation, output_root=root / "out", tmp_root=root / "tmp")
+                self.assertEqual(result["status"], "completed", result.get("errors"))
+                [xlsx] = list((root / "out").rglob("quotation.xlsx"))
+                values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                [total] = [row for row in values if "Total" in row]
+                self.assertIn(round(24 * koncept_catalog_sale_unit_price(carpet) + 2 * koncept_catalog_sale_unit_price(spot), 2), total)
+                self.assertFalse(any("36 sqm" in row or "Dimensions for venue orientation" in str(row) for row in values))
+            self.assertEqual(webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"]["grant"]["state"], "live")
+            changed = copy.deepcopy(request)
+            self._ledger_line(changed, "floor")["quantity"] = 25
+            for row in changed["line_items"]:
+                if row["source_basis_line_id"] == "floor":
+                    row["quantity"] = 25
+            self._ledger_sync(changed)
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(changed), "floor"))
+            pending = self._ledger_post(runner, headers, "/api/quote-sessions", changed)
+            self.assertEqual(webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"]["grant"]["state"], "live")
+            selection = self._ledger_select(runner, headers, changed, "floor", carpet, self._ledger_revision(pending, "floor"))
+            self.assertEqual(selection["body"]["selections"], [
+                {"source_basis_line_id": "floor", "status": "refused", "reason": "unit_review_required"},
+            ])
+            restored = copy.deepcopy(request)
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(restored), "floor"))
+            self.assertEqual(self._ledger_price(self._ledger_brief_rows(restored), "spot"), koncept_catalog_sale_unit_price(spot),
+                             webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"])
+            [floor] = [row for row in changed["line_items"] if row["source_basis_line_id"] == "floor"]
+            for mode, price in (("manual", 7), ("included", 0)):
+                floor["pricing_authority"] = webapp.build_pricing_authority(
+                    mode, floor, price=price, reference_authority=webapp.exact_pricing_reference_authority(changed),
+                )
+                self._ledger_sync(changed)
+                [priced] = [row for row in self._ledger_brief_rows(changed) if row["source_basis_line_id"] == "floor"]
+                self.assertEqual(priced["pricing_authority"]["variant"], mode)
+                self.assertEqual(priced["pricing_authority"]["price"], price)
 
     def test_ledger_structured_linked_pair_seals_like_an_equivalent_prefix(self):
         from scripts.generate_quote import read_first_sheet_rows_with_numbers

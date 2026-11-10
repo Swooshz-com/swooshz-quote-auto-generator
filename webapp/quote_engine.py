@@ -20,6 +20,7 @@ from scripts import pricing_reference_cleanup, pricing_reference_enrichment
 class PreparedDraftMedia:
     single_send: list[dict[str, Any]]
     batches: list[list[tuple[str, dict[str, Any]]]]
+    measurement_sources: dict[str, str] | None = None
 
 
 class QuoteDraftRunner:

@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import tempfile
 import unittest
 import urllib.error
 from unittest import mock
@@ -229,7 +230,9 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.send.reset_mock()
                 body = self.capture(self.payload(*urls))
                 self.send.assert_called_once()
-                expected = [{"type": "input_text", "text": "Synthetic prompt"}]
+                sources = [f"Reference {index}, {'PDF page 1' if url == self.pdf else 'uploaded image'}"
+                           for index, url in enumerate(urls, 1)]
+                expected = [{"type": "input_text", "text": "Synthetic prompt\nVisuals in order: " + "; ".join(sources) + "."}]
                 for index, url in enumerate(urls):
                     if url == self.pdf:
                         expected.extend([
@@ -1234,6 +1237,19 @@ class DraftRequestContractTest(unittest.TestCase):
                 server.draft_quote_basis(self.payload("data:image/png;base64,ZmFrZQ=="))
             fallback.assert_not_called()
             self.send.assert_not_called()
+
+    def test_prepared_direct_pdf_keeps_measurement_text_outside_the_wire_media(self):
+        from scripts.generate_quote import write_text_pdf
+
+        statement = "Synthetic carpet tile flooring: 24 sqm"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic-measurement.pdf"
+            write_text_pdf(path, "Synthetic survey", [statement])
+            reference = {"name": path.name,
+                         "data_url": "data:application/pdf;base64," + base64.b64encode(path.read_bytes()).decode("ascii")}
+            prepared = server.prepare_draft_media([reference])
+        self.assertIn(statement, prepared.measurement_sources["Reference 1, PDF page 1"])
+        self.assertFalse(any("measurement_text" in part for part in prepared.single_send))
 
     def test_real_pdf_decode_without_debug_retention(self):
         # Bypass only the rendering stub, never the network denial backstop.

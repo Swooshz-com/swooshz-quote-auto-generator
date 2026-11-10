@@ -60,7 +60,7 @@ owner approval and eligibility qualification; fake transports prove no endpoint
 capability, Responses schema subset, model accuracy or cost saving.
 
 When enabled, standard and High Quality final drafts, including batched synthesis,
-send `text.format` with `type=json_schema`, `name=draft_synthesis_v1`, `strict=true`
+send `text.format` with `type=json_schema`, `name=draft_synthesis_v2`, `strict=true`
 and the generated schema. Page observations, basis chat, pricing import and
 matching metadata retain their own existing contracts. A trusted contract identity
 is checked separately from the operation and body. Missing, modified or unexpected
@@ -80,6 +80,23 @@ Exact-object JSON parsing, duplicate-key rejection and local shape checks preced
 the existing identity, quantity, coverage, catalogue and sealing guards. Ranges,
 positive values and nonblank text are checked locally; unsupported range/pattern
 schema keywords are not assumed to work at an unqualified endpoint.
+
+An area can receive automatic catalogue pricing when its basis row has a
+matching measurement statement from a source known to the server. Direct drafts
+can cite text in the supplied PDF or quote notes. Batch synthesis can also cite
+the earlier observation for a specific visual. For a derived area, the statement
+must give both dimensions in metres and full coverage of the same quoted scope.
+An image without corroborating measurement text can still suggest an editable
+quantity for pricing review. Informational rows remain in Quote Basis and stay
+out of the bill. The server signs the admitted record with the row, quantity,
+unit, quote session and catalogue reference. The saved pricing ledger retains
+the record and checks the current row at selection and export.
+
+Existing drafts and publications remain readable. Older ledger records retain
+their historical interpretation and check current and reset snapshots for
+provisional measurements. Older application versions do not recognise the
+measurement seal or ledger version. Finish stopping older writers before serving
+the same draft data with this version.
 
 For schema-bearing calls, HTTP 400/404/405/415/422 or closed schema parameter/code
 errors terminate as `response_schema_rejected` at `provider_response_schema`.

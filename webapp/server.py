@@ -5584,8 +5584,10 @@ def normalize_basis_tag(value: Any) -> str:
 
 SCOPE_NUMBER = r"\d+(?:[.,]\d+)?"
 SCOPE_LENGTH = rf"{SCOPE_NUMBER}(?:\s*(?:mm|cm|m|metres?|meters?|ft|feet))?"
+SCOPE_WIDTH = rf"(?:(?:width|w)\s*[:=]?\s*)?{SCOPE_LENGTH}(?:\s+wide)?"
+SCOPE_DEPTH = rf"(?:(?:depth|d)\s*[:=]?\s*)?{SCOPE_LENGTH}(?:\s+deep)?"
 SCOPE_DIMENSION_VALUE = (
-    rf"(?:{SCOPE_LENGTH}\s*(?:x|\u00d7|by)\s*{SCOPE_LENGTH}"
+    rf"(?:{SCOPE_WIDTH}\s*(?:x|\u00d7|by)\s*{SCOPE_DEPTH}"
     rf"|{SCOPE_NUMBER}\s*(?:sqm|sqft|sq\.?\s*(?:m|ft)\.?|m[2\u00b2]|ft[2\u00b2]))"
 )
 PROVISIONAL_DIMENSION_PREFIX = (
@@ -5600,10 +5602,11 @@ DIMENSION_NOTE_DETAIL = re.compile(
     re.I,
 )
 PROVISIONAL_AREA_DEPENDENCY = re.compile(
-    r"\b(?:(?P<negation>not|never|without|rather\s+than|instead\s+of)\s+)?"
+    r"\b(?:(?P<negation>not|never|without|rather\s+than|instead\s+of)\s+(?:being\s+)?)?"
     r"(?P<relation>using|assuming|(?:based|relying|depends|dependent)\s+(?:on|upon)"
     r"|(?:derived|estimated|calculated|scaled)\s+(?:from|using)|for|from|per|according\s+to)\s+"
-    rf"(?:(?:a|an|the)\s+)?{PROVISIONAL_DIMENSION_PREFIX}(?:footprint|dimensions?|size|(?:floor\s+)?area)\b",
+    rf"(?:(?:a|an|the)\s+)?(?:\w+['\u2019]s\s+)?(?:\w+ly\s+)?"
+    rf"{PROVISIONAL_DIMENSION_PREFIX}(?:footprint|dimensions?|size|(?:floor\s+)?area)\b",
     re.I,
 )
 INDEPENDENT_AREA_MEASUREMENT = re.compile(
@@ -19412,7 +19415,21 @@ def render_pdf_pages_with_pdfium(pdf_bytes: bytes, source_name: str, max_pages: 
                     if callable(close):
                         close()
                 if data_url:
-                    images.append(pdf_page_image_entry(source_name, page_index + 1, data_url, "pdfium"))
+                    entry = pdf_page_image_entry(source_name, page_index + 1, data_url, "pdfium")
+                    if complete:
+                        # The text layer is independent of the synthesis response.
+                        # Raster-only pages continue to supply visual scope.
+                        try:
+                            text_page = page.get_textpage()
+                            try:
+                                characters = text_page.count_chars()
+                                text = text_page.get_text_range(count=min(characters, 8192))
+                                entry["measurement_text"] = text if characters <= 8192 else text.rpartition("\n")[0]
+                            finally:
+                                text_page.close()
+                        except pdfium.PdfiumError:
+                            pass
+                    images.append(entry)
                 elif complete:
                     raise DraftBatchError("pdf_page_render", page=page_index + 1)
             except Exception:
@@ -21225,6 +21242,7 @@ def build_quote_draft_prompt(
         "profile": profile_prompt_summary(profile),
         "quote_profile_label": generator_label,
         "user_feedback": user_feedback,
+        "quote_notes": clean_multiline(payload.get("notes")),
         "client": {
             "name": clean_text(client.get("name")),
             "attention": clean_text(client.get("attention")),
@@ -21288,6 +21306,12 @@ def build_quote_draft_prompt(
         + ("" if response_contract else "Each section must include id, title, and lines. Each physical line must have one unique stable id, tag, text, confidence_pct, quantity and unit. ") +
         "All section id, physical line id, and linked source_basis_line_id values must be JSON strings. Use unique section ids matching ^[a-z0-9]+(?:-[a-z0-9]+)*$ (lowercase ASCII letters and digits, separated by single hyphens). Physical line id and linked source_basis_line_id values must match ^[A-Za-z0-9_-]+$ (ASCII letters, digits, underscores, and hyphens only). Use the same id in its linked line_items source_basis_line_id; never reuse an identity for separate physical scope. "
         + ("Pure informational notes use null measurements and need no output item. " if response_contract else "Pure informational notes may omit measurements and need no output item. ") +
+        "Set scope_kind to physical for work or services and informational for notes. "
+        "For an area, supply measurement_evidence only for an explicit source statement about this exact scope. "
+        "It contains kind, source and statement. For kind observed, cite a literal source statement like 'Carpet flooring: 24 sqm'. "
+        "For kind derived, cite explicit dimensions and full coverage for the same scope, such as 'Carpet flooring: 6 m x 4 m, full coverage'. "
+        "Use the provided visual source label or Quote notes, and quote the statement verbatim. "
+        "Use null evidence for estimates, provisional footprints, unverified coverage and unknown quantities. "
         "quote_basis_sections line text and line_items.description are customer-facing quotation text. Do not include provenance, reasoning, analysis, or source phrases such as taken from quotation title, visible in image, as seen in render, AI detected, assumed from, likely, appears to be, from reference image, or suggested by image. "
         + ("Put analysis reasons only in analysis_findings. " if response_contract else "Put analysis reasons only in analysis_findings or internal notes. ") +
         "Use quote_basis_sections as the operator review surface for the same pricing sentences that will become output rows. "
@@ -21884,6 +21908,7 @@ def quote_basis_sections_with_catalog_exact_lines(
     provider_result: bool = False,
     reviewed_selection: bool = False,
     source_units: dict[str, str] | None = None,
+    scope_records: dict[str, dict[str, Any]] | None = None,
     unmatched_candidates: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     invalid_pricing_keyword_flag = "_invalid_pricing_keyword"
@@ -22152,8 +22177,11 @@ def quote_basis_sections_with_catalog_exact_lines(
                 len(measured_units) != 1 or not next(iter(measured_units)))):
             return "unit_review_required"
         selected = {**line, "text": f"[ {clean_text(item.get('description'))} ] - {clean_text(line.get('text'))}"}
+        records = [(scope_records or {})[row_id] for row_id in ids if row_id in (scope_records or {})]
+        if len(records) > 1:
+            return "ineligible"
         return pricing_selection_compatibility_refusal(
-            selected, row, next(iter(measured_units), None), item, exact_catalog_items_by_id,
+            selected, row, next(iter(measured_units), None), item, exact_catalog_items_by_id, records[0] if records else None,
         )
 
     def possible_catalog_items_for_line(line: dict[str, Any], section: dict[str, Any]) -> list[dict[str, Any]]:
@@ -23319,6 +23347,8 @@ def line_items_aligned_to_quote_basis(
 # current revision. Manual and Included prices stay operator overrides of a live grant.
 PRICING_LEDGER_SCHEMA = "swooshz.sqag.pricing-ledger.v1"
 PRICING_ANALYSIS_SEAL_SCHEMA = "swooshz.sqag.pricing-analysis-seal.v1"
+PRICING_LEDGER_MEASUREMENT_SCHEMA = "swooshz.sqag.pricing-ledger.v2"
+PRICING_ANALYSIS_MEASUREMENT_SCHEMA = "swooshz.sqag.pricing-analysis-seal.v2"
 PRICING_ANALYSIS_SEAL_PREFIX = b"sqag-pricing-analysis-seal-v1\0"
 PRICING_DEFERRAL_RECEIPT_PREFIX = b"sqag-pricing-deferral-receipt-v1\0"
 PRICING_ANALYSIS_SEAL_MAC_RE = re.compile(r"v1\.[A-Za-z0-9_-]{43}")
@@ -23502,6 +23532,7 @@ def issue_pricing_analysis_seal(
     *,
     source_units: dict[str, str],
     source_quantities: dict[str, float | None],
+    scope_records: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Seal this analysis result: which rows it produced, in which unit, and which it matched.
 
@@ -23525,6 +23556,8 @@ def issue_pricing_analysis_seal(
         if row_id:
             counts[row_id] = counts.get(row_id, 0) + 1
     rows = []
+    structured = scope_records is not None
+    scope_records = scope_records or {}
     for item in line_items:
         row_id = safe_resource_id(item.get("source_basis_line_id"), "") if isinstance(item, dict) else ""
         if not row_id or counts[row_id] != 1:
@@ -23532,6 +23565,8 @@ def issue_pricing_analysis_seal(
         unit = canonical_pricing_authority_unit(normalize_pricing_unit(item.get("unit")))
         source_unit = source_units.get(row_id, "")
         entry: dict[str, Any] = {"id": row_id, "unit": source_unit, "quantity": pricing_ledger_quantity(item.get("quantity"))}
+        if row_id in scope_records:
+            entry["measurement"] = scope_records[row_id]
         claim = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
         catalog_unit = canonical_pricing_authority_unit(claim.get("catalog_unit"))
         if (
@@ -23546,10 +23581,12 @@ def issue_pricing_analysis_seal(
         ):
             entry.update(catalog_item_id=clean_text(claim["catalog_item_id"]), catalog_unit=catalog_unit)
         rows.append(entry)
+    rows.extend({"id": row_id, "unit": "", "quantity": None, "measurement": record}
+                for row_id, record in scope_records.items() if row_id not in counts)
     if len(rows) > PRICING_ANALYSIS_SEAL_MAX_ROWS:
         return None
     body = {
-        "schema": PRICING_ANALYSIS_SEAL_SCHEMA,
+        "schema": PRICING_ANALYSIS_MEASUREMENT_SCHEMA if structured else PRICING_ANALYSIS_SEAL_SCHEMA,
         "analysis_id": "analysis-" + secrets.token_hex(12),
         "issued_at": round(time.time(), 6),
         "session_id": safe_quote_session_id(session.get("session_id"), ""),
@@ -23573,7 +23610,7 @@ def verified_pricing_analysis_seal(raw: Any, *, scope: str, session_id: str) -> 
     if not hmac.compare_digest(mac, pricing_analysis_seal_mac(key, scope, body)):
         return None
     if (
-        raw.get("schema") != PRICING_ANALYSIS_SEAL_SCHEMA
+        raw.get("schema") not in (PRICING_ANALYSIS_SEAL_SCHEMA, PRICING_ANALYSIS_MEASUREMENT_SCHEMA)
         or raw.get("session_id") != session_id
         or not isinstance(raw.get("analysis_id"), str)
         or not PRICING_ANALYSIS_ID_RE.fullmatch(raw["analysis_id"])
@@ -23624,10 +23661,33 @@ def normalized_pricing_ledger_grant(value: Any) -> dict[str, Any] | None:
     return grant
 
 
+def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    disposition = value.get("disposition")
+    if disposition in ("review", "informational") and set(value) == {"disposition"}:
+        return {"disposition": disposition}
+    if (disposition == "measured" and set(value) == {"disposition", "kind", "source", "quantity", "unit", "evidence_digest"}
+            and value["kind"] in ("observed", "derived")
+            and isinstance(value["source"], str) and value["source"]
+            and type(value["quantity"]) in {int, float} and pricing_ledger_quantity(value["quantity"]) is not None
+            and value["unit"] in ("sqm", "sqft", "ft2", "sq ft")
+            and isinstance(value["evidence_digest"], str) and re.fullmatch(r"[0-9a-f]{64}", value["evidence_digest"])):
+        return dict(value)
+    return None
+
+
+def pricing_measurement_matches(record: dict[str, Any], row: Any) -> bool:
+    return (record["disposition"] == "measured" and isinstance(row, dict)
+            and pricing_ledger_quantity(row.get("quantity")) == record["quantity"]
+            and pricing_units_share_quantity_basis(row.get("unit"), record["unit"]))
+
+
 def normalized_pricing_ledger(value: Any) -> dict[str, Any]:
     """Validate a persisted ledger. A damaged ledger grants nothing; it is never re-bootstrapped."""
     ledger = empty_pricing_ledger("invalid")
-    if not isinstance(value, dict) or value.get("schema") != PRICING_LEDGER_SCHEMA or value.get("origin") not in {"new", "legacy"}:
+    if (not isinstance(value, dict) or value.get("schema") not in (PRICING_LEDGER_SCHEMA, PRICING_LEDGER_MEASUREMENT_SCHEMA)
+            or value.get("origin") not in {"new", "legacy"}):
         return ledger
     revision = value.get("revision")
     rows = value.get("rows")
@@ -23635,6 +23695,7 @@ def normalized_pricing_ledger(value: Any) -> dict[str, Any]:
     if type(revision) is not int or revision < 0 or not isinstance(rows, dict) or not isinstance(analyses, list):
         return ledger
     normalized = empty_pricing_ledger(value["origin"])
+    normalized["schema"] = value["schema"]
     normalized["revision"] = revision
     normalized["analyses"] = [item for item in analyses if isinstance(item, str) and PRICING_ANALYSIS_ID_RE.fullmatch(item)][-PRICING_LEDGER_MAX_ANALYSES:]
     analysis = value.get("analysis")
@@ -23653,6 +23714,11 @@ def normalized_pricing_ledger(value: Any) -> dict[str, Any]:
             "source_unit": entry["source_unit"] if isinstance(entry.get("source_unit"), str) else None,
             "grant": normalized_pricing_ledger_grant(entry.get("grant")),
         }
+        if "measurement" in entry:
+            measurement = normalized_pricing_measurement(entry["measurement"])
+            if measurement is None or value["schema"] != PRICING_LEDGER_MEASUREMENT_SCHEMA:
+                return ledger
+            normalized["rows"][row_id]["measurement"] = measurement
     return normalized
 
 
@@ -23682,20 +23748,29 @@ def pricing_ledger_draft_rows(draft_state: Any, *, include_unlinked_lines: bool 
 
 def provisional_pricing_row_ids(draft_state: Any) -> set[str]:
     draft = draft_state if isinstance(draft_state, dict) else {}
-    views = pricing_ledger_draft_rows(draft, include_unlinked_lines=True)
-    provisional = {
-        row_id for row_id, view in views.items()
-        if provisional_measurement(view["row"] or {}, view["line"] or {})
-    }
-    # Older drafts can retain the source detail only on their Output rows.
-    output_rows = draft.get("outputRows")
-    if isinstance(output_rows, list):
-        for row in output_rows:
-            if not isinstance(row, dict):
-                continue
-            row_id = safe_resource_id(row.get("source_basis_line_id"), "")
-            if row_id and provisional_measurement(row, (views.get(row_id) or {}).get("line") or {}):
-                provisional.add(row_id)
+    original = draft.get("originalAnalysisSnapshot")
+    original = original if isinstance(original, dict) else {}
+    provisional = set()
+    # The editor can restore either snapshot. Check its source detail before
+    # a current or restored catalogue description obscures that evidence.
+    for sections, rows in (
+        (draft.get("quoteBasisSections"), draft.get("lineItems")),
+        (draft.get("quoteBasisSections"), draft.get("outputRows")),
+        (original.get("quote_basis_sections"), draft.get("originalOutputRows")),
+        (original.get("quote_basis_sections"), original.get("line_items")),
+    ):
+        views = pricing_ledger_draft_rows({"quoteBasisSections": sections, "lineItems": rows}, include_unlinked_lines=True)
+        provisional.update(
+            row_id for row_id, view in views.items()
+            if provisional_measurement(view["row"] or {}, view["line"] or {})
+        )
+        if isinstance(rows, list):
+            provisional.update(
+                row_id for row in rows if isinstance(row, dict)
+                and (row_id := safe_resource_id(row.get("source_basis_line_id"), ""))
+                and views[row_id]["row_count"] > 1
+                and provisional_measurement(row, (views.get(row_id) or {}).get("line") or {})
+            )
     return provisional
 
 
@@ -23729,13 +23804,19 @@ def pricing_ledger_row_fingerprint(view: dict[str, Any] | None) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
 
 
-def pricing_ledger_grant_supported(grant: dict[str, Any], view: dict[str, Any] | None, draft_state: Any) -> bool:
+def pricing_ledger_grant_supported(grant: dict[str, Any], view: dict[str, Any] | None, draft_state: Any,
+                                   measurement: dict[str, Any] | None = None) -> bool:
     """Whether a saved draft still supports a grant (Manual/Included rows only override its price)."""
     row = (view or {}).get("row")
     line = (view or {}).get("line")
     if not isinstance(row, dict) or not isinstance(line, dict):
         return False
-    if is_non_quote_note_record(row) or is_non_quote_note_record(line) or provisional_measurement(row, line):
+    if is_non_quote_note_record(row) or is_non_quote_note_record(line):
+        return False
+    if measurement is not None:
+        if not all(pricing_measurement_matches(measurement, value) for value in (row, line)):
+            return False
+    elif provisional_measurement(row, line):
         return False
     # Analysis matches arrive as Confirm (priced, awaiting review); Exclude/Custom end the grant.
     if normalize_basis_tag(line.get("tag")) not in {"Include", "Confirm"} or line.get("custom_pricing"):
@@ -23793,6 +23874,9 @@ def pricing_ledger_seal_grants(seal: dict[str, Any] | None, ledger: dict[str, An
     """
     if not seal or seal["analysis_id"] in ledger["analyses"]:
         return None
+    measured_seal = seal["schema"] == PRICING_ANALYSIS_MEASUREMENT_SCHEMA
+    if not measured_seal and ledger["schema"] == PRICING_LEDGER_MEASUREMENT_SCHEMA:
+        return None
     current = ledger.get("analysis")
     issued_at = float(seal["issued_at"])
     if current and issued_at <= current["issued_at"]:
@@ -23813,6 +23897,11 @@ def pricing_ledger_seal_grants(seal: dict[str, Any] | None, ledger: dict[str, An
             "reference_id": reference.get("id"),
         }) if entry.get("catalog_item_id") else None
         grants[row_id] = {"grant": grant, "source_unit": entry.get("unit") if isinstance(entry.get("unit"), str) else None}
+        if measured_seal and "measurement" in entry:
+            measurement = normalized_pricing_measurement(entry["measurement"]) or {"disposition": "review"}
+            grants[row_id]["measurement"] = measurement
+            if not pricing_measurement_matches(measurement, entry):
+                grants[row_id].update(grant=None, source_unit="")
     return grants
 
 
@@ -23833,15 +23922,22 @@ def pricing_ledger_after_save(
     )
     offered = pricing_ledger_seal_grants(seal, ledger)
     if seal and offered is not None:
+        if seal["schema"] == PRICING_ANALYSIS_MEASUREMENT_SCHEMA:
+            ledger["schema"] = PRICING_LEDGER_MEASUREMENT_SCHEMA
         ledger["analyses"] = (ledger["analyses"] + [seal["analysis_id"]])[-PRICING_LEDGER_MAX_ANALYSES:]
         ledger["analysis"] = {"issued_at": float(seal["issued_at"])}
         for row_id, offer in offered.items():
             entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
             entry.update(grant=offer["grant"], source_unit=offer["source_unit"], rev=entry["rev"] + 1, changed_at=now)
+            if "measurement" in offer:
+                entry["measurement"] = offer["measurement"]
+            else:
+                entry.pop("measurement", None)
         changed = True
     blocked_rows = provisional_pricing_rows_with_saved_evidence(
         draft_state, (existing or {}).get("draft_state"), offered or {},
     )
+    blocked_rows.difference_update(row_id for row_id, entry in ledger["rows"].items() if "measurement" in entry)
     views = pricing_ledger_draft_rows(draft_state)
     for row_id in list(dict.fromkeys([*views, *ledger["rows"]])):
         view = views.get(row_id)
@@ -23855,7 +23951,7 @@ def pricing_ledger_after_save(
             changed = True
         grant = entry.get("grant")
         if grant and grant["state"] == "live" and (
-            row_id in blocked_rows or not pricing_ledger_grant_supported(grant, view, draft_state)
+            row_id in blocked_rows or not pricing_ledger_grant_supported(grant, view, draft_state, entry.get("measurement"))
         ):
             entry["grant"] = {**grant, "state": "superseded"}
             entry["rev"] += 1
@@ -23903,6 +23999,10 @@ class PricingLedgerView:
     ledger: dict[str, Any]
     seal_grants: dict[str, dict[str, Any]] = field(default_factory=dict)
     provisional_rows: set[str] = field(default_factory=set)
+
+    def measurement(self, row_id: str) -> dict[str, Any] | None:
+        entry = self.seal_grants.get(row_id, self.ledger["rows"].get(row_id, {}))
+        return entry.get("measurement")
 
     def grant(self, row_id: str) -> dict[str, Any] | None:
         if row_id in self.provisional_rows:
@@ -23961,13 +24061,16 @@ def pricing_ledger_view_for_payload(
                 return PricingLedgerView(empty_pricing_ledger("invalid"))
     ledger = effective_pricing_ledger(metadata)
     seal = verified_pricing_analysis_seal(pricing_analysis_seal_from_payload(payload), scope=scope, session_id=session_id)
-    basis_sections = payload.get("quote_basis_sections")
-    if not isinstance(basis_sections, list):
-        basis_sections = quote_session_draft_state_from_payload(payload).get("quoteBasisSections")
+    draft = quote_session_draft_state_from_payload(payload)
+    for payload_key, draft_key in (("quote_basis_sections", "quoteBasisSections"), ("line_items", "lineItems")):
+        if isinstance(payload.get(payload_key), list):
+            draft[draft_key] = payload[payload_key]
     offers = pricing_ledger_seal_grants(seal, ledger) or {}
     provisional_rows = provisional_pricing_rows_with_saved_evidence(
-        {"lineItems": payload.get("line_items"), "quoteBasisSections": basis_sections},
-        metadata.get("draft_state"), offers,
+        draft, metadata.get("draft_state"), offers,
+    )
+    provisional_rows.difference_update(
+        row_id for row_id, entry in {**ledger["rows"], **offers}.items() if "measurement" in entry
     )
     return PricingLedgerView(ledger, offers, provisional_rows)
 
@@ -23983,11 +24086,14 @@ def line_items_with_pricing_ledger(
         counts[row_id] = counts.get(row_id, 0) + 1
     result = []
     for item in line_items:
+        row_id = safe_resource_id(item.get("source_basis_line_id"), "") if isinstance(item, dict) else ""
+        measurement = view.measurement(row_id)
+        if measurement and measurement["disposition"] == "informational":
+            continue
         authority = item.get("pricing_authority") if isinstance(item, dict) and isinstance(item.get("pricing_authority"), dict) else {}
         if authority.get("variant") != "catalog":
             result.append(item)
             continue
-        row_id = safe_resource_id(item.get("source_basis_line_id"), "")
         grant = view.grant(row_id) if row_id and counts.get(row_id) == 1 else None
         granted = bool(
             grant
@@ -23998,6 +24104,7 @@ def line_items_with_pricing_ledger(
             # The digest binds the reference content; a pre-ledger grant may not have recorded its id.
             and (not grant["reference_id"] or clean_text(item.get("pricing_reference_id") or grant["reference_id"]) == grant["reference_id"])
             and pricing_units_share_quantity_basis(item.get("unit"), grant["catalog_unit"])
+            and (measurement is None or pricing_measurement_matches(measurement, item))
         )
         result.append(item if granted else reject_catalog_line_item_authority(item))
     return result
@@ -24059,6 +24166,7 @@ def line_items_with_confirmed_basis_selections(
         keyword = clean_text(line.get("pricing_keyword"))
         grant = ledger_view.grant(source_id)
         source_unit = ledger_view.source_unit(source_id)
+        measurement = ledger_view.measurement(source_id)
         catalog_item = lookup.get(keyword)
         quantity = parse_float_or_none(item.get("quantity"))
         unit = normalize_pricing_unit(catalog_item_unit_hint(catalog_item)) if catalog_item else ""
@@ -24068,6 +24176,8 @@ def line_items_with_confirmed_basis_selections(
                 or quantity is None or quantity <= 0
                 or parse_float_or_none(original.get("quantity")) != quantity
                 or parse_float_or_none(line.get("quantity")) != quantity
+                or (measurement is not None and not all(
+                    pricing_measurement_matches(measurement, row) for row in (line, original, item)))
                 or not pricing_units_share_quantity_basis(line.get("unit"), grant["catalog_unit"])
                 or canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)) != grant["catalog_unit"]
                 or not pricing_units_share_quantity_basis(original.get("unit") if source_unit is None else source_unit, unit)
@@ -24254,6 +24364,7 @@ def pricing_selection_refusal(
     source_unit: str | None,
     catalog_item: dict[str, Any] | None,
     lookup: dict[str, dict[str, Any]],
+    measurement: dict[str, Any] | None = None,
 ) -> str:
     """Why the persisted row cannot take this catalogue item now ("" when it can)."""
     row = (view or {}).get("row")
@@ -24273,7 +24384,7 @@ def pricing_selection_refusal(
         return "ineligible"
     if not catalog_item or clean_text(catalog_item.get("id")) != item_id:
         return "not_in_catalogue"
-    return pricing_selection_compatibility_refusal(line, row, source_unit, catalog_item, lookup)
+    return pricing_selection_compatibility_refusal(line, row, source_unit, catalog_item, lookup, measurement)
 
 
 def pricing_selection_compatibility_refusal(
@@ -24282,12 +24393,16 @@ def pricing_selection_compatibility_refusal(
     source_unit: str | None,
     catalog_item: dict[str, Any],
     lookup: dict[str, dict[str, Any]],
+    measurement: dict[str, Any] | None = None,
 ) -> str:
     """Shared candidate/Confirm checks, including explicit selection's low-overlap waiver."""
     if pricing_reference_sale_unit_price(catalog_item) is None:
         return "not_in_catalogue"
     catalog_unit = catalog_item_unit_hint(catalog_item)
-    if provisional_measurement(row, line):
+    if measurement is not None:
+        if not all(pricing_measurement_matches(measurement, value) for value in (row, line)):
+            return "unit_review_required"
+    elif provisional_measurement(row, line):
         return "unit_review_required"
     if not all(pricing_units_share_quantity_basis(unit, catalog_unit)
                for unit in (source_unit if source_unit is not None else row.get("unit"), row.get("unit"), line.get("unit"))):
@@ -24441,7 +24556,7 @@ def plan_pricing_selection_grants(
         entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
         catalog_item = lookup.get(item_id)
         reason = reinclude_refusals.get(row_id) or pricing_selection_refusal(
-            request, views.get(row_id), entry.get("source_unit"), catalog_item, lookup,
+            request, views.get(row_id), entry.get("source_unit"), catalog_item, lookup, entry.get("measurement"),
         )
         if not reason and not (source and reference_id and PRICING_REFERENCE_DIGEST_RE.fullmatch(digest)):
             reason = "reference_changed"
@@ -24504,7 +24619,7 @@ def pricing_reinclude_refusals(
         ):
             refusals[row_id] = "reference_changed"
         else:
-            reason = pricing_selection_refusal(request, view, source_unit, catalog_item, lookup)
+            reason = pricing_selection_refusal(request, view, source_unit, catalog_item, lookup, entry.get("measurement"))
             if reason:
                 refusals[row_id] = reason
     return refusals
@@ -25370,8 +25485,85 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
     return result
 
 
+def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[str]]) -> dict[str, dict[str, Any]]:
+    """Admit area evidence for an exact basis row before catalogue rewriting."""
+    items = {row["source_basis_line_id"]: row for row in parsed.get("line_items", [])}
+    records: dict[str, dict[str, Any]] = {}
+    claims: dict[str, list[str]] = {}
+    facts = {source: {clean_text(fact).rstrip(".") for raw in texts if isinstance(raw, str)
+                      for fact in re.split(r"[;\r\n]", raw)} for source, texts in sources.items()}
+    for section in parsed.get("quote_basis_sections", []):
+        for line in section.get("lines", []):
+            if not isinstance(line, dict) or not (row_id := line.get("id")):
+                continue
+            text = line.get("text") or line.get("line") or line.get("description")
+            item = items.get(row_id, {})
+            if line.get("scope_kind") == "informational":
+                records[row_id] = {"disposition": "informational"}
+                line["text"] = text if is_non_quote_note_record(line) else f"Clarification note: {text}"
+                for key in ("line", "description", "pricing_keyword", "quantity", "unit"):
+                    line.pop(key, None)
+                continue
+            quantity, unit = provider_row_measurement(line, text)
+            item_quantity, item_unit = provider_row_measurement(item, item.get("description", ""))
+            quantity, unit = quantity or item_quantity, canonical_pricing_authority_unit(unit or item_unit)
+            evidence = line.get("measurement_evidence")
+            if isinstance(evidence, dict) and evidence.get("kind") == "provisional":
+                records[row_id] = {"disposition": "review"}
+                continue
+            if unit not in {"sqm", "sqft", "ft2", "sq ft"}:
+                continue
+            records[row_id] = {"disposition": "review"}
+            if line.get("scope_kind") != "physical" or not isinstance(evidence, dict) or quantity is None:
+                continue
+            kind = clean_text(evidence.get("kind"))
+            source = clean_text(evidence.get("source"))
+            statement = clean_text(evidence.get("statement")).rstrip(".")
+            label, separator, measurement = statement.rpartition(":")
+            if kind not in {"observed", "derived"} or not separator or len(statement) > 300:
+                continue
+            scope_key = provider_basis_description_key(label, catalog_reference_only=False)
+            prefix = leading_quantity_prefix(text)
+            row_key = provider_basis_description_key(prefix["text"] if prefix else text, catalog_reference_only=False)
+            if not scope_key or not (row_key == scope_key or row_key.startswith(scope_key + " ")):
+                continue
+            if statement not in facts.get(source, ()):
+                continue
+            measurement = measurement.strip()
+            if kind == "observed":
+                observed = re.fullmatch(rf"({SCOPE_NUMBER})\s+(.+)", measurement)
+                if (not observed or Decimal(observed[1].replace(",", ".")) != quantity
+                        or not pricing_units_share_quantity_basis(observed[2], unit)):
+                    continue
+            else:
+                dimensions = re.fullmatch(
+                    rf"({SCOPE_NUMBER})\s*m\s*(?:x|\u00d7|by)\s*({SCOPE_NUMBER})\s*m\s*,\s*full coverage",
+                    measurement, re.I,
+                )
+                if unit != "sqm" or dimensions is None:
+                    continue
+                width, depth = (Decimal(value.replace(",", ".")) for value in dimensions.groups())
+                if min(width, depth) <= 0 or width * depth != quantity:
+                    continue
+            records[row_id] = {"disposition": "measured", "kind": kind, "source": source,
+                               "quantity": float(quantity), "unit": unit,
+                               "evidence_digest": hashlib.sha256(statement.encode("utf-8")).hexdigest()}
+            claims.setdefault(statement, []).append(row_id)
+    for row_ids in claims.values():
+        if len(row_ids) > 1:
+            for row_id in row_ids:
+                records[row_id] = {"disposition": "review"}
+    for row_id, item in items.items():
+        if row_id not in records:
+            _, unit = provider_row_measurement(item, item["description"])
+            if canonical_pricing_authority_unit(unit) in {"sqm", "sqft", "ft2", "sq ft"}:
+                records[row_id] = {"disposition": "review"}
+    return records
+
+
 def admitted_provider_measurements(
     parsed: dict[str, Any], *, provisional_rows: set[str] | None = None,
+    scope_records: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[Any]]:
     """Recover exact scope measurements in the draft copy, before catalogue rewriting."""
     basis_by_id = {
@@ -25389,7 +25581,8 @@ def admitted_provider_measurements(
         quantity, unit = provider_row_measurement(row, row_text)
         line = basis_by_id.get(row_id)
         line_text = (line.get("text") or line.get("line") or line.get("description")) if line else ""
-        provisional = provisional_measurement(row, line or {})
+        record = (scope_records or {}).get(row_id)
+        provisional = record["disposition"] != "measured" if record else provisional_measurement(row, line or {})
         if provisional and provisional_rows is not None:
             provisional_rows.add(row_id)
         if line is not None:
@@ -25422,7 +25615,9 @@ def admitted_provider_measurements(
             measurements[row_id] = [float(quantity) if quantity is not None else None, canonical_pricing_authority_unit(unit)]
     for row_id, line in basis_by_id.items():
         text = line.get("text") or line.get("line") or line.get("description")
-        if row_id not in item_ids and provisional_measurement({}, line):
+        record = (scope_records or {}).get(row_id)
+        provisional = record["disposition"] != "measured" if record else provisional_measurement({}, line)
+        if row_id not in item_ids and provisional:
             if provisional_rows is not None:
                 provisional_rows.add(row_id)
             continue
@@ -25484,10 +25679,12 @@ def normalize_ai_draft(
     payload: dict[str, Any] | None = None,
     require_confidence: bool = False,
     auth_session: dict[str, Any] | None = None,
+    *, measurement_sources: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     parsed = admit_provider_quote_draft(parsed, require_confidence=require_confidence)
+    scope_records = admitted_scope_measurements(parsed, measurement_sources) if measurement_sources is not None else None
     provisional_rows: set[str] = set()
-    source_measurements = admitted_provider_measurements(parsed, provisional_rows=provisional_rows)
+    source_measurements = admitted_provider_measurements(parsed, provisional_rows=provisional_rows, scope_records=scope_records)
     has_payload_context = payload is not None
     payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if has_payload_context and pricing_reference_snapshot_for_payload(payload) is None:
@@ -25556,6 +25753,7 @@ def normalize_ai_draft(
         mark_unmatched_confirm_custom=has_payload_context,
         provider_result=has_payload_context,
         source_units=source_units,
+        scope_records=scope_records,
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
@@ -25598,10 +25796,11 @@ def normalize_ai_draft(
         # admitted measurements forward internally before either can happen.
         result["_pricing_analysis_source_units"] = source_units
         result["_pricing_analysis_source_quantities"] = source_quantities
+        result["_pricing_analysis_scope_records"] = scope_records
         result["_unmatched_source_measurements"] = source_measurements
         seal = issue_pricing_analysis_seal(
             payload, line_items, auth_session=auth_session,
-            source_units=source_units, source_quantities=source_quantities,
+            source_units=source_units, source_quantities=source_quantities, scope_records=scope_records,
         )
         if seal is not None:
             result["pricing_analysis_seal"] = seal
@@ -26109,6 +26308,7 @@ class DraftBatchRunner:
 def prepare_draft_media(references):
     single_send = []
     media = []
+    measurement_sources = {}
     pages_remaining = MAX_DRAFT_PDF_PAGES
     pdf_bytes_total = 0
     original_pdfs_fit = True
@@ -26116,8 +26316,10 @@ def prepare_draft_media(references):
         url = reference["data_url"]
         if reference_file_mime_type(reference) != "application/pdf":
             image = {"type": "input_image", "image_url": url, "detail": "high"}
+            label = f"Reference {source}, uploaded image"
             single_send.append(image)
-            media.append((f"Reference {source}, uploaded image", image))
+            media.append((label, image))
+            measurement_sources[label] = ""
             continue
         filename = safe_segment(clean_text(reference["name"]) or "reference.pdf", "reference.pdf")
         raw = decode_reference_data_url_bytes(reference, MAX_PDF_BYTES)
@@ -26147,12 +26349,14 @@ def prepare_draft_media(references):
             if validate_draft_media(page_url, MAX_RENDERED_PDF_PAGE_BYTES, stage="rendered_pdf_media") == "application/pdf":
                 draft_request_invalid("rendered_pdf_media", "invalid_media_format")
             image = {"type": "input_image", "image_url": page_url, "detail": "high"}
+            label = f"Reference {source}, PDF page {page['page']}"
             single_send.append(image)
-            media.append((f"Reference {source}, PDF page {page['page']}", image))
+            media.append((label, image))
+            measurement_sources[label] = page.get("measurement_text", "")
 
     if (MAX_DRAFT_PDF_PAGES - pages_remaining <= MAX_RENDERED_PDF_PAGES
             and original_pdfs_fit and pdf_bytes_total <= MAX_DRAFT_INPUT_FILE_TOTAL_BYTES):
-        return PreparedDraftMedia(single_send, [])
+        return PreparedDraftMedia(single_send, [], measurement_sources)
 
     batches = []
     batch = []
@@ -26169,7 +26373,7 @@ def prepare_draft_media(references):
         size += image_size
     if batch:
         batches.append(batch)
-    return PreparedDraftMedia([], batches)
+    return PreparedDraftMedia([], batches, measurement_sources)
 
 
 def draft_request_body(configuration, content, *, final_draft=False):
@@ -26260,7 +26464,8 @@ class PreparedDraftBatches:
 class OpenAIDraftRequest:
     """Bind the admitted quote context to the existing provider and send owners."""
 
-    def __init__(self, gateway, operation, configuration, prompt, catalog_parts, *, payload, auth_session):
+    def __init__(self, gateway, operation, configuration, prompt, catalog_parts, *, payload, auth_session,
+                 measurement_sources=None):
         self.gateway = gateway
         self.operation = operation
         self.configuration = configuration
@@ -26268,12 +26473,16 @@ class OpenAIDraftRequest:
         self.catalog_parts = catalog_parts
         self.payload = payload
         self.auth_session = auth_session
+        self.measurement_sources = measurement_sources
 
     def new_budget(self, batch_count):
         return DraftSendBudget(self.operation, self.configuration.model, batch_count)
 
     def send_single(self, media, budget):
-        content = [{"type": "input_text", "text": self.prompt}, *media, *self.catalog_parts]
+        prompt = self.prompt
+        if isinstance(prompt, str) and self.measurement_sources is not None:
+            prompt += "\nVisuals in order: " + "; ".join(self.measurement_sources) + "."
+        content = [{"type": "input_text", "text": prompt}, *media, *self.catalog_parts]
         return send_draft_request(self.gateway, self.operation, self.configuration, content, budget)
 
     def prepare_batches(self, batches):
@@ -26322,6 +26531,7 @@ class OpenAIDraftRequest:
                 "Capture physical scope, labels, measurements, uncertainties and relationships. "
                 "Retain explicit quantities and units with their object and location, "
                 "including visible counts, areas, lengths and dimension labels. "
+                "For a printed area or fully covered dimensions, keep the literal scope and measurement together. "
                 "Keep dimensions separate from billable quantities; do not turn a dimension string into a scalar quantity. "
                 "Record which object each dimension describes and whether "
                 "the quoted floor coverage is full, partial or unknown. Do not derive area from a provisional footprint. "
@@ -26367,7 +26577,7 @@ class OpenAIDraftRequest:
                 if exc.diagnostics.get("failure_boundary") == "provider_response_schema":
                     raise
                 raise DraftBatchError("synthesis_provider_failure") from exc
-            return self.normalize_response(data, fingerprint)
+            return self.normalize_response(data, fingerprint, observations=observations)
 
         budget.next_stage(synthesis=True)
         try:
@@ -26375,10 +26585,19 @@ class OpenAIDraftRequest:
         except AIModelOutputError as exc:
             return repair_draft_synthesis(exc, body, send_synthesis, budget)
 
-    def normalize_response(self, data, fingerprint):
+    def normalize_response(self, data, fingerprint, *, observations=()):
+        sources = None if self.measurement_sources is None else {
+            source: [text] for source, text in self.measurement_sources.items()
+        }
+        if sources is not None:
+            for observation in observations:
+                if observation["source"] in sources:
+                    sources[observation["source"]].append(observation["observation"])
+            sources["Quote notes"] = [self.payload.get(key, "") for key in ("notes", "user_feedback")]
         return normalize_draft_response(
             data, fingerprint, self.payload, self.auth_session,
             response_contract=self.configuration.response_contract,
+            measurement_sources=sources,
         )
 
     def record_usage(self, budget):
@@ -26420,11 +26639,13 @@ def request_openai_quote_basis(
     operation = "draft_high_quality" if analysis_mode == DRAFT_ANALYSIS_MODE_HIGH_QUALITY else "draft"
     draft_request = OpenAIDraftRequest(
         gateway, operation, configuration, prompt, catalog_parts, payload=payload, auth_session=auth_session,
+        measurement_sources=prepared.measurement_sources,
     )
     return QuoteDraftRunner(draft_request).run(prepared)
 
 
-def normalize_draft_response(data, shape_fingerprint, payload, auth_session, *, response_contract=None):
+def normalize_draft_response(data, shape_fingerprint, payload, auth_session, *, response_contract=None,
+                             measurement_sources=None):
     response_diagnostics = openai_response_failure_diagnostics(data)
     for key in ("provider_error_class", "provider_error_code"):
         response_diagnostics.pop(key, None)
@@ -26474,6 +26695,7 @@ def normalize_draft_response(data, shape_fingerprint, payload, auth_session, *, 
             payload,
             require_confidence=True,
             auth_session=auth_session,
+            measurement_sources=measurement_sources,
         )
     except OpenAIAnalysisError as exc:
         raise type(exc)(
@@ -26569,6 +26791,7 @@ def unpack_ai_draft(
         provider_result=provider_result,
         source_units=ai_draft.get("_pricing_analysis_source_units") if isinstance(
             ai_draft.get("_pricing_analysis_source_units"), dict) else pricing_analysis_source_units(ai_draft.get("line_items")),
+        scope_records=ai_draft.get("_pricing_analysis_scope_records"),
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
@@ -26673,6 +26896,7 @@ def finalized_remote_draft_result(
         provider_result=source.strip().lower() != "local",
         source_units=ai_basis.get("_pricing_analysis_source_units") if isinstance(
             ai_basis.get("_pricing_analysis_source_units"), dict) else pricing_analysis_source_units(ai_basis.get("line_items")),
+        scope_records=ai_basis.get("_pricing_analysis_scope_records"),
     )
     line_items = line_items_with_resolved_basis_catalog(
         line_items,
@@ -26717,10 +26941,12 @@ def finalized_remote_draft_result(
     # Request/default fallback rows keep request trust and never become analysis matches.
     provider_units = ai_basis.get("_pricing_analysis_source_units")
     provider_quantities = ai_basis.get("_pricing_analysis_source_quantities")
+    scope_records = ai_basis.get("_pricing_analysis_scope_records")
     seal = issue_pricing_analysis_seal(
         payload, line_items, auth_session=auth_session,
         source_units=provider_units if isinstance(provider_units, dict) else {},
         source_quantities=provider_quantities if isinstance(provider_quantities, dict) else {},
+        scope_records=scope_records if isinstance(scope_records, dict) else None,
     ) if has_payload_context and source.strip().lower() != "local" else None
     diagnostic_details = ai_draft_diagnostic_details(source, adjusted_basis, adjusted_sections, final_line_items)
     if isinstance(diagnostic_metadata, dict):
@@ -30259,8 +30485,11 @@ class QuotePublicationReadView:
         if include_draft_state:
             editor_draft = public.get("draft_state") or {}
             unsupported_catalogue_rows = provisional_pricing_row_ids(editor_draft)
+            ledger_rows = effective_pricing_ledger(normalized)["rows"]
+            scope_records = {row_id: entry["measurement"] for row_id, entry in ledger_rows.items() if "measurement" in entry}
+            unsupported_catalogue_rows.difference_update(scope_records)
             unsupported_catalogue_rows.update(
-                row_id for row_id, entry in effective_pricing_ledger(normalized)["rows"].items()
+                row_id for row_id, entry in ledger_rows.items()
                 if entry.get("source_unit") == ""
             )
             sections = editor_draft.get("quoteBasisSections")
@@ -30268,18 +30497,35 @@ class QuotePublicationReadView:
                 sections = basis_sections_with_linked_item_notes(sections, editor_draft.get(key))
             if isinstance(sections, list):
                 editor_draft["quoteBasisSections"] = sections
-            for key in ("lineItems", "outputRows", "originalOutputRows"):
-                rows = editor_draft.get(key)
+            original = editor_draft.get("originalAnalysisSnapshot")
+            original = original if isinstance(original, dict) else {}
+            original_sections = basis_sections_with_linked_item_notes(
+                original.get("quote_basis_sections"), original.get("line_items"),
+            )
+            if isinstance(original_sections, list):
+                original["quote_basis_sections"] = original_sections
+            for state, key, basis in (
+                (editor_draft, "lineItems", sections),
+                (editor_draft, "outputRows", sections),
+                (editor_draft, "originalOutputRows", original_sections if isinstance(original_sections, list) else sections),
+                (original, "line_items", original_sections),
+            ):
+                rows = state.get(key)
                 if isinstance(rows, list):
-                    rows = without_non_quote_note_rows(rows, sections)
-                    rows = [
-                        reject_catalog_line_item_authority(row)
-                        if isinstance(row, dict) and row.get("source_basis_line_id") in unsupported_catalogue_rows
-                        and isinstance(row.get("pricing_authority"), dict)
-                        and row["pricing_authority"].get("variant") == "catalog" else row
-                        for row in rows
-                    ]
-                    editor_draft[key] = rows if key == "lineItems" else prepare_output_rows(rows)
+                    rows = without_non_quote_note_rows(rows, basis)
+                    projected = []
+                    for row in rows:
+                        row_id = safe_resource_id(row.get("source_basis_line_id"), "") if isinstance(row, dict) else ""
+                        measurement = scope_records.get(row_id)
+                        if measurement and measurement["disposition"] == "informational":
+                            continue
+                        unsupported = row_id in unsupported_catalogue_rows or (
+                            measurement is not None and (not pricing_measurement_matches(measurement, row)
+                            or (ledger_rows[row_id].get("grant") or {}).get("state") != "live"))
+                        if unsupported and isinstance(row.get("pricing_authority"), dict) and row["pricing_authority"].get("variant") == "catalog":
+                            row = reject_catalog_line_item_authority(row)
+                        projected.append(row)
+                    state[key] = prepare_output_rows(projected) if key in {"outputRows", "originalOutputRows"} else projected
             public["draft_files"] = copy.deepcopy(draft_files or []) if isinstance(self.storage, DatabaseSqagStorage) else read_quote_session_draft_files(normalized["session_id"], normalized)
         else:
             public.pop("draft_state", None)
