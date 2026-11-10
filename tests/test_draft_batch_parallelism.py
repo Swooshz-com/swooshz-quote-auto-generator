@@ -368,6 +368,7 @@ class DraftBatchParallelismTest(unittest.TestCase):
                         "Capture physical scope, labels, measurements, uncertainties and relationships. "
                         "Retain explicit quantities and units with their object and location, "
                         "including visible counts, areas, lengths and dimension labels. "
+                        "For a printed area or fully covered dimensions, keep the literal scope and measurement together. "
                         "Keep dimensions separate from billable quantities; do not turn a dimension string into a scalar quantity. "
                         "Record which object each dimension describes and whether "
                         "the quoted floor coverage is full, partial or unknown. Do not derive area from a provisional footprint. "
