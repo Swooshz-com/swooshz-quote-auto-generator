@@ -23533,6 +23533,7 @@ def issue_pricing_analysis_seal(
     source_units: dict[str, str],
     source_quantities: dict[str, float | None],
     scope_records: dict[str, dict[str, Any]] | None = None,
+    basis_sections: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Seal this analysis result: which rows it produced, in which unit, and which it matched.
 
@@ -23558,6 +23559,7 @@ def issue_pricing_analysis_seal(
     rows = []
     structured = scope_records is not None
     scope_records = scope_records or {}
+    scope_views = pricing_ledger_draft_rows({"quoteBasisSections": basis_sections, "lineItems": line_items}) if scope_records else {}
     for item in line_items:
         row_id = safe_resource_id(item.get("source_basis_line_id"), "") if isinstance(item, dict) else ""
         if not row_id or counts[row_id] != 1:
@@ -23566,7 +23568,18 @@ def issue_pricing_analysis_seal(
         source_unit = source_units.get(row_id, "")
         entry: dict[str, Any] = {"id": row_id, "unit": source_unit, "quantity": pricing_ledger_quantity(item.get("quantity"))}
         if row_id in scope_records:
-            entry["measurement"] = scope_records[row_id]
+            record = scope_records[row_id]
+            if record["disposition"] == "measured":
+                view = scope_views.get(row_id) or {}
+                line = view.get("line") or {}
+                basis_scope = pricing_measurement_row_scope(line, "basis")
+                item_scope = pricing_measurement_row_scope(item, "item")
+                if basis_scope and item_scope:
+                    record = {**record, "basis_scope": basis_scope, "item_scope": item_scope}
+                else:
+                    record = {"disposition": "review"}
+                    entry["unit"] = source_unit = ""
+            entry["measurement"] = record
         claim = item.get("pricing_authority") if isinstance(item.get("pricing_authority"), dict) else {}
         catalog_unit = canonical_pricing_authority_unit(claim.get("catalog_unit"))
         if (
@@ -23581,7 +23594,8 @@ def issue_pricing_analysis_seal(
         ):
             entry.update(catalog_item_id=clean_text(claim["catalog_item_id"]), catalog_unit=catalog_unit)
         rows.append(entry)
-    rows.extend({"id": row_id, "unit": "", "quantity": None, "measurement": record}
+    rows.extend({"id": row_id, "unit": "", "quantity": None,
+                 "measurement": record if record["disposition"] != "measured" else {"disposition": "review"}}
                 for row_id, record in scope_records.items() if row_id not in counts)
     if len(rows) > PRICING_ANALYSIS_SEAL_MAX_ROWS:
         return None
@@ -23667,20 +23681,64 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     disposition = value.get("disposition")
     if disposition in ("review", "informational") and set(value) == {"disposition"}:
         return {"disposition": disposition}
-    if (disposition == "measured" and set(value) == {"disposition", "kind", "source", "quantity", "unit", "evidence_digest"}
+    legacy_fields = {"disposition", "kind", "source", "quantity", "unit", "evidence_digest"}
+    scope_fields = {"scope", "basis_scope", "item_scope"}
+    if disposition == "measured" and set(value) == legacy_fields:
+        # Earlier v2 drafts can open, but their area grants lack a scope binding.
+        return {"disposition": "review"}
+    if (disposition == "measured" and set(value) == legacy_fields | scope_fields
             and value["kind"] in ("observed", "derived")
             and isinstance(value["source"], str) and value["source"]
             and type(value["quantity"]) in {int, float} and pricing_ledger_quantity(value["quantity"]) is not None
-            and value["unit"] in ("sqm", "sqft", "ft2", "sq ft")
+            and isinstance(value["unit"], str) and value["unit"] in AREA_EVIDENCE_UNITS
+            and all(isinstance(value[key], str) and value[key] for key in scope_fields)
             and isinstance(value["evidence_digest"], str) and re.fullmatch(r"[0-9a-f]{64}", value["evidence_digest"])):
         return dict(value)
     return None
 
 
-def pricing_measurement_matches(record: dict[str, Any], row: Any) -> bool:
-    return (record["disposition"] == "measured" and isinstance(row, dict)
-            and pricing_ledger_quantity(row.get("quantity")) == record["quantity"]
-            and pricing_units_share_quantity_basis(row.get("unit"), record["unit"]))
+def pricing_measurement_row_scope(row: Any, role: str) -> str:
+    if not isinstance(row, dict):
+        return ""
+    value = row.get("text") if role == "basis" else row.get("description")
+    bracketed = bracketed_catalog_reference_parts(clean_text(value).rstrip(" ."))
+    scope_text = bracketed[1] if bracketed else value
+    prefix = leading_quantity_prefix(scope_text)
+    if prefix and (prefix["quantity"] != pricing_ledger_quantity(row.get("quantity"))
+                   or not pricing_units_share_quantity_basis(prefix["unit"], row.get("unit"))):
+        return ""
+    if bracketed:
+        reference, detail = (pricing_measurement_scope(part) for part in bracketed)
+        return f"[{reference}] - {detail}" if detail else reference
+    return pricing_measurement_scope(value)
+
+
+def pricing_measurement_matches(record: dict[str, Any], row: Any, *, role: str = "") -> bool:
+    if (record["disposition"] != "measured" or not isinstance(row, dict)
+            or pricing_ledger_quantity(row.get("quantity")) != record["quantity"]
+            or not pricing_units_share_quantity_basis(row.get("unit"), record["unit"])):
+        return False
+    if not role:
+        return True  # The sealed pair has its scopes in the record, not in display fields.
+    scope = pricing_measurement_row_scope(row, role)
+    return bool(scope) and scope in (record["scope"], record.get(f"{role}_scope"))
+
+
+def pricing_measurement_matches_view(record: dict[str, Any], view: dict[str, Any] | None) -> bool:
+    view = view or {}
+    return (pricing_measurement_matches(record, view.get("line"), role="basis")
+            and pricing_measurement_matches(record, view.get("row"), role="item"))
+
+
+def reused_pricing_measurement_rows(entries: dict[str, dict[str, Any]], views: dict[str, dict[str, Any]]) -> set[str]:
+    """Two active rows cannot bill one physical scope, even across separate analyses."""
+    scopes: dict[str, list[str]] = {}
+    for row_id, view in views.items():
+        record = (entries.get(row_id) or {}).get("measurement")
+        line = view.get("line") or {}
+        if record and normalize_basis_tag(line.get("tag")) != "Exclude" and pricing_measurement_matches_view(record, view):
+            scopes.setdefault(record["scope"], []).append(row_id)
+    return {row_id for row_ids in scopes.values() if len(row_ids) > 1 for row_id in row_ids}
 
 
 def normalized_pricing_ledger(value: Any) -> dict[str, Any]:
@@ -23719,6 +23777,8 @@ def normalized_pricing_ledger(value: Any) -> dict[str, Any]:
             if measurement is None or value["schema"] != PRICING_LEDGER_MEASUREMENT_SCHEMA:
                 return ledger
             normalized["rows"][row_id]["measurement"] = measurement
+            if measurement["disposition"] != "measured":
+                normalized["rows"][row_id].update(source_unit="", grant=None)
     return normalized
 
 
@@ -23782,7 +23842,7 @@ def provisional_pricing_rows_with_saved_evidence(
     return provisional_pricing_row_ids(draft) | (provisional_pricing_row_ids(saved) - newly_measured)
 
 
-def pricing_ledger_row_fingerprint(view: dict[str, Any] | None) -> str:
+def pricing_ledger_row_fingerprint(view: dict[str, Any] | None, measurement: dict[str, Any] | None = None) -> str:
     row = (view or {}).get("row")
     line = (view or {}).get("line")
     if not isinstance(row, dict):
@@ -23801,6 +23861,10 @@ def pricing_ledger_row_fingerprint(view: dict[str, Any] | None) -> str:
         clean_text(authority.get("variant")).lower(),
         clean_text(row.get("pricing_keyword")),
     ]
+    if measurement and measurement["disposition"] == "measured":
+        for role, value in (("basis", line), ("item", row)):
+            scope = pricing_measurement_row_scope(value, role)
+            material.append(measurement["scope"] if scope in (measurement["scope"], measurement.get(f"{role}_scope")) else scope)
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
 
 
@@ -23814,7 +23878,7 @@ def pricing_ledger_grant_supported(grant: dict[str, Any], view: dict[str, Any] |
     if is_non_quote_note_record(row) or is_non_quote_note_record(line):
         return False
     if measurement is not None:
-        if not all(pricing_measurement_matches(measurement, value) for value in (row, line)):
+        if not pricing_measurement_matches_view(measurement, view):
             return False
     elif provisional_measurement(row, line):
         return False
@@ -23939,10 +24003,11 @@ def pricing_ledger_after_save(
     )
     blocked_rows.difference_update(row_id for row_id, entry in ledger["rows"].items() if "measurement" in entry)
     views = pricing_ledger_draft_rows(draft_state)
+    blocked_rows.update(reused_pricing_measurement_rows(ledger["rows"], views))
     for row_id in list(dict.fromkeys([*views, *ledger["rows"]])):
         view = views.get(row_id)
         entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
-        fingerprint = pricing_ledger_row_fingerprint(view)
+        fingerprint = pricing_ledger_row_fingerprint(view, entry.get("measurement"))
         if fingerprint != entry["fingerprint"]:
             entry.update(fingerprint=fingerprint, rev=entry["rev"] + 1, changed_at=now)
             changed = True
@@ -24069,9 +24134,17 @@ def pricing_ledger_view_for_payload(
     provisional_rows = provisional_pricing_rows_with_saved_evidence(
         draft, metadata.get("draft_state"), offers,
     )
-    provisional_rows.difference_update(
-        row_id for row_id, entry in {**ledger["rows"], **offers}.items() if "measurement" in entry
-    )
+    measurement_entries = {**ledger["rows"], **offers}
+    provisional_rows.difference_update(row_id for row_id, entry in measurement_entries.items() if "measurement" in entry)
+    saved_draft = metadata.get("draft_state") or {}
+    if not isinstance(draft.get("quoteBasisSections"), list):
+        draft["quoteBasisSections"] = saved_draft.get("quoteBasisSections")
+    current_views = pricing_ledger_draft_rows(draft, include_unlinked_lines=True)
+    provisional_rows.update(reused_pricing_measurement_rows(measurement_entries, current_views))
+    for row_id, entry in measurement_entries.items():
+        measurement = entry.get("measurement")
+        if measurement and row_id in current_views and not pricing_measurement_matches_view(measurement, current_views[row_id]):
+            provisional_rows.add(row_id)
     return PricingLedgerView(ledger, offers, provisional_rows)
 
 
@@ -24104,7 +24177,7 @@ def line_items_with_pricing_ledger(
             # The digest binds the reference content; a pre-ledger grant may not have recorded its id.
             and (not grant["reference_id"] or clean_text(item.get("pricing_reference_id") or grant["reference_id"]) == grant["reference_id"])
             and pricing_units_share_quantity_basis(item.get("unit"), grant["catalog_unit"])
-            and (measurement is None or pricing_measurement_matches(measurement, item))
+            and (measurement is None or pricing_measurement_matches(measurement, item, role="item"))
         )
         result.append(item if granted else reject_catalog_line_item_authority(item))
     return result
@@ -24176,8 +24249,7 @@ def line_items_with_confirmed_basis_selections(
                 or quantity is None or quantity <= 0
                 or parse_float_or_none(original.get("quantity")) != quantity
                 or parse_float_or_none(line.get("quantity")) != quantity
-                or (measurement is not None and not all(
-                    pricing_measurement_matches(measurement, row) for row in (line, original, item)))
+                or (measurement is not None and not pricing_measurement_matches_view(measurement, {"line": line, "row": original}))
                 or not pricing_units_share_quantity_basis(line.get("unit"), grant["catalog_unit"])
                 or canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)) != grant["catalog_unit"]
                 or not pricing_units_share_quantity_basis(original.get("unit") if source_unit is None else source_unit, unit)
@@ -24400,7 +24472,13 @@ def pricing_selection_compatibility_refusal(
         return "not_in_catalogue"
     catalog_unit = catalog_item_unit_hint(catalog_item)
     if measurement is not None:
-        if not all(pricing_measurement_matches(measurement, value) for value in (row, line)):
+        bracketed = bracketed_catalog_reference_parts(line.get("text"))
+        if (measurement["disposition"] == "measured" and bracketed
+                and pricing_measurement_scope(bracketed[0]) == pricing_measurement_scope(catalog_item.get("description"))
+                and pricing_measurement_scope(bracketed[1]) == measurement["scope"]):
+            # Selection can introduce the authenticated catalogue wrapper around the same scope.
+            measurement = {**measurement, "basis_scope": pricing_measurement_row_scope(line, "basis")}
+        if not pricing_measurement_matches_view(measurement, {"line": line, "row": row}):
             return "unit_review_required"
     elif provisional_measurement(row, line):
         return "unit_review_required"
@@ -24563,6 +24641,11 @@ def plan_pricing_selection_grants(
         if reason:
             outcomes.append({"source_basis_line_id": row_id, "status": "refused", "reason": reason})
             continue
+        if entry.get("measurement", {}).get("disposition") == "measured":
+            entry["measurement"].update(
+                basis_scope=pricing_measurement_row_scope(views[row_id]["line"], "basis"),
+                item_scope=pricing_measurement_scope(catalog_item.get("description")),
+            )
         grant = {
             "state": "live", "origin": "operator", "catalog_item_id": item_id,
             "catalog_unit": canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)),
@@ -25485,13 +25568,73 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
     return result
 
 
+AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
+AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
+
+
+def pricing_measurement_scope(value: Any) -> str:
+    """Canonical physical wording, retaining location, extent and interior punctuation."""
+    text = clean_customer_quote_line_text(value)
+    bracketed = bracketed_catalog_reference_parts(text)
+    if bracketed:
+        text = bracketed[1] or bracketed[0]
+    prefix = leading_quantity_prefix(text)
+    if prefix:
+        text = prefix["text"]
+    for match in INDEPENDENT_AREA_MEASUREMENT.finditer(text):
+        suffix = text[match.end():].strip(" ,;.")
+        dependency = PROVISIONAL_AREA_DEPENDENCY.fullmatch(suffix)
+        if not match["negation"] and (not suffix or (dependency and dependency["negation"])):
+            text = text[:match.start()]
+            break
+    return clean_text(unicodedata.normalize("NFKC", text)).casefold().strip(" ,;.")
+
+
+def area_measurement_fact(statement: str) -> tuple[str, str, Decimal, str, tuple[Decimal, ...]] | None:
+    label, separator, raw = clean_text(statement).rstrip(".").rpartition(":")
+    scope = pricing_measurement_scope(label)
+    if (not separator or not scope or len(statement) > 300 or uses_provisional_dimensions(label)
+            or re.match(r"^(?:provisional|default|assumed|estimated|guessed)\b", scope)):
+        return None
+    measurement = raw.strip()
+    dimensions = re.fullmatch(
+        rf"({AREA_EVIDENCE_NUMBER})\s*m\s*(?:x|\u00d7|by)\s*({AREA_EVIDENCE_NUMBER})\s*m\s*,\s*full coverage",
+        measurement, re.I,
+    )
+    try:
+        if dimensions:
+            width, depth = (provider_quantity(value.replace(",", "")) for value in dimensions.groups())
+            kind, quantity, unit, geometry = "derived", width * depth, "sqm", (width, depth)
+        else:
+            observed = re.fullmatch(rf"({AREA_EVIDENCE_NUMBER})\s+(.+)", measurement)
+            if not observed:
+                return None
+            unit = canonical_pricing_authority_unit(normalize_pricing_unit(observed[2])).lower()
+            if unit not in AREA_EVIDENCE_UNITS:
+                return None
+            kind, quantity, geometry = "observed", provider_quantity(observed[1].replace(",", "")), ()
+    except AIModelOutputError:
+        return None  # Unsupported source amounts are suggestions, not provider shape errors.
+    prefix = leading_quantity_prefix(label)
+    if prefix and (Decimal(str(prefix["quantity"])) != quantity or not pricing_units_share_quantity_basis(prefix["unit"], unit)):
+        return None
+    return scope, kind, quantity, unit, geometry
+
+
 def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[str]]) -> dict[str, dict[str, Any]]:
-    """Admit area evidence for an exact basis row before catalogue rewriting."""
+    """Admit each source-backed area once for its exact basis and linked item."""
     items = {row["source_basis_line_id"]: row for row in parsed.get("line_items", [])}
     records: dict[str, dict[str, Any]] = {}
     claims: dict[str, list[str]] = {}
-    facts = {source: {clean_text(fact).rstrip(".") for raw in texts if isinstance(raw, str)
-                      for fact in re.split(r"[;\r\n]", raw)} for source, texts in sources.items()}
+    facts = {source: {fact for raw in texts if isinstance(raw, str) for statement in re.split(r"[;\r\n]", raw)
+                      if (fact := area_measurement_fact(statement)) is not None} for source, texts in sources.items()}
+    amounts: dict[str, set[tuple[Decimal, str]]] = {}
+    geometries: dict[str, set[tuple[Decimal, ...]]] = {}
+    for source_facts in facts.values():
+        for scope, _, quantity, unit, dimensions in source_facts:
+            amounts.setdefault(scope, set()).add((quantity, unit))
+            if dimensions:
+                geometries.setdefault(scope, set()).add(dimensions)
     for section in parsed.get("quote_basis_sections", []):
         for line in section.get("lines", []):
             if not isinstance(line, dict) or not (row_id := line.get("id")):
@@ -25506,49 +25649,32 @@ def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[
                 continue
             quantity, unit = provider_row_measurement(line, text)
             item_quantity, item_unit = provider_row_measurement(item, item.get("description", ""))
-            quantity, unit = quantity or item_quantity, canonical_pricing_authority_unit(unit or item_unit)
+            quantity, unit = quantity or item_quantity, canonical_pricing_authority_unit(unit or item_unit).lower()
             evidence = line.get("measurement_evidence")
             if isinstance(evidence, dict) and evidence.get("kind") == "provisional":
                 records[row_id] = {"disposition": "review"}
                 continue
-            if unit not in {"sqm", "sqft", "ft2", "sq ft"}:
+            if unit not in AREA_EVIDENCE_UNITS:
                 continue
             records[row_id] = {"disposition": "review"}
-            if line.get("scope_kind") != "physical" or not isinstance(evidence, dict) or quantity is None:
+            if (line.get("scope_kind") != "physical" or not isinstance(evidence, dict) or quantity is None
+                    or not item or provisional_measurement(item, line)):
                 continue
             kind = clean_text(evidence.get("kind"))
             source = clean_text(evidence.get("source"))
-            statement = clean_text(evidence.get("statement")).rstrip(".")
-            label, separator, measurement = statement.rpartition(":")
-            if kind not in {"observed", "derived"} or not separator or len(statement) > 300:
+            fact = area_measurement_fact(clean_text(evidence.get("statement")))
+            if fact is None or fact not in facts.get(source, ()):
                 continue
-            scope_key = provider_basis_description_key(label, catalog_reference_only=False)
-            prefix = leading_quantity_prefix(text)
-            row_key = provider_basis_description_key(prefix["text"] if prefix else text, catalog_reference_only=False)
-            if not scope_key or not (row_key == scope_key or row_key.startswith(scope_key + " ")):
+            scope, fact_kind, fact_quantity, fact_unit, dimensions = fact
+            if (scope != pricing_measurement_scope(text) or scope != pricing_measurement_scope(item["description"])
+                    or len(amounts[scope]) != 1 or len(geometries.get(scope, ())) > 1
+                    or kind != fact_kind or quantity != fact_quantity or not pricing_units_share_quantity_basis(unit, fact_unit)):
                 continue
-            if statement not in facts.get(source, ()):
-                continue
-            measurement = measurement.strip()
-            if kind == "observed":
-                observed = re.fullmatch(rf"({SCOPE_NUMBER})\s+(.+)", measurement)
-                if (not observed or Decimal(observed[1].replace(",", ".")) != quantity
-                        or not pricing_units_share_quantity_basis(observed[2], unit)):
-                    continue
-            else:
-                dimensions = re.fullmatch(
-                    rf"({SCOPE_NUMBER})\s*m\s*(?:x|\u00d7|by)\s*({SCOPE_NUMBER})\s*m\s*,\s*full coverage",
-                    measurement, re.I,
-                )
-                if unit != "sqm" or dimensions is None:
-                    continue
-                width, depth = (Decimal(value.replace(",", ".")) for value in dimensions.groups())
-                if min(width, depth) <= 0 or width * depth != quantity:
-                    continue
+            signature = json.dumps([scope, kind, str(fact_quantity.normalize()), fact_unit, [str(side.normalize()) for side in dimensions]])
             records[row_id] = {"disposition": "measured", "kind": kind, "source": source,
-                               "quantity": float(quantity), "unit": unit,
-                               "evidence_digest": hashlib.sha256(statement.encode("utf-8")).hexdigest()}
-            claims.setdefault(statement, []).append(row_id)
+                               "quantity": float(quantity), "unit": unit, "scope": scope,
+                               "evidence_digest": hashlib.sha256(signature.encode("utf-8")).hexdigest()}
+            claims.setdefault(scope, []).append(row_id)
     for row_ids in claims.values():
         if len(row_ids) > 1:
             for row_id in row_ids:
@@ -25556,7 +25682,7 @@ def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[
     for row_id, item in items.items():
         if row_id not in records:
             _, unit = provider_row_measurement(item, item["description"])
-            if canonical_pricing_authority_unit(unit) in {"sqm", "sqft", "ft2", "sq ft"}:
+            if canonical_pricing_authority_unit(unit).lower() in AREA_EVIDENCE_UNITS:
                 records[row_id] = {"disposition": "review"}
     return records
 
@@ -25800,7 +25926,7 @@ def normalize_ai_draft(
         result["_unmatched_source_measurements"] = source_measurements
         seal = issue_pricing_analysis_seal(
             payload, line_items, auth_session=auth_session,
-            source_units=source_units, source_quantities=source_quantities, scope_records=scope_records,
+            source_units=source_units, source_quantities=source_quantities, scope_records=scope_records, basis_sections=sections,
         )
         if seal is not None:
             result["pricing_analysis_seal"] = seal
@@ -26947,6 +27073,7 @@ def finalized_remote_draft_result(
         source_units=provider_units if isinstance(provider_units, dict) else {},
         source_quantities=provider_quantities if isinstance(provider_quantities, dict) else {},
         scope_records=scope_records if isinstance(scope_records, dict) else None,
+        basis_sections=adjusted_sections,
     ) if has_payload_context and source.strip().lower() != "local" else None
     diagnostic_details = ai_draft_diagnostic_details(source, adjusted_basis, adjusted_sections, final_line_items)
     if isinstance(diagnostic_metadata, dict):
@@ -30513,14 +30640,16 @@ class QuotePublicationReadView:
                 rows = state.get(key)
                 if isinstance(rows, list):
                     rows = without_non_quote_note_rows(rows, basis)
+                    views = pricing_ledger_draft_rows({"quoteBasisSections": basis, "lineItems": rows}) if scope_records else {}
+                    reused = reused_pricing_measurement_rows(ledger_rows, views)
                     projected = []
                     for row in rows:
                         row_id = safe_resource_id(row.get("source_basis_line_id"), "") if isinstance(row, dict) else ""
                         measurement = scope_records.get(row_id)
                         if measurement and measurement["disposition"] == "informational":
                             continue
-                        unsupported = row_id in unsupported_catalogue_rows or (
-                            measurement is not None and (not pricing_measurement_matches(measurement, row)
+                        unsupported = row_id in unsupported_catalogue_rows or row_id in reused or (
+                            measurement is not None and (not pricing_measurement_matches_view(measurement, views.get(row_id))
                             or (ledger_rows[row_id].get("grant") or {}).get("state") != "live"))
                         if unsupported and isinstance(row.get("pricing_authority"), dict) and row["pricing_authority"].get("variant") == "catalog":
                             row = reject_catalog_line_item_authority(row)

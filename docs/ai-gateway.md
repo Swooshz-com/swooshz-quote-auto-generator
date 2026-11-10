@@ -84,17 +84,24 @@ schema keywords are not assumed to work at an unqualified endpoint.
 An area can receive automatic catalogue pricing when its basis row has a
 matching measurement statement from a source known to the server. Direct drafts
 can cite text in the supplied PDF or quote notes. Batch synthesis can also cite
-the earlier observation for a specific visual. For a derived area, the statement
-must give both dimensions in metres and full coverage of the same quoted scope.
+the earlier observation for a specific visual. The source label, basis line and
+linked item must identify the same physical scope, including location and extent.
+Conflicting or reused evidence stays in pricing review. A derived area requires
+both dimensions in metres and full coverage of the same quoted scope. A comma
+may group thousands in sets of three and a dot may mark the decimal point.
+Ambiguous number formats stay in pricing review.
 An image without corroborating measurement text can still suggest an editable
 quantity for pricing review. Informational rows remain in Quote Basis and stay
 out of the bill. The server signs the admitted record with the row, quantity,
 unit, quote session and catalogue reference. The saved pricing ledger retains
-the record and checks the current row at selection and export.
+the record and the catalogue presentation it can use. A change in location or
+extent invalidates the rate and advances the row revision. Case, spacing and
+trailing punctuation differences in the same scope preserve eligibility.
 
 Existing drafts and publications remain readable. Older ledger records retain
 their historical interpretation and check current and reset snapshots for
-provisional measurements. Older application versions do not recognise the
+provisional measurements. Earlier structured area records without a scope
+binding reopen for pricing review. Older application versions do not recognise the
 measurement seal or ledger version. Finish stopping older writers before serving
 the same draft data with this version.
 

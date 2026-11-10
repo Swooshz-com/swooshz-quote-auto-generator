@@ -556,14 +556,15 @@ class ProviderHTTPContractTest(unittest.TestCase):
                 self.assertEqual({row["source_basis_line_id"] for row in restored}, expected_ids)
                 self.assertTrue(all(row["pricing_authority"]["variant"] == "catalog" for row in restored))
 
-    def test_real_draft_alias_unit_selection_two_same_text_rows_and_saved_reopen(self):
+    def test_real_draft_alias_unit_selection_two_distinct_scopes_and_saved_reopen(self):
         from tests import test_basis_source_provenance as provenance
         raw = provenance.ProviderSourceSelectionTest.raw_draft(self)
         notes = []
         for index, (line, row) in enumerate(zip(raw["quote_basis_sections"][0]["lines"], raw["line_items"])):
             quantity = 12 if index == 0 else 7
             for item in (line, row): item.update(quantity=quantity, unit="m\u00b2")
-            line["text"] = row["description"] = "Synthetic surface physical installation"
+            location = "east" if index == 0 else "west"
+            line["text"] = row["description"] = f"Synthetic surface physical installation at {location}"
             notes.append(f"{line['text']}: {quantity} sqm")
             line.update(scope_kind="physical", measurement_evidence={"kind": "observed", "source": "Quote notes", "statement": notes[-1]})
         raw["line_items"][1]["id"] = "dimension-note"  # Coherent alternate explicit identity.
