@@ -5583,7 +5583,8 @@ def normalize_basis_tag(value: Any) -> str:
 
 
 SCOPE_NUMBER = r"\d+(?:[.,]\d+)?"
-SCOPE_LENGTH = rf"{SCOPE_NUMBER}(?:\s*(?:mm|cm|m|metres?|meters?|ft|feet))?"
+SCOPE_LENGTH_UNIT = r"mm|cm|m|metres?|meters?|ft|feet"
+SCOPE_LENGTH = rf"{SCOPE_NUMBER}(?:\s*(?:{SCOPE_LENGTH_UNIT}))?"
 SCOPE_WIDTH = rf"(?:(?:width|w)\s*[:=]?\s*)?{SCOPE_LENGTH}(?:\s+wide)?"
 SCOPE_DEPTH = rf"(?:(?:depth|d)\s*[:=]?\s*)?{SCOPE_LENGTH}(?:\s+deep)?"
 SCOPE_DIMENSION_VALUE = (
@@ -23683,10 +23684,11 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
         return {"disposition": disposition}
     legacy_fields = {"disposition", "kind", "source", "quantity", "unit", "evidence_digest"}
     scope_fields = {"scope", "basis_scope", "item_scope"}
-    if disposition == "measured" and set(value) == legacy_fields:
-        # Earlier v2 drafts can open, but their area grants lack a scope binding.
+    if disposition == "measured" and set(value) in (legacy_fields, legacy_fields | scope_fields):
+        # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
-    if (disposition == "measured" and set(value) == legacy_fields | scope_fields
+    if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
+            and type(value["claim_version"]) is int and value["claim_version"] == AREA_EVIDENCE_CLAIM_VERSION
             and value["kind"] in ("observed", "derived")
             and isinstance(value["source"], str) and value["source"]
             and type(value["quantity"]) in {int, float} and pricing_ledger_quantity(value["quantity"]) is not None
@@ -25570,6 +25572,32 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
+AREA_EVIDENCE_CLAIM_VERSION = 1
+# Recognition is deliberately wider than the number grammar that can support a rate.
+AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
+AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
+    {alias for unit in AREA_EVIDENCE_UNITS for alias in quantity_unit_aliases(unit)},
+    key=lambda alias: (-len(alias), alias),
+)) + r"|square\s+(?:met(?:res?|ers?)|feet|foot)"
+AREA_OBSERVED_CLAIM = re.compile(rf"(?:\(\s*)?(?P<number>{AREA_CLAIM_NUMBER})\s*(?P<unit>{AREA_CLAIM_UNIT})(?![\w^])", re.I)
+AREA_DERIVED_CLAIM = re.compile(
+    rf"(?:(?:width|w)\s*[:=]?\s*)?(?P<width>{AREA_CLAIM_NUMBER})\s*(?P<width_unit>{SCOPE_LENGTH_UNIT})"
+    rf"(?:\s+wide)?\s*(?:x|\u00d7|by)\s*(?:(?:depth|d)\s*[:=]?\s*)?"
+    rf"(?P<depth>{AREA_CLAIM_NUMBER})\s*(?P<depth_unit>{SCOPE_LENGTH_UNIT})(?:\s+deep)?(?!\w)", re.I,
+)
+AREA_FULL_COVERAGE = re.compile(r"(?:,\s*full coverage\b|\(\s*full coverage\s*\))", re.I)
+AREA_METRE_UNIT = re.compile(r"m|metres?|meters?", re.I)
+AREA_PROVISIONAL_QUALIFIER = re.compile(r"^(?:provisional|default|assumed|estimated|guessed)\b", re.I)
+
+
+@dataclass(frozen=True)
+class AreaMeasurementClaim:
+    scope: str
+    kind: str
+    quantity: Decimal | None
+    unit: str
+    dimensions: tuple[Decimal, ...]
+    eligible: bool
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -25590,35 +25618,67 @@ def pricing_measurement_scope(value: Any) -> str:
     return clean_text(unicodedata.normalize("NFKC", text)).casefold().strip(" ,;.")
 
 
-def area_measurement_fact(statement: str) -> tuple[str, str, Decimal, str, tuple[Decimal, ...]] | None:
-    label, separator, raw = clean_text(statement).rstrip(".").rpartition(":")
-    scope = pricing_measurement_scope(label)
-    if (not separator or not scope or len(statement) > 300 or uses_provisional_dimensions(label)
-            or re.match(r"^(?:provisional|default|assumed|estimated|guessed)\b", scope)):
+def area_evidence_quantity(token: str) -> Decimal | None:
+    token = token.strip()
+    if not re.fullmatch(AREA_EVIDENCE_NUMBER, token):
         return None
-    measurement = raw.strip()
-    dimensions = re.fullmatch(
-        rf"({AREA_EVIDENCE_NUMBER})\s*m\s*(?:x|\u00d7|by)\s*({AREA_EVIDENCE_NUMBER})\s*m\s*,\s*full coverage",
-        measurement, re.I,
-    )
     try:
-        if dimensions:
-            width, depth = (provider_quantity(value.replace(",", "")) for value in dimensions.groups())
-            kind, quantity, unit, geometry = "derived", width * depth, "sqm", (width, depth)
-        else:
-            observed = re.fullmatch(rf"({AREA_EVIDENCE_NUMBER})\s+(.+)", measurement)
-            if not observed:
-                return None
-            unit = canonical_pricing_authority_unit(normalize_pricing_unit(observed[2])).lower()
-            if unit not in AREA_EVIDENCE_UNITS:
-                return None
-            kind, quantity, geometry = "observed", provider_quantity(observed[1].replace(",", "")), ()
+        return provider_quantity(token.replace(",", ""))
     except AIModelOutputError:
-        return None  # Unsupported source amounts are suggestions, not provider shape errors.
-    prefix = leading_quantity_prefix(label)
-    if prefix and (Decimal(str(prefix["quantity"])) != quantity or not pricing_units_share_quantity_basis(prefix["unit"], unit)):
         return None
-    return scope, kind, quantity, unit, geometry
+
+
+def area_measurement_claim(statement: str) -> AreaMeasurementClaim | None:
+    """Keep identifiable scope claims in conflict checks even when they cannot prove a rate."""
+    text = clean_text(statement).rstrip(".")
+    for separator in re.finditer(":", text):
+        label = text[:separator.start()]
+        measurement = text[separator.end():].lstrip()
+        qualifier = AREA_PROVISIONAL_QUALIFIER.match(measurement)
+        claim_text = measurement[qualifier.end():].lstrip(" :,-") if qualifier else measurement
+        derived = AREA_DERIVED_CLAIM.match(claim_text)
+        observed = None if derived else AREA_OBSERVED_CLAIM.match(claim_text)
+        match = derived or observed
+        if not match:
+            continue
+        scope = pricing_measurement_scope(label)
+        if not scope:
+            continue
+
+        annotation = claim_text[match.end():].strip()
+        geometry: tuple[Decimal, ...] = ()
+        if derived:
+            kind, unit = "derived", "sqm"
+            width = area_evidence_quantity(derived["width"])
+            depth = area_evidence_quantity(derived["depth"])
+            coverage = AREA_FULL_COVERAGE.match(annotation)
+            metre_pair = all(AREA_METRE_UNIT.fullmatch(derived[field]) for field in ("width_unit", "depth_unit"))
+            quantity = width * depth if width is not None and depth is not None and coverage and metre_pair else None
+            if quantity is not None:
+                geometry = (width, depth)
+            if coverage:
+                annotation = annotation[coverage.end():].strip()
+            proof_shape = bool(re.fullmatch(
+                rf"{AREA_EVIDENCE_NUMBER}\s*m\s*(?:x|\u00d7|by)\s*{AREA_EVIDENCE_NUMBER}\s*m\s*,\s*full coverage",
+                measurement, re.I,
+            ))
+        else:
+            kind = "observed"
+            unit = canonical_pricing_authority_unit(normalize_pricing_unit(observed["unit"])).lower()
+            quantity = area_evidence_quantity(observed["number"])
+            proof_shape = bool(re.fullmatch(rf"{AREA_EVIDENCE_NUMBER}\s+(?:{AREA_CLAIM_UNIT})", measurement, re.I))
+
+        prefix = leading_quantity_prefix(label)
+        if (unit not in AREA_EVIDENCE_UNITS or qualifier or uses_provisional_dimensions(label)
+                or uses_provisional_dimensions(annotation, unit) or AREA_PROVISIONAL_QUALIFIER.match(scope)
+                or (prefix and (Decimal(str(prefix["quantity"])) != quantity
+                                or not pricing_units_share_quantity_basis(prefix["unit"], unit)))
+                or AREA_OBSERVED_CLAIM.search(annotation) or AREA_DERIVED_CLAIM.search(annotation)
+                or (derived and re.search(r"\bcoverage\b", annotation, re.I))):
+            quantity = None
+        eligible = quantity is not None and proof_shape and len(text) <= 300
+        return AreaMeasurementClaim(scope, kind, quantity, unit, geometry, eligible)
+    return None
 
 
 def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[str]]) -> dict[str, dict[str, Any]]:
@@ -25627,14 +25687,18 @@ def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[
     records: dict[str, dict[str, Any]] = {}
     claims: dict[str, list[str]] = {}
     facts = {source: {fact for raw in texts if isinstance(raw, str) for statement in re.split(r"[;\r\n]", raw)
-                      if (fact := area_measurement_fact(statement)) is not None} for source, texts in sources.items()}
+                      if (fact := area_measurement_claim(statement)) is not None} for source, texts in sources.items()}
     amounts: dict[str, set[tuple[Decimal, str]]] = {}
     geometries: dict[str, set[tuple[Decimal, ...]]] = {}
+    unresolved_scopes = set()
     for source_facts in facts.values():
-        for scope, _, quantity, unit, dimensions in source_facts:
-            amounts.setdefault(scope, set()).add((quantity, unit))
-            if dimensions:
-                geometries.setdefault(scope, set()).add(dimensions)
+        for fact in source_facts:
+            if fact.quantity is None:
+                unresolved_scopes.add(fact.scope)
+                continue
+            amounts.setdefault(fact.scope, set()).add((fact.quantity, fact.unit))
+            if fact.dimensions:
+                geometries.setdefault(fact.scope, set()).add(fact.dimensions)
     for section in parsed.get("quote_basis_sections", []):
         for line in section.get("lines", []):
             if not isinstance(line, dict) or not (row_id := line.get("id")):
@@ -25662,17 +25726,19 @@ def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[
                 continue
             kind = clean_text(evidence.get("kind"))
             source = clean_text(evidence.get("source"))
-            fact = area_measurement_fact(clean_text(evidence.get("statement")))
-            if fact is None or fact not in facts.get(source, ()):
+            fact = area_measurement_claim(clean_text(evidence.get("statement")))
+            if fact is None or not fact.eligible or fact not in facts.get(source, ()):
                 continue
-            scope, fact_kind, fact_quantity, fact_unit, dimensions = fact
+            scope = fact.scope
             if (scope != pricing_measurement_scope(text) or scope != pricing_measurement_scope(item["description"])
-                    or len(amounts[scope]) != 1 or len(geometries.get(scope, ())) > 1
-                    or kind != fact_kind or quantity != fact_quantity or not pricing_units_share_quantity_basis(unit, fact_unit)):
+                    or scope in unresolved_scopes or len(amounts[scope]) != 1 or len(geometries.get(scope, ())) > 1
+                    or kind != fact.kind or quantity != fact.quantity or not pricing_units_share_quantity_basis(unit, fact.unit)):
                 continue
-            signature = json.dumps([scope, kind, str(fact_quantity.normalize()), fact_unit, [str(side.normalize()) for side in dimensions]])
+            signature = json.dumps([scope, kind, str(fact.quantity.normalize()), fact.unit,
+                                    [str(side.normalize()) for side in fact.dimensions]])
             records[row_id] = {"disposition": "measured", "kind": kind, "source": source,
                                "quantity": float(quantity), "unit": unit, "scope": scope,
+                               "claim_version": AREA_EVIDENCE_CLAIM_VERSION,
                                "evidence_digest": hashlib.sha256(signature.encode("utf-8")).hexdigest()}
             claims.setdefault(scope, []).append(row_id)
     for row_ids in claims.values():

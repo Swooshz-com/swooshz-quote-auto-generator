@@ -43370,6 +43370,19 @@ main().catch((error) => {
                 record = webapp.admitted_scope_measurements(draft, {"Quote notes": [source_text]})["floor"]
                 self.assertEqual(record["disposition"], "measured" if allowed else "review")
 
+        statement = f"{label}: 24 sqm"
+        line = {"id": "floor", "text": label, "scope_kind": "physical", "quantity": 24, "unit": "sqm",
+                "measurement_evidence": {"source": "Quote notes", "kind": "observed", "statement": statement}}
+        row = {"source_basis_line_id": "floor", "description": label, "quantity": 24, "unit": "sqm"}
+        draft = {"quote_basis_sections": [{"lines": [line]}], "line_items": [row]}
+        for other, allowed in (("~4 sqm", False), ("estimated 4 sqm", False), ("4 square feet", False),
+                               ("6 ft x 4 ft, full coverage", False), ("1 200,0 sqm", False),
+                               ("(24 sqm) site record", True), ("6 metres x 4 metres (full coverage)", True)):
+            with self.subTest(other=other):
+                sources = {"Quote notes": [statement], "Reference 1, PDF page 1": [f"{label}: {other}"]}
+                record = webapp.admitted_scope_measurements(draft, sources)["floor"]
+                self.assertEqual(record["disposition"], "measured" if allowed else "review")
+
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
         from scripts.generate_quote import read_first_sheet_rows_with_numbers, write_text_pdf
@@ -43381,13 +43394,25 @@ main().catch((error) => {
         spot = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
         cases = (
             ("approved", label, label, f"{label}: 24 sqm", "", 24, "observed", True),
+            ("decimal", label, label, f"{label}: 1.2 sqm", "", 1.2, "observed", True),
             ("grouped", label, label, f"{label}: 1,200 sqm", "", 1200, "observed", True),
             ("grouped-not-decimal", label, label, f"{label}: 1,200 sqm", "", 1.2, "observed", False),
             ("derived", label, label, f"{label}: 1,200 m x 2 m, full coverage", "", 2400, "derived", True),
             ("generic-west", label + " at west", label + " at west", f"{label}: 24 sqm", f"{label} at west: 4 sqm", 24, "observed", False),
             ("linked-west", label + " at east", label + " at west", f"{label} at east: 24 sqm", "", 24, "observed", False),
             ("contradiction", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm", 24, "observed", False),
+            ("annotated-conflict", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm (final: site measurement)", 24, "observed", False),
+            ("annotated-reversed", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm (final: site measurement)", 24, "observed", False),
+            ("mixed-format", label, label, f"{label}: 1,200 sqm", f"{label}: 1.200,0 sqm", 1200, "observed", False),
+            ("annotated-repeat", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24.0 SQM (site measurement)", 24, "observed", True),
+            ("annotated-alone", label, label, f"{label}: 24 sqm (site measurement)", "", 24, "observed", False),
+            ("independent-ambiguity", label, label, f"{label}: 24 sqm", f"{label} at west: 1.200,0 sqm", 24, "observed", True),
+            ("non-measurement", label, label, f"{label}: 24 sqm", f"{label}: 4 installers required", 24, "observed", True),
+            ("provisional-annotation", label, label, f"{label}: 24 sqm", f"{label}: 24 sqm (using the assumed booth footprint)", 24, "observed", False),
             ("extent-conflict", label, label, f"{label}: 6 m x 4 m, full coverage", f"{label}: 8 m x 3 m, full coverage", 24, "derived", False),
+            ("annotated-extent", label, label, f"{label}: 6 m x 4 m, full coverage", f"{label}: 8 m x 3 m, full coverage (final)", 24, "derived", False),
+            ("derived-repeat", label, label, f"{label}: 6 m x 4 m, full coverage", f"{label}: 6 m x 4 m, full coverage (survey)", 24, "derived", True),
+            ("uncertain-extent", label, label, f"{label}: 24 sqm", f"{label}: W 6 m x D 4 m, partial coverage", 24, "observed", False),
             ("duplicate", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24 SQM", 24, "observed", False),
         )
         config = synthetic_configuration(credential="synthetic")
@@ -43400,6 +43425,10 @@ main().catch((error) => {
                 for name, basis, item, statement, other, quantity, kind, allowed in cases:
                     with self.subTest(route=route, name=name):
                         sources = [statement, other] if other else [statement]
+                        if route == "batch":
+                            sources.reverse()
+                        if name == "annotated-reversed":
+                            sources.reverse()
                         source_label = "Quote notes" if route == "notes" else "Reference 1, PDF page 1"
                         payload = self._ledger_draft_payload(f"quote-scope-{route}-{name}")
                         if route == "notes":
@@ -43441,7 +43470,7 @@ main().catch((error) => {
                         if name == "duplicate":
                             self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
-                        if route == "pdf" and name in {"approved", "grouped", "grouped-not-decimal"}:
+                        if route == "pdf" and name in {"approved", "decimal", "grouped", "grouped-not-decimal", "annotated-conflict", "mixed-format"}:
                             include = {"floor", "spot"} if allowed else {"spot"}
                             sections = copy.deepcopy(final["quote_basis_sections"])
                             for section in sections:
@@ -43507,7 +43536,7 @@ main().catch((error) => {
         statement = "Synthetic carpet tile flooring at east: 24 sqm"
         specifications = (
             ("floor", "Synthetic carpet tile flooring at east", 24, "sqm", carpet),
-            ("review", "Synthetic carpet tile flooring", 36, "sqm", carpet),
+            ("review", "Synthetic carpet tile flooring at west", 36, "sqm", carpet),
             ("spot", "Synthetic spotlight 6 inch", 2, "nos", spot),
         )
         lines, rows = [], []
@@ -43517,6 +43546,8 @@ main().catch((error) => {
             rows.append({"source_basis_line_id": row_id, "section": "Lighting and AV" if row_id == "spot" else "Floors", "description": description,
                          "quantity": quantity, "unit": unit, "pricing_keyword": keyword})
         lines[0]["measurement_evidence"] = {"kind": "observed", "source": "Quote notes", "statement": statement}
+        disputed = "Synthetic carpet tile flooring at west: 36 sqm"
+        lines[1]["measurement_evidence"] = {"kind": "observed", "source": "Quote notes", "statement": disputed}
         lines.append({"id": "info", "tag": "Confirm", "text": "Dimensions for venue orientation", "confidence_pct": 90,
                       "scope_kind": "informational"})
         provider = {"quote_basis_sections": [
@@ -43527,8 +43558,11 @@ main().catch((error) => {
             headers = self._ledger_runner_headers(runner)
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
-            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [statement]})
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
+                statement, disputed, "Synthetic carpet tile flooring at west: 4 sqm (final site measurement)",
+            ]})
             self.assertEqual(drafted["pricing_analysis_seal"]["schema"], webapp.PRICING_ANALYSIS_MEASUREMENT_SCHEMA)
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
             request = self._ledger_carry_draft(payload, drafted)
             self._ledger_line(request, "floor")["tag"] = "Include"
             self._ledger_line(request, "spot")["tag"] = "Include"
@@ -43559,12 +43593,14 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for key in ("scope", "basis_scope", "item_scope"):
-                earlier["rows"]["floor"]["measurement"].pop(key)
+            earlier["rows"]["floor"]["measurement"].pop("claim_version")
             readable = webapp.normalized_pricing_ledger(earlier)
             self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
             self.assertIsNone(readable["rows"]["floor"]["grant"])
             self.assertEqual(readable["rows"]["spot"]["grant"]["state"], "live")
+            for key in ("scope", "basis_scope", "item_scope"):
+                earlier["rows"]["floor"]["measurement"].pop(key)
+            self.assertIsNone(webapp.normalized_pricing_ledger(earlier)["rows"]["floor"]["grant"])
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -43618,6 +43654,7 @@ main().catch((error) => {
             for reopened_rows in (reopened_state["lineItems"], reopened_state["originalOutputRows"],
                                   reopened_state["originalAnalysisSnapshot"]["line_items"]):
                 self.assertIsNone(self._ledger_price(reopened_rows, "floor"))
+                self.assertIsNone(self._ledger_price(reopened_rows, "review"))
             self.assertEqual(webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"]["grant"]["state"], "live")
             selection = self._ledger_select(runner, headers, changed, "floor", carpet, self._ledger_revision(pending, "floor"))
             self.assertEqual(selection["body"]["selections"], [
