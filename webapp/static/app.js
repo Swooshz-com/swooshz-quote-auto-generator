@@ -9882,11 +9882,18 @@ function isNonQuoteNote(value = "", quantity = "", unit = "") {
   const rawText = normalizedLineTextQuantityParts(value, quantity, unit).text;
   const bracketed = bracketedCatalogReferenceParts(rawText);
   const parts = bracketed ? [bracketed.reference, bracketed.detail] : [rawText];
+  const number = String.raw`\d+(?:[.,]\d+)?`;
+  const length = String.raw`${number}(?:\s*(?:mm|cm|m|metres?|meters?|ft|feet))?`;
+  const measure = String.raw`(?:${length}\s*(?:x|\u00d7|by)\s*${length}|${number}\s*(?:sqm|sqft|sq\.?\s*(?:m|ft)\.?|m[2\u00b2]|ft[2\u00b2]))`;
+  const label = new RegExp(String.raw`^(?:${measure}\s+)?(?:provisional|default|assumed|estimated|guessed)\s+(?:${measure}\s+)?(?:(?:booth|stand|space)\s+(?:${measure}\s+)?)?(?:footprint|dimensions?|size)\b`, "i");
+  const dimensionsOnly = new RegExp(String.raw`^\s*(?:(?:is|of)\s+)?[\s().,;=\-]*(?:${measure}[\s().,;=\-]*)?(?:(?:pending|for)\s+confirmation\.?|to\s+be\s+confirmed\.?)?$`, "i");
   return parts.some((part, index) => {
     const text = normalizedLineTextQuantityParts(part, quantity, unit).text;
     if (/^(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:)/i.test(text)) return true;
-    const dimension = text.match(/^(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?(?:footprint|dimensions?|size)\b/i);
-    return Boolean(dimension && (!index || /^\s*:/.test(text.slice(dimension[0].length))));
+    const dimension = text.match(label);
+    if (!dimension) return false;
+    const detail = text.slice(dimension[0].length).trimStart();
+    return !index || detail.startsWith(":") || dimensionsOnly.test(detail);
   });
 }
 

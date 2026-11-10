@@ -345,6 +345,10 @@ the owner-approved CI lane.
   note aliases stay outside the workbook and totals, a provisional area has no
   catalogue amount, and equivalent structured and prefixed measurements price
   only when the exact linked scope supplies a compatible pair.
+  Check dimension-only detail after a bracketed reference, measured scope with
+  a negated dependency, and provisional area with dimensions in the source
+  phrase. Verify direct and batched admission, an older saved catalogue grant,
+  and fresh independent measurement of the same scope.
 - Provider measurement provenance: run `python -m unittest tests.test_basis_source_provenance`. Missing raw row IDs may bind only to one existing basis identity with exact full-detail text and coherent explicit raw measurements. Preserve the raw source unit before catalogue projection; ambiguous, missing or conflicting measurements must not offer an unactionable candidate. The rendered carrier `node scripts/playwright-owner-uat-basis-repair.mjs --source-provenance --fresh-analysis --lines=0 --latency-ms=0 --currency=SGD` covers explicit Possible Match admission, distinct physical rows sharing a catalogue, Output, saved reopen and protected XLSX. A saved blank seal/ledger is never upgraded from the current displayed unit; fresh analysis is required to capture newly recoverable provenance.
 - Pricing reference import, catalog matching, currency/tax metadata, or template parsing: add/update parser and normalization tests, then run the relevant `tests.test_webapp` and `tests.test_generate_quote` cases.
 - Pricing-pack reads and numeric admission: Run `tests.test_codeql_boundaries`

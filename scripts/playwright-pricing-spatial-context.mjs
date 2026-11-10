@@ -28,7 +28,7 @@ replaceOnce('const cases = [', `const cases = [
   { id: "u1-excluded-match", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light" },
   { id: "u1-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },
   { id: "u1-provisional-pair", kind: "unmatched", section: "Lighting and Electrical", text: "Choreographed water feature", quantity: null, unit: "", proposal: true, basisOnly: true },
-  { id: "u1-footprint-note", kind: "note", section: "Lighting and Electrical", text: "24 sqm Provisional booth footprint: 6m x 4m", quantity: null, unit: "" },
+  { id: "u1-footprint-note", kind: "note", section: "Lighting and Electrical", text: "[ Synthetic support ] - Provisional booth footprint (6m x 4m)", itemText: "Venue footprint alias", quantity: null, unit: "" },
   { id: "u1-clarification-note", kind: "note", section: "Lighting and Electrical", text: "1 lot Clarification note: confirm venue access", itemText: "Venue access alias", quantity: null, unit: "" },
   { id: "u1-linked-item-note", kind: "note", section: "Lighting and Electrical", text: "Venue timing alias", itemText: "1 lot Confirmation note: confirm venue timing", quantity: null, unit: "" },`);
 replaceOnce('  lineItems.push({ section: entry.section,', '  if (!entry.basisOnly) lineItems.push({ section: entry.section,');
@@ -51,7 +51,7 @@ replaceOnce('  // Resolve any remaining server-added review line', `
       return notes.length === ids.length && notes.every((line) => line.tag === "Confirm")
         && ![...state.lineItems, ...state.outputRows].some((row) => ids.includes(row.source_basis_line_id));
     }, noteIds), "informational notes lost their review-only status");
-    assert(await page.locator(".basis-line-row").filter({ hasText: /provisional booth footprint:|confirm venue access|confirm venue timing/i }).count() === 0,
+    assert(await page.locator(".basis-line-row").filter({ hasText: /provisional booth footprint|confirm venue access|confirm venue timing/i }).count() === 0,
       "an informational note received individual pricing controls");
   }
   async function assertBasisRow(row, group, tag) {
@@ -372,7 +372,7 @@ replaceOnce('    const download = await downloadPromise;', `
       && await deferredAmount.innerText() === 'Price to be discussed', 'Download did not dismiss the blank deferred editor');
     result.deferredEditorDismissal = 'PASS';
 `);
-replaceOnce('      "bad=[]",', `      "bad=[{'unexpected_note':get(r,'C')} for r in rows if any(note in get(r,'C').lower() for note in ('confirm venue access','confirm venue timing','provisional booth footprint:','venue access alias','venue timing alias'))]",`);
+replaceOnce('      "bad=[]",', `      "bad=[{'unexpected_note':get(r,'C')} for r in rows if any(note in get(r,'C').lower() for note in ('confirm venue access','confirm venue timing','provisional booth footprint','venue access alias','venue timing alias','venue footprint alias'))]",`);
 replaceOnce('    // The analysis seal is opaque transport', `
     expectedRows.push({ id: "u1-unmatched", description: "Kinetic sculpture", quantity: "2 nos", amount: "Price to be discussed" });
     expectedRows.push({ id: "u1-provisional-pair", description: "Choreographed water feature", quantity: "1 nos", amount: "Price to be discussed" });

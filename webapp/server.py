@@ -5582,8 +5582,34 @@ def normalize_basis_tag(value: Any) -> str:
     return "Confirm"
 
 
-PROVISIONAL_DIMENSION_LABEL = (
-    r"(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?(?:footprint|dimensions?|size)\b"
+SCOPE_NUMBER = r"\d+(?:[.,]\d+)?"
+SCOPE_LENGTH = rf"{SCOPE_NUMBER}(?:\s*(?:mm|cm|m|metres?|meters?|ft|feet))?"
+SCOPE_DIMENSION_VALUE = (
+    rf"(?:{SCOPE_LENGTH}\s*(?:x|\u00d7|by)\s*{SCOPE_LENGTH}"
+    rf"|{SCOPE_NUMBER}\s*(?:sqm|sqft|sq\.?\s*(?:m|ft)\.?|m[2\u00b2]|ft[2\u00b2]))"
+)
+PROVISIONAL_DIMENSION_PREFIX = (
+    rf"(?:{SCOPE_DIMENSION_VALUE}\s+)?(?:provisional|default|assumed|estimated|guessed)\s+"
+    rf"(?:{SCOPE_DIMENSION_VALUE}\s+)?"
+    rf"(?:(?:booth|stand|space)\s+(?:{SCOPE_DIMENSION_VALUE}\s+)?)?"
+)
+PROVISIONAL_DIMENSION_LABEL = re.compile(rf"^{PROVISIONAL_DIMENSION_PREFIX}(?:footprint|dimensions?|size)\b", re.I)
+DIMENSION_NOTE_DETAIL = re.compile(
+    rf"\s*(?:(?:is|of)\s+)?[\s().,;=\-]*(?:{SCOPE_DIMENSION_VALUE}[\s().,;=\-]*)?"
+    r"(?:(?:pending|for)\s+confirmation\.?|to\s+be\s+confirmed\.?)?",
+    re.I,
+)
+PROVISIONAL_AREA_DEPENDENCY = re.compile(
+    r"\b(?:(?P<negation>not|never|without|rather\s+than|instead\s+of)\s+)?"
+    r"(?P<relation>using|assuming|(?:based|relying|depends|dependent)\s+(?:on|upon)"
+    r"|(?:derived|estimated|calculated|scaled)\s+(?:from|using)|for|from|per|according\s+to)\s+"
+    rf"(?:(?:a|an|the)\s+)?{PROVISIONAL_DIMENSION_PREFIX}(?:footprint|dimensions?|size|(?:floor\s+)?area)\b",
+    re.I,
+)
+INDEPENDENT_AREA_MEASUREMENT = re.compile(
+    r"\b(?:(?P<negation>not|never)\s+)?"
+    r"(?:independently\s+(?:measured|surveyed)|(?:measured|surveyed)\s+independently)\b",
+    re.I,
 )
 
 
@@ -5598,11 +5624,15 @@ def quote_scope_text_parts(value: Any, quantity: Any = None, unit: Any = "") -> 
 
 def is_non_quote_note(value: Any, quantity: Any = None, unit: Any = "") -> bool:
     for index, text in enumerate(quote_scope_text_parts(value, quantity, unit)):
-        # Catalogue detail may include dimensions as context. Require an
-        # explicit note label there while accepting leading standalone labels.
-        dimension_label = PROVISIONAL_DIMENSION_LABEL + (r"\s*:" if index else "")
-        if re.match(rf"^(?:{dimension_label}|(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:))", text, re.I):
+        if re.match(r"^(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:)", text, re.I):
             return True
+        label = PROVISIONAL_DIMENSION_LABEL.match(text)
+        if label:
+            detail = text[label.end():].lstrip()
+            # A bracketed reference does not make a dimension-only detail
+            # billable. Keep a physical description that merely mentions it.
+            if not index or detail.startswith(":") or DIMENSION_NOTE_DETAIL.fullmatch(detail):
+                return True
     return False
 
 
@@ -5616,11 +5646,18 @@ def uses_provisional_dimensions(value: Any, unit: Any = "") -> bool:
     normalized_unit = canonical_pricing_authority_unit(unit)
     if normalized_unit and normalized_unit not in {"sqm", "sqft", "ft2", "sq ft"}:
         return False
-    return any(re.search(
-        rf"\b(?:using|assuming|based\s+on|derived\s+from|estimated\s+from|calculated\s+from|for|from|per)\s+"
-        rf"(?:(?:a|an|the)\s+)?{PROVISIONAL_DIMENSION_LABEL}",
-        text, re.I,
-    ) for text in quote_scope_text_parts(value))
+    for text in quote_scope_text_parts(value):
+        for match in PROVISIONAL_AREA_DEPENDENCY.finditer(text):
+            if match["negation"]:
+                continue
+            if match["relation"].lower() == "for":
+                # "For" can describe location when this clause already says
+                # where the quantity came from. A stronger dependency still wins.
+                clause = re.split(r"[;!?()]|\.(?=\s|$)", text[:match.start()])[-1]
+                if any(not evidence["negation"] for evidence in INDEPENDENT_AREA_MEASUREMENT.finditer(clause)):
+                    continue
+            return True
+    return False
 
 
 def provisional_measurement(row: dict[str, Any], line: dict[str, Any]) -> bool:
@@ -6195,6 +6232,7 @@ def quote_basis_sections_with_default_dimension_confirmation(
             informational = is_informational_dimension_basis_line(line) or clean_text(line.get("text")).lower().startswith("default booth size")
             if (
                 has_row_identity or has_measurement_or_pricing or has_pricing_authority or line.get("custom_pricing")
+                or bracketed_catalog_reference_parts(line.get("text"))
                 or normalize_basis_tag(line.get("tag")) == "Custom" or not informational
                 or not line_references_default_booth_dimensions(line.get("text"), dimensions)
             ):
@@ -23642,6 +23680,33 @@ def pricing_ledger_draft_rows(draft_state: Any, *, include_unlinked_lines: bool 
     return views
 
 
+def provisional_pricing_row_ids(draft_state: Any) -> set[str]:
+    draft = draft_state if isinstance(draft_state, dict) else {}
+    views = pricing_ledger_draft_rows(draft, include_unlinked_lines=True)
+    provisional = {
+        row_id for row_id, view in views.items()
+        if provisional_measurement(view["row"] or {}, view["line"] or {})
+    }
+    # Older drafts can retain the source detail only on their Output rows.
+    output_rows = draft.get("outputRows")
+    if isinstance(output_rows, list):
+        for row in output_rows:
+            if not isinstance(row, dict):
+                continue
+            row_id = safe_resource_id(row.get("source_basis_line_id"), "")
+            if row_id and provisional_measurement(row, (views.get(row_id) or {}).get("line") or {}):
+                provisional.add(row_id)
+    return provisional
+
+
+def provisional_pricing_rows_with_saved_evidence(
+    draft: Any, saved: Any, offers: dict[str, dict[str, Any]],
+) -> set[str]:
+    # Only a fresh server-issued analysis can replace adverse saved evidence.
+    newly_measured = {row_id for row_id, offer in offers.items() if offer.get("source_unit")}
+    return provisional_pricing_row_ids(draft) | (provisional_pricing_row_ids(saved) - newly_measured)
+
+
 def pricing_ledger_row_fingerprint(view: dict[str, Any] | None) -> str:
     row = (view or {}).get("row")
     line = (view or {}).get("line")
@@ -23774,6 +23839,9 @@ def pricing_ledger_after_save(
             entry = ledger["rows"].setdefault(row_id, pricing_ledger_new_row())
             entry.update(grant=offer["grant"], source_unit=offer["source_unit"], rev=entry["rev"] + 1, changed_at=now)
         changed = True
+    blocked_rows = provisional_pricing_rows_with_saved_evidence(
+        draft_state, (existing or {}).get("draft_state"), offered or {},
+    )
     views = pricing_ledger_draft_rows(draft_state)
     for row_id in list(dict.fromkeys([*views, *ledger["rows"]])):
         view = views.get(row_id)
@@ -23782,8 +23850,13 @@ def pricing_ledger_after_save(
         if fingerprint != entry["fingerprint"]:
             entry.update(fingerprint=fingerprint, rev=entry["rev"] + 1, changed_at=now)
             changed = True
+        if row_id in blocked_rows and entry["source_unit"] != "":
+            entry.update(source_unit="", rev=entry["rev"] + 1, changed_at=now)
+            changed = True
         grant = entry.get("grant")
-        if grant and grant["state"] == "live" and not pricing_ledger_grant_supported(grant, view, draft_state):
+        if grant and grant["state"] == "live" and (
+            row_id in blocked_rows or not pricing_ledger_grant_supported(grant, view, draft_state)
+        ):
             entry["grant"] = {**grant, "state": "superseded"}
             entry["rev"] += 1
             entry["changed_at"] = now
@@ -23891,12 +23964,12 @@ def pricing_ledger_view_for_payload(
     basis_sections = payload.get("quote_basis_sections")
     if not isinstance(basis_sections, list):
         basis_sections = quote_session_draft_state_from_payload(payload).get("quoteBasisSections")
-    views = pricing_ledger_draft_rows({"lineItems": payload.get("line_items"), "quoteBasisSections": basis_sections})
-    provisional_rows = {
-        row_id for row_id, view in views.items()
-        if provisional_measurement(view["row"] or {}, view["line"] or {})
-    }
-    return PricingLedgerView(ledger, pricing_ledger_seal_grants(seal, ledger) or {}, provisional_rows)
+    offers = pricing_ledger_seal_grants(seal, ledger) or {}
+    provisional_rows = provisional_pricing_rows_with_saved_evidence(
+        {"lineItems": payload.get("line_items"), "quoteBasisSections": basis_sections},
+        metadata.get("draft_state"), offers,
+    )
+    return PricingLedgerView(ledger, offers, provisional_rows)
 
 
 def line_items_with_pricing_ledger(
@@ -30185,6 +30258,11 @@ class QuotePublicationReadView:
             public["draft_progress"] = progress
         if include_draft_state:
             editor_draft = public.get("draft_state") or {}
+            unsupported_catalogue_rows = provisional_pricing_row_ids(editor_draft)
+            unsupported_catalogue_rows.update(
+                row_id for row_id, entry in effective_pricing_ledger(normalized)["rows"].items()
+                if entry.get("source_unit") == ""
+            )
             sections = editor_draft.get("quoteBasisSections")
             for key in ("lineItems", "outputRows", "originalOutputRows"):
                 sections = basis_sections_with_linked_item_notes(sections, editor_draft.get(key))
@@ -30194,6 +30272,13 @@ class QuotePublicationReadView:
                 rows = editor_draft.get(key)
                 if isinstance(rows, list):
                     rows = without_non_quote_note_rows(rows, sections)
+                    rows = [
+                        reject_catalog_line_item_authority(row)
+                        if isinstance(row, dict) and row.get("source_basis_line_id") in unsupported_catalogue_rows
+                        and isinstance(row.get("pricing_authority"), dict)
+                        and row["pricing_authority"].get("variant") == "catalog" else row
+                        for row in rows
+                    ]
                     editor_draft[key] = rows if key == "lineItems" else prepare_output_rows(rows)
             public["draft_files"] = copy.deepcopy(draft_files or []) if isinstance(self.storage, DatabaseSqagStorage) else read_quote_session_draft_files(normalized["session_id"], normalized)
         else:
