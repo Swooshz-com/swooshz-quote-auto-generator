@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3))):
+                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4))):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 4
+AREA_EVIDENCE_CLAIM_VERSION = 5
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25601,6 +25601,7 @@ AREA_GEOMETRY_MARKER = re.compile(
 )
 AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
+AREA_RANGE_CONTINUATION = re.compile(rf"(?:to(?:\s|$)|[-\u2013\u2014\u2212]\s*{AREA_CLAIM_NUMBER})", re.I)
 AREA_BODY_BREAK = re.compile(r"[;\r\n]|[.!?](?=\s|$)")
 
 
@@ -25694,7 +25695,7 @@ def area_scope_pattern(scopes: set[str]) -> re.Pattern[str]:
 
 
 def area_standalone_heading(text: str) -> bool:
-    """A heading can bound a completed measurement without naming a quoted scope."""
+    """Recognise heading syntax without deciding whether it identifies a separate scope."""
     if ":" not in text:
         return False
     context, _ = area_bracket_context(text)
@@ -25712,19 +25713,31 @@ def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> Ar
     claim = None
     completed = False
     ambiguous_heading = False
-    for part, separator in parts:
+    separate_heading = None
+    for index, (part, separator) in enumerate(parts):
         heading = bool(prefix) and area_standalone_heading(part)
         if completed:
-            if heading:
-                break
-            tail.append(part)
-            continue
+            boundary = parts[index - 1][1]
+            if boundary == ";":
+                separate_heading = []
+            if separate_heading is not None:
+                separate_heading.append(part)
+                if area_standalone_heading(" ".join(separate_heading)):
+                    break
+                if separator or area_claim_kind(part):
+                    separate_heading = None
+            # A soft wrap cannot separate an attached aside or an unfinished range from its value.
+            aside = part.startswith(("(", "[", "{")) and 0 in area_bracket_context(part)[1]
+            continuation = aside or AREA_RANGE_CONTINUATION.match(part)
+            if heading or tail or boundary or not continuation:
+                tail.append(part)
+                continue
 
         ambiguous_heading |= heading
         # Question marks survive both sentence framing and line-wrap reassembly.
         value = clean_text(" ".join([*prefix, part + ("?" if separator == "?" else "")]))
         claim = area_measurement_claim(record.scope, record.label, value)
-        completed = claim is not None and claim.quantity is not None
+        completed = completed or (claim is not None and claim.quantity is not None)
         prefix.append(part + separator)
 
     if claim is None:
