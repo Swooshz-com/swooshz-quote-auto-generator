@@ -26,7 +26,9 @@ const dirs = Object.fromEntries(["data", "output", "temp", "pricing", "profiles"
 replaceOnce('Bar Stool seating around the display', 'Bar Stools at Round Tables.');
 replaceOnce('const cases = [', `const cases = [
   { id: "u1-excluded-match", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light" },
-  { id: "u1-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },`);
+  { id: "u1-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },
+  { id: "u1-provisional-pair", kind: "unmatched", section: "Lighting and Electrical", text: "Choreographed water feature", quantity: null, unit: "" },
+  { id: "u1-footprint-note", kind: "note", section: "Lighting and Electrical", text: "Provisional booth footprint: 6m x 4m", quantity: null, unit: "" },`);
 replaceOnce('  // Resolve any remaining server-added review line', `
   const spotlightTick = await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]');
   const spotlightCross = await basisControl(page, "u1-confirmed", '[data-basis-tag="Exclude"]');
@@ -51,7 +53,12 @@ replaceOnce('  // Resolve any remaining server-added review line', `
     row.source_basis_line_id === "u1-unmatched" && Boolean(row.unmatched_pricing_offer) && !row.deferred_pricing)),
     "untouched unmatched row already carries a deferral");
   assert(await sculpture.locator('button').count() === 3, "unmatched row has an extra action");
+  const water = page.locator('.basis-line-row').filter({ hasText: "Choreographed water feature" });
   await tickAll.click();
+  assert(await water.getByText("Price to be discussed", { exact: true }).isVisible(),
+    "section tick did not defer unmeasured scope");
+  assert(await page.evaluate(() => !state.lineItems.some((row) =>
+    row.source_basis_line_id === "u1-footprint-note")), "footprint became a pricing row");
   await assertBasisRow(spotlight, "Matched", "include");
   await assertBasisRow(sculpture, "Unmatched", "custom");
   assert(await sculptureStatus.isVisible(), "section tick did not defer eligible unmatched row");
@@ -339,6 +346,9 @@ replaceOnce('    const download = await downloadPromise;', `
 `);
 replaceOnce('    // The analysis seal is opaque transport', `
     expectedRows.push({ id: "u1-unmatched", description: "Kinetic sculpture", quantity: "2 nos", amount: "Price to be discussed" });
+    expectedRows.push({ id: "u1-provisional-pair", description: "Choreographed water feature", quantity: "1 nos", amount: "Price to be discussed" });
+    assert(await page.evaluate(() => !state.outputRows.some((row) =>
+      row.source_basis_line_id === "u1-footprint-note")), "footprint became an Output row");
     expectedRows.push({ id: "u1-excluded-match", description: byName("LED Flood Light").description,
       quantity: "3 nos", amount: cents(3 * floodPrice * fxRate) });
     // The analysis seal is opaque transport`);

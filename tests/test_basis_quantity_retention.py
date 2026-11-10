@@ -128,10 +128,10 @@ class BasisQuantityRetentionTest(unittest.TestCase):
         self.assertIn("Analyze the uploaded reference images", synthesis)
         self.assertIn("Carry supported quantities and units", synthesis)
         self.assertIn("linked line_items", synthesis)
-        self.assertIn("Do not replace missing measurements with 1 lot", synthesis)
-        self.assertIn("Area or length quantities derived from stated booth or object dimensions", synthesis)
-        self.assertIn("including floor area from booth size", synthesis)
-        self.assertIn("except for services genuinely priced per lot in the catalog", synthesis)
+        self.assertIn("Keep unmeasured physical and service scope linked for review", synthesis)
+        self.assertIn("Derive area only from coherent dimensions and confirmed coverage of the same scope", synthesis)
+        self.assertIn("a partial floor without its own measurements does not establish billable area", synthesis)
+        self.assertIn("count each physical object once", synthesis)
         self.assertIn("Do not invent quantities or units", synthesis)
         observations = json.loads(synthesis[synthesis.index('[{"source":'):])
         self.assertEqual([row["source"] for row in observations],
@@ -179,6 +179,27 @@ class BasisQuantityRetentionTest(unittest.TestCase):
                         number, admitted_unit = server.provider_row_measurement(line, line["text"])
                         self.assertEqual(number, 36 if quantity in ("36", 36) else None)
                         self.assertEqual(admitted_unit, unit)
+
+    def test_admission_recovers_evidence_before_any_catalogue_rewrite(self):
+        for source in ("basis", "item"):
+            with self.subTest(source=source):
+                line = {"id": "synthetic-row", "tag": "Confirm", "text": "Synthetic floor panel",
+                        "confidence_pct": 85, "quantity": None, "unit": ""}
+                row = {"source_basis_line_id": "synthetic-row", "section": "Floor",
+                       "description": "Synthetic floor panel", "quantity": None, "unit": ""}
+                if source == "basis":
+                    line["text"] = "24 sqm Synthetic floor panel"
+                else:
+                    row["description"] = "24 sqm Synthetic floor panel"
+                original = {"quote_basis_sections": [{"id": "floor", "title": "Floor", "lines": [line]}],
+                            "line_items": [row]}
+                before = copy.deepcopy(original)
+                admitted = server.admit_provider_quote_draft(original, require_confidence=True)
+                self.assertEqual(original, before)
+                pair = lambda entry: (entry["quantity"], entry["unit"])
+                self.assertEqual(pair(admitted["line_items"][0]), (24, "sqm"))
+                self.assertEqual(pair(admitted["quote_basis_sections"][0]["lines"][0]), (24, "sqm"))
+                self.assertEqual(server.pricing_analysis_source_units(admitted["line_items"]), {"synthetic-row": "sqm"})
 
     def test_only_explicit_leading_measurements_are_extracted_from_text(self):
         for text, expected in (("36 sqm Floor panel", 36),

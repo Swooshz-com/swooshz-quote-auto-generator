@@ -25817,6 +25817,7 @@ eval([
   "normalizeLineItem",
   "normalizeOutputRow",
   "outputComparableText",
+  "isNonQuoteNote",
   "isInformationalDimensionText",
   "basisLineIsInformationalDimension",
   "outputRowIsInformationalDimension",
@@ -26194,6 +26195,19 @@ assert.strictEqual(confirmedNewLineItem.pricing_basis_amount, 154);
 assert.strictEqual(confirmedNewLineItem.approved_quote_amount, 154);
 assert.strictEqual(confirmedNewLineItem.pricing_reference_source, "local");
 assert.strictEqual(confirmedNewLineItem.pricing_reference_id, "new-quote-pricing");
+state.lineItems = [];
+for (const [quantity, unit, expected] of [
+  [null, "", [1, "nos"]], [null, "sqm", [1, "sqm"]], [4, "", [4, "nos"]],
+]) {
+  const line = state.quoteBasisSections[0].lines[0];
+  Object.assign(line, { quantity, unit, catalog_unit_price: 77 });
+  refreshOutputRowsFromLineItems();
+  assert.strictEqual(state.outputRows.length, 1);
+  const [row] = state.outputRows;
+  assert.deepStrictEqual([row.quantity, row.unit], expected);
+  assert.strictEqual(row.amount, "");
+  assert.strictEqual(row.catalog_unit_price, "");
+}
 assert.ok(source.includes("refreshOutputRowsFromLineItems();"));
 """
         completed = subprocess.run(
@@ -31197,6 +31211,7 @@ eval([
   "normalizeQuoteBasisSections",
   "confirmOnlyQuoteBasisSections",
   "basisSections",
+  "isNonQuoteNote",
   "isInformationalDimensionText",
   "basisLineIsInformationalDimension",
   "basisLineAllowsOutput",

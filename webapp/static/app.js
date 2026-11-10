@@ -9878,6 +9878,13 @@ function outputComparableText(value = "") {
     .trim();
 }
 
+function isNonQuoteNote(value = "") {
+  const rawText = cleanCustomerQuoteLineText(value);
+  const bracketed = bracketedCatalogReferenceParts(rawText);
+  const text = bracketed ? (bracketed.detail || bracketed.reference) : rawText;
+  return /^(?:(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?(?:footprint|dimensions?|size)\b|(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:))/i.test(text);
+}
+
 function isInformationalDimensionText(value = "") {
   const rawText = cleanCustomerQuoteLineText(value);
   if (bracketedCatalogReferenceParts(rawText)) return false;
@@ -9891,11 +9898,13 @@ function isInformationalDimensionText(value = "") {
 }
 
 function basisLineIsInformationalDimension(line = {}) {
+  if (isNonQuoteNote(line.text || line.description)) return true;
   if (line.pricing_keyword || line.pricing_reference_description || line.catalog_description) return false;
   return isInformationalDimensionText(line.text || line.description || "");
 }
 
 function outputRowIsInformationalDimension(row = {}) {
+  if (isNonQuoteNote(row.description)) return true;
   if (row.pricing_keyword || row.pricing_reference_description || row.catalog_description) return false;
   return isInformationalDimensionText(row.description || "");
 }
@@ -9933,6 +9942,7 @@ function outputRowCoversBasisEntry(row = {}, line = {}, sectionTitle = "") {
 }
 
 function basisLineAllowsOutput(line = {}) {
+  if (basisLineIsInformationalDimension(line)) return false;
   const basisTag = normalizeBasisTag(line.tag);
   if (basisTag === "Exclude" || basisTag === "Confirm") return false;
   if (basisTag === "Include") return true;
@@ -10089,14 +10099,16 @@ function outputRowFromBasisEntry(basisEntry = null) {
   const text = String(line.text || "").trim();
   if (!text) return null;
   const description = customPricing ? text : outputCatalogDescription(line);
+  const hasQuantity = String(line.quantity ?? "").trim() !== "";
+  const unit = normalizeUnit(line.unit || "");
   return normalizeOutputRow({
     section: normalizeCategoryTitle(section.title || section.id || "Quote Basis"),
     description,
-    quantity: line.quantity ?? "",
-    unit: normalizeUnit(line.unit || ""),
+    quantity: hasQuantity ? line.quantity : 1,
+    unit: unit || "nos",
     price_mode: "Priced",
     unit_price_override: "",
-    catalog_unit_price: line.catalog_unit_price ?? "",
+    catalog_unit_price: hasQuantity && unit ? (line.catalog_unit_price ?? "") : "",
     catalog_description: line.catalog_description || "",
     pricing_reference_description: line.pricing_reference_description || "",
     pricing_keyword: line.pricing_keyword || "",
@@ -10693,7 +10705,8 @@ function outputRowsValid(rows = state.outputRows) {
     if (!String(row.description || "").trim()) errors.push(`${label}: Description is required.`);
     const quantity = numberOrNull(row.quantity);
     if (!String(row.unit || "").trim()) errors.push(`${label}: Unit is required.`);
-    if (row.price_mode !== "Included" && (quantity === null || quantity <= 0)) {
+    if (quantity === null || quantity <= 0
+      || !/^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(String(row.quantity ?? "").trim())) {
       errors.push(`${label}: Quantity must be greater than 0.`);
     }
     if (row.price_mode !== "Included" && !outputPricingIsDeferred(row)) {
@@ -11508,9 +11521,10 @@ function basisPricingRow(line, section) {
     || normalizeUnit(original.unit) !== normalizeUnit(line.unit)) return null;
   const row = normalizeLineItem(rows[0]);
   const basisDescription = cleanCustomerQuoteLineText(original.text);
+  const sameMeasurement = numberOrNull(row.quantity) === numberOrNull(line.quantity)
+    && normalizeUnit(row.unit) === normalizeUnit(line.unit);
   if (canonicalPricingAuthorityText(row.section) !== canonicalPricingAuthorityText(section.title)
-    || numberOrNull(row.quantity) !== numberOrNull(line.quantity)
-    || normalizeUnit(row.unit) !== normalizeUnit(line.unit)
+    || (!sameMeasurement && !basisUnmatchedOffer(line, row, section))
     || (row.pricing_keyword || "") !== (original.pricing_keyword || "")
     || (row.description !== basisDescription && row.description !== outputCatalogDescription(original))) return null;
   // The original analysis can recover a classification and offer, never a deferral decision.
@@ -11528,9 +11542,11 @@ function basisAnalysisReferenceIsCurrent() {
 function basisUnmatchedOffer(line, row, section) {
   if (!row || row.pricing_authority?.variant !== "none" || line.pricing_keyword
     || line.possible_pricing_matches?.length || !basisAnalysisReferenceIsCurrent()) return "";
-  const quantity = numberOrNull(line.quantity);
-  const unit = normalizeUnit(line.unit);
-  if (!(quantity > 0) || !unit) return "";
+  const measuredQuantity = numberOrNull(line.quantity);
+  const measuredUnit = normalizeUnit(line.unit);
+  const quantity = measuredQuantity ?? 1;
+  const unit = measuredUnit || "nos";
+  if (!(quantity > 0) || (measuredQuantity === null && String(line.quantity ?? "").trim())) return "";
   if (canonicalPricingAuthorityText(row.section) !== canonicalPricingAuthorityText(section.title)
     || cleanCustomerQuoteLineText(line.text) !== row.description
     || quantity !== numberOrNull(row.quantity) || unit !== normalizeUnit(row.unit)) return "";
@@ -11538,8 +11554,8 @@ function basisUnmatchedOffer(line, row, section) {
   if (!/^[0-9a-f]{64}$/.test(receipt)) return "";
   const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
   const original = originalBasisLineForPricing(line, section, ids);
-  return original && original.text === line.text && numberOrNull(original.quantity) === quantity
-    && normalizeUnit(original.unit) === unit ? receipt : "";
+  return original && original.text === line.text && numberOrNull(original.quantity) === measuredQuantity
+    && normalizeUnit(original.unit) === measuredUnit ? receipt : "";
 }
 
 function basisPricingGroup(line, section) {
@@ -11961,7 +11977,7 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null) {
   let deferralChanged = false;
   const pricingChanges = new Map();
   section.lines = (section.lines || []).map((line, index) => {
-    if (lineIndex !== null && lineIndex !== index) return line;
+    if ((lineIndex !== null && lineIndex !== index) || basisLineIsInformationalDimension(line)) return line;
     const row = basisPricingRow(line, section);
     const offer = nextTag === "Exclude" ? "" : basisUnmatchedOffer(line, row, section);
     if (offer && row.deferred_pricing !== offer) {
