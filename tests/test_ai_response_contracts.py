@@ -328,8 +328,9 @@ class StrictSynthesisTest(unittest.TestCase):
         self.assertEqual(first['text'], contracts.DRAFT_SYNTHESIS.text_format())
         prompt = first['input'][0]['content'][0]['text']
         self.assertIn('Use null quantity and unit for genuinely unmeasured or purely informational lines.', prompt)
-        self.assertIn('Keep unmeasured physical lines in the basis for review.', prompt)
-        self.assertIn('Do not emit line_items for informational lines.', prompt)
+        self.assertIn('Keep unmeasured physical and service scope in Quote Basis only, with unknown fields null.', prompt)
+        self.assertIn('Do not emit line_items for informational or clarification-only notes.', prompt)
+        self.assertIn('Derive area only from coherent dimensions and confirmed coverage of the same scope.', prompt)
         for key in ('model', 'reasoning', 'provider', 'store'):
             self.assertEqual(first[key], repair[key])
         self.assertIn(contracts.DRAFT_SYNTHESIS.field_instructions(), repair['input'][0]['content'][0]['text'])

@@ -27,8 +27,9 @@ replaceOnce('Bar Stool seating around the display', 'Bar Stools at Round Tables.
 replaceOnce('const cases = [', `const cases = [
   { id: "u1-excluded-match", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light" },
   { id: "u1-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },
-  { id: "u1-provisional-pair", kind: "unmatched", section: "Lighting and Electrical", text: "Choreographed water feature", quantity: null, unit: "" },
+  { id: "u1-provisional-pair", kind: "unmatched", section: "Lighting and Electrical", text: "Choreographed water feature", quantity: null, unit: "", proposal: true, basisOnly: true },
   { id: "u1-footprint-note", kind: "note", section: "Lighting and Electrical", text: "Provisional booth footprint: 6m x 4m", quantity: null, unit: "" },`);
+replaceOnce('  lineItems.push({ section: entry.section,', '  if (!entry.basisOnly) lineItems.push({ section: entry.section,');
 replaceOnce('  // Resolve any remaining server-added review line', `
   const spotlightTick = await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]');
   const spotlightCross = await basisControl(page, "u1-confirmed", '[data-basis-tag="Exclude"]');

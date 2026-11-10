@@ -9881,7 +9881,7 @@ function outputComparableText(value = "") {
 function isNonQuoteNote(value = "") {
   const rawText = cleanCustomerQuoteLineText(value);
   const bracketed = bracketedCatalogReferenceParts(rawText);
-  const text = bracketed ? (bracketed.detail || bracketed.reference) : rawText;
+  const text = bracketed ? bracketed.reference : rawText;
   return /^(?:(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?(?:footprint|dimensions?|size)\b|(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:))/i.test(text);
 }
 

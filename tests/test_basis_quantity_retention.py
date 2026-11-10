@@ -196,9 +196,13 @@ class BasisQuantityRetentionTest(unittest.TestCase):
                 before = copy.deepcopy(original)
                 admitted = server.admit_provider_quote_draft(original, require_confidence=True)
                 self.assertEqual(original, before)
+                self.assertEqual(admitted, before)
+                self.assertEqual(server.admitted_provider_measurements(admitted), {"synthetic-row": [24, "sqm"]})
                 pair = lambda entry: (entry["quantity"], entry["unit"])
                 self.assertEqual(pair(admitted["line_items"][0]), (24, "sqm"))
-                self.assertEqual(pair(admitted["quote_basis_sections"][0]["lines"][0]), (24, "sqm"))
+                basis = server.normalize_basis_line(admitted["quote_basis_sections"][0]["lines"][0])
+                self.assertEqual(float(basis["quantity"]), 24)
+                self.assertEqual(basis["unit"], "sqm")
                 self.assertEqual(server.pricing_analysis_source_units(admitted["line_items"]), {"synthetic-row": "sqm"})
 
     def test_only_explicit_leading_measurements_are_extracted_from_text(self):
