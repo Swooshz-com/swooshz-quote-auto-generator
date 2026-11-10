@@ -28,7 +28,9 @@ replaceOnce('const cases = [', `const cases = [
   { id: "u1-excluded-match", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light" },
   { id: "u1-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },
   { id: "u1-provisional-pair", kind: "unmatched", section: "Lighting and Electrical", text: "Choreographed water feature", quantity: null, unit: "", proposal: true, basisOnly: true },
-  { id: "u1-footprint-note", kind: "note", section: "Lighting and Electrical", text: "Provisional booth footprint: 6m x 4m", quantity: null, unit: "" },`);
+  { id: "u1-footprint-note", kind: "note", section: "Lighting and Electrical", text: "24 sqm Provisional booth footprint: 6m x 4m", quantity: null, unit: "" },
+  { id: "u1-clarification-note", kind: "note", section: "Lighting and Electrical", text: "1 lot Clarification note: confirm venue access", itemText: "Venue access alias", quantity: null, unit: "" },
+  { id: "u1-linked-item-note", kind: "note", section: "Lighting and Electrical", text: "Venue timing alias", itemText: "1 lot Confirmation note: confirm venue timing", quantity: null, unit: "" },`);
 replaceOnce('  lineItems.push({ section: entry.section,', '  if (!entry.basisOnly) lineItems.push({ section: entry.section,');
 replaceOnce('  // Resolve any remaining server-added review line', `
   const spotlightTick = await basisControl(page, "u1-confirmed", '[data-basis-tag="Include"]');
@@ -42,6 +44,16 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   const sectionActions = page.locator('#basisReviewSurface [data-basis-section="' + sectionId + '"][data-basis-section-action]');
   const tickAll = sectionActions.and(page.locator('[data-basis-section-action="Include"]')).first();
   const crossAll = sectionActions.and(page.locator('[data-basis-section-action="Exclude"]')).first();
+  const noteIds = ["u1-footprint-note", "u1-clarification-note", "u1-linked-item-note"];
+  async function assertInformationalScope() {
+    assert(await page.evaluate((ids) => {
+      const notes = state.quoteBasisSections.flatMap((section) => section.lines).filter((line) => ids.includes(line.id));
+      return notes.length === ids.length && notes.every((line) => line.tag === "Confirm")
+        && ![...state.lineItems, ...state.outputRows].some((row) => ids.includes(row.source_basis_line_id));
+    }, noteIds), "informational notes lost their review-only status");
+    assert(await page.locator(".basis-line-row").filter({ hasText: /provisional booth footprint:|confirm venue access|confirm venue timing/i }).count() === 0,
+      "an informational note received individual pricing controls");
+  }
   async function assertBasisRow(row, group, tag) {
     assert(await row.isVisible(), group + " row disappeared after a basis action");
     assert(await row.evaluate((element, expected) =>
@@ -61,11 +73,18 @@ replaceOnce('  // Resolve any remaining server-added review line', `
     const line = state.quoteBasisSections.flatMap((section) => section.lines).find((entry) => entry.id === "u1-provisional-pair");
     return !line?.quantity && !line?.unit;
   }), "displaying the default altered admitted measurement evidence");
+  await page.evaluate((ids) => {
+    for (const section of state.quoteBasisSections) {
+      section.lines.forEach((line, index) => {
+        if (ids.includes(line.id)) applyBasisTag(section.id, "Include", index);
+      });
+    }
+  }, noteIds);
+  await assertInformationalScope();
   await tickAll.click();
   assert(await water.getByText("Price to be discussed", { exact: true }).isVisible(),
     "section tick did not defer unmeasured scope");
-  assert(await page.evaluate(() => !state.lineItems.some((row) =>
-    row.source_basis_line_id === "u1-footprint-note")), "footprint became a pricing row");
+  await assertInformationalScope();
   await assertBasisRow(spotlight, "Matched", "include");
   await assertBasisRow(sculpture, "Unmatched", "custom");
   assert(await sculptureStatus.isVisible(), "section tick did not defer eligible unmatched row");
@@ -82,6 +101,7 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   assert(await sculpture.evaluate((row) => !row.classList.contains("basis-line-exclude")), "single X excluded a different row");
   await spotlightTick.click();
   await assertBasisRow(spotlight, "Matched", "include");
+  await assertInformationalScope();
   assert(await sectionActions.count() === 2, "one section rendered duplicate bulk controls across groups");
   assert(await tickAll.getAttribute("title") === "Accept all review lines"
     && await crossAll.getAttribute("title") === "Exclude all review lines", "original bulk tooltips missing");
@@ -134,6 +154,7 @@ replaceOnce('  await writeJson("timings-raw.json", { timings, confirm: result.co
   await page.waitForFunction(() => !quoteSessionDraftSavePromise);
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.outputRows.length > 0);
+  await assertInformationalScope();
   await assertExcludedOutput();
   if (!(await sculpture.isVisible())) await basisTab.click();
   await assertExcludedBasis();
@@ -351,11 +372,11 @@ replaceOnce('    const download = await downloadPromise;', `
       && await deferredAmount.innerText() === 'Price to be discussed', 'Download did not dismiss the blank deferred editor');
     result.deferredEditorDismissal = 'PASS';
 `);
+replaceOnce('      "bad=[]",', `      "bad=[{'unexpected_note':get(r,'C')} for r in rows if any(note in get(r,'C').lower() for note in ('confirm venue access','confirm venue timing','provisional booth footprint:','venue access alias','venue timing alias'))]",`);
 replaceOnce('    // The analysis seal is opaque transport', `
     expectedRows.push({ id: "u1-unmatched", description: "Kinetic sculpture", quantity: "2 nos", amount: "Price to be discussed" });
     expectedRows.push({ id: "u1-provisional-pair", description: "Choreographed water feature", quantity: "1 nos", amount: "Price to be discussed" });
-    assert(await page.evaluate(() => !state.outputRows.some((row) =>
-      row.source_basis_line_id === "u1-footprint-note")), "footprint became an Output row");
+    await assertInformationalScope();
     expectedRows.push({ id: "u1-excluded-match", description: byName("LED Flood Light").description,
       quantity: "3 nos", amount: cents(3 * floodPrice * fxRate) });
     // The analysis seal is opaque transport`);

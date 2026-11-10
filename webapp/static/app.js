@@ -9878,11 +9878,16 @@ function outputComparableText(value = "") {
     .trim();
 }
 
-function isNonQuoteNote(value = "") {
-  const rawText = cleanCustomerQuoteLineText(value);
+function isNonQuoteNote(value = "", quantity = "", unit = "") {
+  const rawText = normalizedLineTextQuantityParts(value, quantity, unit).text;
   const bracketed = bracketedCatalogReferenceParts(rawText);
-  const text = bracketed ? bracketed.reference : rawText;
-  return /^(?:(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?(?:footprint|dimensions?|size)\b|(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:))/i.test(text);
+  const parts = bracketed ? [bracketed.reference, bracketed.detail] : [rawText];
+  return parts.some((part, index) => {
+    const text = normalizedLineTextQuantityParts(part, quantity, unit).text;
+    if (/^(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:)/i.test(text)) return true;
+    const dimension = text.match(/^(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?(?:footprint|dimensions?|size)\b/i);
+    return Boolean(dimension && (!index || /^\s*:/.test(text.slice(dimension[0].length))));
+  });
 }
 
 function isInformationalDimensionText(value = "") {
@@ -9898,13 +9903,13 @@ function isInformationalDimensionText(value = "") {
 }
 
 function basisLineIsInformationalDimension(line = {}) {
-  if (isNonQuoteNote(line.text || line.description)) return true;
+  if (isNonQuoteNote(line.text || line.description, line.quantity, line.unit)) return true;
   if (line.pricing_keyword || line.pricing_reference_description || line.catalog_description) return false;
   return isInformationalDimensionText(line.text || line.description || "");
 }
 
 function outputRowIsInformationalDimension(row = {}) {
-  if (isNonQuoteNote(row.description)) return true;
+  if (isNonQuoteNote(row.description, row.quantity, row.unit)) return true;
   if (row.pricing_keyword || row.pricing_reference_description || row.catalog_description) return false;
   return isInformationalDimensionText(row.description || "");
 }
@@ -11892,6 +11897,7 @@ function applyPossiblePricingMatch(sectionId, lineIndex, matchIndex) {
   const selectedIndex = Number(matchIndex);
   if (!section || !Number.isInteger(lineNumber) || !section.lines[lineNumber]) return;
   const currentLine = section.lines[lineNumber];
+  if (basisLineIsInformationalDimension(currentLine)) return;
   const matches = normalizePossiblePricingMatches(currentLine.possible_pricing_matches || currentLine.possible_catalog_matches || []);
   if (!Number.isInteger(selectedIndex) || !matches[selectedIndex]) return;
   const match = matches[selectedIndex];
@@ -11981,6 +11987,8 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null) {
   section.lines = (section.lines || []).map((line, index) => {
     if ((lineIndex !== null && lineIndex !== index) || basisLineIsInformationalDimension(line)) return line;
     const row = basisPricingRow(line, section);
+    const linkedIds = [line.id, line.source_line_item_id].filter(Boolean);
+    if (row && linkedIds.includes(row.source_basis_line_id) && isNonQuoteNote(row.description, row.quantity, row.unit)) return line;
     const offer = nextTag === "Exclude" ? "" : basisUnmatchedOffer(line, row, section);
     if (offer && row.deferred_pricing !== offer) {
       pricingChanges.set(row.source_basis_line_id, { ...row, unmatched_pricing_offer: offer, deferred_pricing: offer });

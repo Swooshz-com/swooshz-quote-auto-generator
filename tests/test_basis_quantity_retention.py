@@ -181,7 +181,7 @@ class BasisQuantityRetentionTest(unittest.TestCase):
                         self.assertEqual(admitted_unit, unit)
 
     def test_admission_recovers_evidence_before_any_catalogue_rewrite(self):
-        for source in ("basis", "item"):
+        for source in ("basis", "item", "structured-basis"):
             with self.subTest(source=source):
                 line = {"id": "synthetic-row", "tag": "Confirm", "text": "Synthetic floor panel",
                         "confidence_pct": 85, "quantity": None, "unit": ""}
@@ -189,6 +189,8 @@ class BasisQuantityRetentionTest(unittest.TestCase):
                        "description": "Synthetic floor panel", "quantity": None, "unit": ""}
                 if source == "basis":
                     line["text"] = "24 sqm Synthetic floor panel"
+                elif source == "structured-basis":
+                    line.update(quantity=24, unit="m2")
                 else:
                     row["description"] = "24 sqm Synthetic floor panel"
                 original = {"quote_basis_sections": [{"id": "floor", "title": "Floor", "lines": [line]}],

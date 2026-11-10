@@ -43047,6 +43047,158 @@ main().catch((error) => {
             request["pricing_analysis_seal"] = copy.deepcopy(drafted["pricing_analysis_seal"])
         return self._ledger_sync(request)
 
+    def test_quote_scope_notes_never_enter_the_workbook(self):
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers
+
+        cases = (
+            ("plain", "Clarification note: confirm venue access", ""),
+            ("prefixed", "1 lot Clarification note: confirm venue access", ""),
+            ("footprint", "36 sqm Provisional booth footprint: 6m x 6m", ""),
+            ("bracketed", "[ Synthetic service ] - 1 lot Clarification note: confirm venue access", ""),
+            ("linked-basis", "Synthetic alias", "1 lot Confirmation note: confirm venue access"),
+            ("linked-item", "1 lot Clarification note: confirm venue access", "Synthetic alias"),
+        )
+        for label, description, basis_text in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                payload = valid_payload()
+                payload["quote_basis"] = {}
+                payload["quote_basis_sections"] = []
+                payload["line_items"] = [
+                    {"section": "Services", "description": "Synthetic delivery; provisional booth footprint for context",
+                     "quantity": 1, "unit": "lot", "price_mode": "Priced", "unit_price_override": 20},
+                    {"section": "Services", "description": description, "quantity": 1, "unit": "lot",
+                     "price_mode": "Priced", "unit_price_override": 70, "source_basis_line_id": "note-row"},
+                ]
+                if basis_text:
+                    payload["quote_basis_sections"] = [{"title": "Services", "lines": [
+                        {"id": "note-row", "text": basis_text, "tag": "Include", "quantity": 1, "unit": "lot"}]}]
+                self.assertEqual(webapp.validate_generation_payload(payload), [])
+                brief = webapp.payload_to_brief(payload)
+                self.assertEqual([row.get("unit_price_override") for row in brief["line_items"]], [20])
+                self.assertFalse(brief["quote_basis_sections"])
+                root = Path(temp)
+                result = webapp.run_quote_job(payload, output_root=root / "out", tmp_root=root / "tmp")
+                self.assertEqual(result["status"], "completed", result.get("errors"))
+                [xlsx] = list((root / "out").rglob("quotation.xlsx"))
+                rows = [values for _, values in read_first_sheet_rows_with_numbers(xlsx)]
+                content = " ".join(str(value) for row in rows for value in row)
+                self.assertIn("Synthetic delivery", content)
+                self.assertNotIn("confirm venue access", content)
+                self.assertNotIn("Synthetic alias", content)
+                self.assertNotIn("6m x 6m", content)
+                [total] = [row for row in rows if "Total" in row]
+                self.assertIn(20, total)
+
+    def test_ledger_provisional_footprint_cannot_supply_automatic_area_pricing(self):
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        spotlight = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        spotlight_price = koncept_catalog_sale_unit_price(spotlight)
+        cases = (
+            ("default", "using default booth dimensions 6m x 6m", "sqm", self.LEDGER_CARPET, False),
+            ("provisional", "for provisional booth footprint of 6m x 6m", "sqm", self.LEDGER_CARPET, False),
+            ("measured", "independently measured; provisional booth footprint for context", "sqm", self.LEDGER_CARPET, True),
+        )
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for name, detail, unit, keyword, eligible in cases:
+                with self.subTest(name=name):
+                    payload = self._ledger_draft_payload(f"quote-provenance-{name}")
+                    payload["project"] = {"title": "Synthetic example"}
+                    scope = f"Synthetic carpet tile flooring {detail}"
+                    provider = {
+                        "project": {"booth_width": 6, "booth_depth": 6},
+                        "quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+                            {"id": "coverage", "tag": "Confirm", "text": scope, "quantity": 36, "unit": unit,
+                             "confidence_pct": 82, "pricing_keyword": keyword},
+                            {"id": "dimension-note", "tag": "Confirm", "text": "36 sqm Provisional booth footprint: 6m x 6m",
+                             "confidence_pct": 50},
+                        ]}],
+                        "line_items": [{"section": "Floors", "source_basis_line_id": "coverage",
+                                        "description": "Synthetic carpet tile flooring" if name == "provisional" else scope,
+                                        "quantity": 36, "unit": unit, "pricing_keyword": keyword}],
+                    }
+                    spot = "Synthetic spotlight 6 inch for provisional booth footprint"
+                    provider["quote_basis_sections"].append({"id": "lighting", "title": "Lighting and AV", "lines": [
+                        {"id": "spotlight", "tag": "Confirm", "text": spot, "quantity": 2, "unit": "nos",
+                         "confidence_pct": 82, "pricing_keyword": spotlight},
+                    ]})
+                    provider["line_items"].append({
+                        "section": "Lighting and AV", "source_basis_line_id": "spotlight", "description": spot,
+                        "quantity": 2, "unit": "nos", "pricing_keyword": spotlight,
+                    })
+                    drafted = self._ledger_draft(runner, headers, payload, provider)
+                    [entry] = [row for row in drafted["pricing_analysis_seal"]["rows"] if row["id"] == "coverage"]
+                    self.assertEqual(entry.get("catalog_item_id"), keyword if eligible else None)
+                    self.assertEqual(entry["unit"], unit if eligible else "")
+                    self.assertEqual(self._ledger_price(drafted["line_items"], "coverage"), price if eligible else None)
+                    request = self._ledger_carry_draft(payload, drafted)
+                    expected = price if eligible else None
+                    normalized = self._ledger_normalize(runner, headers, request)
+                    self.assertEqual(self._ledger_price(normalized, "coverage"), expected)
+                    self.assertEqual(self._ledger_price(normalized, "spotlight"), spotlight_price)
+                    saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+                    self.assertEqual(saved["status"], 200)
+                    request.pop("pricing_analysis_seal", None)
+                    request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal", None)
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "coverage"), expected)
+
+    def test_ledger_structured_linked_pair_seals_like_an_equivalent_prefix(self):
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers
+
+        scope = "Synthetic carpet tile flooring across the full booth footprint"
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        cases = (
+            ("structured", scope, 24, "m2", scope, "sqm", price),
+            ("prefix", f"24 sqm {scope}", None, "", scope, "sqm", price),
+            ("no-unit", scope, 24, "", scope, "", None),
+            ("split-fields", scope, 24, "", scope, "sqm", None),
+            ("wrong-unit", scope, 24, "nos", scope, "nos", None),
+            ("wrong-scope", scope + " in the storage area", 24, "sqm", scope, "", None),
+        )
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for name, basis_text, quantity, basis_unit, item_text, expected_unit, expected_price in cases:
+                with self.subTest(name=name):
+                    payload = self._ledger_draft_payload(f"quote-linked-pair-{name}")
+                    line = {"id": "linked-floor", "tag": "Confirm", "text": basis_text,
+                            "quantity": quantity, "unit": basis_unit, "confidence_pct": 82}
+                    row = {"section": "Floors", "source_basis_line_id": "linked-floor", "description": item_text,
+                           "quantity": None, "unit": "sqm" if name == "split-fields" else "",
+                           "pricing_keyword": self.LEDGER_CARPET}
+                    provider = {"quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [line]}],
+                                "line_items": [row]}
+                    if name == "structured":
+                        for wrong_row in ({**row, "source_basis_line_id": "absent-link"},
+                                          {**row, "quantity": 23}, {**row, "unit": "nos"}):
+                            with self.assertRaises(webapp.AIModelOutputError):
+                                webapp.admit_provider_quote_draft({**provider, "line_items": [wrong_row]}, require_confidence=True)
+                        with self.assertRaises(webapp.AIModelOutputError):
+                            webapp.admit_provider_quote_draft({
+                                **provider, "quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+                                    {**line, "text": f"25 sqm {scope}"}]}],
+                            }, require_confidence=True)
+                    drafted = self._ledger_draft(runner, headers, payload, provider)
+                    [entry] = [entry for entry in drafted["pricing_analysis_seal"]["rows"] if entry["id"] == "linked-floor"]
+                    self.assertEqual(entry["unit"], expected_unit)
+                    self.assertEqual(entry.get("catalog_item_id"), self.LEDGER_CARPET if expected_price else None)
+                    request = self._ledger_carry_draft(payload, drafted)
+                    self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, request), "linked-floor"), expected_price)
+                    if expected_price is not None:
+                        self._ledger_line(request, "linked-floor")["tag"] = "Include"
+                        self._ledger_sync(request)
+                        self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "linked-floor"), price)
+                        with tempfile.TemporaryDirectory() as temp:
+                            root = Path(temp)
+                            generation = {**request, "quote_session": {"session_id": request["quote_session"]["session_id"]}}
+                            result = webapp.run_quote_job(generation, output_root=root / "out", tmp_root=root / "tmp")
+                            self.assertEqual(result["status"], "completed", result.get("errors"))
+                            [xlsx] = list((root / "out").rglob("quotation.xlsx"))
+                            values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                            [item] = [row for row in values if "24 sqm" in row]
+                            [total] = [row for row in values if "Total" in row]
+                            self.assertIn(round(24 * price, 2), item)
+                            self.assertIn(round(24 * price, 2), total)
+
     def _ledger_laundering_payload(self, session_id):
         """A request row carrying a self-built current catalogue authority, and a degenerate provider result naming it."""
         payload = self._ledger_draft_payload(session_id)

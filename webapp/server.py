@@ -5582,16 +5582,75 @@ def normalize_basis_tag(value: Any) -> str:
     return "Confirm"
 
 
-def is_non_quote_note(value: Any) -> bool:
-    text = clean_text(value).lower()
+PROVISIONAL_DIMENSION_LABEL = (
+    r"(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?(?:footprint|dimensions?|size)\b"
+)
+
+
+def quote_scope_text_parts(value: Any, quantity: Any = None, unit: Any = "") -> tuple[str, ...]:
+    text = normalized_line_text_quantity_parts(value, quantity, unit)["text"]
     bracketed = bracketed_catalog_reference_parts(text)
-    if bracketed:
-        text = bracketed[0]
-    return bool(re.match(
-        r"^(?:(?:provisional|default|assumed)\s+(?:(?:booth|stand|space)\s+)?"
-        r"(?:footprint|dimensions?|size)\b|(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:))",
-        text,
-    ))
+    return tuple(
+        normalized_line_text_quantity_parts(part, quantity, unit)["text"]
+        for part in (bracketed or (text,)) if part
+    )
+
+
+def is_non_quote_note(value: Any, quantity: Any = None, unit: Any = "") -> bool:
+    for index, text in enumerate(quote_scope_text_parts(value, quantity, unit)):
+        # Catalogue detail may include dimensions as context. Require an
+        # explicit note label there while accepting leading standalone labels.
+        dimension_label = PROVISIONAL_DIMENSION_LABEL + (r"\s*:" if index else "")
+        if re.match(rf"^(?:{dimension_label}|(?:clarification(?:[- ]only)?|confirmation)\s*(?:note\b|:))", text, re.I):
+            return True
+    return False
+
+
+def is_non_quote_note_record(row: dict[str, Any]) -> bool:
+    return any(is_non_quote_note(row[key], row.get("quantity"), row.get("unit"))
+               for key in ("text", "line", "description") if row.get(key))
+
+
+def uses_provisional_dimensions(value: Any, unit: Any = "") -> bool:
+    """Recognize an explicit dependency on provisional dimensions, including bracketed detail."""
+    normalized_unit = canonical_pricing_authority_unit(unit)
+    if normalized_unit and normalized_unit not in {"sqm", "sqft", "ft2", "sq ft"}:
+        return False
+    return any(re.search(
+        rf"\b(?:using|assuming|based\s+on|derived\s+from|estimated\s+from|calculated\s+from|for|from|per)\s+"
+        rf"(?:(?:a|an|the)\s+)?{PROVISIONAL_DIMENSION_LABEL}",
+        text, re.I,
+    ) for text in quote_scope_text_parts(value))
+
+
+def provisional_measurement(row: dict[str, Any], line: dict[str, Any]) -> bool:
+    texts = (row.get("description"), line.get("text") or line.get("line") or line.get("description"))
+    prefix_unit = next((prefix["unit"] for text in texts if (prefix := leading_quantity_prefix(text))), "")
+    unit = row.get("unit") or line.get("unit") or prefix_unit
+    return any(uses_provisional_dimensions(text, unit) for text in texts)
+
+
+def basis_sections_with_linked_item_notes(sections: Any, rows: Any) -> Any:
+    if not isinstance(sections, list) or not isinstance(rows, list):
+        return sections
+    item_notes = {
+        source_id: normalized_line_text_quantity_parts(row.get("description"), row.get("quantity"), row.get("unit"))["text"]
+        for row in rows if isinstance(row, dict)
+        if (source_id := safe_resource_id(row.get("source_basis_line_id"), ""))
+        and is_non_quote_note(row.get("description"), row.get("quantity"), row.get("unit"))
+    }
+    if not item_notes:
+        return sections
+    # A physical-looking alias cannot recreate an item whose own scope is a note.
+    return [
+        {**section, "lines": [
+            {**line, "text": note} if isinstance(line, dict) and not is_non_quote_note_record(line)
+            and (note := item_notes.get(safe_resource_id(line.get("id"), ""))
+                 or item_notes.get(safe_resource_id(line.get("source_line_item_id"), ""))) else line
+            for line in section["lines"]
+        ]} if isinstance(section, dict) and isinstance(section.get("lines"), list) else section
+        for section in sections
+    ]
 
 
 def non_quote_note_ids(sections: Any) -> set[str]:
@@ -5599,7 +5658,7 @@ def non_quote_note_ids(sections: Any) -> set[str]:
         row_id
         for section in sections if isinstance(section, dict) and isinstance(section.get("lines"), list)
         for line in section["lines"] if isinstance(line, dict)
-        if is_non_quote_note(line.get("text") or line.get("description"))
+        if is_non_quote_note_record(line)
         for row_id in (safe_resource_id(line.get("id"), ""), safe_resource_id(line.get("source_line_item_id"), ""))
         if row_id
     } if isinstance(sections, list) else set()
@@ -5613,7 +5672,7 @@ def without_non_quote_note_rows(rows: Any, sections: Any) -> Any:
         row for row in rows
         if not isinstance(row, dict) or (
             safe_resource_id(row.get("source_basis_line_id"), "") not in note_ids
-            and not is_non_quote_note(row.get("description"))
+            and not is_non_quote_note_record(row)
         )
     ]
 
@@ -5622,7 +5681,12 @@ def quote_payload_without_note_rows(payload: dict[str, Any]) -> dict[str, Any]:
     sections = payload.get("quote_basis_sections")
     if not isinstance(sections, list):
         sections = quote_session_draft_state_from_payload(payload).get("quoteBasisSections")
-    return {**payload, "line_items": without_non_quote_note_rows(payload.get("line_items"), sections)}
+    rows = payload.get("line_items")
+    linked_sections = basis_sections_with_linked_item_notes(sections, rows)
+    result = {**payload, "line_items": without_non_quote_note_rows(rows, linked_sections)}
+    if linked_sections is not sections and linked_sections != sections:
+        result["quote_basis_sections"] = linked_sections
+    return result
 
 
 def is_informational_dimension_text(value: Any) -> bool:
@@ -5645,7 +5709,7 @@ def is_informational_dimension_text(value: Any) -> bool:
 def is_informational_dimension_basis_line(line: dict[str, Any]) -> bool:
     if not isinstance(line, dict):
         return False
-    if is_non_quote_note(line.get("text") or line.get("description")):
+    if is_non_quote_note_record(line):
         return True
     if clean_text(line.get("pricing_keyword")):
         return False
@@ -19655,6 +19719,7 @@ def normalize_line_items(
     )
     if authority_error:
         return []
+    raw_items = without_non_quote_note_rows(raw_items, [])
     authority = (
         exact_pricing_reference_authority(payload, auth_session=auth_session)
         if use_catalog
@@ -20248,7 +20313,7 @@ def quote_basis_notes(
                 f"{normalize_basis_tag(line.get('tag'))}: {canonical_basis_section_text(line.get('text'))}"
                 for line in section.get("lines") or []
                 if isinstance(line, dict) and canonical_basis_section_text(line.get("text")) != ""
-                and not is_non_quote_note(line.get("text"))
+                and not is_non_quote_note_record(line)
             ]
             if lines:
                 notes.append(f"{clean_text(section.get('title')) or 'Section'}: {'; '.join(lines)}")
@@ -20308,11 +20373,11 @@ def payload_to_brief(
         or company.get("logo")
         or payload.get("header_logo")
     )
-    canonical_basis_sections = canonical_quote_basis_sections(payload)
-    for section in canonical_basis_sections:
-        section["lines"] = [line for line in section.get("lines") or [] if not is_non_quote_note(line.get("text"))]
-    canonical_basis_sections = [section for section in canonical_basis_sections if section["lines"]]
     output_payload = quote_payload_without_note_rows(payload)
+    canonical_basis_sections = canonical_quote_basis_sections(output_payload)
+    for section in canonical_basis_sections:
+        section["lines"] = [line for line in section.get("lines") or [] if not is_non_quote_note_record(line)]
+    canonical_basis_sections = [section for section in canonical_basis_sections if section["lines"]]
     line_items = normalize_line_items_for_final_brief(output_payload, auth_session=auth_session)
     if (not output_measurement_inputs_valid(output_payload.get("line_items"))
             or not output_rows_have_measurements(line_items)):
@@ -20369,7 +20434,7 @@ def payload_to_brief(
         },
         "rich_text": quote_detail_rich_text(payload),
         "quote_basis_sections": canonical_basis_sections,
-        "notes": quote_basis_notes(payload, auth_session=auth_session),
+        "notes": quote_basis_notes(output_payload, auth_session=auth_session),
     }
 
 
@@ -21813,7 +21878,7 @@ def quote_basis_sections_with_catalog_exact_lines(
         return bool(clean_text(item.get("pricing_reference_description")) or clean_text(item.get("catalog_description")))
 
     def is_default_dimension_basis_line(line: dict[str, Any]) -> bool:
-        if is_non_quote_note(line.get("text")):
+        if is_non_quote_note_record(line):
             return True
         # A uniquely linked physical row can keep its measurements on its item.
         # Dimension-like wording must not suppress that exact row's reconciliation.
@@ -23031,7 +23096,7 @@ def line_items_aligned_to_quote_basis(
             if not isinstance(line, dict):
                 continue
             line_tag = normalize_basis_tag(line.get("tag"))
-            if is_non_quote_note(line.get("text")):
+            if is_non_quote_note_record(line):
                 continue
             if approved_only:
                 if not basis_line_allows_quote_output(line):
@@ -23398,11 +23463,12 @@ def issue_pricing_analysis_seal(
     auth_session: dict[str, Any] | None = None,
     *,
     source_units: dict[str, str],
+    source_quantities: dict[str, float | None],
 ) -> dict[str, Any] | None:
     """Seal this analysis result: which rows it produced, in which unit, and which it matched.
 
-    A match is sealed only when the provider's own unit and the priced row's unit both count
-    the same thing as the catalogue unit; a re-unit from pieces to sets or area is never sealed.
+    A match requires the admitted quantity and units that count the same thing as
+    the catalogue unit. Later defaults and catalogue rewrites cannot supply either.
     """
     key = pricing_analysis_seal_key()
     scope = pricing_ledger_scope_for_auth_session(auth_session)
@@ -23436,6 +23502,7 @@ def issue_pricing_analysis_seal(
             and claim.get("catalog_digest") == digest
             and claim.get("catalog_source") == source
             and entry["quantity"] is not None
+            and entry["quantity"] == source_quantities.get(row_id)
             and pricing_units_share_quantity_basis(source_unit, catalog_unit)
             and pricing_units_share_quantity_basis(unit, catalog_unit)
         ):
@@ -23603,6 +23670,8 @@ def pricing_ledger_grant_supported(grant: dict[str, Any], view: dict[str, Any] |
     line = (view or {}).get("line")
     if not isinstance(row, dict) or not isinstance(line, dict):
         return False
+    if is_non_quote_note_record(row) or is_non_quote_note_record(line) or provisional_measurement(row, line):
+        return False
     # Analysis matches arrive as Confirm (priced, awaiting review); Exclude/Custom end the grant.
     if normalize_basis_tag(line.get("tag")) not in {"Include", "Confirm"} or line.get("custom_pricing"):
         return False
@@ -23760,8 +23829,11 @@ def public_pricing_ledger(metadata: dict[str, Any]) -> dict[str, Any]:
 class PricingLedgerView:
     ledger: dict[str, Any]
     seal_grants: dict[str, dict[str, Any]] = field(default_factory=dict)
+    provisional_rows: set[str] = field(default_factory=set)
 
     def grant(self, row_id: str) -> dict[str, Any] | None:
+        if row_id in self.provisional_rows:
+            return None
         offer = self.seal_grants.get(row_id)
         if offer is not None:
             return offer["grant"]
@@ -23770,6 +23842,8 @@ class PricingLedgerView:
         return grant if grant and grant["state"] == "live" else None
 
     def source_unit(self, row_id: str) -> str | None:
+        if row_id in self.provisional_rows:
+            return ""
         offer = self.seal_grants.get(row_id)
         if offer is not None and offer.get("source_unit") is not None:
             return offer["source_unit"]
@@ -23814,7 +23888,15 @@ def pricing_ledger_view_for_payload(
                 return PricingLedgerView(empty_pricing_ledger("invalid"))
     ledger = effective_pricing_ledger(metadata)
     seal = verified_pricing_analysis_seal(pricing_analysis_seal_from_payload(payload), scope=scope, session_id=session_id)
-    return PricingLedgerView(ledger, pricing_ledger_seal_grants(seal, ledger) or {})
+    basis_sections = payload.get("quote_basis_sections")
+    if not isinstance(basis_sections, list):
+        basis_sections = quote_session_draft_state_from_payload(payload).get("quoteBasisSections")
+    views = pricing_ledger_draft_rows({"lineItems": payload.get("line_items"), "quoteBasisSections": basis_sections})
+    provisional_rows = {
+        row_id for row_id, view in views.items()
+        if provisional_measurement(view["row"] or {}, view["line"] or {})
+    }
+    return PricingLedgerView(ledger, pricing_ledger_seal_grants(seal, ledger) or {}, provisional_rows)
 
 
 def line_items_with_pricing_ledger(
@@ -23898,11 +23980,12 @@ def line_items_with_confirmed_basis_selections(
             continue
         original, line = originals[0], selected[0]
         if (normalize_basis_tag(line.get("tag")) != "Include" or line.get("custom_pricing")
-                or is_non_quote_note(line.get("text"))):
+                or is_non_quote_note_record(line)):
             result.append(item)
             continue
         keyword = clean_text(line.get("pricing_keyword"))
         grant = ledger_view.grant(source_id)
+        source_unit = ledger_view.source_unit(source_id)
         catalog_item = lookup.get(keyword)
         quantity = parse_float_or_none(item.get("quantity"))
         unit = normalize_pricing_unit(catalog_item_unit_hint(catalog_item)) if catalog_item else ""
@@ -23914,7 +23997,7 @@ def line_items_with_confirmed_basis_selections(
                 or parse_float_or_none(line.get("quantity")) != quantity
                 or not pricing_units_share_quantity_basis(line.get("unit"), grant["catalog_unit"])
                 or canonical_pricing_authority_unit(catalog_item_unit_hint(catalog_item)) != grant["catalog_unit"]
-                or not pricing_units_share_quantity_basis(ledger_view.source_unit(source_id) or original.get("unit"), unit)
+                or not pricing_units_share_quantity_basis(original.get("unit") if source_unit is None else source_unit, unit)
                 or (clean_text(line.get("text")) and catalog_line_contradicts_item(
                     line.get("text"), catalog_item, catalog_items=list(lookup.values())))
                 or (clean_text(original.get("description")) and unresolved_detail_contradicts_selected_reference(
@@ -24001,7 +24084,7 @@ def pricing_reinclude_identity(view: dict[str, Any] | None) -> tuple | None:
             or line.get("pricing_keyword") != authority.get("catalog_item_id")):
         return None
     if (normalize_basis_tag(line.get("tag")) not in {"Exclude", "Include", "Confirm"} or line.get("custom_pricing")
-            or is_non_quote_note(line.get("text")) or is_non_quote_note(row.get("description"))):
+            or is_non_quote_note_record(line) or is_non_quote_note_record(row)):
         return None
     return (
         tuple(clean_text(view["section"].get(key)) for key in ("id", "title")),
@@ -24107,7 +24190,7 @@ def pricing_selection_refusal(
         return "ineligible"
     authority = row.get("pricing_authority") if isinstance(row.get("pricing_authority"), dict) else {}
     if (normalize_basis_tag(line.get("tag")) != "Include" or line.get("custom_pricing")
-            or is_non_quote_note(line.get("text")) or is_non_quote_note(row.get("description"))
+            or is_non_quote_note_record(line) or is_non_quote_note_record(row)
             or clean_text(line.get("pricing_keyword")) != item_id
             or authority.get("variant") in {"manual", "included"}
             or clean_text(row.get("price_mode")).lower() == "included"
@@ -24131,6 +24214,8 @@ def pricing_selection_compatibility_refusal(
     if pricing_reference_sale_unit_price(catalog_item) is None:
         return "not_in_catalogue"
     catalog_unit = catalog_item_unit_hint(catalog_item)
+    if provisional_measurement(row, line):
+        return "unit_review_required"
     if not all(pricing_units_share_quantity_basis(unit, catalog_unit)
                for unit in (source_unit if source_unit is not None else row.get("unit"), row.get("unit"), line.get("unit"))):
         return "unit_review_required"
@@ -24553,7 +24638,9 @@ def project_deferred_pricing(
             or section_title != normalize_catalog_section(row.get("section"))
             or context["unit"] != expected_unit
             or context["description"] != canonical_pricing_authority_text(clean_customer_quote_line_text(line.get("text")))
-            or tag == "Exclude" or clean_text(line.get("pricing_keyword")) or is_non_quote_note(line.get("text"))
+            or tag == "Exclude" or clean_text(line.get("pricing_keyword"))
+            or is_non_quote_note_record(line) or is_non_quote_note_record(raw)
+            or provisional_measurement(raw, line)
             or (not offer and not basis_line_allows_quote_output(line))
             or not raw_authority or raw_authority["variant"] != "none"
             or not isinstance(row_authority, dict) or row_authority.get("variant") != "none"
@@ -25210,7 +25297,9 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
     return result
 
 
-def admitted_provider_measurements(parsed: dict[str, Any]) -> dict[str, list[Any]]:
+def admitted_provider_measurements(
+    parsed: dict[str, Any], *, provisional_rows: set[str] | None = None,
+) -> dict[str, list[Any]]:
     """Recover exact scope measurements in the draft copy, before catalogue rewriting."""
     basis_by_id = {
         line["id"]: line
@@ -25226,22 +25315,25 @@ def admitted_provider_measurements(parsed: dict[str, Any]) -> dict[str, list[Any
         row_text = row["description"]
         quantity, unit = provider_row_measurement(row, row_text)
         line = basis_by_id.get(row_id)
+        line_text = (line.get("text") or line.get("line") or line.get("description")) if line else ""
+        provisional = provisional_measurement(row, line or {})
+        if provisional and provisional_rows is not None:
+            provisional_rows.add(row_id)
         if line is not None:
-            line_text = line.get("text") or line.get("line") or line.get("description")
             row_prefix = leading_quantity_prefix(row_text)
             line_prefix = leading_quantity_prefix(line_text)
             row_scope = row_prefix["text"] if row_prefix else row_text
             line_scope = line_prefix["text"] if line_prefix else line_text
             scope_key = provider_basis_description_key(row_scope, catalog_reference_only=False)
-            provisional = any(
+            unsupported_scope = provisional or any(
                 re.match(r"^(?:provisional|default|assumed)\b", clean_text(value), re.I) or is_non_quote_note(value)
                 for value in (row_scope, line_scope)
             )
-            if scope_key and scope_key == provider_basis_description_key(line_scope, catalog_reference_only=False) and not provisional:
+            if scope_key and scope_key == provider_basis_description_key(line_scope, catalog_reference_only=False) and not unsupported_scope:
                 basis_quantity, basis_unit = provider_row_measurement(line, line_text)
-                if quantity is None:
+                if quantity is None and (basis_unit or not unit):
                     quantity = basis_quantity
-                if not unit and line_prefix:
+                if not unit and basis_quantity is not None:
                     unit = basis_unit
                 # A verified prefix can also supply an absent basis measurement.
                 # Structured item measurements already reconcile in normalisation.
@@ -25253,12 +25345,16 @@ def admitted_provider_measurements(parsed: dict[str, Any]) -> dict[str, list[Any
             row["quantity"] = format_quantity_number(float(quantity))
         if not clean_text(row.get("unit")) and unit:
             row["unit"] = unit
-        if not clean_text(row.get("pricing_keyword")):
+        if not provisional and not clean_text(row.get("pricing_keyword")):
             measurements[row_id] = [float(quantity) if quantity is not None else None, canonical_pricing_authority_unit(unit)]
     for row_id, line in basis_by_id.items():
         text = line.get("text") or line.get("line") or line.get("description")
+        if row_id not in item_ids and provisional_measurement({}, line):
+            if provisional_rows is not None:
+                provisional_rows.add(row_id)
+            continue
         if (row_id not in item_ids and normalize_basis_tag(line.get("tag")) == "Custom"
-                and not clean_text(line.get("pricing_keyword")) and not is_non_quote_note(text)):
+                and not clean_text(line.get("pricing_keyword")) and not is_non_quote_note_record(line)):
             quantity, unit = provider_row_measurement(line, text)
             measurements[row_id] = [float(quantity) if quantity is not None else None, canonical_pricing_authority_unit(unit)]
     return measurements
@@ -25317,7 +25413,8 @@ def normalize_ai_draft(
     auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parsed = admit_provider_quote_draft(parsed, require_confidence=require_confidence)
-    source_measurements = admitted_provider_measurements(parsed)
+    provisional_rows: set[str] = set()
+    source_measurements = admitted_provider_measurements(parsed, provisional_rows=provisional_rows)
     has_payload_context = payload is not None
     payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if has_payload_context and pricing_reference_snapshot_for_payload(payload) is None:
@@ -25334,8 +25431,26 @@ def normalize_ai_draft(
     )
     raw_sections = confirm_only_basis_sections(normalize_quote_basis_sections(parsed, pricing_reference_sections))
     raw_line_items = provider_rows_with_unique_basis_ids(raw_line_items, raw_sections)
+    raw_sections = basis_sections_with_linked_item_notes(raw_sections, raw_line_items)
     quote_line_items = without_non_quote_note_rows(raw_line_items, raw_sections)
     source_units = pricing_analysis_source_units(quote_line_items)
+    source_quantities = {
+        row["source_basis_line_id"]: pricing_ledger_quantity(row.get("quantity"))
+        for row in quote_line_items
+    }
+    if provisional_rows:
+        # Keep the physical rows and their proposed measurements. Only their
+        # catalogue authority is unavailable. A blank measured unit is signed
+        # and retained by the ledger, so later matching cannot lend it a unit.
+        source_units.update({row_id: "" for row_id in provisional_rows})
+        quote_line_items = [
+            {**row, "pricing_keyword": ""} if row.get("source_basis_line_id") in provisional_rows else row
+            for row in quote_line_items
+        ]
+        for section in raw_sections:
+            for line in section["lines"]:
+                if line.get("id") in provisional_rows or line.get("source_line_item_id") in provisional_rows:
+                    line.pop("pricing_keyword", None)
     trusted_input_authorities: dict[str, dict[str, Any]] = {}
     if has_payload_context and isinstance(payload.get("line_items"), list):
         trusted_input_items = normalize_line_items(
@@ -25406,11 +25521,15 @@ def normalize_ai_draft(
         "project": dimensions,
     }
     if has_payload_context:
-        # Later stages see these rows re-unit to their catalogue items; only this stage still
-        # holds the unit the provider measured each row in, so it is carried forward internally.
+        # Later stages may apply catalogue units or fill quantities. Carry the
+        # admitted measurements forward internally before either can happen.
         result["_pricing_analysis_source_units"] = source_units
+        result["_pricing_analysis_source_quantities"] = source_quantities
         result["_unmatched_source_measurements"] = source_measurements
-        seal = issue_pricing_analysis_seal(payload, line_items, auth_session=auth_session, source_units=source_units)
+        seal = issue_pricing_analysis_seal(
+            payload, line_items, auth_session=auth_session,
+            source_units=source_units, source_quantities=source_quantities,
+        )
         if seal is not None:
             result["pricing_analysis_seal"] = seal
         snapshot = pricing_reference_snapshot_for_payload(payload)
@@ -26520,13 +26639,15 @@ def finalized_remote_draft_result(
         require_provider_row_coverage(ai_basis.get("line_items", []), ai_basis.get("quote_basis_sections", []),
                                       line_items, adjusted_sections)
     adjusted_basis = quote_basis_from_sections(adjusted_sections)
-    final_line_items = line_items or fallback_line_items
+    final_line_items = line_items or without_non_quote_note_rows(fallback_line_items, adjusted_sections)
     # The seal attests provider-derived rows only, in the units the provider measured them in.
     # Request/default fallback rows keep request trust and never become analysis matches.
     provider_units = ai_basis.get("_pricing_analysis_source_units")
+    provider_quantities = ai_basis.get("_pricing_analysis_source_quantities")
     seal = issue_pricing_analysis_seal(
         payload, line_items, auth_session=auth_session,
         source_units=provider_units if isinstance(provider_units, dict) else {},
+        source_quantities=provider_quantities if isinstance(provider_quantities, dict) else {},
     ) if has_payload_context and source.strip().lower() != "local" else None
     diagnostic_details = ai_draft_diagnostic_details(source, adjusted_basis, adjusted_sections, final_line_items)
     if isinstance(diagnostic_metadata, dict):
@@ -30063,16 +30184,17 @@ class QuotePublicationReadView:
         if progress:
             public["draft_progress"] = progress
         if include_draft_state:
-            if isinstance(draft.get("outputRows"), list):
-                editor_draft = public["draft_state"]
-                sections = draft.get("quoteBasisSections")
-                editor_draft["outputRows"] = prepare_output_rows(
-                    without_non_quote_note_rows(editor_draft["outputRows"], sections),
-                )
-                if isinstance(editor_draft.get("originalOutputRows"), list):
-                    editor_draft["originalOutputRows"] = prepare_output_rows(
-                        without_non_quote_note_rows(editor_draft["originalOutputRows"], sections),
-                    )
+            editor_draft = public.get("draft_state") or {}
+            sections = editor_draft.get("quoteBasisSections")
+            for key in ("lineItems", "outputRows", "originalOutputRows"):
+                sections = basis_sections_with_linked_item_notes(sections, editor_draft.get(key))
+            if isinstance(sections, list):
+                editor_draft["quoteBasisSections"] = sections
+            for key in ("lineItems", "outputRows", "originalOutputRows"):
+                rows = editor_draft.get(key)
+                if isinstance(rows, list):
+                    rows = without_non_quote_note_rows(rows, sections)
+                    editor_draft[key] = rows if key == "lineItems" else prepare_output_rows(rows)
             public["draft_files"] = copy.deepcopy(draft_files or []) if isinstance(self.storage, DatabaseSqagStorage) else read_quote_session_draft_files(normalized["session_id"], normalized)
         else:
             public.pop("draft_state", None)

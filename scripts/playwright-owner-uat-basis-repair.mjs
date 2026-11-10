@@ -96,7 +96,7 @@ const cases = [
   { id: "u1-historical", kind: "historical", section: "Flooring", text: "Blue carpet tile flooring for the lounge zone", quantity: 18, unit: "sqm", claim: "Printed Floor Sticker", select: "Blue Carpet Tile" },
   { id: "u1-legacy", kind: "legacy", section: "Flooring", text: "Needle punch carpet for the storage corner", quantity: 6, unit: "sqm", claim: "Printed Wall Panel" },
   { id: "u1-confirmed", kind: "confirm", section: "Lighting and Electrical", text: "6 inch Spotlight", quantity: 7, unit: "nos", claim: "6 inch Spotlight" },
-  { id: "u1-review", kind: "review", section: "Furniture Rental", text: "Custom reception desk with curved timber cladding", quantity: 1, unit: "lot", rawUnit: "" },
+  { id: "u1-review", kind: "review", section: "Furniture Rental", text: "Custom reception desk with curved timber cladding", itemText: "Custom reception desk with dimensions to confirm", quantity: 1, unit: "lot", rawUnit: "" },
 ];
 const fillerNouns = ["chair", "stool", "table", "counter", "spotlight", "socket point", "carpet tile", "wall graphic", "fabric banner", "floor sticker"];
 for (let index = 0; index < fillerLines; index++) {
@@ -116,7 +116,7 @@ for (const entry of cases) {
   if (claimed) line.pricing_keyword = claimed.id;
   if (!sections.has(entry.section)) sections.set(entry.section, { id: slug(entry.section), title: entry.section, lines: [] });
   sections.get(entry.section).lines.push(line);
-  lineItems.push({ section: entry.section, ...(entry.missingSourceId ? {} : { source_basis_line_id: entry.id }), description: line.text, quantity: entry.quantity, unit: entry.rawUnit ?? entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
+  lineItems.push({ section: entry.section, ...(entry.missingSourceId ? {} : { source_basis_line_id: entry.id }), description: entry.itemText ?? line.text, quantity: entry.quantity, unit: entry.rawUnit ?? entry.unit, ...(claimed ? { pricing_keyword: claimed.id } : {}) });
 }
 const scenarioPath = path.join(runRoot, "scenario.json");
 await fs.writeFile(scenarioPath, JSON.stringify({ raw: { analysis_findings: [], blocking_clarification_questions: [], quote_basis_sections: [...sections.values()], line_items: lineItems } }, null, 2));

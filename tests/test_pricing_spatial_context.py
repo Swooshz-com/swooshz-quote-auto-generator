@@ -350,6 +350,7 @@ class PricingSpatialContextTest(unittest.TestCase):
                     snapshot.update(quote_basis_sections=copy.deepcopy(payload['quote_basis_sections']), line_items=copy.deepcopy(recovered))
                     snapshot['pricing_analysis_seal'] = webapp.issue_pricing_analysis_seal(
                         payload, recovered, source_units={row_id: recovered[0]['unit']},
+                        source_quantities={row_id: float(recovered[0]['quantity'])},
                     )
                     if case == 'legacy-forged':
                         snapshot['pricing_analysis_seal']['mac'] = '0' * 64
@@ -644,6 +645,7 @@ function setup(count, ordinary = 0, version = baseline) {
                     section['lines'] = [{**line, 'id': row_id, 'tag': 'Confirm'} for row_id in row_ids]
                     payload['pricing_analysis_seal'] = webapp.issue_pricing_analysis_seal(
                         payload, payload['line_items'], source_units={row_id: 'nos' for row_id in row_ids},
+                        source_quantities={row_id: float(row['quantity']) for row_id in row_ids},
                     )
                     storage = webapp.LocalSqagStorage()
                     storage.create_or_update_quote_session(self.fixture._ledger_sync(payload))
