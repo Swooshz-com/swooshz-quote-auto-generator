@@ -1,4 +1,4 @@
-pypdfium2==5.14.0
+pypdfium2==5.15.0
 pillow==13.0.0
 boto3==1.43.123
 botocore==1.43.123
