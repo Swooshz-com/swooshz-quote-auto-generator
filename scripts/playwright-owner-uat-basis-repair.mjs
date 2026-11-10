@@ -106,7 +106,7 @@ for (let index = 0; index < fillerLines; index++) {
 if (sourceProvenance) cases.push(
   { id: "u1-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile physical installation", quantity: 12, unit: "m\u00b2", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
   { id: "u1-second-provenance", kind: "select", section: "Flooring", text: "Grey carpet tile physical installation", quantity: 7, unit: "m\u00b2", select: "Grey Carpet Tile", proposal: true, missingSourceId: true },
-  ...["a", "b"].map((suffix) => ({ id: "u1-unmeasured-" + suffix, kind: "unmeasured", section: "Flooring", text: "Grey carpet tile installation with missing original unit", quantity: 3, unit: "sqm", rawUnit: "", proposal: true })),
+  ...["a", "b"].map((suffix) => ({ id: "u1-unmeasured-" + suffix, kind: "unmeasured", section: "Flooring", text: "Grey carpet tile installation with missing original unit", quantity: 3, unit: "", proposal: true })),
 );
 const sections = new Map();
 const lineItems = [];
