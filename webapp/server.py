@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10))):
+                and type(value["claim_version"]) is int and 1 <= value["claim_version"] < AREA_EVIDENCE_CLAIM_VERSION)):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 11
+AREA_EVIDENCE_CLAIM_VERSION = 12
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25602,10 +25602,6 @@ AREA_GEOMETRY_MARKER = re.compile(
 AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
-AREA_MODAL_CLAUSE = re.compile(
-    r"(?P<subject>[^\W\d_][\w'\u2019 -]*?)\s+"
-    r"(?:can|could|may|might|must|shall|should|will|would)\s+[^\W\d_]+\b", re.I,
-)
 
 
 @dataclass(frozen=True)
@@ -25709,18 +25705,6 @@ def area_standalone_heading(text: str) -> bool:
     return False
 
 
-def area_standalone_prose(text: str, scope: str) -> bool:
-    """Recognise a separate clause with a subject, modal predicate and embedded quantity."""
-    frame = AREA_MODAL_CLAUSE.match(text)
-    if not frame or AREA_PROVISIONAL_QUALIFIER.match(text):
-        return False
-    subject = frame["subject"]
-    if pricing_measurement_scope(subject) == scope or area_claim_kind(subject):
-        return False
-    value = AREA_DERIVED_CLAIM.search(text, frame.end()) or AREA_OBSERVED_CLAIM.search(text, frame.end())
-    return value is not None and any(char.isalpha() for char in text[value.end():])
-
-
 def area_value_parts(text: str) -> tuple[re.Match[str] | None, re.Match[str] | None, str, bool]:
     derived = AREA_DERIVED_CLAIM.match(text)
     observed = None if derived else AREA_OBSERVED_CLAIM.match(text)
@@ -25781,21 +25765,17 @@ def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> Ar
     body = []
     measurement_end = 0
     measurement_open = False
-    separated_prose = False
     for index, (part, separator) in enumerate(parts):
         if index and parts[index - 1][1] == ";":
             if area_standalone_heading(part):
                 break
             measurement_open = False
-            separated_prose = area_standalone_prose(part, record.scope)
-        if separated_prose:
-            continue
         body.append((part, separator))
         measurement_open = measurement_open or bool(area_claim_kind(part))
         if measurement_open and (part or separator == "?"):
             measurement_end = len(body)
 
-    # An explicit boundary can separate prose. Keep punctuation within the measurement.
+    # Trim prose after a semicolon only when it adds no dimensional claim.
     body = body[:measurement_end] if measurement_end else body
     if not body:
         return None

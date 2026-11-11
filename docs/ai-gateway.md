@@ -101,10 +101,11 @@ PDF title stays in pricing review unless the source has a clear record boundary
 or supplies the measurement in a separate entry. Independently supported scopes
 can still price. A full stop in unmarked prose, an abbreviation or a numbered
 heading does not establish proof. Unmarked prose after a measurement stays
-with it across a full stop. Use a semicolon before independent prose to
-preserve the rate, or supply it in a separate source entry. A separate clause
-with its own subject and embedded quantity can stay independent. An unbound
-measurement fragment or range can still hold the preceding scope in review.
+with it across a full stop. A semicolon can separate prose that adds no
+dimensional claim. A note with its own area or dimensions needs a distinct
+heading after the semicolon or a separate source entry. An unbound measurement
+fragment, range or quantity-bearing sentence keeps the preceding scope in
+pricing review.
 A structurally complete measurement can frame the next exact label even if its
 own value has an estimated or assumed qualifier in a balanced wrapper with
 explanatory text.

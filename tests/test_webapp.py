@@ -43400,6 +43400,8 @@ main().catch((error) => {
         self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "review")
         sources = {"Quote notes": ["Do not quote", f"{located}: 24 sqm"]}
         self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
+        sources = {"Quote notes": [f"{located}: 24 sqm", "Installer brings 2 sqm of sample boards"]}
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
 
     def test_area_source_labels_use_exact_boundaries_and_local_context(self):
         west, east = "carpet tile west", "carpet tile east"
@@ -43421,8 +43423,15 @@ main().catch((error) => {
             ("Carpet tile west: 24 sqm. (site measurement); Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm. Work ends tomorrow. [Site office]", {west: None}),
             ("Carpet tile west: 24 sqm; Work ends tomorrow. [Site office]", {west: 24}),
-            ("Carpet tile west: 24 sqm; Installer will bring 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: 24, east: 10}),
-            ("Carpet tile west: 24 sqm; Crew may carry 4 to 6 sqm of material; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Installer will bring 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Installer brings 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Installer brought 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; The organiser requests 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey estimates 4 sqm of flooring; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Crew may carry 4 to 6 sqm of material; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: Installer brings 2 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Material samples: Crew may carry 4 to 6 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: Survey estimates 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; 4 to 6 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Installer will bring 2 sqm of sample boards; 4 to 6 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; May be 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
@@ -43598,8 +43607,15 @@ main().catch((error) => {
             ("subject-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Quantity subject to confirmation", 24, "observed", False),
             ("prose-hold", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer will bring sample boards", 24, "observed", False),
             ("prose-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer will bring sample boards", 24, "observed", True),
-            ("qty-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer will bring 2 sqm of sample boards", 24, "observed", True),
-            ("qty-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Crew may carry 4 to 6 sqm of material", 24, "observed", True),
+            ("qty-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer will bring 2 sqm of sample boards", 24, "observed", False),
+            ("qty-present", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer brings 2 sqm of sample boards", 24, "observed", False),
+            ("qty-past", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer brought 2 sqm of sample boards", 24, "observed", False),
+            ("qty-request", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "The organiser requests 2 sqm of sample boards", 24, "observed", False),
+            ("qty-estimate", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey estimates 4 sqm of flooring", 24, "observed", False),
+            ("qty-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Crew may carry 4 to 6 sqm of material", 24, "observed", False),
+            ("qty-heading", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: Installer brings 2 sqm", 24, "observed", True),
+            ("qty-heading-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Material samples: Crew may carry 4 to 6 sqm", 24, "observed", True),
+            ("qty-same-heading", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: Survey estimates 4 sqm", 24, "observed", False),
             ("qty-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "4 to 6 sqm", 24, "observed", False),
             ("same-subj", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west will require 4 sqm of flooring", 24, "observed", False),
             ("est-chain", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: estimated 24 sqm", 24, "observed", False),
@@ -43626,8 +43642,9 @@ main().catch((error) => {
         )
         north_cases = {"est-chain", "geo-chain", "est-sep", "bracket-geo", "paren-val", "brace-geo",
                        "wrap-geo", "wrap-val", "wrap-brace"}
-        independent_prose = {"free-prose", "prose-sep", "qty-prose", "qty-note"}
-        semicolon_cases = independent_prose | {"qty-range", "same-subj"}
+        semicolon_cases = {"free-prose", "prose-sep", "qty-prose", "qty-present", "qty-past", "qty-request",
+                           "qty-estimate", "qty-note", "qty-heading", "qty-heading-range", "qty-same-heading",
+                           "qty-range", "same-subj"}
         aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
                         "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
         qualifier_cases = aside_cases | north_cases
@@ -43883,6 +43900,12 @@ main().catch((error) => {
                 disputed, f"{disputed}.\nQuantity subject to confirmation",
             ]})
             self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "floor"))
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
+                f"{statement}; Sample boards: Installer will bring 2 sqm",
+                disputed, f"{disputed}.\nQuantity subject to confirmation",
+            ]})
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
             request = self._ledger_carry_draft(payload, drafted)
             self._ledger_line(request, "floor")["tag"] = "Include"
             self._ledger_line(request, "spot")["tag"] = "Include"
@@ -43913,7 +43936,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+            for version in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
