@@ -102,9 +102,12 @@ or supplies the measurement in a separate entry. Independently supported scopes
 can still price. A full stop in unmarked prose, an abbreviation or a numbered
 heading does not establish proof. Unmarked prose after a measurement stays
 with it across a full stop. Use a semicolon before independent prose to
-preserve the rate, or supply it in a separate source entry. A structurally
-complete measurement can frame the next exact label even if its own value has
-an estimated or assumed qualifier in balanced brackets or parentheses.
+preserve the rate, or supply it in a separate source entry. A separate clause
+with its own subject and embedded quantity can stay independent. An unbound
+measurement fragment or range can still hold the preceding scope in review.
+A structurally complete measurement can frame the next exact label even if its
+own value has an estimated or assumed qualifier in a balanced wrapper with
+explanatory text.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. Unresolved claims hold that scope in review. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
