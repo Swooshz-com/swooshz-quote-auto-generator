@@ -100,9 +100,10 @@ before an exact measurement label. A first measurement after an unpunctuated
 PDF title stays in pricing review unless the source has a clear record boundary
 or supplies the measurement in a separate entry. Independently supported scopes
 can still price. A full stop in unmarked prose, an abbreviation or a numbered
-heading does not establish proof. Sentence punctuation can separate exact
-labels after a structurally complete measurement, including one with an
-uncertain amount.
+heading does not establish proof. A grouping delimiter immediately after a
+measurement keeps the attached text with that measurement after a full stop.
+A structurally complete measurement can frame
+the next exact label even if its own value is estimated or assumed.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. Unresolved claims hold that scope in review. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma

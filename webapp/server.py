@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5, 6))):
+                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5, 6, 7))):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 7
+AREA_EVIDENCE_CLAIM_VERSION = 8
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25716,18 +25716,43 @@ def area_value_parts(text: str) -> tuple[re.Match[str] | None, re.Match[str] | N
     return derived, observed, annotation, coverage is not None
 
 
-def area_delimited_context(value: str, annotation: str) -> bool:
+def area_claim_body(measurement: str) -> tuple[str, bool]:
+    qualifier = AREA_PROVISIONAL_QUALIFIER.match(measurement)
+    if qualifier is None:
+        return measurement, False
+    return measurement[qualifier.end():].lstrip(" :,-"), True
+
+
+def area_annotation_text(value: str, annotation: str) -> str:
     if value.startswith("(") and annotation.startswith(")"):
-        annotation = annotation[1:].strip()
-    return not annotation.strip(" .,!?") or AREA_ASIDE.fullmatch(annotation) is not None
+        annotation = annotation[1:]
+    return annotation.lstrip(" .!?")
+
+
+def area_paired_asides(text: str) -> bool:
+    text = text.rstrip(" .,!?")
+    if not text.startswith(("(", "[", "{")):
+        return False
+    _, pairs = area_bracket_context(text)
+    start = 0
+    while start < len(text):
+        end = pairs.get(start)
+        if end is None:
+            return False
+        start = end + 1
+        while start < len(text) and (text[start].isspace() or text[start] in ".,!?"):
+            start += 1
+    return True
 
 
 def area_complete_frame(value: str) -> bool:
     """A whole measured shape may frame the next label even if its value is uncertain."""
+    value, _ = area_claim_body(value)
     derived, observed, annotation, _ = area_value_parts(value)
     if not (derived or observed) or (value.startswith("(") and not annotation.startswith(")")):
         return False
-    return area_delimited_context(value, annotation.lstrip(" .!?"))
+    context = area_annotation_text(value, annotation)
+    return not context.strip(" .,!?") or area_paired_asides(context)
 
 
 def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> AreaMeasurementClaim | None:
@@ -25738,9 +25763,11 @@ def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> Ar
         if index and parts[index - 1][1] == ";" and area_standalone_heading(part):
             break
         body.append((part, separator))
-        uncertain_aside = (index and parts[index - 1][1] != ";" and ("?" in part or separator == "?")
-                           and AREA_ASIDE.fullmatch(part))
-        if area_claim_kind(part) or uncertain_aside:
+        attached_aside = (index and parts[index - 1][1] != ";" and (
+            (last_measurement == index and part.startswith(("(", "[", "{")))
+            or (("?" in part or separator == "?") and area_paired_asides(part))
+        ))
+        if area_claim_kind(part) or attached_aside:
             last_measurement = len(body)
 
     # Trailing non-dimensional sentences are prose. Keep punctuation inside a claim.
@@ -25848,8 +25875,7 @@ def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeas
     recognised = area_claim_kind(measurement)
     if not recognised:
         return None
-    qualifier = AREA_PROVISIONAL_QUALIFIER.match(measurement)
-    claim_text = measurement[qualifier.end():].lstrip(" :,-") if qualifier else measurement
+    claim_text, qualifier = area_claim_body(measurement)
     derived, observed, annotation, full_coverage = area_value_parts(claim_text)
     if not (derived or observed):
         return AreaMeasurementClaim(scope, recognised, None, "", (), False)
@@ -25874,7 +25900,8 @@ def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeas
         proof_shape = bool(re.fullmatch(rf"{AREA_EVIDENCE_NUMBER}\s+(?:{AREA_CLAIM_UNIT})", measurement, re.I))
 
     # Delimit context separately from the value so a trailing expression cannot corroborate it.
-    aside = area_delimited_context(claim_text, annotation)
+    context = area_annotation_text(claim_text, annotation)
+    aside = not context.strip(" .,!?") or AREA_ASIDE.fullmatch(context)
     prefix = leading_quantity_prefix(label)
     if (unit not in AREA_EVIDENCE_UNITS or qualifier or uses_provisional_dimensions(label)
             or uses_provisional_dimensions(annotation, unit) or AREA_PROVISIONAL_QUALIFIER.match(scope)
