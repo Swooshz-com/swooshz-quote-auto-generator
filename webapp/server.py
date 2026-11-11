@@ -5645,14 +5645,14 @@ def is_non_quote_note_record(row: dict[str, Any]) -> bool:
                for key in ("text", "line", "description") if row.get(key))
 
 
-def uses_provisional_dimensions(value: Any, unit: Any = "") -> bool:
-    """Recognize an explicit dependency on provisional dimensions, including bracketed detail."""
+def uses_provisional_dimensions(value: Any, unit: Any = "", *, leading_only: bool = False) -> bool:
+    """Recognize a provisional dependency, optionally at the start of a continuation."""
     normalized_unit = canonical_pricing_authority_unit(unit)
     if normalized_unit and normalized_unit not in {"sqm", "sqft", "ft2", "sq ft"}:
         return False
     for text in quote_scope_text_parts(value):
         for match in PROVISIONAL_AREA_DEPENDENCY.finditer(text):
-            if match["negation"]:
+            if match["negation"] or (leading_only and match.start() != 0):
                 continue
             if match["relation"].lower() == "for":
                 # "For" can describe location when this clause already says
@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5, 6, 7))):
+                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5, 6, 7, 8))):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 8
+AREA_EVIDENCE_CLAIM_VERSION = 9
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25718,9 +25718,14 @@ def area_value_parts(text: str) -> tuple[re.Match[str] | None, re.Match[str] | N
 
 def area_claim_body(measurement: str) -> tuple[str, bool]:
     qualifier = AREA_PROVISIONAL_QUALIFIER.match(measurement)
-    if qualifier is None:
-        return measurement, False
-    return measurement[qualifier.end():].lstrip(" :,-"), True
+    if qualifier:
+        return measurement[qualifier.end():].lstrip(" :,-"), True
+    if measurement.startswith(("(", "[", "{")):
+        _, pairs = area_bracket_context(measurement)
+        end = pairs.get(0)
+        if end is not None and AREA_PROVISIONAL_QUALIFIER.fullmatch(measurement[1:end].strip()):
+            return measurement[end + 1:].lstrip(" :,-"), True
+    return measurement, False
 
 
 def area_annotation_text(value: str, annotation: str) -> str:
@@ -25763,11 +25768,12 @@ def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> Ar
         if index and parts[index - 1][1] == ";" and area_standalone_heading(part):
             break
         body.append((part, separator))
-        attached_aside = (index and parts[index - 1][1] != ";" and (
-            (last_measurement == index and part.startswith(("(", "[", "{")))
+        attached_context = (index and parts[index - 1][1] != ";" and (
+            (last_measurement == index and (part.startswith(("(", "[", "{"))
+                                            or uses_provisional_dimensions(part, leading_only=True)))
             or (("?" in part or separator == "?") and area_paired_asides(part))
         ))
-        if area_claim_kind(part) or attached_aside:
+        if area_claim_kind(part) or attached_context:
             last_measurement = len(body)
 
     # Trailing non-dimensional sentences are prose. Keep punctuation inside a claim.
