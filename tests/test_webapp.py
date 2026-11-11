@@ -43419,6 +43419,13 @@ main().catch((error) => {
             ("Do not quote\nCarpet tile east: 10 sqm", {east: None}),
             ("Synthetic survey\nCarpet tile east: 10 sqm", {east: None}),
             ("Synthetic survey;\nCarpet tile east: 10 sqm", {east: 10}),
+            ("Examples only, e.g.\nCarpet tile west: 24 sqm", {west: None}),
+            ("Examples only, e.g. Carpet tile west: 24 sqm", {west: None}),
+            ("Examples only, e.g.;\nCarpet tile west: 24 sqm", {west: 24}),
+            ("Reference A.B.\nCarpet tile west: 24 sqm", {west: None}),
+            ("1.\nCarpet tile west: 24 sqm", {west: None}),
+            ("Reference 24.\nCarpet tile west: 24 sqm", {west: None}),
+            ("Examples only.\nCarpet tile west: 24 sqm", {west: None}),
             ("Carpet tile west: 24 sqm (survey confirmed?) Do not quote\nCarpet tile east: 10 sqm", {west: None, east: None}),
             ("Carpet tile west: 24 sqm (survey confirmed?)\nCarpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm\npending site verification", {west: None}),
@@ -43536,6 +43543,13 @@ main().catch((error) => {
             ("prefix-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Do not quote", 24, "observed", False),
             ("title-bare", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Synthetic survey", 24, "observed", False),
             ("title-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Synthetic survey", 24, "observed", True),
+            ("abbrev", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only, e.g.", 24, "observed", False),
+            ("abbr-inline", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only, e.g.", 24, "observed", False),
+            ("abbr-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only, e.g.", 24, "observed", True),
+            ("initialism", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Reference A.B.", 24, "observed", False),
+            ("list-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "1.", 24, "observed", False),
+            ("number-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Reference 24.", 24, "observed", False),
+            ("prose-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only.", 24, "observed", False),
             ("same-line-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 4 to 6 sqm", 24, "observed", False),
             ("free-geometry", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: width about 4 m, depth still below 6 m", 24, "observed", False),
             ("annotated-repeat", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24.0 SQM (site measurement)", 24, "observed", True),
@@ -43552,7 +43566,8 @@ main().catch((error) => {
         framing_cases = {"question", "q-wrap", "q-geometry", "width-pair", "i-aside", "w-aside", "i-limit", "w-limit", "split-end", "paren-label", "brace-label",
                          "square-label", "open-zone", "roof", "bare-roof", "revision", "confirm", "plain-wrap", "dash-wrap",
                          "roof-open", "roof-unbound", "adjacent", "embedded", "emb-wrap", "adj-wrap",
-                         "prefix-inline", "prefix-wrap", "title-bare", "title-sep"}
+                         "prefix-inline", "prefix-wrap", "title-bare", "title-sep", "abbrev", "abbr-inline", "abbr-sep",
+                         "initialism", "list-dot", "number-dot", "prose-dot"}
         west_cases = {"range", "approximation", "opaque-area", "wrapped-range", "same-line-range", "free-geometry",
                       "punctuated-wrap", "range-suffix", "short-pair", "sentence-end", "after-prose", "open-note", "open-att", "approx-pair"}
         inline_cases = {"same-line-range", "sentence-two", "sentence-end", "after-prose", "open-note", "open-att", "approx-pair"} | framing_cases
@@ -43599,6 +43614,12 @@ main().catch((error) => {
                             sources = [statement, f"{other}\n{east_statement}"]
                         elif name == "prefix-inline":
                             sources = [f"{other} {statement}", east_statement]
+                        elif name == "abbr-inline":
+                            sources = [f"{other} {statement}", east_statement]
+                        elif name in {"abbrev", "initialism", "list-dot", "number-dot", "prose-dot"}:
+                            sources = [f"{other}\n{statement}", east_statement]
+                        elif name == "abbr-sep":
+                            sources = [f"{other};\n{statement}", east_statement]
                         elif name == "prefix-wrap" or (name == "title-bare" and route != "pdf"):
                             sources = [f"{other}\n{statement}", east_statement]
                         elif name == "title-sep" and route != "pdf":
@@ -43795,7 +43816,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in (1, 2, 3, 4, 5):
+            for version in (1, 2, 3, 4, 5, 6):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})

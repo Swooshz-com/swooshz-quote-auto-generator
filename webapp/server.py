@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5))):
+                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5, 6))):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 6
+AREA_EVIDENCE_CLAIM_VERSION = 7
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25794,7 +25794,11 @@ def area_source_claims(raw: str, pattern: re.Pattern[str]):
             prefix_start = previous
             for boundary in AREA_RECORD_BREAK.finditer(text, previous, start):
                 if context[boundary.start()] == group:
-                    prefix_start = boundary.end()
+                    explicit = boundary.group() == ";"
+                    measured = (records and records[-1].framed
+                                and area_complete_frame(clean_text(text[previous:boundary.end()])))
+                    if explicit or measured:
+                        prefix_start = boundary.end()
             prefix = text[prefix_start:start].strip().lstrip("-\u2022 ")
             raw_label = text[start:anchor.end() - 1]
             label = clean_text(prefix + " " + raw_label)
