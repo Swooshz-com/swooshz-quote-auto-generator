@@ -23686,7 +23686,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     scope_fields = {"scope", "basis_scope", "item_scope"}
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
-                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4))):
+                and type(value["claim_version"]) is int and value["claim_version"] in (1, 2, 3, 4, 5))):
         # Earlier v2 drafts can open, but their area grants lack the complete claim check.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 5
+AREA_EVIDENCE_CLAIM_VERSION = 6
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25601,8 +25601,7 @@ AREA_GEOMETRY_MARKER = re.compile(
 )
 AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
-AREA_RANGE_CONTINUATION = re.compile(rf"(?:to(?:\s|$)|[-\u2013\u2014\u2212]\s*{AREA_CLAIM_NUMBER})", re.I)
-AREA_BODY_BREAK = re.compile(r"[;\r\n]|[.!?](?=\s|$)")
+AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
 
 
 @dataclass(frozen=True)
@@ -25706,43 +25705,55 @@ def area_standalone_heading(text: str) -> bool:
     return False
 
 
+def area_value_parts(text: str) -> tuple[re.Match[str] | None, re.Match[str] | None, str, bool]:
+    derived = AREA_DERIVED_CLAIM.match(text)
+    observed = None if derived else AREA_OBSERVED_CLAIM.match(text)
+    match = derived or observed
+    annotation = text[match.end():].strip() if match else ""
+    coverage = AREA_FULL_COVERAGE.match(annotation) if derived else None
+    if coverage:
+        annotation = annotation[coverage.end():].strip()
+    return derived, observed, annotation, coverage is not None
+
+
+def area_delimited_context(value: str, annotation: str) -> bool:
+    if value.startswith("(") and annotation.startswith(")"):
+        annotation = annotation[1:].strip()
+    return not annotation.strip(" .,!?") or AREA_ASIDE.fullmatch(annotation) is not None
+
+
+def area_complete_frame(value: str) -> bool:
+    """A whole measured shape may frame the next label even if its value is uncertain."""
+    derived, observed, annotation, _ = area_value_parts(value)
+    if not (derived or observed) or (value.startswith("(") and not annotation.startswith(")")):
+        return False
+    return area_delimited_context(value, annotation.lstrip(" .!?"))
+
+
 def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> AreaMeasurementClaim | None:
-    """Resolve wraps before testing whether a following heading is independent."""
-    prefix = []
-    tail = []
-    claim = None
-    completed = False
-    ambiguous_heading = False
-    separate_heading = None
+    """Resolve record boundaries before testing the whole measurement body."""
+    body = []
+    last_measurement = 0
     for index, (part, separator) in enumerate(parts):
-        heading = bool(prefix) and area_standalone_heading(part)
-        if completed:
-            boundary = parts[index - 1][1]
-            if boundary == ";":
-                separate_heading = []
-            if separate_heading is not None:
-                separate_heading.append(part)
-                if area_standalone_heading(" ".join(separate_heading)):
-                    break
-                if separator or area_claim_kind(part):
-                    separate_heading = None
-            # A soft wrap cannot separate an attached aside or an unfinished range from its value.
-            aside = part.startswith(("(", "[", "{")) and 0 in area_bracket_context(part)[1]
-            continuation = aside or AREA_RANGE_CONTINUATION.match(part)
-            if heading or tail or boundary or not continuation:
-                tail.append(part)
-                continue
+        if index and parts[index - 1][1] == ";" and area_standalone_heading(part):
+            break
+        body.append((part, separator))
+        uncertain_aside = (index and parts[index - 1][1] != ";" and ("?" in part or separator == "?")
+                           and AREA_ASIDE.fullmatch(part))
+        if area_claim_kind(part) or uncertain_aside:
+            last_measurement = len(body)
 
-        ambiguous_heading |= heading
-        # Question marks survive both sentence framing and line-wrap reassembly.
-        value = clean_text(" ".join([*prefix, part + ("?" if separator == "?" else "")]))
-        claim = area_measurement_claim(record.scope, record.label, value)
-        completed = completed or (claim is not None and claim.quantity is not None)
-        prefix.append(part + separator)
-
+    # Trailing non-dimensional sentences are prose. Keep punctuation inside a claim.
+    body = body[:last_measurement] if last_measurement else body
+    if not body:
+        return None
+    final, separator = body[-1]
+    body[-1] = (final, "?" if separator == "?" else "")
+    value = clean_text(" ".join(part + separator for part, separator in body))
+    claim = area_measurement_claim(record.scope, record.label, value)
     if claim is None:
         return None
-    if not record.framed or ambiguous_heading or area_claim_kind(" ".join(tail)):
+    if not record.framed:
         return AreaMeasurementClaim(record.scope, claim.kind, None, "", (), False)
     if pricing_measurement_scope(record.label) != record.scope:
         # A newly recognised wrapper can locate a conflict without expanding proof authority.
@@ -25766,6 +25777,11 @@ def area_source_claims(raw: str, pattern: re.Pattern[str]):
             start, end = group, pairs[group] + 1
             group = context[group]
         if group < 0 or anchor.end() <= pairs[group]:
+            opener = start
+            while opener > 0 and text[opener - 1].isspace():
+                opener -= 1
+            if opener > 0 and text[opener - 1] in "([{" and opener - 1 not in pairs:
+                start = opener - 1
             groups.setdefault(group, []).append((anchor, start, end))
 
     masked = list(text)
@@ -25776,22 +25792,22 @@ def area_source_claims(raw: str, pattern: re.Pattern[str]):
         for anchor, start, label_end in labels:
             scope = pricing_measurement_scope(anchor["label"])
             prefix_start = previous
-            for boundary in AREA_BODY_BREAK.finditer(text, previous, start):
+            for boundary in AREA_RECORD_BREAK.finditer(text, previous, start):
                 if context[boundary.start()] == group:
                     prefix_start = boundary.end()
             prefix = text[prefix_start:start].strip().lstrip("-\u2022 ")
             raw_label = text[start:anchor.end() - 1]
             label = clean_text(prefix + " " + raw_label)
-            wrapped = start < anchor.start() and not text[label_end:anchor.end() - 1].strip()
+            wrapped = start in pairs and start < anchor.start() and not text[label_end:anchor.end() - 1].strip()
             comparable_label = anchor["label"] if wrapped else raw_label
             canonical = pricing_measurement_scope(prefix + " " + comparable_label) == scope
             framed = group == -1 and canonical and (not records or prefix_start > previous or not prefix)
-            if group == -1 and records and prefix_start == previous and prefix:
-                prior = records[-1]
-                adjacent = area_measurement_claim(prior.scope, prior.label, clean_text(text[previous:start]))
-                framed = bool(adjacent and adjacent.eligible and pricing_measurement_scope(comparable_label) == scope)
+            adjacent = bool(group == -1 and records and prefix and (prefix_start == previous or not canonical))
+            if adjacent:
+                framed = (records[-1].framed and pricing_measurement_scope(comparable_label) == scope
+                          and area_complete_frame(clean_text(text[previous:start])))
                 label = clean_text(raw_label)
-            label_start = prefix_start if framed and prefix and (not records or prefix_start > previous) else start
+            label_start = prefix_start if framed and prefix and not adjacent else start
             records.append(AreaScopeSpan(label_start, anchor.end(), scope, label if framed else anchor["label"], framed))
             previous = anchor.end()
 
@@ -25799,14 +25815,10 @@ def area_source_claims(raw: str, pattern: re.Pattern[str]):
             limit = records[index + 1].start if index + 1 < len(records) else end
             parts = []
             start = record.end
-            for boundary in AREA_BODY_BREAK.finditer(text, start, limit):
+            for boundary in AREA_RECORD_BREAK.finditer(text, start, limit):
                 if context[boundary.start()] == group:
                     part = clean_text("".join(masked[start:boundary.start()]))
-                    separator = boundary.group().strip()
-                    if not part and separator == "?" and parts and not parts[-1][1]:
-                        parts[-1] = (parts[-1][0], separator)
-                    elif part or separator:
-                        parts.append((part, separator))
+                    parts.append((part, boundary.group()))
                     start = boundary.end()
             parts.append((clean_text("".join(masked[start:limit])), ""))
             claim = area_record_claim(record, parts)
@@ -25834,25 +25846,19 @@ def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeas
         return None
     qualifier = AREA_PROVISIONAL_QUALIFIER.match(measurement)
     claim_text = measurement[qualifier.end():].lstrip(" :,-") if qualifier else measurement
-    derived = AREA_DERIVED_CLAIM.match(claim_text)
-    observed = None if derived else AREA_OBSERVED_CLAIM.match(claim_text)
-    match = derived or observed
-    if not match:
+    derived, observed, annotation, full_coverage = area_value_parts(claim_text)
+    if not (derived or observed):
         return AreaMeasurementClaim(scope, recognised, None, "", (), False)
 
-    annotation = claim_text[match.end():].strip()
     geometry: tuple[Decimal, ...] = ()
     if derived:
         kind, unit = "derived", "sqm"
         width = area_evidence_quantity(derived["width"])
         depth = area_evidence_quantity(derived["depth"])
-        coverage = AREA_FULL_COVERAGE.match(annotation)
         metre_pair = all(AREA_METRE_UNIT.fullmatch(derived[field]) for field in ("width_unit", "depth_unit"))
-        quantity = width * depth if width is not None and depth is not None and coverage and metre_pair else None
+        quantity = width * depth if width is not None and depth is not None and full_coverage and metre_pair else None
         if quantity is not None:
             geometry = (width, depth)
-        if coverage:
-            annotation = annotation[coverage.end():].strip()
         proof_shape = bool(re.fullmatch(
             rf"{AREA_EVIDENCE_NUMBER}\s*m\s*(?:x|\u00d7|by)\s*{AREA_EVIDENCE_NUMBER}\s*m\s*,\s*full coverage",
             measurement, re.I,
@@ -25864,10 +25870,7 @@ def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeas
         proof_shape = bool(re.fullmatch(rf"{AREA_EVIDENCE_NUMBER}\s+(?:{AREA_CLAIM_UNIT})", measurement, re.I))
 
     # Delimit context separately from the value so a trailing expression cannot corroborate it.
-    context = annotation
-    if claim_text.startswith("(") and context.startswith(")"):
-        context = context[1:].strip()
-    aside = not context.strip(" .,!?") or AREA_ASIDE.fullmatch(context)
+    aside = area_delimited_context(claim_text, annotation)
     prefix = leading_quantity_prefix(label)
     if (unit not in AREA_EVIDENCE_UNITS or qualifier or uses_provisional_dimensions(label)
             or uses_provisional_dimensions(annotation, unit) or AREA_PROVISIONAL_QUALIFIER.match(scope)
