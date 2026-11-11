@@ -100,11 +100,11 @@ before an exact measurement label. A first measurement after an unpunctuated
 PDF title stays in pricing review unless the source has a clear record boundary
 or supplies the measurement in a separate entry. Independently supported scopes
 can still price. A full stop in unmarked prose, an abbreviation or a numbered
-heading does not establish proof. A grouping delimiter or an explicit
-dependency on provisional dimensions can keep the following text attached
-after a full stop. A structurally complete measurement can frame the next
-exact label even if its own value has an estimated or assumed qualifier in
-balanced brackets or parentheses.
+heading does not establish proof. Unmarked prose after a measurement stays
+with it across a full stop. Use a semicolon before independent prose to
+preserve the rate, or supply it in a separate source entry. A structurally
+complete measurement can frame the next exact label even if its own value has
+an estimated or assumed qualifier in balanced brackets or parentheses.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. Unresolved claims hold that scope in review. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
