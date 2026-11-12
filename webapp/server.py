@@ -256,6 +256,8 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PDF_BYTES = 48 * 1024 * 1024
 MAX_SINGLE_SEND_PDF_BYTES = 16 * 1024 * 1024
 MAX_DRAFT_PDF_PAGES = 96
+# Trusted text stays local. The page preflight also bounds the total parser input.
+MAX_PDF_MEASUREMENT_CHARS_PER_PAGE = 32 * 1024
 MAX_DRAFT_BATCH_MEDIA = 6
 MAX_DRAFT_BATCH_MEDIA_CHARS = 17 * 1024 * 1024
 MAX_DRAFT_BATCH_CALLS = 18
@@ -19418,17 +19420,25 @@ def render_pdf_pages_with_pdfium(pdf_bytes: bytes, source_name: str, max_pages: 
                 if data_url:
                     entry = pdf_page_image_entry(source_name, page_index + 1, data_url, "pdfium")
                     if complete:
-                        # The text layer is independent of the synthesis response.
-                        # Raster-only pages continue to supply visual scope.
+                        # None means the text layer is unavailable as evidence.
+                        # A valid empty layer still permits raster observations.
+                        entry["measurement_text"] = None
                         try:
                             text_page = page.get_textpage()
                             try:
                                 characters = text_page.count_chars()
-                                text = text_page.get_text_range(count=min(characters, 8192))
-                                entry["measurement_text"] = text if characters <= 8192 else text.rpartition("\n")[0]
+                                if characters == 0:
+                                    entry["measurement_text"] = ""
+                                elif 0 < characters <= MAX_PDF_MEASUREMENT_CHARS_PER_PAGE:
+                                    text = text_page.get_text_range(count=characters, errors="strict")
+                                    if (text and len(text) <= MAX_PDF_MEASUREMENT_CHARS_PER_PAGE
+                                            and len(unicodedata.normalize("NFKC", text).casefold())
+                                            <= MAX_PDF_MEASUREMENT_CHARS_PER_PAGE):
+                                        entry["measurement_text"] = text
                             finally:
                                 text_page.close()
-                        except pdfium.PdfiumError:
+                        except (pdfium.PdfiumError, UnicodeError, AssertionError):
+                            # Keep the rendered visual without admitting incomplete text.
                             pass
                     images.append(entry)
                 elif complete:
@@ -25574,7 +25584,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 18
+AREA_EVIDENCE_CLAIM_VERSION = 19
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25613,18 +25623,19 @@ AREA_VERIFICATION_RESULT = (
     r"(?:confirmed|verified|validated|checked|measured|complete(?:d)?|done|finished|performed|carried\s+out)\b"
 )
 AREA_MANNER_ADVERB = r"(?:well|[^\W\d_][\w-]*ly)"
-AREA_VERIFICATION_PARTIAL = r"(?:partly|partially|provisionally|preliminarily|incompletely)"
-AREA_VERIFICATION_NEGATION = r"(?:not|never|(?:has|have|had|is|are|was|were)n['\u2019]t)"
+AREA_VERIFICATION_PARTIAL = r"(?:partly|partially|in\s+part|half(?:way)?|provisionally|preliminarily|incompletely)"
+AREA_NEGATED_AUXILIARY = r"(?:has|have|had|is|are|was|were)n['\u2019]t"
+AREA_VERIFICATION_NEGATION = rf"(?:not|never|{AREA_NEGATED_AUXILIARY})"
 AREA_VERIFICATION_TIMING = r"(?:still|soon|shortly|eventually|later|subsequently)"
 AREA_PROSPECTIVE_LINK = r"(?:(?:yet|due|scheduled|planned|expected|set|going|needs?|requires?)\s+)?to"
 AREA_VERIFICATION_FUTURE = rf"(?:will|must|{AREA_PROSPECTIVE_LINK})"
 AREA_UNVERIFIED_RESULT = (
-    rf"(?:{AREA_VERIFICATION_NEGATION}\s+(?:(?:yet|been|{AREA_MANNER_ADVERB})\s+)*"
+    rf"(?:{AREA_VERIFICATION_NEGATION}\s+(?:(?:yet|all|been|{AREA_MANNER_ADVERB})\s+)*"
     rf"{AREA_VERIFICATION_RESULT}"
-    rf"|(?:{AREA_VERIFICATION_FUTURE}|will\s+not|won['\u2019]t)\s+(?:{AREA_VERIFICATION_TIMING}\s+)?be\s+"
+    rf"|(?:{AREA_VERIFICATION_FUTURE}|will\s+not|won['\u2019]t)\s+(?:(?:only|{AREA_VERIFICATION_TIMING})\s+)*be\s+"
     rf"(?:{AREA_MANNER_ADVERB}\s+)*"
     rf"{AREA_VERIFICATION_RESULT}"
-    rf"|(?:only\s+)?(?:been\s+)?{AREA_VERIFICATION_PARTIAL}\s+(?:{AREA_MANNER_ADVERB}\s+)*"
+    rf"|(?:(?:only|been|{AREA_MANNER_ADVERB})\s+)*{AREA_VERIFICATION_PARTIAL}\s+(?:(?:been|{AREA_MANNER_ADVERB})\s+)*"
     rf"{AREA_VERIFICATION_RESULT}"
     rf"|{AREA_VERIFICATION_RESULT}\s+(?:only\s+)?{AREA_VERIFICATION_PARTIAL}\b)"
 )
@@ -25640,13 +25651,13 @@ AREA_VERIFICATION_OBLIGATION = (
     rf"|(?:{AREA_VERIFICATION_FUTURE}|(?:has|have|will\s+have)\s+to)\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:undergo|receive|complete)"
     r"|(?:due|scheduled)\s+for)"
 )
-AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled)\b"
+AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled|planned)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
-    rf"(?:{AREA_VERIFICATION_REQUIREMENT}|in\s+progress\b|under\s*way\b"
+    rf"(?:(?:{AREA_MANNER_ADVERB}\s+)*{AREA_VERIFICATION_REQUIREMENT}|in\s+progress\b|under\s*way\b"
     rf"|{AREA_VERIFICATION_FUTURE}\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:occur|happen|begin|take\s+place)\b)"
 )
 AREA_PARTIAL_MEASUREMENT_VERIFICATION = (
-    rf"(?:only\s+)?(?:some|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?{AREA_MEASURE_TOPIC}"
+    rf"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?{AREA_MEASURE_TOPIC}"
     rf"{AREA_STATUS_LINKS}(?:{AREA_MANNER_ADVERB}\s+)*{AREA_VERIFICATION_RESULT}"
 )
 AREA_ATTACHED_QUALIFIER = re.compile(
@@ -25700,11 +25711,16 @@ AREA_REVISION_PREFIX = re.compile(
 AREA_REVISION_AUXILIARY = (
     rf"(?:{AREA_PROSPECTIVE_LINK}|is|are|was|were|be|has|have|had|been|being|will|would|should|must|can|could)"
 )
-AREA_REVISION_MODIFIER = rf"(?:now|already|since|still|just|also|{AREA_MANNER_ADVERB})"
+AREA_REVISION_MODIFIER = rf"(?:now|already|since|still|just|also|yet|{AREA_VERIFICATION_NEGATION}|{AREA_MANNER_ADVERB})"
 AREA_PASSIVE_REVISION = rf"(?:(?:{AREA_REVISION_AUXILIARY}|{AREA_REVISION_MODIFIER})\s+)+{AREA_REVISION_ACTION}\b"
 AREA_VALUE_RELATION = re.compile(
-    rf"^(?:(?:{AREA_PASSIVE_REVISION}|to|is|was|now|should\s+be|measurement|area|quantity|value|{AREA_REVISION_ACTION})\s+"
-    r"|[:=]\s*)+", re.I,
+    rf"^(?:(?:{AREA_PASSIVE_REVISION}|to|is|was|now|should\s+be|measurement|area|quantity|value|{AREA_REVISION_ACTION})"
+    r"(?:\s+|(?=[:=]))|[:=]\s*)+", re.I,
+)
+AREA_LOCAL_MEASUREMENT_ASSERTION = re.compile(
+    rf"(?:(?:now|currently)\s+)?(?:{AREA_REVISION_ACTION}|measured|calculated|surveyed)"
+    r"(?:\s+(?:measurement|area|quantity|value))?\s+(?:at|to|as)\s+",
+    re.I,
 )
 
 
@@ -25907,7 +25923,9 @@ def area_member_clauses(annotation: str, patterns: AreaScopePatterns):
                 continue
             next_end = next((part.start() for part in boundaries[index + 1:] if part.group().strip()), len(annotation))
             following, _ = area_comparison_clause(annotation[right:next_end].strip(), patterns, continued=False)
-            if area_named_annotation_value(following, patterns, require_revision=True) is None:
+            named_revision = area_named_annotation_value(following, patterns, require_revision=True)
+            local_revision = AREA_LOCAL_MEASUREMENT_ASSERTION.match(following) and area_claim_kind(following)
+            if named_revision is None and not local_revision:
                 continue
         if separator == "." and re.search(r"\bvs$", clause):
             continue
@@ -25960,21 +25978,31 @@ def area_operand_notes(clause: str, operand: re.Match[str]):
     """Keep balanced notes beside an operand, excluding brackets that supply its value."""
     context, pairs = area_bracket_context(clause)
     parent = context[operand.start("label")]
-    end = operand.end("label")
+    value_ranges = {parent: (operand.end("label"), len(clause))}
+    if parent >= 0:
+        value_ranges[-1] = (pairs[parent] + 1, len(clause))
     masked = list(clause)
     for opener, closer in sorted(pairs.items()):
-        if opener < end:
+        bounds = value_ranges.get(context[opener])
+        if bounds is None or not bounds[0] <= opener < bounds[1]:
             continue
-        if context[opener] == parent:
-            prefix_start = end
-        elif parent >= 0 and context[opener] == -1 and opener > pairs[parent]:
-            prefix_start = pairs[parent] + 1
-        else:
-            continue
-        prefix = "".join(masked[prefix_start:opener]).strip()
+        prefix = "".join(masked[bounds[0]:opener]).strip()
         note = clause[opener + 1:closer]
+        if prefix in {"", "at"}:
+            value, _ = area_claim_body(note.lstrip(" ([{"))
+            derived, observed, _, _ = area_value_parts(value)
+            if derived or observed:
+                # The group supplies the comparison value. Read notes within it.
+                note_context, _ = area_bracket_context(note)
+                boundary = next((part for part in AREA_QUALIFICATION_BREAK.finditer(note)
+                                 if note_context[part.start()] == -1
+                                 and area_complete_frame(note[:part.start()].strip())), None)
+                value_ranges[opener] = (opener + 1, opener + 1 + boundary.start() if boundary else closer)
+                if boundary:
+                    yield note[boundary.end():]
+                continue
         operand_is_complete = area_comparison_value(prefix) or bool(area_claim_kind(prefix))
-        if operand_is_complete and (prefix or not area_complete_frame(note)):
+        if operand_is_complete:
             masked[opener:closer + 1] = " " * (closer + 1 - opener)
             yield note
 
@@ -27272,7 +27300,7 @@ def prepare_draft_media(references):
             label = f"Reference {source}, PDF page {page['page']}"
             single_send.append(image)
             media.append((label, image))
-            measurement_sources[label] = page.get("measurement_text", "")
+            measurement_sources[label] = page.get("measurement_text")
 
     if (MAX_DRAFT_PDF_PAGES - pages_remaining <= MAX_RENDERED_PDF_PAGES
             and original_pdfs_fit and pdf_bytes_total <= MAX_DRAFT_INPUT_FILE_TOTAL_BYTES):
@@ -27507,7 +27535,7 @@ class OpenAIDraftRequest:
 
     def normalize_response(self, data, fingerprint, *, observations=()):
         sources = None if self.measurement_sources is None else {
-            source: [text] for source, text in self.measurement_sources.items()
+            source: [text] for source, text in self.measurement_sources.items() if text is not None
         }
         if sources is not None:
             for observation in observations:

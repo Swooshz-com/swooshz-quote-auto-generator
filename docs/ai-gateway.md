@@ -84,7 +84,13 @@ schema keywords are not assumed to work at an unqualified endpoint.
 An area can receive automatic catalogue pricing when its basis row has a
 matching measurement statement from a source known to the server. Direct drafts
 can cite text in the supplied PDF or quote notes. Batch synthesis can also cite
-the earlier observation for a specific visual. The source label, basis line and
+the earlier observation for a specific visual. A text-bearing PDF page can
+supply evidence only when its complete text fits the 32,768-character proof
+budget per page, including after normalisation. The 96-page preflight also
+bounds the total evidence. An over-budget or unreadable text layer leaves that
+page available as a visual and its measurement in review. Its batch observation
+cannot replace the incomplete layer. Independent sources remain usable and a
+genuinely raster-only page can still supply a batch observation. The source label, basis line and
 linked item must identify the same physical scope, including location and extent.
 Conflicting or reused evidence stays in pricing review. Write each record with
 its exact scope label followed by a colon. Separate records can share a line.

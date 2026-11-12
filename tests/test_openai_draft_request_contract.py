@@ -1251,6 +1251,34 @@ class DraftRequestContractTest(unittest.TestCase):
         self.assertIn(statement, prepared.measurement_sources["Reference 1, PDF page 1"])
         self.assertFalse(any("measurement_text" in part for part in prepared.single_send))
 
+    def test_prepared_pdf_distinguishes_complete_raster_and_unavailable_text(self):
+        maximum = server.MAX_PDF_MEASUREMENT_CHARS_PER_PAGE
+        at_limit = "x" * maximum
+        expanded = "\ufdfa" * (maximum // 2)
+        cases = (
+            ("raster", 0, None, ""),
+            ("complete", maximum, at_limit, at_limit),
+            ("raw overflow", maximum + 1, None, None),
+            ("decoded overflow", maximum, at_limit + "x", None),
+            ("normalised overflow", len(expanded), expanded, None),
+            ("missing text", 10, "", None),
+            ("decode failure", 10, UnicodeDecodeError("utf-16-le", b"x", 0, 1, "synthetic"), None),
+            ("extraction failure", 10, pdfium.PdfiumError("synthetic"), None),
+        )
+        for name, count, decoded, expected in cases:
+            with self.subTest(name=name):
+                effects = {"side_effect": decoded} if isinstance(decoded, Exception) else {"return_value": decoded}
+                with (mock.patch.object(pdfium.PdfTextPage, "count_chars", return_value=count),
+                      mock.patch.object(pdfium.PdfTextPage, "get_text_range", **effects) as extract):
+                    prepared = server.prepare_draft_media([{"name": "synthetic.pdf", "data_url": self.pdf}])
+                self.assertEqual(prepared.measurement_sources, {"Reference 1, PDF page 1": expected})
+                self.assertTrue(any(part["type"] == "input_image" for part in prepared.single_send))
+                self.assertFalse(any("measurement_text" in part for part in prepared.single_send))
+                if 0 < count <= maximum:
+                    extract.assert_called_once_with(count=count, errors="strict")
+                else:
+                    extract.assert_not_called()
+
     def test_real_pdf_decode_without_debug_retention(self):
         # Bypass only the rendering stub, never the network denial backstop.
         with mock.patch.object(server, "persist_pdf_page_debug_images") as retain:

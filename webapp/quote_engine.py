@@ -20,7 +20,8 @@ from scripts import pricing_reference_cleanup, pricing_reference_enrichment
 class PreparedDraftMedia:
     single_send: list[dict[str, Any]]
     batches: list[list[tuple[str, dict[str, Any]]]]
-    measurement_sources: dict[str, str] | None = None
+    # An empty text layer permits visual observations; unavailable PDF text does not.
+    measurement_sources: dict[str, str | None] | None = None
 
 
 class QuoteDraftRunner:

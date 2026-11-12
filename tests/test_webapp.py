@@ -43432,6 +43432,14 @@ main().catch((error) => {
                                ("24 sqm (all of the flooring dimensions have been verified)", True),
                                ("24 sqm (invoice value is awaiting verification)", True),
                                ("24 sqm (the paperwork will be verified)", True),
+                               ("24 sqm (onsite verification is tentatively planned)", False),
+                               ("24 sqm (the flooring dimensions have only partially been verified)", False),
+                               ("24 sqm (the flooring dimensions have been verified in part)", False),
+                               ("24 sqm (the flooring dimensions haven't all been verified)", False),
+                               ("24 sqm (the flooring dimensions will only be verified after installation)", False),
+                               ("24 sqm (the flooring dimensions are only half verified)", False),
+                               ("24 sqm (the flooring dimensions have all been independently verified)", True),
+                               ("24 sqm (invoice verification is tentatively planned)", True),
                                ("24 sqm (site measurement is waiting on independent verification)", False),
                                ("24 sqm (measurement must still be confirmed)", False),
                                ("24 sqm (site measurement will need verification)", False),
@@ -43723,6 +43731,12 @@ main().catch((error) => {
             (f"{compare}, {east} has since been corrected to 4 sqm", {west: 24, east: None, north: 5}),
             (f"{compare}, {east} had just been recalculated to 4 sqm", {west: 24, east: None, north: 5}),
             (f"{compare}, {east} has already been adjusted to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} has been revised: 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} hasn't yet been corrected: 4 sqm", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at (5 sqm [revise {east} to 4 sqm])", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at (5 sqm; {east} has been revised: 4 sqm)", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at (5 sqm [printed reference])", {west: 24, east: 10, north: 5}),
+            (f"{compare}\nnow measured at 4 sqm", {west: None, east: 10, north: 5}),
             (f"{compare}\n{east} must be revised to 4 sqm", {west: 24, east: None, north: 5}),
             (f"{compare}\n{east} will need to be independently revised to 4 sqm", {west: 24, east: None, north: 5}),
             (f"{compare}; {east} has yet to be corrected to 4 sqm", {west: 24, east: None, north: 5}),
@@ -43947,6 +43961,18 @@ main().catch((error) => {
             ("op-need-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\nCarpet tile east needs to be revised to 4 sqm\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("op-need-n", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[Carpet tile east needs to be revised to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("op-since", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has since been corrected to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pd-planned", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Onsite verification is planned)", 24, "observed", False),
+            ("pd-all", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions haven't all been verified)", 24, "observed", False),
+            ("pd-only", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions will only be verified after installation)", 24, "observed", False),
+            ("pd-half", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are only half verified)", 24, "observed", False),
+            ("pd-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions have all been independently verified)", 24, "observed", True),
+            ("pd-no", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (onsite verification is no longer planned or required)", 24, "observed", True),
+            ("pd-inv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification is planned)", 24, "observed", True),
+            ("pa-colon", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has been revised: 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pa-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has not yet been revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pa-inner", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at (5 sqm\n[revise Carpet tile east to 4 sqm])),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pa-local", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\nnow measured at 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", False),
+            ("pa-value", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at (5 sqm\n[printed value])),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -43978,11 +44004,13 @@ main().catch((error) => {
             "vf-await", "vf-of", "vf-yet", "vf-tail", "vf-for", "vf-need", "vf-neg", "vf-done", "vf-inv", "vf-invpre",
             "vf-will", "vf-must", "vf-due", "vf-none",
             "pf-fut", "pf-yet", "pf-neg", "pf-dim", "pf-event", "pf-part", "pf-done", "pf-none", "pf-inv", "pf-value",
+            "pd-planned", "pd-all", "pd-only", "pd-half", "pd-done", "pd-no", "pd-inv",
         }
         scoped_annotations = {
             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
             "op-pass", "op-pass-r", "op-note", "op-note-r", "op-value", "op-local", "op-both", "op-wrap",
             "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
+            "pa-colon", "pa-neg", "pa-inner", "pa-local", "pa-value",
         }
         dotted_comparisons = {"mem-dot-neutral", "mem-dot-first", "mem-dot-mid"}
         wrapped_comparisons = {"mem-line-neutral", "mem-line-first", "mem-line-mid"}
@@ -44150,6 +44178,7 @@ main().catch((error) => {
                             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-nest",
                             "op-pass", "op-pass-r", "op-note", "op-note-r", "op-both", "op-wrap",
                             "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
+                            "pa-colon", "pa-neg", "pa-inner",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
@@ -44192,6 +44221,123 @@ main().catch((error) => {
                                 self.assertEqual(any("24 sqm" in row for row in values), allowed)
                             if name in north_cases:
                                 self.assertEqual(any("5 sqm" in row and 72 in row for row in values), north_priced)
+
+    def test_pdf_pricing_evidence_requires_complete_bounded_page_text(self):
+        import socket
+        from scripts.generate_quote import pdf_escape, read_first_sheet_rows_with_numbers
+        from tests.gateway_test_support import synthetic_configuration
+        from tests.test_basis_quantity_retention import EvidenceTransport
+        from webapp import ai_gateway
+
+        def reference(first_page, second_page, batched):
+            pages = [first_page] if second_page is None else [first_page, second_page]
+            if batched:
+                pages.extend([] for _ in range(13 - len(pages)))
+            kids = " ".join(f"{4 + index * 2} 0 R" for index in range(len(pages)))
+            objects = ["<< /Type /Catalog /Pages 2 0 R >>",
+                       f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>",
+                       "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+            for index, lines in enumerate(pages):
+                height = max(100, 20 + 5 * len(lines))
+                commands = ["BT", "/F1 4 Tf", f"12 {height - 10} Td"]
+                for line in lines:
+                    commands.extend((f"({pdf_escape(line)}) Tj", "0 -5 Td"))
+                stream = "\n".join(commands + ["ET"])
+                objects.extend((
+                    f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 {height}] "
+                    f"/Resources << /Font << /F1 3 0 R >> >> /Contents {5 + index * 2} 0 R >>",
+                    f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream",
+                ))
+            document = bytearray(b"%PDF-1.4\n")
+            offsets = []
+            for number, obj in enumerate(objects, 1):
+                offsets.append(len(document))
+                document.extend(f"{number} 0 obj\n{obj}\nendobj\n".encode("ascii"))
+            xref = len(document)
+            document.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii"))
+            for offset in offsets:
+                document.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+            document.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii"))
+            return {"name": "survey.pdf", "data_url": "data:application/pdf;base64," + base64.b64encode(document).decode("ascii")}
+
+        west, east = "Carpet tile west", "Carpet tile east"
+        west_statement, east_statement = f"{west}: 24 sqm", f"{east}: 10 sqm"
+        conflict = f"{west}: 4 sqm;"
+        context = "Administrative drawing context remains unchanged for the quoted exhibition and sample stock record;"
+        regular, over_budget = [context] * 90, [context] * 390
+        west_record = west_statement + ";"
+        cases = (
+            ("early", [west_record, conflict, *regular], False, False),
+            ("late", [west_record, *regular, conflict], False, False),
+            ("tail", [*regular, west_record], True, False),
+            ("neutral", [west_record, *regular], True, False),
+            ("over", [west_record, *over_budget, conflict], False, False),
+            ("independent", over_budget, True, True),
+            ("raster", [], False, False),
+        )
+        spot = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        with (mock.patch.object(webapp, "read_dotenv_value", side_effect=synthetic_configuration(credential="synthetic").get),
+              mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
+              mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only")),
+              tempfile.TemporaryDirectory(prefix="sq-") as temp):
+            root = Path(temp)
+            for batched in (False, True):
+                for name, first_page, west_allowed, independent in cases:
+                    with self.subTest(batched=batched, name=name):
+                        expected_west = west_allowed or (batched and name == "raster")
+                        payload = self._ledger_draft_payload(f"quote-dense-{int(batched)}-{name}")
+                        second_page = [east_statement + ";"] if name in {"over", "independent"} else None
+                        payload["notes"] = west_statement if independent else (east_statement if second_page is None else "")
+                        payload["images"] = [reference(first_page, second_page, batched)]
+                        lines, items = [], []
+                        for row_id, label, amount, unit, keyword, source in (
+                            ("west", west, 24, "sqm", self.LEDGER_CARPET,
+                             "Quote notes" if independent else "Reference 1, PDF page 1"),
+                            ("east", east, 10, "sqm", self.LEDGER_CARPET,
+                             "Quote notes" if second_page is None else "Reference 1, PDF page 2"),
+                            ("spot", "Synthetic spotlight 6 inch", 2, "nos", spot, ""),
+                        ):
+                            line = {"id": row_id, "tag": "Confirm", "text": label, "quantity": amount, "unit": unit,
+                                    "confidence_pct": 90, "scope_kind": "physical", "pricing_keyword": keyword}
+                            if source:
+                                line["measurement_evidence"] = {"kind": "observed", "source": source,
+                                                                "statement": f"{label}: {amount} {unit}"}
+                            lines.append(line)
+                            items.append({"source_basis_line_id": row_id, "section": "Floors" if source else "Lighting and AV",
+                                          "description": label, "quantity": amount, "unit": unit, "pricing_keyword": keyword})
+                        provider = {"quote_basis_sections": [{"id": "scope", "title": "Scope", "lines": lines}],
+                                    "line_items": items}
+                        transport = EvidenceTransport(provider_result=provider, measurement_note=west_statement)
+                        with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
+                            draft = webapp.request_openai_quote_basis(payload, "synthetic")
+                        final = webapp.finalized_remote_draft_result(payload, draft, "openai", "OpenAI",
+                                                                    webapp.booth_dimensions_from_payload(payload), [])
+                        self.assertEqual(len(transport.calls), 4 if batched else 1)
+                        for call in transport.calls:
+                            self.assertFalse(any(context in part.get("text", "") for part in call["input"][0]["content"]))
+                        seal = final["pricing_analysis_seal"]
+                        signed = {row["id"]: row for row in seal["rows"]}
+                        self.assertEqual(signed["west"]["measurement"]["disposition"], "measured" if expected_west else "review")
+                        self.assertEqual(signed["east"]["measurement"]["disposition"], "measured")
+                        self.assertEqual(signed["spot"]["catalog_item_id"], spot)
+                        sections = copy.deepcopy(final["quote_basis_sections"])
+                        include = {"west", "east", "spot"} if expected_west else {"east", "spot"}
+                        for section in sections:
+                            for line in section["lines"]:
+                                line["tag"] = "Include" if line["id"] in include else "Exclude"
+                        generation = {**payload, "quote_basis_sections": sections,
+                                      "quote_basis": webapp.quote_basis_from_sections(sections), "pricing_analysis_seal": seal,
+                                      "line_items": [row for row in final["line_items"] if row["source_basis_line_id"] in include]}
+                        output = root / f"{int(batched)}-{name}"
+                        result = webapp.run_quote_job(generation, output_root=output, tmp_root=root / "t")
+                        self.assertEqual(result["status"], "completed", result.get("errors"))
+                        [xlsx] = list(output.rglob("quotation.xlsx"))
+                        values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                        [subtotal] = [row for row in values if "Total" in row]
+                        self.assertIn(518.20 if expected_west else 172.60, subtotal)
+                        self.assertEqual(any("24 sqm" in row for row in values), expected_west)
+                        self.assertTrue(any("10 sqm" in row and 144 in row for row in values))
+                        self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
 
     def test_ledger_rejects_reused_scope_across_signed_analyses(self):
         label = "Synthetic carpet tile flooring at east"
@@ -44264,7 +44410,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 17):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 18):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44326,7 +44472,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 18):
+            for version in range(1, 19):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44340,7 +44486,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 17
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 18
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
