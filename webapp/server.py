@@ -25584,7 +25584,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 19
+AREA_EVIDENCE_CLAIM_VERSION = 20
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25641,26 +25641,38 @@ AREA_UNFINISHED_RESULT_PREFIX = (
 )
 AREA_UNFINISHED_RESULT_SUFFIX = rf"\s+(?:only\s+)?{AREA_VERIFICATION_PARTIAL}\b"
 AREA_UNVERIFIED_RESULT = (
-    rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_VERIFICATION_RESULT}|{AREA_VERIFICATION_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
+    rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_VERIFICATION_RESULT}"
+    rf"|(?:only\s+)?{AREA_VERIFICATION_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
 )
 AREA_APPROVAL_RESULT = r"(?:approved|signed[\s-]+off)\b"
 AREA_UNAPPROVED_RESULT = (
-    rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_APPROVAL_RESULT}|{AREA_APPROVAL_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
+    rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_APPROVAL_RESULT}"
+    rf"|(?:only\s+)?{AREA_APPROVAL_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
 )
 AREA_UNRESOLVED_STATUS = (
-    rf"(?:{AREA_PROVISIONAL_STATUS}|pending|outstanding|incomplete|unverified|unconfirmed|unmeasured|unresolved)\b"
+    rf"(?:{AREA_PROVISIONAL_STATUS}|pending|outstanding|incomplete|unverified|unconfirmed|unmeasured|unapproved|unresolved)\b"
 )
 AREA_WAITING_ACTION = r"(?:await(?:s|ing)?|wait(?:s|ing)?\s+(?:for|on)|subject\s+to|requir(?:e|es|ing)|need(?:s|ing)?)"
-AREA_WAITING_FOR_VERIFICATION = rf"{AREA_WAITING_ACTION}\s+(?:{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC})"
+AREA_WAITING_FOR_RESULT = rf"wait(?:s|ing)?\s+to\s+be\s+(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})"
 AREA_VERIFICATION_OBLIGATION = (
     r"(?:will\s+(?:still\s+)?(?:need|require)"
     rf"|(?:{AREA_VERIFICATION_FUTURE}|(?:has|have|will\s+have)\s+to)\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:undergo|receive|complete)"
     r"|(?:due|scheduled)\s+for)"
 )
-AREA_APPROVAL_PENDING = (
-    rf"(?:{AREA_WAITING_ACTION}|{AREA_VERIFICATION_OBLIGATION})\s+(?:(?:the|a|an|their|its)\s+)?"
+AREA_APPROVAL_TOPIC = (
+    r"(?:(?:the|a|an|their|its)\s+)?(?:[^\W\d_][\w-]*(?:\s+[^\W\d_][\w-]*){0,3}['\u2019]s\s+)?"
     rf"{AREA_STATUS_MODIFIERS}{AREA_APPROVAL_EVENT}"
     rf"(?:\s+{AREA_APPROVAL_OBJECT}|(?!\s+(?:of|for|on)\s+))"
+)
+AREA_APPROVAL_PENDING = rf"(?:{AREA_WAITING_ACTION}|{AREA_VERIFICATION_OBLIGATION})\s+{AREA_APPROVAL_TOPIC}"
+AREA_CONDITIONAL_RESULT = (
+    rf"(?:{AREA_MANNER_ADVERB}\s+)*(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})\s+"
+    rf"(?:pending|subject\s+to)\s+(?:{AREA_VERIFICATION_TOPIC}|{AREA_APPROVAL_TOPIC})"
+)
+AREA_ACTIVE_MEASUREMENT_OBLIGATION = (
+    rf"(?:(?:i|we|you|they|he|she)\s+)?{AREA_STATUS_TIMING}"
+    r"(?:must|(?:will\s+(?:still\s+)?)?(?:needs?|requires?)\s+to|(?:has|have)\s+to)\s+"
+    r"(?:confirm|verify|validate|check|measure|approve|sign[\s-]+off)\s+"
 )
 AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled|planned)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
@@ -25668,18 +25680,22 @@ AREA_VERIFICATION_EVENT_STATUS = (
     rf"|{AREA_VERIFICATION_FUTURE}\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:occur|happen|begin|take\s+place)\b)"
 )
 AREA_PARTIAL_MEASUREMENT_VERIFICATION = (
-    rf"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?{AREA_MEASURE_TOPIC}"
+    rf"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?(?P<partial_topic>{AREA_MEASURE_TOPIC})"
     rf"{AREA_STATUS_LINKS}(?:{AREA_MANNER_ADVERB}\s+)*(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})"
 )
 AREA_ATTACHED_QUALIFIER = re.compile(
-    rf"(?:{AREA_MEASUREMENT_EVENT}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_VERIFICATION_EVENT_STATUS}"
-    rf"|{AREA_MEASURE_TOPIC}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}(?:{AREA_APPROVAL_PENDING}|{AREA_UNAPPROVED_RESULT})"
+    rf"(?:(?P<event_topic>{AREA_MEASUREMENT_EVENT}){AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_VERIFICATION_EVENT_STATUS}"
+    rf"|(?P<measure_topic>{AREA_MEASURE_TOPIC}){AREA_STATUS_LINKS}{AREA_STATUS_TIMING}"
+    rf"(?:{AREA_APPROVAL_PENDING}|{AREA_UNAPPROVED_RESULT}|{AREA_CONDITIONAL_RESULT})"
+    rf"|{AREA_ACTIVE_MEASUREMENT_OBLIGATION}(?P<active_topic>{AREA_MEASURE_TOPIC})"
     rf"|{AREA_PARTIAL_MEASUREMENT_VERIFICATION}"
-    rf"|{AREA_STATUS_TOPIC}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
-    rf"|(?:{AREA_STATUS_TOPIC}{AREA_STATUS_LINKS})?{AREA_STATUS_TIMING}"
-    rf"(?:{AREA_UNVERIFIED_RESULT}|{AREA_WAITING_FOR_VERIFICATION}"
-    rf"|{AREA_VERIFICATION_OBLIGATION}\s+{AREA_VERIFICATION_TOPIC})"
-    rf"|{AREA_STATUS_TIMING}(?:{AREA_VERIFICATION_REQUIREMENT}|{AREA_UNRESOLVED_STATUS})\s+{AREA_MEASUREMENT_EVENT}"
+    rf"|(?P<state_topic>{AREA_STATUS_TOPIC}){AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
+    rf"|(?:(?P<result_topic>{AREA_STATUS_TOPIC}){AREA_STATUS_LINKS})?{AREA_STATUS_TIMING}"
+    rf"(?:{AREA_UNVERIFIED_RESULT}|{AREA_WAITING_FOR_RESULT}|{AREA_WAITING_ACTION}\s+"
+    rf"(?P<waiting_topic>{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC})"
+    rf"|{AREA_VERIFICATION_OBLIGATION}\s+(?P<obligation_topic>{AREA_VERIFICATION_TOPIC}))"
+    rf"|{AREA_STATUS_TIMING}(?:{AREA_VERIFICATION_REQUIREMENT}|{AREA_UNRESOLVED_STATUS})\s+"
+    rf"(?P<pending_topic>{AREA_MEASUREMENT_EVENT})"
     rf"|{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
     rf"(?=$|[.!?]|\s+(?:in|from|using|until|pending|for|at|as|per|{AREA_MEASURE_TOPIC}"
     r"|drawings?|plans?|sketch(?:es)?|models?)\b))",
@@ -26045,9 +26061,12 @@ def area_member_claims(annotation: str, scopes: set[str], patterns: AreaScopePat
                 yield from area_referenced_claims(
                     assertion, 0, len(assertion), area_heading_colon(assertion), patterns, {}, set(),
                 )
-            if kind or area_unresolved_qualification(assertion) or area_provisional_annotation(assertion):
-                for scope in scopes:
-                    yield AreaMeasurementClaim(scope, kind or "observed", None, "", (), False)
+            affected = area_qualification_scopes(assertion, scopes, patterns)
+            affected.update(area_paired_qualification_scopes(assertion, scopes, patterns))
+            if kind:
+                affected.update(scopes)
+            for scope in affected:
+                yield AreaMeasurementClaim(scope, kind or "observed", None, "", (), False)
 
 
 def area_heading_scope_base(heading: str) -> str:
@@ -26208,14 +26227,27 @@ def area_annotation_text(value: str, annotation: str) -> str:
     return annotation.lstrip(" .!?")
 
 
-def area_unresolved_qualification(text: str) -> bool:
-    return any(AREA_ATTACHED_QUALIFIER.match(clause.strip()) for clause in AREA_QUALIFICATION_BREAK.split(text))
+def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
+    """Bind unfinished measurement work to the subject or object it qualifies."""
+    affected = set()
+    for clause in AREA_QUALIFICATION_BREAK.split(text):
+        match = AREA_ATTACHED_QUALIFIER.match(clause.strip())
+        if not match:
+            continue
+        named = set()
+        for topic in filter(None, match.groups()):
+            for reference in patterns.reference.finditer(topic.translate(AREA_SCOPE_WRAPPERS)):
+                named.update(patterns.reference_scopes[area_scope_reference_key(reference["label"])])
+            if named:
+                break
+        affected.update(named or enclosing)
+    return affected
 
 
-def area_provisional_annotation(context: str) -> bool:
-    """A status about the measurement can conflict with its apparently exact value."""
+def area_paired_qualification_scopes(context: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
     _, pairs = area_bracket_context(context)
-    return any(area_unresolved_qualification(context[start + 1:end]) for start, end in pairs.items())
+    return {scope for start, end in pairs.items()
+            for scope in area_qualification_scopes(context[start + 1:end], enclosing, patterns)}
 
 
 def area_paired_asides(text: str) -> bool:
@@ -26244,7 +26276,7 @@ def area_complete_frame(value: str) -> bool:
     return not context.strip(" .,!?") or area_paired_asides(context)
 
 
-def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> AreaMeasurementClaim | None:
+def area_record_claims(record: AreaScopeSpan, parts: list[tuple[str, str]], patterns: AreaScopePatterns):
     """Resolve record boundaries before testing the whole measurement body."""
     body = []
     measurement_end = 0
@@ -26262,19 +26294,22 @@ def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> Ar
     # Trim prose after a semicolon only when it adds no dimensional claim.
     body = body[:measurement_end] if measurement_end else body
     if not body:
-        return None
+        return
     final, separator = body[-1]
     body[-1] = (final, "?" if separator == "?" else "")
     value = clean_text(" ".join(part + separator for part, separator in body))
     claim = area_measurement_claim(record.scope, record.label, value)
     if claim is None:
-        return None
-    if not record.framed:
-        return AreaMeasurementClaim(record.scope, claim.kind, None, "", (), False)
-    if pricing_measurement_scope(record.label) != record.scope:
+        return
+    affected = area_paired_qualification_scopes(value, {record.scope}, patterns)
+    if not record.framed or record.scope in affected:
+        claim = AreaMeasurementClaim(record.scope, claim.kind, None, "", (), False)
+    elif pricing_measurement_scope(record.label) != record.scope:
         # A newly recognised wrapper can locate a conflict without expanding proof authority.
-        return replace(claim, eligible=False)
-    return claim
+        claim = replace(claim, eligible=False)
+    yield claim
+    for scope in affected - {record.scope}:
+        yield AreaMeasurementClaim(scope, "observed", None, "", (), False)
 
 
 def area_source_claims(raw: str, patterns: AreaScopePatterns):
@@ -26371,10 +26406,8 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
                     parts.append((part, boundary.group()))
                     start = boundary.end()
             parts.append((clean_text("".join(masked[start:limit])), ""))
-            claim = area_record_claim(record, parts)
             handled[record.anchor[0]] = record.anchor[1]
-            if claim is not None:
-                yield claim
+            yield from area_record_claims(record, parts, patterns)
             if group != -1:
                 masked[record.start:limit] = " " * (limit - record.start)
 
@@ -26436,7 +26469,7 @@ def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeas
             or uses_provisional_dimensions(annotation, unit) or AREA_PROVISIONAL_QUALIFIER.match(scope)
             or (prefix and (Decimal(str(prefix["quantity"])) != quantity
                             or not pricing_units_share_quantity_basis(prefix["unit"], unit)))
-            or not aside or area_provisional_annotation(context) or "?" in measurement
+            or not aside or "?" in measurement
             or any(char.isnumeric() for char in annotation)
             or area_claim_kind(annotation) or (derived and re.search(r"\bcoverage\b", annotation, re.I))):
         quantity = None

@@ -43987,6 +43987,18 @@ main().catch((error) => {
             ("pd-aven", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (venue approval is pending)", 24, "observed", True),
             ("pd-aobj", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions are subject to approval of the venue)", 24, "observed", True),
             ("pd-ainv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice approval is pending)", 24, "observed", True),
+            ("pd-agent", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are awaiting the surveyor's approval)", 24, "observed", False),
+            ("pd-passive", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are still waiting to be verified)", 24, "observed", False),
+            ("pd-partial", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions were only verified in part)", 24, "observed", False),
+            ("pd-obligation", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still need to verify the flooring dimensions)", 24, "observed", False),
+            ("pd-unapproved", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are unapproved)", 24, "observed", False),
+            ("pd-conditional", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions have been approved pending site verification)", 24, "observed", False),
+            ("pd-agent-object", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions await the site manager's approval of the invoice)", 24, "observed", True),
+            ("pd-active-no", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we no longer need to verify the flooring dimensions)", 24, "observed", True),
+            ("pd-cond-inv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions were approved pending verification of the invoice)", 24, "observed", True),
+            ("pd-east-subject", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Carpet tile east dimensions are waiting to be signed off)", 24, "observed", True),
+            ("pd-east-object", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still have to verify the dimensions of Carpet tile east)", 24, "observed", True),
+            ("pd-east-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Carpet tile east dimensions have been approved)", 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -44020,6 +44032,8 @@ main().catch((error) => {
             "pf-fut", "pf-yet", "pf-neg", "pf-dim", "pf-event", "pf-part", "pf-done", "pf-none", "pf-inv", "pf-value",
             "pd-planned", "pd-all", "pd-only", "pd-half", "pd-done", "pd-no", "pd-inv",
             "pd-asig", "pd-asub", "pd-aevt", "pd-aneg", "pd-adone", "pd-aven", "pd-aobj", "pd-ainv",
+            "pd-agent", "pd-passive", "pd-partial", "pd-obligation", "pd-unapproved", "pd-conditional",
+            "pd-agent-object", "pd-active-no", "pd-cond-inv", "pd-east-subject", "pd-east-object", "pd-east-done",
         }
         scoped_annotations = {
             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
@@ -44194,6 +44208,7 @@ main().catch((error) => {
                             "op-pass", "op-pass-r", "op-note", "op-note-r", "op-both", "op-wrap",
                             "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
                             "pa-colon", "pa-neg", "pa-inner",
+                            "pd-east-subject", "pd-east-object",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
@@ -44425,7 +44440,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 18):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 19):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44487,7 +44502,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 19):
+            for version in range(1, 20):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44501,7 +44516,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 18
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 19
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
