@@ -147,11 +147,12 @@ proven equal value. A provisional status or unresolved verification of the
 measurement keeps that scope in review, even when the amount agrees. The
 qualification can name the measured area or its dimensions as waiting for
 verification or sign-off. Future, partial and expressly incomplete verification
-or approval of the dimensions also keep the row in review. An approval subject
-to a further measurement check is still unresolved. A note naming another area
-applies to that area. Completed verification and approval, an explicit statement
-that verification is no longer required, and unrelated invoice or document checks
-remain neutral context. A derived
+or approval of the dimensions also keep the row in review, including work that
+is underway or still required of a named person. An approval subject to a further
+measurement check is still unresolved. The area named in the measurement subject
+or object receives the hold. Completed verification and approval, an explicit
+statement that verification is no longer required, and unrelated invoice or
+document checks remain neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.

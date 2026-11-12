@@ -43764,6 +43764,22 @@ main().catch((error) => {
                 claims = webapp.area_source_claims(raw, patterns)
                 self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
 
+    def test_area_qualification_resolves_complete_named_roles_before_fallback(self):
+        west = "carpet tile west"
+        east = "carpet and vinyl east near the registration desk"
+        patterns = webapp.area_scope_patterns({west, east})
+        for note, expected in (
+            (f"the dimensions on [{east}] are still being checked", {east}),
+            (f"the surveyor will have to verify the quantity for {east}", {east}),
+            (f"the crew working on {east} still needs to verify the flooring dimensions", {west}),
+            (f"the crew has already verified the dimensions for {east}", set()),
+            (f"the crew has only partially verified the dimensions for {east}; the flooring dimensions are still being checked",
+             {east, west}),
+            (f"the crew is still required to verify the invoice for {east}", set()),
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(webapp.area_qualification_scopes(note, {west}, patterns), expected)
+
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
         from scripts.generate_quote import read_first_sheet_rows_with_numbers, write_text_pdf
@@ -43999,6 +44015,24 @@ main().catch((error) => {
             ("pd-east-subject", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Carpet tile east dimensions are waiting to be signed off)", 24, "observed", True),
             ("pd-east-object", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still have to verify the dimensions of Carpet tile east)", 24, "observed", True),
             ("pd-east-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Carpet tile east dimensions have been approved)", 24, "observed", True),
+            ("pd-fut-adv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions still waiting to be fully verified)", 24, "observed", False),
+            ("pd-aspect", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions have only been verified in part)", 24, "observed", False),
+            ("pd-duty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we are still required to verify flooring dimensions)", 24, "observed", False),
+            ("pd-named", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor still needs to verify flooring dimensions)", 24, "observed", False),
+            ("pd-east-for", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still have to verify the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-ongoing", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the measurements are still being independently checked)", 24, "observed", False),
+            ("pd-compound", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions will soon have to be independently validated)", 24, "observed", False),
+            ("pd-east-on", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the installer hasn't yet fully checked the dimensions on Carpet tile east)", 24, "observed", True),
+            ("pd-east-part", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the engineer only checked the dimensions of Carpet tile east in part)", 24, "observed", True),
+            ("pd-east-cond", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the crew confirmed the dimensions for Carpet tile east subject to field validation)", 24, "observed", True),
+            ("pd-actor-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has already fully verified the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-duty-no", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the engineer will not need to verify the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-no-pass", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions are no longer required to be independently verified)", 24, "observed", True),
+            ("pd-inv-duty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor is still required to verify the invoice for Carpet tile east)", 24, "observed", True),
+            ("pd-other-actor", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the Carpet tile east team still needs to verify the flooring dimensions)", 24, "observed", False),
+            ("pd-part-front", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (only some of the dimensions for Carpet tile east have been verified independently)", 24, "observed", True),
+            ("pd-part-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions have been independently verified only in part)", 24, "observed", False),
+            ("pd-east-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we are checking the dimensions on [Carpet tile east])", 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -44034,6 +44068,9 @@ main().catch((error) => {
             "pd-asig", "pd-asub", "pd-aevt", "pd-aneg", "pd-adone", "pd-aven", "pd-aobj", "pd-ainv",
             "pd-agent", "pd-passive", "pd-partial", "pd-obligation", "pd-unapproved", "pd-conditional",
             "pd-agent-object", "pd-active-no", "pd-cond-inv", "pd-east-subject", "pd-east-object", "pd-east-done",
+            "pd-fut-adv", "pd-aspect", "pd-duty", "pd-named", "pd-east-for", "pd-ongoing", "pd-compound",
+            "pd-east-on", "pd-east-part", "pd-east-cond", "pd-actor-done", "pd-duty-no", "pd-no-pass", "pd-inv-duty",
+            "pd-other-actor", "pd-part-front", "pd-part-tail", "pd-east-wrap",
         }
         scoped_annotations = {
             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
@@ -44208,7 +44245,8 @@ main().catch((error) => {
                             "op-pass", "op-pass-r", "op-note", "op-note-r", "op-both", "op-wrap",
                             "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
                             "pa-colon", "pa-neg", "pa-inner",
-                            "pd-east-subject", "pd-east-object",
+                            "pd-east-subject", "pd-east-object", "pd-east-for", "pd-east-on", "pd-east-part",
+                            "pd-east-cond", "pd-part-front", "pd-east-wrap",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
@@ -44440,7 +44478,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 19):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 20):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44502,7 +44540,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 20):
+            for version in range(1, 21):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44516,7 +44554,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 19
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 20
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)

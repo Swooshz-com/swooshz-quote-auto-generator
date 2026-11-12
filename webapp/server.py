@@ -25584,7 +25584,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 20
+AREA_EVIDENCE_CLAIM_VERSION = 21
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25605,13 +25605,13 @@ AREA_VERIFICATION_EVENT = r"(?:confirm(?:ation|ing)|verif(?:ication|ying)|valida
 AREA_STATUS_MODIFIERS = r"(?:(?:on[- ]?site|site|field|physical|independent|final|measured|measurements?|survey)\s+)*"
 AREA_DIMENSION_HEAD = r"(?:areas?|coverage|dimensions?|measurements?|extents?|footprints?)"
 AREA_DIMENSION_WORD = rf"(?!(?:of|for|on|with|by|and|or|not|no|{AREA_VERIFICATION_EVENT})\b)[^\W\d_][\w-]*"
-AREA_DIMENSION_SUBJECT = (
-    rf"(?:{AREA_DIMENSION_WORD}\s+){{0,5}}{AREA_DIMENSION_HEAD}\b"
-    rf"(?:\s+of\s+(?:the\s+)?{AREA_DIMENSION_WORD}(?:\s+{AREA_DIMENSION_WORD}){{0,4}})?"
-)
+AREA_TOPIC_LINK = r"(?:of|for|on)\s+(?:(?:the|a|an)\s+)?"
+AREA_DIMENSION_NOUN_PHRASE = rf"(?:{AREA_DIMENSION_WORD}\s+){{0,5}}{AREA_DIMENSION_HEAD}\b"
 AREA_MEASURE_TOPIC = (
-    rf"(?:the\s+)?(?:{AREA_DIMENSION_SUBJECT}|{AREA_STATUS_MODIFIERS}(?:quantity|value|survey)\b)"
+    rf"(?:the\s+)?(?:{AREA_DIMENSION_NOUN_PHRASE}|{AREA_STATUS_MODIFIERS}(?:quantity|value|survey)\b)"
+    rf"(?:\s+{AREA_TOPIC_LINK}{AREA_DIMENSION_WORD}(?:\s+{AREA_DIMENSION_WORD}){{0,4}})?"
 )
+AREA_MEASURE_TOPIC_PHRASE = re.compile(AREA_MEASURE_TOPIC, re.I)
 AREA_VERIFICATION_TOPIC = (
     rf"(?:(?:the|a|an)\s+)?{AREA_STATUS_MODIFIERS}{AREA_VERIFICATION_EVENT}\b"
     rf"(?:\s+(?:of|for|on)\s+{AREA_MEASURE_TOPIC}|(?!\s+(?:of|for|on)\s+))"
@@ -25621,39 +25621,50 @@ AREA_APPROVAL_OBJECT = rf"(?:of|for|on)\s+{AREA_MEASURE_TOPIC}"
 AREA_DIMENSION_APPROVAL = rf"(?:the\s+)?{AREA_STATUS_MODIFIERS}{AREA_APPROVAL_EVENT}\s+{AREA_APPROVAL_OBJECT}"
 AREA_MEASUREMENT_EVENT = rf"(?:{AREA_VERIFICATION_TOPIC}|{AREA_DIMENSION_APPROVAL})"
 AREA_STATUS_TOPIC = rf"(?:{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC}|status\b)"
-AREA_STATUS_LINKS = r"(?:\s+(?:status|is|are|was|were|remains?|has|have|had|been|still|currently|already))*[\s:\-\u2013\u2014]+"
-AREA_STATUS_TIMING = r"(?:(?:still|currently)\s+)?"
 AREA_VERIFICATION_RESULT = (
     r"(?:confirmed|verified|validated|checked|measured|complete(?:d)?|done|finished|performed|carried\s+out)\b"
 )
 AREA_MANNER_ADVERB = r"(?:well|[^\W\d_][\w-]*ly)"
+AREA_STATUS_AUXILIARY = r"(?:status|am|is|are|was|were|remains?|has|have|had|be|been|being|do|does|did)"
+AREA_STATUS_MODIFIER = rf"(?:still|already|only|all|yet|now|then|soon|later|{AREA_MANNER_ADVERB})"
+AREA_STATUS_LINKS = rf"(?:\s+(?:{AREA_STATUS_AUXILIARY}|{AREA_STATUS_MODIFIER}))*[\s:\-\u2013\u2014]+"
+AREA_STATUS_TIMING = r"(?:(?:still|currently)\s+)?"
 AREA_VERIFICATION_PARTIAL = r"(?:partly|partially|in\s+part|half(?:way)?|provisionally|preliminarily|incompletely)"
-AREA_NEGATED_AUXILIARY = r"(?:has|have|had|is|are|was|were)n['\u2019]t"
-AREA_VERIFICATION_NEGATION = rf"(?:not|never|{AREA_NEGATED_AUXILIARY})"
+AREA_NEGATED_AUXILIARY = r"(?:has|have|had|is|are|was|were|do|does|did)n['\u2019]t"
+AREA_VERIFICATION_NEGATION = rf"(?:not(?!\s+only\b)|never|{AREA_NEGATED_AUXILIARY})"
 AREA_VERIFICATION_TIMING = r"(?:still|soon|shortly|eventually|later|subsequently)"
 AREA_PROSPECTIVE_LINK = r"(?:(?:yet|due|scheduled|planned|expected|set|going|needs?|requires?)\s+)?to"
 AREA_VERIFICATION_FUTURE = rf"(?:will|must|{AREA_PROSPECTIVE_LINK})"
+AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled|planned)\b"
+AREA_RESULT_MODIFIERS = rf"(?:(?:{AREA_STATUS_AUXILIARY}|{AREA_STATUS_MODIFIER})\s+)*"
+AREA_OBLIGATION_VERB = r"(?:needs?|needed|requir(?:e|es|ed)|obliged|has|have|had|wait(?:s|ing)?|yet|due|scheduled|expected|set|going)"
+AREA_OBLIGATION_INFINITIVE = rf"{AREA_OBLIGATION_VERB}\s+{AREA_RESULT_MODIFIERS}to\s+{AREA_RESULT_MODIFIERS}"
+AREA_FUTURE_MODAL = r"(?:will|shall|must|should|may|might)"
+AREA_MODAL_LINK = rf"{AREA_FUTURE_MODAL}\s+{AREA_RESULT_MODIFIERS}"
+AREA_NEGATED_MODAL_LINK = rf"(?:{AREA_FUTURE_MODAL}\s+not(?!\s+only\b)|won['\u2019]t)\s+{AREA_RESULT_MODIFIERS}"
+AREA_PASSIVE_FUTURE = (
+    rf"(?:{AREA_MODAL_LINK}(?:{AREA_OBLIGATION_INFINITIVE})?|{AREA_NEGATED_MODAL_LINK})(?:be|been)\s+"
+    rf"|(?:{AREA_OBLIGATION_INFINITIVE}|(?:not\s+going\s+)?to\s+{AREA_RESULT_MODIFIERS})be\s+"
+)
 AREA_UNFINISHED_RESULT_PREFIX = (
-    rf"(?:{AREA_VERIFICATION_NEGATION}\s+(?:(?:yet|all|been|{AREA_MANNER_ADVERB})\s+)*"
-    rf"|(?:{AREA_VERIFICATION_FUTURE}|will\s+not|won['\u2019]t)\s+(?:(?:only|{AREA_VERIFICATION_TIMING})\s+)*be\s+"
-    rf"(?:{AREA_MANNER_ADVERB}\s+)*"
-    rf"|(?:(?:only|been|{AREA_MANNER_ADVERB})\s+)*{AREA_VERIFICATION_PARTIAL}\s+(?:(?:been|{AREA_MANNER_ADVERB})\s+)*)"
+    rf"(?:{AREA_VERIFICATION_NEGATION}\s+{AREA_RESULT_MODIFIERS}"
+    rf"|(?:{AREA_PASSIVE_FUTURE}|being\s+){AREA_RESULT_MODIFIERS}"
+    rf"|{AREA_RESULT_MODIFIERS}{AREA_VERIFICATION_PARTIAL}\s+{AREA_RESULT_MODIFIERS})"
 )
 AREA_UNFINISHED_RESULT_SUFFIX = rf"\s+(?:only\s+)?{AREA_VERIFICATION_PARTIAL}\b"
 AREA_UNVERIFIED_RESULT = (
     rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_VERIFICATION_RESULT}"
-    rf"|(?:only\s+)?{AREA_VERIFICATION_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
+    rf"|{AREA_RESULT_MODIFIERS}{AREA_VERIFICATION_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
 )
 AREA_APPROVAL_RESULT = r"(?:approved|signed[\s-]+off)\b"
 AREA_UNAPPROVED_RESULT = (
     rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_APPROVAL_RESULT}"
-    rf"|(?:only\s+)?{AREA_APPROVAL_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
+    rf"|{AREA_RESULT_MODIFIERS}{AREA_APPROVAL_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
 )
 AREA_UNRESOLVED_STATUS = (
     rf"(?:{AREA_PROVISIONAL_STATUS}|pending|outstanding|incomplete|unverified|unconfirmed|unmeasured|unapproved|unresolved)\b"
 )
 AREA_WAITING_ACTION = r"(?:await(?:s|ing)?|wait(?:s|ing)?\s+(?:for|on)|subject\s+to|requir(?:e|es|ing)|need(?:s|ing)?)"
-AREA_WAITING_FOR_RESULT = rf"wait(?:s|ing)?\s+to\s+be\s+(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})"
 AREA_VERIFICATION_OBLIGATION = (
     r"(?:will\s+(?:still\s+)?(?:need|require)"
     rf"|(?:{AREA_VERIFICATION_FUTURE}|(?:has|have|will\s+have)\s+to)\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:undergo|receive|complete)"
@@ -25665,42 +25676,49 @@ AREA_APPROVAL_TOPIC = (
     rf"(?:\s+{AREA_APPROVAL_OBJECT}|(?!\s+(?:of|for|on)\s+))"
 )
 AREA_APPROVAL_PENDING = rf"(?:{AREA_WAITING_ACTION}|{AREA_VERIFICATION_OBLIGATION})\s+{AREA_APPROVAL_TOPIC}"
-AREA_CONDITIONAL_RESULT = (
-    rf"(?:{AREA_MANNER_ADVERB}\s+)*(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})\s+"
-    rf"(?:pending|subject\s+to)\s+(?:{AREA_VERIFICATION_TOPIC}|{AREA_APPROVAL_TOPIC})"
+AREA_MEASUREMENT_CONDITION = (
+    rf"(?:pending|subject\s+to|conditional\s+on)\s+(?:{AREA_VERIFICATION_TOPIC}|{AREA_APPROVAL_TOPIC})"
 )
+AREA_ACTIVE_ACTION = r"(?:confirm|verify|validate|check|measure|approve|sign[\s-]+off)\b"
+AREA_ONGOING_ACTION = r"(?:confirming|verifying|validating|checking|measuring|approving|signing[\s-]+off)\b"
+AREA_AGENT_WORD = (
+    rf"(?!(?:{AREA_STATUS_AUXILIARY}|{AREA_STATUS_MODIFIER}|{AREA_OBLIGATION_VERB}|"
+    r"no|not|never|must|will|shall|should|may|might)\b)[^\W\d_][\w-]*"
+)
+AREA_ACTIVE_AGENT = rf"(?:{AREA_AGENT_WORD}\s+){{0,6}}"
 AREA_ACTIVE_MEASUREMENT_OBLIGATION = (
-    rf"(?:(?:i|we|you|they|he|she)\s+)?{AREA_STATUS_TIMING}"
-    r"(?:must|(?:will\s+(?:still\s+)?)?(?:needs?|requires?)\s+to|(?:has|have)\s+to)\s+"
-    r"(?:confirm|verify|validate|check|measure|approve|sign[\s-]+off)\s+"
+    rf"{AREA_ACTIVE_AGENT}{AREA_RESULT_MODIFIERS}"
+    rf"(?:(?:{AREA_MODAL_LINK}(?:{AREA_OBLIGATION_INFINITIVE})?|{AREA_NEGATED_MODAL_LINK}|"
+    rf"{AREA_OBLIGATION_INFINITIVE}){AREA_ACTIVE_ACTION}"
+    rf"|{AREA_ONGOING_ACTION}|{AREA_VERIFICATION_NEGATION}\s+{AREA_RESULT_MODIFIERS}"
+    rf"(?:{AREA_ACTIVE_ACTION}|{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT}))\s+"
 )
-AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled|planned)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
     rf"(?:(?:{AREA_MANNER_ADVERB}\s+)*{AREA_VERIFICATION_REQUIREMENT}|in\s+progress\b|under\s*way\b"
     rf"|{AREA_VERIFICATION_FUTURE}\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:occur|happen|begin|take\s+place)\b)"
 )
-AREA_PARTIAL_MEASUREMENT_VERIFICATION = (
-    rf"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?(?P<partial_topic>{AREA_MEASURE_TOPIC})"
-    rf"{AREA_STATUS_LINKS}(?:{AREA_MANNER_ADVERB}\s+)*(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})"
-)
-AREA_ATTACHED_QUALIFIER = re.compile(
-    rf"(?:(?P<event_topic>{AREA_MEASUREMENT_EVENT}){AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_VERIFICATION_EVENT_STATUS}"
-    rf"|(?P<measure_topic>{AREA_MEASURE_TOPIC}){AREA_STATUS_LINKS}{AREA_STATUS_TIMING}"
-    rf"(?:{AREA_APPROVAL_PENDING}|{AREA_UNAPPROVED_RESULT}|{AREA_CONDITIONAL_RESULT})"
-    rf"|{AREA_ACTIVE_MEASUREMENT_OBLIGATION}(?P<active_topic>{AREA_MEASURE_TOPIC})"
-    rf"|{AREA_PARTIAL_MEASUREMENT_VERIFICATION}"
-    rf"|(?P<state_topic>{AREA_STATUS_TOPIC}){AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
-    rf"|(?:(?P<result_topic>{AREA_STATUS_TOPIC}){AREA_STATUS_LINKS})?{AREA_STATUS_TIMING}"
-    rf"(?:{AREA_UNVERIFIED_RESULT}|{AREA_WAITING_FOR_RESULT}|{AREA_WAITING_ACTION}\s+"
-    rf"(?P<waiting_topic>{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC})"
-    rf"|{AREA_VERIFICATION_OBLIGATION}\s+(?P<obligation_topic>{AREA_VERIFICATION_TOPIC}))"
-    rf"|{AREA_STATUS_TIMING}(?:{AREA_VERIFICATION_REQUIREMENT}|{AREA_UNRESOLVED_STATUS})\s+"
-    rf"(?P<pending_topic>{AREA_MEASUREMENT_EVENT})"
-    rf"|{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
+AREA_PARTIAL_SUBJECT = r"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?"
+AREA_MEASUREMENT_RESULT = rf"(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})"
+AREA_QUALIFICATION_FORMS = tuple(re.compile(form, re.I) for form in (
+    rf"(?P<subject>{AREA_MEASUREMENT_EVENT}){AREA_STATUS_LINKS}{AREA_VERIFICATION_EVENT_STATUS}",
+    rf"(?P<subject>{AREA_MEASURE_TOPIC}){AREA_STATUS_LINKS}"
+    rf"(?:{AREA_APPROVAL_PENDING}|{AREA_UNAPPROVED_RESULT}|{AREA_MEASUREMENT_RESULT}\s+{AREA_MEASUREMENT_CONDITION})",
+    rf"{AREA_ACTIVE_MEASUREMENT_OBLIGATION}(?P<object>{AREA_MEASURE_TOPIC})",
+    rf"{AREA_ACTIVE_AGENT}{AREA_RESULT_MODIFIERS}{AREA_MEASUREMENT_RESULT}\s+(?P<object>{AREA_MEASURE_TOPIC})"
+    rf"(?:{AREA_UNFINISHED_RESULT_SUFFIX}|\s+{AREA_MEASUREMENT_CONDITION})",
+    rf"{AREA_ACTIVE_AGENT}{AREA_RESULT_MODIFIERS}{AREA_VERIFICATION_PARTIAL}\s+{AREA_RESULT_MODIFIERS}"
+    rf"{AREA_MEASUREMENT_RESULT}\s+(?P<object>{AREA_MEASURE_TOPIC})",
+    rf"{AREA_PARTIAL_SUBJECT}(?P<subject>{AREA_MEASURE_TOPIC}){AREA_STATUS_LINKS}{AREA_MEASUREMENT_RESULT}",
+    rf"(?P<subject>{AREA_STATUS_TOPIC}){AREA_STATUS_LINKS}{AREA_UNRESOLVED_STATUS}",
+    rf"(?:(?P<subject>{AREA_STATUS_TOPIC}){AREA_STATUS_LINKS})?{AREA_STATUS_TIMING}"
+    rf"(?:{AREA_UNVERIFIED_RESULT}|{AREA_WAITING_ACTION}\s+(?P<object>{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC})"
+    rf"|{AREA_VERIFICATION_OBLIGATION}\s+(?P<event>{AREA_VERIFICATION_TOPIC}))",
+    rf"{AREA_STATUS_TIMING}(?:{AREA_VERIFICATION_REQUIREMENT}|{AREA_UNRESOLVED_STATUS})\s+"
+    rf"(?P<object>{AREA_MEASUREMENT_EVENT})",
+    rf"{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
     rf"(?=$|[.!?]|\s+(?:in|from|using|until|pending|for|at|as|per|{AREA_MEASURE_TOPIC}"
-    r"|drawings?|plans?|sketch(?:es)?|models?)\b))",
-    re.I,
-)
+    r"|drawings?|plans?|sketch(?:es)?|models?)\b)",
+))
 AREA_UNIT_MARKER = re.compile(
     rf"(?<![^\W\d_])(?:{AREA_CLAIM_UNIT}|square\s+(?:{SCOPE_LENGTH_UNIT}|units?)"
     rf"|(?:{SCOPE_LENGTH_UNIT})\s*(?:\^?\s*2|squared))(?![\w^])", re.I,
@@ -26227,20 +26245,51 @@ def area_annotation_text(value: str, annotation: str) -> str:
     return annotation.lstrip(" .!?")
 
 
-def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
-    """Bind unfinished measurement work to the subject or object it qualifies."""
-    affected = set()
-    for clause in AREA_QUALIFICATION_BREAK.split(text):
-        match = AREA_ATTACHED_QUALIFIER.match(clause.strip())
-        if not match:
+def area_qualification_text(text: str, patterns: AreaScopePatterns) -> tuple[str, list[re.Match[str]]]:
+    """Keep exact area names whole when reading clause boundaries and grammatical roles."""
+    unwrapped = text.translate(AREA_SCOPE_WRAPPERS)
+    references = list(patterns.reference.finditer(unwrapped))
+    if not references:
+        return text, references
+    words = list(unwrapped)
+    for reference in references:
+        start, end = reference.span("label")
+        # A name acts as one noun. Keep its span for attribution and retain dimensional nouns.
+        noun = "area" if AREA_MEASURE_TOPIC_PHRASE.fullmatch(reference["label"]) else "x"
+        words[start:end] = noun.ljust(end - start)
+    return "".join(words), references
+
+
+def area_qualification_targets(roles: re.Match[str], references: list[re.Match[str]], patterns: AreaScopePatterns) -> set[str]:
+    """Resolve exact references in the measured roles, separately from the predicate."""
+    for role in roles.groupdict():
+        start, end = roles.span(role)
+        if start < 0:
             continue
-        named = set()
-        for topic in filter(None, match.groups()):
-            for reference in patterns.reference.finditer(topic.translate(AREA_SCOPE_WRAPPERS)):
-                named.update(patterns.reference_scopes[area_scope_reference_key(reference["label"])])
-            if named:
+        targets = {scope for reference in references
+                   if start <= reference.start("label") < end
+                   for scope in patterns.reference_scopes[area_scope_reference_key(reference["label"])]}
+        if targets:
+            return targets
+    return set()
+
+
+def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
+    """An unfinished assertion disputes its measured subject or object."""
+    text, references = area_qualification_text(text, patterns)
+    affected = set()
+    boundaries = [boundary.span() for boundary in AREA_QUALIFICATION_BREAK.finditer(text)]
+    boundaries.append((len(text), len(text)))
+    start = 0
+    for stop, next_start in boundaries:
+        clause = text[start:stop]
+        first = stop - len(clause.lstrip())
+        last = start + len(clause.rstrip())
+        start = next_start
+        for form in AREA_QUALIFICATION_FORMS:
+            if roles := form.match(text, first, last):
+                affected.update(area_qualification_targets(roles, references, patterns) or enclosing)
                 break
-        affected.update(named or enclosing)
     return affected
 
 
