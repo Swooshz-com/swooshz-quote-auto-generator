@@ -25626,17 +25626,21 @@ AREA_VERIFICATION_RESULT = (
 )
 AREA_MANNER_ADVERB = r"(?:well|[^\W\d_][\w-]*ly)"
 AREA_STATUS_AUXILIARY = r"(?:status|am|is|are|was|were|remains?|has|have|had|be|been|being|do|does|did)"
-AREA_STATUS_MODIFIER = rf"(?:still|already|only|all|yet|now|then|soon|later|{AREA_MANNER_ADVERB})"
-AREA_STATUS_LINKS = rf"(?:\s+(?:{AREA_STATUS_AUXILIARY}|{AREA_STATUS_MODIFIER}))*[\s:\-\u2013\u2014]+"
-AREA_STATUS_TIMING = r"(?:(?:still|currently)\s+)?"
+AREA_STATUS_MODIFIER = rf"(?:still|already|all|yet|now|then|soon|later|{AREA_MANNER_ADVERB})"
 AREA_VERIFICATION_PARTIAL = r"(?:partly|partially|in\s+part|half(?:way)?|provisionally|preliminarily|incompletely)"
+AREA_RESULT_LINK = rf"(?:{AREA_STATUS_AUXILIARY}|{AREA_STATUS_MODIFIER})"
+AREA_NEUTRAL_RESULT_LINK = rf"(?!(?:being|{AREA_VERIFICATION_PARTIAL})\b){AREA_RESULT_LINK}"
+# The neutral bridge ends before any word that can decide the verification status.
+AREA_STATUS_LINKS = rf"(?>(?:\s+{AREA_NEUTRAL_RESULT_LINK})*[\s:\-\u2013\u2014]+)"
+AREA_STATUS_TIMING = r"(?:(?:still|currently)\s+)?"
 AREA_NEGATED_AUXILIARY = r"(?:has|have|had|is|are|was|were|do|does|did)n['\u2019]t"
 AREA_VERIFICATION_NEGATION = rf"(?:not(?!\s+only\b)|never|{AREA_NEGATED_AUXILIARY})"
 AREA_VERIFICATION_TIMING = r"(?:still|soon|shortly|eventually|later|subsequently)"
 AREA_PROSPECTIVE_LINK = r"(?:(?:yet|due|scheduled|planned|expected|set|going|needs?|requires?)\s+)?to"
 AREA_VERIFICATION_FUTURE = rf"(?:will|must|{AREA_PROSPECTIVE_LINK})"
 AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled|planned)\b"
-AREA_RESULT_MODIFIERS = rf"(?:(?:{AREA_STATUS_AUXILIARY}|{AREA_STATUS_MODIFIER})\s+)*"
+AREA_RESULT_MODIFIERS = rf"(?:{AREA_RESULT_LINK}\s+)*"
+AREA_PARTIAL_RESULT = rf"(?:{AREA_NEUTRAL_RESULT_LINK}\s+)*{AREA_VERIFICATION_PARTIAL}\s+{AREA_RESULT_MODIFIERS}"
 AREA_OBLIGATION_VERB = r"(?:needs?|needed|requir(?:e|es|ed)|obliged|has|have|had|wait(?:s|ing)?|yet|due|scheduled|expected|set|going)"
 AREA_OBLIGATION_INFINITIVE = rf"{AREA_OBLIGATION_VERB}\s+{AREA_RESULT_MODIFIERS}to\s+{AREA_RESULT_MODIFIERS}"
 AREA_FUTURE_MODAL = r"(?:will|shall|must|should|may|might)"
@@ -25649,7 +25653,7 @@ AREA_PASSIVE_FUTURE = (
 AREA_UNFINISHED_RESULT_PREFIX = (
     rf"(?:{AREA_VERIFICATION_NEGATION}\s+{AREA_RESULT_MODIFIERS}"
     rf"|(?:{AREA_PASSIVE_FUTURE}|being\s+){AREA_RESULT_MODIFIERS}"
-    rf"|{AREA_RESULT_MODIFIERS}{AREA_VERIFICATION_PARTIAL}\s+{AREA_RESULT_MODIFIERS})"
+    rf"|{AREA_PARTIAL_RESULT})"
 )
 AREA_UNFINISHED_RESULT_SUFFIX = rf"\s+(?:only\s+)?{AREA_VERIFICATION_PARTIAL}\b"
 AREA_UNVERIFIED_RESULT = (
@@ -25706,7 +25710,7 @@ AREA_QUALIFICATION_FORMS = tuple(re.compile(form, re.I) for form in (
     rf"{AREA_ACTIVE_MEASUREMENT_OBLIGATION}(?P<object>{AREA_MEASURE_TOPIC})",
     rf"{AREA_ACTIVE_AGENT}{AREA_RESULT_MODIFIERS}{AREA_MEASUREMENT_RESULT}\s+(?P<object>{AREA_MEASURE_TOPIC})"
     rf"(?:{AREA_UNFINISHED_RESULT_SUFFIX}|\s+{AREA_MEASUREMENT_CONDITION})",
-    rf"{AREA_ACTIVE_AGENT}{AREA_RESULT_MODIFIERS}{AREA_VERIFICATION_PARTIAL}\s+{AREA_RESULT_MODIFIERS}"
+    rf"{AREA_ACTIVE_AGENT}{AREA_PARTIAL_RESULT}"
     rf"{AREA_MEASUREMENT_RESULT}\s+(?P<object>{AREA_MEASURE_TOPIC})",
     rf"{AREA_PARTIAL_SUBJECT}(?P<subject>{AREA_MEASURE_TOPIC}){AREA_STATUS_LINKS}{AREA_MEASUREMENT_RESULT}",
     rf"(?P<subject>{AREA_STATUS_TOPIC}){AREA_STATUS_LINKS}{AREA_UNRESOLVED_STATUS}",

@@ -43776,6 +43776,8 @@ main().catch((error) => {
             (f"the crew has only partially verified the dimensions for {east}; the flooring dimensions are still being checked",
              {east, west}),
             (f"the crew is still required to verify the invoice for {east}", set()),
+            ("flooring dimensions " + "only " * 1000 + "reported", set()),
+            ("flooring dimensions " + "partly " * 1000 + "reported", set()),
         ):
             with self.subTest(note=note):
                 self.assertEqual(webapp.area_qualification_scopes(note, {west}, patterns), expected)
