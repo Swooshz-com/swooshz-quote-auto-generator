@@ -11,7 +11,12 @@ import urllib.error
 import urllib.request
 from types import MappingProxyType
 from typing import Any
-from webapp.ai_response_contracts import DRAFT_SYNTHESIS
+from webapp.ai_response_contracts import ContractViolation, DRAFT_SYNTHESIS
+from webapp.image_observation_contract import (
+    IMAGE_OBSERVATIONS,
+    admit_image_observations,
+    is_image_batch_input,
+)
 
 OPENROUTER_RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 ROUTE_KEYS = MappingProxyType({
@@ -137,6 +142,7 @@ class GatewayConfiguration:
     zdr: bool
     draft_batch_effort: str | None = None
     draft_schema_enabled: bool = False
+    draft_image_schema_enabled: bool = False
 
     @classmethod
     def capture(cls, reader):
@@ -172,8 +178,11 @@ class GatewayConfiguration:
         schema_enabled = reader("OPENROUTER_DRAFT_SCHEMA_ENABLED")
         if schema_enabled not in (None, "", "false", "true"):
             raise GatewayError("response_schema_configuration")
+        image_schema_enabled = reader("OPENROUTER_DRAFT_IMAGE_SCHEMA_ENABLED")
+        if image_schema_enabled not in (None, "", "false", "true"):
+            raise GatewayError("response_schema_configuration")
         return cls(tuple(routes),int(raw_timeout),raw_zdr == "true", batch_effort or None,
-                   schema_enabled == "true")
+                   schema_enabled == "true", image_schema_enabled == "true")
 
     def route(self,operation):
         route = next((r for r in self.routes if r.operation == operation),None)
@@ -347,7 +356,7 @@ def safe_response_diagnostics(data):
     return result
 
 
-def admit_response(data,route):
+def admit_response(data,route, *, strict_image_observations=False):
     if not isinstance(data,dict) or not isinstance(data.get("status"),str):
         raise GatewayError("response_shape",boundary="provider_response_shape")
     if data.get("error") is not None or data.get("error_type") is not None or data["status"]!="completed" or data.get("refusal") is not None or data.get("incomplete_details") is not None:
@@ -377,7 +386,20 @@ def admit_response(data,route):
             texts.append(part["text"])
     if len(texts)!=1 or ("output_text" in data and data["output_text"]!=texts[0]):
         raise GatewayError("response_mixed",boundary="provider_response_contract")
-    # The caller still performs canonical JSON and business admission.
+    if strict_image_observations:
+        try:
+            admit_image_observations(texts[0])
+        except ContractViolation as exc:
+            error = GatewayError("response_image_observations", boundary="provider_response_contract")
+            error.diagnostics.update(
+                response_contract_reason=exc.reason,
+                batch_failure_reason={
+                    "response_too_large": "batch_output_limit",
+                    "schema_shape": "batch_output_coverage",
+                }.get(exc.reason, "batch_provider_failure"),
+            )
+            raise error from None
+    # The caller still performs business admission.
     result={"status":"completed","output":copy.deepcopy(output),"model":route.model}
     usage=admitted_usage(data.get("usage"))
     if usage is not None: result["usage"]=usage
@@ -398,7 +420,7 @@ class AiGateway:
     def request(self,operation,envelope, *, send_budget=None, draft_batch=False, response_contract=None):
         route=self.configuration.route(operation)
         if draft_batch:
-            if operation not in {"draft", "draft_high_quality"}:
+            if draft_batch is not True or operation not in {"draft", "draft_high_quality"}:
                 raise GatewayError("envelope_invalid")
             effort = self.configuration.draft_batch_effort
             if effort is not None:
@@ -414,7 +436,14 @@ class AiGateway:
         if ((contract is not None and not contract.matches_text_format(envelope.get("text")))
                 or (contract is None and "text" in envelope)):
             raise GatewayError("envelope_invalid")
+        strict_image_observations = draft_batch is True and self.configuration.draft_image_schema_enabled
+        if strict_image_observations:
+            if set(envelope) != {"model", "input", "reasoning"} or not is_image_batch_input(envelope["input"]):
+                raise GatewayError("envelope_invalid")
+            contract = IMAGE_OBSERVATIONS
         body=copy.deepcopy(envelope)
+        if strict_image_observations:
+            body["text"] = contract.text_format()
         body["provider"]=self.configuration.provider_policy(operation)
         body["store"]=False
         try:
@@ -448,8 +477,12 @@ class AiGateway:
                 finally:
                     if spend is not None:
                         spend.settle(ordinal, cost)
-                result=admit_response(data,route)
+                result=admit_response(data,route, strict_image_observations=strict_image_observations)
             except GatewayError as exc:
+                if strict_image_observations:
+                    exc.diagnostics.setdefault("response_contract_name", contract.name)
+                    exc.diagnostics.setdefault("response_contract_reason", exc.reason)
+                    exc.diagnostics.setdefault("batch_failure_reason", "batch_provider_failure")
                 if contract is not None and schema_rejected(data, exc.diagnostics):
                     exc.reason = "response_schema_rejected"
                     exc.retryable = False

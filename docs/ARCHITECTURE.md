@@ -16,6 +16,20 @@ Synthesis may repair eligible missing fields once within the same send budget.
 The server maps failures, applies protected-mode rules and rechecks the
 catalogue snapshot before returning a draft.
 
+The gateway option `OPENROUTER_DRAFT_IMAGE_SCHEMA_ENABLED` defaults off and
+is independent of the synthesis schema setting. When enabled, the gateway
+adds the strict `draft_image_observations_v1` schema only to Standard and High
+Quality image batches. Each request contains one prompt and one to six
+high-detail images. The gateway checks the provider envelope and bounded
+JSON with nonblank observations before marking the send successful. The server
+still checks one observation per source, preserves source order and labels, and controls
+synthesis and quote creation. A rejected response stops drafting with
+support-safe diagnostics and no additional provider attempt.
+
+The current batch runner also supports the default-off request format.
+Retire that format after both installed routes qualify for the strict schema
+and the operator accepts the change.
+
 ## Pricing and output
 
 Provider draft evidence enters catalogue matching during server-side draft
