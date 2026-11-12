@@ -119,9 +119,12 @@ full stop or line break. The mentioned areas keep their own evidence, including
 in lists with commas, conjunctions or explicit quantifiers. A balanced measurement annotation immediately after a list
 member can hold that member, while the rest of the list still describes
 comparison or exclusion. Read each clause in the annotation independently.
-An explicit revision holds its named scope. A local amount or qualification
-holds the enclosing member. Comparison operands contribute no measurement
-claim, even when they include their own comparison values. An uncertain separation leaves the
+An explicit revision holds its named scope, including a requested change or
+a completed revision. Within a comparison annotation, a named revision on the
+next line still holds that scope. A local amount or qualification holds the
+enclosing member. Comparison operands contribute no measurement claim. A
+balanced note beside an operand can still revise a named scope or qualify the
+enclosing member. An uncertain separation leaves the
 affected measurements in review. A new unwrapped dimensional statement can
 still end the list and flag a conflict for the scope it names.
 An unheaded correction in a separate source entry can also flag a conflict when
@@ -136,8 +139,9 @@ Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. A neutral annotation can corroborate a separately
 proven equal value. A provisional status or unresolved verification of the
 measurement keeps that scope in review, even when the amount agrees. The
-qualification can name the measurement as waiting for verification or describe
-its verification as required, scheduled, pending or incomplete. Completed verification,
+qualification can name the measured area or its dimensions as waiting for
+verification. Future, partial and expressly incomplete verification also keep
+the row in review. Completed verification,
 an explicit statement that verification is no longer required, and unrelated
 invoice or document checks remain neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma

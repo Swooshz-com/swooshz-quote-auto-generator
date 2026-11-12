@@ -43416,6 +43416,22 @@ main().catch((error) => {
                                ("24 sqm (site measurements need to be independently checked)", False),
                                ("24 sqm (field verification has not yet been carried out)", False),
                                ("24 sqm (onsite verification has yet to be done)", False),
+                               ("24 sqm (the measurement will be verified)", False),
+                               ("24 sqm (flooring dimensions will shortly be verified)", False),
+                               ("24 sqm (the flooring dimensions are going to be verified)", False),
+                               ("24 sqm (measurement has yet to undergo a site verification)", False),
+                               ("24 sqm (measurement has not yet been fully verified)", False),
+                               ("24 sqm (measurement has not been satisfactorily verified)", False),
+                               ("24 sqm (measurement has been verified only partially)", False),
+                               ("24 sqm (only some of the dimensions have been verified)", False),
+                               ("24 sqm (not all flooring dimensions have been independently verified)", False),
+                               ("24 sqm (flooring dimensions still require verification)", False),
+                               ("24 sqm (verification of the flooring dimensions will happen later)", False),
+                               ("24 sqm (the flooring dimensions have been fully independently verified)", True),
+                               ("24 sqm (flooring dimensions do not require verification)", True),
+                               ("24 sqm (all of the flooring dimensions have been verified)", True),
+                               ("24 sqm (invoice value is awaiting verification)", True),
+                               ("24 sqm (the paperwork will be verified)", True),
                                ("24 sqm (site measurement is waiting on independent verification)", False),
                                ("24 sqm (measurement must still be confirmed)", False),
                                ("24 sqm (site measurement will need verification)", False),
@@ -43703,6 +43719,21 @@ main().catch((error) => {
             (f"revise {east} to 4 sqm {compare}", {west: 24, east: None, north: 5}),
             (f"{compare}, the {east} at 10 sqm", {west: 24, east: 10, north: 5}),
             (f"{compare} but now measured at 4 sqm", {west: None, east: 10, north: 5}),
+            (f"{compare}, {east} has been subsequently remeasured to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}\n{east} must be revised to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}\n{east} will need to be independently revised to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}; {east} has yet to be corrected to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}; {east} would need to be remeasured to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at\n5 sqm\nand {east} at 10 sqm", {west: 24, east: 10, north: 5}),
+            (f"{compare}, {east}: 4 sqm", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at [5 sqm] [revise {east} to 4 sqm]", {west: 24, east: None, north: 5}),
+            (f"compared with {north} [5 sqm]", {west: 24, east: 10, north: 5}),
+            (f"compared with {north} at about 5 sqm [revise {east} to 4 sqm]", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at 4 to 6 sqm [now measured at 4 sqm]", {west: None, east: 10, north: 5}),
+            (f"compared with {north} [revise {east} to 4 sqm] [now measured at 4 sqm]",
+             {west: None, east: None, north: 5}),
+            (f"{compare}, [{east} at 10 sqm] [drawing revision]", {west: 24, east: 10, north: 5}),
+            (f"{compare}, [{east} at 10 sqm] [revise {west} to 4 sqm]", {west: None, east: 10, north: 5}),
         )
         for annotation, expected in member_cases:
             with self.subTest(annotation=annotation):
@@ -43889,6 +43920,29 @@ main().catch((error) => {
             ("vf-must", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement must undergo verification)", 24, "observed", False),
             ("vf-due", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement is due for verification)", 24, "observed", False),
             ("vf-none", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement needs no further verification)", 24, "observed", True),
+            ("pf-fut", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the measurement will be verified)", 24, "observed", False),
+            ("pf-yet", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement has yet to undergo verification)", 24, "observed", False),
+            ("pf-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement has not yet been fully verified)", 24, "observed", False),
+            ("pf-dim", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions still require verification)", 24, "observed", False),
+            ("pf-event", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification will be completed)", 24, "observed", False),
+            ("pf-part", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions have been partially verified)", 24, "observed", False),
+            ("pf-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurements have been fully independently verified)", 24, "observed", True),
+            ("pf-none", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions do not require verification)", 24, "observed", True),
+            ("pf-inv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice will be verified)", 24, "observed", True),
+            ("pf-value", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice value is awaiting verification)", 24, "observed", True),
+            ("op-pass", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has been revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-pass-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\nCarpet tile east has been revised to 4 sqm,\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[revise Carpet tile east to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-note-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\n[revise Carpet tile east to 4 sqm]\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-value", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at (5 sqm)),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-local", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[now measured at 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", False),
+            ("op-both", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[Carpet tile east has been revised to 4 sqm]\n[now measured at 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", False),
+            ("op-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with [Carpet tile north at 5 sqm]\n[revise Carpet tile east to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-s", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm;\nCarpet tile east needs to be revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-d", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm.\nCarpet tile east needs to be revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-l", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\nCarpet tile east needs to be revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\nCarpet tile east needs to be revised to 4 sqm\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-n", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[Carpet tile east needs to be revised to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -43919,8 +43973,13 @@ main().catch((error) => {
         scoped_verification = {
             "vf-await", "vf-of", "vf-yet", "vf-tail", "vf-for", "vf-need", "vf-neg", "vf-done", "vf-inv", "vf-invpre",
             "vf-will", "vf-must", "vf-due", "vf-none",
+            "pf-fut", "pf-yet", "pf-neg", "pf-dim", "pf-event", "pf-part", "pf-done", "pf-none", "pf-inv", "pf-value",
         }
-        scoped_annotations = {"an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local"}
+        scoped_annotations = {
+            "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
+            "op-pass", "op-pass-r", "op-note", "op-note-r", "op-value", "op-local", "op-both", "op-wrap",
+            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n",
+        }
         dotted_comparisons = {"mem-dot-neutral", "mem-dot-first", "mem-dot-mid"}
         wrapped_comparisons = {"mem-line-neutral", "mem-line-first", "mem-line-mid"}
         three_area_lists = {"list-comma", "list-ox", "list-all", "list-sep", "list-embed", "list-qty", "list-unc",
@@ -44085,6 +44144,8 @@ main().catch((error) => {
                             "open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty", "ref-clause", "list-unc",
                             "mem-mid", "mem-wait", "mem-dot-mid", "mem-line-mid",
                             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-nest",
+                            "op-pass", "op-pass-r", "op-note", "op-note-r", "op-both", "op-wrap",
+                            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
@@ -44199,7 +44260,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 16):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 17):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44261,7 +44322,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 17):
+            for version in range(1, 18):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44275,7 +44336,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 16
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 17
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
