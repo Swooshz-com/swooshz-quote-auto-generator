@@ -43720,6 +43720,9 @@ main().catch((error) => {
             (f"{compare}, the {east} at 10 sqm", {west: 24, east: 10, north: 5}),
             (f"{compare} but now measured at 4 sqm", {west: None, east: 10, north: 5}),
             (f"{compare}, {east} has been subsequently remeasured to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} has since been corrected to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} had just been recalculated to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} has already been adjusted to 4 sqm", {west: 24, east: None, north: 5}),
             (f"{compare}\n{east} must be revised to 4 sqm", {west: 24, east: None, north: 5}),
             (f"{compare}\n{east} will need to be independently revised to 4 sqm", {west: 24, east: None, north: 5}),
             (f"{compare}; {east} has yet to be corrected to 4 sqm", {west: 24, east: None, north: 5}),
@@ -43943,6 +43946,7 @@ main().catch((error) => {
             ("op-need-l", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\nCarpet tile east needs to be revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("op-need-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\nCarpet tile east needs to be revised to 4 sqm\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("op-need-n", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[Carpet tile east needs to be revised to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-since", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has since been corrected to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -43978,7 +43982,7 @@ main().catch((error) => {
         scoped_annotations = {
             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
             "op-pass", "op-pass-r", "op-note", "op-note-r", "op-value", "op-local", "op-both", "op-wrap",
-            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n",
+            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
         }
         dotted_comparisons = {"mem-dot-neutral", "mem-dot-first", "mem-dot-mid"}
         wrapped_comparisons = {"mem-line-neutral", "mem-line-first", "mem-line-mid"}
@@ -44145,7 +44149,7 @@ main().catch((error) => {
                             "mem-mid", "mem-wait", "mem-dot-mid", "mem-line-mid",
                             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-nest",
                             "op-pass", "op-pass-r", "op-note", "op-note-r", "op-both", "op-wrap",
-                            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n",
+                            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",

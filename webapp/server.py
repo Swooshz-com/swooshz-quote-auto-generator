@@ -25612,19 +25612,19 @@ AREA_STATUS_TIMING = r"(?:(?:still|currently)\s+)?"
 AREA_VERIFICATION_RESULT = (
     r"(?:confirmed|verified|validated|checked|measured|complete(?:d)?|done|finished|performed|carried\s+out)\b"
 )
-AREA_VERIFICATION_MANNER = r"(?:well|[^\W\d_][\w-]*ly)"
+AREA_MANNER_ADVERB = r"(?:well|[^\W\d_][\w-]*ly)"
 AREA_VERIFICATION_PARTIAL = r"(?:partly|partially|provisionally|preliminarily|incompletely)"
 AREA_VERIFICATION_NEGATION = r"(?:not|never|(?:has|have|had|is|are|was|were)n['\u2019]t)"
 AREA_VERIFICATION_TIMING = r"(?:still|soon|shortly|eventually|later|subsequently)"
 AREA_PROSPECTIVE_LINK = r"(?:(?:yet|due|scheduled|planned|expected|set|going|needs?|requires?)\s+)?to"
 AREA_VERIFICATION_FUTURE = rf"(?:will|must|{AREA_PROSPECTIVE_LINK})"
 AREA_UNVERIFIED_RESULT = (
-    rf"(?:{AREA_VERIFICATION_NEGATION}\s+(?:(?:yet|been|{AREA_VERIFICATION_MANNER})\s+)*"
+    rf"(?:{AREA_VERIFICATION_NEGATION}\s+(?:(?:yet|been|{AREA_MANNER_ADVERB})\s+)*"
     rf"{AREA_VERIFICATION_RESULT}"
     rf"|(?:{AREA_VERIFICATION_FUTURE}|will\s+not|won['\u2019]t)\s+(?:{AREA_VERIFICATION_TIMING}\s+)?be\s+"
-    rf"(?:{AREA_VERIFICATION_MANNER}\s+)*"
+    rf"(?:{AREA_MANNER_ADVERB}\s+)*"
     rf"{AREA_VERIFICATION_RESULT}"
-    rf"|(?:only\s+)?(?:been\s+)?{AREA_VERIFICATION_PARTIAL}\s+(?:{AREA_VERIFICATION_MANNER}\s+)*"
+    rf"|(?:only\s+)?(?:been\s+)?{AREA_VERIFICATION_PARTIAL}\s+(?:{AREA_MANNER_ADVERB}\s+)*"
     rf"{AREA_VERIFICATION_RESULT}"
     rf"|{AREA_VERIFICATION_RESULT}\s+(?:only\s+)?{AREA_VERIFICATION_PARTIAL}\b)"
 )
@@ -25647,7 +25647,7 @@ AREA_VERIFICATION_EVENT_STATUS = (
 )
 AREA_PARTIAL_MEASUREMENT_VERIFICATION = (
     rf"(?:only\s+)?(?:some|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?{AREA_MEASURE_TOPIC}"
-    rf"{AREA_STATUS_LINKS}(?:{AREA_VERIFICATION_MANNER}\s+)*{AREA_VERIFICATION_RESULT}"
+    rf"{AREA_STATUS_LINKS}(?:{AREA_MANNER_ADVERB}\s+)*{AREA_VERIFICATION_RESULT}"
 )
 AREA_ATTACHED_QUALIFIER = re.compile(
     rf"(?:{AREA_VERIFICATION_TOPIC}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_VERIFICATION_EVENT_STATUS}"
@@ -25697,10 +25697,11 @@ AREA_REVISION_ACTION = (
 AREA_REVISION_PREFIX = re.compile(
     rf"(?:{AREA_REVISION_ACTION}(?:\s+(?:measurement|area|quantity|value))?(?:\s+(?:for|to|of))?[\s:\-]*)?", re.I,
 )
-AREA_PASSIVE_REVISION = (
-    rf"(?:(?:{AREA_PROSPECTIVE_LINK}|is|are|was|were|be|has|have|had|been|being|will|would|should|must|can|could"
-    rf"|now|already|recently|independently|subsequently)\s+)+{AREA_REVISION_ACTION}\b"
+AREA_REVISION_AUXILIARY = (
+    rf"(?:{AREA_PROSPECTIVE_LINK}|is|are|was|were|be|has|have|had|been|being|will|would|should|must|can|could)"
 )
+AREA_REVISION_MODIFIER = rf"(?:now|already|since|still|just|also|{AREA_MANNER_ADVERB})"
+AREA_PASSIVE_REVISION = rf"(?:(?:{AREA_REVISION_AUXILIARY}|{AREA_REVISION_MODIFIER})\s+)+{AREA_REVISION_ACTION}\b"
 AREA_VALUE_RELATION = re.compile(
     rf"^(?:(?:{AREA_PASSIVE_REVISION}|to|is|was|now|should\s+be|measurement|area|quantity|value|{AREA_REVISION_ACTION})\s+"
     r"|[:=]\s*)+", re.I,
