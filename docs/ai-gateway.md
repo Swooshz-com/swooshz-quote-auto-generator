@@ -118,9 +118,10 @@ a comparison record after a complete measured statement, including after a
 full stop or line break. The mentioned areas keep their own evidence, including
 in lists with commas, conjunctions or explicit quantifiers. A balanced measurement annotation immediately after a list
 member can hold that member, while the rest of the list still describes
-comparison or exclusion. If the annotation explicitly revises a different
-scope, that scope stays in review. A comparison-only annotation preserves
-each area's own evidence. An uncertain separation leaves the
+comparison or exclusion. Read each clause in the annotation independently.
+An explicit revision holds its named scope. A local amount or qualification
+holds the enclosing member. Comparison operands contribute no measurement
+claim, even when they include their own comparison values. An uncertain separation leaves the
 affected measurements in review. A new unwrapped dimensional statement can
 still end the list and flag a conflict for the scope it names.
 An unheaded correction in a separate source entry can also flag a conflict when
@@ -133,10 +134,12 @@ own value has an estimated or assumed qualifier in a balanced wrapper with
 explanatory text.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. A neutral annotation can corroborate a separately
-proven equal value. An attached provisional status, verification still required
-or an explicitly unverified measurement keeps that scope in review, even when
-the amount agrees. Completed verification and document details such as page
-settings can remain neutral context. A derived
+proven equal value. A provisional status or unresolved verification of the
+measurement keeps that scope in review, even when the amount agrees. The
+qualification can name the measurement as waiting for verification or describe
+its verification as required, scheduled, pending or incomplete. Completed verification,
+an explicit statement that verification is no longer required, and unrelated
+invoice or document checks remain neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.
