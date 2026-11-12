@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 15
+AREA_EVIDENCE_CLAIM_VERSION = 16
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25592,10 +25592,12 @@ AREA_METRE_UNIT = re.compile(r"m|metres?|meters?", re.I)
 AREA_PROVISIONAL_STATUS = r"(?:provisional|default|assumed|estimated|guessed)\b"
 AREA_PROVISIONAL_QUALIFIER = re.compile(AREA_PROVISIONAL_STATUS, re.I)
 AREA_VERIFICATION_EVENT = r"(?:confirm(?:ation|ing)|verif(?:ication|ying)|validat(?:ion|ing))"
+AREA_STATUS_MODIFIERS = r"(?:(?:on[- ]site|site|field|physical|independent|final|measurement|survey)\s+)*"
 AREA_STATUS_TOPIC = (
-    r"(?:(?:(?:on[- ]site|site|field|physical|independent|final|measurement|survey)\s+)*"
-    rf"(?:area|coverage|dimensions?|measurements?|quantity|value|survey|{AREA_VERIFICATION_EVENT}))"
+    rf"(?:{AREA_STATUS_MODIFIERS}(?:area|coverage|dimensions?|measurements?|quantity|value|survey|{AREA_VERIFICATION_EVENT}))"
 )
+AREA_STATUS_LINKS = r"(?:\s+(?:status|is|are|was|were|remains?|has|have|had|been))*[\s:\-\u2013\u2014]+"
+AREA_STATUS_TIMING = r"(?:(?:still|currently)\s+)?"
 AREA_VERIFICATION_RESULT = r"(?:confirmed|verified|validated|measured|complete(?:d)?|performed)"
 AREA_NEGATED_VERIFICATION = (
     r"(?:(?:not|never)|(?:has|have|had|is|are|was|were)n['\u2019]t)\s+"
@@ -25605,13 +25607,17 @@ AREA_UNRESOLVED_STATUS = (
     rf"(?:{AREA_PROVISIONAL_STATUS}|pending|outstanding|incomplete|unverified|unconfirmed|unmeasured|unresolved)\b"
 )
 AREA_ATTACHED_QUALIFIER = re.compile(
-    rf"(?:(?:{AREA_STATUS_TOPIC}|status)(?:\s+(?:status|is|are|was|were|remains?|has|have|had|been))*[\s:\-\u2013\u2014]+)?"
-    rf"(?:(?:still|currently)\s+)?(?:{AREA_UNRESOLVED_STATUS}"
+    rf"(?:(?:{AREA_STATUS_TOPIC}|status){AREA_STATUS_LINKS})?"
+    rf"{AREA_STATUS_TIMING}(?:{AREA_UNRESOLVED_STATUS}"
     rf"(?=$|[.!?]|\s+(?:in|from|using|until|pending|for|at|as|per|{AREA_STATUS_TOPIC}"
     r"|drawings?|plans?|sketch(?:es)?|models?)\b)"
     rf"|{AREA_NEGATED_VERIFICATION}|(?:awaiting|waiting\s+for|subject\s+to)\s+{AREA_STATUS_TOPIC}\b"
     rf"|(?:yet\s+)?to\s+be\s+{AREA_VERIFICATION_RESULT}\b)",
     re.I,
+)
+AREA_VERIFICATION_REQUIREMENT = re.compile(
+    rf"{AREA_STATUS_MODIFIERS}{AREA_VERIFICATION_EVENT}{AREA_STATUS_LINKS}"
+    rf"{AREA_STATUS_TIMING}(?:required|needed|necessary|mandatory)\b", re.I,
 )
 AREA_UNIT_MARKER = re.compile(
     rf"(?<![^\W\d_])(?:{AREA_CLAIM_UNIT}|square\s+(?:{SCOPE_LENGTH_UNIT}|units?)"
@@ -25949,6 +25955,35 @@ def area_conflict_records(text: str, context: list[int]):
         part_start = next_start
 
 
+def area_headed_comparison(text: str, start: int, stop: int, colon: int | None,
+                           patterns: AreaScopePatterns) -> bool:
+    """Find a headed measurement with an explicit comparison to a known scope."""
+    if colon is None:
+        return False
+    body = text[start + colon + 1:stop]
+    reference = patterns.reference.search(body.translate(AREA_SCOPE_WRAPPERS))
+    relation = AREA_CONTEXT_RELATION.search(body, 0, reference.start("label")) if reference else None
+    return bool(relation and not relation["uncertain"]
+                and area_complete_frame(clean_text(body[:relation.start()]).rstrip(", ")))
+
+
+def area_comparison_records(text: str, context: list[int], patterns: AreaScopePatterns):
+    """A physical line break can start a headed comparison record."""
+    for start, stop, colon in area_conflict_records(text, context):
+        source_start = start
+        for line_break in re.finditer(r"\n", text[source_start:stop]):
+            boundary = source_start + line_break.start()
+            if context[boundary] != -1 or not text[start:boundary].strip():
+                continue
+            candidate = boundary + 1
+            line_stop = text.find("\n", candidate, stop)
+            candidate_colon = area_heading_colon(text[candidate:stop if line_stop < 0 else line_stop])
+            if area_headed_comparison(text, candidate, stop, candidate_colon, patterns):
+                yield start, boundary, area_heading_colon(text[start:boundary])
+                start, colon = candidate, candidate_colon
+        yield start, stop, colon
+
+
 def area_value_parts(text: str) -> tuple[re.Match[str] | None, re.Match[str] | None, str, bool]:
     derived = AREA_DERIVED_CLAIM.match(text)
     observed = None if derived else AREA_OBSERVED_CLAIM.match(text)
@@ -25979,7 +26014,11 @@ def area_annotation_text(value: str, annotation: str) -> str:
 
 
 def area_unresolved_qualification(text: str) -> bool:
-    return any(AREA_ATTACHED_QUALIFIER.match(clause.strip()) for clause in AREA_QUALIFICATION_BREAK.split(text))
+    for clause in AREA_QUALIFICATION_BREAK.split(text):
+        clause = clause.strip()
+        if AREA_ATTACHED_QUALIFIER.match(clause) or AREA_VERIFICATION_REQUIREMENT.match(clause):
+            return True
+    return False
 
 
 def area_provisional_annotation(context: str) -> bool:
@@ -26051,10 +26090,13 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
     """Discover labels before assigning source framing or interpreting values."""
     text = unicodedata.normalize("NFKC", raw).casefold()
     context, pairs = area_bracket_context(text)
-    source_records = list(area_conflict_records(text, context))
+    source_records = list(area_comparison_records(text, context, patterns))
+    comparison_starts = []
     contextual = set()
     member_claims = []
     for start, stop, colon in source_records:
+        if area_headed_comparison(text, start, stop, colon, patterns):
+            comparison_starts.append(start)
         for position, scopes, annotations in area_comparison_members(text, start, stop, colon, patterns, pairs):
             contextual.add(position)
             for left, right in annotations:
@@ -26116,6 +26158,9 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
         for index, record in enumerate(records):
             limit = records[index + 1].start if index + 1 < len(records) else end
             if record.framed:
+                comparison = next((start for start in comparison_starts if record.end < start < limit), None)
+                if comparison is not None and area_complete_frame(clean_text(text[record.end:comparison])):
+                    limit = comparison
                 for opener, closer in pairs.items():
                     if not (record.end <= opener < closer < limit and context[opener] == group):
                         continue

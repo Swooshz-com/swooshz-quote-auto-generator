@@ -93,9 +93,9 @@ ranges and dimensions with uncertain components. Wrapped labels and measurement
 lines stay together. Wrapped qualifiers and ranges keep their meaning when the
 source wraps onto the next line. A question mark keeps a measurement in review.
 A label inside an annotation can flag a conflict for its own scope. A rate
-requires clearly framed proof. Use a semicolon before a heading outside the
-quoted scopes to start a separate record. A new line alone does not separate an
-unbound dimensional heading from the preceding scope. The same rule applies
+requires clearly framed proof. Use a semicolon before an ordinary dimensional
+heading outside the quoted scopes to start a separate record. A new line alone
+does not separate an unbound dimensional heading from the preceding scope. The same rule applies
 before an exact measurement label. A first measurement after an unpunctuated
 PDF title stays in pricing review unless the source has a clear record boundary
 or supplies the measurement in a separate entry. Independently supported scopes
@@ -112,9 +112,11 @@ claim when it lacks the exact label and value needed for proof. The longest
 explicit scope label identifies the affected row when labels overlap. A heading
 with a distinct spatial qualifier can describe a separate area, including a
 chain of location relations or a level in brackets. An explicit comparison or
-exclusion describes the measurement it qualifies. The mentioned areas keep
-their own evidence, including in lists with commas, conjunctions or explicit
-quantifiers. A balanced measurement annotation immediately after a list
+exclusion describes the measurement it qualifies. A heading with its own
+complete measured shape and an explicit comparison to a named scope starts
+a comparison record after a complete measured statement, including after a
+full stop or line break. The mentioned areas keep their own evidence, including
+in lists with commas, conjunctions or explicit quantifiers. A balanced measurement annotation immediately after a list
 member can hold that member, while the rest of the list still describes
 comparison or exclusion. If the annotation explicitly revises a different
 scope, that scope stays in review. A comparison-only annotation preserves
@@ -131,9 +133,9 @@ own value has an estimated or assumed qualifier in a balanced wrapper with
 explanatory text.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. A neutral annotation can corroborate a separately
-proven equal value. An attached provisional status, incomplete verification or
-an explicitly unverified measurement keeps that scope in review, even when the
-amount agrees. Completed verification and document details such as page
+proven equal value. An attached provisional status, verification still required
+or an explicitly unverified measurement keeps that scope in review, even when
+the amount agrees. Completed verification and document details such as page
 settings can remain neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.

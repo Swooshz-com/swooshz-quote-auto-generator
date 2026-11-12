@@ -43400,6 +43400,9 @@ main().catch((error) => {
                                ("24 sqm (awaiting site verification)", False),
                                ("24 sqm (measurement is waiting for independent confirmation)", False),
                                ("24 sqm (site verification outstanding)", False),
+                               ("24 sqm (site verification required before installation)", False),
+                               ("24 sqm (field confirmation is still needed)", False),
+                               ("24 sqm (invoice verification required)", True),
                                ("24 sqm (field verification remains outstanding)", False),
                                ("24 sqm (field verification has not been completed)", False),
                                ("24 sqm (site verification is not yet complete)", False),
@@ -43654,6 +43657,21 @@ main().catch((error) => {
                 claims = webapp.area_source_claims(f"{exact} {note}", patterns)
                 self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
 
+        comparison = f"Sample boards: 2 sqm, separate from {west}, {east}, and {north}"
+        boundary_cases = (
+            (f"{north}: 5 sqm. {comparison}", 5),
+            (f"{north}: 5 sqm\n{comparison}", 5),
+            (f"{north}: 5 sqm (site verification required)\n{comparison}", None),
+            (f"{north}: 5 sqm. Additional 4 sqm\n{comparison}", None),
+            (f"{north}: 5 sqm\n2 sqm, separate from {west} and {east}", None),
+            (f"{north}: 5 sqm\nSample boards: 2 sqm, possibly separate from {west} and {east}", None),
+        )
+        for raw, expected in boundary_cases:
+            with self.subTest(raw=raw):
+                claims = [claim for claim in webapp.area_source_claims(raw, patterns) if claim.scope == north]
+                self.assertEqual(claims[0].quantity, expected)
+                self.assertEqual(len(claims), 1)
+
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
         from scripts.generate_quote import read_first_sheet_rows_with_numbers, write_text_pdf
@@ -43782,6 +43800,12 @@ main().catch((error) => {
             ("mem-last", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east, and Carpet tile north (now measured at 4 sqm)", 24, "observed", True),
             ("mem-wait", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east (awaiting site verification), and Carpet tile north", 24, "observed", True),
             ("mem-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (site verification completed),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-dot-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (site verification completed), Carpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-dot-first", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (now measured at 4 sqm), Carpet tile east, and Carpet tile north", 24, "observed", False),
+            ("mem-dot-mid", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east (now measured at 4 sqm), and Carpet tile north", 24, "observed", True),
+            ("mem-line-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (site verification completed), Carpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-line-first", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (now measured at 4 sqm), Carpet tile east, and Carpet tile north", 24, "observed", False),
+            ("mem-line-mid", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east (now measured at 4 sqm), and Carpet tile north", 24, "observed", True),
             ("mem-other", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (revise Carpet tile north to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("mem-compare", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (compared with Carpet tile north at 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
             ("mem-mixed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (compared with Carpet tile north at 5 sqm,\nnow measured at 4 sqm), Carpet tile east, and Carpet tile north", 24, "observed", False),
@@ -43801,6 +43825,9 @@ main().catch((error) => {
             ("st-noverify", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement has not been verified)", 24, "observed", False),
             ("st-await", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (awaiting site verification)", 24, "observed", False),
             ("st-open", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification outstanding)", 24, "observed", False),
+            ("st-required", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification required)", 24, "observed", False),
+            ("st-needed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (field confirmation is still needed)", 24, "observed", False),
+            ("st-inv-req", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification required)", 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -43828,9 +43855,11 @@ main().catch((error) => {
             ("uncertain-extent", label, label, f"{label}: 24 sqm", f"{label}: W 6 m x D 4 m, partial coverage", 24, "observed", False),
             ("duplicate", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24 SQM", 24, "observed", False),
         )
+        dotted_comparisons = {"mem-dot-neutral", "mem-dot-first", "mem-dot-mid"}
+        wrapped_comparisons = {"mem-line-neutral", "mem-line-first", "mem-line-mid"}
         three_area_lists = {"list-comma", "list-ox", "list-all", "list-sep", "list-embed", "list-qty", "list-unc",
                             "mem-first", "mem-mid", "mem-last", "mem-wait", "mem-neutral", "mem-other",
-                            "mem-compare", "mem-mixed", "mem-break"}
+                            "mem-compare", "mem-mixed", "mem-break"} | dotted_comparisons | wrapped_comparisons
         north_cases = {"est-chain", "geo-chain", "est-sep", "bracket-geo", "paren-val", "brace-geo",
                        "wrap-geo", "wrap-val", "wrap-brace"} | three_area_lists
         embedded_revisions = {"re-embed", "re-later", "re-title", "re-amount", "re-mixed", "re-mixqty"}
@@ -43841,7 +43870,8 @@ main().catch((error) => {
                            "prov-note", "rev-repeat", "re-brack", "re-square", "loc-chain", "loc-level",
                            "ref-split", "ref-prose", "ref-head", "ref-both", "ref-clause", "ref-neg", "ref-excl", "st-site", "st-unver", "st-field",
                            "st-still", "st-source", "st-key", "st-survey", "list-both",
-                           "st-noverify", "st-await", "st-open", "st-done", "st-invoice"} | embedded_revisions
+                           "st-noverify", "st-await", "st-open", "st-done", "st-invoice",
+                           "st-required", "st-needed", "st-inv-req"} | embedded_revisions
         aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
                         "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
         qualifier_cases = aside_cases | north_cases
@@ -43910,6 +43940,12 @@ main().catch((error) => {
                             terminal = ";" if name in semicolon_cases else "" if name == "assume-soft" else "."
                             wrap = " " if name == "free-inline" else "\n"
                             sources = [f"{statement}{terminal}{wrap}{other};\n{east_statement}"]
+                        elif name in dotted_comparisons | wrapped_comparisons:
+                            separator = "\n"
+                            if name in dotted_comparisons:
+                                separator = ".\n" if route == "pdf" else ". "
+                            wrapped_other = other.replace(", Carpet tile east", ",\nCarpet tile east")
+                            sources = [separator.join((statement, east_statement, north_statement, wrapped_other))]
                         elif name in three_area_lists:
                             sources = [f"{statement};\n{other};\n{east_statement};\n{north_statement}"]
                         elif name in north_cases:
@@ -43981,7 +44017,7 @@ main().catch((error) => {
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
                         east_priced = name in dual_cases and name not in {
                             "open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty", "ref-clause", "list-unc",
-                            "mem-mid", "mem-wait",
+                            "mem-mid", "mem-wait", "mem-dot-mid", "mem-line-mid",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
@@ -44096,7 +44132,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 14):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 15):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44158,7 +44194,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 15):
+            for version in range(1, 16):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44172,7 +44208,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 14
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 15
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
