@@ -25616,7 +25616,11 @@ AREA_VERIFICATION_TOPIC = (
     rf"(?:(?:the|a|an)\s+)?{AREA_STATUS_MODIFIERS}{AREA_VERIFICATION_EVENT}\b"
     rf"(?:\s+(?:of|for|on)\s+{AREA_MEASURE_TOPIC}|(?!\s+(?:of|for|on)\s+))"
 )
-AREA_STATUS_TOPIC = rf"(?:{AREA_VERIFICATION_TOPIC}|{AREA_MEASURE_TOPIC}|status\b)"
+AREA_APPROVAL_EVENT = r"(?:approval|sign[\s-]+off)\b"
+AREA_APPROVAL_OBJECT = rf"(?:of|for|on)\s+{AREA_MEASURE_TOPIC}"
+AREA_DIMENSION_APPROVAL = rf"(?:the\s+)?{AREA_STATUS_MODIFIERS}{AREA_APPROVAL_EVENT}\s+{AREA_APPROVAL_OBJECT}"
+AREA_MEASUREMENT_EVENT = rf"(?:{AREA_VERIFICATION_TOPIC}|{AREA_DIMENSION_APPROVAL})"
+AREA_STATUS_TOPIC = rf"(?:{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC}|status\b)"
 AREA_STATUS_LINKS = r"(?:\s+(?:status|is|are|was|were|remains?|has|have|had|been|still|currently|already))*[\s:\-\u2013\u2014]+"
 AREA_STATUS_TIMING = r"(?:(?:still|currently)\s+)?"
 AREA_VERIFICATION_RESULT = (
@@ -25629,27 +25633,34 @@ AREA_VERIFICATION_NEGATION = rf"(?:not|never|{AREA_NEGATED_AUXILIARY})"
 AREA_VERIFICATION_TIMING = r"(?:still|soon|shortly|eventually|later|subsequently)"
 AREA_PROSPECTIVE_LINK = r"(?:(?:yet|due|scheduled|planned|expected|set|going|needs?|requires?)\s+)?to"
 AREA_VERIFICATION_FUTURE = rf"(?:will|must|{AREA_PROSPECTIVE_LINK})"
-AREA_UNVERIFIED_RESULT = (
+AREA_UNFINISHED_RESULT_PREFIX = (
     rf"(?:{AREA_VERIFICATION_NEGATION}\s+(?:(?:yet|all|been|{AREA_MANNER_ADVERB})\s+)*"
-    rf"{AREA_VERIFICATION_RESULT}"
     rf"|(?:{AREA_VERIFICATION_FUTURE}|will\s+not|won['\u2019]t)\s+(?:(?:only|{AREA_VERIFICATION_TIMING})\s+)*be\s+"
     rf"(?:{AREA_MANNER_ADVERB}\s+)*"
-    rf"{AREA_VERIFICATION_RESULT}"
-    rf"|(?:(?:only|been|{AREA_MANNER_ADVERB})\s+)*{AREA_VERIFICATION_PARTIAL}\s+(?:(?:been|{AREA_MANNER_ADVERB})\s+)*"
-    rf"{AREA_VERIFICATION_RESULT}"
-    rf"|{AREA_VERIFICATION_RESULT}\s+(?:only\s+)?{AREA_VERIFICATION_PARTIAL}\b)"
+    rf"|(?:(?:only|been|{AREA_MANNER_ADVERB})\s+)*{AREA_VERIFICATION_PARTIAL}\s+(?:(?:been|{AREA_MANNER_ADVERB})\s+)*)"
+)
+AREA_UNFINISHED_RESULT_SUFFIX = rf"\s+(?:only\s+)?{AREA_VERIFICATION_PARTIAL}\b"
+AREA_UNVERIFIED_RESULT = (
+    rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_VERIFICATION_RESULT}|{AREA_VERIFICATION_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
+)
+AREA_APPROVAL_RESULT = r"(?:approved|signed[\s-]+off)\b"
+AREA_UNAPPROVED_RESULT = (
+    rf"(?:{AREA_UNFINISHED_RESULT_PREFIX}{AREA_APPROVAL_RESULT}|{AREA_APPROVAL_RESULT}{AREA_UNFINISHED_RESULT_SUFFIX})"
 )
 AREA_UNRESOLVED_STATUS = (
     rf"(?:{AREA_PROVISIONAL_STATUS}|pending|outstanding|incomplete|unverified|unconfirmed|unmeasured|unresolved)\b"
 )
-AREA_WAITING_FOR_VERIFICATION = (
-    rf"(?:await(?:s|ing)?|wait(?:s|ing)?\s+(?:for|on)|subject\s+to|requir(?:e|es|ing)|need(?:s|ing)?)\s+"
-    rf"(?:{AREA_VERIFICATION_TOPIC}|{AREA_MEASURE_TOPIC})"
-)
+AREA_WAITING_ACTION = r"(?:await(?:s|ing)?|wait(?:s|ing)?\s+(?:for|on)|subject\s+to|requir(?:e|es|ing)|need(?:s|ing)?)"
+AREA_WAITING_FOR_VERIFICATION = rf"{AREA_WAITING_ACTION}\s+(?:{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC})"
 AREA_VERIFICATION_OBLIGATION = (
     r"(?:will\s+(?:still\s+)?(?:need|require)"
     rf"|(?:{AREA_VERIFICATION_FUTURE}|(?:has|have|will\s+have)\s+to)\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:undergo|receive|complete)"
     r"|(?:due|scheduled)\s+for)"
+)
+AREA_APPROVAL_PENDING = (
+    rf"(?:{AREA_WAITING_ACTION}|{AREA_VERIFICATION_OBLIGATION})\s+(?:(?:the|a|an|their|its)\s+)?"
+    rf"{AREA_STATUS_MODIFIERS}{AREA_APPROVAL_EVENT}"
+    rf"(?:\s+{AREA_APPROVAL_OBJECT}|(?!\s+(?:of|for|on)\s+))"
 )
 AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled|planned)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
@@ -25658,16 +25669,17 @@ AREA_VERIFICATION_EVENT_STATUS = (
 )
 AREA_PARTIAL_MEASUREMENT_VERIFICATION = (
     rf"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?{AREA_MEASURE_TOPIC}"
-    rf"{AREA_STATUS_LINKS}(?:{AREA_MANNER_ADVERB}\s+)*{AREA_VERIFICATION_RESULT}"
+    rf"{AREA_STATUS_LINKS}(?:{AREA_MANNER_ADVERB}\s+)*(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})"
 )
 AREA_ATTACHED_QUALIFIER = re.compile(
-    rf"(?:{AREA_VERIFICATION_TOPIC}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_VERIFICATION_EVENT_STATUS}"
+    rf"(?:{AREA_MEASUREMENT_EVENT}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_VERIFICATION_EVENT_STATUS}"
+    rf"|{AREA_MEASURE_TOPIC}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}(?:{AREA_APPROVAL_PENDING}|{AREA_UNAPPROVED_RESULT})"
     rf"|{AREA_PARTIAL_MEASUREMENT_VERIFICATION}"
     rf"|{AREA_STATUS_TOPIC}{AREA_STATUS_LINKS}{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
     rf"|(?:{AREA_STATUS_TOPIC}{AREA_STATUS_LINKS})?{AREA_STATUS_TIMING}"
     rf"(?:{AREA_UNVERIFIED_RESULT}|{AREA_WAITING_FOR_VERIFICATION}"
     rf"|{AREA_VERIFICATION_OBLIGATION}\s+{AREA_VERIFICATION_TOPIC})"
-    rf"|{AREA_STATUS_TIMING}(?:{AREA_VERIFICATION_REQUIREMENT}|{AREA_UNRESOLVED_STATUS})\s+{AREA_VERIFICATION_TOPIC}"
+    rf"|{AREA_STATUS_TIMING}(?:{AREA_VERIFICATION_REQUIREMENT}|{AREA_UNRESOLVED_STATUS})\s+{AREA_MEASUREMENT_EVENT}"
     rf"|{AREA_STATUS_TIMING}{AREA_UNRESOLVED_STATUS}"
     rf"(?=$|[.!?]|\s+(?:in|from|using|until|pending|for|at|as|per|{AREA_MEASURE_TOPIC}"
     r"|drawings?|plans?|sketch(?:es)?|models?)\b))",
