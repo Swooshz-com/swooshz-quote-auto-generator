@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 13
+AREA_EVIDENCE_CLAIM_VERSION = 14
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25591,12 +25591,21 @@ AREA_FULL_COVERAGE = re.compile(r"(?:,\s*full coverage\b|\(\s*full coverage\s*\)
 AREA_METRE_UNIT = re.compile(r"m|metres?|meters?", re.I)
 AREA_PROVISIONAL_STATUS = r"(?:provisional|default|assumed|estimated|guessed)\b"
 AREA_PROVISIONAL_QUALIFIER = re.compile(AREA_PROVISIONAL_STATUS, re.I)
+AREA_VERIFICATION_EVENT = r"(?:confirm(?:ation|ing)|verif(?:ication|ying)|validat(?:ion|ing))"
+AREA_STATUS_TOPIC = (
+    r"(?:(?:(?:on[- ]site|site|field|physical|independent|final|measurement|survey)\s+)*"
+    rf"(?:area|coverage|dimensions?|measurements?|quantity|value|survey|{AREA_VERIFICATION_EVENT}))"
+)
+AREA_UNRESOLVED_STATUS = (
+    rf"(?:{AREA_PROVISIONAL_STATUS}|pending|unverified|unconfirmed|unmeasured|unresolved"
+    r"|not\s+(?:yet\s+)?(?:verified|confirmed|validated))\b"
+)
 AREA_ATTACHED_QUALIFIER = re.compile(
-    r"(?:(?:(?:measurement|area|dimensions?|quantity|value|survey)\s+)?status\s*:\s*"
-    r"|(?:measurement|area|dimensions?|quantity|value)(?:\s*:\s*|\s+(?:(?:is|was|remains)\s+)?))?"
-    rf"(?:{AREA_PROVISIONAL_STATUS}(?=$|[.,;!?]|\s+(?:in|from|using|until|pending|for|at|as|per)\b)"
-    r"|(?:pending|subject\s+to)\s+(?:(?:site|measurement)\s+)?(?:confirmation|verification)\b"
-    r"|to\s+be\s+(?:confirmed|verified)\b)",
+    rf"(?:(?:{AREA_STATUS_TOPIC}|status)(?:\s+(?:status|is|was|remains))*[\s:\-\u2013\u2014]+)?"
+    rf"(?:(?:still|currently)\s+)?(?:{AREA_UNRESOLVED_STATUS}"
+    rf"(?=$|[.!?]|\s+(?:in|from|using|until|pending|for|at|as|per|{AREA_STATUS_TOPIC}"
+    r"|drawings?|plans?|sketch(?:es)?|models?)\b)"
+    rf"|subject\s+to\s+{AREA_STATUS_TOPIC}\b|to\s+be\s+(?:confirmed|verified|validated)\b)",
     re.I,
 )
 AREA_UNIT_MARKER = re.compile(
@@ -25612,6 +25621,27 @@ AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
 AREA_SCOPE_WRAPPERS = str.maketrans("()[]{}", "      ")
+AREA_CONTEXT_RELATION = re.compile(
+    r"\b(?:(?P<uncertain>not|never|no\s+longer|possibly|potentially)\s+)?"
+    r"(?:(?:separate|apart|distinct|different)\s+from|independent\s+of"
+    r"|compar(?:ed|ing)\s+(?:with|to)|rather\s+than|instead\s+of"
+    r"|exclud(?:ing|es)|except(?:\s+for)?|versus|vs\.?)\s+(?:the\s+)?[\s(\[{]*$",
+    re.I,
+)
+AREA_LOCATION_QUALIFIER = re.compile(
+    r"(?:(?:upper|lower|ground|basement|mezzanine|top|bottom|[0-9]+(?:st|nd|rd|th))\s+(?:level|floor|tier|deck)"
+    r"|(?:level|floor|tier|deck|zone|bay|room|section)\s+(?:[a-z]|[0-9]+[a-z]?))", re.I,
+)
+AREA_REVISION_ACTION = (
+    r"(?:re[\s-]?(?:measur(?:e|ed|ement)|calculat(?:e|ed|ion)|survey(?:ed)?)"
+    r"|revis(?:e|ed|ion)|correct(?:ed|ion)?|amend(?:ed|ment)?|updat(?:e|ed)|adjust(?:ed|ment)?)"
+)
+AREA_REVISION_PREFIX = re.compile(
+    rf"(?:{AREA_REVISION_ACTION}(?:\s+(?:measurement|area|quantity|value))?(?:\s+(?:for|to|of))?[\s:\-]*)?", re.I,
+)
+AREA_VALUE_RELATION = re.compile(
+    rf"^(?:(?:to|is|was|now|should\s+be|measurement|area|quantity|value|{AREA_REVISION_ACTION})\s+|[:=]\s*)+", re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -25631,6 +25661,7 @@ class AreaScopeSpan:
     scope: str
     label: str
     framed: bool
+    anchor: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -25740,28 +25771,77 @@ def area_heading_colon(text: str) -> int | None:
     return None
 
 
-def area_referenced_claims(text: str, heading_colon: int | None, patterns: AreaScopePatterns):
-    """Keep named dimensional claims that the exact heading reader could not bind."""
+def area_contextual_reference(text: str, start: int, body_start: int) -> bool:
+    """Recognise a comparison or exclusion as an argument of another measurement."""
+    relation = AREA_CONTEXT_RELATION.search(text, 0, start)
+    if not relation or relation["uncertain"]:
+        return False
+    subject = text[:relation.start()]
+    return bool((body_start and any(char.isalpha() for char in subject)) or area_claim_kind(subject))
+
+
+def area_heading_scope_base(heading: str) -> str:
+    """Identify an explicit spatial qualifier on the heading's subject."""
+    heading = heading.strip().lstrip("-\u2022 ")
+    spatial = catalog_spatial_context_parts(heading, allow_chain=True)
+    if spatial:
+        return pricing_measurement_scope(spatial[0])
+    _, pairs = area_bracket_context(heading)
+    for start, end in pairs.items():
+        if end == len(heading) - 1 and AREA_LOCATION_QUALIFIER.fullmatch(heading[start + 1:end].strip()):
+            return pricing_measurement_scope(heading[:start])
+    return ""
+
+
+def area_referenced_claims(text: str, start: int, stop: int, heading_colon: int | None,
+                           patterns: AreaScopePatterns, handled: dict[int, int], contextual: set[int]):
+    """Keep named dimensional claims that no exact record handled."""
+    record = text[start:stop]
     body_start = heading_colon + 1 if heading_colon is not None else 0
-    kind = area_claim_kind(text[body_start:])
+    kind = area_claim_kind(record[body_start:])
     if not kind:
         return
-    anchors = list(patterns.exact.finditer(text))
-    anchored = {anchor.start("label"): anchor.end("label") for anchor in anchors}
-    starts_with_exact = bool(anchors and not text[:anchors[0].start("label")].strip(" \t\r\n([{-\u2022"))
-    spatial = catalog_spatial_context_parts(text[:heading_colon]) if heading_colon is not None else None
-    spatial_primary = pricing_measurement_scope(spatial[0]) if spatial else ""
-    for reference in patterns.reference.finditer(text.translate(AREA_SCOPE_WRAPPERS)):
-        start, end = reference.span("label")
-        if anchored.get(start, -1) >= end:
+    first_anchor = patterns.exact.search(record)
+    starts_with_exact = bool(first_anchor and not record[:first_anchor.start("label")].strip(" \t\r\n([{-\u2022"))
+    spatial_primary = area_heading_scope_base(record[:heading_colon]) if heading_colon is not None else ""
+    for reference in patterns.reference.finditer(record.translate(AREA_SCOPE_WRAPPERS)):
+        left, right = reference.span("label")
+        if start + left in contextual or handled.get(start + left, -1) >= start + right:
             continue
-        if starts_with_exact and not area_claim_kind(text[end:]):
+        if starts_with_exact and not area_claim_kind(record[right:]):
             # An exact record's own amount cannot turn a later reference into a claim.
             continue
         label = area_scope_reference_key(reference["label"])
         for scope in patterns.reference_scopes.get(label, ()):
-            if end >= body_start or scope != spatial_primary:
-                yield AreaMeasurementClaim(scope, kind, None, "", (), False)
+            leading_label = not record[:left].strip(" \t\r\n-\u2022")
+            if (right < body_start and spatial_primary and leading_label
+                    and (scope == spatial_primary or area_heading_scope_base(scope) == spatial_primary)):
+                continue
+            yield AreaMeasurementClaim(scope, kind, None, "", (), False)
+
+
+def area_detached_claim(text: str, owner: str, patterns: AreaScopePatterns) -> AreaMeasurementClaim | None:
+    """A complete measurement assertion in its own balanced annotation can name another row."""
+    references = list(patterns.reference.finditer(text.translate(AREA_SCOPE_WRAPPERS)))
+    if len(references) != 1:
+        return None
+    reference = references[0]
+    start, end = reference.span("label")
+    label = area_scope_reference_key(reference["label"])
+    scopes = patterns.reference_scopes.get(label, ())
+    if len(scopes) != 1 or owner in scopes or area_contextual_reference(text, start, 0):
+        return None
+    before = clean_text(text[:start]).rstrip(" ([{")
+    after = clean_text(text[end:]).lstrip(" )]}")
+    if AREA_REVISION_PREFIX.fullmatch(before):
+        value = AREA_VALUE_RELATION.sub("", after, count=1)
+    elif before.endswith(" for") and not after.strip(" .,!?"):
+        value = before[:-4].strip()
+    else:
+        return None
+    if not area_complete_frame(value):
+        return None
+    return AreaMeasurementClaim(next(iter(scopes)), area_claim_kind(value), None, "", (), False)
 
 
 def area_conflict_records(text: str, context: list[int]):
@@ -25775,10 +25855,10 @@ def area_conflict_records(text: str, context: list[int]):
         colon = area_heading_colon(text[part_start:stop])
         if colon is not None:
             if record_start < part_start:
-                yield text[record_start:part_start], heading_colon
+                yield record_start, part_start, heading_colon
             record_start, heading_colon = part_start, colon
         if separator == ";":
-            yield text[record_start:stop], heading_colon
+            yield record_start, stop, heading_colon
             record_start, heading_colon = next_start, None
         part_start = next_start
 
@@ -25815,7 +25895,8 @@ def area_annotation_text(value: str, annotation: str) -> str:
 def area_provisional_annotation(context: str) -> bool:
     """A status about the measurement can conflict with its apparently exact value."""
     _, pairs = area_bracket_context(context)
-    return any(AREA_ATTACHED_QUALIFIER.match(context[start + 1:end].strip()) for start, end in pairs.items())
+    return any(AREA_ATTACHED_QUALIFIER.match(clause.strip())
+               for start, end in pairs.items() for clause in re.split(r"[,;]", context[start + 1:end]))
 
 
 def area_paired_asides(text: str) -> bool:
@@ -25881,9 +25962,20 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
     """Discover labels before assigning source framing or interpreting values."""
     text = unicodedata.normalize("NFKC", raw).casefold()
     context, pairs = area_bracket_context(text)
+    source_records = list(area_conflict_records(text, context))
+    contextual = set()
+    for start, stop, colon in source_records:
+        record_text = text[start:stop]
+        body_start = colon + 1 if colon is not None else 0
+        for reference in patterns.reference.finditer(record_text.translate(AREA_SCOPE_WRAPPERS)):
+            left = reference.start("label")
+            if area_contextual_reference(record_text, left, body_start):
+                contextual.add(start + left)
     groups = {}
     for anchor in patterns.exact.finditer(text):
         start, end = anchor.span("label")
+        if start in contextual:
+            continue
         group = context[start]
         while (group >= 0 and end <= pairs[group] < anchor.end()
                and not text[group + 1:start].strip() and not text[end:pairs[group]].strip()):
@@ -25898,6 +25990,7 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
             groups.setdefault(group, []).append((anchor, start, end))
 
     masked = list(text)
+    handled = {}
     for group, labels in sorted(groups.items(), reverse=True):
         end = pairs.get(group, len(text))
         previous = group + 1
@@ -25925,11 +26018,22 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
                           and area_complete_frame(clean_text(text[previous:start])))
                 label = clean_text(raw_label)
             label_start = prefix_start if framed and prefix and not adjacent else start
-            records.append(AreaScopeSpan(label_start, anchor.end(), scope, label if framed else anchor["label"], framed))
+            records.append(AreaScopeSpan(label_start, anchor.end(), scope, label if framed else anchor["label"], framed,
+                                         anchor.span("label")))
             previous = anchor.end()
 
         for index, record in enumerate(records):
             limit = records[index + 1].start if index + 1 < len(records) else end
+            if record.framed:
+                for opener, closer in pairs.items():
+                    if not (record.end <= opener < closer < limit and context[opener] == group):
+                        continue
+                    if not area_complete_frame(clean_text("".join(masked[record.end:opener]))):
+                        continue
+                    detached = area_detached_claim(clean_text(text[opener + 1:closer]), record.scope, patterns)
+                    if detached is not None:
+                        yield detached
+                        masked[opener:closer + 1] = " " * (closer + 1 - opener)
             parts = []
             start = record.end
             for boundary in AREA_RECORD_BREAK.finditer(text, start, limit):
@@ -25939,13 +26043,19 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
                     start = boundary.end()
             parts.append((clean_text("".join(masked[start:limit])), ""))
             claim = area_record_claim(record, parts)
+            handled[record.anchor[0]] = record.anchor[1]
             if claim is not None:
                 yield claim
             if group != -1:
                 masked[record.start:limit] = " " * (limit - record.start)
 
-    for record, colon in area_conflict_records(text, context):
-        yield from area_referenced_claims(record, colon, patterns)
+    for start, stop, colon in source_records:
+        yield from area_referenced_claims(text, start, stop, colon, patterns, handled, contextual)
+    # A mixed annotation can preserve an unresolved named claim without removing it from the outer value.
+    for opener, closer in pairs.items():
+        start = opener + 1
+        colon = area_heading_colon(text[start:closer])
+        yield from area_referenced_claims(text, start, closer, colon, patterns, handled, contextual)
 
 
 def area_claim_kind(text: str) -> str:

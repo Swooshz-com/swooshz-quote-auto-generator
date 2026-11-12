@@ -43386,9 +43386,19 @@ main().catch((error) => {
                                ("24 sqm (default until surveyed)", False),
                                ("24 sqm (pending measurement confirmation)", False),
                                ("24 sqm (subject to site verification)", False),
+                               ("24 sqm (site verification pending)", False),
+                               ("24 sqm (measurement remains unverified)", False),
+                               ("24 sqm (pending field verification)", False),
+                               ("24 sqm (still provisional)", False),
+                               ("24 sqm (provisional drawing)", False),
+                               ("24 sqm (measurement status - provisional)", False),
+                               ("24 sqm (site survey status: provisional)", False),
+                               ("24 sqm (area not yet verified)", False),
                                ("24 sqm (PDF saved with default margins)", True),
                                ("24 sqm (default margins)", True),
                                ("24 sqm (pending invoice)", True),
+                               ("24 sqm (invoice verification pending)", True),
+                               ("24 sqm (measurement is not provisional)", True),
                                ("24 sqm (drawing source)", True),
                                ("24 sqm (not provisional)", True),
                                ("24 sqm (not based on the provisional booth footprint)", True),
@@ -43458,12 +43468,27 @@ main().catch((error) => {
             ("Carpet tile west: 24 sqm; Material samples: Crew may carry 4 to 6 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm; Carpet tile west revised measurement: 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Survey (Carpet tile west, field check): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey (revised Carpet tile west): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey [remeasure Carpet tile west]: 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (revise Carpet tile west to 4 sqm)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (Carpet tile west revised to 4 sqm)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (Revision for Carpet tile west: 4 sqm)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (4 sqm for Carpet tile west)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (pending field verification, revise Carpet tile west to 4 sqm)", {west: None, east: None}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (pending field verification, 4 sqm for Carpet tile west)", {west: None, east: None}),
             ("Carpet tile west: 24 sqm; Carpet tile (west): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Survey: revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Survey: 4 sqm for Carpet tile west; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Carpet tile west near reception: 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west near reception behind booth: 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west (upper level): 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm; Carpet tile west near reception: revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, separate from Carpet tile west; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards (separate from Carpet tile west): 2 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, compared with Carpet tile west: 24 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, not separate from Carpet tile west; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey: revise Carpet tile west to 4 sqm, excluding Carpet tile east; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Carpet tile west: 24 sqm (provisional in drawing); Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Carpet tile west: 24 sqm (not provisional); Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm; Carpet tile west: upper level: 4 sqm; Carpet tile east: 10 sqm", {west: 24, qualified: 4, east: 10}),
@@ -43559,10 +43584,15 @@ main().catch((error) => {
                 claims = list(webapp.area_source_claims(raw, webapp.area_scope_patterns(scopes)))
                 self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
                 west_claims = [claim for claim in claims if claim.scope == west]
+                first_record = raw.split(";", 1)[0]
                 for claim in claims:
                     if (claim.quantity is None or (claim.scope == west and len(west_claims) == 1
-                            and (" (" in raw or "\n(" in raw or raw.startswith("Carpet tile east:")))):
+                            and (" (" in first_record or "\n(" in first_record or raw.startswith("Carpet tile east:")))):
                         self.assertFalse(claim.eligible)
+        located = f"{west} near reception"
+        raw = f"{located}: 24 sqm; {located} behind booth: 4 sqm; {east}: 10 sqm"
+        claims = webapp.area_source_claims(raw, webapp.area_scope_patterns({located, east}))
+        self.assertEqual({claim.scope: claim.quantity for claim in claims}, {located: 24, east: 10})
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
@@ -43657,16 +43687,38 @@ main().catch((error) => {
             ("qty-same-heading", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: Survey estimates 4 sqm", 24, "observed", False),
             ("rev-wide", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west revised measurement: 4 sqm", 24, "observed", False),
             ("rev-par", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey (Carpet tile west, field check): 4 sqm", 24, "observed", False),
+            ("re-brack", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey (revised Carpet tile west): 4 sqm", 24, "observed", False),
+            ("re-square", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey [remeasure Carpet tile west]: 4 sqm", 24, "observed", False),
+            ("re-embed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("re-later", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west revised to 4 sqm", 24, "observed", False),
+            ("re-title", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Revision for Carpet tile west: 4 sqm", 24, "observed", False),
+            ("re-amount", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "4 sqm for Carpet tile west", 24, "observed", False),
+            ("re-mixed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "pending field verification, revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("re-mixqty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "pending field verification, 4 sqm for Carpet tile west", 24, "observed", False),
             ("rev-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile (west): 4 sqm", 24, "observed", False),
             ("rev-body", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: revise Carpet tile west to 4 sqm", 24, "observed", False),
             ("rev-after", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: 4 sqm for Carpet tile west", 24, "observed", False),
             ("rev-spat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception: revise Carpet tile west to 4 sqm", 24, "observed", False),
             ("sep-spat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception: 4 sqm", 24, "observed", True),
+            ("loc-chain", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception behind booth: 4 sqm", 24, "observed", True),
+            ("loc-level", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west (upper level): 4 sqm", 24, "observed", True),
+            ("ref-split", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west", 24, "observed", True),
+            ("ref-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: Installer brings 2 sqm, separate from Carpet tile west", 24, "observed", True),
+            ("ref-head", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards (separate from Carpet tile west): 2 sqm", 24, "observed", True),
+            ("ref-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, not separate from Carpet tile west", 24, "observed", False),
+            ("ref-excl", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: revise Carpet tile west to 4 sqm, excluding Carpet tile east", 24, "observed", False),
             ("rev-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: check Carpet tile west after the site visit", 24, "observed", True),
             ("prov-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (provisional in drawing)", 24, "observed", False),
             ("prov-nested", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm [survey status: estimated]", 24, "observed", False),
             ("prov-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (not provisional)", 24, "observed", True),
             ("prov-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (PDF saved with default margins)", 24, "observed", True),
+            ("st-site", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification pending)", 24, "observed", False),
+            ("st-unver", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement remains unverified)", 24, "observed", False),
+            ("st-field", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (pending field verification)", 24, "observed", False),
+            ("st-still", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (still provisional)", 24, "observed", False),
+            ("st-source", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (provisional drawing)", 24, "observed", False),
+            ("st-key", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement status - provisional)", 24, "observed", False),
+            ("st-survey", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site survey status: provisional)", 24, "observed", False),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
             ("qty-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "4 to 6 sqm", 24, "observed", False),
             ("same-subj", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west will require 4 sqm of flooring", 24, "observed", False),
@@ -43694,11 +43746,14 @@ main().catch((error) => {
         )
         north_cases = {"est-chain", "geo-chain", "est-sep", "bracket-geo", "paren-val", "brace-geo",
                        "wrap-geo", "wrap-val", "wrap-brace"}
+        embedded_revisions = {"re-embed", "re-later", "re-title", "re-amount", "re-mixed", "re-mixqty"}
         semicolon_cases = {"free-prose", "prose-sep", "qty-prose", "qty-present", "qty-past", "qty-request",
                            "qty-estimate", "qty-note", "qty-heading", "qty-heading-range", "qty-same-heading",
                            "qty-range", "same-subj", "rev-wide", "rev-par", "rev-wrap", "rev-body", "rev-after",
                            "rev-spat", "sep-spat", "rev-neutral", "prov-tail", "prov-nested", "prov-neg",
-                           "prov-note", "rev-repeat"}
+                           "prov-note", "rev-repeat", "re-brack", "re-square", "loc-chain", "loc-level",
+                           "ref-split", "ref-prose", "ref-head", "ref-neg", "ref-excl", "st-site", "st-unver", "st-field",
+                           "st-still", "st-source", "st-key", "st-survey"} | embedded_revisions
         aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
                         "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
         qualifier_cases = aside_cases | north_cases
@@ -43761,6 +43816,8 @@ main().catch((error) => {
                             sources = [f"{other}\n{statement}", east_statement]
                         elif name == "abbr-sep":
                             sources = [f"{other};\n{statement}", east_statement]
+                        elif name in embedded_revisions:
+                            sources = [f"{statement};\n{east_statement} ({other})"]
                         elif name in aside_cases:
                             terminal = ";" if name in semicolon_cases else "" if name == "assume-soft" else "."
                             wrap = " " if name == "free-inline" else "\n"
@@ -43832,7 +43889,7 @@ main().catch((error) => {
                         if name == "duplicate":
                             self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
-                        east_priced = name in dual_cases and name not in {"open-att", "embedded", "emb-wrap"}
+                        east_priced = name in dual_cases and name not in {"open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty"}
                         if name in dual_cases:
                             self.assertEqual(entries["east"].get("catalog_item_id"), self.LEDGER_CARPET if east_priced else None)
                         if name in north_cases:
@@ -43941,7 +43998,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 12):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 13):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44003,7 +44060,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+            for version in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44017,7 +44074,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 12
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 13
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)

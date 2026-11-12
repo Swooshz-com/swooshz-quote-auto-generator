@@ -110,18 +110,24 @@ A dimensional heading or its body can still name a quoted scope. An expanded
 label, a wrapped reference or a scope named in the body flags an unresolved
 claim when it lacks the exact label and value needed for proof. The longest
 explicit scope label identifies the affected row when labels overlap. A heading
-with a distinct spatial qualifier can describe a separate area. A reference in
-its measurement text can still flag a conflict for the scope it names.
+with a distinct spatial qualifier can describe a separate area, including a
+chain of location relations or a level in brackets. An explicit comparison or
+exclusion describes the measurement it qualifies. The mentioned area keeps its
+own evidence. A revision in the measurement text can still flag a conflict for
+the scope it names.
 An unheaded correction in a separate source entry can also flag a conflict when
 it names the scope and includes an area or dimensions.
+After a complete value, a balanced annotation with a separately stated value
+for another scope can hold that other scope. If the annotation also makes the
+outer measurement uncertain, keep both affected scopes in review.
 A structurally complete measurement can frame the next exact label even if its
 own value has an estimated or assumed qualifier in a balanced wrapper with
 explanatory text.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. A neutral annotation can corroborate a separately
-proven equal value. An attached provisional status keeps that scope in review,
-even when the amount agrees. Document details such as page settings can remain
-as neutral context. A derived
+proven equal value. An attached provisional status or pending measurement
+verification keeps that scope in review, even when the amount agrees. Document
+details such as page settings can remain as neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.
