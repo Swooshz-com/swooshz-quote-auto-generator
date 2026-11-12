@@ -43486,6 +43486,8 @@ main().catch((error) => {
             ("Carpet tile west: 24 sqm; Carpet tile west near reception: revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, separate from Carpet tile west; Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm; Sample boards (separate from Carpet tile west): 2 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east revised to 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: None}),
             ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, compared with Carpet tile west: 24 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, not separate from Carpet tile west; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Survey: revise Carpet tile west to 4 sqm, excluding Carpet tile east; Carpet tile east: 10 sqm", {west: None, east: 10}),
@@ -43705,6 +43707,8 @@ main().catch((error) => {
             ("ref-split", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west", 24, "observed", True),
             ("ref-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: Installer brings 2 sqm, separate from Carpet tile west", 24, "observed", True),
             ("ref-head", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards (separate from Carpet tile west): 2 sqm", 24, "observed", True),
+            ("ref-both", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east", 24, "observed", True),
+            ("ref-clause", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east revised to 4 sqm", 24, "observed", True),
             ("ref-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, not separate from Carpet tile west", 24, "observed", False),
             ("ref-excl", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: revise Carpet tile west to 4 sqm, excluding Carpet tile east", 24, "observed", False),
             ("rev-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: check Carpet tile west after the site visit", 24, "observed", True),
@@ -43752,7 +43756,7 @@ main().catch((error) => {
                            "qty-range", "same-subj", "rev-wide", "rev-par", "rev-wrap", "rev-body", "rev-after",
                            "rev-spat", "sep-spat", "rev-neutral", "prov-tail", "prov-nested", "prov-neg",
                            "prov-note", "rev-repeat", "re-brack", "re-square", "loc-chain", "loc-level",
-                           "ref-split", "ref-prose", "ref-head", "ref-neg", "ref-excl", "st-site", "st-unver", "st-field",
+                           "ref-split", "ref-prose", "ref-head", "ref-both", "ref-clause", "ref-neg", "ref-excl", "st-site", "st-unver", "st-field",
                            "st-still", "st-source", "st-key", "st-survey"} | embedded_revisions
         aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
                         "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
@@ -43889,7 +43893,9 @@ main().catch((error) => {
                         if name == "duplicate":
                             self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
-                        east_priced = name in dual_cases and name not in {"open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty"}
+                        east_priced = name in dual_cases and name not in {
+                            "open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty", "ref-clause",
+                        }
                         if name in dual_cases:
                             self.assertEqual(entries["east"].get("catalog_item_id"), self.LEDGER_CARPET if east_priced else None)
                         if name in north_cases:

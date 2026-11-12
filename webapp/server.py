@@ -25628,6 +25628,7 @@ AREA_CONTEXT_RELATION = re.compile(
     r"|exclud(?:ing|es)|except(?:\s+for)?|versus|vs\.?)\s+(?:the\s+)?[\s(\[{]*$",
     re.I,
 )
+AREA_REFERENCE_COORDINATION = re.compile(r"\s*,?\s*(?:and|or|nor)\s+", re.I)
 AREA_LOCATION_QUALIFIER = re.compile(
     r"(?:(?:upper|lower|ground|basement|mezzanine|top|bottom|[0-9]+(?:st|nd|rd|th))\s+(?:level|floor|tier|deck)"
     r"|(?:level|floor|tier|deck|zone|bay|room|section)\s+(?:[a-z]|[0-9]+[a-z]?))", re.I,
@@ -25967,10 +25968,16 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
     for start, stop, colon in source_records:
         record_text = text[start:stop]
         body_start = colon + 1 if colon is not None else 0
+        previous_end = 0
+        previous_contextual = False
         for reference in patterns.reference.finditer(record_text.translate(AREA_SCOPE_WRAPPERS)):
-            left = reference.start("label")
-            if area_contextual_reference(record_text, left, body_start):
+            left, right = reference.span("label")
+            coordinated = (previous_contextual and AREA_REFERENCE_COORDINATION.fullmatch(record_text[previous_end:left])
+                           and not AREA_VALUE_RELATION.match(record_text[right:].lstrip()))
+            previous_contextual = bool(coordinated or area_contextual_reference(record_text, left, body_start))
+            if previous_contextual:
                 contextual.add(start + left)
+            previous_end = right
     groups = {}
     for anchor in patterns.exact.finditer(text):
         start, end = anchor.span("label")
