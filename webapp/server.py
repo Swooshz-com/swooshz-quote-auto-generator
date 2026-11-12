@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 14
+AREA_EVIDENCE_CLAIM_VERSION = 15
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25596,16 +25596,21 @@ AREA_STATUS_TOPIC = (
     r"(?:(?:(?:on[- ]site|site|field|physical|independent|final|measurement|survey)\s+)*"
     rf"(?:area|coverage|dimensions?|measurements?|quantity|value|survey|{AREA_VERIFICATION_EVENT}))"
 )
+AREA_VERIFICATION_RESULT = r"(?:confirmed|verified|validated|measured|complete(?:d)?|performed)"
+AREA_NEGATED_VERIFICATION = (
+    r"(?:(?:not|never)|(?:has|have|had|is|are|was|were)n['\u2019]t)\s+"
+    rf"(?:yet\s+)?(?:been\s+)?(?:independently\s+)?{AREA_VERIFICATION_RESULT}\b"
+)
 AREA_UNRESOLVED_STATUS = (
-    rf"(?:{AREA_PROVISIONAL_STATUS}|pending|unverified|unconfirmed|unmeasured|unresolved"
-    r"|not\s+(?:yet\s+)?(?:verified|confirmed|validated))\b"
+    rf"(?:{AREA_PROVISIONAL_STATUS}|pending|outstanding|incomplete|unverified|unconfirmed|unmeasured|unresolved)\b"
 )
 AREA_ATTACHED_QUALIFIER = re.compile(
-    rf"(?:(?:{AREA_STATUS_TOPIC}|status)(?:\s+(?:status|is|was|remains))*[\s:\-\u2013\u2014]+)?"
+    rf"(?:(?:{AREA_STATUS_TOPIC}|status)(?:\s+(?:status|is|are|was|were|remains?|has|have|had|been))*[\s:\-\u2013\u2014]+)?"
     rf"(?:(?:still|currently)\s+)?(?:{AREA_UNRESOLVED_STATUS}"
     rf"(?=$|[.!?]|\s+(?:in|from|using|until|pending|for|at|as|per|{AREA_STATUS_TOPIC}"
     r"|drawings?|plans?|sketch(?:es)?|models?)\b)"
-    rf"|subject\s+to\s+{AREA_STATUS_TOPIC}\b|to\s+be\s+(?:confirmed|verified|validated)\b)",
+    rf"|{AREA_NEGATED_VERIFICATION}|(?:awaiting|waiting\s+for|subject\s+to)\s+{AREA_STATUS_TOPIC}\b"
+    rf"|(?:yet\s+)?to\s+be\s+{AREA_VERIFICATION_RESULT}\b)",
     re.I,
 )
 AREA_UNIT_MARKER = re.compile(
@@ -25620,6 +25625,7 @@ AREA_GEOMETRY_MARKER = re.compile(
 AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
+AREA_QUALIFICATION_BREAK = re.compile(r",(?!\d)|;|[.!?](?=\s|$)|\s+(?:and|but)\s+", re.I)
 AREA_SCOPE_WRAPPERS = str.maketrans("()[]{}", "      ")
 AREA_CONTEXT_RELATION = re.compile(
     r"\b(?:(?P<uncertain>not|never|no\s+longer|possibly|potentially)\s+)?"
@@ -25773,13 +25779,91 @@ def area_heading_colon(text: str) -> int | None:
     return None
 
 
-def area_contextual_reference(text: str, start: int, body_start: int) -> bool:
+def area_contextual_reference(text: str, start: int, body_start: int, *, attached: bool = False) -> bool:
     """Recognise a comparison or exclusion as an argument of another measurement."""
     relation = AREA_CONTEXT_RELATION.search(text, 0, start)
     if not relation or relation["uncertain"]:
         return False
     subject = text[:relation.start()]
-    return bool((body_start and any(char.isalpha() for char in subject)) or area_claim_kind(subject))
+    return bool(attached or (body_start and any(char.isalpha() for char in subject)) or area_claim_kind(subject))
+
+
+def area_member_annotations(text: str, right: int, stop: int, pairs: dict[int, int]) -> tuple[int, list[tuple[int, int]]]:
+    """Consume only balanced annotations immediately attached to this member."""
+    end = right
+    annotations = []
+    while right < stop:
+        if text[right].isspace():
+            right += 1
+            continue
+        closer = pairs.get(right)
+        if closer is None or closer >= stop:
+            break
+        annotations.append((right + 1, closer))
+        right = end = closer + 1
+    return end, annotations
+
+
+def area_comparison_members(text: str, start: int, stop: int, colon: int | None,
+                            patterns: AreaScopePatterns, pairs: dict[int, int], *, attached: bool = False):
+    """Read list membership independently of each member's local assertions."""
+    record = text[start:stop]
+    body_start = colon + 1 if colon is not None else 0
+    previous_end = 0
+    previous_contextual = False
+    references = list(patterns.reference.finditer(record.translate(AREA_SCOPE_WRAPPERS)))
+    for index, reference in enumerate(references):
+        left, right = reference.span("label")
+        if left < previous_end:
+            continue  # Names inside the previous member's annotation are not list items.
+        attached_end, annotations = area_member_annotations(text, start + right, stop, pairs)
+        end = attached_end - start
+        next_index = index + 1
+        while next_index < len(references) and references[next_index].start("label") < end:
+            next_index += 1
+        next_start = references[next_index].start("label") if next_index < len(references) else len(record)
+        assertion_end = min(next_start, colon) if colon is not None and right <= colon else next_start
+        coordinated = (previous_contextual and AREA_REFERENCE_COORDINATION.fullmatch(record[previous_end:left])
+                       and not area_claim_kind(record[end:assertion_end]))
+        previous_contextual = bool(coordinated or area_contextual_reference(record, left, body_start, attached=attached))
+        if previous_contextual:
+            label = area_scope_reference_key(reference["label"])
+            yield start + left, patterns.reference_scopes.get(label, set()), annotations
+        previous_end = end if previous_contextual else right
+
+
+def area_annotation_comparisons(text: str, start: int, stop: int, patterns: AreaScopePatterns,
+                                pairs: dict[int, int]) -> tuple[set[int], bool]:
+    """Distinguish an annotation's comparison operands from a local assertion."""
+    annotation = text[start:stop]
+    references = list(patterns.reference.finditer(annotation.translate(AREA_SCOPE_WRAPPERS)))
+    if not references:
+        return set(), False
+    colon = area_heading_colon(annotation)
+    contextual = {position for position, _, _ in area_comparison_members(
+        text, start, stop, colon, patterns, pairs, attached=True,
+    )}
+    first = references[0].start("label")
+    leading = AREA_CONTEXT_RELATION.search(annotation, 0, first)
+    tail = annotation[references[-1].end("label"):]
+    separate_tail = any(area_claim_kind(part) or area_unresolved_qualification(part)
+                        for part in AREA_QUALIFICATION_BREAK.split(tail)[1:])
+    comparison_only = bool(leading and not leading["uncertain"] and not annotation[:leading.start()].strip()
+                           and len(contextual) == len(references) and not separate_tail)
+    return contextual, comparison_only
+
+
+def area_member_claims(annotation: str, scopes: set[str], patterns: AreaScopePatterns):
+    """Keep a member's own veto, or the explicit measurement of another scope."""
+    kind = area_claim_kind(annotation)
+    if kind and len(scopes) == 1:
+        detached = area_detached_claim(clean_text(annotation), next(iter(scopes)), patterns)
+        if detached is not None:
+            yield detached
+            return
+    if kind or area_unresolved_qualification(annotation) or area_provisional_annotation(annotation):
+        for scope in scopes:
+            yield AreaMeasurementClaim(scope, kind or "observed", None, "", (), False)
 
 
 def area_heading_scope_base(heading: str) -> str:
@@ -25894,11 +25978,14 @@ def area_annotation_text(value: str, annotation: str) -> str:
     return annotation.lstrip(" .!?")
 
 
+def area_unresolved_qualification(text: str) -> bool:
+    return any(AREA_ATTACHED_QUALIFIER.match(clause.strip()) for clause in AREA_QUALIFICATION_BREAK.split(text))
+
+
 def area_provisional_annotation(context: str) -> bool:
     """A status about the measurement can conflict with its apparently exact value."""
     _, pairs = area_bracket_context(context)
-    return any(AREA_ATTACHED_QUALIFIER.match(clause.strip())
-               for start, end in pairs.items() for clause in re.split(r"[,;]", context[start + 1:end]))
+    return any(area_unresolved_qualification(context[start + 1:end]) for start, end in pairs.items())
 
 
 def area_paired_asides(text: str) -> bool:
@@ -25966,23 +26053,15 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
     context, pairs = area_bracket_context(text)
     source_records = list(area_conflict_records(text, context))
     contextual = set()
+    member_claims = []
     for start, stop, colon in source_records:
-        record_text = text[start:stop]
-        body_start = colon + 1 if colon is not None else 0
-        previous_end = 0
-        previous_contextual = False
-        references = list(patterns.reference.finditer(record_text.translate(AREA_SCOPE_WRAPPERS)))
-        for index, reference in enumerate(references):
-            left, right = reference.span("label")
-            next_start = references[index + 1].start("label") if index + 1 < len(references) else len(record_text)
-            assertion_end = min(next_start, colon) if colon is not None and right <= colon else next_start
-            # A new dimensional expression ends list inheritance, even if its amount is uncertain.
-            coordinated = (previous_contextual and AREA_REFERENCE_COORDINATION.fullmatch(record_text[previous_end:left])
-                           and not area_claim_kind(record_text[right:assertion_end]))
-            previous_contextual = bool(coordinated or area_contextual_reference(record_text, left, body_start))
-            if previous_contextual:
-                contextual.add(start + left)
-            previous_end = right
+        for position, scopes, annotations in area_comparison_members(text, start, stop, colon, patterns, pairs):
+            contextual.add(position)
+            for left, right in annotations:
+                comparison_positions, comparison_only = area_annotation_comparisons(text, left, right, patterns, pairs)
+                contextual.update(comparison_positions)
+                if not comparison_only:
+                    member_claims.extend(area_member_claims(text[left:right], scopes, patterns))
     groups = {}
     for anchor in patterns.exact.finditer(text):
         start, end = anchor.span("label")
@@ -26068,6 +26147,7 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
         start = opener + 1
         colon = area_heading_colon(text[start:closer])
         yield from area_referenced_claims(text, start, closer, colon, patterns, handled, contextual)
+    yield from member_claims
 
 
 def area_claim_kind(text: str) -> str:

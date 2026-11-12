@@ -114,9 +114,13 @@ with a distinct spatial qualifier can describe a separate area, including a
 chain of location relations or a level in brackets. An explicit comparison or
 exclusion describes the measurement it qualifies. The mentioned areas keep
 their own evidence, including in lists with commas, conjunctions or explicit
-quantifiers. An uncertain separation leaves the affected measurements in
-review. A new dimensional statement can still flag a conflict for the scope
-it names.
+quantifiers. A balanced measurement annotation immediately after a list
+member can hold that member, while the rest of the list still describes
+comparison or exclusion. If the annotation explicitly revises a different
+scope, that scope stays in review. A comparison-only annotation preserves
+each area's own evidence. An uncertain separation leaves the
+affected measurements in review. A new unwrapped dimensional statement can
+still end the list and flag a conflict for the scope it names.
 An unheaded correction in a separate source entry can also flag a conflict when
 it names the scope and includes an area or dimensions.
 After a complete value, a balanced annotation with a separately stated value
@@ -127,9 +131,10 @@ own value has an estimated or assumed qualifier in a balanced wrapper with
 explanatory text.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
 like a second exact amount. A neutral annotation can corroborate a separately
-proven equal value. An attached provisional status or pending measurement
-verification keeps that scope in review, even when the amount agrees. Document
-details such as page settings can remain as neutral context. A derived
+proven equal value. An attached provisional status, incomplete verification or
+an explicitly unverified measurement keeps that scope in review, even when the
+amount agrees. Completed verification and document details such as page
+settings can remain neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.
