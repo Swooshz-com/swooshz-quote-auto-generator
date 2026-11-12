@@ -106,11 +106,22 @@ dimensional claim. A note with its own area or dimensions needs a distinct
 heading after the semicolon or a separate source entry. An unbound measurement
 fragment, range or quantity-bearing sentence keeps the preceding scope in
 pricing review.
+A dimensional heading or its body can still name a quoted scope. An expanded
+label, a wrapped reference or a scope named in the body flags an unresolved
+claim when it lacks the exact label and value needed for proof. The longest
+explicit scope label identifies the affected row when labels overlap. A heading
+with a distinct spatial qualifier can describe a separate area. A reference in
+its measurement text can still flag a conflict for the scope it names.
+An unheaded correction in a separate source entry can also flag a conflict when
+it names the scope and includes an area or dimensions.
 A structurally complete measurement can frame the next exact label even if its
 own value has an estimated or assumed qualifier in a balanced wrapper with
 explanatory text.
 Keep repeat context in brackets or parentheses so a trailing range cannot look
-like a second exact amount. Unresolved claims hold that scope in review. A derived
+like a second exact amount. A neutral annotation can corroborate a separately
+proven equal value. An attached provisional status keeps that scope in review,
+even when the amount agrees. Document details such as page settings can remain
+as neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma
 may group thousands in sets of three and a dot may mark the decimal point.
 Ambiguous number formats stay in pricing review.

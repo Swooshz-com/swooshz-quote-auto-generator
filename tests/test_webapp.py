@@ -43380,6 +43380,18 @@ main().catch((error) => {
                                ("\uff14\u2013\uff16 \u33a1", False),
                                ("between four and six metres squared", False),
                                ("24 sqm (site note; range is 4 to 6 sqm)", False),
+                               ("24 sqm (provisional in drawing)", False),
+                               ("24 sqm [survey status: estimated]", False),
+                               ("24 sqm (measurement is provisional)", False),
+                               ("24 sqm (default until surveyed)", False),
+                               ("24 sqm (pending measurement confirmation)", False),
+                               ("24 sqm (subject to site verification)", False),
+                               ("24 sqm (PDF saved with default margins)", True),
+                               ("24 sqm (default margins)", True),
+                               ("24 sqm (pending invoice)", True),
+                               ("24 sqm (drawing source)", True),
+                               ("24 sqm (not provisional)", True),
+                               ("24 sqm (not based on the provisional booth footprint)", True),
                                ("24 sqm (survey: same measurement)", True),
                                ("(24 sqm) (site record)", True), ("6 metres x 4 metres (full coverage)", True),
                                ("24 sqm to thirty", False), ("(24 sqm) site record", False), ("(24 sqm) to thirty", False),
@@ -43402,6 +43414,19 @@ main().catch((error) => {
         self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
         sources = {"Quote notes": [f"{located}: 24 sqm", "Installer brings 2 sqm of sample boards"]}
         self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
+        for heading, allowed in (
+            (f"{located} revised measurement: 4 sqm", False),
+            (f"Survey ({located}, field check): 4 sqm", False),
+            (f"Survey: confirmed the site visit. Revise {located} to 4 sqm", False),
+            (f"Survey: revise to 4 sqm for {located}", False),
+            (f"Revise {located} to 4 sqm", False),
+            (f"Survey: see {located} after the site visit", True),
+            ("Sample boards: Installer brings 2 sqm", True),
+        ):
+            with self.subTest(heading=heading):
+                sources = {"Quote notes": [f"{located}: 24 sqm"], "Reference 1, PDF page 1": [heading]}
+                record = webapp.admitted_scope_measurements(draft, sources)["floor"]
+                self.assertEqual(record["disposition"], "measured" if allowed else "review")
 
     def test_area_source_labels_use_exact_boundaries_and_local_context(self):
         west, east = "carpet tile west", "carpet tile east"
@@ -43431,6 +43456,19 @@ main().catch((error) => {
             ("Carpet tile west: 24 sqm; Crew may carry 4 to 6 sqm of material; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Sample boards: Installer brings 2 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm; Material samples: Crew may carry 4 to 6 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west revised measurement: 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey (Carpet tile west, field check): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile (west): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey: revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey: 4 sqm for Carpet tile west; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west near reception: 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west near reception: revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: 24 sqm (provisional in drawing); Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: 24 sqm (not provisional); Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: upper level: 4 sqm; Carpet tile east: 10 sqm", {west: 24, qualified: 4, east: 10}),
+            ("Carpet tile west: 24 sqm (see Carpet tile east); Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("- Carpet tile west: 24 sqm (see Carpet tile east); Carpet tile east: 10 sqm", {west: 24, east: 10}),
             ("Carpet tile west: 24 sqm; Carpet tile west: Survey estimates 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; 4 to 6 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
             ("Carpet tile west: 24 sqm; Installer will bring 2 sqm of sample boards; 4 to 6 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
@@ -43518,11 +43556,12 @@ main().catch((error) => {
         )
         for raw, expected in cases:
             with self.subTest(raw=raw):
-                claims = list(webapp.area_source_claims(raw, webapp.area_scope_pattern(scopes)))
+                claims = list(webapp.area_source_claims(raw, webapp.area_scope_patterns(scopes)))
                 self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
+                west_claims = [claim for claim in claims if claim.scope == west]
                 for claim in claims:
-                    if (claim.quantity is None or (" (" in raw and claim.scope == west) or ("\n(" in raw and claim.scope == west)
-                            or (claim.scope == west and raw.startswith("Carpet tile east:"))):
+                    if (claim.quantity is None or (claim.scope == west and len(west_claims) == 1
+                            and (" (" in raw or "\n(" in raw or raw.startswith("Carpet tile east:")))):
                         self.assertFalse(claim.eligible)
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
@@ -43616,6 +43655,19 @@ main().catch((error) => {
             ("qty-heading", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: Installer brings 2 sqm", 24, "observed", True),
             ("qty-heading-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Material samples: Crew may carry 4 to 6 sqm", 24, "observed", True),
             ("qty-same-heading", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: Survey estimates 4 sqm", 24, "observed", False),
+            ("rev-wide", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west revised measurement: 4 sqm", 24, "observed", False),
+            ("rev-par", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey (Carpet tile west, field check): 4 sqm", 24, "observed", False),
+            ("rev-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile (west): 4 sqm", 24, "observed", False),
+            ("rev-body", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("rev-after", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: 4 sqm for Carpet tile west", 24, "observed", False),
+            ("rev-spat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception: revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("sep-spat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception: 4 sqm", 24, "observed", True),
+            ("rev-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: check Carpet tile west after the site visit", 24, "observed", True),
+            ("prov-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (provisional in drawing)", 24, "observed", False),
+            ("prov-nested", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm [survey status: estimated]", 24, "observed", False),
+            ("prov-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (not provisional)", 24, "observed", True),
+            ("prov-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (PDF saved with default margins)", 24, "observed", True),
+            ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
             ("qty-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "4 to 6 sqm", 24, "observed", False),
             ("same-subj", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west will require 4 sqm of flooring", 24, "observed", False),
             ("est-chain", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: estimated 24 sqm", 24, "observed", False),
@@ -43644,7 +43696,9 @@ main().catch((error) => {
                        "wrap-geo", "wrap-val", "wrap-brace"}
         semicolon_cases = {"free-prose", "prose-sep", "qty-prose", "qty-present", "qty-past", "qty-request",
                            "qty-estimate", "qty-note", "qty-heading", "qty-heading-range", "qty-same-heading",
-                           "qty-range", "same-subj"}
+                           "qty-range", "same-subj", "rev-wide", "rev-par", "rev-wrap", "rev-body", "rev-after",
+                           "rev-spat", "sep-spat", "rev-neutral", "prov-tail", "prov-nested", "prov-neg",
+                           "prov-note", "rev-repeat"}
         aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
                         "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
         qualifier_cases = aside_cases | north_cases
@@ -43771,6 +43825,10 @@ main().catch((error) => {
                         entries = {entry["id"]: entry for entry in seal["rows"]}
                         self.assertEqual(entries["floor"].get("catalog_item_id"), self.LEDGER_CARPET if allowed else None)
                         self.assertEqual(entries["floor"]["measurement"]["disposition"], "measured" if allowed else "review")
+                        if allowed:
+                            self.assertEqual(entries["floor"]["measurement"]["claim_version"], webapp.AREA_EVIDENCE_CLAIM_VERSION)
+                        else:
+                            self.assertEqual(entries["floor"]["measurement"], {"disposition": "review"})
                         if name == "duplicate":
                             self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
@@ -43882,6 +43940,14 @@ main().catch((error) => {
             headers = self._ledger_runner_headers(runner)
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
+            old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 12):
+                old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
+            stale = self._ledger_carry_draft(payload, old_draft)
+            self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, stale), "floor"))
+            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, stale), "spot"),
+                             koncept_catalog_sale_unit_price(spot))
             drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
                 statement, disputed, "Synthetic carpet tile flooring at west: 4 to 6 sqm (site survey range)",
             ]})
@@ -43928,7 +43994,8 @@ main().catch((error) => {
             self._ledger_sync(request)
             saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
             self.assertEqual(saved["status"], 200)
-            ledger = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]
+            metadata = webapp.read_quote_session_metadata(session_id)
+            ledger = metadata["pricing_ledger"]
             self.assertEqual(ledger["schema"], webapp.PRICING_LEDGER_MEASUREMENT_SCHEMA)
             self.assertEqual(ledger["rows"]["review"]["measurement"], {"disposition": "review"})
             self.assertEqual(ledger["rows"]["info"]["measurement"], {"disposition": "informational"})
@@ -43936,7 +44003,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+            for version in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -43949,6 +44016,20 @@ main().catch((error) => {
             self.assertIsNone(webapp.normalized_pricing_ledger(earlier)["rows"]["floor"]["grant"])
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+            stale_metadata = copy.deepcopy(metadata)
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 12
+            webapp.write_quote_session_metadata(stale_metadata)
+            try:
+                legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                self.assertEqual(legacy["status"], 200)
+                legacy_state = legacy["body"]["quote_session"]["draft_state"]
+                for legacy_rows in (legacy_state["lineItems"], legacy_state["originalOutputRows"],
+                                    legacy_state["originalAnalysisSnapshot"]["line_items"]):
+                    self.assertIsNone(self._ledger_price(legacy_rows, "floor"))
+                    self.assertEqual(self._ledger_price(legacy_rows, "spot"), koncept_catalog_sale_unit_price(spot))
+                self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "floor"))
+            finally:
+                webapp.write_quote_session_metadata(metadata)
             self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "floor"), koncept_catalog_sale_unit_price(carpet))
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
@@ -43959,6 +44040,8 @@ main().catch((error) => {
                 values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
                 [total] = [row for row in values if "Total" in row]
                 self.assertIn(round(24 * koncept_catalog_sale_unit_price(carpet) + 2 * koncept_catalog_sale_unit_price(spot), 2), total)
+                [grand_total] = [row for row in values if "Total including GST" in row]
+                self.assertIn(407.88, grand_total)
                 self.assertFalse(any("36 sqm" in row or "Dimensions for venue orientation" in str(row) for row in values))
             self.assertEqual(webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"]["grant"]["state"], "live")
             harmless = copy.deepcopy(request)

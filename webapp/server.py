@@ -25574,7 +25574,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 12
+AREA_EVIDENCE_CLAIM_VERSION = 13
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25589,7 +25589,16 @@ AREA_DERIVED_CLAIM = re.compile(
 )
 AREA_FULL_COVERAGE = re.compile(r"(?:,\s*full coverage\b|\(\s*full coverage\s*\))", re.I)
 AREA_METRE_UNIT = re.compile(r"m|metres?|meters?", re.I)
-AREA_PROVISIONAL_QUALIFIER = re.compile(r"^(?:provisional|default|assumed|estimated|guessed)\b", re.I)
+AREA_PROVISIONAL_STATUS = r"(?:provisional|default|assumed|estimated|guessed)\b"
+AREA_PROVISIONAL_QUALIFIER = re.compile(AREA_PROVISIONAL_STATUS, re.I)
+AREA_ATTACHED_QUALIFIER = re.compile(
+    r"(?:(?:(?:measurement|area|dimensions?|quantity|value|survey)\s+)?status\s*:\s*"
+    r"|(?:measurement|area|dimensions?|quantity|value)(?:\s*:\s*|\s+(?:(?:is|was|remains)\s+)?))?"
+    rf"(?:{AREA_PROVISIONAL_STATUS}(?=$|[.,;!?]|\s+(?:in|from|using|until|pending|for|at|as|per)\b)"
+    r"|(?:pending|subject\s+to)\s+(?:(?:site|measurement)\s+)?(?:confirmation|verification)\b"
+    r"|to\s+be\s+(?:confirmed|verified)\b)",
+    re.I,
+)
 AREA_UNIT_MARKER = re.compile(
     rf"(?<![^\W\d_])(?:{AREA_CLAIM_UNIT}|square\s+(?:{SCOPE_LENGTH_UNIT}|units?)"
     rf"|(?:{SCOPE_LENGTH_UNIT})\s*(?:\^?\s*2|squared))(?![\w^])", re.I,
@@ -25602,6 +25611,7 @@ AREA_GEOMETRY_MARKER = re.compile(
 AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
+AREA_SCOPE_WRAPPERS = str.maketrans("()[]{}", "      ")
 
 
 @dataclass(frozen=True)
@@ -25621,6 +25631,13 @@ class AreaScopeSpan:
     scope: str
     label: str
     framed: bool
+
+
+@dataclass(frozen=True)
+class AreaScopePatterns:
+    exact: re.Pattern[str]
+    reference: re.Pattern[str]
+    reference_scopes: dict[str, set[str]]
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -25687,22 +25704,83 @@ def scoped_area_text(statement: str, scopes: set[str]) -> tuple[str, str, str] |
     return matched
 
 
-def area_scope_pattern(scopes: set[str]) -> re.Pattern[str]:
-    labels = [re.escape(scope).replace(r"\ ", r"\s+").replace(":", r"\s*:")
-              for scope in sorted(scopes, key=lambda scope: (-len(scope), scope))]
-    return re.compile(rf"(?<![\w-])(?P<label>{'|'.join(labels) or '(?!)'})(?:\s*[)\]}}])*\s*:")
+def area_scope_reference_key(text: str) -> str:
+    return re.sub(r"\s+:", ":", clean_text(text.translate(AREA_SCOPE_WRAPPERS)))
 
 
-def area_standalone_heading(text: str) -> bool:
-    """Recognise heading syntax without deciding whether it identifies a separate scope."""
+def area_scope_patterns(scopes: set[str]) -> AreaScopePatterns:
+    def labels(values):
+        phrases = [re.escape(scope).replace(r"\ ", r"\s+").replace(":", r"\s*:")
+                   for scope in sorted(values, key=lambda scope: (-len(scope), scope))]
+        return rf"(?<![\w-])(?P<label>{'|'.join(phrases) or '(?!)'})"
+
+    reference_scopes: dict[str, set[str]] = {}
+    for scope in scopes:
+        reference = area_scope_reference_key(scope)
+        if reference:
+            reference_scopes.setdefault(reference, set()).add(scope)
+    return AreaScopePatterns(
+        exact=re.compile(rf"{labels(scopes)}(?:\s*[)\]}}])*\s*:"),
+        reference=re.compile(rf"{labels(reference_scopes)}(?![\w-])"),
+        reference_scopes=reference_scopes,
+    )
+
+
+def area_heading_colon(text: str) -> int | None:
+    """Locate the heading delimiter without assigning the heading's physical scope."""
     if ":" not in text:
-        return False
+        return None
     context, _ = area_bracket_context(text)
     for delimiter in re.finditer(":", text):
         if context[delimiter.start()] == -1:
             heading = text[:delimiter.start()]
-            return any(char.isalpha() for char in heading) and not area_claim_kind(heading)
-    return False
+            if any(char.isalpha() for char in heading) and not area_claim_kind(heading):
+                return delimiter.start()
+            break
+    return None
+
+
+def area_referenced_claims(text: str, heading_colon: int | None, patterns: AreaScopePatterns):
+    """Keep named dimensional claims that the exact heading reader could not bind."""
+    body_start = heading_colon + 1 if heading_colon is not None else 0
+    kind = area_claim_kind(text[body_start:])
+    if not kind:
+        return
+    anchors = list(patterns.exact.finditer(text))
+    anchored = {anchor.start("label"): anchor.end("label") for anchor in anchors}
+    starts_with_exact = bool(anchors and not text[:anchors[0].start("label")].strip(" \t\r\n([{-\u2022"))
+    spatial = catalog_spatial_context_parts(text[:heading_colon]) if heading_colon is not None else None
+    spatial_primary = pricing_measurement_scope(spatial[0]) if spatial else ""
+    for reference in patterns.reference.finditer(text.translate(AREA_SCOPE_WRAPPERS)):
+        start, end = reference.span("label")
+        if anchored.get(start, -1) >= end:
+            continue
+        if starts_with_exact and not area_claim_kind(text[end:]):
+            # An exact record's own amount cannot turn a later reference into a claim.
+            continue
+        label = area_scope_reference_key(reference["label"])
+        for scope in patterns.reference_scopes.get(label, ()):
+            if end >= body_start or scope != spatial_primary:
+                yield AreaMeasurementClaim(scope, kind, None, "", (), False)
+
+
+def area_conflict_records(text: str, context: list[int]):
+    """Collect headed and unheaded source records for conflict detection only."""
+    boundaries = [(match.start(), match.end(), match.group())
+                  for match in AREA_RECORD_BREAK.finditer(text) if context[match.start()] == -1]
+    boundaries.append((len(text), len(text), ";"))
+    part_start = record_start = 0
+    heading_colon = None
+    for stop, next_start, separator in boundaries:
+        colon = area_heading_colon(text[part_start:stop])
+        if colon is not None:
+            if record_start < part_start:
+                yield text[record_start:part_start], heading_colon
+            record_start, heading_colon = part_start, colon
+        if separator == ";":
+            yield text[record_start:stop], heading_colon
+            record_start, heading_colon = next_start, None
+        part_start = next_start
 
 
 def area_value_parts(text: str) -> tuple[re.Match[str] | None, re.Match[str] | None, str, bool]:
@@ -25732,6 +25810,12 @@ def area_annotation_text(value: str, annotation: str) -> str:
     if value.startswith("(") and annotation.startswith(")"):
         annotation = annotation[1:]
     return annotation.lstrip(" .!?")
+
+
+def area_provisional_annotation(context: str) -> bool:
+    """A status about the measurement can conflict with its apparently exact value."""
+    _, pairs = area_bracket_context(context)
+    return any(AREA_ATTACHED_QUALIFIER.match(context[start + 1:end].strip()) for start, end in pairs.items())
 
 
 def area_paired_asides(text: str) -> bool:
@@ -25767,7 +25851,7 @@ def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> Ar
     measurement_open = False
     for index, (part, separator) in enumerate(parts):
         if index and parts[index - 1][1] == ";":
-            if area_standalone_heading(part):
+            if area_heading_colon(part) is not None:
                 break
             measurement_open = False
         body.append((part, separator))
@@ -25793,15 +25877,12 @@ def area_record_claim(record: AreaScopeSpan, parts: list[tuple[str, str]]) -> Ar
     return claim
 
 
-def area_source_claims(raw: str, pattern: re.Pattern[str]):
+def area_source_claims(raw: str, patterns: AreaScopePatterns):
     """Discover labels before assigning source framing or interpreting values."""
     text = unicodedata.normalize("NFKC", raw).casefold()
-    anchors = list(pattern.finditer(text))
-    if not anchors:
-        return
     context, pairs = area_bracket_context(text)
     groups = {}
-    for anchor in anchors:
+    for anchor in patterns.exact.finditer(text):
         start, end = anchor.span("label")
         group = context[start]
         while (group >= 0 and end <= pairs[group] < anchor.end()
@@ -25863,6 +25944,9 @@ def area_source_claims(raw: str, pattern: re.Pattern[str]):
             if group != -1:
                 masked[record.start:limit] = " " * (limit - record.start)
 
+    for record, colon in area_conflict_records(text, context):
+        yield from area_referenced_claims(record, colon, patterns)
+
 
 def area_claim_kind(text: str) -> str:
     if AREA_UNIT_MARKER.search(text):
@@ -25912,7 +25996,8 @@ def area_measurement_claim(scope: str, label: str, measurement: str) -> AreaMeas
             or uses_provisional_dimensions(annotation, unit) or AREA_PROVISIONAL_QUALIFIER.match(scope)
             or (prefix and (Decimal(str(prefix["quantity"])) != quantity
                             or not pricing_units_share_quantity_basis(prefix["unit"], unit)))
-            or not aside or "?" in measurement or any(char.isnumeric() for char in annotation)
+            or not aside or area_provisional_annotation(context) or "?" in measurement
+            or any(char.isnumeric() for char in annotation)
             or area_claim_kind(annotation) or (derived and re.search(r"\bcoverage\b", annotation, re.I))):
         quantity = None
     eligible = quantity is not None and proof_shape and len(label) + len(measurement) + 2 <= 300
@@ -25927,8 +26012,8 @@ def admitted_scope_measurements(parsed: dict[str, Any], sources: dict[str, list[
     scopes = {pricing_measurement_scope(line.get("text") or line.get("line") or line.get("description"))
               for section in parsed.get("quote_basis_sections", []) for line in section.get("lines", [])
               if isinstance(line, dict) and line.get("scope_kind") == "physical"} - {""}
-    pattern = area_scope_pattern(scopes)
-    facts = {source: {fact for raw in texts if isinstance(raw, str) for fact in area_source_claims(raw, pattern)}
+    patterns = area_scope_patterns(scopes)
+    facts = {source: {fact for raw in texts if isinstance(raw, str) for fact in area_source_claims(raw, patterns)}
              for source, texts in sources.items()}
     amounts: dict[str, set[tuple[Decimal, str]]] = {}
     geometries: dict[str, set[tuple[Decimal, ...]]] = {}
