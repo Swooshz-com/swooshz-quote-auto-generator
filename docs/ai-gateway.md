@@ -113,9 +113,10 @@ explicit scope label identifies the affected row when labels overlap. A heading
 with a distinct spatial qualifier can describe a separate area, including a
 chain of location relations or a level in brackets. An explicit comparison or
 exclusion describes the measurement it qualifies. The mentioned areas keep
-their own evidence, including when the relation joins two named areas. A
-separate assertion in the measurement text can still flag a conflict for the
-scope it names.
+their own evidence, including in lists with commas, conjunctions or explicit
+quantifiers. An uncertain separation leaves the affected measurements in
+review. A new dimensional statement can still flag a conflict for the scope
+it names.
 An unheaded correction in a separate source entry can also flag a conflict when
 it names the scope and includes an area or dimensions.
 After a complete value, a balanced annotation with a separately stated value

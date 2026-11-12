@@ -43595,6 +43595,26 @@ main().catch((error) => {
         raw = f"{located}: 24 sqm; {located} behind booth: 4 sqm; {east}: 10 sqm"
         claims = webapp.area_source_claims(raw, webapp.area_scope_patterns({located, east}))
         self.assertEqual({claim.scope: claim.quantity for claim in claims}, {located: 24, east: 10})
+        north = "carpet tile north"
+        exact = f"{west}: 24 sqm; {east}: 10 sqm; {north}: 5 sqm;"
+        context_cases = (
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east}, and {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from both {west} and {east}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from all of the {west}, {east} and {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from the {west}, the {east}, and the {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from either {west} or {east}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north}; Survey: revise {north} to 4 sqm",
+             {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north} revised to 4 sqm", {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north} 4 to 6 sqm", {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, possibly separate from both {west} and {east}", {west: None, east: None, north: 5}),
+        )
+        patterns = webapp.area_scope_patterns({west, east, north})
+        for note, expected in context_cases:
+            with self.subTest(note=note):
+                claims = webapp.area_source_claims(f"{exact} {note}", patterns)
+                self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
@@ -43711,6 +43731,14 @@ main().catch((error) => {
             ("ref-clause", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east revised to 4 sqm", 24, "observed", True),
             ("ref-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, not separate from Carpet tile west", 24, "observed", False),
             ("ref-excl", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: revise Carpet tile west to 4 sqm, excluding Carpet tile east", 24, "observed", False),
+            ("list-comma", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east and Carpet tile north", 24, "observed", True),
+            ("list-ox", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east, and Carpet tile north", 24, "observed", True),
+            ("list-both", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from both Carpet tile west and Carpet tile east", 24, "observed", True),
+            ("list-all", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from all of the Carpet tile west,\nCarpet tile east and Carpet tile north", 24, "observed", True),
+            ("list-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east and Carpet tile north;\nSurvey: revise Carpet tile north to 4 sqm", 24, "observed", True),
+            ("list-embed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east and Carpet tile north revised to 4 sqm", 24, "observed", True),
+            ("list-qty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east and Carpet tile north 4 to 6 sqm", 24, "observed", True),
+            ("list-unc", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, possibly separate from Carpet tile west,\nCarpet tile east and Carpet tile north", 24, "observed", False),
             ("rev-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: check Carpet tile west after the site visit", 24, "observed", True),
             ("prov-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (provisional in drawing)", 24, "observed", False),
             ("prov-nested", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm [survey status: estimated]", 24, "observed", False),
@@ -43748,8 +43776,9 @@ main().catch((error) => {
             ("uncertain-extent", label, label, f"{label}: 24 sqm", f"{label}: W 6 m x D 4 m, partial coverage", 24, "observed", False),
             ("duplicate", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24 SQM", 24, "observed", False),
         )
+        three_area_lists = {"list-comma", "list-ox", "list-all", "list-sep", "list-embed", "list-qty", "list-unc"}
         north_cases = {"est-chain", "geo-chain", "est-sep", "bracket-geo", "paren-val", "brace-geo",
-                       "wrap-geo", "wrap-val", "wrap-brace"}
+                       "wrap-geo", "wrap-val", "wrap-brace"} | three_area_lists
         embedded_revisions = {"re-embed", "re-later", "re-title", "re-amount", "re-mixed", "re-mixqty"}
         semicolon_cases = {"free-prose", "prose-sep", "qty-prose", "qty-present", "qty-past", "qty-request",
                            "qty-estimate", "qty-note", "qty-heading", "qty-heading-range", "qty-same-heading",
@@ -43757,7 +43786,7 @@ main().catch((error) => {
                            "rev-spat", "sep-spat", "rev-neutral", "prov-tail", "prov-nested", "prov-neg",
                            "prov-note", "rev-repeat", "re-brack", "re-square", "loc-chain", "loc-level",
                            "ref-split", "ref-prose", "ref-head", "ref-both", "ref-clause", "ref-neg", "ref-excl", "st-site", "st-unver", "st-field",
-                           "st-still", "st-source", "st-key", "st-survey"} | embedded_revisions
+                           "st-still", "st-source", "st-key", "st-survey", "list-both"} | embedded_revisions
         aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
                         "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
         qualifier_cases = aside_cases | north_cases
@@ -43826,6 +43855,8 @@ main().catch((error) => {
                             terminal = ";" if name in semicolon_cases else "" if name == "assume-soft" else "."
                             wrap = " " if name == "free-inline" else "\n"
                             sources = [f"{statement}{terminal}{wrap}{other};\n{east_statement}"]
+                        elif name in three_area_lists:
+                            sources = [f"{statement};\n{other};\n{east_statement};\n{north_statement}"]
                         elif name in north_cases:
                             terminal = ";" if name == "est-sep" else "."
                             sources = [f"{other}{terminal}\n{east_statement}{terminal}\n{north_statement}"]
@@ -43894,12 +43925,13 @@ main().catch((error) => {
                             self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
                         east_priced = name in dual_cases and name not in {
-                            "open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty", "ref-clause",
+                            "open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty", "ref-clause", "list-unc",
                         }
+                        north_priced = name in north_cases and name not in {"list-sep", "list-embed", "list-qty", "list-unc"}
                         if name in dual_cases:
                             self.assertEqual(entries["east"].get("catalog_item_id"), self.LEDGER_CARPET if east_priced else None)
                         if name in north_cases:
-                            self.assertEqual(entries["north"].get("catalog_item_id"), self.LEDGER_CARPET)
+                            self.assertEqual(entries["north"].get("catalog_item_id"), self.LEDGER_CARPET if north_priced else None)
                         workbook_cases = {"approved", "decimal", "grouped", "derived-wrapped", "grouped-not-decimal", "annotated-conflict",
                                           "mixed-format", "range", "approximation", "punctuated-wrap", "range-suffix",
                                           "short-pair", "sentence-two", "sentence-end", "after-prose", "open-note", "open-att", "approx-pair"} | framing_cases
@@ -43907,7 +43939,7 @@ main().catch((error) => {
                             include = {"floor", "spot"} if allowed else {"spot"}
                             if east_priced:
                                 include.add("east")
-                            if name in north_cases:
+                            if north_priced:
                                 include.add("north")
                             sections = copy.deepcopy(final["quote_basis_sections"])
                             for section in sections:
@@ -43922,7 +43954,7 @@ main().catch((error) => {
                             [xlsx] = list(output_root.rglob("quotation.xlsx"))
                             values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
                             [total] = [row for row in values if "Total" in row]
-                            priced_area = (10 if east_priced else 0) + (5 if name in north_cases else 0) + (quantity if allowed else 0)
+                            priced_area = (10 if east_priced else 0) + (5 if north_priced else 0) + (quantity if allowed else 0)
                             expected = round(2 * koncept_catalog_sale_unit_price(spot) +
                                              priced_area * koncept_catalog_sale_unit_price(self.LEDGER_CARPET), 2)
                             self.assertIn(expected, total)
@@ -43931,7 +43963,7 @@ main().catch((error) => {
                                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
                                 self.assertEqual(any("24 sqm" in row for row in values), allowed)
                             if name in north_cases:
-                                self.assertTrue(any("5 sqm" in row and 72 in row for row in values))
+                                self.assertEqual(any("5 sqm" in row and 72 in row for row in values), north_priced)
 
     def test_ledger_rejects_reused_scope_across_signed_analyses(self):
         label = "Synthetic carpet tile flooring at east"

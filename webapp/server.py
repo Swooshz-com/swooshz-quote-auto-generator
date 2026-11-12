@@ -25625,10 +25625,11 @@ AREA_CONTEXT_RELATION = re.compile(
     r"\b(?:(?P<uncertain>not|never|no\s+longer|possibly|potentially)\s+)?"
     r"(?:(?:separate|apart|distinct|different)\s+from|independent\s+of"
     r"|compar(?:ed|ing)\s+(?:with|to)|rather\s+than|instead\s+of"
-    r"|exclud(?:ing|es)|except(?:\s+for)?|versus|vs\.?)\s+(?:the\s+)?[\s(\[{]*$",
+    r"|exclud(?:ing|es)|except(?:\s+for)?|versus|vs\.?)\s+"
+    r"(?:(?:both|either|each|all)\s+(?:of\s+)?)?(?:the\s+)?[\s(\[{]*$",
     re.I,
 )
-AREA_REFERENCE_COORDINATION = re.compile(r"\s*,?\s*(?:and|or|nor)\s+", re.I)
+AREA_REFERENCE_COORDINATION = re.compile(r"\s*(?:,\s*(?:(?:and|or|nor)\s+)?|(?:and|or|nor)\s+)(?:the\s+)?", re.I)
 AREA_LOCATION_QUALIFIER = re.compile(
     r"(?:(?:upper|lower|ground|basement|mezzanine|top|bottom|[0-9]+(?:st|nd|rd|th))\s+(?:level|floor|tier|deck)"
     r"|(?:level|floor|tier|deck|zone|bay|room|section)\s+(?:[a-z]|[0-9]+[a-z]?))", re.I,
@@ -25970,10 +25971,14 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
         body_start = colon + 1 if colon is not None else 0
         previous_end = 0
         previous_contextual = False
-        for reference in patterns.reference.finditer(record_text.translate(AREA_SCOPE_WRAPPERS)):
+        references = list(patterns.reference.finditer(record_text.translate(AREA_SCOPE_WRAPPERS)))
+        for index, reference in enumerate(references):
             left, right = reference.span("label")
+            next_start = references[index + 1].start("label") if index + 1 < len(references) else len(record_text)
+            assertion_end = min(next_start, colon) if colon is not None and right <= colon else next_start
+            # A new dimensional expression ends list inheritance, even if its amount is uncertain.
             coordinated = (previous_contextual and AREA_REFERENCE_COORDINATION.fullmatch(record_text[previous_end:left])
-                           and not AREA_VALUE_RELATION.match(record_text[right:].lstrip()))
+                           and not area_claim_kind(record_text[right:assertion_end]))
             previous_contextual = bool(coordinated or area_contextual_reference(record_text, left, body_start))
             if previous_contextual:
                 contextual.add(start + left)
