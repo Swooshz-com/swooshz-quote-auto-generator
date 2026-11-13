@@ -24,10 +24,14 @@ high-detail images. The gateway checks the provider envelope and bounded
 JSON with nonblank observations before marking the send successful. The server
 still checks one observation per source, preserves source order and labels,
 and controls synthesis and quote creation. A rejected response stops drafting
-with a support reference. If a body read is interrupted or short, the
-gateway discards the partial body and records one failed send with unknown
-usage and cost. For a complete image-batch error, the gateway reports a
-schema rejection only when an allowlisted provider field identifies one.
+with a support reference. The gateway reads up to 8 MiB for a successful
+response or 128 KiB for an HTTP error, plus one byte to detect an oversized
+body. A short or interrupted read is partial. At the limit plus one byte,
+the gateway stops reading and reports an oversized response. It discards
+both partial and oversized bodies, records unknown usage and cost, and
+does not retry. For a complete image-batch error, an explicit target must
+name the response schema, or an untargeted provider code must identify a
+schema failure specifically. Image errors keep their HTTP classification.
 
 The current batch runner also supports the default-off request format.
 Retire that format after both installed routes qualify for the strict schema

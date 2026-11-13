@@ -26,6 +26,7 @@ ROUTE_KEYS = MappingProxyType({
     "pricing_import": "PRICING_IMPORT", "pricing_metadata": "PRICING_METADATA",
 })
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ERROR_BODY_BYTES = 128 * 1024
 MAX_REQUEST_BYTES = 300 * 1024 * 1024
 MODEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._/-]{0,134}")
 SUPPORTED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
@@ -48,23 +49,45 @@ NONRETRY_ERROR_CODES = frozenset({
     "context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "invalid_prompt",
     "image_content_policy_violation", "permission_denied", "invalid_api_key",
 })
-SCHEMA_ERROR_CODES = frozenset({"unsupported_parameter", "unsupported_schema", "invalid_json_schema",
+SCHEMA_SPECIFIC_CODES = frozenset({"unsupported_schema", "invalid_json_schema",
     "json_schema_not_supported", "unsupported_response_format"})
+SCHEMA_ERROR_CODES = SCHEMA_SPECIFIC_CODES | {"unsupported_parameter"}
+IMAGE_ERROR_CODES = frozenset({"invalid_image", "image_too_large", "image_too_small",
+    "unsupported_image_format", "image_not_found", "image_download_failed", "image_content_policy_violation"})
 SCHEMA_ERROR_PARAMS = frozenset({"text", "text.format", "text.format.type", "text.format.name",
                                 "text.format.strict", "text.format.schema", "response_format"})
 
 
-def schema_rejected(data, diagnostics, *, strict_image_observations):
-    """Use allowlisted provider fields. Synthesis retains its existing status rule."""
+def _image_schema_rejected(data, metadata):
+    error = data.get("error") if isinstance(data, dict) else None
+    target = error.get("param") if isinstance(error, dict) else metadata.get("provider_error_param")
+    markers = tuple(metadata.get(key) for key in
+                    ("provider_error_code", "provider_error_type", "provider_error_class"))
+    # A supplied target must name the response schema. A generic marker without
+    # a target cannot distinguish a schema rejection from an input error.
+    if any(isinstance(marker, str) and marker in IMAGE_ERROR_CODES for marker in markers):
+        return False
+    if target is not None:
+        return isinstance(target, str) and target in SCHEMA_ERROR_PARAMS
+    return any(isinstance(marker, str) and marker in SCHEMA_SPECIFIC_CODES for marker in markers)
+
+
+def schema_rejected(data, error, *, strict_image_observations):
+    """Classify machine evidence. Synthesis retains its existing status rule."""
+    diagnostics = error.diagnostics
     metadata = draft_provider_error_diagnostics(data)
-    if not strict_image_observations and diagnostics.get("http_status") in {400, 404, 405, 415, 422}:
-        return True
-    error_fields = ("provider_error_code", "provider_error_type", "provider_error_class")
-    transport_fields = error_fields if strict_image_observations else ("provider_error_code",)
+    if strict_image_observations:
+        if data is not None:
+            return _image_schema_rejected(data, metadata)
+        if hasattr(error, "image_schema_rejected"):
+            return error.image_schema_rejected
+        return _image_schema_rejected(None, diagnostics)
     return (
-        any(metadata.get(key) in SCHEMA_ERROR_CODES for key in error_fields)
-        or any(diagnostics.get(key) in SCHEMA_ERROR_CODES for key in transport_fields)
+        diagnostics.get("http_status") in {400, 404, 405, 415, 422}
+        or any(metadata.get(key) in SCHEMA_ERROR_CODES
+               for key in ("provider_error_code", "provider_error_type", "provider_error_class"))
         or metadata.get("provider_error_param") in SCHEMA_ERROR_PARAMS
+        or diagnostics.get("provider_error_code") in SCHEMA_ERROR_CODES
         or diagnostics.get("provider_error_param") in SCHEMA_ERROR_PARAMS
     )
 
@@ -238,12 +261,25 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class BoundedHttpsTransport:
     @staticmethod
     def _read_body(response, limit, *, http_status=None):
-        # Once headers arrive, a failed read cannot supply diagnostics or billing.
+        headers = response.headers
+        length = headers.get("Content-Length") if headers is not None else None
+        if length is not None and (not isinstance(length, str) or not re.fullmatch(r"[0-9]{1,12}", length)):
+            raise GatewayError("response_size", boundary="provider_response_shape", http_status=http_status)
+        declared = int(length) if length is not None else None
         try:
-            return response.read(limit + 1)
+            raw = response.read(limit + 1)
         except (HTTPException, OSError):
             raise GatewayError("response_partial", boundary="provider_response_shape",
                                http_status=http_status) from None
+        # Short reads provide evidence of incompleteness. A read at the sentinel
+        # may have left bytes unread, so treat it as oversize without parsing it.
+        if declared is not None and len(raw) < min(declared, limit + 1):
+            raise GatewayError("response_partial", boundary="provider_response_shape", http_status=http_status)
+        if len(raw) > limit or (declared is not None and declared > limit):
+            raise GatewayError("response_size", boundary="provider_response_shape", http_status=http_status)
+        if declared is not None and len(raw) != declared:
+            raise GatewayError("response_partial", boundary="provider_response_shape", http_status=http_status)
+        return raw
 
     def __init__(self, *, opener=None):
         self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect())
@@ -258,14 +294,9 @@ class BoundedHttpsTransport:
             metadata = {}
             parsed = None
             try:
-                raw = self._read_body(exc, 128 * 1024, http_status=status)
-                if len(raw) <= 128 * 1024:
-                    length = exc.headers.get("Content-Length") if exc.headers is not None else None
-                    if (isinstance(length, str) and re.fullmatch(r"[0-9]{1,12}", length)
-                            and len(raw) < int(length)):
-                        raise GatewayError("response_partial", boundary="provider_response_shape", http_status=status)
-                    parsed = _load_json(raw.decode("utf-8"))
-                    metadata = draft_provider_error_diagnostics(parsed)
+                raw = self._read_body(exc, MAX_ERROR_BODY_BYTES, http_status=status)
+                parsed = _load_json(raw.decode("utf-8"))
+                metadata = draft_provider_error_diagnostics(parsed)
             except (AttributeError, OSError, ValueError, TypeError, UnicodeError, RecursionError):
                 # Diagnostics are optional; the failed HTTP response remains a failure.
                 metadata = {}
@@ -274,6 +305,7 @@ class BoundedHttpsTransport:
             error = GatewayError("http_error", boundary="provider_http", http_status=status,
                                  retryable=http_error_retryable(status, parsed))
             error.diagnostics.update(metadata)
+            error.image_schema_rejected = _image_schema_rejected(parsed, metadata)
             # Keep the billing fields out of diagnostics and business output.
             if isinstance(parsed, dict):
                 error.reported_cost = (parsed.get("model"), _response_cost(parsed))
@@ -289,14 +321,7 @@ class BoundedHttpsTransport:
                     raise GatewayError("redirect_or_status",boundary="provider_http")
                 if response.headers.get_content_type().lower() != "application/json":
                     raise GatewayError("response_mime",boundary="provider_response_json")
-                length=response.headers.get("Content-Length")
-                if length is not None and (not re.fullmatch(r"[0-9]{1,12}",length) or int(length)>MAX_RESPONSE_BYTES):
-                    raise GatewayError("response_size",boundary="provider_response_shape")
-                raw=self._read_body(response, MAX_RESPONSE_BYTES)
-                if len(raw)>MAX_RESPONSE_BYTES:
-                    raise GatewayError("response_size",boundary="provider_response_shape")
-                if length is not None and len(raw)!=int(length):
-                    raise GatewayError("response_partial",boundary="provider_response_shape")
+                raw = self._read_body(response, MAX_RESPONSE_BYTES)
                 result=_load_json(raw.decode("utf-8"))
         except GatewayError:
             raise
@@ -500,8 +525,8 @@ class AiGateway:
                     exc.diagnostics.setdefault("response_contract_name", contract.name)
                     exc.diagnostics.setdefault("response_contract_reason", exc.reason)
                     exc.diagnostics.setdefault("batch_failure_reason", "batch_provider_failure")
-                if (contract is not None and exc.reason != "response_partial"
-                        and schema_rejected(data, exc.diagnostics,
+                if (contract is not None and exc.reason not in {"response_partial", "response_size"}
+                        and schema_rejected(data, exc,
                                             strict_image_observations=strict_image_observations)):
                     exc.reason = "response_schema_rejected"
                     exc.retryable = False
