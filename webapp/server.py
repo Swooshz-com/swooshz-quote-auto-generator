@@ -26440,10 +26440,15 @@ def area_measurement_condition(text: str, start: int, stop: int) -> AreaQualific
     """Read one condition clause. The caller keeps its coordination and main predicate."""
     if modifiers := AREA_RESULT_MODIFIERS.match(text, start, stop):
         start = modifiers.end()
+    if intro := AREA_CONDITION_INTRO.match(text, start, stop):
+        if claim := area_qualification_claim(text, intro.end(), stop, None):
+            return claim
     if condition := AREA_CONDITION_TOPIC.match(text, start, stop):
+        # A gerund followed by a direct object must pass the predicate's role check.
+        action = AREA_ACTION.match(text, condition.start("event"), stop)
+        if action and action["ongoing"] and not AREA_CONTINUATION.match(text, condition.end(), stop):
+            return None
         return AreaQualification((condition.span("event"),))
-    if condition := AREA_CONDITION_INTRO.match(text, start, stop):
-        return area_qualification_claim(text, condition.end(), stop, None)
     return None
 
 

@@ -43897,6 +43897,8 @@ main().catch((error) => {
             (f"if the site measurements are independently verified, the dimensions for {east} are approved", {east}),
             (f"the dimensions for {east} were approved if the invoice is independently verified", set()),
             (f"the dimensions for {east} were approved if verified invoices arrive", set()),
+            (f"the dimensions for {east} were approved only after verifying the invoice", set()),
+            (f"the dimensions for {east} were approved only after verifying the measurements", {east}),
             (f"the dimensions for {east} were approved conditional upon independent review of the invoice", set()),
             (f"the dimensions for {east} were approved if the site measurements are used for ordering", set()),
             (f"the dimensions for {east} were approved if the dimensions for {west} are verified", {east}),
