@@ -166,8 +166,20 @@ at most two same-route transient retries with the existing two/five-second delay
 Auth, payment, permission, unsupported input, refusal and partial output are never
 replayed. Closed canonical Responses error types and native machine codes override
 transient HTTP status. Unknown explicit machine categories fail without replay;
-raw error messages never select retries. An HTTP error carrying partial output is
-also terminal. No retry selects another model, provider, tier or parser.
+raw error messages never select retries. The HTTPS response reader requires a
+complete status line and header terminator before urllib exposes the response.
+On the POST route, a final 1xx, 204, 205 or 304 response is closed before any
+body read. It keeps the applicable HTTP status reporting, settles once with
+unknown cost and supplies no body diagnostics, retry or schema rejection.
+The reader verifies fixed-length and chunked framing before using an eligible
+body. A response delimited by connection closure requires a TLS closure alert.
+A response that starts but is cut off, times out, exceeds the body limit or has
+invalid framing ends the attempt with unknown cost. Complete transient HTTP
+errors and eligible pre-response transport failures can still retry on Basis.
+Explicit refusal or an unfinished response blocks retry and schema rejection
+diagnosis even when the provider supplies no details. A fully received response
+can still supply a valid reported cost when its output is refused or unfinished.
+Retries keep the original model, provider, tier and parser.
 
 Operation correlation has a scoped owner. Nested operations restore the exact enclosing operation, counters and usage on every exit, including logging failures. Missing or invalid configuration and credentials record validation at attempt zero. Actual sends retain one terminal record each; full-analysis and metadata owners keep correlation until business admission completes.
 

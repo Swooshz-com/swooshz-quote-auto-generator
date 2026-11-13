@@ -679,6 +679,16 @@ is explicitly changed. All six maintained gateway callers share shape/completion
 The retained legacy envelope parser tests cover historical consumers only.
 Single-send analysis and pricing calls send once; text retries stay on the captured
 route and never switch model, provider or response parser.
+Run `tests.test_openrouter_gateway` and `tests.test_image_observation_contract`
+for response framing and state. The gateway suite uses the OpenSSL CLI to
+generate a temporary certificate and exercises both image modes and both Basis
+routes over loopback TLS. Verify valid and interrupted closure, fixed-length and
+chunked framing, explicit refusal and incompleteness, and genuine transient and
+schema errors. Ordinary bodyless response mocks cover final 1xx, 204, 205 and
+304 across both image modes, synthesis and both Basis routes. Assert zero body
+reads, compatible status reporting, response closure, no body diagnostics or
+retry, and one settlement with unknown cost. Verify that a failed image batch
+preserves the saved quote and stops before synthesis in both modes.
 Confidence supplied by a fresh response is an integer from 0 to 100, including
 0 and 1; fractions, percent strings and conflicting aliases reject. Saved/user
 confidence and commercial-number normalisers remain compatible with their existing

@@ -3,6 +3,15 @@ import copy
 import dataclasses
 import io
 import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import socketserver
+import ssl
+import subprocess
+import tempfile
+from threading import Event, Thread
 import unittest
 import urllib.error
 from email.message import Message
@@ -180,6 +189,23 @@ class OpenRouterGatewayTest(unittest.TestCase):
             with self.subTest(status=status),self.assertRaises(gateway.GatewayError) as caught: gateway.BoundedHttpsTransport(opener=opener).send(b"{}",credential="synthetic",timeout=10)
             self.assertNotIn("private-canary",str(caught.exception)); self.assertEqual(caught.exception.diagnostics["http_status"],status)
 
+    def test_returned_no_content_statuses_keep_existing_rejection_without_reading(self):
+        for status in (204, 205):
+            with self.subTest(status=status):
+                response = Response(b"", status=status)
+                opener = mock.Mock()
+                opener.open.return_value = response
+                with (mock.patch.object(response, "read", wraps=response.read) as read,
+                      self.assertRaises(gateway.GatewayError) as caught):
+                    gateway.BoundedHttpsTransport(opener=opener).send(b"{}", credential="synthetic", timeout=10)
+                self.assertEqual(caught.exception.reason, "redirect_or_status")
+                self.assertEqual(caught.exception.diagnostics["failure_boundary"], "provider_http")
+                self.assertNotIn("http_status", caught.exception.diagnostics)
+                self.assertFalse(caught.exception.retryable)
+                self.assertTrue(response.closed)
+                read.assert_not_called()
+                opener.open.assert_called_once()
+
     def test_G08_G12_failures_keep_classification_and_only_allowlisted_diagnostics(self):
         config=self.config()
         for operation in gateway.ROUTE_KEYS:
@@ -229,7 +255,9 @@ class OpenRouterGatewayTest(unittest.TestCase):
         negatives += [{"error_type":"PRIVATE_UNKNOWN_TYPE"},{"error":{"code":"PRIVATE_UNKNOWN_CODE"}},
                       {"error_type":["PRIVATE_TYPE"]},{"output_text":"PRIVATE_PARTIAL"},
                       {"output":[{"text":"PRIVATE_PARTIAL"}]},{"refusal":"PRIVATE_REFUSAL"},
-                      {"incomplete_details":{"reason":"PRIVATE_REASON"}}]
+                      {"refusal":""},{"incomplete_details":[]},{"incomplete_details":{"reason":"PRIVATE_REASON"}},
+                      {"status":"incomplete"},{"status":"incomplete","incomplete_details":None},
+                      {"status":"in_progress"},{"status":"queued"},{"status":"cancelled"}]
         for operation in gateway.ROUTE_KEYS:
             route=config.route(operation)
             for status in gateway.TRANSIENT_HTTP_STATUSES:
@@ -252,7 +280,7 @@ class OpenRouterGatewayTest(unittest.TestCase):
 
     def test_G10_genuine_http_transients_keep_same_route_limits_delays_and_one_terminal_per_send(self):
         config=self.config()
-        positives=[{}, {"error":{"type":"server_error","code":"server_error"}}]
+        positives=[{}, {"status":"failed","error":{"type":"server_error","code":"server_error"}}]
         positives += [{"error_type":value,"error":{"code":"server_error"}} for value in gateway.TRANSIENT_ERROR_TYPES]
         for operation in gateway.ROUTE_KEYS:
             route=config.route(operation)
@@ -279,6 +307,244 @@ class OpenRouterGatewayTest(unittest.TestCase):
         self.assertEqual(gateway.admitted_usage({"input_tokens":2,"output_tokens":3,"total_tokens":5,"private":"canary"}),{"input_tokens":2,"output_tokens":3,"total_tokens":5})
         for value in [None,[],{}, {"input_tokens":True},{"input_tokens":-1},{"total_tokens":float("inf")},{"total_tokens":"3"},{"input_tokens":2,"output_tokens":3,"total_tokens":4},{"output_tokens":2,"output_tokens_details":{"reasoning_tokens":3}}]:
             with self.subTest(kind=type(value).__name__): self.assertIsNone(gateway.admitted_usage(value))
+
+
+class LoopbackResponseTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Generate a short-lived fixture identity locally. No stored key or external service.
+        openssl = shutil.which("openssl")
+        if openssl is None and os.name == "nt":
+            openssl = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/usr/bin/openssl.exe"
+        if not openssl or not Path(openssl).is_file():
+            raise RuntimeError("OpenSSL CLI is required for the gateway's loopback TLS tests.")
+        with tempfile.TemporaryDirectory() as directory:
+            key = str(Path(directory) / "key.pem")
+            cert = str(Path(directory) / "cert.pem")
+            subprocess.run(
+                [str(openssl), "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                 "-subj", "/CN=openrouter.ai", "-addext", "subjectAltName=DNS:openrouter.ai",
+                 "-keyout", key, "-out", cert],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, check=True,
+            )
+            cls.server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            cls.server_tls.load_cert_chain(cert, key)
+            cls.client_tls = ssl.create_default_context(cafile=cert)
+
+    def setUp(self):
+        self.reply = b""
+        self.hold_open = False
+        self.orderly_close = True
+        self.release = Event()
+        self.requests = []
+        fixture = self
+
+        class Provider(socketserver.StreamRequestHandler):
+            def handle(self):
+                request_line = self.rfile.readline()
+                length = 0
+                while (line := self.rfile.readline()) not in (b"\r\n", b""):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1])
+                reply, hold_open, orderly_close = fixture.reply, fixture.hold_open, fixture.orderly_close
+                fixture.requests.append((request_line, json.loads(self.rfile.read(length))))
+                self.wfile.write(reply)
+                if hold_open:
+                    fixture.release.wait(5)
+                if orderly_close:
+                    # Send close_notify. urllib may close before sending its own alert.
+                    try:
+                        self.request.unwrap().close()
+                    except OSError:
+                        pass
+
+        class TlsServer(socketserver.ThreadingTCPServer):
+            def get_request(self):
+                raw, address = super().get_request()
+                raw.settimeout(1)
+                try:
+                    return fixture.server_tls.wrap_socket(raw, server_side=True), address
+                except OSError:
+                    raw.close()
+                    raise
+
+        provider = TlsServer(("127.0.0.1", 0), Provider)
+        self.addCleanup(provider.server_close)
+        worker = Thread(target=provider.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(provider.shutdown)
+        self.addCleanup(self.release.set)
+
+        # Preserve the HTTPS opener, handshake, hostname check and response parser.
+        # Substitute only the trust root and TCP destination.
+        create_connection = socket.create_connection
+
+        def connect(address, *args, **kwargs):
+            self.assertEqual(address, ("openrouter.ai", 443))
+            return create_connection(provider.server_address, timeout=0.5)
+
+        real_connect = socket.socket.connect
+
+        def local_only(sock, address):
+            self.assertEqual(address, provider.server_address)
+            return real_connect(sock, address)
+
+        self.enterContext(mock.patch.object(socket.socket, "connect", local_only))
+        self.enterContext(mock.patch.object(socket, "create_connection", connect))
+        # Model a context that would otherwise turn a ragged EOF into a clean one.
+        self.client_tls.options |= getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
+        self.enterContext(mock.patch.object(ssl, "_create_default_https_context", return_value=self.client_tls))
+        self.enterContext(mock.patch.object(urllib.request, "getproxies", return_value={}))
+        self.config = gateway.GatewayConfiguration.capture(synthetic_configuration(overrides={
+            "OPENROUTER_DRAFT_IMAGE_SCHEMA_ENABLED": "true",
+        }).get)
+
+    def request(self, operation, reply, *, reason=None, sends=1, cost=None, hold_open=False,
+                orderly_close=True, draft_batch=False, output_text=None, response_status=None):
+        self.requests.clear()
+        self.reply, self.hold_open, self.orderly_close = reply, hold_open, orderly_close
+        spend, sleep, telemetry = mock.Mock(), mock.Mock(), mock.Mock()
+        route = self.config.route(operation)
+        subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic-key",
+                                    quote_spend=spend, telemetry=telemetry, sleep=sleep)
+        if draft_batch:
+            from tests.test_image_observation_contract import batch_body
+            body = batch_body(route)
+        else:
+            body = envelope(route)
+        if reason is None:
+            expected = completed(route)["output"]
+            if output_text is not None:
+                expected[0]["content"][0]["text"] = output_text
+            self.assertEqual(subject.request(operation, body, draft_batch=draft_batch)["output"], expected)
+        else:
+            with self.assertRaises(gateway.GatewayError) as caught:
+                subject.request(operation, body, draft_batch=draft_batch)
+            self.assertEqual(caught.exception.reason, reason)
+            if response_status is not None:
+                self.assertEqual(caught.exception.diagnostics["responses_status"], response_status)
+                self.assertFalse(caught.exception.retryable)
+            if reason in {"response_partial", "response_framing"}:
+                self.assertFalse(caught.exception.retryable)
+                self.assertFalse(hasattr(caught.exception, "reported_cost"))
+                self.assertNotIn("provider_error_code", caught.exception.diagnostics)
+                self.assertNotIn("synthetic-private-value", repr(caught.exception.diagnostics))
+        self.assertEqual(len(self.requests), sends)
+        for request_line, body in self.requests:
+            self.assertEqual(request_line, b"POST /api/v1/responses HTTP/1.1\r\n")
+            self.assertEqual(body["model"], route.model)
+            self.assertEqual(body["provider"], self.config.provider_policy(operation))
+        self.assertEqual(spend.reserve.call_count, sends)
+        self.assertEqual([call.args[1] for call in spend.settle.call_args_list], [cost] * sends)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2.0, 5.0][:sends-1])
+        self.assertEqual([call.args[1] for call in telemetry.call_args_list], list(range(1, sends+1)))
+        self.assertEqual([call.args[4]["retry_pending"] for call in telemetry.call_args_list],
+                         [True] * (sends-1) + [False])
+        self.assertNotIn("synthetic-private-value", repr(telemetry.call_args_list))
+
+    def test_only_complete_response_heads_can_authorise_http_status_retries(self):
+        status = b"HTTP/1.1 503 Synthetic fixture\r\n"
+        header = b"X-Synthetic: synthetic-private-value\r\n"
+        interim = b"HTTP/1.1 100 Continue\r\n"
+        cases = (
+            ("pre-response EOF", b"", False, "connection_failed", 3),
+            ("pre-response timeout", b"", True, "connection_failed", 3),
+            ("status EOF", status[:-2], False, "response_partial", 1),
+            ("status timeout", status[:-2], True, "response_partial", 1),
+            ("header EOF", status + header, False, "response_partial", 1),
+            ("header timeout", status + header, True, "response_partial", 1),
+            ("mid header EOF", status + header[:-2], False, "response_partial", 1),
+            ("bare LF", status + b"\n", False, "response_partial", 1),
+            ("invalid status", b"HTTP/1.1 +503\r\n\r\n", False, "response_framing", 1),
+            ("invalid field", status + b"Invalid field\r\n\r\n", False, "response_framing", 1),
+            ("long field", status + b"X-Test: " + b"x" * 65536 + b"\r\n\r\n", False, "response_framing", 1),
+            ("many fields", status + header * 101 + b"\r\n", False, "response_framing", 1),
+            ("folded field", status + header + b" value\r\n\r\n", False, "response_framing", 1),
+            ("interim header EOF", interim + header, False, "response_partial", 1),
+            ("final status EOF", interim + b"\r\n", False, "response_partial", 1),
+            ("final header EOF", interim + b"\r\n" + status + header, False, "response_partial", 1),
+            ("interim limit", (interim + b"\r\n") * 100 + status + b"\r\n", False, "response_framing", 1),
+            ("interim complete", interim + b"\r\n" + status + header + b"\r\n", False, "http_error", 3),
+            ("final complete", status + header + b"\r\n", False, "http_error", 3),
+        )
+        for operation in ("basis_line", "basis_answer"):
+            for name, reply, hold_open, reason, sends in cases:
+                with self.subTest(operation=operation, name=name):
+                    self.request(operation, reply, hold_open=hold_open, reason=reason, sends=sends)
+
+    def test_only_valid_body_framing_exposes_cost_and_allows_retry(self):
+        for operation in ("draft", "draft_high_quality", "basis_line", "basis_answer"):
+            basis = operation.startswith("basis_")
+            status = b"503 Service Unavailable" if basis else b"200 OK"
+            route = self.config.route(operation)
+            reply = {"usage": {"cost": 0.125}}
+            reply = {"model": route.model, **reply} if basis else completed(route, **reply)
+            payload = json.dumps(reply).encode()
+            size = str(len(payload)).encode()
+            chunk = f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
+            cases = (
+                ("fixed", b"1.1", b"Content-Length: " + size, payload, None),
+                ("fixed OWS", b"1.1", b"Content-Length:\t " + size + b" \t", payload, None),
+                ("fixed HTTP/1.0", b"1.0", b"Content-Length: " + size, payload, None),
+                ("close-delimited", b"1.1", b"Connection: close", payload, None),
+                ("short fixed", b"1.1", b"Content-Length: " + size, payload[:-1], "response_partial"),
+                ("invalid fixed", b"1.1", b"Content-Length: +" + size, payload, "response_framing"),
+                ("duplicate length", b"1.1", b"Content-Length: " + size + b"\r\nContent-Length: " + size, payload, "response_framing"),
+                ("conflicting fields", b"1.1", b"Content-Length: " + size + b"\r\nTransfer-Encoding: chunked", payload, "response_framing"),
+                ("chunked", b"1.1", b"Transfer-Encoding: chunked", chunk + b"0\r\nX-Test: example\r\n\r\n", None),
+                ("chunked OWS", b"1.1", b"Transfer-Encoding: Chunked \t", chunk + b"0\r\n\r\n", None),
+                ("chunked HTTP/1.0", b"1.0", b"Transfer-Encoding: chunked", chunk + b"0\r\n\r\n", "response_framing"),
+                ("unsupported coding", b"1.1", b"Transfer-Encoding: gzip, chunked", chunk + b"0\r\n\r\n", "response_framing"),
+                ("incomplete chunk trailers", b"1.1", b"Transfer-Encoding: chunked", chunk + b"0\r\n", "response_partial"),
+            )
+            for name, version, header, body, framing_error in cases:
+                with self.subTest(operation=operation, name=name):
+                    head = b"HTTP/" + version + b" " + status + b"\r\nContent-Type: application/json\r\n"
+                    self.request(operation, head + header + b"\r\n\r\n" + body,
+                                 reason=framing_error or ("http_error" if basis else None),
+                                 sends=3 if basis and not framing_error else 1,
+                                 cost=None if framing_error else 0.125)
+
+    def test_tls_close_alert_required_only_for_close_delimited_reply(self):
+        observation = '{"observations":["Synthetic observation"]}'
+        for operation in ("draft", "draft_high_quality", "basis_line", "basis_answer"):
+            route = self.config.route(operation)
+            image = operation.startswith("draft")
+            value = completed(route) if image else {"model": route.model, "error_type": "provider_unavailable"}
+            value["usage"] = {"cost": 0.125}
+            if image:
+                value["output"][0]["content"][0]["text"] = observation
+            payload = json.dumps(value).encode()
+            status = b"200 OK" if image else b"503 Service Unavailable"
+            head = b"HTTP/1.1 " + status + b"\r\nContent-Type: application/json\r\n"
+            length = str(len(payload)).encode()
+            chunk = f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
+            cases = (
+                ("orderly close", b"Connection: close", payload, True, True, False),
+                ("missing close alert", b"Connection: close", payload, False, False, False),
+                ("timed out waiting for close alert", b"Connection: close", payload, True, False, True),
+                ("fixed without close alert", b"Content-Length: " + length, payload, False, True, False),
+                ("short fixed without close alert", b"Content-Length: " + length, payload[:-1], False, False, False),
+                ("chunked without close alert", b"Transfer-Encoding: chunked", chunk + b"0\r\n\r\n", False, True, False),
+                ("short chunked without close alert", b"Transfer-Encoding: chunked", chunk + b"0\r\n", False, False, False),
+            )
+            for name, header, body, orderly, complete, hold_open in cases:
+                with self.subTest(operation=operation, name=name):
+                    self.request(operation, head + header + b"\r\n\r\n" + body,
+                                 reason=(None if image else "http_error") if complete else "response_partial",
+                                 sends=3 if complete and not image else 1, cost=0.125 if complete else None,
+                                 orderly_close=orderly, draft_batch=image, output_text=observation,
+                                 hold_open=hold_open)
+
+    def test_orderly_close_with_explicit_incomplete_status_never_retries(self):
+        for operation in ("basis_line", "basis_answer"):
+            route = self.config.route(operation)
+            payload = json.dumps({"model": route.model, "status": "incomplete", "incomplete_details": None,
+                                  "error_type": "provider_unavailable", "usage": {"cost": 0.125}}).encode()
+            with self.subTest(operation=operation):
+                self.request(operation, b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n" + payload,
+                             reason="http_error", response_status="incomplete", cost=0.125)
 
 
 class ReportedResponseCostTest(unittest.TestCase):

@@ -3,15 +3,22 @@ from __future__ import annotations
 import copy
 import dataclasses
 from decimal import Decimal, InvalidOperation
+from http.client import HTTPException, HTTPResponse, HTTPSConnection, IncompleteRead
 import json
 import math
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
 from types import MappingProxyType
 from typing import Any
-from webapp.ai_response_contracts import DRAFT_SYNTHESIS
+from webapp.ai_response_contracts import ContractViolation, DRAFT_SYNTHESIS
+from webapp.image_observation_contract import (
+    IMAGE_OBSERVATIONS,
+    admit_image_observations,
+    is_image_batch_input,
+)
 
 OPENROUTER_RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 ROUTE_KEYS = MappingProxyType({
@@ -20,6 +27,8 @@ ROUTE_KEYS = MappingProxyType({
     "pricing_import": "PRICING_IMPORT", "pricing_metadata": "PRICING_METADATA",
 })
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ERROR_BODY_BYTES = 128 * 1024
+MAX_CHUNK_FRAMING_BYTES = 128 * 1024
 MAX_REQUEST_BYTES = 300 * 1024 * 1024
 MODEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._/-]{0,134}")
 SUPPORTED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
@@ -42,33 +51,90 @@ NONRETRY_ERROR_CODES = frozenset({
     "context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "invalid_prompt",
     "image_content_policy_violation", "permission_denied", "invalid_api_key",
 })
-SCHEMA_ERROR_CODES = frozenset({"unsupported_parameter", "unsupported_schema", "invalid_json_schema",
+SCHEMA_SPECIFIC_CODES = frozenset({"unsupported_schema", "invalid_json_schema",
     "json_schema_not_supported", "unsupported_response_format"})
+SCHEMA_ERROR_CODES = SCHEMA_SPECIFIC_CODES | {"unsupported_parameter"}
+SCHEMA_COMPATIBLE_MARKERS = SCHEMA_ERROR_CODES | {
+    "invalid_request", "invalid_request_error", "invalid_parameter", "invalid_type", "invalid_value", "unsupported_value",
+}
 SCHEMA_ERROR_PARAMS = frozenset({"text", "text.format", "text.format.type", "text.format.name",
                                 "text.format.strict", "text.format.schema", "response_format"})
 
 
-def schema_rejected(data, diagnostics):
-    """Closed machine fields only. Never classify errors from provider prose."""
+def _refusal_part(part):
+    return isinstance(part, dict) and (part.get("type") == "refusal" or "refusal" in part)
+
+
+def _response_state(data):
+    """Identify explicit refusal or an unfinished result in a parsed reply."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("refusal") is not None or data.get("error_type") == "refusal":
+        return "response_refused"
+    output = data.get("output")
+    unfinished_item = False
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if item.get("type") == "refusal" or (isinstance(content, list) and any(map(_refusal_part, content))):
+                return "response_refused"
+            if item.get("status") not in (None, "completed"):
+                unfinished_item = True
+    # A failed envelope can still carry a genuine provider error.
+    if (unfinished_item or data.get("incomplete_details") is not None
+            or data.get("status") in ("incomplete", "in_progress", "queued", "cancelled")):
+        return "response_incomplete"
+    return None
+
+
+def _image_schema_rejected(data):
+    if not isinstance(data, dict):
+        return False
+    error = data.get("error")
+    if error is not None and not isinstance(error, dict):
+        return False
+    fields = error if error is not None else {}
+    target = fields.get("param")
+    markers = tuple(marker for marker in (data.get("error_type"), fields.get("type"), fields.get("code"))
+                    if marker is not None)
+    # Any contradictory or unknown machine marker prevents a capability
+    # diagnosis. Only the safe projection is retained after this decision.
+    if any(not isinstance(marker, str) or marker not in SCHEMA_COMPATIBLE_MARKERS for marker in markers):
+        return False
+    if target is not None:
+        return isinstance(target, str) and target in SCHEMA_ERROR_PARAMS
+    return any(marker in SCHEMA_SPECIFIC_CODES for marker in markers)
+
+
+def schema_rejected(data, error, *, strict_image_observations):
+    """Classify machine evidence. Synthesis retains its existing status rule."""
+    if error.response_state is not None:
+        return False
+    if strict_image_observations:
+        if data is not None:
+            return _image_schema_rejected(data)
+        return error.image_schema_rejected
+    diagnostics = error.diagnostics
     metadata = draft_provider_error_diagnostics(data)
-    return (diagnostics.get("http_status") in {400, 404, 405, 415, 422}
-            or metadata.get("provider_error_code") in SCHEMA_ERROR_CODES
-            or metadata.get("provider_error_type") in SCHEMA_ERROR_CODES
-            or metadata.get("provider_error_class") in SCHEMA_ERROR_CODES
-            or metadata.get("provider_error_param") in SCHEMA_ERROR_PARAMS
-            or diagnostics.get("provider_error_code") in SCHEMA_ERROR_CODES
-            or diagnostics.get("provider_error_param") in SCHEMA_ERROR_PARAMS)
+    return (
+        diagnostics.get("http_status") in {400, 404, 405, 415, 422}
+        or any(metadata.get(key) in SCHEMA_ERROR_CODES
+               for key in ("provider_error_code", "provider_error_type", "provider_error_class"))
+        or metadata.get("provider_error_param") in SCHEMA_ERROR_PARAMS
+        or diagnostics.get("provider_error_code") in SCHEMA_ERROR_CODES
+        or diagnostics.get("provider_error_param") in SCHEMA_ERROR_PARAMS
+    )
 
 
-def http_error_retryable(status, value):
-    if status not in TRANSIENT_HTTP_STATUSES:
+def http_error_retryable(status, value, *, response_state):
+    if status not in TRANSIENT_HTTP_STATUSES or response_state is not None:
         return False
     if not isinstance(value, dict):
         return True
-    # No HTTP error is replayed once any output or explicit response refusal/
-    # incompleteness is present, even if its outer status looks transient.
-    if any(value.get(key) is not None and value.get(key) != [] and value.get(key) != ""
-           for key in ("output", "output_text", "refusal", "incomplete_details")):
+    # Even unrecognised output makes an HTTP error ineligible for replay.
+    if any(value.get(key) not in (None, [], "") for key in ("output", "output_text")):
         return False
     canonical = value.get("error_type")
     if canonical is not None and (not isinstance(canonical, str) or canonical not in TRANSIENT_ERROR_TYPES):
@@ -85,10 +151,13 @@ def http_error_retryable(status, value):
     return True
 
 class GatewayError(RuntimeError):
-    def __init__(self, reason, *, boundary="request_validation", attempt=0, http_status=None, retryable=False):
+    def __init__(self, reason, *, boundary="request_validation", attempt=0, http_status=None,
+                 retryable=False, response_state=None):
         super().__init__("AI request could not be completed.")
         self.reason = reason
         self.retryable = retryable
+        self.response_state = response_state
+        self.image_schema_rejected = False
         self.diagnostics = {"failure_boundary": boundary, "attempt_number": attempt}
         if type(http_status) is int and 100 <= http_status <= 599:
             self.diagnostics.update(http_status=http_status, http_status_class=f"{http_status // 100}xx")
@@ -137,6 +206,7 @@ class GatewayConfiguration:
     zdr: bool
     draft_batch_effort: str | None = None
     draft_schema_enabled: bool = False
+    draft_image_schema_enabled: bool = False
 
     @classmethod
     def capture(cls, reader):
@@ -172,8 +242,11 @@ class GatewayConfiguration:
         schema_enabled = reader("OPENROUTER_DRAFT_SCHEMA_ENABLED")
         if schema_enabled not in (None, "", "false", "true"):
             raise GatewayError("response_schema_configuration")
+        image_schema_enabled = reader("OPENROUTER_DRAFT_IMAGE_SCHEMA_ENABLED")
+        if image_schema_enabled not in (None, "", "false", "true"):
+            raise GatewayError("response_schema_configuration")
         return cls(tuple(routes),int(raw_timeout),raw_zdr == "true", batch_effort or None,
-                   schema_enabled == "true")
+                   schema_enabled == "true", image_schema_enabled == "true")
 
     def route(self,operation):
         route = next((r for r in self.routes if r.operation == operation),None)
@@ -222,9 +295,185 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,req,fp,code,msg,headers,newurl):
         return None
 
+# HTTP field tokens and quoted chunk extensions, restricted to a bounded line.
+_HTTP_TOKEN = rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+_CHUNK_EXTENSION = rb'[ \t]*;[ \t]*' + _HTTP_TOKEN + (
+    rb'(?:[ \t]*=[ \t]*(?:' + _HTTP_TOKEN + rb'|"(?:[\t !#-\[\]-~\x80-\xff]|\\[\t -~\x80-\xff])*"))?'
+)
+_CHUNK_LINE = re.compile(rb"([0-9a-fA-F]+)(?:" + _CHUNK_EXTENSION + rb")*\r\n")
+_FIELD_LINE = re.compile(rb"(" + _HTTP_TOKEN + rb"):[\t -~\x80-\xff]*\r\n")
+
+_STATUS_LINE = re.compile(rb"HTTP/1\.[0-9] ([1-5][0-9]{2})(?: [\t -~\x80-\xff]*)?\r\n")
+_MAX_CONTINUE_RESPONSES = 100
+
+
+class _ResponseHeadReader:
+    """Require intact status/header lines while http.client parses and bounds them."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.started = False
+        self.status = None
+        self.continues = 0
+
+    def readline(self, size):
+        try:
+            # Buffered readline can raise on a timeout even after consuming bytes.
+            # Peek first so a timeout mid-status is never a pre-response failure.
+            if not self.started:
+                self.started = bool(self.stream.peek(1))
+                if not self.started:
+                    return b""
+            line = self.stream.readline(size)
+        except OSError:
+            if not self.started:
+                raise
+            raise GatewayError("response_partial", boundary="provider_response_shape",
+                               http_status=self.status) from None
+        if len(line) == size:
+            # Preserve http.client's line limit and its framing failure path.
+            return line
+        if not line.endswith(b"\r\n"):
+            raise GatewayError("response_partial", boundary="provider_response_shape",
+                               http_status=self.status)
+        if self.status is None:
+            match = _STATUS_LINE.fullmatch(line)
+            if match is None:
+                raise GatewayError("response_framing", boundary="provider_response_shape")
+            self.status = int(match[1])
+            if self.status == 100:
+                self.continues += 1
+                # Python 3.12 bounds each head but can read unlimited interim heads.
+                if self.continues >= _MAX_CONTINUE_RESPONSES:
+                    raise GatewayError("response_framing", boundary="provider_response_shape", http_status=100)
+        elif line == b"\r\n":
+            # http.client reads another status after a complete 100 Continue.
+            self.status = None
+        elif _FIELD_LINE.fullmatch(line) is None:
+            raise GatewayError("response_framing", boundary="provider_response_shape",
+                               http_status=self.status)
+        return line
+
+
+class _ProviderHttpResponse(HTTPResponse):
+    def begin(self):
+        stream = self.fp
+        self.fp = _ResponseHeadReader(stream)
+        try:
+            super().begin()
+        finally:
+            self.fp = stream
+
+
+class _ProviderHttpsConnection(HTTPSConnection):
+    response_class = _ProviderHttpResponse
+
+    def connect(self):
+        super().connect()
+        # A close-delimited body needs TLS close_notify. Surface unexpected
+        # socket EOF as an SSL error before it can look like a complete read.
+        self.sock.suppress_ragged_eofs = False
+
+
+class _ProviderHttpsHandler(urllib.request.HTTPSHandler):
+    def __init__(self):
+        super().__init__()
+        # Keep OpenSSL from treating an unexpected EOF as close_notify.
+        self._context.options &= ~getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
+
+    def https_open(self, req):
+        return self.do_open(_ProviderHttpsConnection, req, context=self._context)
+
+
 class BoundedHttpsTransport:
+    @staticmethod
+    def _header_values(headers, name):
+        if headers is None:
+            return []
+        if hasattr(headers, "get_all"):
+            return headers.get_all(name, [])
+        value = headers.get(name)
+        return [] if value is None else [value]
+
+    @staticmethod
+    def _read_chunked(stream, limit):
+        # http.client accepts EOF in place of the final trailer terminator.
+        # The stream is positioned at the first chunk after parsing the headers.
+        remaining_framing = MAX_CHUNK_FRAMING_BYTES
+
+        def framing_line():
+            nonlocal remaining_framing
+            line = stream.readline(min(8192, remaining_framing) + 1)
+            remaining_framing -= len(line)
+            if remaining_framing < 0 or len(line) > 8192 or not line.endswith(b"\r\n"):
+                raise IncompleteRead(b"")
+            return line
+
+        body = bytearray()
+        while True:
+            match = _CHUNK_LINE.fullmatch(framing_line())
+            if match is None:
+                raise IncompleteRead(b"")
+            size = int(match[1], 16)
+            if not size:
+                break
+            wanted = min(size, limit + 1 - len(body))
+            chunk = stream.read(wanted)
+            if len(chunk) != wanted:
+                raise IncompleteRead(b"")
+            body.extend(chunk)
+            if len(body) > limit:
+                return body
+            if stream.read(2) != b"\r\n":
+                raise IncompleteRead(b"")
+            remaining_framing -= 2
+        while (line := framing_line()) != b"\r\n":
+            field = _FIELD_LINE.fullmatch(line)
+            if field is None or field[1].lower() in {b"content-length", b"transfer-encoding"}:
+                raise IncompleteRead(b"")
+        return body
+
+    @classmethod
+    def _read_body(cls, response, limit, *, http_status=None):
+        headers = response.headers
+        lengths = cls._header_values(headers, "Content-Length")
+        encodings = cls._header_values(headers, "Transfer-Encoding")
+        wire = response.fp if isinstance(response, urllib.error.HTTPError) else response
+        if len(lengths) > 1 or (encodings and (
+            lengths or len(encodings) != 1 or not isinstance(encodings[0], str)
+            or encodings[0].strip(" \t").lower() != "chunked"
+            or not isinstance(wire, HTTPResponse) or wire.version != 11
+        )):
+            raise GatewayError("response_framing", boundary="provider_response_shape", http_status=http_status)
+        declared = None
+        if lengths:
+            length = lengths[0].strip(" \t") if isinstance(lengths[0], str) else ""
+            if not re.fullmatch(r"[0-9]{1,12}", length):
+                raise GatewayError("response_framing", boundary="provider_response_shape", http_status=http_status)
+            declared = int(length)
+        try:
+            if encodings:
+                if wire.fp is None:
+                    raise IncompleteRead(b"")
+                raw = cls._read_chunked(wire.fp, limit)
+            else:
+                raw = response.read(limit + 1)
+        except (HTTPException, OSError):
+            raise GatewayError("response_partial", boundary="provider_response_shape",
+                               http_status=http_status) from None
+        # A short read is incomplete. At the sentinel the rest may be unread.
+        if declared is not None and len(raw) < min(declared, limit + 1):
+            raise GatewayError("response_partial", boundary="provider_response_shape", http_status=http_status)
+        if len(raw) > limit or (declared is not None and declared > limit):
+            raise GatewayError("response_size", boundary="provider_response_shape", http_status=http_status)
+        if declared is not None and len(raw) != declared:
+            raise GatewayError("response_partial", boundary="provider_response_shape", http_status=http_status)
+        return raw
+
     def __init__(self, *, opener=None):
-        self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect())
+        self._opener = opener if opener is not None else urllib.request.build_opener(
+            _NoRedirect(), _ProviderHttpsHandler(),
+        )
 
     def send(self, body, *, credential, timeout):
         request = urllib.request.Request(OPENROUTER_RESPONSES_URL,data=body,
@@ -232,51 +481,56 @@ class BoundedHttpsTransport:
         try:
             response = self._opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            status = exc.code
-            metadata = {}
-            parsed = None
-            try:
-                raw = exc.read(128 * 1024 + 1)
-                if len(raw) <= 128 * 1024:
-                    parsed = _load_json(raw.decode("utf-8"))
-                    metadata = draft_provider_error_diagnostics(parsed)
-            except (AttributeError, OSError, ValueError, TypeError, UnicodeError, RecursionError):
-                # Diagnostics are optional; the failed HTTP response remains a failure.
-                metadata = {}
-            finally:
-                exc.close()
-            error = GatewayError("http_error", boundary="provider_http", http_status=status,
-                                 retryable=http_error_retryable(status, parsed))
-            error.diagnostics.update(metadata)
-            # Keep the billing fields out of diagnostics and business output.
-            if isinstance(parsed, dict):
-                error.reported_cost = (parsed.get("model"), _response_cost(parsed))
+            # urllib exposes complete response heads through either return path.
+            response = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            error = GatewayError("connection_failed", boundary="provider_transport", retryable=True)
+            error.diagnostics["transport_timeout"] = isinstance(exc, TimeoutError) or isinstance(
+                getattr(exc, "reason", None), TimeoutError,
+            )
             raise error from None
-        except (urllib.error.URLError,TimeoutError,OSError) as exc:
-            error = GatewayError("connection_failed",boundary="provider_transport",retryable=True)
-            error.diagnostics["transport_timeout"] = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
-            raise error from None
-        # Once a response has begun, never replay it after a read/shape/partial failure.
+        except HTTPException:
+            raise GatewayError("response_framing", boundary="provider_response_shape") from None
+
+        http_error = isinstance(response, urllib.error.HTTPError)
+        status = response.code if http_error else None
+        limit = MAX_ERROR_BODY_BYTES if http_error else MAX_RESPONSE_BYTES
         try:
             with response:
-                if response.status != 200 or response.geturl() != OPENROUTER_RESPONSES_URL:
-                    raise GatewayError("redirect_or_status",boundary="provider_http")
-                if response.headers.get_content_type().lower() != "application/json":
-                    raise GatewayError("response_mime",boundary="provider_response_json")
-                length=response.headers.get("Content-Length")
-                if length is not None and (not re.fullmatch(r"[0-9]{1,12}",length) or int(length)>MAX_RESPONSE_BYTES):
-                    raise GatewayError("response_size",boundary="provider_response_shape")
-                raw=response.read(MAX_RESPONSE_BYTES+1)
-                if len(raw)>MAX_RESPONSE_BYTES:
-                    raise GatewayError("response_size",boundary="provider_response_shape")
-                if length is not None and len(raw)!=int(length):
-                    raise GatewayError("response_partial",boundary="provider_response_shape")
-                result=_load_json(raw.decode("utf-8"))
-        except GatewayError:
-            raise
-        except (ValueError,TypeError,UnicodeError,RecursionError,OSError,TimeoutError,urllib.error.URLError):
-            raise GatewayError("response_invalid",boundary="provider_response_json") from None
-        return result
+                if not http_error:
+                    if response.status != 200 or response.geturl() != OPENROUTER_RESPONSES_URL:
+                        raise GatewayError("redirect_or_status", boundary="provider_http")
+                    if response.headers.get_content_type().lower() != "application/json":
+                        raise GatewayError("response_mime", boundary="provider_response_json")
+                elif 100 <= status < 200 or status in (204, 205, 304):
+                    # The fixed POST route cannot admit content for these statuses.
+                    # Check status before inspecting body framing (RFC 9112 and RFC 9110).
+                    raise GatewayError("http_error", boundary="provider_http", http_status=status)
+                raw = self._read_body(response, limit, http_status=status)
+                try:
+                    parsed = _load_json(raw.decode("utf-8"))
+                except (ValueError, RecursionError):
+                    if not http_error:
+                        raise GatewayError("response_invalid", boundary="provider_response_json") from None
+                    # A fully framed HTTP error may have no JSON diagnostics.
+                    parsed = None
+        except (TypeError, OSError):
+            raise GatewayError("response_invalid", boundary="provider_response_json",
+                               http_status=status) from None
+
+        if not http_error:
+            return parsed
+        response_state = _response_state(parsed)
+        error = GatewayError("http_error", boundary="provider_http", http_status=status,
+                             retryable=http_error_retryable(status, parsed, response_state=response_state),
+                             response_state=response_state)
+        error.image_schema_rejected = status >= 400 and response_state is None and _image_schema_rejected(parsed)
+        error.diagnostics.update(draft_provider_error_diagnostics(parsed))
+        error.diagnostics.update(_response_state_diagnostics(parsed, response_state))
+        # Keep the billing fields out of diagnostics and business output.
+        if isinstance(parsed, dict):
+            error.reported_cost = (parsed.get("model"), _response_cost(parsed))
+        raise error from None
 
 
 def admitted_usage(value):
@@ -320,7 +574,20 @@ def reported_response_cost_usd(response, model):
     return None
 
 
-def safe_response_diagnostics(data):
+def _response_state_diagnostics(data, response_state):
+    if not isinstance(data, dict):
+        return {}
+    result = {"refusal_present": True} if response_state == "response_refused" else {}
+    incomplete = data.get("incomplete_details")
+    if isinstance(incomplete, dict) and incomplete.get("reason") in ("max_output_tokens", "content_filter"):
+        result["incomplete_reason"] = incomplete["reason"]
+    status = data.get("status")
+    if status in ("completed", "failed", "incomplete", "in_progress", "queued", "cancelled"):
+        result["responses_status"] = status
+    return result
+
+
+def safe_response_diagnostics(data, response_state):
     if not isinstance(data, dict):
         return {}
     output = data.get("output")
@@ -332,25 +599,19 @@ def safe_response_diagnostics(data):
     result = {"output_item_count": len(items), "output_text_count": len(texts),
               "output_length": len(combined), "output_empty": not bool(combined.strip()),
               "output_contains_json_object_bounds": "{" in combined and "}" in combined}
-    result.update(output_item_present=bool(items), output_text_present=bool(texts),
-                  refusal_present=data.get("refusal") is not None or any(
-                      isinstance(item, dict) and (item.get("type") == "refusal" or any(
-                          isinstance(part, dict) and (part.get("type") == "refusal" or "refusal" in part)
-                          for part in (item.get("content") if isinstance(item.get("content"), list) else [])))
-                      for item in items))
-    incomplete = data.get("incomplete_details")
-    if isinstance(incomplete, dict) and isinstance(incomplete.get("reason"), str) and incomplete["reason"] in {"max_output_tokens", "content_filter"}:
-        result["incomplete_reason"] = incomplete["reason"]
-    if isinstance(data.get("status"), str) and data["status"] in {"completed", "failed", "incomplete", "in_progress", "queued", "cancelled"}:
-        result["responses_status"] = data["status"]
+    result.update(output_item_present=bool(items), output_text_present=bool(texts), refusal_present=False)
+    result.update(_response_state_diagnostics(data, response_state))
     result.update(draft_provider_error_diagnostics(data))
     return result
 
 
-def admit_response(data,route):
+def admit_response(data,route, *, strict_image_observations=False):
+    response_state = _response_state(data)
+    if response_state is not None:
+        raise GatewayError(response_state, boundary="provider_response_contract", response_state=response_state)
     if not isinstance(data,dict) or not isinstance(data.get("status"),str):
         raise GatewayError("response_shape",boundary="provider_response_shape")
-    if data.get("error") is not None or data.get("error_type") is not None or data["status"]!="completed" or data.get("refusal") is not None or data.get("incomplete_details") is not None:
+    if data.get("error") is not None or data.get("error_type") is not None or data["status"]!="completed":
         raise GatewayError("response_incomplete",boundary="provider_response_contract")
     if data.get("model") != route.model or ("output_text" in data and not isinstance(data["output_text"], str)):
         raise GatewayError("response_model_mismatch",boundary="provider_response_shape")
@@ -361,15 +622,11 @@ def admit_response(data,route):
     for item in output:
         if not isinstance(item,dict): raise GatewayError("response_shape",boundary="provider_response_shape")
         if item.get("type")=="reasoning": continue
-        if item.get("type")=="refusal" or item.get("status") not in (None,"completed"):
-            raise GatewayError("response_refused",boundary="provider_response_contract")
         if item.get("type")!="message" or item.get("role")!="assistant" or not isinstance(item.get("content"),list):
             raise GatewayError("response_shape",boundary="provider_response_shape")
         for part in item["content"]:
             if not isinstance(part,dict):
                 raise GatewayError("response_shape",boundary="provider_response_shape")
-            if part.get("type")=="refusal" or "refusal" in part:
-                raise GatewayError("response_refused",boundary="provider_response_contract")
             if part.get("type")!="output_text" or not isinstance(part.get("text"),str):
                 raise GatewayError("response_shape",boundary="provider_response_shape")
             if not part["text"].strip():
@@ -377,7 +634,20 @@ def admit_response(data,route):
             texts.append(part["text"])
     if len(texts)!=1 or ("output_text" in data and data["output_text"]!=texts[0]):
         raise GatewayError("response_mixed",boundary="provider_response_contract")
-    # The caller still performs canonical JSON and business admission.
+    if strict_image_observations:
+        try:
+            admit_image_observations(texts[0])
+        except ContractViolation as exc:
+            error = GatewayError("response_image_observations", boundary="provider_response_contract")
+            error.diagnostics.update(
+                response_contract_reason=exc.reason,
+                batch_failure_reason={
+                    "response_too_large": "batch_output_limit",
+                    "schema_shape": "batch_output_coverage",
+                }.get(exc.reason, "batch_provider_failure"),
+            )
+            raise error from None
+    # The caller still performs business admission.
     result={"status":"completed","output":copy.deepcopy(output),"model":route.model}
     usage=admitted_usage(data.get("usage"))
     if usage is not None: result["usage"]=usage
@@ -398,7 +668,7 @@ class AiGateway:
     def request(self,operation,envelope, *, send_budget=None, draft_batch=False, response_contract=None):
         route=self.configuration.route(operation)
         if draft_batch:
-            if operation not in {"draft", "draft_high_quality"}:
+            if draft_batch is not True or operation not in {"draft", "draft_high_quality"}:
                 raise GatewayError("envelope_invalid")
             effort = self.configuration.draft_batch_effort
             if effort is not None:
@@ -414,7 +684,14 @@ class AiGateway:
         if ((contract is not None and not contract.matches_text_format(envelope.get("text")))
                 or (contract is None and "text" in envelope)):
             raise GatewayError("envelope_invalid")
+        strict_image_observations = draft_batch is True and self.configuration.draft_image_schema_enabled
+        if strict_image_observations:
+            if set(envelope) != {"model", "input", "reasoning"} or not is_image_batch_input(envelope["input"]):
+                raise GatewayError("envelope_invalid")
+            contract = IMAGE_OBSERVATIONS
         body=copy.deepcopy(envelope)
+        if strict_image_observations:
+            body["text"] = contract.text_format()
         body["provider"]=self.configuration.provider_policy(operation)
         body["store"]=False
         try:
@@ -438,8 +715,9 @@ class AiGateway:
             cost = None
             try:
                 try:
-                    data=self._transport.send(encoded,credential=credential,timeout=self.configuration.timeout_seconds)
+                    data = self._transport.send(encoded, credential=credential, timeout=self.configuration.timeout_seconds)
                     cost = reported_response_cost_usd(data, route.model)
+                    result = admit_response(data, route, strict_image_observations=strict_image_observations)
                 except GatewayError as exc:
                     billed_model, billed_cost = getattr(exc, "reported_cost", (None, None))
                     if billed_model == route.model:
@@ -448,15 +726,21 @@ class AiGateway:
                 finally:
                     if spend is not None:
                         spend.settle(ordinal, cost)
-                result=admit_response(data,route)
             except GatewayError as exc:
-                if contract is not None and schema_rejected(data, exc.diagnostics):
+                if strict_image_observations:
+                    exc.diagnostics.setdefault("response_contract_name", contract.name)
+                    exc.diagnostics.setdefault("response_contract_reason", exc.reason)
+                    exc.diagnostics.setdefault("batch_failure_reason", "batch_provider_failure")
+                if (contract is not None
+                        and exc.reason not in {"response_partial", "response_size", "response_framing", "redirect_or_status"}
+                        and schema_rejected(data, exc,
+                                            strict_image_observations=strict_image_observations)):
                     exc.reason = "response_schema_rejected"
                     exc.retryable = False
                     exc.diagnostics.update(failure_boundary="provider_response_schema",
                                            response_contract_reason="response_schema_rejected",
                                            response_contract_name=contract.name)
-                exc.diagnostics.update(safe_response_diagnostics(data))
+                exc.diagnostics.update(safe_response_diagnostics(data, exc.response_state))
                 usage = admitted_usage(data.get("usage")) if isinstance(data, dict) else None
                 if usage is not None:
                     exc.diagnostics.update({key:value for key,value in usage.items() if key != "output_tokens_details"})
