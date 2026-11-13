@@ -44320,9 +44320,24 @@ main().catch((error) => {
         west_statement = f"{west}: 24 sqm"
         east_statement = f"{east}: 10 sqm"
         role_cases = (
+            ("condition-oxford-list", f"the dimensions for {east} are approved when the invoice clears, the deposit is paid, and the site measurements are verified", True, False),
+            ("condition-oxford-completed", f"the dimensions for {east} were approved after the invoice cleared, the deposit was paid, and the site measurements had been verified", True, True),
+            ("condition-oxford-main", f"when site measurements are verified, the dimensions for {east} are approved, and the dimensions for {west} are approved", False, False),
+            ("condition-oxford-leading", f"when the invoice clears, the deposit is paid, and site measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-named-report", f"once we verify the dimensions for {east}, we will issue the survey report", True, False),
+            ("condition-completed-report", f"once we verified the dimensions for {east}, we issued the survey report", True, True),
+            ("condition-partial-report", f"after we had partially verified the dimensions for {east}, we issued the survey report", True, False),
+            ("condition-factual-after", f"the dimensions for {east} were approved after the site measurements had been verified", True, True),
+            ("condition-factual-once", f"the dimensions for {east} were approved once the site measurements had been verified", True, True),
+            ("condition-after-gerund", f"the dimensions for {east} are approved only after verifying the measurements", True, False),
+            ("pronoun-invoice-topic", f"we checked the dimensions for {east} and sent the invoice, but it has not been verified", True, True),
+            ("pronoun-invoice-plural-topic", f"we checked the dimensions for {east} and sent the invoices. They have not been verified", True, True),
+            ("pronoun-same-record", f"we checked the dimensions for {east}. They have not been verified yet", True, False),
+            ("pronoun-new-record", f"we checked the dimensions for {east}; they have not been verified yet", False, True),
             ("condition-if", f"the dimensions for {east} were approved if the site measurements are verified", True, False),
             ("condition-upon", f"we approved the dimensions for {east}, conditional upon independent review", True, False),
-            ("condition-once", f"we finished checking the dimensions for {east} once the dimensions were verified", True, False),
+            # Both predicates report completed past events.
+            ("condition-once", f"we finished checking the dimensions for {east} once the dimensions were verified", True, True),
             ("future-when", f"the dimensions for {east} will be approved when the site measurements are verified", True, False),
             ("future-once", f"the dimensions for {east} will be approved once the site measurements are verified", True, False),
             ("conditional-when", f"the dimensions for {east} are approved when the site measurements are verified", True, False),
@@ -44360,6 +44375,10 @@ main().catch((error) => {
                    f"Sample boards: 2 sqm, separate from {west} (the dimensions for {east} were checked but not verified)",
                    24, "observed", True),)
         quote_cases = (
+            ("wrapped-quoted-label", 'the owner selected "Option 6" wide panels and marked "Aisle 4"', True, True),
+            ("wrapped-real-inch", "the note reads 'the gap is 6' wide'", False, True),
+            ("wrapped-ambiguous-heading", "Survey status: estimated area 20 to 25 sqm", False, True),
+            ("headed-real-inch", "Sample stock: a spare strip is 6 inches wide", True, True),
             ("quote-label", "the owner selected the label 'Option 6'", True, True),
             ("quote-label-adjective", "the owner selected 'Option 6' wide panels and marked 'Aisle 4'", True, True),
             ("quote-label-adjective-double", 'the owner selected "Option 6" wide panels and marked "Aisle 4"', True, True),
@@ -44474,6 +44493,8 @@ main().catch((error) => {
                             sources = [f"{statement};\n{east_statement} ({other})"]
                         elif name == "separate-after":
                             sources = [f"{statement};\n{east_statement};\n{other}"]
+                        elif name in {"wrapped-quoted-label", "wrapped-real-inch", "wrapped-ambiguous-heading"}:
+                            sources = [f"{statement}\n{other}; {east_statement}"]
                         elif name in aside_cases:
                             terminal = ";" if name in semicolon_cases else "" if name == "assume-soft" else "."
                             wrap = " " if name == "free-inline" else "\n"
@@ -44622,7 +44643,10 @@ main().catch((error) => {
                             if name in dual_cases:
                                 self.assertEqual(any("10 sqm" in row and 144 in row for row in values), east_priced)
                                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
-                                self.assertEqual(any("24 sqm" in row for row in values), allowed)
+                                if quantity == 24:
+                                    self.assertEqual(any("24 sqm" in row and 345.60 in row for row in values), allowed)
+                                if other:
+                                    self.assertFalse(any(other in str(cell) for row in values for cell in row))
                             if name in north_cases:
                                 self.assertEqual(any("5 sqm" in row and 72 in row for row in values), north_priced)
 
@@ -44815,10 +44839,11 @@ main().catch((error) => {
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [
                 statement, disputed, f"{disputed} (provisional in drawing)",
-                f"The dimensions for {specifications[0][1]} were approved only after site verification",
+                f"The dimensions for {specifications[0][1]} are approved when the invoice clears, "
+                "the deposit is paid, and the site measurements are verified",
             ]}
-            # Reproduce the v24 grant on a source whose trailing condition v24 missed.
-            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 24),
+            # Reproduce the v25 grant on a source whose trailing condition v25 missed.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 25),
                   mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
@@ -44855,7 +44880,7 @@ main().catch((error) => {
                         self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
                         self.assertFalse(list((root / path).rglob("quotation.xlsx")))
                         if path == "seal":
-                            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 24):
+                            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 25):
                                 self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
                             stale.pop("pricing_analysis_seal")
                             stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")

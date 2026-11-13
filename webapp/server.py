@@ -47,6 +47,7 @@ import urllib.request
 import unicodedata
 import warnings
 import zipfile
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
@@ -23697,7 +23698,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
                 and type(value["claim_version"]) is int and 1 <= value["claim_version"] < AREA_EVIDENCE_CLAIM_VERSION)):
-        # Older claims did not require the full predicate and its measurement conditions.
+        # Reanalyse older automatic measurements under the current source interpretation.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
             and type(value["claim_version"]) is int and value["claim_version"] == AREA_EVIDENCE_CLAIM_VERSION
@@ -25584,7 +25585,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 25
+AREA_EVIDENCE_CLAIM_VERSION = 26
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25647,6 +25648,7 @@ AREA_PROSPECTIVE_LINK = r"(?:(?:yet|due|scheduled|planned|expected|set|going|nee
 AREA_VERIFICATION_FUTURE = rf"(?:will|must|{AREA_PROSPECTIVE_LINK})"
 AREA_VERIFICATION_REQUIREMENT = r"(?:required|needed|necessary|mandatory|awaited|due|scheduled|planned)\b"
 AREA_APPROVAL_RESULT = r"(?:approved|signed[\s-]+off)\b"
+AREA_APPROVAL_RESULT_WORD = re.compile(rf"\b{AREA_APPROVAL_RESULT}", re.I)
 AREA_UNRESOLVED_STATUS = (
     rf"(?:{AREA_PROVISIONAL_STATUS}|pending|outstanding|incomplete|unverified|unconfirmed|unmeasured|unapproved|unresolved)\b"
 )
@@ -25664,7 +25666,7 @@ AREA_APPROVAL_TOPIC = (
 AREA_APPROVAL_PENDING = rf"(?:{AREA_WAITING_ACTION}|{AREA_VERIFICATION_OBLIGATION})\s+{AREA_APPROVAL_TOPIC}"
 AREA_CONDITION_PREFIX = r"(?:pending|subject\s+to|conditional\s+(?:on|upon)|contingent\s+(?:on|upon)|(?:only\s+)?after)\s+"
 AREA_CONDITION_EVENT = rf"(?:{AREA_MEASUREMENT_EVENT}|{AREA_APPROVAL_TOPIC})"
-AREA_CONDITION_CLAUSE = r"(?:provided(?:\s+that)?|on\s+condition\s+that|(?:only\s+)?(?:if|after|(?P<temporal>when))|unless|until|once)\s+"
+AREA_CONDITION_CLAUSE = r"(?:provided(?:\s+that)?|on\s+condition\s+that|(?:only\s+)?(?:if|(?P<temporal>when|after|once))|unless|until)\s+"
 AREA_ACTIVE_ACTION = r"(?:confirms?|verif(?:y|ies)|validates?|(?:double[\s-]+)?checks?|measures?|approves?|signs?[\s-]+off)\b"
 AREA_ONGOING_ACTION = r"(?:confirming|verifying|validating|(?:double[\s-]+)?checking|measuring|approving|signing[\s-]+off)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
@@ -25688,7 +25690,7 @@ AREA_REFERENTIAL_SUBJECT = re.compile(
     r"(?=[\s:\-]|$)", re.I,
 )
 AREA_SUBJECT_PRONOUN = re.compile(r"(?P<topic>it|they)(?=\s)", re.I)
-AREA_OBJECT_PRONOUN = re.compile(r"\s+(?:it|them)\b", re.I)
+AREA_OBJECT_PRONOUN = re.compile(r"\s+(?P<topic>it|them)\b", re.I)
 AREA_QUALIFICATION_WORD = re.compile(r"[^\W\d_][\w'\u2019-]*", re.I)
 AREA_ACTION = re.compile(rf"(?P<ongoing>{AREA_ONGOING_ACTION})|(?P<result>{AREA_MEASUREMENT_RESULT})|{AREA_ACTIVE_ACTION}", re.I)
 AREA_EVENT_STATUS = re.compile(AREA_VERIFICATION_EVENT_STATUS, re.I)
@@ -25767,6 +25769,9 @@ AREA_LINEAR_SYMBOL = re.compile(
 AREA_QUOTATION_MARKS = re.compile(r"['\"\u2018\u2019\u201c\u201d]")
 AREA_SINGLE_QUOTES = frozenset("'\u2018\u2019")
 AREA_OPEN_ONLY_QUOTES = frozenset("\u2018\u201c")
+AREA_EXPLICIT_NOUN = re.compile(r"\b(?:the|an?|this|that|these|those|their|our|its)\s+(?P<start>\w+)\b", re.I)
+AREA_TOPIC_WORD = re.compile(r"[^\W\d_][\w-]*")
+AREA_TOPIC_END = re.compile(r"\b(?:of|for|on|at|with|by)\b", re.I)
 AREA_SYMBOL_DIMENSION = re.compile(r"\s*(?:long|wide|deep|high|tall|thick)\b", re.I)
 AREA_UNIT_MARKER = re.compile(
     rf"(?<![^\W\d_])(?:{AREA_CLAIM_UNIT}|square\s+(?:{SCOPE_LENGTH_UNIT}|units?)"
@@ -25778,7 +25783,12 @@ AREA_GEOMETRY_MARKER = re.compile(
     rf"(?<![^\W\d_])(?:{SCOPE_LENGTH_UNIT})(?:\s+wide)?\s+by\b", re.I,
 )
 AREA_BY_MARKER = re.compile(r"(?:\d|\bwide)\s+by\s+", re.I)
+AREA_FRAME_SPACE = re.compile(r"\s*")
+AREA_FRAME_QUALIFIER_SPACE = re.compile(r"[\s:,-]*")
+AREA_FRAME_ASIDE_SPACE = re.compile(r"[\s.,!?]*")
 AREA_ASIDE = re.compile(r"(?:\s*(?:\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}))+[\s.,]*")
+AREA_LINE_BREAK = re.compile(r"\r?\n")
+AREA_HEADING_COLON = re.compile(":")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
 AREA_QUALIFICATION_BREAK = re.compile(r",(?!\d)|;|[.!?](?=\s|$)|\s+(?:and|but|whereas|while|or|nor)\s+", re.I)
 AREA_ANNOTATION_BREAK = re.compile(rf"{AREA_QUALIFICATION_BREAK.pattern}|\s+then\s+|\r?\n", re.I)
@@ -25861,6 +25871,7 @@ class AreaQualification:
     pending: bool = False
     result_end: int | None = None
     past: bool = False
+    number: str = ""
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -25891,12 +25902,14 @@ def area_evidence_quantity(token: str) -> Decimal | None:
         return None
 
 
-def area_bracket_context(text: str) -> tuple[list[int], dict[int, int]]:
+def area_bracket_context(text: str, quotes: list[int] | None = None) -> tuple[list[int], dict[int, int]]:
     """Only paired brackets shelter labels. An open bracket cannot swallow later records."""
     groups = {"(": ")", "[": "]", "{": "}"}
     opens = []
     pairs = {}
     for index, char in enumerate(text):
+        if quotes is not None and quotes[index] >= 0:
+            continue
         if char in groups:
             opens.append((index, groups[char]))
         elif char in ")]}":
@@ -25949,31 +25962,29 @@ def area_scope_patterns(scopes: set[str]) -> AreaScopePatterns:
     )
 
 
-def area_has_linear_operand(text: str) -> bool:
-    if AREA_LINEAR_OPERAND.search(text):
-        return True
-    unit_positions = set()
+def area_quote_spans(text: str) -> tuple[dict[int, int], list[int]]:
+    """Pair literal quotes and collect the positions of measurement symbols."""
+    unit_positions = {}
+    units = []
     for match in AREA_LINEAR_SYMBOL.finditer(text):
-        symbol = match["symbol"]
-        if match["compound"] or symbol in {"\u2032", "\u2033"}:
-            return True
-        unit_positions.add(match.start("symbol"))
-    if not unit_positions:
-        return False
+        if match["compound"] or match["symbol"] in {"\u2032", "\u2033"}:
+            units.append(match.start())
+        else:
+            unit_positions[match.start("symbol")] = match.start()
     marks = list(AREA_QUOTATION_MARKS.finditer(text))
+    pairs = {}
     quote_stack = []
     for index, mark in enumerate(marks):
         position, char = mark.start(), mark[0]
         before = text[position - 1] if position else ""
         after = text[position + 1:position + 2]
         single = char in AREA_SINGLE_QUOTES
-        same_quote = bool(quote_stack and quote_stack[-1] == single)
+        same_quote = bool(quote_stack and quote_stack[-1][1] == single)
         next_mark = marks[index + 1] if index + 1 < len(marks) else None
         next_same = next_mark is not None and (next_mark[0] in AREA_SINGLE_QUOTES) == single
         if single and before.isalpha():
             if after.isalpha():
                 continue
-            # A possessive apostrophe after a plural can occur inside a label.
             if before.casefold() == "s" and same_quote and next_mark is not None:
                 following = text[position + 1:next_mark.start()]
                 next_opens = (next_mark[0] in AREA_OPEN_ONLY_QUOTES
@@ -25981,36 +25992,114 @@ def area_has_linear_operand(text: str) -> bool:
                 if after.isspace() and following.strip() and not next_opens and not re.search(r"[;.!?]", following):
                     continue
         if position in unit_positions:
-            if not same_quote or char in AREA_OPEN_ONLY_QUOTES:
-                return True
-            # A second opener cannot supply the missing closer for an in-quote unit.
-            if next_same and (next_mark.start() == position + 1 or (
-                next_mark[0] not in AREA_OPEN_ONLY_QUOTES
-                and not text[next_mark.start() - 1].isspace()
-                and not text[next_mark.end():next_mark.end() + 1].isalnum()
-                and AREA_SYMBOL_DIMENSION.match(text, position + 1, next_mark.start())
+            if not same_quote or char in AREA_OPEN_ONLY_QUOTES or (next_same and (
+                next_mark.start() == position + 1 or (
+                    next_mark[0] not in AREA_OPEN_ONLY_QUOTES
+                    and not text[next_mark.start() - 1].isspace()
+                    and not text[next_mark.end():next_mark.end() + 1].isalnum()
+                    and AREA_SYMBOL_DIMENSION.match(text, position + 1, next_mark.start())
+                )
             )):
-                return True
-            quote_stack.pop()
-            continue
+                units.append(unit_positions[position])
+                continue
         if same_quote and char not in AREA_OPEN_ONLY_QUOTES and before and not before.isspace():
-            quote_stack.pop()
+            pairs[quote_stack.pop()[0]] = position
         elif not before.isalnum() and after and not after.isspace():
-            quote_stack.append(single)
-    return False
+            quote_stack.append((position, single))
+    return pairs, sorted(units)
+
+
+class AreaSourceSpans:
+    """Index punctuation and balanced spans once, with offsets in the original text."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.quotes, self.symbols = area_quote_spans(text)
+        self.quote_starts = sorted(self.quotes)
+        self.literal = [-1] * len(text)
+        outer_end = -1
+        for left in self.quote_starts:
+            right = self.quotes[left]
+            if left > outer_end:
+                self.literal[left:right + 1] = [left] * (right + 1 - left)
+                outer_end = right
+        self.context, self.pairs = area_bracket_context(text, self.literal)
+        self.children = {}
+        for opener in sorted(self.pairs):
+            self.children.setdefault(self.context[opener], []).append(opener)
+        self.frame_bounds = {}
+
+    def separators(self, pattern: re.Pattern[str], start: int, stop: int, group: int = -1,
+                   *, text: str | None = None):
+        for match in pattern.finditer(self.text if text is None else text, start, stop):
+            left, right = match.span()
+            if self.context[left] == group and self.literal[left] == -1:
+                yield left, right, match.group()
+
+    def brackets(self, start: int, stop: int, group: int = -1):
+        children = self.children.get(group, ())
+        for index in range(bisect_left(children, start), bisect_left(children, stop)):
+            opener = children[index]
+            if self.pairs[opener] < stop:
+                yield opener, self.pairs[opener]
+
+    def linear_operand(self, start: int, stop: int) -> bool:
+        index = bisect_left(self.symbols, start)
+        return ((index < len(self.symbols) and self.symbols[index] < stop)
+                or AREA_LINEAR_OPERAND.search(self.text, start, stop) is not None)
+
+    def frame(self, start: int, stop: int, group: int) -> bool:
+        key = (start, group)
+        if key not in self.frame_bounds:
+            self.frame_bounds[key] = self._frame_bounds(start, group)
+        minimum, maximum = self.frame_bounds[key]
+        return minimum <= stop <= maximum
+
+    def _frame_bounds(self, start: int, group: int) -> tuple[int, int]:
+        """Read the amount and walk its adjacent balanced notes once."""
+        text = self.text
+        start = AREA_FRAME_SPACE.match(text, start).end()
+        qualifier = AREA_PROVISIONAL_QUALIFIER.match(text, start)
+        if qualifier:
+            start = AREA_FRAME_QUALIFIER_SPACE.match(text, qualifier.end()).end()
+        elif start in self.pairs and AREA_PROVISIONAL_QUALIFIER.match(
+            text, AREA_FRAME_SPACE.match(text, start + 1).end(), self.pairs[start],
+        ):
+            start = AREA_FRAME_QUALIFIER_SPACE.match(text, self.pairs[start] + 1).end()
+        derived = AREA_DERIVED_CLAIM.match(text, start)
+        value = derived or AREA_OBSERVED_CLAIM.match(text, start)
+        if value is None:
+            return len(text) + 1, -1
+        stop = value.end()
+        if derived:
+            coverage = AREA_FULL_COVERAGE.match(text, AREA_FRAME_SPACE.match(text, stop).end())
+            if coverage:
+                stop = coverage.end()
+        if text[start] == "(":
+            if self.pairs.get(start) != AREA_FRAME_SPACE.match(text, stop).end():
+                return len(text) + 1, -1
+            stop = self.pairs[start] + 1
+        minimum = stop
+        stop = AREA_FRAME_ASIDE_SPACE.match(text, stop).end()
+        while stop in self.pairs and self.context[stop] == group:
+            stop = AREA_FRAME_ASIDE_SPACE.match(text, self.pairs[stop] + 1).end()
+        return minimum, stop
+
+
+def area_has_linear_operand(text: str) -> bool:
+    return AreaSourceSpans(text).linear_operand(0, len(text))
 
 
 def area_heading_colon(text: str) -> int | None:
     """Locate the heading delimiter without assigning the heading's physical scope."""
     if ":" not in text:
         return None
-    context, _ = area_bracket_context(text)
-    for delimiter in re.finditer(":", text):
-        if context[delimiter.start()] == -1:
-            heading = text[:delimiter.start()]
-            if any(char.isalpha() for char in heading) and not (area_claim_kind(heading) or area_has_linear_operand(heading)):
-                return delimiter.start()
-            break
+    source = AreaSourceSpans(text)
+    for left, _, _ in source.separators(AREA_HEADING_COLON, 0, len(text)):
+        heading = text[:left]
+        if any(char.isalpha() for char in heading) and not (area_claim_kind(heading) or source.linear_operand(0, left)):
+            return left
+        break
     return None
 
 
@@ -26106,24 +26195,29 @@ def area_comparison_members(text: str, start: int, stop: int, colon: int | None,
 
 def area_member_clauses(annotation: str, patterns: AreaScopePatterns):
     """Keep grammatical coordination intact within each comparison assertion."""
-    context, _ = area_bracket_context(annotation)
+    source = AreaSourceSpans(annotation)
     qualification_text, references = area_qualification_text(annotation, patterns)
     labels = [match.span("label") for match in references]
-    boundaries = [boundary for boundary in AREA_ANNOTATION_BREAK.finditer(annotation)
-                  if context[boundary.start()] == -1 and not any(
-                      begin < boundary.end() and boundary.start() < end for begin, end in labels
-                  )]
+    label_ends = [end for _, end in labels]
+    boundaries = []
+    for left, right, separator in source.separators(AREA_ANNOTATION_BREAK, 0, len(annotation)):
+        label_index = bisect_right(label_ends, left)
+        if label_index == len(labels) or labels[label_index][0] >= right:
+            boundaries.append((left, right, separator.strip()))
+    next_stops = [len(annotation)] * len(boundaries)
+    next_stop = len(annotation)
+    for index in range(len(boundaries) - 1, -1, -1):
+        next_stops[index] = next_stop
+        if boundaries[index][2]:
+            next_stop = boundaries[index][0]
     start = 0
-    for index, boundary in enumerate(boundaries):
-        left, right = boundary.span()
+    for index, (left, right, separator) in enumerate(boundaries):
         clause = annotation[start:left].strip()
-        separator = boundary.group().strip()
         if not separator:
             _, operand = area_comparison_clause(clause, patterns, continued=False)
             if operand is None:
                 continue
-            next_end = next((part.start() for part in boundaries[index + 1:] if part.group().strip()), len(annotation))
-            following, _ = area_comparison_clause(annotation[right:next_end].strip(), patterns, continued=False)
+            following, _ = area_comparison_clause(annotation[right:next_stops[index]].strip(), patterns, continued=False)
             named_revision = area_named_annotation_value(following, patterns, require_revision=True)
             local_revision = AREA_LOCAL_MEASUREMENT_ASSERTION.match(following) and area_claim_kind(following)
             if named_revision is None and not local_revision:
@@ -26177,9 +26271,9 @@ def area_comparison_clause(clause: str, patterns: AreaScopePatterns,
         reference = references[0]
         head = clause[:reference.start("label")].strip(" ([{")
         end = reference.end("label")
-        context, pairs = area_bracket_context(clause)
-        parent = context[reference.start("label")]
-        tail = clause[end:] if parent == -1 else clause[end:pairs[parent]] + " " + clause[pairs[parent] + 1:]
+        source = AreaSourceSpans(clause)
+        parent = source.context[reference.start("label")]
+        tail = clause[end:] if parent == -1 else clause[end:source.pairs[parent]] + " " + clause[source.pairs[parent] + 1:]
         if head in {"", "the"} and area_comparison_value(tail.strip()):
             return "", reference
     return clause, None
@@ -26276,11 +26370,12 @@ def area_referenced_claims(text: str, start: int, stop: int, heading_colon: int 
     first_anchor = patterns.exact.search(record)
     starts_with_exact = bool(first_anchor and not record[:first_anchor.start("label")].strip(" \t\r\n([{-\u2022"))
     spatial_primary = area_heading_scope_base(record[:heading_colon]) if heading_colon is not None else ""
+    last_claim_start = area_last_claim_start(record) if starts_with_exact else -1
     for reference in patterns.reference.finditer(record.translate(AREA_SCOPE_WRAPPERS)):
         left, right = reference.span("label")
         if start + left in contextual or handled.get(start + left, -1) >= start + right:
             continue
-        if starts_with_exact and not area_claim_kind(record[right:]):
+        if starts_with_exact and right > last_claim_start:
             # An exact record's own amount cannot turn a later reference into a claim.
             continue
         label = area_scope_reference_key(reference["label"])
@@ -26290,6 +26385,17 @@ def area_referenced_claims(text: str, start: int, stop: int, heading_colon: int 
                     and (scope == spatial_primary or area_heading_scope_base(scope) == spatial_primary)):
                 continue
             yield AreaMeasurementClaim(scope, kind, None, "", (), False)
+
+
+def area_last_claim_start(text: str) -> int:
+    """The latest suffix that still has an area marker or a recognisable geometry."""
+    observed = max((match.start() for match in AREA_UNIT_MARKER.finditer(text)), default=-1)
+    lengths = [match.start() for match in AREA_LENGTH_MARKER.finditer(text)]
+    if not lengths:
+        return observed
+    geometry = max((match.start() for match in AREA_GEOMETRY_MARKER.finditer(text)), default=-1)
+    by = max((match.start() for match in AREA_BY_MARKER.finditer(text, 0, lengths[-1])), default=-1)
+    return max(observed, by, lengths[-2] if len(lengths) > 1 else -1, min(geometry, lengths[-1]))
 
 
 def area_named_annotation_value(text: str, patterns: AreaScopePatterns, *,
@@ -26333,10 +26439,10 @@ def area_detached_claim(text: str, owner: str, patterns: AreaScopePatterns) -> A
     return AreaMeasurementClaim(scope, area_claim_kind(value), None, "", (), False)
 
 
-def area_conflict_records(text: str, context: list[int]):
+def area_conflict_records(source: AreaSourceSpans):
     """Collect headed and unheaded source records for conflict detection only."""
-    boundaries = [(match.start(), match.end(), match.group())
-                  for match in AREA_RECORD_BREAK.finditer(text) if context[match.start()] == -1]
+    text = source.text
+    boundaries = list(source.separators(AREA_RECORD_BREAK, 0, len(text)))
     boundaries.append((len(text), len(text), ";"))
     part_start = record_start = 0
     heading_colon = None
@@ -26364,19 +26470,16 @@ def area_headed_comparison(text: str, start: int, stop: int, colon: int | None,
                 and area_complete_frame(clean_text(body[:relation.start()]).rstrip(", ")))
 
 
-def area_comparison_records(text: str, context: list[int], patterns: AreaScopePatterns):
+def area_comparison_records(source: AreaSourceSpans, patterns: AreaScopePatterns):
     """A physical line break can start a headed comparison record."""
-    for start, stop, colon in area_conflict_records(text, context):
-        source_start = start
-        for line_break in re.finditer(r"\n", text[source_start:stop]):
-            boundary = source_start + line_break.start()
-            if context[boundary] != -1 or not text[start:boundary].strip():
-                continue
-            candidate = boundary + 1
+    text = source.text
+    for start, stop, colon in area_conflict_records(source):
+        for boundary, candidate, _ in source.separators(AREA_LINE_BREAK, start, stop):
             line_stop = text.find("\n", candidate, stop)
             candidate_colon = area_heading_colon(text[candidate:stop if line_stop < 0 else line_stop])
-            if area_headed_comparison(text, candidate, stop, candidate_colon, patterns):
-                yield start, boundary, area_heading_colon(text[start:boundary])
+            if candidate_colon is not None and area_headed_comparison(text, candidate, stop, candidate_colon, patterns):
+                if text[start:boundary].strip():
+                    yield start, boundary, area_heading_colon(text[start:boundary])
                 start, colon = candidate, candidate_colon
         yield start, stop, colon
 
@@ -26441,12 +26544,13 @@ def area_condition_start(text: str, start: int, stop: int) -> re.Match[str] | No
     return AREA_CONDITION_INTRO.match(text, start, stop)
 
 
-def area_measurement_condition(text: str, start: int, stop: int) -> AreaQualification | None:
+def area_measurement_condition(text: str, start: int, stop: int,
+                               previous: AreaQualification | None = None) -> AreaQualification | None:
     """Read one condition clause. The caller keeps its coordination and main predicate."""
     if modifiers := AREA_RESULT_MODIFIERS.match(text, start, stop):
         start = modifiers.end()
     if intro := AREA_CONDITION_INTRO.match(text, start, stop):
-        if claim := area_qualification_claim(text, intro.end(), stop, None):
+        if claim := area_qualification_claim(text, intro.end(), stop, previous):
             return claim
     if condition := AREA_CONDITION_TOPIC.match(text, start, stop):
         # A gerund followed by a direct object must pass the predicate's role check.
@@ -26473,11 +26577,18 @@ def area_measured_subject(text: str, first: int, last: int) -> re.Match[str] | N
     return subject
 
 
+def area_reference_start(reference: re.Match[str]) -> int:
+    return reference.start("label")
+
+
 def area_qualification_targets(roles: tuple[tuple[int, int], ...], references: list[re.Match[str]],
                                patterns: AreaScopePatterns) -> set[str]:
     """Resolve exact references in the measured roles, separately from the predicate."""
-    return {scope for reference in references
-            if any(start <= reference.start("label") < end for start, end in roles)
+    if not roles:
+        return set()
+    return {scope for start, end in roles for reference in references[
+                bisect_left(references, start, key=area_reference_start):
+                bisect_left(references, end, key=area_reference_start)]
             for scope in patterns.reference_scopes[area_scope_reference_key(reference["label"])]}
 
 
@@ -26553,7 +26664,7 @@ def area_qualification_predicate(
             end = (measured or pronoun or action).end()
             if measured and not subject:
                 roles = (measured.span(),)
-            elif pronoun and not measured and AREA_CONTINUATION.match(text, end, stop):
+            elif pronoun and carry_roles and not measured and AREA_CONTINUATION.match(text, end, stop):
                 roles = carry_roles or ()
             elif subject and not measured and (not pronoun_subject or AREA_CONTINUATION.match(text, end, stop)):
                 roles = subject_roles
@@ -26618,9 +26729,15 @@ def area_qualification_claim(
             subject = AREA_REFERENTIAL_SUBJECT.match(text, first, last)
         subject = subject or AREA_SUBJECT_PRONOUN.match(text, first, last)
     inherited_roles = previous.roles if previous else None
+    if subject is not None and subject.re is AREA_SUBJECT_PRONOUN and previous is not None and not previous.roles:
+        return None
     claim = area_qualification_predicate(text, first, last, subject, inherited_roles=inherited_roles)
     if claim is not None:
-        return claim
+        number = previous.number if previous and claim.roles == previous.roles else ""
+        if claim.roles and not number:
+            begin, end = claim.roles[0]
+            number = area_topic_number(text, begin, end)
+        return replace(claim, number=number)
     for form in AREA_NOMINAL_QUALIFICATIONS:
         if match := form.match(text, first, last):
             roles = (match.span("object"),) if "object" in match.groupdict() else inherited_roles or ()
@@ -26628,18 +26745,76 @@ def area_qualification_claim(
     return None
 
 
+def area_topic_number(text: str, start: int, stop: int) -> str:
+    connector = AREA_TOPIC_END.search(text, start, stop)
+    head = ""
+    for word in AREA_TOPIC_WORD.finditer(text, start, connector.start() if connector else stop):
+        head = word[0]
+    if not head or head.startswith(("x_", "a_")):
+        return ""
+    return "plural" if head.endswith("s") and not head.endswith(("ss", "us")) else "singular"
+
+
+def area_intervening_topic(text: str, start: int, stop: int) -> str:
+    """An explicit non-measurement noun phrase can own a later pronoun."""
+    noun = None
+    for match in AREA_EXPLICIT_NOUN.finditer(text, start, stop):
+        noun = match
+    if noun is None or AREA_MEASURE_TOPIC_PHRASE.match(text, noun.start(), stop):
+        return ""
+    predicate = AREA_FINITE_BRIDGE.search(text, noun.end(), stop)
+    return area_topic_number(text, noun.start("start"), predicate.start() if predicate else stop)
+
+
+def area_qualification_clauses(source: AreaSourceSpans, text: str):
+    """Read local separators, retaining the individual conjuncts of comma lists."""
+    clauses = []
+    start = 0
+    for stop, next_start, separator in source.separators(AREA_QUALIFICATION_BREAK, 0, len(text), text=text):
+        if separator.strip().isalpha() and not text[start:stop].strip():
+            continue  # After punctuation, the coordinator belongs to the next clause.
+        clauses.append((start, stop, separator.strip()))
+        start = next_start
+    clauses.append((start, len(text), ""))
+    spans = []
+    for start, stop, separator in clauses:
+        clause = text[start:stop]
+        first = stop - len(clause.lstrip())
+        last = start + len(clause.rstrip())
+        coordinator = AREA_CLAUSE_COORDINATOR.match(text, first, last)
+        spans.append((coordinator.end() if coordinator else first, last, coordinator, separator))
+    list_comma = False
+    for index in range(len(spans) - 2, -1, -1):
+        first, last, coordinator, separator = spans[index]
+        next_coordinator = spans[index + 1][2]
+        list_comma = separator == "," and (
+            list_comma or (next_coordinator and next_coordinator[0].strip() in {"and", "or", "nor"})
+        )
+        if list_comma:
+            spans[index] = (first, last, coordinator, "list")
+    return spans
+
+
+def area_measure_condition_result(text: str, first: int, last: int) -> bool:
+    """A result predicate can start a coordinated main clause after a leading condition."""
+    claim = area_qualification_claim(text, first, last, None)
+    if claim is None or claim.result_end is None:
+        return False
+    return AREA_APPROVAL_RESULT_WORD.search(text, first, claim.result_end) is not None
+
+
 def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
     """An unfinished assertion disputes its measured subject or object."""
+    source = AreaSourceSpans(text)
     text, references = area_qualification_text(text, patterns)
     affected = set()
-    previous = None
-    antecedent = None
-    conditional_result = None
-    condition = None
+    previous = antecedent = None
+    intervening_topics = set()
+    conditional_result = condition = leading_dependency = None
+    dependency_roles = set()
+    has_dependency = leading_bound = False
     reading_condition = temporal_condition = False
-    start = 0
     separator = ""
-    leading_dependency = None
 
     def dispute(claim: AreaQualification, dependency: AreaQualification | None = None) -> None:
         targets = area_qualification_targets(claim.roles, references, patterns)
@@ -26648,78 +26823,100 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
         affected.update(targets or enclosing)
 
     def is_dependency(claim: AreaQualification | None) -> bool:
-        # A plain temporal clause can report a completed past event.
         return claim is not None and (not temporal_condition or not claim.past or claim.pending)
 
-    def finish_condition() -> None:
-        nonlocal conditional_result, condition, reading_condition, temporal_condition
-        if conditional_result and is_dependency(condition):
-            dispute(conditional_result, condition)
-        conditional_result = condition = None
-        reading_condition = temporal_condition = False
+    def retain_condition(claim: AreaQualification | None) -> None:
+        nonlocal has_dependency, condition
+        if claim is not None:
+            condition = claim
+        if is_dependency(claim):
+            has_dependency = True
+            dependency_roles.update(claim.roles)
 
-    boundaries = [boundary.span() for boundary in AREA_QUALIFICATION_BREAK.finditer(text)]
-    boundaries.append((len(text), len(text)))
-    for stop, next_start in boundaries:
-        clause = text[start:stop]
-        first = stop - len(clause.lstrip())
-        last = start + len(clause.rstrip())
-        coordinator = AREA_CLAUSE_COORDINATOR.match(text, first, last)
-        if coordinator:
-            first = coordinator.end()
+    def finish_condition() -> AreaQualification | None:
+        nonlocal conditional_result, condition, reading_condition, temporal_condition, has_dependency
+        dependency = AreaQualification(tuple(dependency_roles)) if has_dependency else None
+        if conditional_result and dependency:
+            dispute(conditional_result, dependency)
+        leading = dependency if conditional_result is None else None
+        conditional_result = condition = None
+        reading_condition = temporal_condition = has_dependency = False
+        dependency_roles.clear()
+        return leading
+
+    def finish_leading(dependency: AreaQualification | None) -> None:
+        if dependency and not leading_bound:
+            # A named pending verification is relevant even if the main action is unrelated.
+            affected.update(area_qualification_targets(dependency.roles, references, patterns))
+
+    for first, last, coordinator, following in area_qualification_clauses(source, text):
         if first < last:
             if reading_condition and (separator in {"but", "while", "whereas"} or (
-                separator == "," and not coordinator
+                separator in {",", "list"} and not coordinator and (
+                    separator == "," or conditional_result is None and has_dependency
+                    and area_measure_condition_result(text, first, last)
+                )
             )):
-                # A contrast can introduce a separate assertion. A comma introduces the main clause.
-                if conditional_result:
-                    finish_condition()
-                else:
-                    leading_dependency = condition if is_dependency(condition) else None
-                    condition = None
-                    reading_condition = temporal_condition = False
+                finish_leading(leading_dependency)
+                leading_dependency = finish_condition()
+                leading_bound = False
             if reading_condition:
-                claim = area_qualification_claim(text, first, last, condition)
-                if claim and (condition is None or (
-                    is_dependency(claim) and (not is_dependency(condition) or not condition.roles)
-                )):
-                    condition = claim
+                retain_condition(area_qualification_claim(text, first, last, condition))
             elif intro := area_condition_start(text, first, last):
                 conditional_result = previous if separator == "," else None
-                condition = area_measurement_condition(text, first, last)
                 temporal_condition = bool(intro["temporal"])
+                retain_condition(area_measurement_condition(text, first, last, antecedent))
                 reading_condition = True
-            elif previous and separator == "," and (dependency := area_measurement_condition(text, first, last)):
+            elif previous and separator == "," and (dependency := area_measurement_condition(text, first, last, antecedent)):
                 dispute(previous, dependency)
-            elif (claim := area_qualification_claim(text, first, last, antecedent)) is not None:
-                if separator in {"but", "whereas", "while", ","} and leading_dependency and antecedent:
-                    leading_dependency = None
-                if claim.pending or leading_dependency:
-                    dispute(claim, leading_dependency)
-                previous = antecedent = claim
-                if claim.result_end is not None:
-                    intro = area_condition_start(text, claim.result_end, last)
-                    condition = area_measurement_condition(text, claim.result_end, last)
-                    temporal_condition = bool(intro and intro["temporal"])
-                    reading_condition = bool(condition or intro)
-                    if reading_condition:
-                        conditional_result = claim
             else:
-                # A coordinated action can intervene without supplying a new measured role.
-                previous = None
-                if separator == "," and not coordinator:
-                    antecedent = None
-        separator = text[stop:next_start].strip()
+                # Explicit pronouns follow the closest compatible topic across this record.
+                pronoun = AREA_SUBJECT_PRONOUN.match(text, first, last)
+                if not pronoun:
+                    pronoun = next((match for action in AREA_ACTION.finditer(text, first, last)
+                                    if (match := AREA_OBJECT_PRONOUN.match(text, action.end(), last))), None)
+                prior = antecedent
+                if pronoun:
+                    number = "singular" if pronoun["topic"] == "it" else "plural"
+                    if number in intervening_topics or (prior and prior.number and prior.number != number):
+                        prior = AreaQualification(())
+                claim = area_qualification_claim(text, first, last, prior)
+                if claim is not None:
+                    if leading_bound and separator in {"but", "whereas", "while", ","}:
+                        leading_dependency = None
+                    if claim.pending or leading_dependency:
+                        dispute(claim, leading_dependency)
+                        leading_bound = leading_bound or leading_dependency is not None
+                    if antecedent is None or claim.roles != antecedent.roles:
+                        intervening_topics.clear()
+                    previous = antecedent = claim
+                    if claim.result_end is not None:
+                        intro = area_condition_start(text, claim.result_end, last)
+                        temporal_condition = bool(intro and intro["temporal"])
+                        retain_condition(area_measurement_condition(text, claim.result_end, last, claim))
+                        reading_condition = bool(condition or intro)
+                        if reading_condition:
+                            conditional_result = claim
+                else:
+                    previous = None
+                    if antecedent and not pronoun:
+                        if number := area_intervening_topic(text, first, last):
+                            intervening_topics.add(number)
+        separator = following
         if separator in {";", ".", "!", "?", ""}:
-            finish_condition()
-            previous = antecedent = leading_dependency = None
-        start = next_start
+            finish_leading(leading_dependency)
+            leading_bound = False
+            finish_leading(finish_condition())
+            previous = leading_dependency = None
+            if separator == ";":
+                antecedent = None
+                intervening_topics.clear()
     return affected
 
 
 def area_paired_qualification_scopes(context: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
-    _, pairs = area_bracket_context(context)
-    return {scope for start, end in pairs.items()
+    source = AreaSourceSpans(context)
+    return {scope for start, end in source.pairs.items()
             for scope in area_qualification_scopes(context[start + 1:end], enclosing, patterns)}
 
 
@@ -26727,7 +26924,7 @@ def area_paired_asides(text: str) -> bool:
     text = text.rstrip(" .,!?")
     if not text.startswith(("(", "[", "{")):
         return False
-    _, pairs = area_bracket_context(text)
+    pairs = AreaSourceSpans(text).pairs
     start = 0
     while start < len(text):
         end = pairs.get(start)
@@ -26785,11 +26982,35 @@ def area_record_claims(record: AreaScopeSpan, parts: list[tuple[str, str]], patt
         yield AreaMeasurementClaim(scope, "observed", None, "", (), False)
 
 
+def area_literal_prose_end(source: AreaSourceSpans, record: AreaScopeSpan, stop: int,
+                           group: int, patterns: AreaScopePatterns) -> int:
+    """Separate literal label prose after a complete amount at a physical line break."""
+    if not source.quotes or record.end == stop:
+        return stop
+    for left, right, _ in source.separators(AREA_LINE_BREAK, record.end, stop, group):
+        if not source.frame(record.end, left, group):
+            break
+        first = AREA_FRAME_SPACE.match(source.text, right, stop).end()
+        if first == stop or not source.text[first].isalpha():
+            continue
+        index = bisect_left(source.quote_starts, first)
+        if index == len(source.quote_starts) or source.quotes[source.quote_starts[index]] >= stop:
+            break
+        tail = source.text[first:stop].strip().rstrip(";").strip()
+        if (area_claim_kind(tail) or source.linear_operand(right, stop) or "?" in tail
+                or uses_provisional_dimensions(tail) or patterns.reference.search(tail.translate(AREA_SCOPE_WRAPPERS))
+                or area_qualification_scopes(tail, {record.scope}, patterns)):
+            break
+        return left
+    return stop
+
+
 def area_source_claims(raw: str, patterns: AreaScopePatterns):
     """Discover labels before assigning source framing or interpreting values."""
     text = unicodedata.normalize("NFKC", raw).casefold()
-    context, pairs = area_bracket_context(text)
-    source_records = list(area_comparison_records(text, context, patterns))
+    source = AreaSourceSpans(text)
+    context, pairs = source.context, source.pairs
+    source_records = list(area_comparison_records(source, patterns))
     comparison_starts = []
     contextual = set()
     member_claims = []
@@ -26808,7 +27029,7 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
     groups = {}
     for anchor in patterns.exact.finditer(text):
         start, end = anchor.span("label")
-        if start in contextual:
+        if start in contextual or source.literal[start] >= 0:
             continue
         group = context[start]
         while (group >= 0 and end <= pairs[group] < anchor.end()
@@ -26832,13 +27053,9 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
         for anchor, start, label_end in labels:
             scope = pricing_measurement_scope(anchor["label"])
             prefix_start = previous
-            for boundary in AREA_RECORD_BREAK.finditer(text, previous, start):
-                if context[boundary.start()] == group:
-                    explicit = boundary.group() == ";"
-                    measured = (records and records[-1].framed
-                                and area_complete_frame(clean_text(text[previous:boundary.end()])))
-                    if explicit or measured:
-                        prefix_start = boundary.end()
+            for _, boundary_end, separator in source.separators(AREA_RECORD_BREAK, previous, start, group):
+                if separator == ";" or (records and records[-1].framed and source.frame(previous, boundary_end, group)):
+                    prefix_start = boundary_end
             prefix = text[prefix_start:start].strip().lstrip("-\u2022 ")
             raw_label = text[start:anchor.end() - 1]
             label = clean_text(prefix + " " + raw_label)
@@ -26849,7 +27066,7 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
             adjacent = bool(group == -1 and records and prefix and (prefix_start == previous or not canonical))
             if adjacent:
                 framed = (records[-1].framed and pricing_measurement_scope(comparable_label) == scope
-                          and area_complete_frame(clean_text(text[previous:start])))
+                          and source.frame(previous, start, group))
                 label = clean_text(raw_label)
             label_start = prefix_start if framed and prefix and not adjacent else start
             records.append(AreaScopeSpan(label_start, anchor.end(), scope, label if framed else anchor["label"], framed,
@@ -26859,25 +27076,26 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
         for index, record in enumerate(records):
             limit = records[index + 1].start if index + 1 < len(records) else end
             if record.framed:
-                comparison = next((start for start in comparison_starts if record.end < start < limit), None)
-                if comparison is not None and area_complete_frame(clean_text(text[record.end:comparison])):
-                    limit = comparison
-                for opener, closer in pairs.items():
-                    if not (record.end <= opener < closer < limit and context[opener] == group):
-                        continue
-                    if not area_complete_frame(clean_text("".join(masked[record.end:opener]))):
+                comparison_index = bisect_right(comparison_starts, record.end)
+                if comparison_index < len(comparison_starts):
+                    comparison = comparison_starts[comparison_index]
+                    if comparison < limit and source.frame(record.end, comparison, group):
+                        limit = comparison
+                for opener, closer in source.brackets(record.end, limit, group):
+                    if not source.frame(record.end, opener, group):
                         continue
                     detached = area_detached_claim(clean_text(text[opener + 1:closer]), record.scope, patterns)
                     if detached is not None:
                         yield detached
                         masked[opener:closer + 1] = " " * (closer + 1 - opener)
+            if record.framed:
+                limit = area_literal_prose_end(source, record, limit, group, patterns)
             parts = []
             start = record.end
-            for boundary in AREA_RECORD_BREAK.finditer(text, start, limit):
-                if context[boundary.start()] == group:
-                    part = clean_text("".join(masked[start:boundary.start()]))
-                    parts.append((part, boundary.group()))
-                    start = boundary.end()
+            for left, right, separator in source.separators(AREA_RECORD_BREAK, start, limit, group):
+                part = clean_text("".join(masked[start:left]))
+                parts.append((part, separator))
+                start = right
             parts.append((clean_text("".join(masked[start:limit])), ""))
             handled[record.anchor[0]] = record.anchor[1]
             yield from area_record_claims(record, parts, patterns)
