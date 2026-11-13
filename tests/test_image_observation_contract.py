@@ -564,6 +564,33 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 opener.open.assert_called_once()
                 spend.settle.assert_called_once_with(spend.reserve.return_value, 0.125)
 
+    def test_nested_refusal_precedes_schema_classification_on_both_http_paths(self):
+        cases = (
+            ({"refusal": CANARY}, True),
+            ({"output": [{"type": "refusal", "refusal": CANARY}]}, True),
+            ({"output": [{"type": "message", "content": [{"type": "refusal", "text": CANARY}]}]}, True),
+            ({"output": [{"type": "message", "content": [{"type": "output_text", "refusal": None}]}]}, True),
+            ({"incomplete_details": {"reason": "content_filter"}}, False),
+            ({}, False),
+        )
+        for operation, status, (fields, refused) in product(("draft", "draft_high_quality"), (200, 400), cases):
+            with self.subTest(operation=operation, status=status, fields=fields):
+                gateway, _, _, telemetry, spend = self.gateway(images="true")
+                route = gateway.configuration.route(operation)
+                reply = {"model": route.model, "status": "failed", "usage": USAGE,
+                         "error": {"code": "unsupported_schema", "message": CANARY}, **fields}
+                opener, _ = wire_opener(status, json.dumps(reply).encode(), truncated=False)
+                gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                with self.assertRaises(ai_gateway.GatewayError) as caught:
+                    gateway.request(operation, batch_body(route), draft_batch=True)
+                expected = ("http_error" if status == 400 else "response_incomplete") if fields else "response_schema_rejected"
+                self.assertEqual(caught.exception.reason, expected)
+                self.assertEqual(caught.exception.diagnostics["response_contract_reason"], expected)
+                self.assertIs(caught.exception.diagnostics.get("refusal_present", False), refused)
+                self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
+                opener.open.assert_called_once()
+                spend.settle.assert_called_once_with(spend.reserve.return_value, 0.125)
+
     def test_success_uses_the_actual_larger_transport_limit(self):
         limit = ai_gateway.MAX_RESPONSE_BYTES
         for chunked, extra in product((False, True), (0, 1)):

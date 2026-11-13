@@ -1,8 +1,12 @@
 """G01-G13 synthetic gateway boundaries; no network or paid inference."""
 import copy
 import dataclasses
+import http.client
 import io
 import json
+import socket
+import socketserver
+from threading import Event, Thread
 import unittest
 import urllib.error
 from email.message import Message
@@ -229,7 +233,7 @@ class OpenRouterGatewayTest(unittest.TestCase):
         negatives += [{"error_type":"PRIVATE_UNKNOWN_TYPE"},{"error":{"code":"PRIVATE_UNKNOWN_CODE"}},
                       {"error_type":["PRIVATE_TYPE"]},{"output_text":"PRIVATE_PARTIAL"},
                       {"output":[{"text":"PRIVATE_PARTIAL"}]},{"refusal":"PRIVATE_REFUSAL"},
-                      {"incomplete_details":{"reason":"PRIVATE_REASON"}}]
+                      {"refusal":""},{"incomplete_details":[]},{"incomplete_details":{"reason":"PRIVATE_REASON"}}]
         for operation in gateway.ROUTE_KEYS:
             route=config.route(operation)
             for status in gateway.TRANSIENT_HTTP_STATUSES:
@@ -279,6 +283,146 @@ class OpenRouterGatewayTest(unittest.TestCase):
         self.assertEqual(gateway.admitted_usage({"input_tokens":2,"output_tokens":3,"total_tokens":5,"private":"canary"}),{"input_tokens":2,"output_tokens":3,"total_tokens":5})
         for value in [None,[],{}, {"input_tokens":True},{"input_tokens":-1},{"total_tokens":float("inf")},{"total_tokens":"3"},{"input_tokens":2,"output_tokens":3,"total_tokens":4},{"output_tokens":2,"output_tokens_details":{"reasoning_tokens":3}}]:
             with self.subTest(kind=type(value).__name__): self.assertIsNone(gateway.admitted_usage(value))
+
+
+class LoopbackResponseTest(unittest.TestCase):
+    def setUp(self):
+        self.reply = b""
+        self.hold_open = False
+        self.release = Event()
+        self.requests = []
+        fixture = self
+
+        class Provider(socketserver.StreamRequestHandler):
+            def handle(self):
+                request_line = self.rfile.readline()
+                length = 0
+                while (line := self.rfile.readline()) not in (b"\r\n", b""):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1])
+                fixture.requests.append((request_line, json.loads(self.rfile.read(length))))
+                self.wfile.write(fixture.reply)
+                if fixture.hold_open:
+                    fixture.release.wait(5)
+
+        provider = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Provider)
+        self.addCleanup(provider.server_close)
+        worker = Thread(target=provider.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(provider.shutdown)
+        self.addCleanup(self.release.set)
+
+        # Exercise the production HTTPS opener and response parser over local TCP.
+        # Only TLS setup is substituted, and no connection can leave loopback.
+        def connect(connection):
+            self.assertEqual(connection.host, "openrouter.ai")
+            connection.sock = socket.create_connection(provider.server_address, timeout=0.5)
+
+        real_connect = socket.socket.connect
+
+        def local_only(sock, address):
+            self.assertEqual(address, provider.server_address)
+            return real_connect(sock, address)
+
+        self.enterContext(mock.patch.object(socket.socket, "connect", local_only))
+        self.enterContext(mock.patch.object(http.client.HTTPSConnection, "connect", connect))
+        self.enterContext(mock.patch.object(urllib.request, "getproxies", return_value={}))
+        self.config = gateway.GatewayConfiguration.capture(synthetic_configuration().get)
+
+    def request(self, operation, reply, *, reason=None, sends=1, cost=None, hold_open=False):
+        self.requests.clear()
+        self.reply, self.hold_open = reply, hold_open
+        spend, sleep, telemetry = mock.Mock(), mock.Mock(), mock.Mock()
+        route = self.config.route(operation)
+        subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic-key",
+                                    quote_spend=spend, telemetry=telemetry, sleep=sleep)
+        if reason is None:
+            self.assertEqual(subject.request(operation, envelope(route))["output"], completed(route)["output"])
+        else:
+            with self.assertRaises(gateway.GatewayError) as caught:
+                subject.request(operation, envelope(route))
+            self.assertEqual(caught.exception.reason, reason)
+            if reason in {"response_partial", "response_framing"}:
+                self.assertFalse(caught.exception.retryable)
+                self.assertFalse(hasattr(caught.exception, "reported_cost"))
+                self.assertNotIn("provider_error_code", caught.exception.diagnostics)
+                self.assertNotIn("synthetic-private-value", repr(caught.exception.diagnostics))
+        self.assertEqual(len(self.requests), sends)
+        for request_line, body in self.requests:
+            self.assertEqual(request_line, b"POST /api/v1/responses HTTP/1.1\r\n")
+            self.assertEqual(body["model"], route.model)
+            self.assertEqual(body["provider"], self.config.provider_policy(operation))
+        self.assertEqual(spend.reserve.call_count, sends)
+        self.assertEqual([call.args[1] for call in spend.settle.call_args_list], [cost] * sends)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2.0, 5.0][:sends-1])
+        self.assertEqual([call.args[1] for call in telemetry.call_args_list], list(range(1, sends+1)))
+        self.assertEqual([call.args[4]["retry_pending"] for call in telemetry.call_args_list],
+                         [True] * (sends-1) + [False])
+        self.assertNotIn("synthetic-private-value", repr(telemetry.call_args_list))
+
+    def test_only_complete_response_heads_can_authorise_http_status_retries(self):
+        status = b"HTTP/1.1 503 Synthetic fixture\r\n"
+        header = b"X-Synthetic: synthetic-private-value\r\n"
+        interim = b"HTTP/1.1 100 Continue\r\n"
+        cases = (
+            ("pre-response EOF", b"", False, "connection_failed", 3),
+            ("pre-response timeout", b"", True, "connection_failed", 3),
+            ("status EOF", status[:-2], False, "response_partial", 1),
+            ("status timeout", status[:-2], True, "response_partial", 1),
+            ("header EOF", status + header, False, "response_partial", 1),
+            ("header timeout", status + header, True, "response_partial", 1),
+            ("mid header EOF", status + header[:-2], False, "response_partial", 1),
+            ("bare LF", status + b"\n", False, "response_partial", 1),
+            ("invalid status", b"HTTP/1.1 +503\r\n\r\n", False, "response_framing", 1),
+            ("invalid field", status + b"Invalid field\r\n\r\n", False, "response_framing", 1),
+            ("long field", status + b"X-Test: " + b"x" * 65536 + b"\r\n\r\n", False, "response_framing", 1),
+            ("many fields", status + header * 101 + b"\r\n", False, "response_framing", 1),
+            ("folded field", status + header + b" value\r\n\r\n", False, "response_framing", 1),
+            ("interim header EOF", interim + header, False, "response_partial", 1),
+            ("final status EOF", interim + b"\r\n", False, "response_partial", 1),
+            ("final header EOF", interim + b"\r\n" + status + header, False, "response_partial", 1),
+            ("interim limit", (interim + b"\r\n") * 100 + status + b"\r\n", False, "response_framing", 1),
+            ("interim complete", interim + b"\r\n" + status + header + b"\r\n", False, "http_error", 3),
+            ("final complete", status + header + b"\r\n", False, "http_error", 3),
+        )
+        for operation in ("basis_line", "basis_answer"):
+            for name, reply, hold_open, reason, sends in cases:
+                with self.subTest(operation=operation, name=name):
+                    self.request(operation, reply, hold_open=hold_open, reason=reason, sends=sends)
+
+    def test_only_valid_body_framing_exposes_cost_and_allows_retry(self):
+        for operation in ("draft", "draft_high_quality", "basis_line", "basis_answer"):
+            basis = operation.startswith("basis_")
+            status = b"503 Service Unavailable" if basis else b"200 OK"
+            route = self.config.route(operation)
+            reply = {"usage": {"cost": 0.125}}
+            reply = {"model": route.model, **reply} if basis else completed(route, **reply)
+            payload = json.dumps(reply).encode()
+            size = str(len(payload)).encode()
+            chunk = f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
+            cases = (
+                ("fixed", b"1.1", b"Content-Length: " + size, payload, None),
+                ("fixed OWS", b"1.1", b"Content-Length:\t " + size + b" \t", payload, None),
+                ("fixed HTTP/1.0", b"1.0", b"Content-Length: " + size, payload, None),
+                ("close-delimited", b"1.1", b"Connection: close", payload, None),
+                ("short fixed", b"1.1", b"Content-Length: " + size, payload[:-1], "response_partial"),
+                ("invalid fixed", b"1.1", b"Content-Length: +" + size, payload, "response_framing"),
+                ("duplicate length", b"1.1", b"Content-Length: " + size + b"\r\nContent-Length: " + size, payload, "response_framing"),
+                ("conflicting fields", b"1.1", b"Content-Length: " + size + b"\r\nTransfer-Encoding: chunked", payload, "response_framing"),
+                ("chunked", b"1.1", b"Transfer-Encoding: chunked", chunk + b"0\r\nX-Test: example\r\n\r\n", None),
+                ("chunked OWS", b"1.1", b"Transfer-Encoding: Chunked \t", chunk + b"0\r\n\r\n", None),
+                ("chunked HTTP/1.0", b"1.0", b"Transfer-Encoding: chunked", chunk + b"0\r\n\r\n", "response_framing"),
+                ("unsupported coding", b"1.1", b"Transfer-Encoding: gzip, chunked", chunk + b"0\r\n\r\n", "response_framing"),
+                ("incomplete chunk trailers", b"1.1", b"Transfer-Encoding: chunked", chunk + b"0\r\n", "response_partial"),
+            )
+            for name, version, header, body, framing_error in cases:
+                with self.subTest(operation=operation, name=name):
+                    head = b"HTTP/" + version + b" " + status + b"\r\nContent-Type: application/json\r\n"
+                    self.request(operation, head + header + b"\r\n\r\n" + body,
+                                 reason=framing_error or ("http_error" if basis else None),
+                                 sends=3 if basis and not framing_error else 1,
+                                 cost=None if framing_error else 0.125)
 
 
 class ReportedResponseCostTest(unittest.TestCase):

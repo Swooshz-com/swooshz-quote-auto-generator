@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 from decimal import Decimal, InvalidOperation
-from http.client import HTTPException, HTTPResponse, IncompleteRead
+from http.client import HTTPException, HTTPResponse, HTTPSConnection, IncompleteRead
 import json
 import math
 import re
@@ -60,8 +60,25 @@ SCHEMA_ERROR_PARAMS = frozenset({"text", "text.format", "text.format.type", "tex
                                 "text.format.strict", "text.format.schema", "response_format"})
 
 
+def _refusal_part(part):
+    return isinstance(part, dict) and (part.get("type") == "refusal" or "refusal" in part)
+
+
+def _response_refused(data):
+    if not isinstance(data, dict):
+        return False
+    if data.get("refusal") is not None:
+        return True
+    output = data.get("output")
+    return isinstance(output, list) and any(
+        isinstance(item, dict) and (item.get("type") == "refusal" or (
+            isinstance(item.get("content"), list) and any(map(_refusal_part, item["content"]))
+        )) for item in output
+    )
+
+
 def _image_schema_rejected(data):
-    if not isinstance(data, dict) or data.get("refusal") is not None or data.get("incomplete_details") is not None:
+    if not isinstance(data, dict) or _response_refused(data) or data.get("incomplete_details") is not None:
         return False
     error = data.get("error")
     if error is not None and not isinstance(error, dict):
@@ -104,8 +121,8 @@ def http_error_retryable(status, value):
         return True
     # No HTTP error is replayed once any output or explicit response refusal/
     # incompleteness is present, even if its outer status looks transient.
-    if any(value.get(key) is not None and value.get(key) != [] and value.get(key) != ""
-           for key in ("output", "output_text", "refusal", "incomplete_details")):
+    if (value.get("refusal") is not None or value.get("incomplete_details") is not None
+            or any(value.get(key) not in (None, [], "") for key in ("output", "output_text"))):
         return False
     canonical = value.get("error_type")
     if canonical is not None and (not isinstance(canonical, str) or canonical not in TRANSIENT_ERROR_TYPES):
@@ -270,7 +287,77 @@ _CHUNK_EXTENSION = rb'[ \t]*;[ \t]*' + _HTTP_TOKEN + (
     rb'(?:[ \t]*=[ \t]*(?:' + _HTTP_TOKEN + rb'|"(?:[\t !#-\[\]-~\x80-\xff]|\\[\t -~\x80-\xff])*"))?'
 )
 _CHUNK_LINE = re.compile(rb"([0-9a-fA-F]+)(?:" + _CHUNK_EXTENSION + rb")*\r\n")
-_TRAILER_LINE = re.compile(rb"(" + _HTTP_TOKEN + rb"):[\t -~\x80-\xff]*\r\n")
+_FIELD_LINE = re.compile(rb"(" + _HTTP_TOKEN + rb"):[\t -~\x80-\xff]*\r\n")
+
+_STATUS_LINE = re.compile(rb"HTTP/1\.[0-9] ([1-5][0-9]{2})(?: [\t -~\x80-\xff]*)?\r\n")
+_MAX_CONTINUE_RESPONSES = 100
+
+
+class _ResponseHeadReader:
+    """Require intact status/header lines while http.client parses and bounds them."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.started = False
+        self.status = None
+        self.continues = 0
+
+    def readline(self, size):
+        try:
+            # Buffered readline can raise on a timeout even after consuming bytes.
+            # Peek first so a timeout mid-status is never a pre-response failure.
+            if not self.started:
+                self.started = bool(self.stream.peek(1))
+                if not self.started:
+                    return b""
+            line = self.stream.readline(size)
+        except OSError:
+            if not self.started:
+                raise
+            raise GatewayError("response_partial", boundary="provider_response_shape",
+                               http_status=self.status) from None
+        if len(line) == size:
+            # Preserve http.client's line limit and its framing failure path.
+            return line
+        if not line.endswith(b"\r\n"):
+            raise GatewayError("response_partial", boundary="provider_response_shape",
+                               http_status=self.status)
+        if self.status is None:
+            match = _STATUS_LINE.fullmatch(line)
+            if match is None:
+                raise GatewayError("response_framing", boundary="provider_response_shape")
+            self.status = int(match[1])
+            if self.status == 100:
+                self.continues += 1
+                # Python 3.12 bounds each head but can read unlimited interim heads.
+                if self.continues >= _MAX_CONTINUE_RESPONSES:
+                    raise GatewayError("response_framing", boundary="provider_response_shape", http_status=100)
+        elif line == b"\r\n":
+            # http.client reads another status after a complete 100 Continue.
+            self.status = None
+        elif _FIELD_LINE.fullmatch(line) is None:
+            raise GatewayError("response_framing", boundary="provider_response_shape",
+                               http_status=self.status)
+        return line
+
+
+class _ProviderHttpResponse(HTTPResponse):
+    def begin(self):
+        stream = self.fp
+        self.fp = _ResponseHeadReader(stream)
+        try:
+            super().begin()
+        finally:
+            self.fp = stream
+
+
+class _ProviderHttpsConnection(HTTPSConnection):
+    response_class = _ProviderHttpResponse
+
+
+class _ProviderHttpsHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_ProviderHttpsConnection, req, context=self._context)
 
 
 class BoundedHttpsTransport:
@@ -284,13 +371,9 @@ class BoundedHttpsTransport:
         return [] if value is None else [value]
 
     @staticmethod
-    def _read_chunked(response, limit):
+    def _read_chunked(stream, limit):
         # http.client accepts EOF in place of the final trailer terminator.
-        # Its stream is positioned at the first chunk after parsing the headers.
-        wire_response = response.fp if isinstance(response, urllib.error.HTTPError) else response
-        if not isinstance(wire_response, HTTPResponse) or not wire_response.chunked or wire_response.fp is None:
-            raise IncompleteRead(b"")
-        stream = wire_response.fp
+        # The stream is positioned at the first chunk after parsing the headers.
         remaining_framing = MAX_CHUNK_FRAMING_BYTES
 
         def framing_line():
@@ -320,7 +403,7 @@ class BoundedHttpsTransport:
                 raise IncompleteRead(b"")
             remaining_framing -= 2
         while (line := framing_line()) != b"\r\n":
-            field = _TRAILER_LINE.fullmatch(line)
+            field = _FIELD_LINE.fullmatch(line)
             if field is None or field[1].lower() in {b"content-length", b"transfer-encoding"}:
                 raise IncompleteRead(b"")
         return body
@@ -330,16 +413,26 @@ class BoundedHttpsTransport:
         headers = response.headers
         lengths = cls._header_values(headers, "Content-Length")
         encodings = cls._header_values(headers, "Transfer-Encoding")
-        if len(lengths) > 1 or (encodings and (lengths or len(encodings) != 1
-                                               or not isinstance(encodings[0], str)
-                                               or encodings[0].strip().lower() != "chunked")):
+        wire = response.fp if isinstance(response, urllib.error.HTTPError) else response
+        if len(lengths) > 1 or (encodings and (
+            lengths or len(encodings) != 1 or not isinstance(encodings[0], str)
+            or encodings[0].strip(" \t").lower() != "chunked"
+            or not isinstance(wire, HTTPResponse) or wire.version != 11
+        )):
             raise GatewayError("response_framing", boundary="provider_response_shape", http_status=http_status)
-        length = lengths[0] if lengths else None
-        if length is not None and (not isinstance(length, str) or not re.fullmatch(r"[0-9]{1,12}", length)):
-            raise GatewayError("response_framing", boundary="provider_response_shape", http_status=http_status)
-        declared = int(length) if length is not None else None
+        declared = None
+        if lengths:
+            length = lengths[0].strip(" \t") if isinstance(lengths[0], str) else ""
+            if not re.fullmatch(r"[0-9]{1,12}", length):
+                raise GatewayError("response_framing", boundary="provider_response_shape", http_status=http_status)
+            declared = int(length)
         try:
-            raw = cls._read_chunked(response, limit) if encodings else response.read(limit + 1)
+            if encodings:
+                if wire.fp is None:
+                    raise IncompleteRead(b"")
+                raw = cls._read_chunked(wire.fp, limit)
+            else:
+                raw = response.read(limit + 1)
         except (HTTPException, OSError):
             raise GatewayError("response_partial", boundary="provider_response_shape",
                                http_status=http_status) from None
@@ -353,7 +446,9 @@ class BoundedHttpsTransport:
         return raw
 
     def __init__(self, *, opener=None):
-        self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect())
+        self._opener = opener if opener is not None else urllib.request.build_opener(
+            _NoRedirect(), _ProviderHttpsHandler(),
+        )
 
     def send(self, body, *, credential, timeout):
         request = urllib.request.Request(OPENROUTER_RESPONSES_URL,data=body,
@@ -361,45 +456,51 @@ class BoundedHttpsTransport:
         try:
             response = self._opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            status = exc.code
-            parsed = None
-            try:
-                raw = self._read_body(exc, MAX_ERROR_BODY_BYTES, http_status=status)
-                try:
-                    parsed = _load_json(raw.decode("utf-8"))
-                except (ValueError, RecursionError):
-                    # A fully framed HTTP error may have no JSON diagnostics.
-                    pass
-            finally:
-                exc.close()
-            error = GatewayError("http_error", boundary="provider_http", http_status=status,
-                                 retryable=http_error_retryable(status, parsed))
-            error.image_schema_rejected = status >= 400 and _image_schema_rejected(parsed)
-            error.diagnostics.update(draft_provider_error_diagnostics(parsed))
-            # Keep the billing fields out of diagnostics and business output.
-            if isinstance(parsed, dict):
-                error.reported_cost = (parsed.get("model"), _response_cost(parsed))
-            raise error from None
-        except (urllib.error.URLError,TimeoutError,OSError) as exc:
-            error = GatewayError("connection_failed",boundary="provider_transport",retryable=True)
-            error.diagnostics["transport_timeout"] = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
+            # urllib exposes complete response heads through either return path.
+            response = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            error = GatewayError("connection_failed", boundary="provider_transport", retryable=True)
+            error.diagnostics["transport_timeout"] = isinstance(exc, TimeoutError) or isinstance(
+                getattr(exc, "reason", None), TimeoutError,
+            )
             raise error from None
         except HTTPException:
             raise GatewayError("response_framing", boundary="provider_response_shape") from None
-        # Once a response has begun, never replay it after a read/shape/partial failure.
+
+        http_error = isinstance(response, urllib.error.HTTPError)
+        status = response.code if http_error else None
+        limit = MAX_ERROR_BODY_BYTES if http_error else MAX_RESPONSE_BYTES
         try:
             with response:
-                if response.status != 200 or response.geturl() != OPENROUTER_RESPONSES_URL:
-                    raise GatewayError("redirect_or_status",boundary="provider_http")
-                if response.headers.get_content_type().lower() != "application/json":
-                    raise GatewayError("response_mime",boundary="provider_response_json")
-                raw = self._read_body(response, MAX_RESPONSE_BYTES)
-                result=_load_json(raw.decode("utf-8"))
-        except GatewayError:
-            raise
-        except (ValueError,TypeError,UnicodeError,RecursionError,OSError,TimeoutError,urllib.error.URLError):
-            raise GatewayError("response_invalid",boundary="provider_response_json") from None
-        return result
+                if not http_error:
+                    if response.status != 200 or response.geturl() != OPENROUTER_RESPONSES_URL:
+                        raise GatewayError("redirect_or_status", boundary="provider_http")
+                    if response.headers.get_content_type().lower() != "application/json":
+                        raise GatewayError("response_mime", boundary="provider_response_json")
+                raw = self._read_body(response, limit, http_status=status)
+                try:
+                    parsed = _load_json(raw.decode("utf-8"))
+                except (ValueError, RecursionError):
+                    if not http_error:
+                        raise GatewayError("response_invalid", boundary="provider_response_json") from None
+                    # A fully framed HTTP error may have no JSON diagnostics.
+                    parsed = None
+        except (TypeError, OSError):
+            raise GatewayError("response_invalid", boundary="provider_response_json",
+                               http_status=status) from None
+
+        if not http_error:
+            return parsed
+        error = GatewayError("http_error", boundary="provider_http", http_status=status,
+                             retryable=http_error_retryable(status, parsed))
+        error.image_schema_rejected = status >= 400 and _image_schema_rejected(parsed)
+        error.diagnostics.update(draft_provider_error_diagnostics(parsed))
+        if _response_refused(parsed):
+            error.diagnostics["refusal_present"] = True
+        # Keep the billing fields out of diagnostics and business output.
+        if isinstance(parsed, dict):
+            error.reported_cost = (parsed.get("model"), _response_cost(parsed))
+        raise error from None
 
 
 def admitted_usage(value):
@@ -456,11 +557,7 @@ def safe_response_diagnostics(data):
               "output_length": len(combined), "output_empty": not bool(combined.strip()),
               "output_contains_json_object_bounds": "{" in combined and "}" in combined}
     result.update(output_item_present=bool(items), output_text_present=bool(texts),
-                  refusal_present=data.get("refusal") is not None or any(
-                      isinstance(item, dict) and (item.get("type") == "refusal" or any(
-                          isinstance(part, dict) and (part.get("type") == "refusal" or "refusal" in part)
-                          for part in (item.get("content") if isinstance(item.get("content"), list) else [])))
-                      for item in items))
+                  refusal_present=_response_refused(data))
     incomplete = data.get("incomplete_details")
     if isinstance(incomplete, dict) and isinstance(incomplete.get("reason"), str) and incomplete["reason"] in {"max_output_tokens", "content_filter"}:
         result["incomplete_reason"] = incomplete["reason"]
@@ -491,7 +588,7 @@ def admit_response(data,route, *, strict_image_observations=False):
         for part in item["content"]:
             if not isinstance(part,dict):
                 raise GatewayError("response_shape",boundary="provider_response_shape")
-            if part.get("type")=="refusal" or "refusal" in part:
+            if _refusal_part(part):
                 raise GatewayError("response_refused",boundary="provider_response_contract")
             if part.get("type")!="output_text" or not isinstance(part.get("text"),str):
                 raise GatewayError("response_shape",boundary="provider_response_shape")
