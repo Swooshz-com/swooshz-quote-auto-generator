@@ -25613,7 +25613,7 @@ AREA_DIMENSION_WORD = (
 AREA_TOPIC_LINK = r"(?:of|for|on)\s+(?:(?:both|each|either|all)\s+(?:of\s+)?)?(?:(?:the|a|an)\s+)?"
 AREA_MASKED_REFERENCE = r"[xa]_+\b"
 AREA_DIMENSION_NOUN_PHRASE = rf"(?:{AREA_DIMENSION_WORD}\s+){{0,5}}{AREA_DIMENSION_HEAD}\b"
-AREA_MEASURE_DETERMINER = r"(?:(?:the|all(?:\s+the)?|their|its|our|your)\s+)?"
+AREA_MEASURE_DETERMINER = r"(?:(?:the|this|that|these|those|all(?:\s+the)?|their|its|our|your)\s+)?"
 AREA_MEASURE_TOPIC = (
     rf"(?:{AREA_MEASURE_DETERMINER}"
     rf"(?:{AREA_DIMENSION_NOUN_PHRASE}|{AREA_STATUS_MODIFIERS}(?:quantity|value|survey)\b)"
@@ -25685,6 +25685,12 @@ AREA_NOMINAL_QUALIFICATIONS = tuple(re.compile(form, re.I) for form in (
     r"|drawings?|plans?|sketch(?:es)?|models?)\b)",
 ))
 AREA_QUALIFICATION_SUBJECT = re.compile(rf"(?P<partial>{AREA_PARTIAL_SUBJECT})?(?P<topic>{AREA_STATUS_TOPIC})(?=[\s:\-]|$)", re.I)
+AREA_DEMONSTRATIVE_MEASUREMENT = re.compile(
+    rf"(?:this|that|these|those)\s+{AREA_DIMENSION_NOUN_PHRASE}", re.I,
+)
+AREA_IMPLICIT_VERIFICATION = re.compile(
+    rf"(?:(?:the|this|that)\s+)?{AREA_STATUS_MODIFIERS}{AREA_VERIFICATION_EVENT}", re.I,
+)
 AREA_REFERENTIAL_SUBJECT = re.compile(
     rf"(?P<partial>{AREA_PARTIAL_SUBJECT})?(?P<topic>(?:those|that)\s+{AREA_TOPIC_LINK}{AREA_MASKED_REFERENCE})"
     r"(?=[\s:\-]|$)", re.I,
@@ -26729,10 +26735,18 @@ def area_qualification_claim(
             subject = AREA_REFERENTIAL_SUBJECT.match(text, first, last)
         subject = subject or AREA_SUBJECT_PRONOUN.match(text, first, last)
     inherited_roles = previous.roles if previous else None
-    if subject is not None and subject.re is AREA_SUBJECT_PRONOUN and previous is not None and not previous.roles:
-        return None
+    if previous is not None and not previous.roles and (subject is None or subject.re is AREA_SUBJECT_PRONOUN):
+        if subject is not None:
+            return None
+        inherited_roles = None
     claim = area_qualification_predicate(text, first, last, subject, inherited_roles=inherited_roles)
     if claim is not None:
+        if subject is not None and previous is not None and claim.roles == (subject.span("topic"),):
+            topic = subject["topic"]
+            if AREA_IMPLICIT_VERIFICATION.fullmatch(topic) or AREA_DEMONSTRATIVE_MEASUREMENT.fullmatch(topic):
+                if not previous.roles:
+                    return None
+                claim = replace(claim, roles=previous.roles)
         number = previous.number if previous and claim.roles == previous.roles else ""
         if claim.roles and not number:
             begin, end = claim.roles[0]
@@ -26851,12 +26865,13 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
 
     for first, last, coordinator, following in area_qualification_clauses(source, text):
         if first < last:
-            if reading_condition and (separator in {"but", "while", "whereas"} or (
-                separator in {",", "list"} and not coordinator and (
-                    separator == "," or conditional_result is None and has_dependency
-                    and area_measure_condition_result(text, first, last)
-                )
-            )):
+            # In a trailing condition, an uncoordinated comma can separate listed
+            # prerequisites. The condition still owns these clauses if no new result starts.
+            starts_result = reading_condition and separator in {",", "list"} and not coordinator and (
+                area_measure_condition_result(text, first, last)
+                or (separator == "," and conditional_result is None and has_dependency)
+            )
+            if reading_condition and (separator in {"but", "while", "whereas"} or starts_result):
                 finish_leading(leading_dependency)
                 leading_dependency = finish_condition()
                 leading_bound = False
@@ -26880,6 +26895,10 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
                     number = "singular" if pronoun["topic"] == "it" else "plural"
                     if number in intervening_topics or (prior and prior.number and prior.number != number):
                         prior = AreaQualification(())
+                if not pronoun and intervening_topics:
+                    # A competing topic supersedes elided roles. A new measured role
+                    # in this clause can still be read by the predicate.
+                    prior = AreaQualification(())
                 claim = area_qualification_claim(text, first, last, prior)
                 if claim is not None:
                     if leading_bound and separator in {"but", "whereas", "while", ","}:

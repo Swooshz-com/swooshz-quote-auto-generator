@@ -44320,6 +44320,18 @@ main().catch((error) => {
         west_statement = f"{west}: 24 sqm"
         east_statement = f"{east}: 10 sqm"
         role_cases = (
+            ("condition-comma-list", f"the dimensions for {east} are approved when the invoice clears, the deposit is paid, the site measurements are verified", True, False),
+            ("condition-comma-list-leading", f"when the invoice clears, the deposit is paid, the site measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-comma-list-completed", f"the dimensions for {east} were approved after the invoice cleared, the deposit was paid, the site measurements had been verified", True, True),
+            ("condition-comma-list-invoice", f"the dimensions for {east} were approved when the invoice cleared, the deposit was paid, the invoice was verified", True, True),
+            ("pronoun-demonstrative-measured", f"we checked the dimensions for {east}. Those dimensions have not been verified", True, False),
+            ("pronoun-demonstrative-explicit", f"we checked the dimensions for {east}. Those dimensions for {west} have not been verified", False, True),
+            ("pronoun-demonstrative-completed", f"we checked the dimensions for {east}. Those dimensions had been verified", True, True),
+            ("pronoun-implicit-verification", f"we checked the dimensions for {east}. Verification is still pending", True, False),
+            ("pronoun-implicit-completed", f"we checked the dimensions for {east}. Verification was completed", True, True),
+            ("pronoun-implicit-new-topic", f"we checked the dimensions for {east}. The invoice was sent. Invoice verification is still pending", True, True),
+            ("pronoun-implicit-competing-topic", f"we checked the dimensions for {east}. The invoice was sent. Verification is still pending", True, True),
+            ("pronoun-implicit-new-record", f"we checked the dimensions for {east}; verification is still pending", False, True),
             ("condition-oxford-list", f"the dimensions for {east} are approved when the invoice clears, the deposit is paid, and the site measurements are verified", True, False),
             ("condition-oxford-completed", f"the dimensions for {east} were approved after the invoice cleared, the deposit was paid, and the site measurements had been verified", True, True),
             ("condition-oxford-main", f"when site measurements are verified, the dimensions for {east} are approved, and the dimensions for {west} are approved", False, False),
