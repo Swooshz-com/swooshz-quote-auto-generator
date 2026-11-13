@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// AI-AGENT-TOOLKIT:secure-ci-cd:VENDORED plain-text-check check=1 sha256=50e08f819a3e
+// AI-AGENT-TOOLKIT:secure-ci-cd:VENDORED plain-text-check check=1 sha256=20f59ff12180
 'use strict';
 
 // Plain-text check: user-facing docs say what they mean in plain English. It fails on
@@ -18,21 +18,27 @@
 // a reason) and a line marker `plain-text: allow <reason>` for a `#number` on one line that is not a
 // reference (in Markdown, inside an HTML comment: `<!-- plain-text: allow a colour value -->`). The
 // marker hides nothing else: links, "PR 12" labels and banned terms are still reported on that line.
+// A kept term that exempts nothing fails a full run, whether unused or already exempted elsewhere.
 //
 // Usage: node plain-text-check.cjs [--repo <dir>] [--config <file>] [--files <path>...]
-//          [--init-baseline] [--prune-baseline] [--explain]
+//          [--init-baseline | --prune-baseline | --migrate-baseline] [--explain]
 //   --files          check only these files (paths relative to the repository; out-of-scope ones are skipped)
 //   --init-baseline  write the baseline from what is there now, only when no baseline exists yet
 //   --prune-baseline lower baseline counts to what still occurs; never adds or raises anything
+//   --migrate-baseline replace legacy matched text with fingerprints, keeping the same allowances
+// Baseline writes require a full run; they cannot be combined with --files or --explain.
 // Exit codes: 0 clean, 1 findings, 2 could not check (bad settings, unreadable file).
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 
 const CHECK_VERSION = 1;
 const CONFIG_SCHEMA = 'toolkit-plain-text-config/v1';
-const BASELINE_SCHEMA = 'toolkit-plain-references-baseline/v1';
+const LEGACY_BASELINE_SCHEMA = 'toolkit-plain-references-baseline/v1';
+const BASELINE_SCHEMA = 'toolkit-plain-references-baseline/v2';
+const BASELINE_DESCRIPTION = 'Existing findings, allowed up to each count until rewritten. This list only shrinks: rewrite an entry, then run with --prune-baseline. Never add entries. Fingerprints replace matched text.';
 const DEFAULT_CONFIG = path.join('.github', 'plain-text.json');
 
 const DEFAULTS = Object.freeze({
@@ -192,15 +198,20 @@ function explainedIn(text, config) {
   return explained;
 }
 
-function keptFor(rel, config) {
-  return new Set(config.kept_terms.filter((entry) => matchesPrefix(rel, entry.file)).map((entry) => entry.text));
+function keptFor(rel, config, used) {
+  const entries = config.kept_terms.filter((entry) => matchesPrefix(rel, entry.file));
+  return (text) => {
+    const matches = entries.filter((entry) => entry.text === text);
+    for (const entry of matches) used?.add(entry);
+    return matches.length > 0;
+  };
 }
 
-function findInText(text, file, config, scope = 'text') {
+function findInText(text, file, config, scope = 'text', used) {
   const findings = [];
   const body = normalise(text);
   const explained = explainedIn(body, config);
-  const kept = keptFor(file, config);
+  const kept = keptFor(file, config, used);
   const rules = REFERENCE_RULES.filter((rule) => config.rules[rule.id]);
   const terms = config.banned_terms.map((entry) => ({ entry, pattern: termPattern(entry.term, entry.case_sensitive !== false, entry.letter_suffix === true) }));
   body.split('\n').forEach((line, index) => {
@@ -209,13 +220,13 @@ function findInText(text, file, config, scope = 'text') {
     for (const rule of rules) {
       if (allowed && rule.id === 'number-reference') continue;
       for (const match of line.matchAll(rule.pattern)) {
-        if (kept.has(match[0])) continue;
+        if (kept(match[0])) continue;
         findings.push({ file, line: index + 1, rule: rule.id, text: match[0] });
       }
     }
     for (const { entry, pattern } of terms) {
       for (const match of line.matchAll(pattern)) {
-        if (explained.has(match[0]) || kept.has(match[0])) continue;
+        if (explained.has(match[0]) || kept(match[0])) continue;
         findings.push({ file, line: index + 1, rule: 'banned-term', text: match[0], term: entry.term });
       }
     }
@@ -223,7 +234,7 @@ function findInText(text, file, config, scope = 'text') {
   return findings;
 }
 
-function scanFiles(root, files, config) {
+function scanFiles(root, files, config, used) {
   const findings = [];
   for (const rel of files) {
     const scope = scopeOf(rel, config);
@@ -234,26 +245,52 @@ function scanFiles(root, files, config) {
       if (error.code === 'ENOENT') continue;
       throw new CheckError(`${rel} could not be read (${error.code || 'error'})`);
     }
-    findings.push(...findInText(text, rel, config, scope));
+    findings.push(...findInText(text, rel, config, scope, used));
   }
   return findings;
 }
 
-const keyOf = (entry) => `${entry.file}\u0000${entry.rule}\u0000${entry.text}`;
+// Include the file and rule in the digest as well as the exact match. Line movement is harmless;
+// moving a finding to another file, editing its link or exceeding its count is not an allowance.
+const fingerprintOf = (entry) => createHash('sha256').update(JSON.stringify([entry.file, entry.rule, entry.text]), 'utf8').digest('hex');
+const keyOf = (entry) => JSON.stringify([entry.file, entry.rule, entry.fingerprint || fingerprintOf(entry)]);
 
 function readBaseline(root, config) {
   const file = path.join(root, config.baseline);
-  if (!fs.existsSync(file)) return { schema: BASELINE_SCHEMA, allowed: [], missing: true };
-  let baseline;
-  try { baseline = JSON.parse(normalise(fs.readFileSync(file, 'utf8'))); }
-  catch { throw new CheckError(`${config.baseline} is not valid JSON`); }
-  if (baseline.schema !== BASELINE_SCHEMA || !Array.isArray(baseline.allowed)) throw new CheckError(`${config.baseline} is not a ${BASELINE_SCHEMA} file`);
-  for (const entry of baseline.allowed) {
-    if (typeof entry.file !== 'string' || typeof entry.rule !== 'string' || typeof entry.text !== 'string' || !Number.isInteger(entry.count) || entry.count < 1) {
-      throw new CheckError(`${config.baseline} has an entry without file, rule, text and a positive count`);
-    }
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT') return { schema: BASELINE_SCHEMA, allowed: [], missing: true };
+    throw new CheckError('Baseline could not be read or is invalid.');
   }
-  return baseline;
+  try {
+    const baseline = JSON.parse(normalise(raw));
+    if (!baseline || ![LEGACY_BASELINE_SCHEMA, BASELINE_SCHEMA].includes(baseline.schema) || !Array.isArray(baseline.allowed)) throw new Error();
+    const legacy = baseline.schema === LEGACY_BASELINE_SCHEMA;
+    const fields = ['file', 'rule', legacy ? 'text' : 'fingerprint', 'count'];
+    const seen = new Set();
+    for (const entry of baseline.allowed) {
+      if (!entry || typeof entry.file !== 'string' || !entry.file || typeof entry.rule !== 'string' || !entry.rule
+        || entry.file.includes('\\') || entry.file.split('/').some(part => !part || part === '.' || part === '..') || /[:\x00-\x1f\x7f]/.test(entry.file)
+        || ![...REFERENCE_RULES.map(rule => rule.id), 'banned-term'].includes(entry.rule)
+        || !Number.isSafeInteger(entry.count) || entry.count < 1
+        || Object.keys(entry).length !== fields.length || fields.some(field => !Object.hasOwn(entry, field))
+        || (legacy ? typeof entry.text !== 'string' : typeof entry.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(entry.fingerprint))) throw new Error();
+      const key = keyOf(entry);
+      if (seen.has(key)) throw new Error();
+      seen.add(key);
+    }
+    return baseline;
+  } catch {
+    // JSON parser errors and malformed entry values can contain the matched link. Never echo them.
+    throw new CheckError('Baseline could not be read or is invalid.');
+  }
+}
+
+function baselineMigrationNotice(baseline, config) {
+  return baseline.schema === LEGACY_BASELINE_SCHEMA && baseline.allowed.some(entry => REFERENCE_RULES.some(rule => rule.id === entry.rule))
+    ? `baseline ${config.baseline}: stores matched text (v1); run the check with --migrate-baseline`
+    : null;
 }
 
 // Findings beyond the baseline count fail (every occurrence of that text in that file is listed, so
@@ -263,7 +300,8 @@ function check(root, config, { files = null, spawn } = {}) {
   const baseline = readBaseline(root, config);
   const allowed = new Map(baseline.allowed.map((entry) => [keyOf(entry), entry.count]));
   const scoped = files ? files.map((rel) => slash(rel)).filter((rel) => scopeOf(rel, config)) : listScopedFiles(root, config, { spawn });
-  const findings = scanFiles(root, scoped, config);
+  const used = new Set();
+  const findings = scanFiles(root, scoped, config, used);
   const groups = new Map();
   for (const finding of findings) {
     const key = keyOf(finding);
@@ -274,7 +312,8 @@ function check(root, config, { files = null, spawn } = {}) {
   for (const [key, group] of groups) if (group.length > (allowed.get(key) || 0)) failures.push(...group);
   const stale = files ? [] : baseline.allowed.filter((entry) => (groups.get(keyOf(entry)) || []).length < entry.count)
     .map((entry) => ({ ...entry, found: (groups.get(keyOf(entry)) || []).length }));
-  return { failures, stale, findings, baseline };
+  const unusedKept = files ? [] : config.kept_terms.filter((entry) => !used.has(entry));
+  return { failures, stale, unusedKept, findings, baseline, scoped: Boolean(files) };
 }
 
 // One failure. A reference is described without its matched text, because a matched link can carry
@@ -296,6 +335,7 @@ function writeBaseline(root, config, baseline) {
 
 // Lowers each baseline count to what still occurs and drops entries that no longer occur. Never raises a count.
 function pruneBaseline(root, config, options = {}) {
+  requireFullBaselineRun(options);
   const { baseline, findings } = check(root, config, options);
   const counts = new Map();
   for (const finding of findings) counts.set(keyOf(finding), (counts.get(keyOf(finding)) || 0) + 1);
@@ -310,20 +350,37 @@ function pruneBaseline(root, config, options = {}) {
 // Writes the starting baseline once, from what is there now. Refuses when a baseline already exists,
 // so nothing can be added to a list that only shrinks.
 function initBaseline(root, config, options = {}) {
+  requireFullBaselineRun(options);
   if (fs.existsSync(path.join(root, config.baseline))) throw new CheckError(`${config.baseline} already exists; it only shrinks, so it was not rewritten`);
   const { findings } = check(root, config, options);
   const counts = new Map();
   for (const finding of findings) {
     const key = keyOf(finding);
-    if (!counts.has(key)) counts.set(key, { file: finding.file, rule: finding.rule, text: finding.text, count: 0 });
+    if (!counts.has(key)) counts.set(key, { file: finding.file, rule: finding.rule, fingerprint: fingerprintOf(finding), count: 0 });
     counts.get(key).count += 1;
   }
   const allowed = [...counts.values()].sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
   writeBaseline(root, config, {
     schema: BASELINE_SCHEMA,
-    description: 'What was already there when the plain-text check was added. Each entry is allowed up to its count until it is rewritten; new ones fail. This list only shrinks: rewrite an entry, then run the check with --prune-baseline. Never add entries.',
+    description: BASELINE_DESCRIPTION,
     allowed
   });
+  return { entries: allowed.length };
+}
+
+function requireFullBaselineRun(options) {
+  if (options.files) throw new CheckError('Baseline writes cannot be combined with --files.');
+}
+
+// Explicit format-only migration. No scan can add an entry or raise an allowance. Keep legacy
+// pruning separate so reporting, installation and pruning never silently migrate an existing file.
+function migrateBaseline(root, config, options = {}) {
+  requireFullBaselineRun(options);
+  const baseline = readBaseline(root, config);
+  if (baseline.missing) throw new CheckError('No baseline exists to migrate.');
+  if (baseline.schema === BASELINE_SCHEMA) return { entries: baseline.allowed.length };
+  const allowed = baseline.allowed.map(entry => ({ file: entry.file, rule: entry.rule, fingerprint: fingerprintOf(entry), count: entry.count }));
+  writeBaseline(root, config, { schema: BASELINE_SCHEMA, description: BASELINE_DESCRIPTION, allowed });
   return { entries: allowed.length };
 }
 
@@ -341,7 +398,7 @@ function explain(config) {
 }
 
 function parseArgs(argv) {
-  const args = { repo: process.cwd(), config: null, files: null, init: false, prune: false, explain: false };
+  const args = { repo: process.cwd(), config: null, files: null, init: false, prune: false, migrate: false, explain: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--repo' || arg === '--config') {
@@ -352,21 +409,28 @@ function parseArgs(argv) {
     } else if (arg === '--files') { args.files = argv.slice(index + 1); break; }
     else if (arg === '--init-baseline') args.init = true;
     else if (arg === '--prune-baseline') args.prune = true;
+    else if (arg === '--migrate-baseline') args.migrate = true;
     else if (arg === '--explain') args.explain = true;
     else throw new CheckError(`unknown option ${arg}`);
   }
+  const writes = [args.init, args.prune, args.migrate].filter(Boolean).length;
+  if (writes > 1 || (writes && (args.files || args.explain))) throw new CheckError('Choose one baseline write mode, without --files or --explain.');
   args.repo = path.resolve(args.repo);
   args.config = args.config ? path.resolve(args.config) : path.join(args.repo, DEFAULT_CONFIG);
   return args;
 }
 
-function report({ failures, stale }, config, out, err) {
-  for (const entry of stale) out.write(`NOTE: ${entry.file}: ${entry.rule} "${entry.text}" is in the baseline ${entry.count} time(s) but occurs ${entry.found}; run with --prune-baseline.\n`);
+function report({ failures, stale, unusedKept, baseline, scoped }, config, out, err) {
+  const notice = scoped ? null : baselineMigrationNotice(baseline, config);
+  if (notice) out.write(`NOTE: ${notice}\n`);
+  for (const entry of stale) out.write(`NOTE: ${entry.file}: ${entry.rule} is in the baseline ${entry.count} time(s) but occurs ${entry.found}; run with --prune-baseline.\n`);
+  for (const entry of unusedKept) err.write(`FAIL: kept term "${entry.text}" for ${entry.file} is no longer needed (it exempts nothing); remove it from kept_terms\n`);
   if (failures.length) {
     for (const finding of failures) err.write(`FAIL: ${describeFailure(finding, config)}\n`);
     err.write(`\n${failures.length} item(s) to rewrite in plain English. Repository file links are fine.\n`);
     return 1;
   }
+  if (unusedKept.length) return 1;
   out.write('Plain-text check passed.\n');
   return 0;
 }
@@ -387,6 +451,11 @@ function main(argv = process.argv.slice(2), { out = process.stdout, err = proces
       out.write(`Plain-text baseline pruned: ${result.removed} entr${result.removed === 1 ? 'y' : 'ies'} removed, ${result.kept} kept.\n`);
       return 0;
     }
+    if (args.migrate) {
+      const result = migrateBaseline(args.repo, config);
+      out.write(`Plain-text baseline uses fingerprints (${result.entries} entries); allowances unchanged.\n`);
+      return 0;
+    }
     return report(check(args.repo, config, { files: args.files }), config, out, err);
   } catch (error) {
     err.write(`Could not check: ${error instanceof CheckError ? error.message : `internal error (${error && error.name ? error.name : 'unknown'})`}\n`);
@@ -395,9 +464,9 @@ function main(argv = process.argv.slice(2), { out = process.stdout, err = proces
 }
 
 module.exports = Object.freeze({
-  CHECK_VERSION, CONFIG_SCHEMA, BASELINE_SCHEMA, DEFAULT_CONFIG, DEFAULTS, REFERENCE_RULES, CheckError,
+  CHECK_VERSION, CONFIG_SCHEMA, BASELINE_SCHEMA, LEGACY_BASELINE_SCHEMA, DEFAULT_CONFIG, DEFAULTS, REFERENCE_RULES, CheckError,
   termPattern, resolveConfig, readConfigFile, scopeOf, listFiles, listScopedFiles, findInText, scanFiles,
-  ALLOW_MARKER, check, describeFailure, pruneBaseline, initBaseline, explain, report, main
+  ALLOW_MARKER, readBaseline, baselineMigrationNotice, check, describeFailure, pruneBaseline, initBaseline, migrateBaseline, explain, report, main
 });
 
 if (require.main === module) process.exitCode = main();

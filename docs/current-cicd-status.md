@@ -1,8 +1,17 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-08
+Last updated: 2026-11-13
 
-Sources of truth: `.github/workflows/ci.yml` and `.github/workflows/plain-text.yml`
+Sources of truth: `.github/workflows/ci.yml`, `.github/workflows/plain-text.yml`,
+and the two Toolkit Programme Sweep workflows.
+
+The cloud programme sweep runs on pushes to `main` or by dispatch. The hourly
+gate and eligible repository activity dispatch it on `main` only. The sweep
+checks the selected ref before minting the separate GitHub App tokens for the
+quote repository and private evidence store. Footer cleanup requires a refresh
+that ran on the same commit and skips when the refresh reaches its rate limit.
+The sweep uses the existing repository App variable and secret. These
+workflows update programme records and do not deploy the application.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.
