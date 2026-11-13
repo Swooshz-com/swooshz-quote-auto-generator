@@ -43840,6 +43840,59 @@ main().catch((error) => {
                 self.assertEqual({claim.scope for claim in webapp.area_source_claims(source, patterns)
                                   if claim.eligible}, {west, east})
 
+    def test_area_length_distinguishes_quote_delimiters_from_units(self):
+        for note, has_length in (
+            ("selected label 'Option 6'", False),
+            ("selected label \u2019Option 6\u2019", False),
+            ("selected label \u201dOption 6\u201d", False),
+            ("selected label 'installers' Option 6'", False),
+            ("selected label \u2019installers\u2019 Option 6\u2019", False),
+            ("selected label 'the installer said \"Option 6\"'", False),
+            ("selected label 'sample 6 '", False),
+            ("selected label 'sample 6' wide panels", False),
+            ("selected label 'Option 6'; the installers' tape measures 6\"", True),
+            ("the note reads 'the gap is 6\" wide'", True),
+            ("the note reads \u2019the gap is 6\u201d wide\u2019", True),
+            ('the note reads "the gap is 6" wide"', True),
+            ("the note reads 'the gap is 6\"'", True),
+            ("the note reads 'the gap is 5' 11\" wide'", True),
+            ("the note reads \"the gap is 6\u2033\"", True),
+            ("the note reads \"the gap is 6 inches\"", True),
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(webapp.area_has_linear_operand(note), has_length)
+
+    def test_area_verification_preserves_measured_roles_across_predicates(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        for clause, expected in (
+            (f"the dimensions for {east} were approved if the site measurements are independently verified", {east}),
+            (f"we approved the dimensions for {east}, conditional upon independent review", {east}),
+            (f"verification of the dimensions for {east} has finished once we verify the site measurements", {east}),
+            (f"if the site measurements are independently verified, the dimensions for {east} are approved", {east}),
+            (f"the dimensions for {east} were approved if the invoice is independently verified", set()),
+            (f"the dimensions for {east} were approved if verified invoices arrive", set()),
+            (f"the dimensions for {east} were approved conditional upon independent review of the invoice", set()),
+            (f"the dimensions for {east} were approved if the site measurements are used for ordering", set()),
+            (f"the dimensions for {east} were approved if the dimensions for {west} are verified", {east}),
+            (f"the dimensions for {east} were approved if the dimensions for {west} are verified but have not been signed off", {east}),
+            (f"the engineer approved the dimensions for {east} upon review and will check the invoice", set()),
+            (f"the dimensions for {east} have been checked but have not been verified", {east}),
+            (f"{west}'s and {east}'s dimensions have been checked but not verified", {west, east}),
+            (f"the dimensions for {east} were checked, but are still awaiting final approval", {east}),
+            (f"the engineer checked the dimensions for {east} but has not verified them", {east}),
+            (f"the dimensions for {east} were checked and independently verified", set()),
+            (f"the dimensions for {east} were checked but the invoice has not been verified", set()),
+            (f"the engineer checked the dimensions for {east} but has not verified the invoice", set()),
+            (f"the dimensions for {east} were checked while the dimensions for {west} were not verified", {west}),
+            (f"the dimensions for {east} were checked but have not been verified, and those for {west} are complete", {east}),
+            (f"the dimensions for {east} were checked; the dimensions have not been verified", {west}),
+        ):
+            with self.subTest(clause=clause):
+                self.assertEqual(webapp.area_qualification_scopes(clause, {west}, patterns), expected)
+        member = f"the dimensions for {east} were checked but have not been verified"
+        self.assertEqual({claim.scope for claim in webapp.area_member_claims(member, {west}, patterns)}, {east})
+
     def test_area_verification_resolves_roles_before_result_conditions(self):
         west, east = "carpet tile west", "carpet tile east"
         patterns = webapp.area_scope_patterns({west, east})
@@ -43879,6 +43932,12 @@ main().catch((error) => {
                 self.assertEqual(webapp.area_qualification_scopes(clause, {west}, patterns), expected)
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
+        self._assert_area_workbooks(correction_cases=False)
+
+    def test_area_qualification_and_quote_boundaries_through_notes_pdf_and_batch(self):
+        self._assert_area_workbooks(correction_cases=True)
+
+    def _assert_area_workbooks(self, *, correction_cases):
         import socket
         from textwrap import wrap as wrap_pdf_line
         from scripts.generate_quote import read_first_sheet_rows_with_numbers, write_text_pdf
@@ -44215,6 +44274,50 @@ main().catch((error) => {
             "pd-carry-cond", "pd-done-cond", "pd-carried-clear", "pd-head-obj",
             "pd-head-sub", "pd-poss-pair", "pd-quoted-label", "pd-inch-symbol", "pd-head-inch",
         }
+        # Keep both seal and workbook assertions for each input route.
+        west = "Carpet tile west"
+        east = "Carpet tile east"
+        west_statement = f"{west}: 24 sqm"
+        east_statement = f"{east}: 10 sqm"
+        role_cases = (
+            ("condition-if", f"the dimensions for {east} were approved if the site measurements are verified", True, False),
+            ("condition-upon", f"we approved the dimensions for {east}, conditional upon independent review", True, False),
+            ("condition-once", f"we finished checking the dimensions for {east} once the dimensions were verified", True, False),
+            ("condition-before", f"if the measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-other", f"the dimensions for {east} were approved if the invoice is verified", True, True),
+            ("condition-use", f"the dimensions for {east} were approved if the measurements are used for ordering", True, True),
+            ("condition-scope", f"the dimensions for {east} were approved if the dimensions for {west} are verified", True, False),
+            ("subject-shared", f"the dimensions for {east} were checked but have not been verified", True, False),
+            ("subject-list", f"{west}'s and {east}'s dimensions were checked but not verified", False, False),
+            ("subject-switch", f"the dimensions for {east} were checked but the dimensions for {west} were not verified", False, True),
+            ("subject-invoice", f"the dimensions for {east} were checked but the invoice was not verified", True, True),
+            ("object-pronoun", f"we checked the dimensions for {east} but have not verified them", True, False),
+            ("object-explicit", f"we checked the dimensions for {east} but have not verified the invoice", True, True),
+            ("subject-complete", f"the dimensions for {east} were checked and independently verified", True, True),
+        )
+        member_case = "member-subject"
+        cases += ((member_case, west, west, west_statement,
+                   f"Sample boards: 2 sqm, separate from {west} (the dimensions for {east} were checked but not verified)",
+                   24, "observed", True),)
+        quote_cases = (
+            ("quote-label", "the owner selected the label 'Option 6'", True, True),
+            ("quote-possessive", "the owner selected the label 'installers' Option 6'", True, True),
+            ("quote-nested", "the owner selected the label 'the installer said \"Option 6\"'", True, True),
+            ("quote-length", "the note reads 'the gap is 6\" wide'", False, True),
+            ("quote-final-length", "the note reads 'the gap is 6\"'", False, True),
+            ("quote-headed-length", "Sample stock: the note reads 'the gap is 6\" wide'", True, True),
+        )
+        separate_cases = (
+            ("separate-role", f"the dimensions for {east} were checked but are unverified", True, False),
+            ("separate-after", f"the dimensions for {east} were checked but are unverified", True, False),
+            ("separate-unbound", "the dimensions were checked but are unverified", True, True),
+        )
+        correction_east = {name: east_priced for name, _, _, east_priced in role_cases + quote_cases + separate_cases}
+        correction_east[member_case] = False
+        cases += tuple((name, west, west, west_statement, f"{west_statement} ({note})", 24, "observed", west_priced)
+                       for name, note, west_priced, _ in role_cases)
+        cases += tuple((name, west, west, west_statement, note, 24, "observed", west_priced)
+                       for name, note, west_priced, _ in quote_cases + separate_cases)
         scoped_annotations = {
             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
             "op-pass", "op-pass-r", "op-note", "op-note-r", "op-value", "op-local", "op-both", "op-wrap",
@@ -44237,7 +44340,7 @@ main().catch((error) => {
                            "ref-split", "ref-prose", "ref-head", "ref-both", "ref-clause", "ref-neg", "ref-excl", "st-site", "st-unver", "st-field",
                            "st-still", "st-source", "st-key", "st-survey", "list-both",
                            "st-noverify", "st-await", "st-open", "st-done", "st-invoice",
-                           "st-required", "st-needed", "st-inv-req"} | embedded_revisions | scoped_verification
+                           "st-required", "st-needed", "st-inv-req"} | embedded_revisions | scoped_verification | correction_east.keys()
         aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
                         "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
         qualifier_cases = aside_cases | north_cases
@@ -44258,6 +44361,8 @@ main().catch((error) => {
             root = Path(temp)
             for route in ("notes", "pdf", "batch"):
                 for name, basis, item, statement, other, quantity, kind, allowed in cases:
+                    if (name in correction_east) != correction_cases:
+                        continue
                     with self.subTest(route=route, name=name):
                         east_label = "Carpet tile east" if name in inline_cases else f"{label} at east"
                         east_statement = f"{east_label}: 10 sqm"
@@ -44302,6 +44407,8 @@ main().catch((error) => {
                             sources = [f"{other};\n{statement}", east_statement]
                         elif name in embedded_revisions:
                             sources = [f"{statement};\n{east_statement} ({other})"]
+                        elif name == "separate-after":
+                            sources = [f"{statement};\n{east_statement};\n{other}"]
                         elif name in aside_cases:
                             terminal = ";" if name in semicolon_cases else "" if name == "assume-soft" else "."
                             wrap = " " if name == "free-inline" else "\n"
@@ -44338,6 +44445,19 @@ main().catch((error) => {
                             # The fixture writer clips each physical line at 110 characters.
                             write_text_pdf(path, title, [segment for line in lines
                                                         for segment in (wrap_pdf_line(line, 90) if len(line) > 110 else [line])])
+                            if name in {"quote-label", "quote-possessive"}:
+                                import pypdfium2
+
+                                with pypdfium2.PdfDocument(path) as pdf:
+                                    page = pdf[0]
+                                    text_page = page.get_textpage()
+                                    try:
+                                        extracted = text_page.get_text_range()
+                                    finally:
+                                        text_page.close()
+                                        page.close()
+                                label_text = "'Option 6'" if name == "quote-label" else "'installers' Option 6'"
+                                self.assertIn(label_text.replace("'", "\u2019"), extracted)
                             payload["images"] = [{"name": path.name, "data_url": "data:application/pdf;base64," +
                                                   base64.b64encode(path.read_bytes()).decode("ascii")}]
                         else:
@@ -44384,7 +44504,7 @@ main().catch((error) => {
                         if name == "duplicate":
                             self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
                         self.assertEqual(entries["spot"]["catalog_item_id"], spot)
-                        east_priced = name in dual_cases and name not in {
+                        east_priced = correction_east.get(name, name in dual_cases and name not in {
                             "open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty", "ref-clause", "list-unc",
                             "mem-mid", "mem-wait", "mem-dot-mid", "mem-line-mid",
                             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-nest",
@@ -44398,7 +44518,7 @@ main().catch((error) => {
                             "pd-event-gerund", "pd-ref-clause",
                             "pd-both-shared", "pd-both-poss", "pd-both-ref",
                             "pd-carry-cond", "pd-done-cond", "pd-head-obj", "pd-head-sub", "pd-poss-pair",
-                        }
+                        })
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
                         }
