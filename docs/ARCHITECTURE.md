@@ -24,7 +24,10 @@ high-detail images. The gateway checks the provider envelope and bounded
 JSON with nonblank observations before marking the send successful. The server
 still checks one observation per source, preserves source order and labels, and controls
 synthesis and quote creation. A rejected response stops drafting with
-support-safe diagnostics and no additional provider attempt.
+support-safe diagnostics and no additional provider attempt. A truncated
+HTTP body is reported as a partial response, including when the status
+indicates an upstream error. The gateway discards the partial body and
+records the send with unknown usage and cost.
 
 The current batch runner also supports the default-off request format.
 Retire that format after both installed routes qualify for the strict schema

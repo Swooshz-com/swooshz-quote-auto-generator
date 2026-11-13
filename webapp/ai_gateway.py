@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 from decimal import Decimal, InvalidOperation
+from http.client import IncompleteRead
 import json
 import math
 import re
@@ -247,8 +248,14 @@ class BoundedHttpsTransport:
             try:
                 raw = exc.read(128 * 1024 + 1)
                 if len(raw) <= 128 * 1024:
+                    length = exc.headers.get("Content-Length") if exc.headers is not None else None
+                    if (isinstance(length, str) and re.fullmatch(r"[0-9]{1,12}", length)
+                            and len(raw) < int(length)):
+                        raise GatewayError("response_partial", boundary="provider_response_shape", http_status=status)
                     parsed = _load_json(raw.decode("utf-8"))
                     metadata = draft_provider_error_diagnostics(parsed)
+            except IncompleteRead:
+                raise GatewayError("response_partial", boundary="provider_response_shape", http_status=status) from None
             except (AttributeError, OSError, ValueError, TypeError, UnicodeError, RecursionError):
                 # Diagnostics are optional; the failed HTTP response remains a failure.
                 metadata = {}
@@ -283,6 +290,8 @@ class BoundedHttpsTransport:
                 result=_load_json(raw.decode("utf-8"))
         except GatewayError:
             raise
+        except IncompleteRead:
+            raise GatewayError("response_partial", boundary="provider_response_shape") from None
         except (ValueError,TypeError,UnicodeError,RecursionError,OSError,TimeoutError,urllib.error.URLError):
             raise GatewayError("response_invalid",boundary="provider_response_json") from None
         return result
@@ -483,7 +492,7 @@ class AiGateway:
                     exc.diagnostics.setdefault("response_contract_name", contract.name)
                     exc.diagnostics.setdefault("response_contract_reason", exc.reason)
                     exc.diagnostics.setdefault("batch_failure_reason", "batch_provider_failure")
-                if contract is not None and schema_rejected(data, exc.diagnostics):
+                if contract is not None and exc.reason != "response_partial" and schema_rejected(data, exc.diagnostics):
                     exc.reason = "response_schema_rejected"
                     exc.retryable = False
                     exc.diagnostics.update(failure_boundary="provider_response_schema",

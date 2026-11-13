@@ -1,9 +1,13 @@
 """Offline image observation wire, admission and server handoff tests."""
 
 import copy
+import http.client
+import io
 import json
 import socket
 import unittest
+import urllib.error
+from types import SimpleNamespace
 from unittest import mock
 
 from tests import test_synthesis_contract_repair as synthesis
@@ -27,6 +31,37 @@ def batch_body(route, count=1):
     image = {"type": "input_image", "detail": "high", "image_url": synthetic_image()}
     return {"model": route.model, "reasoning": {"effort": route.effort},
             "input": [{"role": "user", "content": [prompt, *[dict(image) for _ in range(count)]]}]}
+
+
+def wire_http_response(status, payload, *, truncated, chunked=True):
+    class Response(http.client.HTTPResponse):
+        def geturl(self):
+            return ai_gateway.OPENROUTER_RESPONSES_URL
+
+    head = f"HTTP/1.1 {status} Synthetic fixture\r\nContent-Type: application/json\r\n".encode()
+    if chunked:
+        head += b"Transfer-Encoding: chunked\r\n\r\n"
+        chunk = f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
+        body = chunk + (b"10\r\nshort" if truncated else b"0\r\n\r\n")
+    else:
+        declared = len(payload) + int(truncated)
+        head += f"Content-Length: {declared}\r\n\r\n".encode()
+        body = payload
+    response = Response(SimpleNamespace(makefile=lambda *_args: io.BytesIO(head + body)))
+    response.begin()
+    return response
+
+
+def wire_opener(status, payload, *, truncated, chunked=True):
+    response = wire_http_response(status, payload, truncated=truncated, chunked=chunked)
+    opener = mock.Mock()
+    if status == 200:
+        opener.open.return_value = response
+    else:
+        opener.open.side_effect = urllib.error.HTTPError(
+            response.geturl(), status, "Synthetic fixture", response.headers, response,
+        )
+    return opener, response
 
 
 class ImageObservationGatewayTest(unittest.TestCase):
@@ -178,6 +213,79 @@ class ImageObservationGatewayTest(unittest.TestCase):
         transport.send.assert_not_called()
         telemetry.assert_not_called()
 
+    def test_chunked_read_closure_and_spend_in_both_quality_modes(self):
+        for operation in ("draft", "draft_high_quality"):
+            for status in (200, 400, 503):
+                for truncated in (False, True):
+                    with self.subTest(operation=operation, status=status, truncated=truncated):
+                        gateway, _, _, telemetry, spend = self.gateway(images="true")
+                        route = gateway.configuration.route(operation)
+                        if status == 200:
+                            reply = responses_envelope(
+                                route.model, json.dumps({"observations": [CANARY]}), usage=USAGE,
+                            )
+                        else:
+                            reply = {"model": route.model, "usage": USAGE,
+                                     "error": {"code": "unsupported_schema", "message": CANARY}}
+                        opener, response = wire_opener(status, json.dumps(reply).encode(), truncated=truncated)
+                        gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                        budget = mock.Mock()
+                        args = {"send_budget": budget, "draft_batch": True}
+                        if truncated or status != 200:
+                            with self.assertRaises(ai_gateway.GatewayError) as caught:
+                                gateway.request(operation, batch_body(route), **args)
+                            error = caught.exception
+                            reason = "response_partial" if truncated else "response_schema_rejected"
+                            self.assertEqual(error.reason, reason)
+                            self.assertFalse(error.retryable)
+                            self.assertEqual(error.diagnostics["response_contract_reason"], reason)
+                            self.assertEqual(error.diagnostics["response_contract_name"], IMAGE_OBSERVATIONS.name)
+                            self.assertEqual(error.diagnostics["batch_failure_reason"], "batch_provider_failure")
+                            self.assertEqual(error.diagnostics.get("http_status"), status if status != 200 else None)
+                            if truncated:
+                                self.assertNotIn("provider_error_code", error.diagnostics)
+                            self.assertNotIn(CANARY, str(error))
+                        else:
+                            result = gateway.request(operation, batch_body(route), **args)
+                            self.assertEqual(result["output"], reply["output"])
+                        self.assertTrue(response.closed)
+                        opener.open.assert_called_once()
+                        spend.reserve.assert_called_once_with()
+                        cost = None if truncated else 0.125
+                        spend.settle.assert_called_once_with(spend.reserve.return_value, cost)
+                        budget.claim.assert_called_once_with(operation, route.model)
+                        tokens = {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+                        budget.finish.assert_called_once_with(tokens if status == 200 and not truncated else None, cost_usd=cost)
+                        telemetry.assert_called_once()
+                        self.assertEqual(telemetry.call_args.args[2], "success" if status == 200 and not truncated else "failed")
+                        self.assertFalse(telemetry.call_args.args[4]["retry_pending"])
+                        self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
+
+    def test_partial_bodies_never_retry_even_on_a_retry_eligible_route(self):
+        operation = "basis_line"
+        for chunked in (False, True):
+            for status in (200, 503):
+                with self.subTest(chunked=chunked, status=status):
+                    gateway, _, _, telemetry, spend = self.gateway()
+                    route = gateway.configuration.route(operation)
+                    reply = {"model": route.model, "usage": USAGE, "error": {"message": CANARY}}
+                    opener, response = wire_opener(status, json.dumps(reply).encode(), truncated=True, chunked=chunked)
+                    gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                    with self.assertRaises(ai_gateway.GatewayError) as caught:
+                        gateway.request(operation, batch_body(route))
+                    error = caught.exception
+                    self.assertEqual(error.reason, "response_partial")
+                    self.assertEqual(error.diagnostics["failure_boundary"], "provider_response_shape")
+                    self.assertEqual(error.diagnostics.get("http_status"), 503 if status == 503 else None)
+                    self.assertFalse(error.retryable)
+                    self.assertNotIn("response_contract_name", error.diagnostics)
+                    self.assertNotIn(CANARY, json.dumps(error.diagnostics))
+                    self.assertTrue(response.closed)
+                    opener.open.assert_called_once()
+                    spend.settle.assert_called_once_with(spend.reserve.return_value, None)
+                    telemetry.assert_called_once()
+                    self.assertFalse(telemetry.call_args.args[4]["retry_pending"])
+
     def test_response_failure_matrix_settles_once_with_safe_diagnostics(self):
         valid = json.dumps({"observations": [CANARY]})
         cases = (
@@ -234,6 +342,53 @@ class ImageObservationDraftTest(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
         self.fixture.values[IMAGE_OPTION] = "true"
+
+    def test_real_draft_job_keeps_partial_response_reference_in_both_modes(self):
+        media = {"type": "input_image", "image_url": self.fixture.image, "detail": "high"}
+        prepared = server.PreparedDraftMedia([], [[("Reference 1", media)]])
+        for mode in ("standard", "high_quality"):
+            for status in (200, 503):
+                with self.subTest(mode=mode, status=status):
+                    self.fixture.logs.clear()
+                    opener, response = wire_opener(status, CANARY.encode(), truncated=True)
+                    transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                    operation = "draft_high_quality" if mode == "high_quality" else "draft"
+                    with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
+                        gateway = server.configured_ai_gateway()
+                    route = gateway.configuration.route(operation)
+                    configuration = server.OpenAIDraftConfiguration(mode, route.model, route.effort, gateway)
+                    payload = {"analysis_mode": mode, "images": [{"name": "synthetic.png", "data_url": self.fixture.image}]}
+                    with (mock.patch.object(server, "prepare_draft_media", return_value=prepared),
+                          mock.patch.object(server, "capture_openai_draft_configuration", return_value=configuration),
+                          mock.patch.object(server, "pricing_reference_snapshot_for_payload", return_value=object()),
+                          mock.patch.object(server, "pricing_reference_authority_error", return_value=""),
+                          mock.patch.object(server, "protected_ai_draft_mode_enabled", return_value=False),
+                          mock.patch.object(server, "set_job_state") as state):
+                        server.finish_draft_job("job-synthetic-partial", payload)
+                    state.assert_called_once()
+                    result = state.call_args.kwargs["result"]
+                    self.assertEqual(state.call_args.kwargs["status"], "blocked")
+                    self.assertNotIn("line_items", result)
+                    failure = [row for event, row in self.fixture.logs if event == "openai_draft_failed"][-1]
+                    self.assertEqual(result["error_reference"], failure["error_reference"])
+                    self.assertEqual(failure["failure_boundary"], "draft_batch")
+                    self.assertEqual(failure["batch_failure_reason"], "batch_provider_failure")
+                    self.assertEqual(failure["response_contract_reason"], "response_partial")
+                    self.assertEqual(failure["response_contract_name"], IMAGE_OBSERVATIONS.name)
+                    self.assertNotIn(CANARY, json.dumps([result, self.fixture.logs]))
+                    wire = json.loads(opener.open.call_args.args[0].data)
+                    self.assertEqual(wire["model"], route.model)
+                    self.assertEqual(wire["reasoning"], {"effort": route.effort})
+                    self.assertEqual(wire["text"], IMAGE_OBSERVATIONS.text_format())
+                    opener.open.assert_called_once()
+                    self.assertTrue(response.closed)
+                    self.assertEqual(self.fixture.usage()["total"]["sends"], 1)
+                    self.assertEqual(self.fixture.usage()["total"]["unknown_cost_attempts"], 1)
+                    self.assertEqual(self.fixture.usage()["total"]["unknown_usage_attempts"], 1)
+                    terminals = [row for event, row in self.fixture.logs if event == "ai_call_attempt"
+                                 and row.get("attempt_number", 0) > 0]
+                    self.assertEqual(len(terminals), 1)
+                    self.assertEqual(terminals[0]["status"], "failed")
 
     def test_batch_coverage_failure_stops_before_synthesis_and_keeps_job_reference(self):
         class InvalidBatch:
