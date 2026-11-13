@@ -25606,7 +25606,7 @@ AREA_STATUS_MODIFIERS = r"(?:(?:on[- ]?site|site|field|physical|independent|fina
 AREA_DIMENSION_HEAD = r"(?:areas?|coverage|dimensions?|measurements?|extents?|footprints?|a_+)"
 AREA_DIMENSION_WORD = (
     rf"(?!(?:of|for|on|with|by|and|or|nor|but|while|whereas|not|no|provided|unless|until|once|if|"
-    rf"subject|conditional|contingent|pending|after|"
+    rf"subject|conditional|contingent|pending|after|when|"
     rf"{AREA_VERIFICATION_EVENT})\b)[^\W\d_][\w-]*"
 )
 AREA_TOPIC_LINK = r"(?:of|for|on)\s+(?:(?:both|each|either|all)\s+(?:of\s+)?)?(?:(?:the|a|an)\s+)?"
@@ -25664,7 +25664,7 @@ AREA_APPROVAL_TOPIC = (
 AREA_APPROVAL_PENDING = rf"(?:{AREA_WAITING_ACTION}|{AREA_VERIFICATION_OBLIGATION})\s+{AREA_APPROVAL_TOPIC}"
 AREA_CONDITION_PREFIX = r"(?:pending|subject\s+to|conditional\s+(?:on|upon)|contingent\s+(?:on|upon)|(?:only\s+)?after)\s+"
 AREA_CONDITION_EVENT = rf"(?:{AREA_MEASUREMENT_EVENT}|{AREA_APPROVAL_TOPIC})"
-AREA_CONDITION_CLAUSE = r"(?:provided(?:\s+that)?|on\s+condition\s+that|(?:only\s+)?(?:if|after)|unless|until|once)\s+"
+AREA_CONDITION_CLAUSE = r"(?:provided(?:\s+that)?|on\s+condition\s+that|(?:only\s+)?(?:if|after|(?P<temporal>when))|unless|until|once)\s+"
 AREA_ACTIVE_ACTION = r"(?:confirms?|verif(?:y|ies)|validates?|(?:double[\s-]+)?checks?|measures?|approves?|signs?[\s-]+off)\b"
 AREA_ONGOING_ACTION = r"(?:confirming|verifying|validating|(?:double[\s-]+)?checking|measuring|approving|signing[\s-]+off)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
@@ -25734,13 +25734,17 @@ AREA_CONTINUATION = re.compile(
     rf"{AREA_CONDITION_PREFIX}|{AREA_CONDITION_CLAUSE}|{AREA_MANNER_ADVERB}\b))", re.I,
 )
 AREA_RESULT_MODIFIERS = re.compile(
-    rf"\s+(?:(?!only\s+(?:if|after)\b)(?:yet|{AREA_MANNER_ADVERB})\b\s*)++", re.I,
+    rf"\s+(?:(?!only\s+(?:if|after|when)\b)(?:yet|{AREA_MANNER_ADVERB})\b\s*)++", re.I,
 )
-AREA_QUALIFICATION_AUXILIARIES = frozenset("am is are was were remain remains has have had be been do does did status".split())
+AREA_QUALIFICATION_AUXILIARIES = frozenset("am is are was were remain remains remained has have had be been do does did status".split())
 AREA_QUALIFICATION_ADVERB = re.compile(
     rf"(?!(?:{AREA_VERIFICATION_PARTIAL})\b)(?:still|already|only|all|now|then|soon|later|so\s+far|well|also|even|{AREA_MANNER_ADVERB})\b", re.I,
 )
 AREA_QUALIFICATION_MODALS = frozenset("will shall must should may might".split())
+AREA_PAST_AUXILIARIES = frozenset({"was", "were", "had", "did"})
+AREA_TENSE_AUXILIARIES = AREA_PAST_AUXILIARIES | AREA_QUALIFICATION_MODALS | frozenset(
+    {"am", "is", "are", "has", "have", "do", "does", "to"},
+)
 AREA_QUALIFICATION_DUTIES = frozenset("need needs needed require requires required oblige obliged wait waits waiting due schedule scheduled expect expected set going".split())
 AREA_QUALIFICATION_PARTS = frozenset("partly partially half halfway provisionally preliminarily incompletely".split())
 AREA_FINITE_WORDS = (AREA_QUALIFICATION_AUXILIARIES | AREA_QUALIFICATION_MODALS | AREA_QUALIFICATION_DUTIES) - {"status"}
@@ -25856,6 +25860,7 @@ class AreaQualification:
     roles: tuple[tuple[int, int], ...]
     pending: bool = False
     result_end: int | None = None
+    past: bool = False
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -26453,9 +26458,9 @@ def area_measurement_condition(text: str, start: int, stop: int) -> AreaQualific
 
 
 def area_verification_result(text: str, end: int, stop: int, roles: tuple[tuple[int, int], ...],
-                             unfinished: bool) -> AreaQualification:
+                             unfinished: bool, *, past: bool) -> AreaQualification:
     """Preserve the measured roles and the point where a condition can begin."""
-    return AreaQualification(roles, unfinished or bool(AREA_RESULT_TAIL.match(text, end, stop)), end)
+    return AreaQualification(roles, unfinished or bool(AREA_RESULT_TAIL.match(text, end, stop)), end, past)
 
 
 def area_measured_subject(text: str, first: int, last: int) -> re.Match[str] | None:
@@ -26491,6 +26496,7 @@ def area_qualification_predicate(
     event_subject = bool(subject and AREA_EVENT_SUBJECT.fullmatch(subject["topic"]))
     negative = future = ongoing = duty = started = expired_duty = False
     actor_words = 0
+    tense = ""
     while position < stop:
         if separator := AREA_WORD_SEPARATOR.match(text, position, stop):
             position = separator.end()
@@ -26511,6 +26517,9 @@ def area_qualification_predicate(
         if not token:
             break
         word = token[0].casefold().replace("\u2019", "'")
+        if not tense and word in AREA_TENSE_AUXILIARIES:
+            tense = word
+        past = tense in AREA_PAST_AUXILIARIES or (not tense and actor_words > 0 and word.endswith("ed"))
         after = token.end()
         aspect = AREA_RESULT_ASPECT.match(text, after, stop)
         following = aspect[0].strip().casefold() if aspect else ""
@@ -26527,7 +26536,7 @@ def area_qualification_predicate(
         if execution := AREA_EVENT_EXECUTION.match(text, position, stop):
             return area_verification_result(
                 text, execution.end(), stop, (execution.span("event"),),
-                unfinished or bool(execution["unfinished"]),
+                unfinished or bool(execution["unfinished"]), past=past,
             )
         if inception_action:
             return None
@@ -26535,7 +26544,7 @@ def area_qualification_predicate(
             event = AREA_COMPLETION_EVENT.match(text, completion.end(), stop)
             if event:
                 return area_verification_result(
-                    text, event.end(), stop, (event.span("event"),), unfinished,
+                    text, event.end(), stop, (event.span("event"),), unfinished, past=past,
                 )
         action = complement or AREA_ACTION.match(text, position, stop)
         if action:
@@ -26555,6 +26564,7 @@ def area_qualification_predicate(
                 return None
             return area_verification_result(
                 text, end, stop, roles, unfinished or bool(not complement and action["ongoing"]),
+                past=past,
             )
         if word == "no" and following == "longer":
             expired_duty = negative = True
@@ -26626,7 +26636,7 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
     antecedent = None
     conditional_result = None
     condition = None
-    reading_condition = False
+    reading_condition = temporal_condition = False
     start = 0
     separator = ""
     leading_dependency = None
@@ -26637,12 +26647,16 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
             targets = area_qualification_targets(dependency.roles, references, patterns)
         affected.update(targets or enclosing)
 
+    def is_dependency(claim: AreaQualification | None) -> bool:
+        # A plain temporal clause can report a completed past event.
+        return claim is not None and (not temporal_condition or not claim.past or claim.pending)
+
     def finish_condition() -> None:
-        nonlocal conditional_result, condition, reading_condition
-        if conditional_result and condition:
+        nonlocal conditional_result, condition, reading_condition, temporal_condition
+        if conditional_result and is_dependency(condition):
             dispute(conditional_result, condition)
         conditional_result = condition = None
-        reading_condition = False
+        reading_condition = temporal_condition = False
 
     boundaries = [boundary.span() for boundary in AREA_QUALIFICATION_BREAK.finditer(text)]
     boundaries.append((len(text), len(text)))
@@ -26661,15 +26675,19 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
                 if conditional_result:
                     finish_condition()
                 else:
-                    leading_dependency, condition = condition, None
-                    reading_condition = False
+                    leading_dependency = condition if is_dependency(condition) else None
+                    condition = None
+                    reading_condition = temporal_condition = False
             if reading_condition:
                 claim = area_qualification_claim(text, first, last, condition)
-                if claim and (condition is None or not condition.roles):
+                if claim and (condition is None or (
+                    is_dependency(claim) and (not is_dependency(condition) or not condition.roles)
+                )):
                     condition = claim
-            elif area_condition_start(text, first, last):
+            elif intro := area_condition_start(text, first, last):
                 conditional_result = previous if separator == "," else None
                 condition = area_measurement_condition(text, first, last)
+                temporal_condition = bool(intro["temporal"])
                 reading_condition = True
             elif previous and separator == "," and (dependency := area_measurement_condition(text, first, last)):
                 dispute(previous, dependency)
@@ -26680,8 +26698,10 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
                     dispute(claim, leading_dependency)
                 previous = antecedent = claim
                 if claim.result_end is not None:
+                    intro = area_condition_start(text, claim.result_end, last)
                     condition = area_measurement_condition(text, claim.result_end, last)
-                    reading_condition = bool(condition or area_condition_start(text, claim.result_end, last))
+                    temporal_condition = bool(intro and intro["temporal"])
+                    reading_condition = bool(condition or intro)
                     if reading_condition:
                         conditional_result = claim
             else:
