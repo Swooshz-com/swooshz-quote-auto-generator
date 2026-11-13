@@ -43794,7 +43794,7 @@ main().catch((error) => {
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
-        from textwrap import wrap
+        from textwrap import wrap as wrap_pdf_line
         from scripts.generate_quote import read_first_sheet_rows_with_numbers, write_text_pdf
         from tests.gateway_test_support import synthetic_configuration
         from tests.test_basis_quantity_retention import EvidenceTransport
@@ -44221,7 +44221,7 @@ main().catch((error) => {
                             lines = ";\n".join(sources).splitlines()
                             # The fixture writer clips each physical line at 110 characters.
                             write_text_pdf(path, title, [segment for line in lines
-                                                        for segment in (wrap(line, 90) if len(line) > 110 else [line])])
+                                                        for segment in (wrap_pdf_line(line, 90) if len(line) > 110 else [line])])
                             payload["images"] = [{"name": path.name, "data_url": "data:application/pdf;base64," +
                                                   base64.b64encode(path.read_bytes()).decode("ascii")}]
                         else:
