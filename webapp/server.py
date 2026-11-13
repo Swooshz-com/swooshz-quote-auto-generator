@@ -25685,9 +25685,11 @@ AREA_NOMINAL_QUALIFICATIONS = tuple(re.compile(form, re.I) for form in (
     r"|drawings?|plans?|sketch(?:es)?|models?)\b)",
 ))
 AREA_QUALIFICATION_SUBJECT = re.compile(rf"(?P<partial>{AREA_PARTIAL_SUBJECT})?(?P<topic>{AREA_STATUS_TOPIC})(?=[\s:\-]|$)", re.I)
-AREA_DEMONSTRATIVE_MEASUREMENT = re.compile(
-    rf"(?:this|that|these|those)\s+{AREA_DIMENSION_NOUN_PHRASE}", re.I,
+AREA_DEMONSTRATIVE_MEASUREMENT = (
+    rf"(?:this|that|these|those)\s+{AREA_DIMENSION_NOUN_PHRASE}"
 )
+AREA_REFERENTIAL_MEASUREMENT = re.compile(rf"(?:{AREA_DEMONSTRATIVE_MEASUREMENT}|"
+    rf"(?:{AREA_VERIFICATION_EVENT}|{AREA_APPROVAL_EVENT}|review)\s+(?:of|for|on)\s+{AREA_DEMONSTRATIVE_MEASUREMENT})", re.I)
 AREA_IMPLICIT_VERIFICATION = re.compile(
     rf"(?:(?:the|this|that)\s+)?{AREA_STATUS_MODIFIERS}{AREA_VERIFICATION_EVENT}", re.I,
 )
@@ -26741,9 +26743,8 @@ def area_qualification_claim(
         inherited_roles = None
     claim = area_qualification_predicate(text, first, last, subject, inherited_roles=inherited_roles)
     if claim is not None:
-        if subject is not None and previous is not None and claim.roles == (subject.span("topic"),):
-            topic = subject["topic"]
-            if AREA_IMPLICIT_VERIFICATION.fullmatch(topic) or AREA_DEMONSTRATIVE_MEASUREMENT.fullmatch(topic):
+        if previous is not None and claim.roles and claim.roles != previous.roles:
+            if area_uses_antecedent(text, claim.roles):
                 if not previous.roles:
                     return None
                 claim = replace(claim, roles=previous.roles)
@@ -26757,6 +26758,15 @@ def area_qualification_claim(
             roles = (match.span("object"),) if "object" in match.groupdict() else inherited_roles or ()
             return AreaQualification(roles, pending=True)
     return None
+
+
+def area_uses_antecedent(text: str, roles: tuple[tuple[int, int], ...]) -> bool:
+    if len(roles) != 1:
+        return False
+    start, stop = roles[0]
+    start = AREA_FRAME_SPACE.match(text, start, stop).end()
+    return bool(AREA_REFERENTIAL_MEASUREMENT.fullmatch(text, start, stop)
+                or AREA_IMPLICIT_VERIFICATION.fullmatch(text, start, stop))
 
 
 def area_topic_number(text: str, start: int, stop: int) -> str:
