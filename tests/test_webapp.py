@@ -43764,6 +43764,28 @@ main().catch((error) => {
                 claims = webapp.area_source_claims(raw, patterns)
                 self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
 
+    def test_area_comparison_reads_local_relation_spans_for_long_records(self):
+        scope = "carpet tile west"
+        patterns = webapp.area_scope_patterns({scope})
+        heading = "sample boards: 2 sqm, "
+        member = f"separate from {scope} (drawing source)"
+        for count in (16, 128, 1024):
+            with self.subTest(count=count):
+                source = heading + ", ".join([member] * count)
+                _, pairs = webapp.area_bracket_context(source)
+                with mock.patch.object(webapp, "area_contextual_reference", side_effect=AssertionError("Growing prefix scan")):
+                    members = list(webapp.area_comparison_members(
+                        source, 0, len(source), heading.index(":"), patterns, pairs,
+                    ))
+                self.assertEqual(len(members), count)
+                self.assertEqual([position for position, _, _ in members], [
+                    len(heading) + index * (len(member) + 2) + len("separate from ")
+                    for index in range(count)
+                ])
+                for _, scopes, [(left, right)] in members:
+                    self.assertEqual(scopes, {scope})
+                    self.assertEqual(source[left:right], "drawing source")
+
     def test_area_qualification_resolves_complete_named_roles_before_fallback(self):
         west = "carpet tile west"
         east = "carpet and vinyl east near the registration desk"
@@ -43850,6 +43872,9 @@ main().catch((error) => {
             ("selected label 'the installer said \"Option 6\"'", False),
             ("selected label 'sample 6 '", False),
             ("selected label 'sample 6' wide panels", False),
+            ("the owner selected 'Option 6' wide panels and marked 'Aisle 4'", False),
+            ('the owner selected "Option 6" wide panels and marked "Aisle 4"', False),
+            ("the note reads 'the gap is 6' wide'", True),
             ("selected label 'Option 6'; the installers' tape measures 6\"", True),
             ("the note reads 'the gap is 6\" wide'", True),
             ("the note reads \u2019the gap is 6\u201d wide\u2019", True),
@@ -44284,6 +44309,15 @@ main().catch((error) => {
             ("condition-upon", f"we approved the dimensions for {east}, conditional upon independent review", True, False),
             ("condition-once", f"we finished checking the dimensions for {east} once the dimensions were verified", True, False),
             ("condition-before", f"if the measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-after-event", f"the dimensions for {east} were approved only after site verification", True, False),
+            ("condition-after-clause", f"the dimensions for {east} were approved only after the measurements are verified", True, False),
+            ("condition-after-coordination", f"the dimensions for {east} were approved if the invoice clears and the measurements are verified", True, False),
+            ("condition-after-comma", f"the dimensions for {east} were approved, if the invoice clears and the measurements are verified", True, False),
+            ("condition-before-coordination", f"if the invoice clears and the measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-before-trailing", f"if the measurements are verified and the invoice clears, the dimensions for {east} are approved", True, False),
+            ("condition-before-both", f"if the measurements are verified, the dimensions for {east} are approved and the dimensions for {west} are approved", False, False),
+            ("condition-before-independent", f"if the measurements are verified, the dimensions for {east} are approved while the dimensions for {west} are verified", True, False),
+            ("condition-only-invoice", f"the dimensions for {east} were approved only after the invoice is verified", True, True),
             ("condition-other", f"the dimensions for {east} were approved if the invoice is verified", True, True),
             ("condition-use", f"the dimensions for {east} were approved if the measurements are used for ordering", True, True),
             ("condition-scope", f"the dimensions for {east} were approved if the dimensions for {west} are verified", True, False),
@@ -44292,6 +44326,11 @@ main().catch((error) => {
             ("subject-switch", f"the dimensions for {east} were checked but the dimensions for {west} were not verified", False, True),
             ("subject-invoice", f"the dimensions for {east} were checked but the invoice was not verified", True, True),
             ("object-pronoun", f"we checked the dimensions for {east} but have not verified them", True, False),
+            ("object-pronoun-yet", f"we checked the dimensions for {east} but have not verified them yet", True, False),
+            ("object-pronoun-actor", f"we checked the dimensions for {east} but we have not verified them yet", True, False),
+            ("subject-pronoun", f"we checked the dimensions for {east}, but they have not been verified", True, False),
+            ("subject-pronoun-intervening", f"we checked the dimensions for {east} and filed the report but they have not been verified", True, False),
+            ("subject-pronoun-switch", f"the dimensions for {east} were checked but they have not been verified, and the dimensions for {west} are complete", True, False),
             ("object-explicit", f"we checked the dimensions for {east} but have not verified the invoice", True, True),
             ("subject-complete", f"the dimensions for {east} were checked and independently verified", True, True),
         )
@@ -44301,6 +44340,9 @@ main().catch((error) => {
                    24, "observed", True),)
         quote_cases = (
             ("quote-label", "the owner selected the label 'Option 6'", True, True),
+            ("quote-label-adjective", "the owner selected 'Option 6' wide panels and marked 'Aisle 4'", True, True),
+            ("quote-label-adjective-double", 'the owner selected "Option 6" wide panels and marked "Aisle 4"', True, True),
+            ("quote-length-same-delimiter", "the note reads 'the gap is 6' wide'", False, True),
             ("quote-possessive", "the owner selected the label 'installers' Option 6'", True, True),
             ("quote-nested", "the owner selected the label 'the installer said \"Option 6\"'", True, True),
             ("quote-length", "the note reads 'the gap is 6\" wide'", False, True),
@@ -44311,6 +44353,8 @@ main().catch((error) => {
             ("separate-role", f"the dimensions for {east} were checked but are unverified", True, False),
             ("separate-after", f"the dimensions for {east} were checked but are unverified", True, False),
             ("separate-unbound", "the dimensions were checked but are unverified", True, True),
+            ("separate-headed", f"Survey status: the dimensions for {east} have not been verified", True, False),
+            ("separate-heading-bound", f"{east}: verification pending", True, False),
         )
         correction_east = {name: east_priced for name, _, _, east_priced in role_cases + quote_cases + separate_cases}
         correction_east[member_case] = False
@@ -44360,7 +44404,7 @@ main().catch((error) => {
               tempfile.TemporaryDirectory() as temp):
             root = Path(temp)
             for route in ("notes", "pdf", "batch"):
-                for name, basis, item, statement, other, quantity, kind, allowed in cases:
+                for case_index, (name, basis, item, statement, other, quantity, kind, allowed) in enumerate(cases):
                     if (name in correction_east) != correction_cases:
                         continue
                     with self.subTest(route=route, name=name):
@@ -44435,7 +44479,7 @@ main().catch((error) => {
                         elif name in {"paren-label", "brace-label", "square-label"}:
                             sources = [statement, f"{east_statement}\n{other}"]
                         source_label = "Quote notes" if route == "notes" else "Reference 1, PDF page 1"
-                        payload = self._ledger_draft_payload(f"quote-scope-{route}-{name}")
+                        payload = self._ledger_draft_payload(f"quote-scope-{route[0]}-{case_index}")
                         if route == "notes":
                             payload["notes"] = "; ".join(sources)
                         elif route == "pdf":
@@ -44544,7 +44588,7 @@ main().catch((error) => {
                             generation = {**payload, "quote_basis_sections": sections, "quote_basis": webapp.quote_basis_from_sections(sections),
                                           "pricing_analysis_seal": seal, "line_items": [row for row in final["line_items"]
                                             if row["source_basis_line_id"] in include]}
-                            output_root = root / (name if route == "pdf" else f"{route[0]}-{name}")
+                            output_root = root / f"{route[0]}-{case_index}"
                             result = webapp.run_quote_job(generation, output_root=output_root, tmp_root=root / "tmp")
                             self.assertEqual(result["status"], "completed", result.get("errors"))
                             [xlsx] = list(output_root.rglob("quotation.xlsx"))
@@ -44748,14 +44792,98 @@ main().catch((error) => {
             headers = self._ledger_runner_headers(runner)
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
-            old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 23):
+            old_sources = {"Quote notes": [
+                statement, disputed, f"{disputed} (provisional in drawing)",
+                f"The dimensions for {specifications[0][1]} were approved only after site verification",
+            ]}
+            # Reproduce the v24 grant on a source whose trailing condition v24 missed.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 24),
+                  mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
             self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, stale), "floor"))
             self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, stale), "spot"),
                              koncept_catalog_sale_unit_price(spot))
+            self._ledger_line(stale, "floor")["tag"] = "Include"
+            self._ledger_line(stale, "spot")["tag"] = "Include"
+            self._ledger_line(stale, "review")["tag"] = "Exclude"
+            stale["line_items"] = [row for row in stale["line_items"] if row["source_basis_line_id"] != "review"]
+            stale_state = stale["quote_session"]["draft_state"]
+            stale_state["originalAnalysisSnapshot"].update(
+                quote_basis_sections=copy.deepcopy(old_draft["quote_basis_sections"]),
+                line_items=copy.deepcopy(old_draft["line_items"]),
+            )
+            stale_state["originalOutputRows"] = copy.deepcopy(stale["line_items"])
+            details = stale_state["quoteDetails"]
+            details["company"]["logo_data_url"] = synthetic_image()
+            details["quote_text"].update(payload["quote_text"])
+            details["signature"].update(company_signatory="Synthetic signatory", company_title="Synthetic title")
+            details["commercial_snapshot"]["presence"] = {
+                key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
+            }
+            self._ledger_sync(stale)
+
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                for path in ("seal", "ledger"):
+                    with self.subTest(path=path):
+                        self.assertIsNone(self._ledger_price(self._ledger_brief_rows(stale), "floor"))
+                        blocked = webapp.run_quote_job(copy.deepcopy(stale), output_root=root / path, tmp_root=root / "tmp")
+                        self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
+                        self.assertFalse(list((root / path).rglob("quotation.xlsx")))
+                        if path == "seal":
+                            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 24):
+                                self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
+                            stale.pop("pricing_analysis_seal")
+                            stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+                reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                self.assertEqual(reopened["status"], 200)
+                reopened_state = reopened["body"]["quote_session"]["draft_state"]
+                for reset_rows in (reopened_state["lineItems"], reopened_state["originalOutputRows"],
+                                   reopened_state["originalAnalysisSnapshot"]["line_items"]):
+                    reset = copy.deepcopy(stale)
+                    reset["line_items"] = copy.deepcopy(reset_rows)
+                    self._ledger_sync(reset)
+                    self.assertIsNone(self._ledger_price(self._ledger_brief_rows(reset), "floor"))
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(reset), "spot"), koncept_catalog_sale_unit_price(spot))
+                self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
+                stale_floor = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["floor"]
+                self.assertEqual(stale_floor["measurement"], {"disposition": "review"})
+                self.assertIsNone(stale_floor["grant"])
+                review_metadata = webapp.read_quote_session_metadata(session_id)
+                for variant, price in (("manual", 7), ("included", 0)):
+                    with self.subTest(variant=variant):
+                        repaired = copy.deepcopy(stale)
+                        floor = next(row for row in repaired["line_items"] if row["source_basis_line_id"] == "floor")
+                        floor["pricing_authority"] = webapp.build_pricing_authority(
+                            variant, floor, price=price, reference_authority=webapp.exact_pricing_reference_authority(repaired),
+                        )
+                        if variant == "included":
+                            floor.update(price_mode="Included", display_price="Included",
+                                         pricing_basis_amount=0, approved_quote_amount=0)
+                        self._ledger_sync(repaired)
+                        # Replay each operator decision from the same saved review state.
+                        webapp.write_quote_session_metadata(review_metadata)
+                        workbook = webapp.run_quote_job(repaired, output_root=root / variant, tmp_root=root / "tmp")
+                        self.assertEqual(workbook["status"], "completed", workbook.get("errors"))
+                        [xlsx] = list((root / variant).rglob("quotation.xlsx"))
+                        values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                        [total] = [row for row in values if "Total" in row]
+                        self.assertIn(round(24 * price + 2 * koncept_catalog_sale_unit_price(spot), 2), total)
+                        [floor_values] = [row for row in values if any(
+                            isinstance(cell, str) and "carpet tile" in cell.casefold() for cell in row
+                        )]
+                        if variant == "included":
+                            self.assertIn(0, floor_values)
+                            self.assertNotIn(24 * koncept_catalog_sale_unit_price(carpet), floor_values)
+                        else:
+                            self.assertIn("24 sqm", floor_values)
+                            self.assertIn(24 * price, floor_values)
+            reanalysed = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
+            self.assertIsNone(self._ledger_price(reanalysed["line_items"], "floor"))
+            self.assertEqual(self._ledger_price(reanalysed["line_items"], "spot"), koncept_catalog_sale_unit_price(spot))
             drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
                 statement, disputed, "Synthetic carpet tile flooring at west: 4 to 6 sqm (site survey range)",
             ]})
@@ -44791,14 +44919,7 @@ main().catch((error) => {
                 line_items=copy.deepcopy(drafted["line_items"]),
             )
             draft_state["originalOutputRows"] = copy.deepcopy(request["line_items"])
-            details = draft_state["quoteDetails"]
-            details["company"]["logo_data_url"] = synthetic_image()
-            details["quote_text"].update(payload["quote_text"])
-            details["signature"].update(company_signatory="Synthetic signatory", company_title="Synthetic title")
-            details["commercial_snapshot"]["presence"] = {
-                key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
-                for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
-            }
+            draft_state["quoteDetails"] = copy.deepcopy(stale_state["quoteDetails"])
             self._ledger_sync(request)
             saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
             self.assertEqual(saved["status"], 200)
@@ -44811,7 +44932,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 24):
+            for version in range(1, webapp.AREA_EVIDENCE_CLAIM_VERSION):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44825,7 +44946,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 23
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 24
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)

@@ -23697,7 +23697,7 @@ def normalized_pricing_measurement(value: Any) -> dict[str, Any] | None:
     if disposition == "measured" and (set(value) in (legacy_fields, legacy_fields | scope_fields)
             or (set(value) == legacy_fields | scope_fields | {"claim_version"}
                 and type(value["claim_version"]) is int and 1 <= value["claim_version"] < AREA_EVIDENCE_CLAIM_VERSION)):
-        # Earlier v2 drafts can open, but their area grants lack the complete claim check.
+        # Older claims did not require the full predicate and its measurement conditions.
         return {"disposition": "review"}
     if (disposition == "measured" and set(value) == legacy_fields | scope_fields | {"claim_version"}
             and type(value["claim_version"]) is int and value["claim_version"] == AREA_EVIDENCE_CLAIM_VERSION
@@ -25584,7 +25584,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 24
+AREA_EVIDENCE_CLAIM_VERSION = 25
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25606,7 +25606,7 @@ AREA_STATUS_MODIFIERS = r"(?:(?:on[- ]?site|site|field|physical|independent|fina
 AREA_DIMENSION_HEAD = r"(?:areas?|coverage|dimensions?|measurements?|extents?|footprints?|a_+)"
 AREA_DIMENSION_WORD = (
     rf"(?!(?:of|for|on|with|by|and|or|nor|but|while|whereas|not|no|provided|unless|until|once|if|"
-    rf"subject|conditional|contingent|pending|"
+    rf"subject|conditional|contingent|pending|after|"
     rf"{AREA_VERIFICATION_EVENT})\b)[^\W\d_][\w-]*"
 )
 AREA_TOPIC_LINK = r"(?:of|for|on)\s+(?:(?:both|each|either|all)\s+(?:of\s+)?)?(?:(?:the|a|an)\s+)?"
@@ -25662,9 +25662,9 @@ AREA_APPROVAL_TOPIC = (
     rf"(?:\s+{AREA_APPROVAL_OBJECT}|(?!\s+(?:of|for|on)\s+))"
 )
 AREA_APPROVAL_PENDING = rf"(?:{AREA_WAITING_ACTION}|{AREA_VERIFICATION_OBLIGATION})\s+{AREA_APPROVAL_TOPIC}"
-AREA_CONDITION_PREFIX = r"(?:pending|subject\s+to|conditional\s+(?:on|upon)|contingent\s+(?:on|upon))\s+"
+AREA_CONDITION_PREFIX = r"(?:pending|subject\s+to|conditional\s+(?:on|upon)|contingent\s+(?:on|upon)|(?:only\s+)?after)\s+"
 AREA_CONDITION_EVENT = rf"(?:{AREA_MEASUREMENT_EVENT}|{AREA_APPROVAL_TOPIC})"
-AREA_CONDITION_CLAUSE = r"(?:provided(?:\s+that)?|on\s+condition\s+that|(?:only\s+)?if|unless|until|once)\s+"
+AREA_CONDITION_CLAUSE = r"(?:provided(?:\s+that)?|on\s+condition\s+that|(?:only\s+)?(?:if|after)|unless|until|once)\s+"
 AREA_ACTIVE_ACTION = r"(?:confirms?|verif(?:y|ies)|validates?|(?:double[\s-]+)?checks?|measures?|approves?|signs?[\s-]+off)\b"
 AREA_ONGOING_ACTION = r"(?:confirming|verifying|validating|(?:double[\s-]+)?checking|measuring|approving|signing[\s-]+off)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
@@ -25687,6 +25687,8 @@ AREA_REFERENTIAL_SUBJECT = re.compile(
     rf"(?P<partial>{AREA_PARTIAL_SUBJECT})?(?P<topic>(?:those|that)\s+{AREA_TOPIC_LINK}{AREA_MASKED_REFERENCE})"
     r"(?=[\s:\-]|$)", re.I,
 )
+AREA_SUBJECT_PRONOUN = re.compile(r"(?P<topic>it|they)(?=\s)", re.I)
+AREA_OBJECT_PRONOUN = re.compile(r"\s+(?:it|them)\b", re.I)
 AREA_QUALIFICATION_WORD = re.compile(r"[^\W\d_][\w'\u2019-]*", re.I)
 AREA_ACTION = re.compile(rf"(?P<ongoing>{AREA_ONGOING_ACTION})|(?P<result>{AREA_MEASUREMENT_RESULT})|{AREA_ACTIVE_ACTION}", re.I)
 AREA_EVENT_STATUS = re.compile(AREA_VERIFICATION_EVENT_STATUS, re.I)
@@ -25728,11 +25730,11 @@ AREA_COMPLETED_ACTION = re.compile(rf"\b{AREA_MEASUREMENT_RESULT}", re.I)
 AREA_MEASUREMENT_ACTION = re.compile(rf"\b(?:{AREA_MEASUREMENT_RESULT}|{AREA_ACTIVE_ACTION}|{AREA_ONGOING_ACTION})", re.I)
 AREA_CLAUSE_COORDINATOR = re.compile(r"(?:and|but|while|whereas|nor|or)\s+", re.I)
 AREA_CONTINUATION = re.compile(
-    rf"\s*(?:(?:it|them)\b\s*)?(?=$|[,;.!?]|(?:by|in\s+part|only\s+in\s+part|"
+    rf"\s*(?=$|[,;.!?]|(?:by|yet\b|in\s+part|only\s+in\s+part|"
     rf"{AREA_CONDITION_PREFIX}|{AREA_CONDITION_CLAUSE}|{AREA_MANNER_ADVERB}\b))", re.I,
 )
 AREA_RESULT_MODIFIERS = re.compile(
-    rf"\s+(?:(?!only\s+if\b){AREA_MANNER_ADVERB}\b\s*)++", re.I,
+    rf"\s+(?:(?!only\s+(?:if|after)\b)(?:yet|{AREA_MANNER_ADVERB})\b\s*)++", re.I,
 )
 AREA_QUALIFICATION_AUXILIARIES = frozenset("am is are was were remain remains has have had be been do does did status".split())
 AREA_QUALIFICATION_ADVERB = re.compile(
@@ -25777,14 +25779,15 @@ AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
 AREA_QUALIFICATION_BREAK = re.compile(r",(?!\d)|;|[.!?](?=\s|$)|\s+(?:and|but|whereas|while|or|nor)\s+", re.I)
 AREA_ANNOTATION_BREAK = re.compile(rf"{AREA_QUALIFICATION_BREAK.pattern}|\s+then\s+|\r?\n", re.I)
 AREA_SCOPE_WRAPPERS = str.maketrans("()[]{}", "      ")
-AREA_CONTEXT_RELATION = re.compile(
+AREA_CONTEXT_RELATION_SPAN = re.compile(
     r"\b(?:(?P<uncertain>not|never|no\s+longer|possibly|potentially)\s+)?"
     r"(?:(?:separate|apart|distinct|different)\s+from|independent\s+of"
     r"|compar(?:ed|ing)\s+(?:with|to)|rather\s+than|instead\s+of"
     r"|exclud(?:ing|es)|except(?:\s+for)?|versus|vs\.?)\s+"
-    r"(?:(?:both|either|each|all)\s+(?:of\s+)?)?(?:the\s+)?[\s(\[{]*$",
+    r"(?:(?:both|either|each|all)\s+(?:of\s+)?)?(?:the\s+)?[\s(\[{]*",
     re.I,
 )
+AREA_CONTEXT_RELATION = re.compile(rf"{AREA_CONTEXT_RELATION_SPAN.pattern}$", re.I)
 AREA_REFERENCE_COORDINATION = re.compile(r"\s*(?:,\s*(?:(?:and|or|nor)\s+)?|(?:and|or|nor)\s+)(?:the\s+)?", re.I)
 AREA_MEASURE_COORDINATION = re.compile(
     rf"(?P<possessive>['\u2019]s)?"
@@ -25852,7 +25855,7 @@ class AreaScopePatterns:
 class AreaQualification:
     roles: tuple[tuple[int, int], ...]
     pending: bool = False
-    dependency_roles: tuple[tuple[int, int], ...] = ()
+    result_end: int | None = None
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -25975,9 +25978,13 @@ def area_has_linear_operand(text: str) -> bool:
         if position in unit_positions:
             if not same_quote or char in AREA_OPEN_ONLY_QUOTES:
                 return True
-            # A following closer can be adjacent to the unit or follow a dimension adjective.
-            if next_same and (next_mark.start() == position + 1 or AREA_SYMBOL_DIMENSION.match(
-                    text, position + 1, next_mark.start())):
+            # A second opener cannot supply the missing closer for an in-quote unit.
+            if next_same and (next_mark.start() == position + 1 or (
+                next_mark[0] not in AREA_OPEN_ONLY_QUOTES
+                and not text[next_mark.start() - 1].isspace()
+                and not text[next_mark.end():next_mark.end() + 1].isalnum()
+                and AREA_SYMBOL_DIMENSION.match(text, position + 1, next_mark.start())
+            )):
                 return True
             quote_stack.pop()
             continue
@@ -26011,6 +26018,35 @@ def area_contextual_reference(text: str, start: int, body_start: int, *, attache
     return bool(attached or (body_start and any(char.isalpha() for char in subject)) or area_claim_kind(subject))
 
 
+def area_first_claim_end(text: str) -> int:
+    """Find the earliest complete area marker in a record without rescanning prefixes."""
+    observed = AREA_UNIT_MARKER.search(text)
+    first = AREA_LENGTH_MARKER.search(text)
+    end = observed.end() if observed else len(text) + 1
+    if first:
+        if AREA_BY_MARKER.search(text, 0, first.start()):
+            end = min(end, first.end())
+        second = AREA_LENGTH_MARKER.search(text, first.end())
+        geometry = AREA_GEOMETRY_MARKER.search(text)
+        if second:
+            end = min(end, second.end())
+        if geometry:
+            end = min(end, max(first.end(), geometry.end()))
+    return end
+
+
+def area_reference_relations(text: str, references: list[re.Match[str]]):
+    """Find each label's local relation without searching the preceding record again."""
+    spans = iter(AREA_CONTEXT_RELATION_SPAN.finditer(text))
+    span = next(spans, None)
+    for reference in references:
+        left = reference.start("label")
+        while span is not None and span.end() < left:
+            span = next(spans, None)
+        # Only a label inside or at the end of the bounded relation suffix can match.
+        yield AREA_CONTEXT_RELATION.fullmatch(text, span.start(), left) if span and span.start() < left else None
+
+
 def area_member_annotations(text: str, right: int, stop: int, pairs: dict[int, int]) -> tuple[int, list[tuple[int, int]]]:
     """Consume only balanced annotations immediately attached to this member."""
     end = right
@@ -26035,20 +26071,28 @@ def area_comparison_members(text: str, start: int, stop: int, colon: int | None,
     previous_end = 0
     previous_contextual = False
     references = list(patterns.reference.finditer(record.translate(AREA_SCOPE_WRAPPERS)))
-    for index, reference in enumerate(references):
+    if not references:
+        return
+    first_alpha = next((index for index, char in enumerate(record) if char.isalpha()), len(record))
+    first_claim_end = area_first_claim_end(record)
+    relations = area_reference_relations(record, references)
+    for index, (reference, relation) in enumerate(zip(references, relations, strict=True)):
         left, right = reference.span("label")
         if left < previous_end:
             continue  # Names inside the previous member's annotation are not list items.
         attached_end, annotations = area_member_annotations(text, start + right, stop, pairs)
         end = attached_end - start
-        next_index = index + 1
-        while next_index < len(references) and references[next_index].start("label") < end:
-            next_index += 1
-        next_start = references[next_index].start("label") if next_index < len(references) else len(record)
-        assertion_end = min(next_start, colon) if colon is not None and right <= colon else next_start
-        coordinated = (previous_contextual and AREA_REFERENCE_COORDINATION.fullmatch(record[previous_end:left])
-                       and not area_claim_kind(record[end:assertion_end]))
-        previous_contextual = bool(coordinated or area_contextual_reference(record, left, body_start, attached=attached))
+        coordinated = False
+        if previous_contextual and AREA_REFERENCE_COORDINATION.fullmatch(record, previous_end, left):
+            next_index = index + 1
+            while next_index < len(references) and references[next_index].start("label") < end:
+                next_index += 1
+            next_start = references[next_index].start("label") if next_index < len(references) else len(record)
+            assertion_end = min(next_start, colon) if colon is not None and right <= colon else next_start
+            coordinated = not area_claim_kind(record[end:assertion_end])
+        previous_contextual = bool(coordinated or (relation and not relation["uncertain"] and (
+            attached or (body_start and first_alpha < relation.start()) or first_claim_end <= relation.start()
+        )))
         if previous_contextual:
             label = area_scope_reference_key(reference["label"])
             yield start + left, patterns.reference_scopes.get(label, set()), annotations
@@ -26094,7 +26138,8 @@ def area_member_clauses(annotation: str, patterns: AreaScopePatterns):
             continue  # Keep an unfinished revision with its coordinated targets.
         if separator in {",", "and", "but", "while", "whereas", "or", "nor"} and not area_claim_kind(clause):
             first = left - len(annotation[start:left].lstrip())
-            if area_qualification_claim(qualification_text, first, left, None) is not None:
+            if (area_condition_start(qualification_text, first, left)
+                    or area_qualification_claim(qualification_text, first, left, None) is not None):
                 continue
         yield clause, separator
         start = right
@@ -26120,8 +26165,7 @@ def area_comparison_clause(clause: str, patterns: AreaScopePatterns,
                            continued: bool) -> tuple[str, re.Match[str] | None]:
     """Separate the enclosing assertion from its comparison operand."""
     references = list(patterns.reference.finditer(clause.translate(AREA_SCOPE_WRAPPERS)))
-    for reference in references:
-        relation = AREA_CONTEXT_RELATION.search(clause, 0, reference.start("label"))
+    for reference, relation in zip(references, area_reference_relations(clause, references), strict=True):
         if relation and not relation["uncertain"]:
             return clause[:relation.start()].strip(), reference
     if continued and references:
@@ -26386,27 +26430,27 @@ def area_qualification_text(text: str, patterns: AreaScopePatterns):
     return "".join(words), references
 
 
-def area_measurement_condition(text: str, start: int, stop: int) -> tuple[tuple[int, int], ...]:
+def area_condition_start(text: str, start: int, stop: int) -> re.Match[str] | None:
+    if modifiers := AREA_RESULT_MODIFIERS.match(text, start, stop):
+        start = modifiers.end()
+    return AREA_CONDITION_INTRO.match(text, start, stop)
+
+
+def area_measurement_condition(text: str, start: int, stop: int) -> AreaQualification | None:
+    """Read one condition clause. The caller keeps its coordination and main predicate."""
     if modifiers := AREA_RESULT_MODIFIERS.match(text, start, stop):
         start = modifiers.end()
     if condition := AREA_CONDITION_TOPIC.match(text, start, stop):
-        return (condition.span("event"),)
+        return AreaQualification((condition.span("event"),))
     if condition := AREA_CONDITION_INTRO.match(text, start, stop):
-        first = condition.end()
-        claim = area_qualification_predicate(
-            text, first, stop, area_measured_subject(text, first, stop), check_condition=False,
-        )
-        if claim:
-            return claim.roles
-    return ()
+        return area_qualification_claim(text, condition.end(), stop, None)
+    return None
 
 
 def area_verification_result(text: str, end: int, stop: int, roles: tuple[tuple[int, int], ...],
-                             unfinished: bool, *, check_condition: bool) -> AreaQualification:
-    """Keep measured roles even after a completed predicate."""
-    if check_condition and (condition := area_measurement_condition(text, end, stop)):
-        return AreaQualification(roles, pending=True, dependency_roles=condition)
-    return AreaQualification(roles, pending=unfinished or bool(AREA_RESULT_TAIL.match(text, end, stop)))
+                             unfinished: bool) -> AreaQualification:
+    """Preserve the measured roles and the point where a condition can begin."""
+    return AreaQualification(roles, unfinished or bool(AREA_RESULT_TAIL.match(text, end, stop)), end)
 
 
 def area_measured_subject(text: str, first: int, last: int) -> re.Match[str] | None:
@@ -26429,13 +26473,16 @@ def area_qualification_targets(roles: tuple[tuple[int, int], ...], references: l
 
 def area_qualification_predicate(
     text: str, start: int, stop: int, subject: re.Match[str] | None,
-    *, inherited_roles: tuple[tuple[int, int], ...] | None = None, check_condition: bool = True,
+    *, inherited_roles: tuple[tuple[int, int], ...] | None = None,
 ) -> AreaQualification | None:
     """Scan the verb phrase once, resolving modality, aspect and polarity at the action."""
     position = subject.end() if subject else start
+    pronoun_subject = subject is not None and subject.re is AREA_SUBJECT_PRONOUN
     subject_roles = (subject.span("topic"),) if subject else ()
+    if pronoun_subject:
+        subject_roles = inherited_roles or ()
     carry_roles = subject_roles if subject else inherited_roles
-    partial = bool(subject and subject["partial"])
+    partial = bool(subject and not pronoun_subject and subject["partial"])
     event_subject = bool(subject and AREA_EVENT_SUBJECT.fullmatch(subject["topic"]))
     negative = future = ongoing = duty = started = expired_duty = False
     actor_words = 0
@@ -26475,7 +26522,7 @@ def area_qualification_predicate(
         if execution := AREA_EVENT_EXECUTION.match(text, position, stop):
             return area_verification_result(
                 text, execution.end(), stop, (execution.span("event"),),
-                unfinished or bool(execution["unfinished"]), check_condition=check_condition,
+                unfinished or bool(execution["unfinished"]),
             )
         if inception_action:
             return None
@@ -26483,24 +26530,26 @@ def area_qualification_predicate(
             event = AREA_COMPLETION_EVENT.match(text, completion.end(), stop)
             if event:
                 return area_verification_result(
-                    text, event.end(), stop, (event.span("event"),), unfinished, check_condition=check_condition,
+                    text, event.end(), stop, (event.span("event"),), unfinished,
                 )
         action = complement or AREA_ACTION.match(text, position, stop)
         if action:
             measured = AREA_VERB_OBJECT.match(text, action.end(), stop)
+            pronoun = AREA_OBJECT_PRONOUN.match(text, action.end(), stop)
+            end = (measured or pronoun or action).end()
             if measured and not subject:
                 roles = (measured.span(),)
-            elif subject and not measured:
+            elif pronoun and not measured and AREA_CONTINUATION.match(text, end, stop):
+                roles = carry_roles or ()
+            elif subject and not measured and (not pronoun_subject or AREA_CONTINUATION.match(text, end, stop)):
                 roles = subject_roles
-            elif (not subject and not actor_words and AREA_CONTINUATION.match(text, action.end(), stop)
+            elif (not subject and not actor_words and AREA_CONTINUATION.match(text, end, stop)
                   and (inherited_roles is not None or (not complement and action["result"]))):
                 roles = inherited_roles or ()
             else:
                 return None
-            end = measured.end() if measured else action.end()
             return area_verification_result(
                 text, end, stop, roles, unfinished or bool(not complement and action["ongoing"]),
-                check_condition=check_condition,
             )
         if word == "no" and following == "longer":
             expired_duty = negative = True
@@ -26549,8 +26598,10 @@ def area_qualification_claim(
     text: str, first: int, last: int, previous: AreaQualification | None,
 ) -> AreaQualification | None:
     subject = area_measured_subject(text, first, last)
-    if subject is None and previous and previous.roles:
-        subject = AREA_REFERENTIAL_SUBJECT.match(text, first, last)
+    if subject is None:
+        if previous and previous.roles:
+            subject = AREA_REFERENTIAL_SUBJECT.match(text, first, last)
+        subject = subject or AREA_SUBJECT_PRONOUN.match(text, first, last)
     inherited_roles = previous.roles if previous else None
     claim = area_qualification_predicate(text, first, last, subject, inherited_roles=inherited_roles)
     if claim is not None:
@@ -26566,40 +26617,78 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
     """An unfinished assertion disputes its measured subject or object."""
     text, references = area_qualification_text(text, patterns)
     affected = set()
-    boundaries = []
-    previous_boundary = 0
-    for boundary in AREA_QUALIFICATION_BREAK.finditer(text):
-        if (boundary[0] != "," or not AREA_COMPLETED_ACTION.search(text, previous_boundary, boundary.start())
-                or not area_measurement_condition(text, boundary.end(), len(text))):
-            boundaries.append(boundary.span())
-        previous_boundary = boundary.end()
-    boundaries.append((len(text), len(text)))
-    start = 0
     previous = None
-    leading_condition = None
+    antecedent = None
+    conditional_result = None
+    condition = None
+    reading_condition = False
+    start = 0
+    separator = ""
+    leading_dependency = None
+
+    def dispute(claim: AreaQualification, dependency: AreaQualification | None = None) -> None:
+        targets = area_qualification_targets(claim.roles, references, patterns)
+        if not targets and dependency:
+            targets = area_qualification_targets(dependency.roles, references, patterns)
+        affected.update(targets or enclosing)
+
+    def finish_condition() -> None:
+        nonlocal conditional_result, condition, reading_condition
+        if conditional_result and condition:
+            dispute(conditional_result, condition)
+        conditional_result = condition = None
+        reading_condition = False
+
+    boundaries = [boundary.span() for boundary in AREA_QUALIFICATION_BREAK.finditer(text)]
+    boundaries.append((len(text), len(text)))
     for stop, next_start in boundaries:
         clause = text[start:stop]
         first = stop - len(clause.lstrip())
         last = start + len(clause.rstrip())
-        start = next_start
-        separator = text[stop:next_start]
-        if coordinator := AREA_CLAUSE_COORDINATOR.match(text, first, last):
+        coordinator = AREA_CLAUSE_COORDINATOR.match(text, first, last)
+        if coordinator:
             first = coordinator.end()
-        claim = area_qualification_claim(text, first, last, previous) if first < last else None
-        if claim and (claim.pending or leading_condition):
-            targets = area_qualification_targets(claim.roles, references, patterns)
-            if not targets:
-                dependency = leading_condition or claim.dependency_roles
-                targets = area_qualification_targets(dependency, references, patterns)
-            affected.update(targets or enclosing)
-        if separator == "," and AREA_CONDITION_INTRO.match(text, first, last):
-            leading_condition = area_measurement_condition(text, first, last)
-        elif first < last:
-            leading_condition = None
         if first < last:
-            previous = claim
-        if separator in {";", ".", "!", "?"}:
-            previous = leading_condition = None
+            if reading_condition and (separator in {"but", "while", "whereas"} or (
+                separator == "," and not coordinator
+            )):
+                # A contrast can introduce a separate assertion. A comma introduces the main clause.
+                if conditional_result:
+                    finish_condition()
+                else:
+                    leading_dependency, condition = condition, None
+                    reading_condition = False
+            if reading_condition:
+                claim = area_qualification_claim(text, first, last, condition)
+                if claim and (condition is None or not condition.roles):
+                    condition = claim
+            elif area_condition_start(text, first, last):
+                conditional_result = previous if separator == "," else None
+                condition = area_measurement_condition(text, first, last)
+                reading_condition = True
+            elif previous and separator == "," and (dependency := area_measurement_condition(text, first, last)):
+                dispute(previous, dependency)
+            elif (claim := area_qualification_claim(text, first, last, antecedent)) is not None:
+                if separator in {"but", "whereas", "while", ","} and leading_dependency and antecedent:
+                    leading_dependency = None
+                if claim.pending or leading_dependency:
+                    dispute(claim, leading_dependency)
+                previous = antecedent = claim
+                if claim.result_end is not None:
+                    condition = area_measurement_condition(text, claim.result_end, last)
+                    reading_condition = bool(condition or area_condition_start(text, claim.result_end, last))
+                    if reading_condition:
+                        conditional_result = claim
+            else:
+                # A coordinated action can intervene without supplying a new measured role.
+                previous = None
+                if separator == "," and not coordinator:
+                    antecedent = None
+        separator = text[stop:next_start].strip()
+        if separator in {";", ".", "!", "?", ""}:
+            finish_condition()
+            previous = antecedent = leading_dependency = None
+        start = next_start
     return affected
 
 
@@ -26775,7 +26864,13 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
         # A separate note can dispute a named scope without supplying a new area.
         record = text[start:stop]
         if patterns.reference.search(record.translate(AREA_SCOPE_WRAPPERS)) and not area_claim_kind(record):
-            for scope in area_qualification_scopes(record, set(), patterns):
+            if colon is None:
+                targets = area_qualification_scopes(record, set(), patterns)
+            else:
+                heading = pricing_measurement_scope(record[:colon])
+                enclosing = {heading} if heading in patterns.reference_scopes.get(heading, ()) else set()
+                targets = area_qualification_scopes(record[colon + 1:], enclosing, patterns)
+            for scope in targets:
                 yield AreaMeasurementClaim(scope, "observed", None, "", (), False)
     # A mixed annotation can preserve an unresolved named claim without removing it from the outer value.
     for opener, closer in pairs.items():
