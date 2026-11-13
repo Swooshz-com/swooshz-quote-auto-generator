@@ -77,6 +77,16 @@ def wire_opener(status, payload, *, truncated, chunked=True, interruption=None, 
     return opener, response
 
 
+def bodyless_error_opener(status):
+    stream = io.BytesIO()
+    headers = {"Content-Length": "128"} if status == 304 else {}
+    opener = mock.Mock()
+    opener.open.side_effect = urllib.error.HTTPError(
+        ai_gateway.OPENROUTER_RESPONSES_URL, status, "Synthetic fixture", headers, stream,
+    )
+    return opener, stream
+
+
 class ImageObservationGatewayTest(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only")))
@@ -515,6 +525,54 @@ class ImageObservationGatewayTest(unittest.TestCase):
         telemetry.assert_called_once()
         self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
 
+    def test_bodyless_http_errors_never_read_or_supply_response_accounting(self):
+        cases = (
+            ("draft", True), ("draft_high_quality", True),
+            ("draft", False), ("draft_high_quality", False),
+            ("basis_line", False), ("basis_answer", False),
+        )
+        for (operation, draft_batch), status in product(cases, (101, 103, 199, 204, 205, 304)):
+            with self.subTest(operation=operation, draft_batch=draft_batch, status=status):
+                gateway, _, _, telemetry, spend = self.gateway(images="true", final="true")
+                route = gateway.configuration.route(operation)
+                body = batch_body(route)
+                budget = mock.Mock()
+                options = {"draft_batch": draft_batch, "send_budget": budget}
+                if operation.startswith("draft") and not draft_batch:
+                    body["text"] = DRAFT_SYNTHESIS.text_format()
+                    options["response_contract"] = DRAFT_SYNTHESIS.name
+                opener, stream = bodyless_error_opener(status)
+                gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                with (mock.patch.object(stream, "read", wraps=stream.read) as read,
+                      mock.patch.object(stream, "readline", wraps=stream.readline) as readline,
+                      mock.patch.object(gateway._transport, "_read_body", wraps=gateway._transport._read_body) as read_body,
+                      self.assertRaises(ai_gateway.GatewayError) as caught):
+                    gateway.request(operation, body, **options)
+                read_body.assert_not_called()
+                read.assert_not_called()
+                readline.assert_not_called()
+                self.assertTrue(stream.closed)
+                error = caught.exception
+                self.assertEqual(error.reason, "http_error")
+                self.assertEqual(error.diagnostics["failure_boundary"], "provider_http")
+                self.assertEqual(error.diagnostics["http_status"], status)
+                self.assertEqual(error.diagnostics["http_status_class"], f"{status // 100}xx")
+                self.assertIsNone(error.response_state)
+                self.assertFalse(error.image_schema_rejected)
+                self.assertFalse(error.retryable)
+                self.assertFalse(hasattr(error, "reported_cost"))
+                self.assertFalse(any(key.startswith(("provider_error_", "responses_")) for key in error.diagnostics))
+                opener.open.assert_called_once()
+                gateway._sleep.assert_not_called()
+                spend.reserve.assert_called_once_with()
+                spend.settle.assert_called_once_with(spend.reserve.return_value, None)
+                budget.claim.assert_called_once_with(operation, route.model)
+                budget.finish.assert_called_once_with(None, cost_usd=None)
+                telemetry.assert_called_once()
+                self.assertEqual(telemetry.call_args.args[1:3], (1, "failed"))
+                self.assertIsNone(telemetry.call_args.args[4]["usage"])
+                self.assertFalse(telemetry.call_args.args[4]["retry_pending"])
+
     def test_redirect_status_cannot_become_a_schema_rejection(self):
         for operation in ("draft", "draft_high_quality"):
             with self.subTest(operation=operation):
@@ -759,7 +817,7 @@ class ImageObservationDraftTest(unittest.TestCase):
         self.fixture.setUp()
         self.fixture.values[IMAGE_OPTION] = "true"
 
-    def test_real_draft_job_keeps_partial_response_reference_in_both_modes(self):
+    def test_real_draft_job_preserves_saved_draft_on_partial_or_bodyless_response(self):
         media = {"type": "input_image", "image_url": self.fixture.image, "detail": "high"}
         prepared = server.PreparedDraftMedia([], [[("Reference 1", media)]])
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -768,13 +826,16 @@ class ImageObservationDraftTest(unittest.TestCase):
         server.create_or_update_quote_session({"quote_session": {"session_id": saved_id}})
         metadata = server.quote_session_metadata_path(saved_id)
         saved = metadata.read_bytes()
-        for mode, status, interruption in product(
-            ("standard", "high_quality"), (200, 400, 503),
-            (None, ConnectionResetError, TimeoutError),
-        ):
+        partial_cases = product((200, 400, 503), (None, ConnectionResetError, TimeoutError))
+        cases = [(status, interruption, "response_partial") for status, interruption in partial_cases]
+        cases.extend((status, None, "http_error") for status in (103, 204, 205, 304))
+        for mode, (status, interruption, reason) in product(("standard", "high_quality"), cases):
             with self.subTest(mode=mode, status=status, interruption=interruption):
                 self.fixture.logs.clear()
-                opener, response = wire_opener(status, CANARY.encode(), truncated=True, interruption=interruption)
+                if reason == "response_partial":
+                    opener, response = wire_opener(status, CANARY.encode(), truncated=True, interruption=interruption)
+                else:
+                    opener, response = bodyless_error_opener(status)
                 transport = ai_gateway.BoundedHttpsTransport(opener=opener)
                 operation = "draft_high_quality" if mode == "high_quality" else "draft"
                 with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
@@ -789,7 +850,7 @@ class ImageObservationDraftTest(unittest.TestCase):
                       mock.patch.object(server, "pricing_reference_authority_error", return_value=""),
                       mock.patch.object(server, "protected_ai_draft_mode_enabled", return_value=False),
                       mock.patch.object(server, "set_job_state") as state):
-                    server.finish_draft_job("job-synthetic-partial", payload)
+                    server.finish_draft_job("job-synthetic-response", payload)
                 state.assert_called_once()
                 result = state.call_args.kwargs["result"]
                 self.assertEqual(state.call_args.kwargs["status"], "blocked")
@@ -799,7 +860,7 @@ class ImageObservationDraftTest(unittest.TestCase):
                 self.assertEqual(result["error_reference"], failure["error_reference"])
                 self.assertEqual(failure["failure_boundary"], "draft_batch")
                 self.assertEqual(failure["batch_failure_reason"], "batch_provider_failure")
-                self.assertEqual(failure["response_contract_reason"], "response_partial")
+                self.assertEqual(failure["response_contract_reason"], reason)
                 self.assertEqual(failure["response_contract_name"], IMAGE_OBSERVATIONS.name)
                 self.assertNotIn(CANARY, json.dumps([result, self.fixture.logs]))
                 wire = json.loads(opener.open.call_args.args[0].data)

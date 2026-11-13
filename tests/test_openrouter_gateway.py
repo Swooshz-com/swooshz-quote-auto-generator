@@ -189,6 +189,23 @@ class OpenRouterGatewayTest(unittest.TestCase):
             with self.subTest(status=status),self.assertRaises(gateway.GatewayError) as caught: gateway.BoundedHttpsTransport(opener=opener).send(b"{}",credential="synthetic",timeout=10)
             self.assertNotIn("private-canary",str(caught.exception)); self.assertEqual(caught.exception.diagnostics["http_status"],status)
 
+    def test_returned_no_content_statuses_keep_existing_rejection_without_reading(self):
+        for status in (204, 205):
+            with self.subTest(status=status):
+                response = Response(b"", status=status)
+                opener = mock.Mock()
+                opener.open.return_value = response
+                with (mock.patch.object(response, "read", wraps=response.read) as read,
+                      self.assertRaises(gateway.GatewayError) as caught):
+                    gateway.BoundedHttpsTransport(opener=opener).send(b"{}", credential="synthetic", timeout=10)
+                self.assertEqual(caught.exception.reason, "redirect_or_status")
+                self.assertEqual(caught.exception.diagnostics["failure_boundary"], "provider_http")
+                self.assertNotIn("http_status", caught.exception.diagnostics)
+                self.assertFalse(caught.exception.retryable)
+                self.assertTrue(response.closed)
+                read.assert_not_called()
+                opener.open.assert_called_once()
+
     def test_G08_G12_failures_keep_classification_and_only_allowlisted_diagnostics(self):
         config=self.config()
         for operation in gateway.ROUTE_KEYS:

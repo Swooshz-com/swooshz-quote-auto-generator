@@ -502,6 +502,10 @@ class BoundedHttpsTransport:
                         raise GatewayError("redirect_or_status", boundary="provider_http")
                     if response.headers.get_content_type().lower() != "application/json":
                         raise GatewayError("response_mime", boundary="provider_response_json")
+                elif 100 <= status < 200 or status in (204, 205, 304):
+                    # The fixed POST route cannot admit content for these statuses.
+                    # Check status before inspecting body framing (RFC 9112 and RFC 9110).
+                    raise GatewayError("http_error", boundary="provider_http", http_status=status)
                 raw = self._read_body(response, limit, http_status=status)
                 try:
                     parsed = _load_json(raw.decode("utf-8"))

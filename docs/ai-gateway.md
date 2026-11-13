@@ -168,8 +168,11 @@ replayed. Closed canonical Responses error types and native machine codes overri
 transient HTTP status. Unknown explicit machine categories fail without replay;
 raw error messages never select retries. The HTTPS response reader requires a
 complete status line and header terminator before urllib exposes the response.
-It verifies fixed-length and chunked framing before using the body. A response
-delimited by connection closure requires a TLS closure alert.
+On the POST route, a final 1xx, 204, 205 or 304 response is closed before any
+body read. It keeps the applicable HTTP status reporting, settles once with
+unknown cost and supplies no body diagnostics, retry or schema rejection.
+The reader verifies fixed-length and chunked framing before using an eligible
+body. A response delimited by connection closure requires a TLS closure alert.
 A response that starts but is cut off, times out, exceeds the body limit or has
 invalid framing ends the attempt with unknown cost. Complete transient HTTP
 errors and eligible pre-response transport failures can still retry on Basis.
