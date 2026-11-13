@@ -148,12 +148,14 @@ measurement keeps that scope in review, even when the amount agrees. The
 qualification can name the measured area or its dimensions as waiting for
 verification or sign-off. Future, partial and expressly incomplete verification
 or approval of the dimensions also keep the row in review, including work that
-has started, has yet to start, or is still required of a named person. An approval subject to a further
-measurement check is still unresolved, including when the condition follows a
-comma. Each named area in a shared or coordinated measured subject or object receives the hold.
+has started, has yet to start, has paused, or is still required of a named
+person. A completion or approval with a further measurement condition stays
+in review, including when the condition follows a comma. A shared or
+coordinated measured subject or object holds each named area it describes.
 An unheaded clause containing a single length follows the same separation rule
 as a clause containing an area or a dimension pair, including hyphenated units
-and lengths expressed in inches. Completed verification and
+and lengths expressed in inches. Quote marks that close a quoted label are
+ordinary prose. Unconditional completed verification and
 approval, an explicit statement that verification is no longer required, and
 unrelated invoice or document checks remain neutral context. A derived
 area requires both dimensions in metres and full coverage of the same scope. A comma

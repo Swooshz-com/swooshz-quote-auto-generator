@@ -43825,18 +43825,58 @@ main().catch((error) => {
         west, east = "carpet tile west", "carpet tile east"
         patterns = webapp.area_scope_patterns({west, east})
         for length in ("6-metre", "6\u2011metre", "6\u2013metre", "\uff16\u00a0METRES",
-                       "6 inches", "6\u2033", "6-in", "6 in wide", "1 1/2 ft", "-0.4 m", "5'11\""):
+                       "6 inches", "6\u2033", "6-in", "6 in wide", "six-inch", "1 1/2 ft", "-0.4 m", "5'11\""):
             for heading, expected in (("", {east}), ("Sample stock: ", {west, east})):
                 with self.subTest(length=length, heading=heading):
                     source = f"{west}: 24 sqm; {heading}the reference tape has a length of {length}; {east}: 10 sqm"
                     self.assertEqual({claim.scope for claim in webapp.area_source_claims(source, patterns)
                                       if claim.eligible}, expected)
         for prose in ("there are 6 installers", "six people arrived at 6 in the morning", "the owner selected model T6-m",
-                      'the owner requested item "6"', "the owner requested item \u201c6\u201d"):
+                      'the owner requested item "6"', "the owner requested item \u201c6\u201d",
+                      'the label is "Option 6"', "the label is 'Option 6'", 'the label is "Hall 6"',
+                      "the label is \u201cDisplay 8\u201d", "the label is 'the customer's Option 6'"):
             with self.subTest(prose=prose):
                 source = f"{west}: 24 sqm; {prose}; {east}: 10 sqm"
                 self.assertEqual({claim.scope for claim in webapp.area_source_claims(source, patterns)
                                   if claim.eligible}, {west, east})
+
+    def test_area_verification_resolves_roles_before_result_conditions(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        topics = (
+            f"the dimensions for {east}",
+            f"the dimensions of {west} and the dimensions for {east}",
+            f"the dimensions for {west} together with those on {east}",
+            f"{west}'s and {east}'s dimensions",
+        )
+        for topic, scopes in zip(topics, ({east}, {west, east}, {west, east}, {west, east}), strict=True):
+            for result in (
+                f"the surveyor has checked {topic}",
+                f"the surveyor has completed verification of {topic}",
+                f"the surveyor has carried out verification of {topic}",
+                f"the surveyor has finished checking {topic}",
+                f"verification of {topic} has been completed",
+            ):
+                for condition, expected in (
+                    ("", set()),
+                    (", subject to review of the invoice", set()),
+                    (", subject to independent review of the site measurements", scopes),
+                    (", provided that the site measurements are independently verified", scopes),
+                    (" only if the site measurements are independently verified", scopes),
+                ):
+                    with self.subTest(result=result, condition=condition):
+                        self.assertEqual(webapp.area_qualification_scopes(result + condition, {west}, patterns), expected)
+        for clause, expected in (
+            (f"the dimensions for {west}, together with those for {east}, have yet to be verified", {west, east}),
+            (f"the dimensions for {west} are complete while those for {east} remain unverified", {east}),
+            (f"the drawings of the area are complete while those for {east} remain unverified", set()),
+            (f"verification of the dimensions for {east} has been suspended", {east}),
+            (f"verification of the dimensions for {east} is subject to a final site check", {east}),
+            (f"verification of the dimensions for {east} is subject to the invoice check", set()),
+            ("site " * 6000 + f"activity, and those for {east} still require verification", set()),
+        ):
+            with self.subTest(clause=clause[-120:]):
+                self.assertEqual(webapp.area_qualification_scopes(clause, {west}, patterns), expected)
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
@@ -44119,6 +44159,15 @@ main().catch((error) => {
             ("pd-linear-hyphen", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved a 6-metre sample tape", 24, "observed", False),
             ("pd-linear-inch", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved 6 inches of sample tape", 24, "observed", False),
             ("pd-head-hyphen", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample stock: the surveyor moved a 6-metre sample tape", 24, "observed", True),
+            ("pd-carried-condition", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has carried out verification of the dimensions for Carpet tile east, subject to independent review of the site measurements)", 24, "observed", True),
+            ("pd-finished-condition", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has completed verification of the dimensions for Carpet tile east, subject to independent review of the site measurements)", 24, "observed", True),
+            ("pd-carried-clear", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has carried out verification of the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-double-head-object", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still need to verify the dimensions of Carpet tile west and the dimensions of Carpet tile east)", 24, "observed", False),
+            ("pd-double-head-subject", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions of Carpet tile west and the dimensions of Carpet tile east have not been verified)", 24, "observed", False),
+            ("pd-double-possessive", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we must still verify Carpet tile west's and Carpet tile east's dimensions)", 24, "observed", False),
+            ("pd-quoted-label", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'the customer selected the label "Option 6"', 24, "observed", True),
+            ("pd-inch-symbol", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'the fabricator brought a 6" sample', 24, "observed", False),
+            ("pd-headed-inch-symbol", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample stock: the fabricator brought a 6" sample', 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -44163,6 +44212,8 @@ main().catch((error) => {
             "pd-event-gerund", "pd-ref-clause",
             "pd-cond-review", "pd-cond-inv-rev", "pd-both-shared", "pd-both-poss", "pd-both-ref",
             "pd-linear-hyphen", "pd-linear-inch", "pd-head-hyphen",
+            "pd-carried-condition", "pd-finished-condition", "pd-carried-clear", "pd-double-head-object",
+            "pd-double-head-subject", "pd-double-possessive", "pd-quoted-label", "pd-inch-symbol", "pd-headed-inch-symbol",
         }
         scoped_annotations = {
             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
@@ -44346,6 +44397,8 @@ main().catch((error) => {
                             "pd-started", "pd-not-started", "pd-event-execute", "pd-cond-review",
                             "pd-event-gerund", "pd-ref-clause",
                             "pd-both-shared", "pd-both-poss", "pd-both-ref",
+                            "pd-carried-condition", "pd-finished-condition", "pd-double-head-object",
+                            "pd-double-head-subject", "pd-double-possessive",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
@@ -44577,7 +44630,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 22):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 23):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44639,7 +44692,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 23):
+            for version in range(1, 24):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44653,7 +44706,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 22
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 23
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
