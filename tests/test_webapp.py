@@ -44673,7 +44673,12 @@ main().catch((error) => {
                                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
                                 if quantity == 24:
                                     self.assertEqual(any("24 sqm" in row and 345.60 in row for row in values), allowed)
-                                if other:
+                                if name == "list-dot":
+                                    # Column A's numbering shares this fixture's "1." prefix.
+                                    for row in values:
+                                        if len(row) > 2 and isinstance(row[2], str):
+                                            self.assertNotIn(other, row[2])
+                                elif other:
                                     self.assertFalse(any(other in str(cell) for row in values for cell in row))
                             if name in north_cases:
                                 self.assertEqual(any("5 sqm" in row and 72 in row for row in values), north_priced)
