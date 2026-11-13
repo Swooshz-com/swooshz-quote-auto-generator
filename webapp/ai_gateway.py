@@ -7,6 +7,7 @@ from http.client import HTTPException, HTTPResponse, HTTPSConnection, Incomplete
 import json
 import math
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -64,21 +65,32 @@ def _refusal_part(part):
     return isinstance(part, dict) and (part.get("type") == "refusal" or "refusal" in part)
 
 
-def _response_refused(data):
+def _response_state(data):
+    """Identify explicit refusal or an unfinished result in a parsed reply."""
     if not isinstance(data, dict):
-        return False
-    if data.get("refusal") is not None:
-        return True
+        return None
+    if data.get("refusal") is not None or data.get("error_type") == "refusal":
+        return "response_refused"
     output = data.get("output")
-    return isinstance(output, list) and any(
-        isinstance(item, dict) and (item.get("type") == "refusal" or (
-            isinstance(item.get("content"), list) and any(map(_refusal_part, item["content"]))
-        )) for item in output
-    )
+    unfinished_item = False
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if item.get("type") == "refusal" or (isinstance(content, list) and any(map(_refusal_part, content))):
+                return "response_refused"
+            if item.get("status") not in (None, "completed"):
+                unfinished_item = True
+    # A failed envelope can still carry a genuine provider error.
+    if (unfinished_item or data.get("incomplete_details") is not None
+            or data.get("status") in ("incomplete", "in_progress", "queued", "cancelled")):
+        return "response_incomplete"
+    return None
 
 
 def _image_schema_rejected(data):
-    if not isinstance(data, dict) or _response_refused(data) or data.get("incomplete_details") is not None:
+    if not isinstance(data, dict):
         return False
     error = data.get("error")
     if error is not None and not isinstance(error, dict):
@@ -98,6 +110,8 @@ def _image_schema_rejected(data):
 
 def schema_rejected(data, error, *, strict_image_observations):
     """Classify machine evidence. Synthesis retains its existing status rule."""
+    if error.response_state is not None:
+        return False
     if strict_image_observations:
         if data is not None:
             return _image_schema_rejected(data)
@@ -114,15 +128,13 @@ def schema_rejected(data, error, *, strict_image_observations):
     )
 
 
-def http_error_retryable(status, value):
-    if status not in TRANSIENT_HTTP_STATUSES:
+def http_error_retryable(status, value, *, response_state):
+    if status not in TRANSIENT_HTTP_STATUSES or response_state is not None:
         return False
     if not isinstance(value, dict):
         return True
-    # No HTTP error is replayed once any output or explicit response refusal/
-    # incompleteness is present, even if its outer status looks transient.
-    if (value.get("refusal") is not None or value.get("incomplete_details") is not None
-            or any(value.get(key) not in (None, [], "") for key in ("output", "output_text"))):
+    # Even unrecognised output makes an HTTP error ineligible for replay.
+    if any(value.get(key) not in (None, [], "") for key in ("output", "output_text")):
         return False
     canonical = value.get("error_type")
     if canonical is not None and (not isinstance(canonical, str) or canonical not in TRANSIENT_ERROR_TYPES):
@@ -139,10 +151,12 @@ def http_error_retryable(status, value):
     return True
 
 class GatewayError(RuntimeError):
-    def __init__(self, reason, *, boundary="request_validation", attempt=0, http_status=None, retryable=False):
+    def __init__(self, reason, *, boundary="request_validation", attempt=0, http_status=None,
+                 retryable=False, response_state=None):
         super().__init__("AI request could not be completed.")
         self.reason = reason
         self.retryable = retryable
+        self.response_state = response_state
         self.image_schema_rejected = False
         self.diagnostics = {"failure_boundary": boundary, "attempt_number": attempt}
         if type(http_status) is int and 100 <= http_status <= 599:
@@ -354,8 +368,19 @@ class _ProviderHttpResponse(HTTPResponse):
 class _ProviderHttpsConnection(HTTPSConnection):
     response_class = _ProviderHttpResponse
 
+    def connect(self):
+        super().connect()
+        # A close-delimited body needs TLS close_notify. Surface unexpected
+        # socket EOF as an SSL error before it can look like a complete read.
+        self.sock.suppress_ragged_eofs = False
+
 
 class _ProviderHttpsHandler(urllib.request.HTTPSHandler):
+    def __init__(self):
+        super().__init__()
+        # Keep OpenSSL from treating an unexpected EOF as close_notify.
+        self._context.options &= ~getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
+
     def https_open(self, req):
         return self.do_open(_ProviderHttpsConnection, req, context=self._context)
 
@@ -491,12 +516,13 @@ class BoundedHttpsTransport:
 
         if not http_error:
             return parsed
+        response_state = _response_state(parsed)
         error = GatewayError("http_error", boundary="provider_http", http_status=status,
-                             retryable=http_error_retryable(status, parsed))
-        error.image_schema_rejected = status >= 400 and _image_schema_rejected(parsed)
+                             retryable=http_error_retryable(status, parsed, response_state=response_state),
+                             response_state=response_state)
+        error.image_schema_rejected = status >= 400 and response_state is None and _image_schema_rejected(parsed)
         error.diagnostics.update(draft_provider_error_diagnostics(parsed))
-        if _response_refused(parsed):
-            error.diagnostics["refusal_present"] = True
+        error.diagnostics.update(_response_state_diagnostics(parsed, response_state))
         # Keep the billing fields out of diagnostics and business output.
         if isinstance(parsed, dict):
             error.reported_cost = (parsed.get("model"), _response_cost(parsed))
@@ -544,7 +570,20 @@ def reported_response_cost_usd(response, model):
     return None
 
 
-def safe_response_diagnostics(data):
+def _response_state_diagnostics(data, response_state):
+    if not isinstance(data, dict):
+        return {}
+    result = {"refusal_present": True} if response_state == "response_refused" else {}
+    incomplete = data.get("incomplete_details")
+    if isinstance(incomplete, dict) and incomplete.get("reason") in ("max_output_tokens", "content_filter"):
+        result["incomplete_reason"] = incomplete["reason"]
+    status = data.get("status")
+    if status in ("completed", "failed", "incomplete", "in_progress", "queued", "cancelled"):
+        result["responses_status"] = status
+    return result
+
+
+def safe_response_diagnostics(data, response_state):
     if not isinstance(data, dict):
         return {}
     output = data.get("output")
@@ -556,21 +595,19 @@ def safe_response_diagnostics(data):
     result = {"output_item_count": len(items), "output_text_count": len(texts),
               "output_length": len(combined), "output_empty": not bool(combined.strip()),
               "output_contains_json_object_bounds": "{" in combined and "}" in combined}
-    result.update(output_item_present=bool(items), output_text_present=bool(texts),
-                  refusal_present=_response_refused(data))
-    incomplete = data.get("incomplete_details")
-    if isinstance(incomplete, dict) and isinstance(incomplete.get("reason"), str) and incomplete["reason"] in {"max_output_tokens", "content_filter"}:
-        result["incomplete_reason"] = incomplete["reason"]
-    if isinstance(data.get("status"), str) and data["status"] in {"completed", "failed", "incomplete", "in_progress", "queued", "cancelled"}:
-        result["responses_status"] = data["status"]
+    result.update(output_item_present=bool(items), output_text_present=bool(texts), refusal_present=False)
+    result.update(_response_state_diagnostics(data, response_state))
     result.update(draft_provider_error_diagnostics(data))
     return result
 
 
 def admit_response(data,route, *, strict_image_observations=False):
+    response_state = _response_state(data)
+    if response_state is not None:
+        raise GatewayError(response_state, boundary="provider_response_contract", response_state=response_state)
     if not isinstance(data,dict) or not isinstance(data.get("status"),str):
         raise GatewayError("response_shape",boundary="provider_response_shape")
-    if data.get("error") is not None or data.get("error_type") is not None or data["status"]!="completed" or data.get("refusal") is not None or data.get("incomplete_details") is not None:
+    if data.get("error") is not None or data.get("error_type") is not None or data["status"]!="completed":
         raise GatewayError("response_incomplete",boundary="provider_response_contract")
     if data.get("model") != route.model or ("output_text" in data and not isinstance(data["output_text"], str)):
         raise GatewayError("response_model_mismatch",boundary="provider_response_shape")
@@ -581,15 +618,11 @@ def admit_response(data,route, *, strict_image_observations=False):
     for item in output:
         if not isinstance(item,dict): raise GatewayError("response_shape",boundary="provider_response_shape")
         if item.get("type")=="reasoning": continue
-        if item.get("type")=="refusal" or item.get("status") not in (None,"completed"):
-            raise GatewayError("response_refused",boundary="provider_response_contract")
         if item.get("type")!="message" or item.get("role")!="assistant" or not isinstance(item.get("content"),list):
             raise GatewayError("response_shape",boundary="provider_response_shape")
         for part in item["content"]:
             if not isinstance(part,dict):
                 raise GatewayError("response_shape",boundary="provider_response_shape")
-            if _refusal_part(part):
-                raise GatewayError("response_refused",boundary="provider_response_contract")
             if part.get("type")!="output_text" or not isinstance(part.get("text"),str):
                 raise GatewayError("response_shape",boundary="provider_response_shape")
             if not part["text"].strip():
@@ -678,8 +711,9 @@ class AiGateway:
             cost = None
             try:
                 try:
-                    data=self._transport.send(encoded,credential=credential,timeout=self.configuration.timeout_seconds)
+                    data = self._transport.send(encoded, credential=credential, timeout=self.configuration.timeout_seconds)
                     cost = reported_response_cost_usd(data, route.model)
+                    result = admit_response(data, route, strict_image_observations=strict_image_observations)
                 except GatewayError as exc:
                     billed_model, billed_cost = getattr(exc, "reported_cost", (None, None))
                     if billed_model == route.model:
@@ -688,7 +722,6 @@ class AiGateway:
                 finally:
                     if spend is not None:
                         spend.settle(ordinal, cost)
-                result=admit_response(data,route, strict_image_observations=strict_image_observations)
             except GatewayError as exc:
                 if strict_image_observations:
                     exc.diagnostics.setdefault("response_contract_name", contract.name)
@@ -703,7 +736,7 @@ class AiGateway:
                     exc.diagnostics.update(failure_boundary="provider_response_schema",
                                            response_contract_reason="response_schema_rejected",
                                            response_contract_name=contract.name)
-                exc.diagnostics.update(safe_response_diagnostics(data))
+                exc.diagnostics.update(safe_response_diagnostics(data, exc.response_state))
                 usage = admitted_usage(data.get("usage")) if isinstance(data, dict) else None
                 if usage is not None:
                     exc.diagnostics.update({key:value for key,value in usage.items() if key != "output_tokens_details"})

@@ -168,12 +168,15 @@ replayed. Closed canonical Responses error types and native machine codes overri
 transient HTTP status. Unknown explicit machine categories fail without replay;
 raw error messages never select retries. The HTTPS response reader requires a
 complete status line and header terminator before urllib exposes the response.
-It then checks fixed-length and chunked bodies before reading provider metadata.
+It verifies fixed-length and chunked framing before using the body. A response
+delimited by connection closure requires a TLS closure alert.
 A response that starts but is cut off, times out, exceeds the body limit or has
 invalid framing ends the attempt with unknown cost. Complete transient HTTP
 errors and eligible pre-response transport failures can still retry on Basis.
-Strict image schema diagnosis excludes both top-level and nested refusals. No
-retry selects another model, provider, tier or parser.
+Explicit refusal or an unfinished response blocks retry and schema rejection
+diagnosis even when the provider supplies no details. A fully received response
+can still supply a valid reported cost when its output is refused or unfinished.
+Retries keep the original model, provider, tier and parser.
 
 Operation correlation has a scoped owner. Nested operations restore the exact enclosing operation, counters and usage on every exit, including logging failures. Missing or invalid configuration and credentials record validation at attempt zero. Actual sends retain one terminal record each; full-analysis and metadata owners keep correlation until business admission completes.
 

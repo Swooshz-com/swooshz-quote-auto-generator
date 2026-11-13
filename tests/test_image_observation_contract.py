@@ -5,7 +5,9 @@ import http.client
 import io
 import json
 import socket
+import tempfile
 from itertools import product
+from pathlib import Path
 import unittest
 import urllib.error
 from types import SimpleNamespace
@@ -564,16 +566,22 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 opener.open.assert_called_once()
                 spend.settle.assert_called_once_with(spend.reserve.return_value, 0.125)
 
-    def test_nested_refusal_precedes_schema_classification_on_both_http_paths(self):
+    def test_explicit_refusal_and_incompleteness_precede_schema_classification(self):
         cases = (
-            ({"refusal": CANARY}, True),
-            ({"output": [{"type": "refusal", "refusal": CANARY}]}, True),
-            ({"output": [{"type": "message", "content": [{"type": "refusal", "text": CANARY}]}]}, True),
-            ({"output": [{"type": "message", "content": [{"type": "output_text", "refusal": None}]}]}, True),
-            ({"incomplete_details": {"reason": "content_filter"}}, False),
-            ({}, False),
+            ({"refusal": CANARY}, "response_refused"),
+            ({"output": [{"type": "refusal", "refusal": CANARY}]}, "response_refused"),
+            ({"output": [{"type": "message", "content": [{"type": "refusal", "text": CANARY}]}]}, "response_refused"),
+            ({"output": [{"type": "message", "content": [{"type": "output_text", "refusal": None}]}]}, "response_refused"),
+            ({"incomplete_details": {"reason": "content_filter"}}, "response_incomplete"),
+            ({"status": "incomplete", "incomplete_details": None}, "response_incomplete"),
+            ({"status": "incomplete"}, "response_incomplete"),
+            ({"status": "queued"}, "response_incomplete"),
+            ({"status": "in_progress"}, "response_incomplete"),
+            ({"status": "cancelled"}, "response_incomplete"),
+            ({"output": [{"type": "message", "status": "incomplete"}]}, "response_incomplete"),
+            ({}, None),
         )
-        for operation, status, (fields, refused) in product(("draft", "draft_high_quality"), (200, 400), cases):
+        for operation, status, (fields, response_state) in product(("draft", "draft_high_quality"), (200, 400), cases):
             with self.subTest(operation=operation, status=status, fields=fields):
                 gateway, _, _, telemetry, spend = self.gateway(images="true")
                 route = gateway.configuration.route(operation)
@@ -583,10 +591,11 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
                 with self.assertRaises(ai_gateway.GatewayError) as caught:
                     gateway.request(operation, batch_body(route), draft_batch=True)
-                expected = ("http_error" if status == 400 else "response_incomplete") if fields else "response_schema_rejected"
+                expected = ("http_error" if status == 400 else response_state) if fields else "response_schema_rejected"
                 self.assertEqual(caught.exception.reason, expected)
                 self.assertEqual(caught.exception.diagnostics["response_contract_reason"], expected)
-                self.assertIs(caught.exception.diagnostics.get("refusal_present", False), refused)
+                self.assertEqual(caught.exception.diagnostics["responses_status"], reply["status"])
+                self.assertIs(caught.exception.diagnostics.get("refusal_present", False), response_state == "response_refused")
                 self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
                 opener.open.assert_called_once()
                 spend.settle.assert_called_once_with(spend.reserve.return_value, 0.125)
@@ -753,6 +762,12 @@ class ImageObservationDraftTest(unittest.TestCase):
     def test_real_draft_job_keeps_partial_response_reference_in_both_modes(self):
         media = {"type": "input_image", "image_url": self.fixture.image, "detail": "high"}
         prepared = server.PreparedDraftMedia([], [[("Reference 1", media)]])
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(server, "configured_data_root", return_value=scratch))
+        saved_id = "quote-synthetic-preserved"
+        server.create_or_update_quote_session({"quote_session": {"session_id": saved_id}})
+        metadata = server.quote_session_metadata_path(saved_id)
+        saved = metadata.read_bytes()
         for mode, status, interruption in product(
             ("standard", "high_quality"), (200, 400, 503),
             (None, ConnectionResetError, TimeoutError),
@@ -766,7 +781,8 @@ class ImageObservationDraftTest(unittest.TestCase):
                     gateway = server.configured_ai_gateway()
                 route = gateway.configuration.route(operation)
                 configuration = server.OpenAIDraftConfiguration(mode, route.model, route.effort, gateway)
-                payload = {"analysis_mode": mode, "images": [{"name": "synthetic.png", "data_url": self.fixture.image}]}
+                payload = {"analysis_mode": mode, "images": [{"name": "synthetic.png", "data_url": self.fixture.image}],
+                           "quote_session": {"session_id": saved_id}}
                 with (mock.patch.object(server, "prepare_draft_media", return_value=prepared),
                       mock.patch.object(server, "capture_openai_draft_configuration", return_value=configuration),
                       mock.patch.object(server, "pricing_reference_snapshot_for_payload", return_value=object()),
@@ -778,6 +794,7 @@ class ImageObservationDraftTest(unittest.TestCase):
                 result = state.call_args.kwargs["result"]
                 self.assertEqual(state.call_args.kwargs["status"], "blocked")
                 self.assertNotIn("line_items", result)
+                self.assertEqual(metadata.read_bytes(), saved)
                 failure = [row for event, row in self.fixture.logs if event == "openai_draft_failed"][-1]
                 self.assertEqual(result["error_reference"], failure["error_reference"])
                 self.assertEqual(failure["failure_boundary"], "draft_batch")

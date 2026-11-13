@@ -1,11 +1,16 @@
 """G01-G13 synthetic gateway boundaries; no network or paid inference."""
 import copy
 import dataclasses
-import http.client
 import io
 import json
+import os
+from pathlib import Path
+import shutil
 import socket
 import socketserver
+import ssl
+import subprocess
+import tempfile
 from threading import Event, Thread
 import unittest
 import urllib.error
@@ -233,7 +238,9 @@ class OpenRouterGatewayTest(unittest.TestCase):
         negatives += [{"error_type":"PRIVATE_UNKNOWN_TYPE"},{"error":{"code":"PRIVATE_UNKNOWN_CODE"}},
                       {"error_type":["PRIVATE_TYPE"]},{"output_text":"PRIVATE_PARTIAL"},
                       {"output":[{"text":"PRIVATE_PARTIAL"}]},{"refusal":"PRIVATE_REFUSAL"},
-                      {"refusal":""},{"incomplete_details":[]},{"incomplete_details":{"reason":"PRIVATE_REASON"}}]
+                      {"refusal":""},{"incomplete_details":[]},{"incomplete_details":{"reason":"PRIVATE_REASON"}},
+                      {"status":"incomplete"},{"status":"incomplete","incomplete_details":None},
+                      {"status":"in_progress"},{"status":"queued"},{"status":"cancelled"}]
         for operation in gateway.ROUTE_KEYS:
             route=config.route(operation)
             for status in gateway.TRANSIENT_HTTP_STATUSES:
@@ -256,7 +263,7 @@ class OpenRouterGatewayTest(unittest.TestCase):
 
     def test_G10_genuine_http_transients_keep_same_route_limits_delays_and_one_terminal_per_send(self):
         config=self.config()
-        positives=[{}, {"error":{"type":"server_error","code":"server_error"}}]
+        positives=[{}, {"status":"failed","error":{"type":"server_error","code":"server_error"}}]
         positives += [{"error_type":value,"error":{"code":"server_error"}} for value in gateway.TRANSIENT_ERROR_TYPES]
         for operation in gateway.ROUTE_KEYS:
             route=config.route(operation)
@@ -286,9 +293,31 @@ class OpenRouterGatewayTest(unittest.TestCase):
 
 
 class LoopbackResponseTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Generate a short-lived fixture identity locally. No stored key or external service.
+        openssl = shutil.which("openssl")
+        if openssl is None and os.name == "nt":
+            openssl = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/usr/bin/openssl.exe"
+        if not openssl or not Path(openssl).is_file():
+            raise RuntimeError("OpenSSL CLI is required for the gateway's loopback TLS tests.")
+        with tempfile.TemporaryDirectory() as directory:
+            key = str(Path(directory) / "key.pem")
+            cert = str(Path(directory) / "cert.pem")
+            subprocess.run(
+                [str(openssl), "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                 "-subj", "/CN=openrouter.ai", "-addext", "subjectAltName=DNS:openrouter.ai",
+                 "-keyout", key, "-out", cert],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, check=True,
+            )
+            cls.server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            cls.server_tls.load_cert_chain(cert, key)
+            cls.client_tls = ssl.create_default_context(cafile=cert)
+
     def setUp(self):
         self.reply = b""
         self.hold_open = False
+        self.orderly_close = True
         self.release = Event()
         self.requests = []
         fixture = self
@@ -300,12 +329,29 @@ class LoopbackResponseTest(unittest.TestCase):
                 while (line := self.rfile.readline()) not in (b"\r\n", b""):
                     if line.lower().startswith(b"content-length:"):
                         length = int(line.split(b":", 1)[1])
+                reply, hold_open, orderly_close = fixture.reply, fixture.hold_open, fixture.orderly_close
                 fixture.requests.append((request_line, json.loads(self.rfile.read(length))))
-                self.wfile.write(fixture.reply)
-                if fixture.hold_open:
+                self.wfile.write(reply)
+                if hold_open:
                     fixture.release.wait(5)
+                if orderly_close:
+                    # Send close_notify. urllib may close before sending its own alert.
+                    try:
+                        self.request.unwrap().close()
+                    except OSError:
+                        pass
 
-        provider = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Provider)
+        class TlsServer(socketserver.ThreadingTCPServer):
+            def get_request(self):
+                raw, address = super().get_request()
+                raw.settimeout(1)
+                try:
+                    return fixture.server_tls.wrap_socket(raw, server_side=True), address
+                except OSError:
+                    raw.close()
+                    raise
+
+        provider = TlsServer(("127.0.0.1", 0), Provider)
         self.addCleanup(provider.server_close)
         worker = Thread(target=provider.serve_forever, kwargs={"poll_interval": 0.01})
         worker.start()
@@ -313,11 +359,13 @@ class LoopbackResponseTest(unittest.TestCase):
         self.addCleanup(provider.shutdown)
         self.addCleanup(self.release.set)
 
-        # Exercise the production HTTPS opener and response parser over local TCP.
-        # Only TLS setup is substituted, and no connection can leave loopback.
-        def connect(connection):
-            self.assertEqual(connection.host, "openrouter.ai")
-            connection.sock = socket.create_connection(provider.server_address, timeout=0.5)
+        # Preserve the HTTPS opener, handshake, hostname check and response parser.
+        # Substitute only the trust root and TCP destination.
+        create_connection = socket.create_connection
+
+        def connect(address, *args, **kwargs):
+            self.assertEqual(address, ("openrouter.ai", 443))
+            return create_connection(provider.server_address, timeout=0.5)
 
         real_connect = socket.socket.connect
 
@@ -326,23 +374,40 @@ class LoopbackResponseTest(unittest.TestCase):
             return real_connect(sock, address)
 
         self.enterContext(mock.patch.object(socket.socket, "connect", local_only))
-        self.enterContext(mock.patch.object(http.client.HTTPSConnection, "connect", connect))
+        self.enterContext(mock.patch.object(socket, "create_connection", connect))
+        # Model a context that would otherwise turn a ragged EOF into a clean one.
+        self.client_tls.options |= getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
+        self.enterContext(mock.patch.object(ssl, "_create_default_https_context", return_value=self.client_tls))
         self.enterContext(mock.patch.object(urllib.request, "getproxies", return_value={}))
-        self.config = gateway.GatewayConfiguration.capture(synthetic_configuration().get)
+        self.config = gateway.GatewayConfiguration.capture(synthetic_configuration(overrides={
+            "OPENROUTER_DRAFT_IMAGE_SCHEMA_ENABLED": "true",
+        }).get)
 
-    def request(self, operation, reply, *, reason=None, sends=1, cost=None, hold_open=False):
+    def request(self, operation, reply, *, reason=None, sends=1, cost=None, hold_open=False,
+                orderly_close=True, draft_batch=False, output_text=None, response_status=None):
         self.requests.clear()
-        self.reply, self.hold_open = reply, hold_open
+        self.reply, self.hold_open, self.orderly_close = reply, hold_open, orderly_close
         spend, sleep, telemetry = mock.Mock(), mock.Mock(), mock.Mock()
         route = self.config.route(operation)
         subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic-key",
                                     quote_spend=spend, telemetry=telemetry, sleep=sleep)
+        if draft_batch:
+            from tests.test_image_observation_contract import batch_body
+            body = batch_body(route)
+        else:
+            body = envelope(route)
         if reason is None:
-            self.assertEqual(subject.request(operation, envelope(route))["output"], completed(route)["output"])
+            expected = completed(route)["output"]
+            if output_text is not None:
+                expected[0]["content"][0]["text"] = output_text
+            self.assertEqual(subject.request(operation, body, draft_batch=draft_batch)["output"], expected)
         else:
             with self.assertRaises(gateway.GatewayError) as caught:
-                subject.request(operation, envelope(route))
+                subject.request(operation, body, draft_batch=draft_batch)
             self.assertEqual(caught.exception.reason, reason)
+            if response_status is not None:
+                self.assertEqual(caught.exception.diagnostics["responses_status"], response_status)
+                self.assertFalse(caught.exception.retryable)
             if reason in {"response_partial", "response_framing"}:
                 self.assertFalse(caught.exception.retryable)
                 self.assertFalse(hasattr(caught.exception, "reported_cost"))
@@ -423,6 +488,46 @@ class LoopbackResponseTest(unittest.TestCase):
                                  reason=framing_error or ("http_error" if basis else None),
                                  sends=3 if basis and not framing_error else 1,
                                  cost=None if framing_error else 0.125)
+
+    def test_tls_close_alert_required_only_for_close_delimited_reply(self):
+        observation = '{"observations":["Synthetic observation"]}'
+        for operation in ("draft", "draft_high_quality", "basis_line", "basis_answer"):
+            route = self.config.route(operation)
+            image = operation.startswith("draft")
+            value = completed(route) if image else {"model": route.model, "error_type": "provider_unavailable"}
+            value["usage"] = {"cost": 0.125}
+            if image:
+                value["output"][0]["content"][0]["text"] = observation
+            payload = json.dumps(value).encode()
+            status = b"200 OK" if image else b"503 Service Unavailable"
+            head = b"HTTP/1.1 " + status + b"\r\nContent-Type: application/json\r\n"
+            length = str(len(payload)).encode()
+            chunk = f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
+            cases = (
+                ("orderly close", b"Connection: close", payload, True, True, False),
+                ("missing close alert", b"Connection: close", payload, False, False, False),
+                ("timed out waiting for close alert", b"Connection: close", payload, True, False, True),
+                ("fixed without close alert", b"Content-Length: " + length, payload, False, True, False),
+                ("short fixed without close alert", b"Content-Length: " + length, payload[:-1], False, False, False),
+                ("chunked without close alert", b"Transfer-Encoding: chunked", chunk + b"0\r\n\r\n", False, True, False),
+                ("short chunked without close alert", b"Transfer-Encoding: chunked", chunk + b"0\r\n", False, False, False),
+            )
+            for name, header, body, orderly, complete, hold_open in cases:
+                with self.subTest(operation=operation, name=name):
+                    self.request(operation, head + header + b"\r\n\r\n" + body,
+                                 reason=(None if image else "http_error") if complete else "response_partial",
+                                 sends=3 if complete and not image else 1, cost=0.125 if complete else None,
+                                 orderly_close=orderly, draft_batch=image, output_text=observation,
+                                 hold_open=hold_open)
+
+    def test_orderly_close_with_explicit_incomplete_status_never_retries(self):
+        for operation in ("basis_line", "basis_answer"):
+            route = self.config.route(operation)
+            payload = json.dumps({"model": route.model, "status": "incomplete", "incomplete_details": None,
+                                  "error_type": "provider_unavailable", "usage": {"cost": 0.125}}).encode()
+            with self.subTest(operation=operation):
+                self.request(operation, b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n" + payload,
+                             reason="http_error", response_status="incomplete", cost=0.125)
 
 
 class ReportedResponseCostTest(unittest.TestCase):
