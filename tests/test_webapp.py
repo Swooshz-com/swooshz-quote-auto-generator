@@ -43786,6 +43786,17 @@ main().catch((error) => {
                     self.assertEqual(scopes, {scope})
                     self.assertEqual(source[left:right], "drawing source")
 
+    def test_nested_area_wrappers_read_the_inner_assertion_once(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        for depth in (8, 128, 512):
+            with self.subTest(depth=depth):
+                text = "(" * depth + f"the dimensions for {east} remain unverified" + ")" * depth
+                with mock.patch.object(webapp, "area_qualification_scopes",
+                                       wraps=webapp.area_qualification_scopes) as parse:
+                    self.assertEqual(webapp.area_paired_qualification_scopes(text, {west}, patterns), {east})
+                parse.assert_called_once()
+
     def test_area_qualification_resolves_complete_named_roles_before_fallback(self):
         west = "carpet tile west"
         east = "carpet and vinyl east near the registration desk"
@@ -44328,6 +44339,8 @@ main().catch((error) => {
             ("pronoun-demonstrative-explicit", f"we checked the dimensions for {east}. Those dimensions for {west} have not been verified", False, True),
             ("pronoun-demonstrative-completed", f"we checked the dimensions for {east}. Those dimensions had been verified", True, True),
             ("pronoun-implicit-verification", f"we checked the dimensions for {east}. Verification is still pending", True, False),
+            ("nested-measured-pending", f"(((the dimensions for {east} were partially verified)))", False, False),
+            ("nested-measured-completed", f"(((the dimensions for {east} had already been verified)))", False, True),
             ("pronoun-demonstrative-event", f"we checked the dimensions for {east}. Verification of those dimensions is still pending", True, False),
             ("pronoun-demonstrative-object", f"we checked the dimensions for {east}. We still need to verify those dimensions", True, False),
             ("pronoun-demonstrative-event-complete", f"we checked the dimensions for {east}. Verification of those dimensions was completed", True, True),

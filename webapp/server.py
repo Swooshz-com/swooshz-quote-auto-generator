@@ -26039,10 +26039,18 @@ class AreaSourceSpans:
 
     def separators(self, pattern: re.Pattern[str], start: int, stop: int, group: int = -1,
                    *, text: str | None = None):
-        for match in pattern.finditer(self.text if text is None else text, start, stop):
+        candidate = self.text if text is None else text
+        while start < stop and (match := pattern.search(candidate, start, stop)):
             left, right = match.span()
-            if self.context[left] == group and self.literal[left] == -1:
+            parent = self.context[left]
+            literal = self.literal[left]
+            if parent == group and literal < 0:
                 yield left, right, match.group()
+            start = right
+            if parent != group and parent >= 0:
+                start = max(start, self.pairs[parent] + 1)
+            if literal >= 0:
+                start = max(start, self.quotes[literal] + 1)
 
     def brackets(self, start: int, stop: int, group: int = -1):
         children = self.children.get(group, ())
@@ -26050,6 +26058,20 @@ class AreaSourceSpans:
             opener = children[index]
             if self.pairs[opener] < stop:
                 yield opener, self.pairs[opener]
+
+    def independent_brackets(self):
+        """Skip wrapper chains that contribute no text outside their nested span."""
+        for start, end in self.pairs.items():
+            first = AREA_FRAME_SPACE.match(self.text, start + 1, end).end()
+            local = first
+            for opener, closer in self.brackets(first, end, start):
+                if AREA_FRAME_ASIDE_SPACE.fullmatch(self.text, local, opener) is None:
+                    break
+                local = closer + 1
+            else:
+                if AREA_FRAME_ASIDE_SPACE.fullmatch(self.text, local, end):
+                    continue
+            yield first, end
 
     def linear_operand(self, start: int, stop: int) -> bool:
         index = bisect_left(self.symbols, start)
@@ -26945,8 +26967,8 @@ def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScop
 
 def area_paired_qualification_scopes(context: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
     source = AreaSourceSpans(context)
-    return {scope for start, end in source.pairs.items()
-            for scope in area_qualification_scopes(context[start + 1:end], enclosing, patterns)}
+    return {scope for start, stop in source.independent_brackets()
+            for scope in area_qualification_scopes(context[start:stop], enclosing, patterns)}
 
 
 def area_paired_asides(text: str) -> bool:
@@ -27145,10 +27167,9 @@ def area_source_claims(raw: str, patterns: AreaScopePatterns):
             for scope in targets:
                 yield AreaMeasurementClaim(scope, "observed", None, "", (), False)
     # A mixed annotation can preserve an unresolved named claim without removing it from the outer value.
-    for opener, closer in pairs.items():
-        start = opener + 1
-        colon = area_heading_colon(text[start:closer])
-        yield from area_referenced_claims(text, start, closer, colon, patterns, handled, contextual)
+    for start, stop in source.independent_brackets():
+        colon = area_heading_colon(text[start:stop])
+        yield from area_referenced_claims(text, start, stop, colon, patterns, handled, contextual)
     yield from member_claims
 
 
