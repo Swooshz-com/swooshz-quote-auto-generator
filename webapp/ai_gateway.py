@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 from decimal import Decimal, InvalidOperation
-from http.client import HTTPException
+from http.client import HTTPException, HTTPResponse, IncompleteRead
 import json
 import math
 import re
@@ -27,6 +27,7 @@ ROUTE_KEYS = MappingProxyType({
 })
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_ERROR_BODY_BYTES = 128 * 1024
+MAX_CHUNK_FRAMING_BYTES = 128 * 1024
 MAX_REQUEST_BYTES = 300 * 1024 * 1024
 MODEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._/-]{0,134}")
 SUPPORTED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
@@ -52,36 +53,40 @@ NONRETRY_ERROR_CODES = frozenset({
 SCHEMA_SPECIFIC_CODES = frozenset({"unsupported_schema", "invalid_json_schema",
     "json_schema_not_supported", "unsupported_response_format"})
 SCHEMA_ERROR_CODES = SCHEMA_SPECIFIC_CODES | {"unsupported_parameter"}
-IMAGE_ERROR_CODES = frozenset({"invalid_image", "image_too_large", "image_too_small",
-    "unsupported_image_format", "image_not_found", "image_download_failed", "image_content_policy_violation"})
+SCHEMA_COMPATIBLE_MARKERS = SCHEMA_ERROR_CODES | {
+    "invalid_request", "invalid_request_error", "invalid_parameter", "invalid_type", "invalid_value", "unsupported_value",
+}
 SCHEMA_ERROR_PARAMS = frozenset({"text", "text.format", "text.format.type", "text.format.name",
                                 "text.format.strict", "text.format.schema", "response_format"})
 
 
-def _image_schema_rejected(data, metadata):
-    error = data.get("error") if isinstance(data, dict) else None
-    target = error.get("param") if isinstance(error, dict) else metadata.get("provider_error_param")
-    markers = tuple(metadata.get(key) for key in
-                    ("provider_error_code", "provider_error_type", "provider_error_class"))
-    # A supplied target must name the response schema. A generic marker without
-    # a target cannot distinguish a schema rejection from an input error.
-    if any(isinstance(marker, str) and marker in IMAGE_ERROR_CODES for marker in markers):
+def _image_schema_rejected(data):
+    if not isinstance(data, dict) or data.get("refusal") is not None or data.get("incomplete_details") is not None:
+        return False
+    error = data.get("error")
+    if error is not None and not isinstance(error, dict):
+        return False
+    fields = error if error is not None else {}
+    target = fields.get("param")
+    markers = tuple(marker for marker in (data.get("error_type"), fields.get("type"), fields.get("code"))
+                    if marker is not None)
+    # Any contradictory or unknown machine marker prevents a capability
+    # diagnosis. Only the safe projection is retained after this decision.
+    if any(not isinstance(marker, str) or marker not in SCHEMA_COMPATIBLE_MARKERS for marker in markers):
         return False
     if target is not None:
         return isinstance(target, str) and target in SCHEMA_ERROR_PARAMS
-    return any(isinstance(marker, str) and marker in SCHEMA_SPECIFIC_CODES for marker in markers)
+    return any(marker in SCHEMA_SPECIFIC_CODES for marker in markers)
 
 
 def schema_rejected(data, error, *, strict_image_observations):
     """Classify machine evidence. Synthesis retains its existing status rule."""
-    diagnostics = error.diagnostics
-    metadata = draft_provider_error_diagnostics(data)
     if strict_image_observations:
         if data is not None:
-            return _image_schema_rejected(data, metadata)
-        if hasattr(error, "image_schema_rejected"):
-            return error.image_schema_rejected
-        return _image_schema_rejected(None, diagnostics)
+            return _image_schema_rejected(data)
+        return error.image_schema_rejected
+    diagnostics = error.diagnostics
+    metadata = draft_provider_error_diagnostics(data)
     return (
         diagnostics.get("http_status") in {400, 404, 405, 415, 422}
         or any(metadata.get(key) in SCHEMA_ERROR_CODES
@@ -121,6 +126,7 @@ class GatewayError(RuntimeError):
         super().__init__("AI request could not be completed.")
         self.reason = reason
         self.retryable = retryable
+        self.image_schema_rejected = False
         self.diagnostics = {"failure_boundary": boundary, "attempt_number": attempt}
         if type(http_status) is int and 100 <= http_status <= 599:
             self.diagnostics.update(http_status=http_status, http_status_class=f"{http_status // 100}xx")
@@ -258,21 +264,86 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,req,fp,code,msg,headers,newurl):
         return None
 
+# HTTP field tokens and quoted chunk extensions, restricted to a bounded line.
+_HTTP_TOKEN = rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+_CHUNK_EXTENSION = rb'[ \t]*;[ \t]*' + _HTTP_TOKEN + (
+    rb'(?:[ \t]*=[ \t]*(?:' + _HTTP_TOKEN + rb'|"(?:[\t !#-\[\]-~\x80-\xff]|\\[\t -~\x80-\xff])*"))?'
+)
+_CHUNK_LINE = re.compile(rb"([0-9a-fA-F]+)(?:" + _CHUNK_EXTENSION + rb")*\r\n")
+_TRAILER_LINE = re.compile(rb"(" + _HTTP_TOKEN + rb"):[\t -~\x80-\xff]*\r\n")
+
+
 class BoundedHttpsTransport:
     @staticmethod
-    def _read_body(response, limit, *, http_status=None):
+    def _header_values(headers, name):
+        if headers is None:
+            return []
+        if hasattr(headers, "get_all"):
+            return headers.get_all(name, [])
+        value = headers.get(name)
+        return [] if value is None else [value]
+
+    @staticmethod
+    def _read_chunked(response, limit):
+        # http.client accepts EOF in place of the final trailer terminator.
+        # Its stream is positioned at the first chunk after parsing the headers.
+        wire_response = response.fp if isinstance(response, urllib.error.HTTPError) else response
+        if not isinstance(wire_response, HTTPResponse) or not wire_response.chunked or wire_response.fp is None:
+            raise IncompleteRead(b"")
+        stream = wire_response.fp
+        remaining_framing = MAX_CHUNK_FRAMING_BYTES
+
+        def framing_line():
+            nonlocal remaining_framing
+            line = stream.readline(min(8192, remaining_framing) + 1)
+            remaining_framing -= len(line)
+            if remaining_framing < 0 or len(line) > 8192 or not line.endswith(b"\r\n"):
+                raise IncompleteRead(b"")
+            return line
+
+        body = bytearray()
+        while True:
+            match = _CHUNK_LINE.fullmatch(framing_line())
+            if match is None:
+                raise IncompleteRead(b"")
+            size = int(match[1], 16)
+            if not size:
+                break
+            wanted = min(size, limit + 1 - len(body))
+            chunk = stream.read(wanted)
+            if len(chunk) != wanted:
+                raise IncompleteRead(b"")
+            body.extend(chunk)
+            if len(body) > limit:
+                return body
+            if stream.read(2) != b"\r\n":
+                raise IncompleteRead(b"")
+            remaining_framing -= 2
+        while (line := framing_line()) != b"\r\n":
+            field = _TRAILER_LINE.fullmatch(line)
+            if field is None or field[1].lower() in {b"content-length", b"transfer-encoding"}:
+                raise IncompleteRead(b"")
+        return body
+
+    @classmethod
+    def _read_body(cls, response, limit, *, http_status=None):
         headers = response.headers
-        length = headers.get("Content-Length") if headers is not None else None
+        lengths = cls._header_values(headers, "Content-Length")
+        encodings = cls._header_values(headers, "Transfer-Encoding")
+        if len(lengths) > 1 or (encodings and (lengths or len(encodings) != 1
+                                               or not isinstance(encodings[0], str)
+                                               or encodings[0].strip().lower() != "chunked")):
+            raise GatewayError("response_framing", boundary="provider_response_shape", http_status=http_status)
+        length = lengths[0] if lengths else None
         if length is not None and (not isinstance(length, str) or not re.fullmatch(r"[0-9]{1,12}", length)):
-            raise GatewayError("response_size", boundary="provider_response_shape", http_status=http_status)
+            raise GatewayError("response_framing", boundary="provider_response_shape", http_status=http_status)
         declared = int(length) if length is not None else None
         try:
-            raw = response.read(limit + 1)
+            raw = cls._read_chunked(response, limit) if encodings else response.read(limit + 1)
         except (HTTPException, OSError):
             raise GatewayError("response_partial", boundary="provider_response_shape",
                                http_status=http_status) from None
-        # Short reads provide evidence of incompleteness. A read at the sentinel
-        # may have left bytes unread, so treat it as oversize without parsing it.
+        # A short read is incomplete. At the sentinel the rest may be unread.
         if declared is not None and len(raw) < min(declared, limit + 1):
             raise GatewayError("response_partial", boundary="provider_response_shape", http_status=http_status)
         if len(raw) > limit or (declared is not None and declared > limit):
@@ -291,21 +362,20 @@ class BoundedHttpsTransport:
             response = self._opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
             status = exc.code
-            metadata = {}
             parsed = None
             try:
                 raw = self._read_body(exc, MAX_ERROR_BODY_BYTES, http_status=status)
-                parsed = _load_json(raw.decode("utf-8"))
-                metadata = draft_provider_error_diagnostics(parsed)
-            except (AttributeError, OSError, ValueError, TypeError, UnicodeError, RecursionError):
-                # Diagnostics are optional; the failed HTTP response remains a failure.
-                metadata = {}
+                try:
+                    parsed = _load_json(raw.decode("utf-8"))
+                except (ValueError, RecursionError):
+                    # A fully framed HTTP error may have no JSON diagnostics.
+                    pass
             finally:
                 exc.close()
             error = GatewayError("http_error", boundary="provider_http", http_status=status,
                                  retryable=http_error_retryable(status, parsed))
-            error.diagnostics.update(metadata)
-            error.image_schema_rejected = _image_schema_rejected(parsed, metadata)
+            error.image_schema_rejected = status >= 400 and _image_schema_rejected(parsed)
+            error.diagnostics.update(draft_provider_error_diagnostics(parsed))
             # Keep the billing fields out of diagnostics and business output.
             if isinstance(parsed, dict):
                 error.reported_cost = (parsed.get("model"), _response_cost(parsed))
@@ -314,6 +384,8 @@ class BoundedHttpsTransport:
             error = GatewayError("connection_failed",boundary="provider_transport",retryable=True)
             error.diagnostics["transport_timeout"] = isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError)
             raise error from None
+        except HTTPException:
+            raise GatewayError("response_framing", boundary="provider_response_shape") from None
         # Once a response has begun, never replay it after a read/shape/partial failure.
         try:
             with response:
@@ -525,7 +597,8 @@ class AiGateway:
                     exc.diagnostics.setdefault("response_contract_name", contract.name)
                     exc.diagnostics.setdefault("response_contract_reason", exc.reason)
                     exc.diagnostics.setdefault("batch_failure_reason", "batch_provider_failure")
-                if (contract is not None and exc.reason not in {"response_partial", "response_size"}
+                if (contract is not None
+                        and exc.reason not in {"response_partial", "response_size", "response_framing", "redirect_or_status"}
                         and schema_rejected(data, exc,
                                             strict_image_observations=strict_image_observations)):
                     exc.reason = "response_schema_rejected"

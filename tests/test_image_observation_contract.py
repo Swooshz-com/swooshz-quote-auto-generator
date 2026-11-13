@@ -34,16 +34,18 @@ def batch_body(route, count=1):
             "input": [{"role": "user", "content": [prompt, *[dict(image) for _ in range(count)]]}]}
 
 
-def wire_http_response(status, payload, *, truncated, chunked=True, interruption=None, missing_bytes=0):
+def wire_http_response(status, payload, *, truncated, chunked=True, interruption=None, missing_bytes=0, chunk_tail=None, extra_headers=b""):
     class Response(http.client.HTTPResponse):
         def geturl(self):
             return ai_gateway.OPENROUTER_RESPONSES_URL
 
     head = f"HTTP/1.1 {status} Synthetic fixture\r\nContent-Type: application/json\r\n".encode()
+    head += extra_headers
     if chunked:
         head += b"Transfer-Encoding: chunked\r\n\r\n"
         chunk = f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
-        body = chunk + (b"10\r\nshort" if truncated else b"0\r\n\r\n")
+        tail = b"10\r\nshort" if truncated else b"0\r\n\r\n"
+        body = chunk + (tail if chunk_tail is None else chunk_tail)
     else:
         declared = len(payload) + missing_bytes + int(truncated)
         head += f"Content-Length: {declared}\r\n\r\n".encode()
@@ -60,9 +62,9 @@ def wire_http_response(status, payload, *, truncated, chunked=True, interruption
     return response
 
 
-def wire_opener(status, payload, *, truncated, chunked=True, interruption=None, missing_bytes=0):
+def wire_opener(status, payload, *, truncated, chunked=True, interruption=None, missing_bytes=0, chunk_tail=None, extra_headers=b""):
     response = wire_http_response(status, payload, truncated=truncated, chunked=chunked, interruption=interruption,
-                                  missing_bytes=missing_bytes)
+                                  missing_bytes=missing_bytes, chunk_tail=chunk_tail, extra_headers=extra_headers)
     opener = mock.Mock()
     if status == 200:
         opener.open.return_value = response
@@ -380,8 +382,11 @@ class ImageObservationGatewayTest(unittest.TestCase):
                     chunked=chunked, missing_bytes=missing,
                     interruption=ConnectionResetError if label == "reset at limit" else None,
                 )
-                read = mock.Mock(wraps=response.read)
-                response.read = read
+                read = mock.Mock(wraps=response.fp.read if chunked else response.read)
+                if chunked:
+                    response.fp.read = read
+                else:
+                    response.read = read
                 gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
                 draft_batch = operation.startswith("draft")
                 expected = body_failure
@@ -406,7 +411,10 @@ class ImageObservationGatewayTest(unittest.TestCase):
                         self.assertEqual(gateway.request(operation, batch_body(route), draft_batch=draft_batch)
                                          ["output"], reply["output"])
                 self.assertTrue(response.closed)
-                read.assert_called_once_with(limit + 1)
+                if chunked:
+                    self.assertLessEqual(sum(call.args[0] for call in read.call_args_list), limit + 3)
+                else:
+                    read.assert_called_once_with(limit + 1)
                 opener.open.assert_called_once()
                 spend.reserve.assert_called_once_with()
                 spend.settle.assert_called_once_with(spend.reserve.return_value, None if body_failure else 0.125)
@@ -414,6 +422,147 @@ class ImageObservationGatewayTest(unittest.TestCase):
                 self.assertEqual(telemetry.call_args.args[2], "failed" if expected else "success")
                 self.assertFalse(telemetry.call_args.args[4]["retry_pending"])
                 self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
+
+    def test_wire_termination_precedes_admission_status_and_billing(self):
+        cases = (
+            ("EOF before zero", b"", b"", "response_partial"),
+            ("EOF after zero", b"0\r\n", b"", "response_partial"),
+            ("EOF after trailer", b"0\r\nX-Test: sample\r\n", b"", "response_partial"),
+            ("EOF mid trailer", b"0\r\nX-Test: sample", b"", "response_partial"),
+            ("invalid size", b"+0\r\n\r\n", b"", "response_partial"),
+            ("malformed trailer", b"0\r\nInvalid trailer\r\n\r\n", b"", "response_partial"),
+            ("framing trailer", b"0\r\nContent-Length: 0\r\n\r\n", b"", "response_partial"),
+            ("long trailer", b"0\r\nX-Test: " + b"x" * 8192 + b"\r\n\r\n", b"", "response_partial"),
+            ("framing budget", b"0\r\n" + (b"X-Test: " + b"x" * 4096 + b"\r\n") * 33 + b"\r\n", b"", "response_partial"),
+            ("conflicting headers", b"0\r\n\r\n", b"Content-Length: 3\r\n", "response_framing"),
+            ("duplicate transfer encoding", b"0\r\n\r\n", b"Transfer-Encoding: chunked\r\n", "response_framing"),
+            ("complete trailer", b'0;fixture="done"\r\nX-Test: sample\r\n\r\n', b"", None),
+        )
+        for operation, status, case in product(
+            ("draft", "draft_high_quality", "basis_line", "basis_answer"), (200, 400, 503), cases,
+        ):
+            label, tail, headers, failure = case
+            with self.subTest(operation=operation, status=status, case=label):
+                gateway, _, _, telemetry, spend = self.gateway(images="true")
+                route = gateway.configuration.route(operation)
+                payload = responses_envelope(route.model, '{"observations":["Synthetic"]}', usage=USAGE)
+                if status != 200:
+                    payload = {"model": route.model, "usage": USAGE,
+                               "error": {"code": "unsupported_schema", "message": CANARY}}
+                opener, response = wire_opener(status, json.dumps(payload).encode(), truncated=False,
+                                               chunk_tail=tail, extra_headers=headers)
+                gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                draft_batch = operation.startswith("draft")
+                expected = failure
+                if not failure and status != 200:
+                    expected = "response_schema_rejected" if draft_batch else "http_error"
+                if expected:
+                    with self.assertRaises(ai_gateway.GatewayError) as caught:
+                        gateway.request(operation, batch_body(route), draft_batch=draft_batch)
+                    self.assertEqual(caught.exception.reason, expected)
+                    self.assertEqual(caught.exception.diagnostics.get("http_status"), status if status != 200 else None)
+                    if failure:
+                        self.assertNotIn("provider_error_code", caught.exception.diagnostics)
+                        self.assertIsNone(telemetry.call_args.args[4]["usage"])
+                else:
+                    self.assertEqual(gateway.request(operation, batch_body(route), draft_batch=draft_batch)
+                                     ["output"], payload["output"])
+                self.assertTrue(response.closed)
+                opener.open.assert_called_once()
+                spend.reserve.assert_called_once_with()
+                spend.settle.assert_called_once_with(spend.reserve.return_value, None if failure else 0.125)
+                telemetry.assert_called_once()
+                self.assertFalse(telemetry.call_args.args[4]["retry_pending"])
+                self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
+
+    def test_fixed_and_unsupported_transfer_framing_fail_without_replay(self):
+        headers = (
+            b"Content-Length: 0\r\n",
+            b"Content-Length: 0, 1\r\n",
+            b"Transfer-Encoding: gzip, chunked\r\n",
+            b"Transfer-Encoding: identity\r\n",
+        )
+        for operation, status, extra in product(("draft", "basis_answer"), (200, 503), headers):
+            with self.subTest(operation=operation, status=status, extra=extra):
+                gateway, _, _, telemetry, spend = self.gateway(images="true")
+                route = gateway.configuration.route(operation)
+                opener, response = wire_opener(status, b"{}", truncated=False, chunked=False,
+                                               extra_headers=extra)
+                gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                with self.assertRaises(ai_gateway.GatewayError) as caught:
+                    gateway.request(operation, batch_body(route), draft_batch=operation == "draft")
+                self.assertEqual(caught.exception.reason, "response_framing")
+                self.assertFalse(caught.exception.retryable)
+                opener.open.assert_called_once()
+                spend.settle.assert_called_once_with(spend.reserve.return_value, None)
+                telemetry.assert_called_once()
+                self.assertTrue(response.closed)
+
+    def test_malformed_response_headers_do_not_replay(self):
+        gateway, _, _, telemetry, spend = self.gateway()
+        route = gateway.configuration.route("basis_line")
+        opener = mock.Mock()
+        opener.open.side_effect = http.client.LineTooLong(CANARY)
+        gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+        with self.assertRaises(ai_gateway.GatewayError) as caught:
+            gateway.request("basis_line", batch_body(route))
+        self.assertEqual(caught.exception.reason, "response_framing")
+        self.assertFalse(caught.exception.retryable)
+        opener.open.assert_called_once()
+        spend.settle.assert_called_once_with(spend.reserve.return_value, None)
+        telemetry.assert_called_once()
+        self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
+
+    def test_redirect_status_cannot_become_a_schema_rejection(self):
+        for operation in ("draft", "draft_high_quality"):
+            with self.subTest(operation=operation):
+                gateway, _, _, telemetry, _ = self.gateway(images="true")
+                route = gateway.configuration.route(operation)
+                opener, response = wire_opener(302, b'{"error":{"code":"unsupported_schema"}}', truncated=False)
+                gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                with self.assertRaises(ai_gateway.GatewayError) as caught:
+                    gateway.request(operation, batch_body(route), draft_batch=True)
+                self.assertEqual(caught.exception.reason, "http_error")
+                self.assertEqual(caught.exception.diagnostics["http_status"], 302)
+                self.assertTrue(response.closed)
+                opener.open.assert_called_once()
+                telemetry.assert_called_once()
+
+    def test_raw_non_schema_markers_override_schema_target_in_both_error_paths(self):
+        cases = (
+            (None, "code", "unsupported_schema", None, True),
+            (None, "code", "unsupported_parameter", "text.format", True),
+            (None, "type", "invalid_request_error", "text.format.schema", True),
+            (None, "code", "unsupported_parameter", None, False),
+            (None, "code", "unsupported_parameter", "input[0].content[1].image_url", False),
+            ("unsupported_schema", "code", "image_too_large", None, False),
+            (None, "code", "unsupported_image_format", "text.format", False),
+            (None, "type", "invalid_image", "text.format", False),
+            ("provider_unavailable", "code", "unsupported_schema", "text.format", False),
+            (None, "code", "authentication_error", "text.format", False),
+            (None, "code", CANARY, "text.format", False),
+            (None, "code", [CANARY], "text.format", False),
+        )
+        for operation, status, case in product(("draft", "draft_high_quality"), (200, 400), cases):
+            top, key, marker, target, schema_failure = case
+            with self.subTest(operation=operation, status=status, case=case):
+                gateway, _, _, telemetry, spend = self.gateway(images="true")
+                route = gateway.configuration.route(operation)
+                fields = {key: marker, "message": CANARY}
+                if target is not None:
+                    fields["param"] = target
+                payload = {"model": route.model, "status": "failed", "error_type": top, "error": fields, "usage": USAGE}
+                opener, _ = wire_opener(status, json.dumps(payload).encode(), truncated=False)
+                gateway._transport = ai_gateway.BoundedHttpsTransport(opener=opener)
+                with self.assertRaises(ai_gateway.GatewayError) as caught:
+                    gateway.request(operation, batch_body(route), draft_batch=True)
+                expected = "response_schema_rejected" if schema_failure else (
+                    "http_error" if status == 400 else "response_incomplete")
+                self.assertEqual(caught.exception.reason, expected)
+                self.assertEqual(caught.exception.diagnostics["response_contract_reason"], expected)
+                self.assertNotIn(CANARY, json.dumps(telemetry.call_args.args))
+                opener.open.assert_called_once()
+                spend.settle.assert_called_once_with(spend.reserve.return_value, 0.125)
 
     def test_success_uses_the_actual_larger_transport_limit(self):
         limit = ai_gateway.MAX_RESPONSE_BYTES
