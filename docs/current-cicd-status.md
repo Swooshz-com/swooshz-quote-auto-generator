@@ -10,6 +10,8 @@ gate and eligible repository activity dispatch it on `main` only. The sweep
 checks the selected ref before minting the separate GitHub App tokens for the
 quote repository and private evidence store. Footer cleanup requires a refresh
 that ran on the same commit and skips when the refresh reaches its rate limit.
+The hourly gate skips invalid programme bindings, including legacy bindings with
+version 2 governance fields.
 The sweep uses the existing repository App variable and secret. These
 workflows update programme records and do not deploy the application.
 
