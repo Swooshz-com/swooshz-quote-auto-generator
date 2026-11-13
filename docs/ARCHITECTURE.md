@@ -22,12 +22,12 @@ adds the strict `draft_image_observations_v1` schema only to Standard and High
 Quality image batches. Each request contains one prompt and one to six
 high-detail images. The gateway checks the provider envelope and bounded
 JSON with nonblank observations before marking the send successful. The server
-still checks one observation per source, preserves source order and labels, and controls
-synthesis and quote creation. A rejected response stops drafting with
-support-safe diagnostics and no additional provider attempt. A truncated
-HTTP body is reported as a partial response, including when the status
-indicates an upstream error. The gateway discards the partial body and
-records the send with unknown usage and cost.
+still checks one observation per source, preserves source order and labels,
+and controls synthesis and quote creation. A rejected response stops drafting
+with a support reference. If a body read is interrupted or short, the
+gateway discards the partial body and records one failed send with unknown
+usage and cost. For a complete image-batch error, the gateway reports a
+schema rejection only when an allowlisted provider field identifies one.
 
 The current batch runner also supports the default-off request format.
 Retire that format after both installed routes qualify for the strict schema

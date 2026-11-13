@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 from decimal import Decimal, InvalidOperation
-from http.client import IncompleteRead
+from http.client import HTTPException
 import json
 import math
 import re
@@ -54,16 +54,19 @@ SCHEMA_ERROR_PARAMS = frozenset({"text", "text.format", "text.format.type", "tex
                                 "text.format.strict", "text.format.schema", "response_format"})
 
 
-def schema_rejected(data, diagnostics):
-    """Closed machine fields only. Never classify errors from provider prose."""
+def schema_rejected(data, diagnostics, *, strict_image_observations):
+    """Use allowlisted provider fields. Synthesis retains its existing status rule."""
     metadata = draft_provider_error_diagnostics(data)
-    return (diagnostics.get("http_status") in {400, 404, 405, 415, 422}
-            or metadata.get("provider_error_code") in SCHEMA_ERROR_CODES
-            or metadata.get("provider_error_type") in SCHEMA_ERROR_CODES
-            or metadata.get("provider_error_class") in SCHEMA_ERROR_CODES
-            or metadata.get("provider_error_param") in SCHEMA_ERROR_PARAMS
-            or diagnostics.get("provider_error_code") in SCHEMA_ERROR_CODES
-            or diagnostics.get("provider_error_param") in SCHEMA_ERROR_PARAMS)
+    if not strict_image_observations and diagnostics.get("http_status") in {400, 404, 405, 415, 422}:
+        return True
+    error_fields = ("provider_error_code", "provider_error_type", "provider_error_class")
+    transport_fields = error_fields if strict_image_observations else ("provider_error_code",)
+    return (
+        any(metadata.get(key) in SCHEMA_ERROR_CODES for key in error_fields)
+        or any(diagnostics.get(key) in SCHEMA_ERROR_CODES for key in transport_fields)
+        or metadata.get("provider_error_param") in SCHEMA_ERROR_PARAMS
+        or diagnostics.get("provider_error_param") in SCHEMA_ERROR_PARAMS
+    )
 
 
 def http_error_retryable(status, value):
@@ -233,6 +236,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 class BoundedHttpsTransport:
+    @staticmethod
+    def _read_body(response, limit, *, http_status=None):
+        # Once headers arrive, a failed read cannot supply diagnostics or billing.
+        try:
+            return response.read(limit + 1)
+        except (HTTPException, OSError):
+            raise GatewayError("response_partial", boundary="provider_response_shape",
+                               http_status=http_status) from None
+
     def __init__(self, *, opener=None):
         self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect())
 
@@ -246,7 +258,7 @@ class BoundedHttpsTransport:
             metadata = {}
             parsed = None
             try:
-                raw = exc.read(128 * 1024 + 1)
+                raw = self._read_body(exc, 128 * 1024, http_status=status)
                 if len(raw) <= 128 * 1024:
                     length = exc.headers.get("Content-Length") if exc.headers is not None else None
                     if (isinstance(length, str) and re.fullmatch(r"[0-9]{1,12}", length)
@@ -254,8 +266,6 @@ class BoundedHttpsTransport:
                         raise GatewayError("response_partial", boundary="provider_response_shape", http_status=status)
                     parsed = _load_json(raw.decode("utf-8"))
                     metadata = draft_provider_error_diagnostics(parsed)
-            except IncompleteRead:
-                raise GatewayError("response_partial", boundary="provider_response_shape", http_status=status) from None
             except (AttributeError, OSError, ValueError, TypeError, UnicodeError, RecursionError):
                 # Diagnostics are optional; the failed HTTP response remains a failure.
                 metadata = {}
@@ -282,7 +292,7 @@ class BoundedHttpsTransport:
                 length=response.headers.get("Content-Length")
                 if length is not None and (not re.fullmatch(r"[0-9]{1,12}",length) or int(length)>MAX_RESPONSE_BYTES):
                     raise GatewayError("response_size",boundary="provider_response_shape")
-                raw=response.read(MAX_RESPONSE_BYTES+1)
+                raw=self._read_body(response, MAX_RESPONSE_BYTES)
                 if len(raw)>MAX_RESPONSE_BYTES:
                     raise GatewayError("response_size",boundary="provider_response_shape")
                 if length is not None and len(raw)!=int(length):
@@ -290,8 +300,6 @@ class BoundedHttpsTransport:
                 result=_load_json(raw.decode("utf-8"))
         except GatewayError:
             raise
-        except IncompleteRead:
-            raise GatewayError("response_partial", boundary="provider_response_shape") from None
         except (ValueError,TypeError,UnicodeError,RecursionError,OSError,TimeoutError,urllib.error.URLError):
             raise GatewayError("response_invalid",boundary="provider_response_json") from None
         return result
@@ -492,7 +500,9 @@ class AiGateway:
                     exc.diagnostics.setdefault("response_contract_name", contract.name)
                     exc.diagnostics.setdefault("response_contract_reason", exc.reason)
                     exc.diagnostics.setdefault("batch_failure_reason", "batch_provider_failure")
-                if contract is not None and exc.reason != "response_partial" and schema_rejected(data, exc.diagnostics):
+                if (contract is not None and exc.reason != "response_partial"
+                        and schema_rejected(data, exc.diagnostics,
+                                            strict_image_observations=strict_image_observations)):
                     exc.reason = "response_schema_rejected"
                     exc.retryable = False
                     exc.diagnostics.update(failure_boundary="provider_response_schema",
