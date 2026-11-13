@@ -43787,10 +43787,56 @@ main().catch((error) => {
             (f"the surveyor has not finished independently checking the dimensions for {east}", {east}),
             (f"the surveyor did not complete verification of the dimensions for {east}", {east}),
             (f"the dimensions for {east} have been approved, subject to approval of the invoice", set()),
+            (f"the dimensions for each of the {west} and the {east} have not been measured", {west, east}),
+            (f"we still need to double-check the dimensions for {east} as well as {west}", {west, east}),
+            (f"the measurements on {east} have so far only been checked approximately", {east}),
+            (f"verification for the dimensions on {east} has not yet commenced", {east}),
+            (f"verification for the dimensions on {east} is not yet underway", {east}),
+            (f"verification for the dimensions on {east} has been initiated", {east}),
+            (f"verification for the dimensions on {east} no longer needs to start", set()),
+            (f"the surveyor has begun to verify the dimensions for {east}", {east}),
+            (f"the surveyor has not yet started verifying the dimensions for {east}", {east}),
+            (f"the surveyor is beginning verification of the dimensions for {east}", {east}),
+            (f"the dimensions for {east} are starting to be checked", {east}),
+            (f"the dimensions for {west} are complete, and those for {east} still require verification", {east}),
+            (f"the invoices for {west} are ready, and those for {east} still require verification", set()),
+            (f"the measurements on {east} have been approved, subject to the further review of their dimensions", {east}),
+            (f"the surveyor has started reviewing the invoice for {east}", set()),
+            (f"independent review of the dimensions for {east} is underway", {east}),
+            (f"verification of the invoice for {east} has not yet commenced", set()),
+            (f"the dimensions on {east} were approved subject to independent review of the invoice", set()),
             ("drawing source, pending site verification", {west}),
         ):
             with self.subTest(note=note):
                 self.assertEqual(webapp.area_qualification_scopes(note, {west}, patterns), expected)
+        west, east = "west floor area", "east floor area"
+        patterns = webapp.area_scope_patterns({west, east})
+        for note, expected in (
+            (f"the dimensions for {east} are still being checked", {east}),
+            (f"verification of the dimensions for {east} has started", {east}),
+            (f"{east} has not been verified", {east}),
+            (f"the surveyor must still verify {west} and {east}'s dimensions", {west, east}),
+            (f"the dimensions for both {west} and {east} have been verified", set()),
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(webapp.area_qualification_scopes(note, {west}, patterns), expected)
+
+    def test_area_length_conflicts_require_a_distinct_source_heading(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        for length in ("6-metre", "6\u2011metre", "6\u2013metre", "\uff16\u00a0METRES",
+                       "6 inches", "6\u2033", "6-in", "6 in wide", "1 1/2 ft", "-0.4 m", "5'11\""):
+            for heading, expected in (("", {east}), ("Sample stock: ", {west, east})):
+                with self.subTest(length=length, heading=heading):
+                    source = f"{west}: 24 sqm; {heading}the reference tape has a length of {length}; {east}: 10 sqm"
+                    self.assertEqual({claim.scope for claim in webapp.area_source_claims(source, patterns)
+                                      if claim.eligible}, expected)
+        for prose in ("there are 6 installers", "six people arrived at 6 in the morning", "the owner selected model T6-m",
+                      'the owner requested item "6"', "the owner requested item \u201c6\u201d"):
+            with self.subTest(prose=prose):
+                source = f"{west}: 24 sqm; {prose}; {east}: 10 sqm"
+                self.assertEqual({claim.scope for claim in webapp.area_source_claims(source, patterns)
+                                  if claim.eligible}, {west, east})
 
     def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
         import socket
@@ -44058,6 +44104,21 @@ main().catch((error) => {
             ("pd-list-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions for Carpet tile west and Carpet tile east have been fully verified)", 24, "observed", True),
             ("pd-linear", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved 6 m of sample tape", 24, "observed", False),
             ("pd-head-len", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample stock: the surveyor moved 6 m of sample tape", 24, "observed", True),
+            ("pd-started", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (independent verification of the dimensions for Carpet tile east has started)", 24, "observed", True),
+            ("pd-not-started", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (independent verification of the dimensions for Carpet tile east has not started)", 24, "observed", True),
+            ("pd-event-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (independent verification of the dimensions for Carpet tile east has finished)", 24, "observed", True),
+            ("pd-event-execute", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor still needs to carry out verification of the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-event-gerund", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has not yet started verifying the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-event-unneeded", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor no longer needs to carry out verification of the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-cond-review", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor approved the dimensions for Carpet tile east, subject to independent review of the site measurements)", 24, "observed", True),
+            ("pd-cond-inv-rev", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor approved the dimensions for Carpet tile east, subject to independent review of the invoice)", 24, "observed", True),
+            ("pd-both-shared", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions for both Carpet tile west and Carpet tile east are still being checked)", 24, "observed", False),
+            ("pd-both-poss", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor must still verify Carpet tile west and Carpet tile east's dimensions)", 24, "observed", False),
+            ("pd-both-ref", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor must still verify the dimensions of Carpet tile west and those of Carpet tile east)", 24, "observed", False),
+            ("pd-ref-clause", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions for Carpet tile west are complete, and those for Carpet tile east still require verification)", 24, "observed", True),
+            ("pd-linear-hyphen", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved a 6-metre sample tape", 24, "observed", False),
+            ("pd-linear-inch", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved 6 inches of sample tape", 24, "observed", False),
+            ("pd-head-hyphen", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample stock: the surveyor moved a 6-metre sample tape", 24, "observed", True),
             ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
             ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
             ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
@@ -44098,6 +44159,10 @@ main().catch((error) => {
             "pd-other-actor", "pd-part-front", "pd-part-tail", "pd-east-wrap",
             "pd-asp-tail", "pd-chain", "pd-chain-pass", "pd-unfinished", "pd-finish", "pd-cond-comma",
             "pd-obj-list", "pd-subj-list", "pd-finished", "pd-list-done", "pd-linear", "pd-head-len",
+            "pd-started", "pd-not-started", "pd-event-done", "pd-event-execute", "pd-event-unneeded",
+            "pd-event-gerund", "pd-ref-clause",
+            "pd-cond-review", "pd-cond-inv-rev", "pd-both-shared", "pd-both-poss", "pd-both-ref",
+            "pd-linear-hyphen", "pd-linear-inch", "pd-head-hyphen",
         }
         scoped_annotations = {
             "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
@@ -44278,6 +44343,9 @@ main().catch((error) => {
                             "pd-east-subject", "pd-east-object", "pd-east-for", "pd-east-on", "pd-east-part",
                             "pd-east-cond", "pd-part-front", "pd-east-wrap",
                             "pd-asp-tail", "pd-chain", "pd-unfinished", "pd-cond-comma", "pd-obj-list", "pd-subj-list",
+                            "pd-started", "pd-not-started", "pd-event-execute", "pd-cond-review",
+                            "pd-event-gerund", "pd-ref-clause",
+                            "pd-both-shared", "pd-both-poss", "pd-both-ref",
                         }
                         north_priced = name in north_cases and name not in {
                             "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
@@ -44509,7 +44577,7 @@ main().catch((error) => {
             session_id = "quote-admitted-scope-ledger"
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [statement, disputed, f"{disputed} (provisional in drawing)"]}
-            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 21):
+            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 22):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
             self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
@@ -44571,7 +44639,7 @@ main().catch((error) => {
             self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
             self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
             earlier = copy.deepcopy(ledger)
-            for version in range(1, 22):
+            for version in range(1, 23):
                 earlier["rows"]["floor"]["measurement"]["claim_version"] = version
                 readable = webapp.normalized_pricing_ledger(earlier)
                 self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
@@ -44585,7 +44653,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 21
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 22
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
