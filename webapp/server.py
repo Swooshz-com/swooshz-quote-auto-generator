@@ -25654,7 +25654,7 @@ AREA_CONDITION_EVENT = rf"(?:{AREA_VERIFICATION_TOPIC}|{AREA_APPROVAL_TOPIC})"
 AREA_ACTIVE_ACTION = r"(?:confirm|verify|validate|check|measure|approve|sign[\s-]+off)\b"
 AREA_ONGOING_ACTION = r"(?:confirming|verifying|validating|checking|measuring|approving|signing[\s-]+off)\b"
 AREA_VERIFICATION_EVENT_STATUS = (
-    rf"(?:(?:{AREA_MANNER_ADVERB}\s+)*{AREA_VERIFICATION_REQUIREMENT}|in\s+progress\b|under\s*way\b"
+    rf"(?:{AREA_VERIFICATION_REQUIREMENT}|in\s+progress\b|under\s*way\b"
     rf"|{AREA_VERIFICATION_FUTURE}\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:occur|happen|begin|take\s+place)\b)"
 )
 AREA_PARTIAL_SUBJECT = r"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?"

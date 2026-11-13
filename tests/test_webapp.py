@@ -43780,6 +43780,8 @@ main().catch((error) => {
             ("flooring dimensions " + "partly " * 1000 + "reported", set()),
             ("flooring dimensions " + "has still " * 2000 + "reported", set()),
             ("flooring dimensions " + "has still " * 2000 + "been partly verified", {west}),
+            ("site verification " + "independently " * 2000 + "reported", set()),
+            ("site verification " + "independently " * 2000 + "required", {west}),
             (f"the surveyor has finished checking the dimensions for {east}", set()),
             (f"the surveyor has not finished checking the dimensions for {east}", {east}),
             (f"the surveyor has not finished independently checking the dimensions for {east}", {east}),
