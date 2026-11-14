@@ -43891,7 +43891,7 @@ main().catch((error) => {
         for prefix in ("", "as of this morning ", "up to last week ", "at this stage, ",
                        "for the time being ", "by the end of this week\n", "in the meantime ",
                        "as of yet ", "to this point ", "by midnight ", "before noon ",
-                       "by 09:30 ", "before 9 pm "):
+                       "by 09:30 ", "before 9 pm ", "between 9 am and 10 am ", "from 9 am to 10 am "):
             for clause, expected in (
                 ("nobody has verified them", {east}),
                 ("no independent surveyor has verified them", {east}),
@@ -43920,10 +43920,10 @@ main().catch((error) => {
         patterns = webapp.area_scope_patterns({east, west})
         amounts = f"{east}: 10 sqm; {west}: 14 sqm; "
         checked = f"We checked the dimensions for {east}. "
-        for time in ("09:30", "09:30:45", "9 pm"):
+        for time in ("By 09:30", "By 09:30:45", "By 9 pm", "Between 09:30 and 10:30"):
             for actor, eligible in (("Nobody", False), ("The surveyor", True)):
                 with self.subTest(time=time, actor=actor):
-                    note = amounts + checked + f"By {time} {actor} has verified them."
+                    note = amounts + checked + f"{time} {actor} has verified them."
                     claims = list(webapp.area_source_claims(note, patterns))
                     self.assertEqual({claim.scope for claim in claims if not claim.eligible},
                                      set() if eligible else {east})
@@ -44934,6 +44934,7 @@ main().catch((error) => {
             (f"{checked} To this point nobody has verified them.", {"west"}, (230.20, 250.92)),
             (f"{checked} We sent drawing and report (they remain unverified).", {"east", "west"}, (374.20, 407.88)),
             (f"{checked} By 09:30 nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} Between 9 am and 10 am nobody has verified them.", {"west"}, (230.20, 250.92)),
             (f"{checked} The surveyor who met the installer who spoke to the foreman has not verified them.",
              {"west"}, (230.20, 250.92)),
         )

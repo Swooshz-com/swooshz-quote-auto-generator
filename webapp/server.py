@@ -25781,6 +25781,10 @@ AREA_TEMPORAL_POINT = (
     r"|(?:this|that|the\s+(?:present|current))\s+(?:stage|point|moment|time)"
     rf"|the\s+(?:start|beginning|middle|end|close)\s+of\s+{AREA_TIME_PERIOD})"
 )
+AREA_TIME_INTERVAL = re.compile(
+    rf"\b(?:between\s+{AREA_TEMPORAL_POINT}(?P<link>\s+and\s+){AREA_TEMPORAL_POINT}"
+    rf"|from\s+{AREA_TEMPORAL_POINT}\s+(?:to|until|through)\s+{AREA_TEMPORAL_POINT})(?=\s|$)", re.I,
+)
 AREA_CLAUSE_ADJUNCT = re.compile(
     rf"(?:(?:as\s+of|(?:up\s+)?to|until|since|by|before|after)\s+{AREA_TEMPORAL_POINT}"
     r"|as\s+yet|at\s+(?:present|(?:this|that|the)\s+(?:stage|point|moment|time))"
@@ -26950,8 +26954,8 @@ def area_qualification_predicate(
 
 def area_clause_after_adjuncts(text: str, start: int, stop: int) -> int:
     """Read leading adjuncts before assigning the actor or measured subject."""
-    while adjunct := AREA_CLAUSE_ADJUNCT.match(text, start, stop):
-        start = adjunct.end()
+    while adjunct := (AREA_CLAUSE_ADJUNCT.match(text, start, stop) or AREA_TIME_INTERVAL.match(text, start, stop)):
+        start = AREA_FRAME_SPACE.match(text, adjunct.end(), stop).end()
     intro = AREA_INITIAL_ADJUNCT.match(text, start, stop)
     if intro is None:
         return start
@@ -27106,7 +27110,10 @@ def area_qualification_clauses(source: AreaSourceSpans, text: str):
     """Read local separators, retaining the individual conjuncts of comma lists."""
     clauses = []
     start = 0
+    interval_links = {match.start("link") for match in AREA_TIME_INTERVAL.finditer(text) if match["link"]}
     for stop, next_start, separator in source.separators(AREA_QUALIFICATION_CLAUSE_BREAK, 0, len(text), text=text):
+        if stop in interval_links:
+            continue
         if AREA_CLAUSE_COORDINATOR.fullmatch(separator.lstrip()) and not text[start:stop].strip():
             continue  # After punctuation, the coordinator belongs to the next clause.
         # A child can sit in the whitespace consumed before a conjunction.
