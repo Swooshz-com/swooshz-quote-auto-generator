@@ -1,19 +1,23 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-13
+Last updated: 2026-11-14
 
 Sources of truth: `.github/workflows/ci.yml`, `.github/workflows/plain-text.yml`,
 and the two Toolkit Programme Sweep workflows.
 
 The cloud programme sweep runs on pushes to `main` or by dispatch. The hourly
-gate and eligible repository activity dispatch it on `main` only. The sweep
-checks the selected ref before minting the separate GitHub App tokens for the
-quote repository and private evidence store. Footer cleanup requires a refresh
-that ran on the same commit and skips when the refresh reaches its rate limit.
-The hourly gate skips invalid programme bindings, including legacy bindings with
-version 2 governance fields.
-The sweep uses the existing repository App variable and secret. These
-workflows update programme records and do not deploy the application.
+gate also starts it on `main` after eligible repository activity or CI.
+The sweep checks the selected ref and programme binding before minting
+separate GitHub App tokens for the quote repository and its private evidence
+store. Both use the existing App variable and secret. An off-main run or
+invalid binding leaves both token steps skipped.
+
+The sweep reads large state documents by Git blob ID when GitHub truncates
+them in the bulk response, within the sweep's request budget. After writing
+nested state, it verifies the saved blob IDs against the bytes it wrote.
+Footer cleanup requires both tokens and a refresh that ran on the same
+commit. It skips queued runs and passes stopped at the App rate limit.
+These workflows maintain programme records.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.
