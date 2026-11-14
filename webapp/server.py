@@ -25585,7 +25585,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 28
+AREA_EVIDENCE_CLAIM_VERSION = 29
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25703,6 +25703,9 @@ AREA_REFERENTIAL_SUBJECT = re.compile(
     rf"(?P<partial>{AREA_PARTIAL_SUBJECT})?(?P<topic>(?:those|that)\s+{AREA_TOPIC_LINK}{AREA_MASKED_REFERENCE})"
     r"(?=[\s:\-]|$)", re.I,
 )
+AREA_ELIDED_MEASURE_SUBJECT = re.compile(
+    rf"(?:the\s+)?(?P<topic>{AREA_MASKED_REFERENCE})(?=[\s:\-]|$)", re.I,
+)
 AREA_NEGATIVE_ACTOR = re.compile(
     r"(?:nobody|no[\s-]+one|none|neither)\b"
     r"|no\s+(?!(?:longer|further|more|need|reason|requirement)\b)[^\W\d_][\w-]*\b", re.I,
@@ -25752,7 +25755,20 @@ AREA_CONDITION_INTRO = re.compile(rf"\s*,?\s*{AREA_CONDITION_CLAUSE}", re.I)
 AREA_TRAILING_CONDITION = re.compile(rf"\b{AREA_CONDITION_CLAUSE}", re.I)
 AREA_COMPLETED_ACTION = re.compile(rf"\b{AREA_MEASUREMENT_RESULT}", re.I)
 AREA_MEASUREMENT_ACTION = re.compile(rf"\b(?:{AREA_MEASUREMENT_RESULT}|{AREA_ACTIVE_ACTION}|{AREA_ONGOING_ACTION})", re.I)
-AREA_CLAUSE_COORDINATOR = re.compile(r"(?:and|but|while|whereas|nor|or)\s+", re.I)
+AREA_ADDITIVE_CONNECTOR = r"(?:and|as\s+well\s+as|together\s+with)"
+AREA_CLAUSE_CONNECTOR = rf"(?:{AREA_ADDITIVE_CONNECTOR}|but|while|whereas|nor|or)"
+AREA_CLAUSE_COORDINATOR = re.compile(rf"{AREA_CLAUSE_CONNECTOR}\s+", re.I)
+AREA_ADDITIVE_COORDINATOR = re.compile(AREA_ADDITIVE_CONNECTOR, re.I)
+AREA_TEMPORAL_POINT = (
+    r"(?:now|today|yesterday|then|date|(?:this|that|last|the\s+previous)\s+"
+    r"(?:morning|afternoon|evening|day|week|month|quarter|year)|the\s+(?:start|beginning|end)\s+"
+    r"of\s+(?:this|that|last|the\s+previous)\s+(?:day|week|month|quarter|year))"
+)
+AREA_CLAUSE_ADJUNCT = re.compile(
+    rf"(?:as\s+of\s+{AREA_TEMPORAL_POINT}|(?:up\s+)?(?:to|until|since|by)\s+{AREA_TEMPORAL_POINT}"
+    r"|as\s+yet|at\s+(?:present|(?:this|that|the)\s+(?:stage|point|moment|time))"
+    r"|for\s+(?:now|the\s+time\s+being)|so\s+far|in\s+the\s+meantime)(?:\s+|$)", re.I,
+)
 AREA_CONTINUATION = re.compile(
     rf"\s*(?=$|[,;.!?]|(?:by|yet\b|today\b|tomorrow\b|{AREA_VERIFICATION_TIMING}\b|in\s+part|only\s+in\s+part|"
     rf"{AREA_CONDITION_PREFIX}|{AREA_CONDITION_CLAUSE}|{AREA_MANNER_ADVERB}\b))", re.I,
@@ -25815,6 +25831,11 @@ AREA_HEADING_COLON = re.compile(":")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
 # A closed aside becomes whitespace. Test a whitespace run once when looking for conjunctions.
 AREA_QUALIFICATION_BREAK = re.compile(r",(?!\d)|;|[.!?](?=\s|$)|(?<!\s)\s++(?:and|but|whereas|while|or|nor)\s+", re.I)
+# Comparison parsing keeps its own boundaries. These additional connectors
+# divide qualification clauses only where the reference masker left them intact.
+AREA_QUALIFICATION_CLAUSE_BREAK = re.compile(
+    rf",(?!\d)|;|[.!?](?=\s|$)|(?<!\s)\s++{AREA_CLAUSE_CONNECTOR}\s+", re.I,
+)
 AREA_ANNOTATION_BREAK = re.compile(rf"{AREA_QUALIFICATION_BREAK.pattern}|\s+then\s+|\r?\n", re.I)
 AREA_SCOPE_WRAPPERS = str.maketrans("()[]{}", "      ")
 AREA_CONTEXT_RELATION_SPAN = re.compile(
@@ -26692,7 +26713,7 @@ def area_qualification_predicate(
     if pronoun_subject:
         subject_roles = inherited_roles or ()
     carry_roles = subject_roles if subject else inherited_roles
-    partial = bool(subject and not pronoun_subject and subject["partial"])
+    partial = bool(subject and subject.groupdict().get("partial"))
     event_subject = bool(subject and not pronoun_subject and AREA_EVENT_SUBJECT.fullmatch(subject["topic"]))
     negative = bool(subject and subject.groupdict().get("negative"))
     future = ongoing = duty = started = expired_duty = False
@@ -26833,15 +26854,36 @@ def area_qualification_predicate(
     return None
 
 
+def area_clause_after_adjuncts(text: str, start: int, stop: int) -> int:
+    """Read leading adjuncts before assigning the actor or measured subject."""
+    while adjunct := AREA_CLAUSE_ADJUNCT.match(text, start, stop):
+        start = adjunct.end()
+    return start
+
+
+def area_qualification_subject(
+    text: str, first: int, last: int, previous: AreaQualification | None,
+    *, additive: bool = False,
+) -> re.Match[str] | None:
+    subject = area_measured_subject(text, first, last)
+    if subject is not None or previous is None or not previous.roles:
+        return subject
+    if subject := AREA_REFERENTIAL_SUBJECT.match(text, first, last):
+        return subject
+    if additive and (subject := AREA_ELIDED_MEASURE_SUBJECT.match(text, first, last)):
+        following = AREA_FRAME_SPACE.match(text, subject.end(), last).end()
+        if following == last or AREA_FINITE_BRIDGE.match(text, following, last):
+            return subject
+    return None
+
+
 def area_qualification_claim(
     text: str, first: int, last: int, previous: AreaQualification | None,
-    *, measured_topics: dict[str, AreaQualification] | None = None, prerequisite: bool = False,
+    *, measured_topics: dict[str, AreaQualification] | None = None, prerequisite: bool = False, additive: bool = False,
 ) -> AreaQualification | None:
-    subject = area_measured_subject(text, first, last)
-    if subject is None:
-        if previous and previous.roles:
-            subject = AREA_REFERENTIAL_SUBJECT.match(text, first, last)
-        subject = subject or AREA_SUBJECT_PRONOUN.match(text, first, last)
+    first = area_clause_after_adjuncts(text, first, last)
+    subject = area_qualification_subject(text, first, last, previous, additive=additive)
+    subject = subject or AREA_SUBJECT_PRONOUN.match(text, first, last)
     inherited_roles = previous.roles if previous else None
     if previous is not None and not previous.roles and (subject is None or subject.re is AREA_SUBJECT_PRONOUN):
         if subject is not None:
@@ -26882,6 +26924,10 @@ def area_bind_qualification_roles(
                 return replace(claim, roles=reference.roles, number=reference.number)
             if measured_topics:
                 return None
+        elif previous and previous.roles and (
+            AREA_REFERENTIAL_SUBJECT.fullmatch(text, begin, end) or AREA_ELIDED_MEASURE_SUBJECT.fullmatch(text, begin, end)
+        ):
+            number = previous.number
         elif previous is not None and AREA_IMPLICIT_VERIFICATION.fullmatch(text, begin, end):
             return replace(claim, roles=previous.roles, number=previous.number) if previous.roles else None
     return replace(claim, number=number)
@@ -26926,12 +26972,12 @@ def area_qualification_clauses(source: AreaSourceSpans, text: str):
     """Read local separators, retaining the individual conjuncts of comma lists."""
     clauses = []
     start = 0
-    for stop, next_start, separator in source.separators(AREA_QUALIFICATION_BREAK, 0, len(text), text=text):
-        if separator.strip().isalpha() and not text[start:stop].strip():
+    for stop, next_start, separator in source.separators(AREA_QUALIFICATION_CLAUSE_BREAK, 0, len(text), text=text):
+        if AREA_CLAUSE_COORDINATOR.fullmatch(separator.lstrip()) and not text[start:stop].strip():
             continue  # After punctuation, the coordinator belongs to the next clause.
         # A child can sit in the whitespace consumed before a conjunction.
         stop += len(separator) - len(separator.lstrip())
-        clauses.append((start, stop, separator.strip()))
+        clauses.append((start, stop, " ".join(separator.casefold().split())))
         start = next_start
     clauses.append((start, len(text), ""))
     spans = []
@@ -26940,13 +26986,15 @@ def area_qualification_clauses(source: AreaSourceSpans, text: str):
         first = stop - len(clause.lstrip())
         last = start + len(clause.rstrip())
         coordinator = AREA_CLAUSE_COORDINATOR.match(text, first, last)
-        spans.append((coordinator.end() if coordinator else first, last, coordinator, separator, stop))
+        first = area_clause_after_adjuncts(text, coordinator.end() if coordinator else first, last)
+        spans.append((first, last, coordinator, separator, stop))
     list_comma = False
     for index in range(len(spans) - 2, -1, -1):
         first, last, coordinator, separator, stop = spans[index]
         next_coordinator = spans[index + 1][2]
         list_comma = separator == "," and (
-            list_comma or (next_coordinator and next_coordinator[0].strip() in {"and", "or", "nor"})
+            list_comma or (next_coordinator and (AREA_ADDITIVE_COORDINATOR.fullmatch(next_coordinator[0].strip())
+                                               or next_coordinator[0].strip().casefold() in {"or", "nor"}))
         )
         if list_comma:
             spans[index] = (first, last, coordinator, "list", stop)
@@ -27065,8 +27113,9 @@ def area_local_qualification_scopes(
     ) -> bool:
         """Read an explicit topic even when its parent frame has no recognised predicate."""
         nonlocal local_topic
-        if child_index < len(children) and children[child_index][0] < stop:
-            if subject := area_measured_subject(text, first, last):
+        has_child = child_index < len(children) and children[child_index][0] < stop
+        if has_child or (additive and prior is not None):
+            if subject := area_qualification_subject(text, first, last, prior, additive=additive):
                 local = AreaQualification((subject.span("topic"),))
                 topic = area_bind_qualification_roles(text, local, prior, measured_topics)
                 if topic is not None:
@@ -27074,13 +27123,14 @@ def area_local_qualification_scopes(
                         seed_measured_children(topic, first, stop)
                     else:
                         remember(topic, first, last, stop)
+                        if additive and previous and previous.pending and subject.end() == last:
+                            # An elided shared result can still qualify the new member.
+                            dispute(topic)
                     return False
         if not antecedent and child_index == len(children):
             return False
         conjunct = condition_ordinary_conjunct if temporary else ordinary_conjunct
-        joined = conjunct and (separator == "and" or (
-            separator == "list" and coordinator and coordinator[0].strip().casefold() == "and"
-        ))
+        joined = conjunct and additive
         number, end = area_intervening_topic(text, first, last, conjunct=bool(joined))
         if not number:
             return False
@@ -27138,6 +27188,9 @@ def area_local_qualification_scopes(
             affected.update(area_qualification_targets(dependency.roles, references, patterns))
 
     for first, last, coordinator, following, stop in area_qualification_clauses(source, text):
+        additive = bool(AREA_ADDITIVE_COORDINATOR.fullmatch(separator) or (
+            coordinator and AREA_ADDITIVE_COORDINATOR.fullmatch(coordinator[0].strip())
+        ))
         seed_children(first)
         next_ordinary_conjunct = False
         if first < last:
@@ -27153,7 +27206,7 @@ def area_local_qualification_scopes(
                 leading_bound = False
             if reading_condition:
                 retain_condition(area_qualification_claim(
-                    text, first, last, condition, measured_topics=measured_topics, prerequisite=True,
+                    text, first, last, condition, measured_topics=measured_topics, prerequisite=True, additive=additive,
                 ), first, last, stop)
             elif intro := area_condition_start(text, first, last):
                 conditional_result = previous if separator == "," else None
@@ -27184,7 +27237,9 @@ def area_local_qualification_scopes(
                     # An ordinary topic supersedes an elided role until a more
                     # recent measured phrase supplies the child frame's subject.
                     prior = AreaQualification(())
-                claim = area_qualification_claim(text, first, last, prior, measured_topics=measured_topics)
+                claim = area_qualification_claim(
+                    text, first, last, prior, measured_topics=measured_topics, additive=additive,
+                )
                 if claim is not None:
                     if leading_bound and separator in {"but", "whereas", "while", ","}:
                         leading_dependency = None
@@ -27204,12 +27259,12 @@ def area_local_qualification_scopes(
                             conditional_result = claim
                             trailing_condition = True
                 else:
-                    previous = None
                     # Give main and subordinate topics their own source ranges.
                     intro = AREA_TRAILING_CONDITION.search(text, first, last)
                     topic_stop = intro.start() if intro else last
                     if not pronoun:
                         next_ordinary_conjunct = seed_local_topic(first, topic_stop, intro.start() if intro else stop, prior)
+                    previous = None
                     if intro:
                         seed_children(intro.end())
                         temporal_condition = bool(intro["temporal"])

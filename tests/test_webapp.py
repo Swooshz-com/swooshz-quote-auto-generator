@@ -43884,6 +43884,61 @@ main().catch((error) => {
             with self.subTest(note=note):
                 self.assertEqual(webapp.area_qualification_scopes(note, {west}, patterns), expected)
 
+    def test_area_actor_polarity_survives_leading_clause_adjuncts(self):
+        east, west = "east flooring", "west flooring"
+        patterns = webapp.area_scope_patterns({east, west})
+        measured = f"we checked the dimensions for {east}. "
+        for prefix in ("", "as of this morning ", "up to last week ", "at this stage, ",
+                       "for the time being ", "by the end of this week\n", "in the meantime "):
+            for clause, expected in (
+                ("nobody has verified them", {east}),
+                ("no independent surveyor has verified them", {east}),
+                ("none of them have been verified", {east}),
+                (f"no one has verified the dimensions for {west}", {west}),
+                ("the surveyor has verified them", set()),
+                ("nobody has verified the report", set()),
+            ):
+                with self.subTest(prefix=prefix, clause=clause):
+                    self.assertEqual(
+                        webapp.area_qualification_scopes(measured + prefix + clause, {west}, patterns), expected,
+                    )
+
+        documents = measured + "As of today the invoices were sent. "
+        for clause, expected in (
+            ("as yet nobody has verified them", set()),
+            ("as of today those dimensions remain unverified", {east}),
+            ("the supervisor said nobody verified the invoice", set()),
+            ("the supervisor who knows nobody has verified the invoice", set()),
+        ):
+            with self.subTest(clause=clause):
+                self.assertEqual(webapp.area_qualification_scopes(documents + clause, {west}, patterns), expected)
+
+    def test_area_post_result_asides_follow_local_coordinated_topics(self):
+        east, west = "east flooring", "west flooring"
+        patterns = webapp.area_scope_patterns({east, west})
+        result = f"the dimensions for {east} were checked"
+        for link in ("and ", "AS WELL AS ", "as well\nas ", "together with ", ", together with "):
+            topic = f"the dimensions for {west}"
+            for clause, expected in (
+                (f"{result} {link}{topic} (remain unverified)", {west}),
+                (f"{result} {link}{topic}. [They remain unverified]", {west}),
+                (f"{result} (remain unverified) {link}{topic} (already verified)", {east}),
+                (f"{result} {link}{topic} (already verified)", set()),
+                (f"{result} {link}{topic} were not verified", {west}),
+                (f"{result} {link}those for {west} (remain unverified)", {west}),
+                (f"{result} {link}[{west}] (remain unverified)", {west}),
+                (f"{result} {link}{west} remain unverified", {west}),
+                (f"{result} {link}the drawing for {west} (remain unverified)", set()),
+                (f"the dimensions for {east} were not checked {link}{topic}", {east, west}),
+                (f"{result}. We sent the drawing {link}the report (they remain unverified)", set()),
+                (f"{result}. We sent the drawing {link}report [still unverified]", set()),
+                (f"{result}. We sent the drawing {link}the report (those dimensions remain unverified)", {east}),
+                (f"{result} after the drawing {link}the report (they remain unverified) were sent", set()),
+                (f"{result} after {topic} (remain unverified) were reviewed", {west}),
+            ):
+                with self.subTest(clause=clause):
+                    self.assertEqual(webapp.area_qualification_scopes(clause, {east}, patterns), expected)
+
     def test_area_length_conflicts_require_a_distinct_source_heading(self):
         west, east = "carpet tile west", "carpet tile east"
         patterns = webapp.area_scope_patterns({west, east})
@@ -44794,6 +44849,128 @@ main().catch((error) => {
                             if name in north_cases:
                                 self.assertEqual(any("5 sqm" in row and 72 in row for row in values), north_priced)
 
+    def test_area_pricing_survives_reopen_and_protected_download_across_sources(self):
+        from textwrap import wrap as wrap_pdf_line
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers, write_text_pdf
+        from tests.gateway_test_support import synthetic_configuration
+        from tests.test_basis_quantity_retention import EvidenceTransport
+        from webapp import ai_gateway
+
+        east, west = "Carpet tile east", "Carpet tile west"
+        checked = f"We checked the dimensions for {east}."
+        spot = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        specifications = (
+            ("east", east, 10, "sqm", self.LEDGER_CARPET, 144.00),
+            ("west", west, 14, "sqm", self.LEDGER_CARPET, 201.60),
+            ("spot", "Synthetic spotlight 6 inch", 2, "nos", spot, 28.60),
+        )
+        cases = (
+            (f"{checked} As of today nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} As of today the surveyor has verified them.", {"east", "west"}, (374.20, 407.88)),
+            (f"The dimensions for {east} were checked as well as the dimensions for {west} (remain unverified).",
+             {"east"}, (172.60, 188.13)),
+            (f"{checked} We sent the drawing together with the report (they remain unverified).",
+             {"east", "west"}, (374.20, 407.88)),
+        )
+        config = synthetic_configuration(credential="synthetic")
+        with (mock.patch.dict(os.environ, self._ledger_env()),
+              mock.patch.object(webapp, "read_dotenv_value", side_effect=config.get),
+              mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
+              tempfile.TemporaryDirectory() as scratch, LocalRunnerServer() as runner):
+            root = Path(scratch)
+            headers = self._ledger_runner_headers(runner)
+            for route in ("notes", "pdf", "batch"):
+                source_label = "Quote notes" if route == "notes" else "Reference 1, PDF page 1"
+                lines, items = [], []
+                for row_id, label, quantity, unit, keyword, _ in specifications:
+                    fields = {"quantity": quantity, "unit": unit, "pricing_keyword": keyword}
+                    line = {"id": row_id, "tag": "Confirm", "text": label, "confidence_pct": 90, **fields}
+                    if unit == "sqm":
+                        line.update(scope_kind="physical", measurement_evidence={
+                            "kind": "observed", "source": source_label, "statement": f"{label}: {quantity} sqm",
+                        })
+                    lines.append(line)
+                    items.append({"source_basis_line_id": row_id, "description": label, **fields,
+                                  "section": "Floors" if unit == "sqm" else "Lighting and AV"})
+                provider = {"quote_basis_sections": [
+                    {"id": "floors", "title": "Floors", "lines": lines[:2]},
+                    {"id": "lighting", "title": "Lighting and AV", "lines": lines[2:]},
+                ], "line_items": items}
+                for index, (clause, accepted, totals) in enumerate(cases):
+                    with self.subTest(route=route, clause=clause):
+                        included = accepted | {"spot"}
+                        session_id = f"quote-area-download-{route}-{index}"
+                        payload = self._ledger_draft_payload(session_id)
+                        note = "; ".join((f"{east}: 10 sqm", f"{west}: 14 sqm", clause))
+                        if route == "notes":
+                            payload["notes"] = note
+                        elif route == "pdf":
+                            pdf = root / "survey.pdf"
+                            write_text_pdf(pdf, "Synthetic survey;", wrap_pdf_line(note, 88))
+                            payload["images"] = [{"name": pdf.name, "data_url": "data:application/pdf;base64," +
+                                                  base64.b64encode(pdf.read_bytes()).decode("ascii")}]
+                        else:
+                            payload["images"] = [{"name": "synthetic.pdf", "data_url": synthetic_pdf(13)}]
+                        transport = EvidenceTransport(provider_result=copy.deepcopy(provider), measurement_note=note)
+                        with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
+                            raw = webapp.request_openai_quote_basis(payload, "synthetic")
+                        drafted = webapp.finalized_remote_draft_result(
+                            payload, raw, "openai", "OpenAI", webapp.booth_dimensions_from_payload(payload), [],
+                        )
+                        self.assertEqual(len(transport.calls), 4 if route == "batch" else 1)
+                        entries = {row["id"]: row for row in drafted["pricing_analysis_seal"]["rows"]}
+                        self.assertEqual({row_id for row_id, row in entries.items() if row.get("catalog_item_id")}, included)
+                        request = self._ledger_carry_draft(payload, drafted)
+                        for row_id, *_ in specifications:
+                            self._ledger_line(request, row_id)["tag"] = "Include" if row_id in included else "Exclude"
+                        request["line_items"] = [row for row in request["line_items"] if row["source_basis_line_id"] in included]
+                        state = request["quote_session"]["draft_state"]
+                        state["originalAnalysisSnapshot"].update(
+                            quote_basis_sections=copy.deepcopy(drafted["quote_basis_sections"]),
+                            line_items=copy.deepcopy(drafted["line_items"]),
+                        )
+                        state["originalOutputRows"] = copy.deepcopy(request["line_items"])
+                        details = state["quoteDetails"]
+                        details["company"]["logo_data_url"] = synthetic_image()
+                        details["quote_text"].update(payload["quote_text"])
+                        details["signature"].update(company_signatory="Synthetic signatory", company_title="Synthetic title")
+                        details["commercial_snapshot"]["presence"] = {
+                            key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                            for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
+                        }
+                        self._ledger_sync(request)
+                        self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", request)["status"], 200)
+                        ledger = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]
+                        self.assertEqual({row_id for row_id, row in ledger.items()
+                                          if (row.get("grant") or {}).get("state") == "live"}, included)
+                        response = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                        self.assertEqual(response["status"], 200)
+                        restored = response["body"]["quote_session"]["draft_state"]
+                        request["line_items"] = restored["lineItems"]
+                        request["quote_basis_sections"] = restored["quoteBasisSections"]
+                        for row_id, *_ in specifications:
+                            self.assertEqual(self._ledger_price(request["line_items"], row_id) is not None, row_id in included)
+                        request.pop("pricing_analysis_seal")
+                        state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+                        self._ledger_sync(request)
+                        generated = self._ledger_post(runner, headers, "/api/generate", request)
+                        self.assertEqual(generated["status"], 200)
+                        self.assertEqual(generated["body"]["status"], "completed", generated["body"].get("errors"))
+                        export = generated["body"]["quote_session"]["exports"]["xlsx"]
+                        status, data = local_http_get_bytes(runner, export["url"], headers=headers)
+                        self.assertEqual(status, 200)
+                        workbook = root / "protected.xlsx"
+                        workbook.write_bytes(data)
+                        values = [row for _, row in read_first_sheet_rows_with_numbers(workbook)]
+                        for row_id, _, quantity, unit, _, amount in specifications:
+                            matching = [row for row in values if f"{quantity} {unit}" in row]
+                            self.assertEqual(len(matching), int(row_id in included))
+                            if matching:
+                                self.assertIn(amount, matching[0])
+                        for label, total in zip(("Total", "Total including GST"), totals, strict=True):
+                            [row] = [row for row in values if label in row]
+                            self.assertIn(total, row)
+
     def test_pdf_pricing_evidence_requires_complete_bounded_page_text(self):
         import socket
         from scripts.generate_quote import pdf_escape, read_first_sheet_rows_with_numbers
@@ -44983,11 +45160,10 @@ main().catch((error) => {
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [
                 statement, disputed, f"{disputed} (provisional in drawing)",
-                f"{statement} (we checked the dimensions for {specifications[0][1]}. "
-                "(Those dimensions remain unverified))",
+                f"We checked the dimensions for {specifications[0][1]}. As of today nobody has verified them.",
             ]}
-            # Reproduce a v27 grant from a nested qualification missed by that reader.
-            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 27),
+            # Reproduce a v28 grant issued before the actor's polarity was read.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 28),
                   mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
@@ -45018,11 +45194,11 @@ main().catch((error) => {
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 # Save before any current-version request can demote the old signed grant.
-                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 27):
+                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 28):
                     self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
-                    saved_v27 = webapp.read_quote_session_metadata(session_id)
-                    saved_floor = saved_v27["pricing_ledger"]["rows"]["floor"]
-                    self.assertEqual(saved_floor["measurement"]["claim_version"], 27)
+                    saved_v28 = webapp.read_quote_session_metadata(session_id)
+                    saved_floor = saved_v28["pricing_ledger"]["rows"]["floor"]
+                    self.assertEqual(saved_floor["measurement"]["claim_version"], 28)
                     self.assertEqual(saved_floor["grant"]["state"], "live")
                 for path in ("seal", "ledger"):
                     with self.subTest(path=path):
@@ -45031,7 +45207,7 @@ main().catch((error) => {
                         self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
                         self.assertFalse(list((root / path).rglob("quotation.xlsx")))
                         if path == "seal":
-                            webapp.write_quote_session_metadata(saved_v27)
+                            webapp.write_quote_session_metadata(saved_v28)
                             stale.pop("pricing_analysis_seal")
                             stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
                 reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
@@ -45056,7 +45232,7 @@ main().catch((error) => {
                 reset_values = [row for _, row in read_first_sheet_rows_with_numbers(reset_xlsx)]
                 self.assertFalse(any("24 sqm" in row for row in reset_values))
                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in reset_values))
-                webapp.write_quote_session_metadata(saved_v27)
+                webapp.write_quote_session_metadata(saved_v28)
                 self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
                 stale_floor = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["floor"]
                 self.assertEqual(stale_floor["measurement"], {"disposition": "review"})
@@ -45090,9 +45266,16 @@ main().catch((error) => {
                         else:
                             self.assertIn("24 sqm", floor_values)
                             self.assertIn(24 * price, floor_values)
-            reanalysed = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
-            self.assertIsNone(self._ledger_price(reanalysed["line_items"], "floor"))
-            self.assertEqual(self._ledger_price(reanalysed["line_items"], "spot"), koncept_catalog_sale_unit_price(spot))
+            for pending in (
+                old_sources["Quote notes"][-1],
+                f"{statement} (we checked the dimensions for {specifications[0][1]}. "
+                "(Those dimensions remain unverified))",
+            ):
+                reanalysed = self._ledger_draft(runner, headers, payload, provider, measurement_sources={
+                    "Quote notes": [*old_sources["Quote notes"][:-1], pending],
+                })
+                self.assertIsNone(self._ledger_price(reanalysed["line_items"], "floor"))
+                self.assertEqual(self._ledger_price(reanalysed["line_items"], "spot"), koncept_catalog_sale_unit_price(spot))
             drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
                 statement, disputed, "Synthetic carpet tile flooring at west: 4 to 6 sqm (site survey range)",
             ]})
