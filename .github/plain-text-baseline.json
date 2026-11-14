@@ -125,18 +125,6 @@
     {
       "file": "docs/README.md",
       "rule": "number-reference",
-      "text": "#143",
-      "count": 1
-    },
-    {
-      "file": "docs/README.md",
-      "rule": "number-reference",
-      "text": "#212",
-      "count": 1
-    },
-    {
-      "file": "docs/README.md",
-      "rule": "number-reference",
       "text": "#82",
       "count": 1
     },
