@@ -43889,7 +43889,8 @@ main().catch((error) => {
         patterns = webapp.area_scope_patterns({east, west})
         measured = f"we checked the dimensions for {east}. "
         for prefix in ("", "as of this morning ", "up to last week ", "at this stage, ",
-                       "for the time being ", "by the end of this week\n", "in the meantime "):
+                       "for the time being ", "by the end of this week\n", "in the meantime ",
+                       "as of yet ", "to this point ", "by midnight ", "before noon "):
             for clause, expected in (
                 ("nobody has verified them", {east}),
                 ("no independent surveyor has verified them", {east}),
@@ -43912,6 +43913,46 @@ main().catch((error) => {
         ):
             with self.subTest(clause=clause):
                 self.assertEqual(webapp.area_qualification_scopes(documents + clause, {west}, patterns), expected)
+
+    def test_area_verification_actor_and_object_stay_in_the_current_clause(self):
+        east, west = "east flooring", "west flooring"
+        patterns = webapp.area_scope_patterns({east, west})
+        measured = f"We checked the dimensions for {east}. "
+        for clause, expected in (
+            ("By handover nobody has verified them", {east}),
+            ("Before site handover no independent surveyor has verified them", {east}),
+            ("By handover the surveyor has verified them", set()),
+            ("By handover the surveyor said nobody has verified them", set()),
+            ("The supervisor said nobody verified them", set()),
+            ("The supervisor who has not verified them sent the report", set()),
+            ("Nobody who attended has verified them", {east}),
+            ("Nobody who attended verified them", {east}),
+            ("The surveyor who attended never verified them", {east}),
+            ("The supervisor who planned to verify them has sent the report", set()),
+            ("The supervisor who started verifying them has sent a report", set()),
+            ("Nobody who has been checked has verified them", {east}),
+            ("The supervisor who has not verified them has sent the report", set()),
+            ("The supervisor who has checked them has not verified them", {east}),
+            ("The supervisor who has verified them has not verified the report", set()),
+            ("No one but the surveyor has verified them", set()),
+            ("No one except the surveyor has verified them", set()),
+            ("Nobody has verified the report mentioning them", set()),
+            (f"Nobody has verified the dimensions for {west}", {west}),
+            ("It is unclear whether they have been verified", {east}),
+            ("We do not know whether the surveyor verified them", {east}),
+            (f"It is unclear whether the dimensions for {west} were verified", {west}),
+            ("It is unclear whether the report has been verified", set()),
+            ("Drawing and report (they remain unverified) were sent", set()),
+            ("We sent drawing and report (they remain unverified)", set()),
+            ("We have sent drawing and report (they remain unverified)", set()),
+            ("The surveyor has sent drawing and report (they remain unverified)", set()),
+            ("The supervisor went home and they remain unverified", {east}),
+            ("We received drawing, invoice, and report (they remain unverified)", set()),
+            ("We sent drawing and report. It is unclear whether they have been verified", set()),
+            ("We sent drawing and report (those dimensions remain unverified)", {east}),
+        ):
+            with self.subTest(clause=clause):
+                self.assertEqual(webapp.area_qualification_scopes(measured + clause, {west}, patterns), expected)
 
     def test_area_post_result_asides_follow_local_coordinated_topics(self):
         east, west = "east flooring", "west flooring"
@@ -44871,6 +44912,9 @@ main().catch((error) => {
              {"east"}, (172.60, 188.13)),
             (f"{checked} We sent the drawing together with the report (they remain unverified).",
              {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} As of yet nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} To this point nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} We sent drawing and report (they remain unverified).", {"east", "west"}, (374.20, 407.88)),
         )
         config = synthetic_configuration(credential="synthetic")
         with (mock.patch.dict(os.environ, self._ledger_env()),
@@ -45160,10 +45204,10 @@ main().catch((error) => {
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [
                 statement, disputed, f"{disputed} (provisional in drawing)",
-                f"We checked the dimensions for {specifications[0][1]}. As of today nobody has verified them.",
+                f"We checked the dimensions for {specifications[0][1]}. As of yet nobody has verified them.",
             ]}
-            # Reproduce a v28 grant issued before the actor's polarity was read.
-            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 28),
+            # Reproduce a v29 grant issued before the actor's polarity was read.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 29),
                   mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
@@ -45194,11 +45238,11 @@ main().catch((error) => {
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 # Save before any current-version request can demote the old signed grant.
-                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 28):
+                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 29):
                     self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
-                    saved_v28 = webapp.read_quote_session_metadata(session_id)
-                    saved_floor = saved_v28["pricing_ledger"]["rows"]["floor"]
-                    self.assertEqual(saved_floor["measurement"]["claim_version"], 28)
+                    saved_v29 = webapp.read_quote_session_metadata(session_id)
+                    saved_floor = saved_v29["pricing_ledger"]["rows"]["floor"]
+                    self.assertEqual(saved_floor["measurement"]["claim_version"], 29)
                     self.assertEqual(saved_floor["grant"]["state"], "live")
                 for path in ("seal", "ledger"):
                     with self.subTest(path=path):
@@ -45207,7 +45251,7 @@ main().catch((error) => {
                         self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
                         self.assertFalse(list((root / path).rglob("quotation.xlsx")))
                         if path == "seal":
-                            webapp.write_quote_session_metadata(saved_v28)
+                            webapp.write_quote_session_metadata(saved_v29)
                             stale.pop("pricing_analysis_seal")
                             stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
                 reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
@@ -45232,7 +45276,7 @@ main().catch((error) => {
                 reset_values = [row for _, row in read_first_sheet_rows_with_numbers(reset_xlsx)]
                 self.assertFalse(any("24 sqm" in row for row in reset_values))
                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in reset_values))
-                webapp.write_quote_session_metadata(saved_v28)
+                webapp.write_quote_session_metadata(saved_v29)
                 self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
                 stale_floor = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["floor"]
                 self.assertEqual(stale_floor["measurement"], {"disposition": "review"})
