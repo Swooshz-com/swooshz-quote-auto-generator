@@ -25908,6 +25908,7 @@ class AreaQualificationContext:
     antecedent: AreaQualification | None
     measured_topics: Mapping[str, AreaQualification]
     intervening_topics: frozenset[str]
+    local_topic: bool = False
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -26973,6 +26974,7 @@ def area_local_qualification_scopes(
     affected = set()
     previous = None
     antecedent = inherited.antecedent if inherited else None
+    local_topic = inherited.local_topic if inherited else False
     intervening_topics = set(inherited.intervening_topics) if inherited else set()
     conditional_result = condition = leading_dependency = None
     measured_topics = dict(inherited.measured_topics) if inherited else {}
@@ -27007,7 +27009,9 @@ def area_local_qualification_scopes(
             barriers -= {topic.number}
         elif barriers_at_child:
             barriers |= barriers_at_child
-        context = AreaQualificationContext(resolve(topic or antecedent), topics, barriers)
+        context = AreaQualificationContext(
+            resolve(topic or antecedent), topics, barriers, topic is not None or (local_topic and not barriers_at_child),
+        )
         while child_index < len(children) and children[child_index][0] < before:
             contexts[children[child_index][1]] = context
             child_index += 1
@@ -27060,6 +27064,7 @@ def area_local_qualification_scopes(
         first: int, last: int, stop: int, prior: AreaQualification | None, *, temporary: bool = False,
     ) -> bool:
         """Read an explicit topic even when its parent frame has no recognised predicate."""
+        nonlocal local_topic
         if child_index < len(children) and children[child_index][0] < stop:
             if subject := area_measured_subject(text, first, last):
                 local = AreaQualification((subject.span("topic"),))
@@ -27086,6 +27091,7 @@ def area_local_qualification_scopes(
             seed_children(stop, barriers_at_child=numbers)
         else:
             intervening_topics.update(numbers)
+            local_topic = False
         return AREA_FINITE_BRIDGE.search(text, end, last) is None
 
     def dispute(claim: AreaQualification, dependency: AreaQualification | None = None) -> None:
@@ -27174,9 +27180,9 @@ def area_local_qualification_scopes(
                     prior = measured_topics.get(number)
                     if number in intervening_topics or (prior is None and antecedent is not None):
                         prior = AreaQualification(())
-                if not pronoun and intervening_topics:
-                    # A competing topic supersedes elided roles. A new measured role
-                    # in this clause can still be read by the predicate.
+                if not pronoun and intervening_topics and not local_topic:
+                    # An ordinary topic supersedes an elided role until a more
+                    # recent measured phrase supplies the child frame's subject.
                     prior = AreaQualification(())
                 claim = area_qualification_claim(text, first, last, prior, measured_topics=measured_topics)
                 if claim is not None:
@@ -27221,6 +27227,7 @@ def area_local_qualification_scopes(
             previous = leading_dependency = None
             if separator == ";":
                 antecedent = None
+                local_topic = False
                 measured_topics.clear()
                 intervening_topics.clear()
     seed_children(len(text) + 1)
