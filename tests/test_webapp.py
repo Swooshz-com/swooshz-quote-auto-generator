@@ -44385,6 +44385,27 @@ main().catch((error) => {
             ("aside-sibling", f"the dimensions for {east} (the dimensions for {west} were verified) (remain unverified)", True, False),
             ("aside-inner-override", f"the dimensions for {east} (the dimensions for {west} (remain unverified))", False, True),
             ("aside-before-barrier", f"we checked the dimensions for {east}. (They remain unverified) The invoices were sent", True, False),
+            ("modifier-negative-actor", f"we checked the dimensions for {east}. So far nobody has verified them", True, False),
+            ("modifier-positive-actor", f"we checked the dimensions for {east}. So far a surveyor has verified them", True, True),
+            ("modifier-negative-documents", f"we checked the dimensions for {east}. The drawing and the report were sent. So far nobody has verified them", True, True),
+            ("coordinated-ordinary-aside", f"we checked the dimensions for {east}. The drawing and the report (they remain unverified) were sent", True, True),
+            ("coordinated-elided-determiner", f"we checked the dimensions for {east}. The drawing and report (they remain unverified) were sent", True, True),
+            ("coordination-after-aside", f"we checked the dimensions for {east}. The drawing (they remain unverified) and the report were sent", True, False),
+            ("coordinate-subordinate-documents", f"we checked the dimensions for {east} after the drawing and the report (they remain unverified) were sent", True, True),
+            ("coordinated-demonstrative", f"we checked the dimensions for {east}. The drawing and the report (those dimensions remain unverified) were sent", True, False),
+            ("coordinated-three-ordinary", f"we checked the dimensions for {east}. The drawing, the invoice, and the report (they remain unverified) were sent", True, True),
+            ("measured-member-status", f"the dimensions for {east} (remain unverified) and the dimensions for {west} were verified", True, False),
+            ("measured-member-event", f"the dimensions for {east} (still pending verification) and the dimensions for {west} were verified", True, False),
+            ("measured-member-complete", f"the dimensions for {east} (already verified) and the dimensions for {west} were verified", True, True),
+            ("measured-second-member", f"the dimensions for {east} and the dimensions for {west} (remain unverified) were verified", False, True),
+            ("measured-shared-noun", f"the dimensions for {east} and {west} (remain unverified) were verified", False, False),
+            ("measured-shared-predicate", f"the dimensions for {east} and the dimensions for {west} were verified (those dimensions remain unverified)", False, False),
+            ("measured-members-pending", f"the dimensions for {east} (remain unverified) and the dimensions for {west} (still pending verification) were verified", False, False),
+            ("subordinate-reviewed-local", f"we checked the dimensions for {east} after the dimensions for {west} (remain unverified) were reviewed", False, True),
+            ("subordinate-verified-local", f"we checked the dimensions for {east} after the dimensions for {west} (remain unverified) were verified", False, True),
+            ("subordinate-future-review", f"we checked the dimensions for {east} after the dimensions for {west} (still pending verification) will be reviewed", False, False),
+            ("subordinate-document-local", f"we checked the dimensions for {east} after the invoices (they remain unverified) were sent", True, True),
+            ("subordinate-complete-control", f"we checked the dimensions for {east} after the dimensions for {west} (already verified) were reviewed", True, True),
             ("negative-indefinite", f"we checked the dimensions for {east}. Nobody has verified them yet", True, False),
             ("negative-two-words", f"we checked the dimensions for {east}. (No one has verified them yet)", True, False),
             ("negative-determiner", f"no surveyor has verified the dimensions for {east} yet", True, False),
@@ -44735,10 +44756,14 @@ main().catch((error) => {
                             expected = round(2 * koncept_catalog_sale_unit_price(spot) +
                                              priced_area * koncept_catalog_sale_unit_price(self.LEDGER_CARPET), 2)
                             self.assertIn(expected, total)
-                            if name in correction_east and allowed and not east_priced:
-                                self.assertIn(374.20, total)
+                            if name in correction_east:
                                 [grand_total] = [row for row in values if "Total including GST" in row]
-                                self.assertIn(407.88, grand_total)
+                                self.assertIn({
+                                    (False, False): 31.17,
+                                    (False, True): 188.13,
+                                    (True, False): 407.88,
+                                    (True, True): 564.84,
+                                }[allowed, east_priced], grand_total)
                             if name in dual_cases:
                                 self.assertEqual(any("10 sqm" in row and 144 in row for row in values), east_priced)
                                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))

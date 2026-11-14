@@ -25747,6 +25747,7 @@ AREA_CONDITION_REVIEW = (
 AREA_CONDITION_TOPIC = re.compile(
     rf"\s*,?\s*{AREA_CONDITION_PREFIX}(?P<event>{AREA_CONDITION_EVENT}|{AREA_CONDITION_REVIEW})", re.I,
 )
+AREA_REVIEW_RESULT = re.compile(r"reviewed\b", re.I)
 AREA_CONDITION_INTRO = re.compile(rf"\s*,?\s*{AREA_CONDITION_CLAUSE}", re.I)
 AREA_TRAILING_CONDITION = re.compile(rf"\b{AREA_CONDITION_CLAUSE}", re.I)
 AREA_COMPLETED_ACTION = re.compile(rf"\b{AREA_MEASUREMENT_RESULT}", re.I)
@@ -25830,7 +25831,8 @@ AREA_MEASURE_COORDINATION = re.compile(
     rf"(?P<possessive>['\u2019]s)?"
     r"(?:\s*(?P<parenthetical>,\s*together\s+with\s+)|\s*,\s*(?:(?:and|or|nor)\s+)?"
     r"|\s+(?:and|or|nor|as\s+well\s+as|together\s+with)\s+)"
-    rf"(?:(?:those|that|{AREA_MEASURE_DETERMINER}{AREA_DIMENSION_NOUN_PHRASE})\s+{AREA_TOPIC_LINK}|(?:the\s+)?)", re.I,
+    rf"(?:(?P<member>(?:those|that|{AREA_MEASURE_DETERMINER}{AREA_DIMENSION_NOUN_PHRASE})\s+"
+    rf"{AREA_TOPIC_LINK})|(?:the\s+)?)", re.I,
 )
 AREA_POSSESSIVE = re.compile(r"['\u2019]s\b", re.I)
 AREA_COORDINATION_TAIL = re.compile(r"\s*(?P<comma>,)\s*")
@@ -26587,7 +26589,9 @@ def area_annotation_text(value: str, annotation: str) -> str:
     return annotation.lstrip(" .!?")
 
 
-def area_qualification_text(text: str, patterns: AreaScopePatterns):
+def area_qualification_text(
+    text: str, patterns: AreaScopePatterns, *, member_starts: list[int] | None = None,
+):
     """Keep exact area names whole when reading clause boundaries and grammatical roles."""
     unwrapped = text.translate(AREA_SCOPE_WRAPPERS)
     references = list(patterns.reference.finditer(unwrapped))
@@ -26602,6 +26606,8 @@ def area_qualification_text(text: str, patterns: AreaScopePatterns):
         if connector and (not connector["possessive"] or AREA_POSSESSIVE.match(unwrapped, end)):
             # A list of exact labels occupies one noun slot. Preserve their source offsets.
             words[previous:end] = "_" * (end - previous)
+            if member_starts is not None and (connector["member"] or connector["possessive"]):
+                member_starts.append(start)
             if connector["parenthetical"] and (tail := AREA_COORDINATION_TAIL.match(unwrapped, end)):
                 if AREA_FINITE_BRIDGE.match(unwrapped, tail.end()):
                     words[tail.start("comma")] = " "
@@ -26624,7 +26630,9 @@ def area_measurement_condition(text: str, start: int, stop: int, previous: AreaQ
     if modifiers := AREA_RESULT_MODIFIERS.match(text, start, stop):
         start = modifiers.end()
     if intro := AREA_CONDITION_INTRO.match(text, start, stop):
-        if claim := area_qualification_claim(text, intro.end(), stop, previous, measured_topics=measured_topics):
+        if claim := area_qualification_claim(
+            text, intro.end(), stop, previous, measured_topics=measured_topics, prerequisite=True,
+        ):
             return claim
     if condition := AREA_CONDITION_TOPIC.match(text, start, stop):
         # A gerund followed by a direct object must pass the predicate's role check.
@@ -26674,6 +26682,7 @@ def area_qualification_targets(roles: tuple[AreaQualificationRole, ...], referen
 def area_qualification_predicate(
     text: str, start: int, stop: int, subject: re.Match[str] | None,
     *, inherited_roles: tuple[AreaQualificationRole, ...] | None = None,
+    prerequisite: bool = False,
 ) -> AreaQualification | None:
     """Scan the verb phrase once, resolving modality, aspect and polarity at the action."""
     position = subject.end() if subject else start
@@ -26684,19 +26693,24 @@ def area_qualification_predicate(
     carry_roles = subject_roles if subject else inherited_roles
     partial = bool(subject and not pronoun_subject and subject["partial"])
     event_subject = bool(subject and not pronoun_subject and AREA_EVENT_SUBJECT.fullmatch(subject["topic"]))
-    negative_actor = AREA_NEGATIVE_ACTOR.match(text, start, stop) if subject is None else None
-    negative = negative_actor is not None or bool(subject and subject.groupdict().get("negative"))
+    negative = bool(subject and subject.groupdict().get("negative"))
     future = ongoing = duty = started = expired_duty = False
     actor_words = 0
-    if negative_actor:
-        position = negative_actor.end()
-        actor_words = 1
     tense = ""
     while position < stop:
         if separator := AREA_WORD_SEPARATOR.match(text, position, stop):
             position = separator.end()
         if position == stop:
             break
+        if not subject and not started and not actor_words:
+            if actor := AREA_NEGATIVE_ACTOR.match(text, position, stop):
+                negative = True
+                actor_words = 1
+                position = actor.end()
+                continue
+            if adverb := AREA_QUALIFICATION_ADVERB.match(text, position, stop):
+                position = adverb.end()
+                continue
         if event_subject and not expired_duty and AREA_EVENT_PROGRESS.match(text, position, stop):
             return AreaQualification(subject_roles, pending=True)
         if carry_roles is not None and not negative:
@@ -26745,6 +26759,10 @@ def area_qualification_predicate(
             )
         if inception_action:
             return None
+        if prerequisite and subject and not pronoun_subject:
+            if action := AREA_REVIEW_RESULT.match(text, position, stop):
+                if AREA_CONTINUATION.match(text, action.end(), stop):
+                    return area_verification_result(text, action.end(), stop, subject_roles, unfinished, past=past)
         if completion and not complement:
             event = AREA_COMPLETION_EVENT.match(text, completion.end(), stop)
             if event:
@@ -26816,7 +26834,7 @@ def area_qualification_predicate(
 
 def area_qualification_claim(
     text: str, first: int, last: int, previous: AreaQualification | None,
-    *, measured_topics: dict[str, AreaQualification] | None = None,
+    *, measured_topics: dict[str, AreaQualification] | None = None, prerequisite: bool = False,
 ) -> AreaQualification | None:
     subject = area_measured_subject(text, first, last)
     if subject is None:
@@ -26828,7 +26846,9 @@ def area_qualification_claim(
         if subject is not None:
             return None
         inherited_roles = None
-    claim = area_qualification_predicate(text, first, last, subject, inherited_roles=inherited_roles)
+    claim = area_qualification_predicate(
+        text, first, last, subject, inherited_roles=inherited_roles, prerequisite=prerequisite,
+    )
     if claim is None:
         for form in AREA_NOMINAL_QUALIFICATIONS:
             if match := form.match(text, first, last):
@@ -26876,7 +26896,7 @@ def area_topic_number(text: str, start: int, stop: int) -> str:
     return "plural" if head.endswith("s") and not head.endswith(("ss", "us")) else "singular"
 
 
-def area_intervening_topic(text: str, start: int, stop: int) -> tuple[str, int]:
+def area_intervening_topic(text: str, start: int, stop: int, *, conjunct: bool) -> tuple[str, int]:
     """Locate an ordinary topic where it can first replace a measured reference."""
     noun = None
     for match in AREA_EXPLICIT_NOUN.finditer(text, start, stop):
@@ -26894,8 +26914,10 @@ def area_intervening_topic(text: str, start: int, stop: int) -> tuple[str, int]:
         predicate = AREA_FINITE_BRIDGE.search(text, start, stop)
         end = predicate.start() if predicate else stop
         head = AREA_TRAILING_TOPIC_WORD.search(text, start, end)
-        if head and area_topic_number(text, head.start("head"), head.end("head")) == "plural":
-            return "plural", head.end("head")
+        if head:
+            number = area_topic_number(text, head.start("head"), head.end("head"))
+            if number == "plural" or (conjunct and head.start() == start):
+                return number, head.end("head")
     return "", stop
 
 
@@ -26906,6 +26928,8 @@ def area_qualification_clauses(source: AreaSourceSpans, text: str):
     for stop, next_start, separator in source.separators(AREA_QUALIFICATION_BREAK, 0, len(text), text=text):
         if separator.strip().isalpha() and not text[start:stop].strip():
             continue  # After punctuation, the coordinator belongs to the next clause.
+        # A child can sit in the whitespace consumed before a conjunction.
+        stop += len(separator) - len(separator.lstrip())
         clauses.append((start, stop, separator.strip()))
         start = next_start
     clauses.append((start, len(text), ""))
@@ -26944,7 +26968,8 @@ def area_local_qualification_scopes(
 ) -> set[str]:
     """An unfinished assertion disputes its measured subject or object within this frame."""
     source = AreaSourceSpans(text)
-    text, references = area_qualification_text(text, patterns)
+    member_starts: list[int] = []
+    text, references = area_qualification_text(text, patterns, member_starts=member_starts)
     affected = set()
     previous = None
     antecedent = inherited.antecedent if inherited else None
@@ -26953,6 +26978,7 @@ def area_local_qualification_scopes(
     measured_topics = dict(inherited.measured_topics) if inherited else {}
     dependency_roles: set[AreaQualificationRole] = set()
     child_index = 0
+    ordinary_conjunct = condition_ordinary_conjunct = False
     resolved: dict[tuple[AreaQualificationRole, ...], tuple[AreaQualificationRole, ...]] = {}
     has_dependency = leading_bound = trailing_condition = False
     reading_condition = temporal_condition = False
@@ -26967,7 +26993,9 @@ def area_local_qualification_scopes(
             resolved[claim.roles] = (frozenset(area_qualification_targets(claim.roles, references, patterns)),)
         return replace(claim, roles=resolved[claim.roles], result_end=None)
 
-    def seed_children(before: int, *, topic: AreaQualification | None = None) -> None:
+    def seed_children(
+        before: int, *, topic: AreaQualification | None = None, barriers_at_child: set[str] | None = None,
+    ) -> None:
         nonlocal child_index
         if contexts is None or child_index == len(children) or children[child_index][0] >= before:
             return
@@ -26977,21 +27005,82 @@ def area_local_qualification_scopes(
             if topic.number:
                 topics[topic.number] = resolve(topic)
             barriers -= {topic.number}
+        elif barriers_at_child:
+            barriers |= barriers_at_child
         context = AreaQualificationContext(resolve(topic or antecedent), topics, barriers)
         while child_index < len(children) and children[child_index][0] < before:
             contexts[children[child_index][1]] = context
             child_index += 1
 
-    def remember(claim: AreaQualification, first: int, last: int) -> None:
+    def seed_measured_children(claim: AreaQualification, first: int, last: int) -> None:
+        """Give each delimiter the measured role and exact names read before it."""
+        if child_index == len(children) or children[child_index][0] >= last:
+            return
+        roles = sorted(role for role in claim.roles if isinstance(role, tuple) and first <= role[0] < last)
+        for index, (begin, end) in enumerate(roles):
+            seed_children(begin)
+            boundary = roles[index + 1][0] if index + 1 < len(roles) else last
+            while child_index < len(children) and (opener := children[child_index][0]) < boundary:
+                if claim.result_end is not None and opener >= claim.result_end:
+                    seed_children(boundary, topic=claim)
+                    break
+                # Masking keeps coordinated names intact for the shared predicate.
+                # A child sees only names already read, starting with its local member.
+                position = min(end, opener)
+                reference = bisect_left(references, position, key=area_reference_start) - 1
+                if opener < end and (reference < 0 or references[reference].start("label") < begin
+                                     or references[reference].end("label") > opener):
+                    seed_children(opener + 1)
+                    continue
+                member = bisect_left(member_starts, position) - 1
+                member_begin = max(begin, member_starts[member]) if member >= 0 else begin
+                topic = replace(claim, roles=((member_begin, position),))
+                if opener >= end and len(roles) == 1 and member_begin == begin:
+                    boundary_of_predicate = claim.result_end if claim.result_end is not None else boundary
+                    seed_children(min(boundary, boundary_of_predicate), topic=topic)
+                else:
+                    seed_children(opener + 1, topic=topic)
+
+    def remember(claim: AreaQualification, first: int, last: int, stop: int) -> None:
         nonlocal antecedent
-        spans = [role for role in claim.roles if isinstance(role, tuple) and first <= role[0] < last]
-        # The aside can only see a measured phrase once its subject or object has been read.
-        seed_children(max((end for _, end in spans), default=first))
-        if spans:
+        seed_measured_children(claim, first, stop)
+        if any(isinstance(role, tuple) and first <= role[0] < last for role in claim.roles):
             intervening_topics.discard(claim.number)
         if claim.number and claim.roles:
             measured_topics[claim.number] = claim
         antecedent = claim
+
+    def seed_local_topic(
+        first: int, last: int, stop: int, prior: AreaQualification | None, *, temporary: bool = False,
+    ) -> bool:
+        """Read an explicit topic even when its parent frame has no recognised predicate."""
+        if child_index < len(children) and children[child_index][0] < stop:
+            if subject := area_measured_subject(text, first, last):
+                local = AreaQualification((subject.span("topic"),))
+                topic = area_bind_qualification_roles(text, local, prior, measured_topics)
+                if topic is not None:
+                    if temporary:
+                        seed_measured_children(topic, first, stop)
+                    else:
+                        remember(topic, first, last, stop)
+                    return False
+        if not antecedent and (child_index == len(children) or children[child_index][0] >= stop):
+            return False
+        conjunct = condition_ordinary_conjunct if temporary else ordinary_conjunct
+        joined = conjunct and (separator == "and" or (
+            separator == "list" and coordinator and coordinator[0].strip().casefold() == "and"
+        ))
+        number, end = area_intervening_topic(text, first, last, conjunct=bool(joined))
+        if not number:
+            return False
+        seed_children(end)
+        # The individual noun remains a competing topic for a singular pronoun.
+        numbers = {number, "plural"} if joined else {number}
+        if temporary:
+            seed_children(stop, barriers_at_child=numbers)
+        else:
+            intervening_topics.update(numbers)
+        return AREA_FINITE_BRIDGE.search(text, end, last) is None
 
     def dispute(claim: AreaQualification, dependency: AreaQualification | None = None) -> None:
         targets = area_qualification_targets(claim.roles, references, patterns)
@@ -27002,23 +27091,22 @@ def area_local_qualification_scopes(
     def is_dependency(claim: AreaQualification | None) -> bool:
         return claim is not None and (not temporal_condition or not claim.past or claim.pending)
 
-    def retain_condition(claim: AreaQualification | None, first: int, last: int) -> None:
-        nonlocal has_dependency, condition
+    def retain_condition(claim: AreaQualification | None, first: int, last: int, stop: int) -> None:
+        nonlocal has_dependency, condition, condition_ordinary_conjunct
         if claim is not None:
             condition = claim
-            if child_index < len(children) and children[child_index][0] < last:
-                # A measured prerequisite can supply a topic to its own aside.
-                # That topic does not replace the main clause's antecedent.
-                spans = [role for role in claim.roles if isinstance(role, tuple) and first <= role[0] < last]
-                if spans:
-                    seed_children(max(end for _, end in spans))
-                    seed_children(last, topic=claim)
+            condition_ordinary_conjunct = False
+            seed_measured_children(claim, first, stop)
+        else:
+            condition_ordinary_conjunct = seed_local_topic(first, last, stop, condition or antecedent, temporary=True)
         if is_dependency(claim):
             has_dependency = True
             dependency_roles.update(claim.roles)
 
     def finish_condition() -> AreaQualification | None:
         nonlocal conditional_result, condition, reading_condition, temporal_condition, has_dependency, trailing_condition
+        nonlocal condition_ordinary_conjunct
+        condition_ordinary_conjunct = False
         dependency = AreaQualification(tuple(dependency_roles)) if has_dependency else None
         if dependency:
             if trailing_condition and conditional_result is not None:
@@ -27039,6 +27127,7 @@ def area_local_qualification_scopes(
 
     for first, last, coordinator, following, stop in area_qualification_clauses(source, text):
         seed_children(first)
+        next_ordinary_conjunct = False
         if first < last:
             # In a trailing condition, an uncoordinated comma can separate listed
             # prerequisites. The condition still owns these clauses if no new result starts.
@@ -27051,14 +27140,16 @@ def area_local_qualification_scopes(
                 leading_dependency = finish_condition()
                 leading_bound = False
             if reading_condition:
-                retain_condition(area_qualification_claim(text, first, last, condition, measured_topics=measured_topics),
-                                 first, stop)
+                retain_condition(area_qualification_claim(
+                    text, first, last, condition, measured_topics=measured_topics, prerequisite=True,
+                ), first, last, stop)
             elif intro := area_condition_start(text, first, last):
                 conditional_result = previous if separator == "," else None
                 trailing_condition = conditional_result is not None
                 temporal_condition = bool(intro["temporal"])
-                retain_condition(area_measurement_condition(text, first, last, antecedent, measured_topics=measured_topics),
-                                 first, stop)
+                retain_condition(area_measurement_condition(
+                    text, first, last, antecedent, measured_topics=measured_topics,
+                ), intro.end(), last, stop)
                 reading_condition = True
             elif previous and separator == "," and (dependency := area_measurement_condition(
                 text, first, last, antecedent, measured_topics=measured_topics,
@@ -27088,44 +27179,34 @@ def area_local_qualification_scopes(
                     if claim.pending or leading_dependency:
                         dispute(claim, leading_dependency)
                         leading_bound = leading_bound or leading_dependency is not None
-                    remember(claim, first, last)
+                    intro = area_condition_start(text, claim.result_end, last) if claim.result_end is not None else None
+                    remember(claim, first, last, intro.end() if intro else stop)
                     previous = claim
                     if claim.result_end is not None:
-                        intro = area_condition_start(text, claim.result_end, last)
                         temporal_condition = bool(intro and intro["temporal"])
                         retain_condition(area_measurement_condition(
                             text, claim.result_end, last, claim, measured_topics=measured_topics,
-                        ), claim.result_end, stop)
+                        ), intro.end() if intro else claim.result_end, last, stop)
                         reading_condition = bool(condition or intro)
                         if reading_condition:
                             conditional_result = claim
                             trailing_condition = True
                 else:
                     previous = None
-                    # A condition can carry its own measured subject even when the result does not.
-                    if intro := AREA_TRAILING_CONDITION.search(text, first, last):
+                    # Give main and subordinate topics their own source ranges.
+                    intro = AREA_TRAILING_CONDITION.search(text, first, last)
+                    topic_stop = intro.start() if intro else last
+                    if not pronoun:
+                        next_ordinary_conjunct = seed_local_topic(first, topic_stop, intro.start() if intro else stop, prior)
+                    if intro:
+                        seed_children(intro.end())
                         temporal_condition = bool(intro["temporal"])
                         retain_condition(area_measurement_condition(
                             text, intro.start(), last, prior, measured_topics=measured_topics,
-                        ), intro.start(), stop)
+                        ), intro.end(), last, stop)
                         reading_condition = trailing_condition = True
-                    topic_stop = intro.start() if intro else last
-                    child_here = child_index < len(children) and children[child_index][0] < stop
-                    if child_here:
-                        # An aside can supply the whole predicate of a measured subject.
-                        subject = area_measured_subject(text, first, topic_stop)
-                        if subject:
-                            role = subject.span("topic")
-                            topic = area_bind_qualification_roles(text, AreaQualification((role,)), prior, measured_topics)
-                            if topic is not None:
-                                seed_children(role[1])
-                                remember(topic, first, topic_stop)
-                    if (antecedent or child_here) and not pronoun:
-                        number, end = area_intervening_topic(text, first, topic_stop)
-                        if number:
-                            seed_children(end)
-                            intervening_topics.add(number)
         seed_children(stop)
+        ordinary_conjunct = next_ordinary_conjunct
         separator = following
         if separator in {";", ".", "!", "?", ""}:
             finish_leading(leading_dependency)
