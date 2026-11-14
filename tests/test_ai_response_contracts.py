@@ -28,6 +28,8 @@ def canonical_draft():
             line.setdefault('quantity', None)
             line.setdefault('unit', None)
             line['pricing_keyword'] = None
+            line['scope_kind'] = 'physical'
+            line['measurement_evidence'] = None
     for item in value['line_items']:
         item.update(price_mode=None, display_price=None)
     return value
@@ -40,19 +42,20 @@ class ContractDefinitionTest(unittest.TestCase):
         fmt = schema['format']
         self.assertEqual(set(fmt), {'type', 'name', 'strict', 'schema'})
         self.assertEqual(fmt['type'], 'json_schema')
-        self.assertEqual(fmt['name'], 'draft_synthesis_v1')
+        self.assertEqual(fmt['name'], 'draft_synthesis_v2')
         self.assertIs(fmt.get('strict'), True)
         root = fmt['schema']
         self.assertEqual(set(root['required']), {'project', 'quote_basis_sections', 'line_items', 'analysis_findings'})
         line = root['properties']['quote_basis_sections']['items']['properties']['lines']['items']
-        self.assertEqual(set(line['required']), {'id', 'tag', 'text', 'confidence_pct', 'quantity', 'unit', 'pricing_keyword'})
+        self.assertEqual(set(line['required']), {'id', 'tag', 'text', 'confidence_pct', 'quantity', 'unit', 'pricing_keyword',
+                                                 'scope_kind', 'measurement_evidence'})
         self.assertEqual(line['properties']['confidence_pct']['type'], 'integer')
         self.assertEqual(line['properties']['quantity']['type'], ['number', 'null'])
         self.assertEqual(set(line['properties']['tag']['enum']), {'Include', 'Confirm', 'Custom', 'Exclude'})
 
         def walk(node):
             self.assertLessEqual(set(node), {'type', 'properties', 'required', 'additionalProperties', 'items', 'enum'})
-            if node['type'] == 'object':
+            if node['type'] in ('object', ['object', 'null']):
                 self.assertIs(node.get('additionalProperties'), False)
                 self.assertEqual(set(node['required']), set(node['properties']))
                 for child in node['properties'].values():
@@ -146,7 +149,7 @@ class GatewayContractTest(unittest.TestCase):
             body = envelope(route); body['text'] = contracts.DRAFT_SYNTHESIS.text_format()
             transport = RecordingTransport([responses_envelope(route.model, json.dumps(canonical_draft()))])
             subject = ai_gateway.AiGateway(config, credential_reader=lambda: 'synthetic', transport=transport)
-            subject.request(operation, body, response_contract='draft_synthesis_v1')
+            subject.request(operation, body, response_contract='draft_synthesis_v2')
             sent = transport.calls[0][0]
             self.assertEqual(set(sent), {'model', 'input', 'reasoning', 'text', 'provider', 'store'})
             self.assertIs(sent['text']['format']['strict'], True)
@@ -165,7 +168,7 @@ class GatewayContractTest(unittest.TestCase):
                 if operation in ('draft', 'draft_high_quality') and not batch:
                     continue
                 with self.subTest(operation=operation, batch=batch), self.assertRaises(ai_gateway.GatewayError):
-                    subject.request(operation, body, draft_batch=batch, response_contract='draft_synthesis_v1')
+                    subject.request(operation, body, draft_batch=batch, response_contract='draft_synthesis_v2')
                 credential.assert_not_called(); self.assertFalse(transport.calls)
 
     def test_missing_or_altered_contract_refused_before_credentials_and_send(self):
@@ -181,7 +184,7 @@ class GatewayContractTest(unittest.TestCase):
             credential = mock.Mock(return_value='synthetic'); transport = RecordingTransport([])
             gateway = ai_gateway.AiGateway(config, credential_reader=credential, transport=transport)
             with self.subTest(change=change), self.assertRaises(ai_gateway.GatewayError):
-                gateway.request('draft', body, response_contract='draft_synthesis_v1')
+                gateway.request('draft', body, response_contract='draft_synthesis_v2')
             credential.assert_not_called(); self.assertFalse(transport.calls)
         with self.assertRaises(ai_gateway.GatewayError):
             gateway.request('draft', original)  # trusted identity is separate from operation/body
@@ -200,7 +203,7 @@ class GatewayContractTest(unittest.TestCase):
             gateway = ai_gateway.AiGateway(config, credential_reader=lambda: 'synthetic',
                 transport=ai_gateway.BoundedHttpsTransport(opener=opener), quote_spend=spend, telemetry=telemetry, sleep=sleep)
             with self.subTest(status=status), self.assertRaises(ai_gateway.GatewayError) as caught:
-                gateway.request('draft', body, response_contract='draft_synthesis_v1')
+                gateway.request('draft', body, response_contract='draft_synthesis_v2')
             self.assertEqual(caught.exception.reason, 'response_schema_rejected')
             self.assertEqual(caught.exception.diagnostics['failure_boundary'], 'provider_response_schema')
             self.assertEqual(caught.exception.diagnostics['attempt_number'], 1)
@@ -244,7 +247,7 @@ class GatewayContractTest(unittest.TestCase):
             transport = RecordingTransport([data]); spend = mock.Mock(); spend.tracks.return_value = True
             gateway = ai_gateway.AiGateway(config, credential_reader=lambda: 'synthetic', transport=transport, quote_spend=spend)
             with self.subTest(error=error), self.assertRaises(ai_gateway.GatewayError) as caught:
-                gateway.request('draft', body, response_contract='draft_synthesis_v1')
+                gateway.request('draft', body, response_contract='draft_synthesis_v2')
             self.assertEqual(caught.exception.reason, 'response_schema_rejected')
             self.assertFalse(caught.exception.retryable)
             self.assertNotIn(CANARY, str(caught.exception)+json.dumps(caught.exception.diagnostics))
@@ -262,11 +265,11 @@ class GatewayContractTest(unittest.TestCase):
             gateway = ai_gateway.AiGateway(config, credential_reader=credential, transport=transport)
             with mock.patch.object(ai_gateway, 'MAX_REQUEST_BYTES', limit):
                 if allowed:
-                    gateway.request('draft', body, response_contract='draft_synthesis_v1')
+                    gateway.request('draft', body, response_contract='draft_synthesis_v2')
                     credential.assert_called_once()
                 else:
                     with self.assertRaises(ai_gateway.GatewayError):
-                        gateway.request('draft', body, response_contract='draft_synthesis_v1')
+                        gateway.request('draft', body, response_contract='draft_synthesis_v2')
                     credential.assert_not_called(); self.assertFalse(transport.calls)
 
 
@@ -328,8 +331,9 @@ class StrictSynthesisTest(unittest.TestCase):
         self.assertEqual(first['text'], contracts.DRAFT_SYNTHESIS.text_format())
         prompt = first['input'][0]['content'][0]['text']
         self.assertIn('Use null quantity and unit for genuinely unmeasured or purely informational lines.', prompt)
-        self.assertIn('Keep unmeasured physical lines in the basis for review.', prompt)
-        self.assertIn('Do not emit line_items for informational lines.', prompt)
+        self.assertIn('Keep unmeasured physical and service scope in Quote Basis only, with unknown fields null.', prompt)
+        self.assertIn('Do not emit line_items for informational or clarification-only notes.', prompt)
+        self.assertIn('Derive area only from coherent dimensions and confirmed coverage of the same scope.', prompt)
         for key in ('model', 'reasoning', 'provider', 'store'):
             self.assertEqual(first[key], repair[key])
         self.assertIn(contracts.DRAFT_SYNTHESIS.field_instructions(), repair['input'][0]['content'][0]['text'])

@@ -488,7 +488,7 @@ class ProviderHTTPContractTest(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
 
-    def run_http(self, raw, *, exercise_selection=False):
+    def run_http(self, raw, *, exercise_selection=False, measurement_notes=""):
         from tests import test_basis_source_provenance as provenance
         with tempfile.TemporaryDirectory(dir=existing.test_temp_root()) as temp:
             reference_id = "response-admission-reference"
@@ -497,7 +497,7 @@ class ProviderHTTPContractTest(unittest.TestCase):
             payload.update(images=[{"name": "synthetic.png", "data_url": synthetic_image()}],
                 pricing_reference_id=reference_id, pricing_reference_source="local",
                 pricing_reference={"id": reference_id, "source": "local", "currency": "SGD"},
-                quote_session={"session_id": "quote-response-contract"})
+                quote_session={"session_id": "quote-response-contract"}, notes=measurement_notes)
             env = existing.isolated_env(OPENROUTER_API_KEY="synthetic-mocked-only", AUTH_REQUIRED="false",
                                        QUOTE_DATA_ROOT=str(self.fixture._test_data_root))
             response = json_response(existing.SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], raw)
@@ -556,14 +556,19 @@ class ProviderHTTPContractTest(unittest.TestCase):
                 self.assertEqual({row["source_basis_line_id"] for row in restored}, expected_ids)
                 self.assertTrue(all(row["pricing_authority"]["variant"] == "catalog" for row in restored))
 
-    def test_real_draft_alias_unit_selection_two_same_text_rows_and_saved_reopen(self):
+    def test_real_draft_alias_unit_selection_two_distinct_scopes_and_saved_reopen(self):
         from tests import test_basis_source_provenance as provenance
         raw = provenance.ProviderSourceSelectionTest.raw_draft(self)
+        notes = []
         for index, (line, row) in enumerate(zip(raw["quote_basis_sections"][0]["lines"], raw["line_items"])):
-            for item in (line, row): item.update(quantity=12 if index == 0 else 7, unit="m\u00b2")
-            line["text"] = row["description"] = "Synthetic surface physical installation"
+            quantity = 12 if index == 0 else 7
+            for item in (line, row): item.update(quantity=quantity, unit="m\u00b2")
+            location = "east" if index == 0 else "west"
+            line["text"] = row["description"] = f"Synthetic surface physical installation at {location}"
+            notes.append(f"{line['text']}: {quantity} sqm")
+            line.update(scope_kind="physical", measurement_evidence={"kind": "observed", "source": "Quote notes", "statement": notes[-1]})
         raw["line_items"][1]["id"] = "dimension-note"  # Coherent alternate explicit identity.
-        self.run_http(raw, exercise_selection=True)
+        self.run_http(raw, exercise_selection=True, measurement_notes="\n".join(notes))
 
     def test_real_draft_invalid_quantity_missing_scope_and_collision_reject_without_partial_result(self):
         for case in ("comma", "prefix-conflict", "missing-ids", "orphan-id", "malformed-extra", "duplicate-id"):

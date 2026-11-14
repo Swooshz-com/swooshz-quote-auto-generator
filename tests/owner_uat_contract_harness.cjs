@@ -320,6 +320,12 @@ if (input.mode==='reopen') {
   assert.strictEqual(outputRowsAlignedToBasis([row])[0],row,'Repeating the same ID within one basis line is one owner');
   console.log(JSON.stringify({status:'STABLE_ROW_SECTION_ALIGNMENT_PASS'}));
 } else if (input.mode==='selection') {
+  for (const name of [
+    'cleanCustomerQuoteLineText', 'bracketedCatalogReferenceParts', 'leadingNumber', 'formatQuantityNumber',
+    'normalizeQuantityPrefixUnit', 'leadingQuantityPrefix', 'quantityUnitAliases', 'startsWithQuantityUnit',
+    'stripLeadingQuantityCountFromLineText', 'normalizedLineTextQuantityParts',
+    'isNonQuoteNote', 'isInformationalDimensionText', 'basisLineIsInformationalDimension',
+  ]) eval(extract(name));
   state.lineItems=[input.row];state.outputRows=[{...input.row}];
   const line={...input.line,tag:'Custom',custom_pricing:true,possible_pricing_matches:[input.match]};
   delete line.pricing_keyword;state.quoteBasisSections=[{id:'selected',lines:[line]}];

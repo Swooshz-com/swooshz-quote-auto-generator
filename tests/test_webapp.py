@@ -25817,6 +25817,7 @@ eval([
   "normalizeLineItem",
   "normalizeOutputRow",
   "outputComparableText",
+  "isNonQuoteNote",
   "isInformationalDimensionText",
   "basisLineIsInformationalDimension",
   "outputRowIsInformationalDimension",
@@ -26194,6 +26195,19 @@ assert.strictEqual(confirmedNewLineItem.pricing_basis_amount, 154);
 assert.strictEqual(confirmedNewLineItem.approved_quote_amount, 154);
 assert.strictEqual(confirmedNewLineItem.pricing_reference_source, "local");
 assert.strictEqual(confirmedNewLineItem.pricing_reference_id, "new-quote-pricing");
+state.lineItems = [];
+for (const [quantity, unit, expected] of [
+  [null, "", [1, "nos"]], [null, "sqm", [1, "sqm"]], [4, "", [4, "nos"]],
+]) {
+  const line = state.quoteBasisSections[0].lines[0];
+  Object.assign(line, { quantity, unit, catalog_unit_price: 77 });
+  refreshOutputRowsFromLineItems();
+  assert.strictEqual(state.outputRows.length, 1);
+  const [row] = state.outputRows;
+  assert.deepStrictEqual([row.quantity, row.unit], expected);
+  assert.strictEqual(row.amount, "");
+  assert.strictEqual(row.catalog_unit_price, "");
+}
 assert.ok(source.includes("refreshOutputRowsFromLineItems();"));
 """
         completed = subprocess.run(
@@ -31197,6 +31211,7 @@ eval([
   "normalizeQuoteBasisSections",
   "confirmOnlyQuoteBasisSections",
   "basisSections",
+  "isNonQuoteNote",
   "isInformationalDimensionText",
   "basisLineIsInformationalDimension",
   "basisLineAllowsOutput",
@@ -42991,7 +43006,7 @@ main().catch((error) => {
             self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, request), "carpet-row"))
             self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "carpet-row"))
 
-    def _ledger_draft(self, runner, headers, payload, provider_raw):
+    def _ledger_draft(self, runner, headers, payload, provider_raw, *, measurement_sources=None):
         """POST /api/draft with the provider's raw JSON fed through the real normaliser (no network, no paid AI)."""
         saved = self._ledger_post(runner, headers, "/api/quote-sessions", {
             "quote_session": {"session_id": payload["quote_session"]["session_id"]},
@@ -43005,7 +43020,8 @@ main().catch((error) => {
         def provider(provider_payload, _key, auth_session=None, *, draft_configuration):
             self.assertIsInstance(draft_configuration, webapp.OpenAIDraftConfiguration)
             self.assertEqual(draft_configuration.analysis_mode, webapp.draft_analysis_mode(provider_payload))
-            return webapp.normalize_ai_draft(copy.deepcopy(provider_raw), provider_payload, require_confidence=True, auth_session=auth_session)
+            return webapp.normalize_ai_draft(copy.deepcopy(provider_raw), provider_payload, require_confidence=True,
+                                             auth_session=auth_session, measurement_sources=measurement_sources)
 
         with mock.patch.object(webapp, "read_dotenv_value", side_effect=dotenv), \
                 mock.patch.object(webapp, "request_openai_quote_basis", side_effect=provider):
@@ -43031,6 +43047,2256 @@ main().catch((error) => {
         if drafted.get("pricing_analysis_seal") is not None:
             request["pricing_analysis_seal"] = copy.deepcopy(drafted["pricing_analysis_seal"])
         return self._ledger_sync(request)
+
+    def test_quote_scope_notes_never_enter_the_workbook(self):
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers
+
+        cases = (
+            ("plain", "Clarification note: confirm venue access", ""),
+            ("prefixed", "1 lot Clarification note: confirm venue access", ""),
+            ("footprint", "36 sqm Provisional booth footprint: 6m x 6m", ""),
+            ("bracketed", "[ Synthetic service ] - 1 lot Clarification note: confirm venue access", ""),
+            ("bracketed-footprint", "[ Synthetic support ] - Provisional booth footprint (6m x 4m)", ""),
+            ("bracketed-axis-suffix", "[ Synthetic support ] - Provisional booth footprint (6 m wide x 4 m deep)", ""),
+            ("bracketed-axis-prefix", "[ Synthetic support ] - Provisional booth dimensions (W 6m x D 4m)", ""),
+            ("bracketed-link", "Synthetic alias", "[ Synthetic support ] - Provisional booth footprint (6m x 4m)"),
+            ("bracketed-item-link", "[ Synthetic support ] - Provisional booth footprint (6m x 4m)", "Synthetic alias"),
+            ("linked-basis", "Synthetic alias", "1 lot Confirmation note: confirm venue access"),
+            ("linked-item", "1 lot Clarification note: confirm venue access", "Synthetic alias"),
+        )
+        for label, description, basis_text in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                payload = valid_payload()
+                payload["quote_basis"] = {}
+                payload["quote_basis_sections"] = []
+                payload["line_items"] = [
+                    {"section": "Services", "description": "[ Synthetic delivery ] - delivery for setup; provisional booth footprint for context",
+                     "quantity": 1, "unit": "lot", "price_mode": "Priced", "unit_price_override": 20},
+                    {"section": "Services", "description": description, "quantity": 2 if label == "bracketed-footprint" else 1,
+                     "unit": "lot", "price_mode": "Priced", "unit_price_override": 35 if label == "bracketed-footprint" else 70,
+                     "source_basis_line_id": "note-row"},
+                ]
+                if basis_text:
+                    payload["quote_basis_sections"] = [{"title": "Services", "lines": [
+                        {"id": "note-row", "text": basis_text, "tag": "Include", "quantity": 1, "unit": "lot"}]}]
+                self.assertEqual(webapp.validate_generation_payload(payload), [])
+                brief = webapp.payload_to_brief(payload)
+                self.assertEqual([row.get("unit_price_override") for row in brief["line_items"]], [20])
+                self.assertFalse(brief["quote_basis_sections"])
+                root = Path(temp)
+                result = webapp.run_quote_job(payload, output_root=root / "out", tmp_root=root / "tmp")
+                self.assertEqual(result["status"], "completed", result.get("errors"))
+                [xlsx] = list((root / "out").rglob("quotation.xlsx"))
+                rows = [values for _, values in read_first_sheet_rows_with_numbers(xlsx)]
+                content = " ".join(str(value) for row in rows for value in row)
+                self.assertIn("Synthetic delivery", content)
+                self.assertNotIn("confirm venue access", content)
+                self.assertNotIn("Synthetic alias", content)
+                self.assertNotIn("Provisional booth footprint (6m x 4m)", content)
+                self.assertNotIn("6m x 6m", content)
+                [total] = [row for row in rows if "Total" in row]
+                self.assertIn(20, total)
+
+    def test_ledger_provisional_footprint_cannot_supply_automatic_area_pricing(self):
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers
+
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        spotlight = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        spotlight_price = koncept_catalog_sale_unit_price(spotlight)
+        cases = (
+            ("default", "using default booth dimensions 6m x 6m", "sqm", self.LEDGER_CARPET, False),
+            ("provisional", "for provisional booth footprint of 6m x 6m", "sqm", self.LEDGER_CARPET, False),
+            ("assumed-size", "based on an assumed 6m x 6m booth footprint", "sqm", self.LEDGER_CARPET, False),
+            ("reset-output", "calculated using the booth's assumed 6m x 6m footprint", "sqm", self.LEDGER_CARPET, False),
+            ("reset-analysis", "based on the currently assumed 6m x 6m booth footprint", "sqm", self.LEDGER_CARPET, False),
+            ("default-size", "using the default 6m x 6m footprint", "sqm", self.LEDGER_CARPET, False),
+            ("preposed-size", "based on the 6m x 6m default booth footprint", "sqm", self.LEDGER_CARPET, False),
+            ("proposed-area", "(area estimated from a provisional 36 sqm footprint)", "sqm", self.LEDGER_CARPET, False),
+            ("cross-symbol", "calculated using an assumed 6 m \u00d7 6 m stand footprint", "sqm", self.LEDGER_CARPET, False),
+            ("measured", "independently measured; provisional booth footprint for context", "sqm", self.LEDGER_CARPET, True),
+            ("negated", "independently measured, not based on provisional booth dimensions", "sqm", self.LEDGER_CARPET, True),
+            ("negated-then-dependent", "not based on provisional booth dimensions; using the default 6m x 6m footprint", "sqm", self.LEDGER_CARPET, False),
+            ("independent-location", "measured independently for the provisional booth footprint", "sqm", self.LEDGER_CARPET, True),
+        )
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for name, detail, unit, keyword, eligible in cases:
+                with self.subTest(name=name):
+                    payload = self._ledger_draft_payload(f"quote-provenance-{name}")
+                    payload["project"] = {"title": "Synthetic example"}
+                    scope = f"Synthetic carpet tile flooring {detail}"
+                    provider = {
+                        "project": {"booth_width": 6, "booth_depth": 6},
+                        "quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+                            {"id": "coverage", "tag": "Confirm", "text": scope, "quantity": 36, "unit": unit,
+                             "confidence_pct": 82, "pricing_keyword": keyword},
+                            {"id": "dimension-note", "tag": "Confirm", "text": "36 sqm Provisional booth footprint: 6m x 6m",
+                             "confidence_pct": 50},
+                        ]}],
+                        "line_items": [{"section": "Floors", "source_basis_line_id": "coverage",
+                                        "description": "Synthetic carpet tile flooring" if name in {"provisional", "assumed-size"} else scope,
+                                        "quantity": 36, "unit": unit, "pricing_keyword": keyword}],
+                    }
+                    spot = "Synthetic spotlight 6 inch for provisional booth footprint"
+                    provider["quote_basis_sections"].append({"id": "lighting", "title": "Lighting and AV", "lines": [
+                        {"id": "spotlight", "tag": "Confirm", "text": spot, "quantity": 2, "unit": "nos",
+                         "confidence_pct": 82, "pricing_keyword": spotlight},
+                    ]})
+                    provider["line_items"].append({
+                        "section": "Lighting and AV", "source_basis_line_id": "spotlight", "description": spot,
+                        "quantity": 2, "unit": "nos", "pricing_keyword": spotlight,
+                    })
+                    if name.startswith("reset-"):
+                        historical = copy.deepcopy(provider)
+                        historical["quote_basis_sections"][0]["lines"][0]["text"] = "Synthetic carpet tile flooring"
+                        historical["line_items"][0]["description"] = "Synthetic carpet tile flooring"
+                        with mock.patch.object(webapp, "provisional_measurement", return_value=False):
+                            previous = self._ledger_carry_draft(payload, self._ledger_draft(runner, headers, payload, historical))
+                            [area] = [row for row in previous["line_items"] if row["source_basis_line_id"] == "coverage"]
+                            previous_state = previous["quote_session"]["draft_state"]
+                            previous_snapshot = previous_state["originalAnalysisSnapshot"]
+                            if name == "reset-output":
+                                previous_state["originalOutputRows"] = [{**area, "description": scope}]
+                            else:
+                                previous_snapshot["quote_basis_sections"] = copy.deepcopy(previous["quote_basis_sections"])
+                                previous_snapshot["line_items"] = [{**area, "description": scope}]
+                            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, previous), "coverage"), price)
+                            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", previous)["status"], 200)
+                        previous.pop("pricing_analysis_seal")
+                        previous_snapshot.pop("pricing_analysis_seal")
+                        session_id = payload["quote_session"]["session_id"]
+                        reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                        self.assertEqual(reopened["status"], 200)
+                        reopened_state = reopened["body"]["quote_session"]["draft_state"]
+                        self.assertIsNone(self._ledger_price(reopened_state["lineItems"], "coverage"))
+                        reset_rows = (reopened_state["originalOutputRows"] if name == "reset-output" else
+                                      reopened_state["originalAnalysisSnapshot"]["line_items"])
+                        self.assertEqual(len(reset_rows), 1)
+                        self.assertIsNone(self._ledger_price(reset_rows, "coverage"))
+                        normalized = self._ledger_normalize(runner, headers, previous)
+                        self.assertIsNone(self._ledger_price(normalized, "coverage"))
+                        self.assertEqual(self._ledger_price(normalized, "spotlight"), spotlight_price)
+                    if name == "assumed-size":
+                        # A historical classifier granted this exact evidence.
+                        # Persist it before the current saved read and final gate.
+                        with mock.patch.object(webapp, "provisional_measurement", return_value=False):
+                            prior_draft = self._ledger_draft(runner, headers, payload, provider)
+                            prior = self._ledger_carry_draft(payload, prior_draft)
+                            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, prior), "coverage"), price)
+                            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", prior)["status"], 200)
+                        prior.pop("pricing_analysis_seal")
+                        prior["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+                        self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, prior), "coverage"))
+                        self.assertIsNone(self._ledger_price(self._ledger_brief_rows(prior), "coverage"))
+                        session_id = payload["quote_session"]["session_id"]
+                        reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                        self.assertEqual(reopened["status"], 200)
+                        self.assertIsNone(self._ledger_price(reopened["body"]["quote_session"]["draft_state"]["lineItems"], "coverage"))
+                        stripped = copy.deepcopy(prior)
+                        self._ledger_line(stripped, "coverage")["text"] = "Synthetic carpet tile flooring"
+                        for item in stripped["line_items"]:
+                            if item["source_basis_line_id"] == "coverage":
+                                item["description"] = "Synthetic carpet tile flooring"
+                        self._ledger_sync(stripped)
+                        self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, stripped), "coverage"))
+                        self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stripped)["status"], 200)
+                        retained = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["coverage"]
+                        self.assertEqual(retained["source_unit"], "")
+                        self.assertEqual(retained["grant"]["state"], "superseded")
+                        self.assertIsNone(self._ledger_price(self._ledger_brief_rows(stripped), "coverage"))
+                    drafted = self._ledger_draft(runner, headers, payload, provider)
+                    [entry] = [row for row in drafted["pricing_analysis_seal"]["rows"] if row["id"] == "coverage"]
+                    self.assertEqual(entry.get("catalog_item_id"), keyword if eligible else None)
+                    self.assertEqual(entry["unit"], unit if eligible else "")
+                    self.assertEqual(self._ledger_price(drafted["line_items"], "coverage"), price if eligible else None)
+                    request = self._ledger_carry_draft(payload, drafted)
+                    expected = price if eligible else None
+                    normalized = self._ledger_normalize(runner, headers, request)
+                    self.assertEqual(self._ledger_price(normalized, "coverage"), expected)
+                    self.assertEqual(self._ledger_price(normalized, "spotlight"), spotlight_price)
+                    saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+                    self.assertEqual(saved["status"], 200)
+                    request.pop("pricing_analysis_seal", None)
+                    request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal", None)
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "coverage"), expected)
+                    if name == "proposed-area":
+                        self._ledger_click(request, "coverage", keyword)
+                        pending = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+                        selected = self._ledger_select(runner, headers, request, "coverage", keyword,
+                                                       self._ledger_revision(pending, "coverage"))
+                        self.assertEqual(selected["body"]["selections"], [
+                            {"source_basis_line_id": "coverage", "status": "refused", "reason": "unit_review_required"},
+                        ])
+                        manual = copy.deepcopy(request)
+                        [area_row] = [row for row in manual["line_items"] if row["source_basis_line_id"] == "coverage"]
+                        area_row["pricing_authority"] = webapp.build_pricing_authority(
+                            "manual", area_row, price=7, reference_authority=webapp.exact_pricing_reference_authority(manual),
+                        )
+                        self._ledger_sync(manual)
+                        [manual_area] = [row for row in self._ledger_brief_rows(manual) if row["source_basis_line_id"] == "coverage"]
+                        self.assertEqual(manual_area["pricing_authority"]["variant"], "manual")
+                        self.assertEqual(manual_area["pricing_authority"]["price"], 7)
+                    if name in {"assumed-size", "negated"}:
+                        for row_id in ("coverage", "spotlight"):
+                            self._ledger_line(request, row_id)["tag"] = "Include" if row_id == "spotlight" or eligible else "Exclude"
+                        if not eligible:
+                            request["line_items"] = [row for row in request["line_items"] if row["source_basis_line_id"] != "coverage"]
+                        self._ledger_sync(request)
+                        generation = {**request, "quote_session": {"session_id": request["quote_session"]["session_id"]}}
+                        with tempfile.TemporaryDirectory() as temp:
+                            root = Path(temp)
+                            result = webapp.run_quote_job(generation, output_root=root / "out", tmp_root=root / "tmp")
+                            self.assertEqual(result["status"], "completed", result.get("errors"))
+                            [xlsx] = list((root / "out").rglob("quotation.xlsx"))
+                            values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                            [total] = [row for row in values if "Total" in row]
+                            self.assertIn(round(2 * spotlight_price + (36 * price if eligible else 0), 2), total)
+                            self.assertEqual(any("36 sqm" in row for row in values), eligible)
+                            self.assertFalse(any("Provisional booth footprint" in str(row) for row in values))
+                    if name == "assumed-size":
+                        independent = "Synthetic carpet tile flooring measured independently on site"
+                        refreshed = copy.deepcopy(provider)
+                        refreshed["quote_basis_sections"][0]["lines"][0].update(text=independent, quantity=24)
+                        refreshed["line_items"][0].update(description=independent, quantity=24)
+                        reviewed = self._ledger_carry_draft(payload, self._ledger_draft(runner, headers, payload, refreshed))
+                        self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, reviewed), "coverage"), price)
+
+    def test_provisional_scope_survives_direct_and_batch_provider_assembly(self):
+        import socket
+        from tests.gateway_test_support import synthetic_configuration
+        from tests.test_basis_quantity_retention import EvidenceTransport
+        from tests.test_openai_draft_request_contract import synthetic_pdf
+        from webapp import ai_gateway
+
+        vinyl = "synthetic-floors-synthetic-vinyl-floor-finish"
+        specs = (
+            ("assumed", "Synthetic carpet tile flooring based on an assumed 6m x 6m booth footprint", 36, "sqm", self.LEDGER_CARPET),
+            ("possessive", "Synthetic carpet tile flooring calculated using the booth's assumed 6m x 6m footprint", 36, "sqm", self.LEDGER_CARPET),
+            ("currently-assumed", "Synthetic carpet tile flooring based on the currently assumed 6m x 6m booth footprint", 36, "sqm", self.LEDGER_CARPET),
+            ("default", "Synthetic carpet tile flooring using the default 6m x 6m footprint", 36, "sqm", self.LEDGER_CARPET),
+            ("estimated", "Synthetic carpet tile flooring (area estimated from a provisional 36 sqm footprint)", 36, "sqm", self.LEDGER_CARPET),
+            ("measured", "Synthetic carpet tile flooring independently measured rather than being based on the provisional booth footprint", 24, "sqm", self.LEDGER_CARPET),
+            ("derived", "Synthetic vinyl floor finish", 24, "sqm", vinyl),
+            ("bad-coverage", "Synthetic carpet tile flooring at entrance", 24, "sqm", self.LEDGER_CARPET),
+            ("bad-area", "Synthetic carpet tile flooring at rear", 25, "sqm", self.LEDGER_CARPET),
+            ("note", "Footprint shown to orient venue review", None, "", ""),
+        )
+        provider = {"project": {"booth_width": 6, "booth_depth": 6}, "quote_basis_sections": [
+            {"title": "Floors", "lines": [
+                {"id": row_id, "tag": "Confirm", "text": text, "quantity": quantity, "unit": unit,
+                 "confidence_pct": 82, "pricing_keyword": keyword}
+                for row_id, text, quantity, unit, keyword in specs
+            ]}],
+            "line_items": [
+                {"section": "Floors", "source_basis_line_id": row_id, "description": text if row_id != "note" else "Venue footprint alias",
+                 "quantity": quantity, "unit": unit, "pricing_keyword": keyword}
+                for row_id, text, quantity, unit, keyword in specs
+            ],
+        }
+        evidence = {
+            "measured": ("observed", "Synthetic carpet tile flooring: 24 sqm"),
+            "derived": ("derived", "Synthetic vinyl floor finish: 6 m x 4 m, full coverage"),
+            "bad-coverage": ("derived", "Synthetic carpet tile flooring at entrance: 6 m x 4 m, partial coverage"),
+            "bad-area": ("derived", "Synthetic carpet tile flooring at rear: 6 m x 4 m, full coverage"),
+            "possessive": ("observed", "Synthetic carpet tile flooring: 36 sqm"),
+        }
+        notes = "; ".join(statement for row_id, (_, statement) in evidence.items() if row_id != "possessive")
+        config = synthetic_configuration(credential="synthetic")
+        for pages, sends in ((12, 1), (13, 4)):
+            with (self.subTest(pages=pages), mock.patch.object(webapp, "read_dotenv_value", side_effect=config.get),
+                  mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
+                  mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only"))):
+                response = copy.deepcopy(provider)
+                for line in response["quote_basis_sections"][0]["lines"]:
+                    row_id = line["id"]
+                    line["scope_kind"] = "informational" if row_id == "note" else "physical"
+                    if row_id in evidence:
+                        kind, statement = evidence[row_id]
+                        source = "Quote notes" if pages <= 12 else "Reference 1, PDF page 1"
+                        line["measurement_evidence"] = {"kind": kind, "statement": statement, "source": source}
+                transport = EvidenceTransport(provider_result=response, measurement_note=notes)
+                with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
+                    gateway = webapp.configured_ai_gateway()
+                route = gateway.configuration.route("draft")
+                draft_config = webapp.OpenAIDraftConfiguration("standard", route.model, route.effort, gateway)
+                payload = self._ledger_draft_payload(f"quote-provenance-pages-{pages}")
+                payload["project"] = {"title": "Synthetic provenance review"}
+                if pages <= 12:
+                    payload["notes"] = notes
+                payload["images"] = [{"name": "synthetic.pdf", "data_url": synthetic_pdf(pages)}]
+                draft = webapp.request_openai_quote_basis(payload, "synthetic", draft_configuration=draft_config)
+                final = webapp.finalized_remote_draft_result(
+                    payload, draft, "openai", "OpenAI", webapp.booth_dimensions_from_payload(payload), [],
+                )
+                self.assertEqual(len(transport.calls), sends)
+                self.assertEqual(final["project"]["dimension_source"], "default")
+                sealed = {entry["id"]: entry for entry in final["pricing_analysis_seal"]["rows"]}
+                self.assertEqual(sealed["note"]["measurement"], {"disposition": "informational"})
+                self.assertNotIn("note", {row["source_basis_line_id"] for row in final["line_items"]})
+                for row_id in ("assumed", "possessive", "currently-assumed", "default", "estimated", "bad-coverage", "bad-area"):
+                    self.assertEqual(sealed[row_id]["unit"], "")
+                    self.assertEqual(sealed[row_id]["measurement"], {"disposition": "review"})
+                    self.assertNotIn("catalog_item_id", sealed[row_id])
+                self.assertEqual(sealed["measured"]["catalog_item_id"], self.LEDGER_CARPET)
+                self.assertEqual(sealed["measured"]["quantity"], 24)
+                self.assertEqual(sealed["derived"]["measurement"].get("kind"), "derived", sealed["derived"])
+                self.assertEqual(sealed["derived"].get("catalog_item_id"), vinyl, sealed["derived"])
+
+    def test_admitted_measurements_require_same_scope_and_valid_grouping(self):
+        label = "Synthetic carpet tile flooring"
+        cases = (
+            ("exact", label + " at east", label + " at east", "24 sqm", 24, "observed", True),
+            ("generic-to-west", label + " at west", label + " at west", "24 sqm", 24, "observed", False),
+            ("linked-conflict", label + " at east", label + " at west", "24 sqm", 24, "observed", False),
+            ("provisional", label + " calculated using the booth's assumed 6m x 6m footprint", label, "24 sqm", 24, "observed", False),
+            ("grouped", label, label, "1,200 sqm", 1200, "observed", True),
+            ("grouped-not-decimal", label, label, "1,200 sqm", 1.2, "observed", False),
+            ("ambiguous", label, label, "1,2 sqm", 1.2, "observed", False),
+            ("conflicting-prefix", label, label, "24 sqm", 24, "observed", False),
+            ("derived-grouped", label, label, "1,200 m x 2 m, full coverage", 2400, "derived", True),
+            ("derived-not-decimal", label, label, "1,200 m x 2 m, full coverage", 2.4, "derived", False),
+        )
+        for name, basis, item, amount, quantity, kind, allowed in cases:
+            with self.subTest(name=name):
+                source_label = basis if name in {"exact", "linked-conflict"} else label
+                if name == "conflicting-prefix":
+                    source_label = f"12 sqm {source_label}"
+                statement = f"{source_label}: {amount}"
+                source_text = statement + (f"; {label} at west: 4 sqm" if name == "generic-to-west" else "")
+                row = {"source_basis_line_id": "floor", "description": item, "quantity": quantity, "unit": "sqm"}
+                line = {"id": "floor", "text": basis, "scope_kind": "physical", "quantity": quantity, "unit": "sqm",
+                        "measurement_evidence": {"source": "Quote notes", "kind": kind, "statement": statement}}
+                draft = {"quote_basis_sections": [{"lines": [line]}], "line_items": [row]}
+                record = webapp.admitted_scope_measurements(draft, {"Quote notes": [source_text]})["floor"]
+                self.assertEqual(record["disposition"], "measured" if allowed else "review")
+
+        statement = f"{label}: 24 sqm"
+        line = {"id": "floor", "text": label, "scope_kind": "physical", "quantity": 24, "unit": "sqm",
+                "measurement_evidence": {"source": "Quote notes", "kind": "observed", "statement": statement}}
+        row = {"source_basis_line_id": "floor", "description": label, "quantity": 24, "unit": "sqm"}
+        draft = {"quote_basis_sections": [{"lines": [line]}], "line_items": [row]}
+        for other, allowed in (("~4 sqm", False), ("estimated 4 sqm", False), ("4 square feet", False),
+                               ("6 ft x 4 ft, full coverage", False), ("1 200,0 sqm", False),
+                               ("\uff14\u2013\uff16 \u33a1", False),
+                               ("between four and six metres squared", False),
+                               ("24 sqm (site note; range is 4 to 6 sqm)", False),
+                               ("24 sqm (provisional in drawing)", False),
+                               ("24 sqm [survey status: estimated]", False),
+                               ("24 sqm (measurement is provisional)", False),
+                               ("24 sqm (default until surveyed)", False),
+                               ("24 sqm (pending measurement confirmation)", False),
+                               ("24 sqm (subject to site verification)", False),
+                               ("24 sqm (site verification pending)", False),
+                               ("24 sqm (measurement remains unverified)", False),
+                               ("24 sqm (pending field verification)", False),
+                               ("24 sqm (still provisional)", False),
+                               ("24 sqm (provisional drawing)", False),
+                               ("24 sqm (measurement status - provisional)", False),
+                               ("24 sqm (site survey status: provisional)", False),
+                               ("24 sqm (area not yet verified)", False),
+                               ("24 sqm (site measurement has not been verified)", False),
+                               ("24 sqm (measurement hasn't yet been independently verified by the surveyor)", False),
+                               ("24 sqm (measurement has yet to be verified)", False),
+                               ("24 sqm (awaiting site verification)", False),
+                               ("24 sqm (measurement is waiting for independent confirmation)", False),
+                               ("24 sqm (site verification outstanding)", False),
+                               ("24 sqm (site verification required before installation)", False),
+                               ("24 sqm (field confirmation is still needed)", False),
+                               ("24 sqm (invoice verification required)", True),
+                               ("24 sqm (field verification remains outstanding)", False),
+                               ("24 sqm (field verification has not been completed)", False),
+                               ("24 sqm (site verification is not yet complete)", False),
+                               ("24 sqm (drawing source. Awaiting site verification)", False),
+                               ("24 sqm (not provisional but awaiting field verification)", False),
+                               ("24 sqm (site verification completed)", True),
+                               ("24 sqm (site verification still remains incomplete)", False),
+                               ("24 sqm (verification of the area is awaited)", False),
+                               ("24 sqm (required verification of the site measurement)", False),
+                               ("24 sqm (the measured area must be independently verified)", False),
+                               ("24 sqm (site measurements need to be independently checked)", False),
+                               ("24 sqm (field verification has not yet been carried out)", False),
+                               ("24 sqm (onsite verification has yet to be done)", False),
+                               ("24 sqm (the measurement will be verified)", False),
+                               ("24 sqm (flooring dimensions will shortly be verified)", False),
+                               ("24 sqm (the flooring dimensions are going to be verified)", False),
+                               ("24 sqm (measurement has yet to undergo a site verification)", False),
+                               ("24 sqm (measurement has not yet been fully verified)", False),
+                               ("24 sqm (measurement has not been satisfactorily verified)", False),
+                               ("24 sqm (measurement has been verified only partially)", False),
+                               ("24 sqm (only some of the dimensions have been verified)", False),
+                               ("24 sqm (not all flooring dimensions have been independently verified)", False),
+                               ("24 sqm (flooring dimensions still require verification)", False),
+                               ("24 sqm (verification of the flooring dimensions will happen later)", False),
+                               ("24 sqm (the flooring dimensions have been fully independently verified)", True),
+                               ("24 sqm (flooring dimensions do not require verification)", True),
+                               ("24 sqm (all of the flooring dimensions have been verified)", True),
+                               ("24 sqm (invoice value is awaiting verification)", True),
+                               ("24 sqm (the paperwork will be verified)", True),
+                               ("24 sqm (onsite verification is tentatively planned)", False),
+                               ("24 sqm (the flooring dimensions have only partially been verified)", False),
+                               ("24 sqm (the flooring dimensions have been verified in part)", False),
+                               ("24 sqm (the flooring dimensions haven't all been verified)", False),
+                               ("24 sqm (the flooring dimensions will only be verified after installation)", False),
+                               ("24 sqm (the flooring dimensions are only half verified)", False),
+                               ("24 sqm (the flooring dimensions have all been independently verified)", True),
+                               ("24 sqm (invoice verification is tentatively planned)", True),
+                               ("24 sqm (awaiting approval of the dimensions)", False),
+                               ("24 sqm (the flooring dimensions are expected to be signed off)", False),
+                               ("24 sqm (only some of the floor dimensions have been approved)", False),
+                               ("24 sqm (approval of the flooring dimensions is no longer required)", True),
+                               ("24 sqm (venue sign-off is still due)", True),
+                               ("24 sqm (measurement is subject to sign-off for the venue)", True),
+                               ("24 sqm (site measurement is waiting on independent verification)", False),
+                               ("24 sqm (measurement must still be confirmed)", False),
+                               ("24 sqm (site measurement will need verification)", False),
+                               ("24 sqm (site measurement must undergo verification)", False),
+                               ("24 sqm (site measurement is due for verification)", False),
+                               ("24 sqm (site measurement is scheduled to be verified)", False),
+                               ("24 sqm (verification is already scheduled before handover)", False),
+                               ("24 sqm (site measurement needs no further verification)", True),
+                               ("24 sqm (site measurement will not need verification)", True),
+                               ("24 sqm (site measurement is due for invoice verification)", True),
+                               ("24 sqm (verification of the area is no longer required)", True),
+                               ("24 sqm (site measurement does not need verification)", True),
+                               ("24 sqm (verification has already been completed)", True),
+                               ("24 sqm (verification of invoices is still incomplete)", True),
+                               ("24 sqm (awaiting validation of the invoice)", True),
+                               ("24 sqm (measurement has been independently verified)", True),
+                               ("24 sqm (invoice verification outstanding)", True),
+                               ("24 sqm (PDF saved with default margins)", True),
+                               ("24 sqm (default margins)", True),
+                               ("24 sqm (pending invoice)", True),
+                               ("24 sqm (invoice verification pending)", True),
+                               ("24 sqm (measurement is not provisional)", True),
+                               ("24 sqm (drawing source)", True),
+                               ("24 sqm (not provisional)", True),
+                               ("24 sqm (not based on the provisional booth footprint)", True),
+                               ("24 sqm (survey: same measurement)", True),
+                               ("(24 sqm) (site record)", True), ("6 metres x 4 metres (full coverage)", True),
+                               ("24 sqm to thirty", False), ("(24 sqm) site record", False), ("(24 sqm) to thirty", False),
+                               ("24 sqm (site note) to thirty", False), ("24 sqm,", True)):
+            with self.subTest(other=other):
+                sources = {"Quote notes": [statement], "Reference 1, PDF page 1": [f"{label}: {other}"]}
+                record = webapp.admitted_scope_measurements(draft, sources)["floor"]
+                self.assertEqual(record["disposition"], "measured" if allowed else "review")
+
+        located = f"{label}: west lower level"
+        line.update(text=located, measurement_evidence={"source": "Quote notes", "kind": "observed", "statement": f"{located}: 24 sqm"})
+        row.update(description=located)
+        sources = {"Quote notes": [f"{located}: 24 sqm"]}
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
+        sources["Quote notes"].append(f"Synthetic carpet tile\nflooring: west lower level: about four to six sqm")
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "review")
+        sources = {"Quote notes": [f"{located}: 24 sqm; approximately 4 sqm"]}
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "review")
+        sources = {"Quote notes": ["Do not quote", f"{located}: 24 sqm"]}
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
+        sources = {"Quote notes": [f"{located}: 24 sqm", "Installer brings 2 sqm of sample boards"]}
+        self.assertEqual(webapp.admitted_scope_measurements(draft, sources)["floor"]["disposition"], "measured")
+        for heading, allowed in (
+            (f"{located} revised measurement: 4 sqm", False),
+            (f"Survey ({located}, field check): 4 sqm", False),
+            (f"Survey: confirmed the site visit. Revise {located} to 4 sqm", False),
+            (f"Survey: revise to 4 sqm for {located}", False),
+            (f"Revise {located} to 4 sqm", False),
+            (f"Survey: see {located} after the site visit", True),
+            ("Sample boards: Installer brings 2 sqm", True),
+        ):
+            with self.subTest(heading=heading):
+                sources = {"Quote notes": [f"{located}: 24 sqm"], "Reference 1, PDF page 1": [heading]}
+                record = webapp.admitted_scope_measurements(draft, sources)["floor"]
+                self.assertEqual(record["disposition"], "measured" if allowed else "review")
+
+    def test_area_source_labels_use_exact_boundaries_and_local_context(self):
+        west, east = "carpet tile west", "carpet tile east"
+        qualified = "carpet tile west: upper level"
+        scopes = {west, east, qualified, "tile west"}
+        cases = (
+            ("Carpet tile west: upper level: 24 sqm", {qualified: 24}),
+            ("Carpet tile west: 24 sqm. Carpet tile east: 10 sqm.", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm. 10 sqm Carpet tile east: 10 sqm.", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm (survey confirmed?) Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. (survey confirmed?) Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm.\n(using the assumed booth footprint);\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. (using the assumed booth footprint); Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm.\n((using the assumed booth footprint));\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm.\n(using the assumed booth footprint;\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm.\n(using the assumed booth footprint) and estimates may vary;\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. (site measurement). [survey confirmed?]. Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. (site measurement); Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm. Work ends tomorrow. [Site office]", {west: None}),
+            ("Carpet tile west: 24 sqm; Work ends tomorrow. [Site office]", {west: 24}),
+            ("Carpet tile west: 24 sqm; Installer will bring 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Installer brings 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Installer brought 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; The organiser requests 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey estimates 4 sqm of flooring; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Crew may carry 4 to 6 sqm of material; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: Installer brings 2 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Material samples: Crew may carry 4 to 6 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west revised measurement: 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey (Carpet tile west, field check): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey (revised Carpet tile west): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey [remeasure Carpet tile west]: 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (revise Carpet tile west to 4 sqm)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (Carpet tile west revised to 4 sqm)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (Revision for Carpet tile west: 4 sqm)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (4 sqm for Carpet tile west)", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (pending field verification, revise Carpet tile west to 4 sqm)", {west: None, east: None}),
+            ("Carpet tile west: 24 sqm; Carpet tile east: 10 sqm (pending field verification, 4 sqm for Carpet tile west)", {west: None, east: None}),
+            ("Carpet tile west: 24 sqm; Carpet tile (west): 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey: revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey: 4 sqm for Carpet tile west; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west near reception: 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west near reception behind booth: 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west (upper level): 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west near reception: revise Carpet tile west to 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, separate from Carpet tile west; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards (separate from Carpet tile west): 2 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east revised to 4 sqm; Carpet tile east: 10 sqm", {west: 24, east: None}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, compared with Carpet tile west: 24 sqm; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Sample boards: 2 sqm, not separate from Carpet tile west; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Survey: revise Carpet tile west to 4 sqm, excluding Carpet tile east; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: 24 sqm (provisional in drawing); Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: 24 sqm (not provisional); Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: upper level: 4 sqm; Carpet tile east: 10 sqm", {west: 24, qualified: 4, east: 10}),
+            ("Carpet tile west: 24 sqm (see Carpet tile east); Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("- Carpet tile west: 24 sqm (see Carpet tile east); Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west: Survey estimates 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; 4 to 6 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Installer will bring 2 sqm of sample boards; 4 to 6 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; May be 4 sqm; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; Carpet tile west will require 4 sqm of flooring; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. Installer will bring 2 sqm of sample boards; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm.\nUsing the assumed booth footprint;\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. Using the assumed booth footprint; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. The installer is using the assumed booth footprint; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm; The installer is using the assumed booth footprint; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm; Not using the assumed booth footprint; Carpet tile east: 10 sqm", {west: 24, east: 10}),
+            ("Carpet tile west: 24 sqm.\nPending site verification;\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm. Pending site verification; Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm.\nQuantity subject to confirmation;\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm.\n?;\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: [estimated] 6 m x 4 m, full coverage.\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: (PROVISIONAL) - 24 sqm. Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: {AsSuMeD}: 6 m x 4 m, full coverage. Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: [estimated from drawings] 6 m x 4 m, full coverage. Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: (estimated from drawings) 24 sqm. Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: {AsSuMeD from drawings}: 24 sqm. Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: [estimated from drawings) 24 sqm. Carpet tile east: 10 sqm", {west: None, east: None}),
+            ("Carpet tile west: [estimated 6 m x 4 m, full coverage. Carpet tile east: 10 sqm", {west: None, east: None}),
+            ("Carpet tile west: estimated 24 sqm.\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: provisional 6 m x 4 m, full coverage. Carpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: estimated 24 sqm. Do not quote Carpet tile east: 10 sqm", {west: None, east: None}),
+            ("Carpet tile west: 24 sqm (survey confirmed?) Do not quote Carpet tile east: 10 sqm.", {west: None, east: None}),
+            ("Carpet tile west: survey pending, do not quote Carpet tile east: 10 sqm.", {east: None}),
+            ("Carpet tile west: 24 sqm. Do not quote Carpet tile east: 10 sqm.", {west: None, east: None}),
+            ("Carpet tile west: 24 sqm; Do not quote Carpet tile east: 10 sqm.", {west: 24, east: None}),
+            ("Do not quote Carpet tile east: 10 sqm", {east: None}),
+            ("Do not quote\nCarpet tile east: 10 sqm", {east: None}),
+            ("Synthetic survey\nCarpet tile east: 10 sqm", {east: None}),
+            ("Synthetic survey;\nCarpet tile east: 10 sqm", {east: 10}),
+            ("Examples only, e.g.\nCarpet tile west: 24 sqm", {west: None}),
+            ("Examples only, e.g. Carpet tile west: 24 sqm", {west: None}),
+            ("Examples only, e.g.;\nCarpet tile west: 24 sqm", {west: 24}),
+            ("Reference A.B.\nCarpet tile west: 24 sqm", {west: None}),
+            ("1.\nCarpet tile west: 24 sqm", {west: None}),
+            ("Reference 24.\nCarpet tile west: 24 sqm", {west: None}),
+            ("Examples only.\nCarpet tile west: 24 sqm", {west: None}),
+            ("Carpet tile west: 24 sqm (survey confirmed?) Do not quote\nCarpet tile east: 10 sqm", {west: None, east: None}),
+            ("Carpet tile west: 24 sqm (survey confirmed?)\nCarpet tile east: 10 sqm", {west: None, east: 10}),
+            ("Carpet tile west: 24 sqm\npending site verification", {west: None}),
+            ("Carpet tile west: 24 sqm\n-\n30", {west: None}),
+            ("Carpet tile west: Site survey; Pavilion roof: 68 sqm", {}),
+            ("Carpet tile west: Site survey\nPavilion roof: 68 sqm", {west: None}),
+            ("[ Carpet tile west ]: 24 sqm", {west: 24}),
+            ("Carpet tile west: 24 sqm (see Carpet tile east: survey pending)", {west: 24}),
+            ("Carpet tile west: 24 sqm (Carpet tile east: roughly four sqm)", {west: 24, east: None}),
+            ("Survey (pending\nCarpet tile west: roughly four sqm", {west: None}),
+            ("Carpet tile east: 10 sqm;\nSurvey (pending\nCarpet tile west: roughly four sqm", {east: 10, west: None}),
+            ("Carpet tile east: 10 sqm\nSurvey (pending\nCarpet tile west: roughly four sqm", {east: None, west: None}),
+            ("Recarpet tile west: 24 sqm", {"tile west": None}),
+            ("Uncarpeted: 24 sqm", {}),
+            ("12 sqm Carpet tile west: 24 sqm", {west: None}),
+            ("Carpet tile west: 6 by roughly four m", {west: None}),
+            ("Carpet tile west: 6 metres wide by roughly four", {west: None}),
+            ("Carpet tile west: survey by 4 m aisle", {}),
+            ("Carpet tile west: 24.\nsqm", {west: None}),
+            ("Carpet tile west: 24; sqm", {west: None}),
+            ("Carpet tile west: 24\nsqm", {west: 24}),
+            ("Carpet tile west: 24 sqm; Work ends tomorrow.", {west: 24}),
+            ("Carpet tile west: 24 sqm\n?", {west: None}),
+            ("Carpet tile west: 24 sqm (survey confirmed?)", {west: None}),
+            ("Carpet tile west: 24 sqm\n(survey confirmed?)", {west: None}),
+            ("Carpet tile west: 24 sqm to 30", {west: None}),
+            ("Carpet tile west: 24 sqm\nto 30", {west: None}),
+            ("Carpet tile west: 24 sqm\nto\n30", {west: None}),
+            ("Carpet tile west: 24 sqm\nto thirty", {west: None}),
+            ("Carpet tile west: 24 sqm\n\u2013 30", {west: None}),
+            ("Carpet tile west: 24 sqm\n(site measurement)", {west: 24}),
+            ("Carpet tile west: 6 wide by 4 m", {west: None}),
+            ("Carpet tile west: 6 wide x 4 m", {west: None}),
+            ("Carpet tile west: 24 sqm\nPavilion roof: 68 sqm", {west: None}),
+            ("Carpet tile west: 24 sqm\nRevised area: 18 sqm", {west: None}),
+            ("Carpet tile west: 24 sqm. Measurement to confirm: 24 to 30 sqm", {west: None}),
+            ("Carpet tile west: 24 sqm;\nPavilion roof: 68 sqm", {west: 24}),
+            ("Carpet tile west: 24 sqm;\nPavilion\nroof: 68 sqm", {west: 24}),
+            ("Carpet tile west: 6 m x 4 m,\nfull coverage;\nPavilion roof: 68 sqm", {west: 24}),
+            ("Carpet tile west: Site survey\nZone B: 4 to 6 sqm", {west: None}),
+            ("Carpet tile east: 10 sqm\n(Carpet tile west): 18 sqm", {east: 10, west: 18}),
+            ("Carpet tile east: 10 sqm\n{Carpet tile west}: 18 sqm", {east: 10, west: 18}),
+            ("Carpet tile east: 10 sqm\n(Carpet tile west]: 18 sqm", {east: 10, west: None}),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                claims = list(webapp.area_source_claims(raw, webapp.area_scope_patterns(scopes)))
+                self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
+                west_claims = [claim for claim in claims if claim.scope == west]
+                first_record = raw.split(";", 1)[0]
+                for claim in claims:
+                    if (claim.quantity is None or (claim.scope == west and len(west_claims) == 1
+                            and (" (" in first_record or "\n(" in first_record or raw.startswith("Carpet tile east:")))):
+                        self.assertFalse(claim.eligible)
+        located = f"{west} near reception"
+        raw = f"{located}: 24 sqm; {located} behind booth: 4 sqm; {east}: 10 sqm"
+        claims = webapp.area_source_claims(raw, webapp.area_scope_patterns({located, east}))
+        self.assertEqual({claim.scope: claim.quantity for claim in claims}, {located: 24, east: 10})
+        north = "carpet tile north"
+        exact = f"{west}: 24 sqm; {east}: 10 sqm; {north}: 5 sqm;"
+        context_cases = (
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east}, and {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from both {west} and {east}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from all of the {west}, {east} and {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from the {west}, the {east}, and the {north}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from either {west} or {east}", {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north}; Survey: revise {north} to 4 sqm",
+             {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north} revised to 4 sqm", {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east} and {north} 4 to 6 sqm", {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, possibly separate from both {west} and {east}", {west: None, east: None, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west} (now measured at 4 sqm), {east}, and {north}",
+             {west: None, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west},\n{east} (now measured at 4 sqm), and {north}",
+             {west: 24, east: None, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east}, and {north} (now measured at 4 sqm)",
+             {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, separate from {west} (drawing source) (roughly 4 to 6 sqm), {east}, and {north}",
+             {west: None, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west}, {east} (awaiting site verification), and {north}",
+             {west: 24, east: None, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west} (site verification completed), {east}, and {north}",
+             {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west} (revise {north} to 4 sqm), {east}, and {north}",
+             {west: 24, east: 10, north: None}),
+            (f"Sample boards: 2 sqm, separate from {west} (compared with {north} at 4 sqm)",
+             {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west} (compared with {north} at 4 sqm), {east}, and {north}",
+             {west: 24, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west} (compared with {north} at 5 sqm, now measured at 4 sqm), {east}, and {north}",
+             {west: None, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west} (compared with {north} at 5 sqm but awaiting site verification), {east}, and {north}",
+             {west: None, east: 10, north: 5}),
+            (f"Sample boards: 2 sqm, separate from {west} (now measured at 4 sqm), {east}, and {north} revised to 6 sqm",
+             {west: None, east: 10, north: None}),
+        )
+        patterns = webapp.area_scope_patterns({west, east, north})
+        for note, expected in context_cases:
+            with self.subTest(note=note):
+                claims = webapp.area_source_claims(f"{exact} {note}", patterns)
+                self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
+
+        comparison = f"Sample boards: 2 sqm, separate from {west}, {east}, and {north}"
+        boundary_cases = (
+            (f"{north}: 5 sqm. {comparison}", 5),
+            (f"{north}: 5 sqm\n{comparison}", 5),
+            (f"{north}: 5 sqm (site verification required)\n{comparison}", None),
+            (f"{north}: 5 sqm. Additional 4 sqm\n{comparison}", None),
+            (f"{north}: 5 sqm\n2 sqm, separate from {west} and {east}", None),
+            (f"{north}: 5 sqm\nSample boards: 2 sqm, possibly separate from {west} and {east}", None),
+        )
+        for raw, expected in boundary_cases:
+            with self.subTest(raw=raw):
+                claims = [claim for claim in webapp.area_source_claims(raw, patterns) if claim.scope == north]
+                self.assertEqual(claims[0].quantity, expected)
+                self.assertEqual(len(claims), 1)
+
+        compare = f"compared with {north} at 5 sqm"
+        member_cases = (
+            (f"{compare}, {east}: 4 or 6 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, revise {east} and {north} to 4 sqm", {west: None, east: None, north: None}),
+            (f"4 sqm for {east}, {compare}", {west: 24, east: None, north: 5}),
+            (f"{east} was revised to 4 sqm then {compare}", {west: 24, east: None, north: 5}),
+            (f"revise {east} to 4 sqm {compare}", {west: 24, east: None, north: 5}),
+            (f"{compare}, the {east} at 10 sqm", {west: 24, east: 10, north: 5}),
+            (f"{compare} but now measured at 4 sqm", {west: None, east: 10, north: 5}),
+            (f"{compare}, {east} has been subsequently remeasured to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} has since been corrected to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} had just been recalculated to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} has already been adjusted to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} has been revised: 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}, {east} hasn't yet been corrected: 4 sqm", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at (5 sqm [revise {east} to 4 sqm])", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at (5 sqm; {east} has been revised: 4 sqm)", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at (5 sqm [printed reference])", {west: 24, east: 10, north: 5}),
+            (f"{compare}\nnow measured at 4 sqm", {west: None, east: 10, north: 5}),
+            (f"{compare}\n{east} must be revised to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}\n{east} will need to be independently revised to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}; {east} has yet to be corrected to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"{compare}; {east} would need to be remeasured to 4 sqm", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at\n5 sqm\nand {east} at 10 sqm", {west: 24, east: 10, north: 5}),
+            (f"{compare}, {east}: 4 sqm", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at [5 sqm] [revise {east} to 4 sqm]", {west: 24, east: None, north: 5}),
+            (f"compared with {north} [5 sqm]", {west: 24, east: 10, north: 5}),
+            (f"compared with {north} at about 5 sqm [revise {east} to 4 sqm]", {west: 24, east: None, north: 5}),
+            (f"compared with {north} at 4 to 6 sqm [now measured at 4 sqm]", {west: None, east: 10, north: 5}),
+            (f"compared with {north} [revise {east} to 4 sqm] [now measured at 4 sqm]",
+             {west: None, east: None, north: 5}),
+            (f"{compare}, [{east} at 10 sqm] [drawing revision]", {west: 24, east: 10, north: 5}),
+            (f"{compare}, [{east} at 10 sqm] [revise {west} to 4 sqm]", {west: None, east: 10, north: 5}),
+        )
+        for annotation, expected in member_cases:
+            with self.subTest(annotation=annotation):
+                raw = f"{exact} Sample boards: 2 sqm, separate from {west} ({annotation}), {east}, and {north}"
+                claims = webapp.area_source_claims(raw, patterns)
+                self.assertEqual({claim.scope: claim.quantity for claim in claims}, expected)
+
+    def test_area_comparison_reads_local_relation_spans_for_long_records(self):
+        scope = "carpet tile west"
+        patterns = webapp.area_scope_patterns({scope})
+        heading = "sample boards: 2 sqm, "
+        member = f"separate from {scope} (drawing source)"
+        for count in (16, 128, 1024):
+            with self.subTest(count=count):
+                source = heading + ", ".join([member] * count)
+                _, pairs = webapp.area_bracket_context(source)
+                with mock.patch.object(webapp, "area_contextual_reference", side_effect=AssertionError("Growing prefix scan")):
+                    members = list(webapp.area_comparison_members(
+                        source, 0, len(source), heading.index(":"), patterns, pairs,
+                    ))
+                self.assertEqual(len(members), count)
+                self.assertEqual([position for position, _, _ in members], [
+                    len(heading) + index * (len(member) + 2) + len("separate from ")
+                    for index in range(count)
+                ])
+                for _, scopes, [(left, right)] in members:
+                    self.assertEqual(scopes, {scope})
+                    self.assertEqual(source[left:right], "drawing source")
+
+    def test_nested_area_wrappers_read_the_inner_assertion_once(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        for depth in (8, 128, 512):
+            for local in ("", "site note "):
+                with self.subTest(depth=depth, local=local):
+                    assertion = f"the dimensions for {east} remain unverified"
+                    text = f"({local}" * depth + assertion + ")" * depth
+                    with mock.patch.object(webapp, "area_local_qualification_scopes",
+                                           wraps=webapp.area_local_qualification_scopes) as parse:
+                        self.assertEqual(webapp.area_qualification_scopes(text, {west}, patterns, paired_only=True), {east})
+                    self.assertEqual(
+                        [args[0].strip() for args, _ in parse.call_args_list],
+                        ([local.strip()] * (depth - 1) if local else []) + [local + assertion],
+                    )
+
+    def test_wide_area_notes_walk_collapsed_whitespace_once(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        prefix = f"We checked the dimensions for {east}. "
+        retained = "(Those dimensions remain unverified)"
+        aside = "(drawing reference) "
+        count = (webapp.MAX_PDF_MEASUREMENT_CHARS_PER_PAGE - len(prefix + retained)) // len(aside)
+        text = (prefix + aside * count + retained).casefold()
+        self.assertEqual(webapp.area_qualification_scopes(text, {west}, patterns, paired_only=True), {east})
+        self.assertIsNone(webapp.AREA_QUALIFICATION_BREAK.search(" " * (count * 3)))
+
+    def test_coordinated_area_asides_resolve_each_exact_label_once(self):
+        east, west = "carpet tile east", "carpet tile west"
+        patterns = webapp.area_scope_patterns({east, west})
+        first = f"{east} (drawing)"
+        last = f"{west} (remain unverified)"
+        prefix, suffix = "the dimensions for ", " were verified"
+        budget = webapp.MAX_PDF_MEASUREMENT_CHARS_PER_PAGE - len(prefix + last + suffix)
+        count = budget // len(first + " and ")
+        note = prefix + (first + " and ") * count + last + suffix
+        with mock.patch.object(webapp, "area_scope_reference_key",
+                               wraps=webapp.area_scope_reference_key) as read:
+            self.assertEqual(webapp.area_qualification_scopes(note, set(), patterns), {east, west})
+        self.assertLessEqual(read.call_count, 3 * (count + 1))
+
+    def test_area_qualification_resolves_complete_named_roles_before_fallback(self):
+        west = "carpet tile west"
+        east = "carpet and vinyl east near the registration desk"
+        patterns = webapp.area_scope_patterns({west, east})
+        for note, expected in (
+            (f"the dimensions on [{east}] are still being checked", {east}),
+            (f"the surveyor will have to verify the quantity for {east}", {east}),
+            (f"the crew working on {east} still needs to verify the flooring dimensions", {west}),
+            (f"the crew has already verified the dimensions for {east}", set()),
+            (f"the crew has only partially verified the dimensions for {east}; the flooring dimensions are still being checked",
+             {east, west}),
+            (f"the crew is still required to verify the invoice for {east}", set()),
+            ("flooring dimensions " + "only " * 1000 + "reported", set()),
+            ("flooring dimensions " + "partly " * 1000 + "reported", set()),
+            ("flooring dimensions " + "has still " * 2000 + "reported", set()),
+            ("flooring dimensions " + "has still " * 2000 + "been partly verified", {west}),
+            ("site verification " + "independently " * 2000 + "reported", set()),
+            ("site verification " + "independently " * 2000 + "required", {west}),
+            (f"the surveyor has finished checking the dimensions for {east}", set()),
+            (f"the surveyor has not finished checking the dimensions for {east}", {east}),
+            (f"the surveyor has not finished independently checking the dimensions for {east}", {east}),
+            (f"the surveyor did not complete verification of the dimensions for {east}", {east}),
+            (f"the dimensions for {east} have been approved, subject to approval of the invoice", set()),
+            (f"the dimensions for each of the {west} and the {east} have not been measured", {west, east}),
+            (f"we still need to double-check the dimensions for {east} as well as {west}", {west, east}),
+            (f"the measurements on {east} have so far only been checked approximately", {east}),
+            (f"verification for the dimensions on {east} has not yet commenced", {east}),
+            (f"verification for the dimensions on {east} is not yet underway", {east}),
+            (f"verification for the dimensions on {east} has been initiated", {east}),
+            (f"verification for the dimensions on {east} no longer needs to start", set()),
+            (f"the surveyor has begun to verify the dimensions for {east}", {east}),
+            (f"the surveyor has not yet started verifying the dimensions for {east}", {east}),
+            (f"the surveyor is beginning verification of the dimensions for {east}", {east}),
+            (f"the dimensions for {east} are starting to be checked", {east}),
+            (f"the dimensions for {west} are complete, and those for {east} still require verification", {east}),
+            (f"the invoices for {west} are ready, and those for {east} still require verification", set()),
+            (f"the measurements on {east} have been approved, subject to the further review of their dimensions", {east}),
+            (f"the surveyor has started reviewing the invoice for {east}", set()),
+            (f"independent review of the dimensions for {east} is underway", {east}),
+            (f"verification of the invoice for {east} has not yet commenced", set()),
+            (f"the dimensions on {east} were approved subject to independent review of the invoice", set()),
+            ("drawing source, pending site verification", {west}),
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(webapp.area_qualification_scopes(note, {west}, patterns), expected)
+        west, east = "west floor area", "east floor area"
+        patterns = webapp.area_scope_patterns({west, east})
+        for note, expected in (
+            (f"the dimensions for {east} are still being checked", {east}),
+            (f"verification of the dimensions for {east} has started", {east}),
+            (f"{east} has not been verified", {east}),
+            (f"the surveyor must still verify {west} and {east}'s dimensions", {west, east}),
+            (f"the dimensions for both {west} and {east} have been verified", set()),
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(webapp.area_qualification_scopes(note, {west}, patterns), expected)
+
+    def test_area_length_conflicts_require_a_distinct_source_heading(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        for length in ("6-metre", "6\u2011metre", "6\u2013metre", "\uff16\u00a0METRES",
+                       "6 inches", "6\u2033", "6-in", "6 in wide", "six-inch", "1 1/2 ft", "-0.4 m", "5'11\""):
+            for heading, expected in (("", {east}), ("Sample stock: ", {west, east})):
+                with self.subTest(length=length, heading=heading):
+                    source = f"{west}: 24 sqm; {heading}the reference tape has a length of {length}; {east}: 10 sqm"
+                    self.assertEqual({claim.scope for claim in webapp.area_source_claims(source, patterns)
+                                      if claim.eligible}, expected)
+        for prose in ("there are 6 installers", "six people arrived at 6 in the morning", "the owner selected model T6-m",
+                      'the owner requested item "6"', "the owner requested item \u201c6\u201d",
+                      'the label is "Option 6"', "the label is 'Option 6'", 'the label is "Hall 6"',
+                      "the label is \u201cDisplay 8\u201d", "the label is 'the customer's Option 6'"):
+            with self.subTest(prose=prose):
+                source = f"{west}: 24 sqm; {prose}; {east}: 10 sqm"
+                self.assertEqual({claim.scope for claim in webapp.area_source_claims(source, patterns)
+                                  if claim.eligible}, {west, east})
+
+    def test_area_length_distinguishes_quote_delimiters_from_units(self):
+        for note, has_length in (
+            ("selected label 'Option 6'", False),
+            ("selected label \u2019Option 6\u2019", False),
+            ("selected label \u201dOption 6\u201d", False),
+            ("selected label 'installers' Option 6'", False),
+            ("selected label \u2019installers\u2019 Option 6\u2019", False),
+            ("selected label 'the installer said \"Option 6\"'", False),
+            ("selected label 'sample 6 '", False),
+            ("selected label 'sample 6' wide panels", False),
+            ("the owner selected 'Option 6' wide panels and marked 'Aisle 4'", False),
+            ('the owner selected "Option 6" wide panels and marked "Aisle 4"', False),
+            ("the note reads 'the gap is 6' wide'", True),
+            ("selected label 'Option 6'; the installers' tape measures 6\"", True),
+            ("the note reads 'the gap is 6\" wide'", True),
+            ("the note reads \u2019the gap is 6\u201d wide\u2019", True),
+            ('the note reads "the gap is 6" wide"', True),
+            ("the note reads 'the gap is 6\"'", True),
+            ("the note reads 'the gap is 5' 11\" wide'", True),
+            ("the note reads \"the gap is 6\u2033\"", True),
+            ("the note reads \"the gap is 6 inches\"", True),
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(webapp.area_has_linear_operand(note), has_length)
+
+    def test_area_verification_preserves_measured_roles_across_predicates(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        for clause, expected in (
+            (f"the dimensions for {east} were approved if the site measurements are independently verified", {east}),
+            (f"we approved the dimensions for {east}, conditional upon independent review", {east}),
+            (f"verification of the dimensions for {east} has finished once we verify the site measurements", {east}),
+            (f"if the site measurements are independently verified, the dimensions for {east} are approved", {east}),
+            (f"the dimensions for {east} will be approved when the site measurements are verified", {east}),
+            (f"the dimensions for {east} will be approved once the site measurements are verified", {east}),
+            (f"the dimensions for {east} are approved when the site measurements are verified", {east}),
+            (f"we approve the dimensions for {east} only when the surveyor verifies the measurements", {east}),
+            (f"when the site measurements are verified and the invoice clears, we approve the dimensions for {east}", {east}),
+            (f"we approve the dimensions for {east} when the invoice clears and the site measurements are verified", {east}),
+            (f"the dimensions for {east} were approved when the site measurements were verified", set()),
+            (f"when the surveyor verified the measurements, we approved the dimensions for {east}", set()),
+            (f"when the surveyor independently verified the measurements, we approved the dimensions for {east}", set()),
+            (f"the dimensions for {east} are approved when the invoice is verified", set()),
+            (f"the dimensions for {east} will be approved when the invoice is verified", {east}),
+            (f"the dimensions for {east} are approved when the measurements are used for ordering", set()),
+            (f"when the dimensions for {west} were verified, the dimensions for {east} remained unverified", {east}),
+            (f"the dimensions for {east} were approved if the invoice is independently verified", set()),
+            (f"the dimensions for {east} were approved if verified invoices arrive", set()),
+            (f"the dimensions for {east} were approved only after verifying the invoice", set()),
+            (f"the dimensions for {east} were approved only after verifying the measurements", {east}),
+            (f"the dimensions for {east} were approved conditional upon independent review of the invoice", set()),
+            (f"the dimensions for {east} were approved if the site measurements are used for ordering", set()),
+            (f"the dimensions for {east} were approved if the dimensions for {west} are verified", {east}),
+            (f"the dimensions for {east} were approved if the dimensions for {west} are verified but have not been signed off", {east}),
+            (f"the engineer approved the dimensions for {east} upon review and will check the invoice", set()),
+            (f"the dimensions for {east} have been checked but have not been verified", {east}),
+            (f"{west}'s and {east}'s dimensions have been checked but not verified", {west, east}),
+            (f"the dimensions for {east} were checked, but are still awaiting final approval", {east}),
+            (f"the engineer checked the dimensions for {east} but has not verified them", {east}),
+            (f"the dimensions for {east} were checked and independently verified", set()),
+            (f"the dimensions for {east} were checked but the invoice has not been verified", set()),
+            (f"the engineer checked the dimensions for {east} but has not verified the invoice", set()),
+            (f"the dimensions for {east} were checked while the dimensions for {west} were not verified", {west}),
+            (f"the dimensions for {east} were checked but have not been verified, and those for {west} are complete", {east}),
+            (f"the dimensions for {east} were checked; the dimensions have not been verified", {west}),
+        ):
+            with self.subTest(clause=clause):
+                self.assertEqual(webapp.area_qualification_scopes(clause, {west}, patterns), expected)
+        member = f"the dimensions for {east} were checked but have not been verified"
+        self.assertEqual({claim.scope for claim in webapp.area_member_claims(member, {west}, patterns)}, {east})
+
+    def test_area_verification_resolves_roles_before_result_conditions(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        topics = (
+            f"the dimensions for {east}",
+            f"the dimensions of {west} and the dimensions for {east}",
+            f"the dimensions for {west} together with those on {east}",
+            f"{west}'s and {east}'s dimensions",
+        )
+        for topic, scopes in zip(topics, ({east}, {west, east}, {west, east}, {west, east}), strict=True):
+            for result in (
+                f"the surveyor has checked {topic}",
+                f"the surveyor has completed verification of {topic}",
+                f"the surveyor has carried out verification of {topic}",
+                f"the surveyor has finished checking {topic}",
+                f"verification of {topic} has been completed",
+            ):
+                for condition, expected in (
+                    ("", set()),
+                    (", subject to review of the invoice", set()),
+                    (", subject to independent review of the site measurements", scopes),
+                    (", provided that the site measurements are independently verified", scopes),
+                    (" only if the site measurements are independently verified", scopes),
+                ):
+                    with self.subTest(result=result, condition=condition):
+                        self.assertEqual(webapp.area_qualification_scopes(result + condition, {west}, patterns), expected)
+        for clause, expected in (
+            (f"the dimensions for {west}, together with those for {east}, have yet to be verified", {west, east}),
+            (f"the dimensions for {west} are complete while those for {east} remain unverified", {east}),
+            (f"the drawings of the area are complete while those for {east} remain unverified", set()),
+            (f"verification of the dimensions for {east} has been suspended", {east}),
+            (f"verification of the dimensions for {east} is subject to a final site check", {east}),
+            (f"verification of the dimensions for {east} is subject to the invoice check", set()),
+            ("site " * 6000 + f"activity, and those for {east} still require verification", set()),
+        ):
+            with self.subTest(clause=clause[-120:]):
+                self.assertEqual(webapp.area_qualification_scopes(clause, {west}, patterns), expected)
+
+    def test_grouped_area_and_scope_conflicts_through_notes_pdf_and_batch(self):
+        self._assert_area_workbooks(correction_cases=False)
+
+    def test_area_qualification_and_quote_boundaries_through_notes_pdf_and_batch(self):
+        self._assert_area_workbooks(correction_cases=True)
+
+    def _assert_area_workbooks(self, *, correction_cases):
+        import socket
+        from textwrap import wrap as wrap_pdf_line
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers, write_text_pdf
+        from tests.gateway_test_support import synthetic_configuration
+        from tests.test_basis_quantity_retention import EvidenceTransport
+        from webapp import ai_gateway
+
+        label = "Synthetic carpet tile flooring"
+        spot = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        cases = (
+            ("approved", label, label, f"{label}: 24 sqm", "", 24, "observed", True),
+            ("decimal", label, label, f"{label}: 1.2 sqm", "", 1.2, "observed", True),
+            ("grouped", label, label, f"{label}: 1,200 sqm", "", 1200, "observed", True),
+            ("grouped-not-decimal", label, label, f"{label}: 1,200 sqm", "", 1.2, "observed", False),
+            ("derived", label, label, f"{label}: 1,200 m x 2 m, full coverage", "", 2400, "derived", True),
+            ("derived-wrapped", label, label, f"{label}: 6 m x 4 m, full coverage", "", 24, "derived", True),
+            ("generic-west", label + " at west", label + " at west", f"{label}: 24 sqm", f"{label} at west: 4 sqm", 24, "observed", False),
+            ("linked-west", label + " at east", label + " at west", f"{label} at east: 24 sqm", "", 24, "observed", False),
+            ("contradiction", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm", 24, "observed", False),
+            ("annotated-conflict", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm (final: site measurement)", 24, "observed", False),
+            ("annotated-reversed", label, label, f"{label}: 24 sqm", f"{label}: 4 sqm (final: site measurement)", 24, "observed", False),
+            ("mixed-format", label, label, f"{label}: 1,200 sqm", f"{label}: 1.200,0 sqm", 1200, "observed", False),
+            ("range", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: 4 to 6 sqm (site survey range)", 24, "observed", False),
+            ("approximation", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: Approximately 4 sqm", 24, "observed", False),
+            ("opaque-area", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: the survey estimate is unresolved, in sqm", 24, "observed", False),
+            ("wrapped-range", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: site survey\n4 to 6 sqm", 24, "observed", False),
+            ("punctuated-wrap", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: Site survey\nrange: 4 to 6 sqm", 24, "observed", False),
+            ("range-suffix", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: 24 sqm to 30", 24, "observed", False),
+            ("short-pair", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: 6 by 4 m", 24, "observed", False),
+            ("sentence-two", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "", 24, "observed", True),
+            ("sentence-end", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: roughly four sqm", 24, "observed", False),
+            ("after-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey may change. Carpet tile west: roughly four sqm.", 24, "observed", False),
+            ("open-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey (pending\nCarpet tile west: roughly four sqm", 24, "observed", False),
+            ("open-att", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey (pending\nCarpet tile west: roughly four sqm", 24, "observed", False),
+            ("approx-pair", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 6 m by roughly four, partial", 24, "observed", False),
+            ("question", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm?", 24, "observed", False),
+            ("q-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24\nsqm?", 24, "observed", False),
+            ("q-geometry", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 6 m x 4 m, full coverage?", 24, "observed", False),
+            ("width-pair", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 6 wide by 4 m", 24, "observed", False),
+            ("i-aside", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (survey confirmed?)", 24, "observed", False),
+            ("w-aside", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm\n(survey confirmed?)", 24, "observed", False),
+            ("i-limit", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm to 30", 24, "observed", False),
+            ("w-limit", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm\nto 30", 24, "observed", False),
+            ("split-end", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm\nto\n30", 24, "observed", False),
+            ("paren-label", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "(Carpet tile west): 18 sqm", 24, "observed", False),
+            ("brace-label", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "{Carpet tile west}: 18 sqm", 24, "observed", False),
+            ("square-label", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "[Carpet tile west]: 18 sqm", 24, "observed", False),
+            ("open-zone", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: Site survey\nZone B: 4 to 6 sqm", 24, "observed", False),
+            ("roof", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Pavilion roof: 68 sqm", 24, "observed", True),
+            ("bare-roof", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Pavilion roof: 68 sqm", 24, "observed", False),
+            ("revision", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Revised area: 18 sqm", 24, "observed", False),
+            ("confirm", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Measurement to confirm: 24 to 30 sqm", 24, "observed", False),
+            ("plain-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm\npending site verification", 24, "observed", False),
+            ("dash-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm\n-\n30", 24, "observed", False),
+            ("roof-open", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: Site survey; Pavilion roof: 68 sqm", 24, "observed", True),
+            ("roof-unbound", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: Site survey\nPavilion roof: 68 sqm", 24, "observed", False),
+            ("adjacent", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (survey confirmed?)", 24, "observed", False),
+            ("embedded", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (survey confirmed?) Do not quote", 24, "observed", False),
+            ("emb-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (survey confirmed?) Do not quote", 24, "observed", False),
+            ("adj-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (survey confirmed?)", 24, "observed", False),
+            ("prefix-inline", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Do not quote", 24, "observed", False),
+            ("prefix-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Do not quote", 24, "observed", False),
+            ("title-bare", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Synthetic survey", 24, "observed", False),
+            ("title-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Synthetic survey", 24, "observed", True),
+            ("abbrev", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only, e.g.", 24, "observed", False),
+            ("abbr-inline", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only, e.g.", 24, "observed", False),
+            ("abbr-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only, e.g.", 24, "observed", True),
+            ("initialism", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Reference A.B.", 24, "observed", False),
+            ("list-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "1.", 24, "observed", False),
+            ("number-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Reference 24.", 24, "observed", False),
+            ("prose-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Examples only.", 24, "observed", False),
+            ("assume-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "(using the assumed booth footprint)", 24, "observed", False),
+            ("assume-soft", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "(using the assumed booth footprint)", 24, "observed", False),
+            ("assume-open", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "(using the assumed booth footprint", 24, "observed", False),
+            ("assume-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "(using the assumed booth footprint) and estimates may vary", 24, "observed", False),
+            ("free-assume", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Using the assumed booth footprint", 24, "observed", False),
+            ("free-inline", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Using the assumed booth footprint", 24, "observed", False),
+            ("free-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "The installer is using the assumed booth footprint", 24, "observed", True),
+            ("pending-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Pending site verification", 24, "observed", False),
+            ("subject-dot", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Quantity subject to confirmation", 24, "observed", False),
+            ("prose-hold", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer will bring sample boards", 24, "observed", False),
+            ("prose-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer will bring sample boards", 24, "observed", True),
+            ("qty-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer will bring 2 sqm of sample boards", 24, "observed", False),
+            ("qty-present", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer brings 2 sqm of sample boards", 24, "observed", False),
+            ("qty-past", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Installer brought 2 sqm of sample boards", 24, "observed", False),
+            ("qty-request", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "The organiser requests 2 sqm of sample boards", 24, "observed", False),
+            ("qty-estimate", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey estimates 4 sqm of flooring", 24, "observed", False),
+            ("qty-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Crew may carry 4 to 6 sqm of material", 24, "observed", False),
+            ("qty-heading", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: Installer brings 2 sqm", 24, "observed", True),
+            ("qty-heading-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Material samples: Crew may carry 4 to 6 sqm", 24, "observed", True),
+            ("qty-same-heading", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: Survey estimates 4 sqm", 24, "observed", False),
+            ("rev-wide", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west revised measurement: 4 sqm", 24, "observed", False),
+            ("rev-par", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey (Carpet tile west, field check): 4 sqm", 24, "observed", False),
+            ("re-brack", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey (revised Carpet tile west): 4 sqm", 24, "observed", False),
+            ("re-square", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey [remeasure Carpet tile west]: 4 sqm", 24, "observed", False),
+            ("re-embed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("re-later", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west revised to 4 sqm", 24, "observed", False),
+            ("re-title", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Revision for Carpet tile west: 4 sqm", 24, "observed", False),
+            ("re-amount", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "4 sqm for Carpet tile west", 24, "observed", False),
+            ("re-mixed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "pending field verification, revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("re-mixqty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "pending field verification, 4 sqm for Carpet tile west", 24, "observed", False),
+            ("rev-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile (west): 4 sqm", 24, "observed", False),
+            ("rev-body", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("rev-after", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: 4 sqm for Carpet tile west", 24, "observed", False),
+            ("rev-spat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception: revise Carpet tile west to 4 sqm", 24, "observed", False),
+            ("sep-spat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception: 4 sqm", 24, "observed", True),
+            ("loc-chain", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west near reception behind booth: 4 sqm", 24, "observed", True),
+            ("loc-level", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west (upper level): 4 sqm", 24, "observed", True),
+            ("ref-split", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west", 24, "observed", True),
+            ("ref-prose", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: Installer brings 2 sqm, separate from Carpet tile west", 24, "observed", True),
+            ("ref-head", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards (separate from Carpet tile west): 2 sqm", 24, "observed", True),
+            ("ref-both", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east", 24, "observed", True),
+            ("ref-clause", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west and Carpet tile east revised to 4 sqm", 24, "observed", True),
+            ("ref-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, not separate from Carpet tile west", 24, "observed", False),
+            ("ref-excl", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: revise Carpet tile west to 4 sqm, excluding Carpet tile east", 24, "observed", False),
+            ("list-comma", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east and Carpet tile north", 24, "observed", True),
+            ("list-ox", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east, and Carpet tile north", 24, "observed", True),
+            ("list-both", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from both Carpet tile west and Carpet tile east", 24, "observed", True),
+            ("list-all", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from all of the Carpet tile west,\nCarpet tile east and Carpet tile north", 24, "observed", True),
+            ("list-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east and Carpet tile north;\nSurvey: revise Carpet tile north to 4 sqm", 24, "observed", True),
+            ("list-embed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east and Carpet tile north revised to 4 sqm", 24, "observed", True),
+            ("list-qty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east and Carpet tile north 4 to 6 sqm", 24, "observed", True),
+            ("list-unc", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, possibly separate from Carpet tile west,\nCarpet tile east and Carpet tile north", 24, "observed", False),
+            ("mem-first", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (now measured at 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", False),
+            ("mem-mid", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east (now measured at 4 sqm), and Carpet tile north", 24, "observed", True),
+            ("mem-last", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east, and Carpet tile north (now measured at 4 sqm)", 24, "observed", True),
+            ("mem-wait", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west,\nCarpet tile east (awaiting site verification), and Carpet tile north", 24, "observed", True),
+            ("mem-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (site verification completed),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-dot-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (site verification completed), Carpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-dot-first", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (now measured at 4 sqm), Carpet tile east, and Carpet tile north", 24, "observed", False),
+            ("mem-dot-mid", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east (now measured at 4 sqm), and Carpet tile north", 24, "observed", True),
+            ("mem-line-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (site verification completed), Carpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-line-first", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (now measured at 4 sqm), Carpet tile east, and Carpet tile north", 24, "observed", False),
+            ("mem-line-mid", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west, Carpet tile east (now measured at 4 sqm), and Carpet tile north", 24, "observed", True),
+            ("mem-other", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (revise Carpet tile north to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-compare", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (compared with Carpet tile north at 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("mem-mixed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (compared with Carpet tile north at 5 sqm,\nnow measured at 4 sqm), Carpet tile east, and Carpet tile north", 24, "observed", False),
+            ("mem-break", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (now measured at 4 sqm),\nCarpet tile east, and Carpet tile north revised to 6 sqm", 24, "observed", False),
+            ("rev-neutral", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Survey: check Carpet tile west after the site visit", 24, "observed", True),
+            ("prov-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (provisional in drawing)", 24, "observed", False),
+            ("prov-nested", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm [survey status: estimated]", 24, "observed", False),
+            ("prov-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (not provisional)", 24, "observed", True),
+            ("prov-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (PDF saved with default margins)", 24, "observed", True),
+            ("st-site", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification pending)", 24, "observed", False),
+            ("st-unver", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement remains unverified)", 24, "observed", False),
+            ("st-field", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (pending field verification)", 24, "observed", False),
+            ("st-still", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (still provisional)", 24, "observed", False),
+            ("st-source", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (provisional drawing)", 24, "observed", False),
+            ("st-key", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement status - provisional)", 24, "observed", False),
+            ("st-survey", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site survey status: provisional)", 24, "observed", False),
+            ("st-noverify", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement has not been verified)", 24, "observed", False),
+            ("st-await", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (awaiting site verification)", 24, "observed", False),
+            ("st-open", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification outstanding)", 24, "observed", False),
+            ("st-required", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification required)", 24, "observed", False),
+            ("st-needed", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (field confirmation is still needed)", 24, "observed", False),
+            ("st-inv-req", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification required)", 24, "observed", True),
+            ('vf-await', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (site measurement awaits verification)', 24, "observed", False),
+            ('vf-of', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (verification of site measurements is still required)', 24, "observed", False),
+            ('vf-yet', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (measurement has yet to be independently verified)', 24, "observed", False),
+            ('vf-tail', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (site verification is still outstanding before final sign-off)', 24, "observed", False),
+            ('vf-for', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (verification for the site measurement remains incomplete)', 24, "observed", False),
+            ('vf-need', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (site measurements require independent verification)', 24, "observed", False),
+            ('vf-neg', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (site verification is no longer required)', 24, "observed", True),
+            ('vf-done', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (site measurements have been independently verified)', 24, "observed", True),
+            ('vf-inv', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (verification of invoices is pending)', 24, "observed", True),
+            ('vf-invpre', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Carpet tile west: 24 sqm (pending verification of the invoice)', 24, "observed", True),
+            ('an-ce', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nrevise Carpet tile east to 4 sqm),\nCarpet tile east, and Carpet tile north', 24, "observed", True),
+            ('an-ec', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\nrevise Carpet tile east to 4 sqm,\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north', 24, "observed", True),
+            ('an-and', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\nand revise Carpet tile east to 4 sqm),\nCarpet tile east, and Carpet tile north', 24, "observed", True),
+            ('an-semi', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\nrevise Carpet tile east to 4 sqm;\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north', 24, "observed", True),
+            ('an-dot', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm.\nrevise Carpet tile east to 4 sqm),\nCarpet tile east, and Carpet tile north', 24, "observed", True),
+            ('an-both', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nnow measured at 4 sqm,\nrevise Carpet tile east to 4 sqm),\nCarpet tile east, and Carpet tile north', 24, "observed", False),
+            ('an-list', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\nand Carpet tile east at 10 sqm),\nCarpet tile east, and Carpet tile north', 24, "observed", True),
+            ('an-nest', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\n[revise Carpet tile east to 4 sqm]),\nCarpet tile east, and Carpet tile north', 24, "observed", True),
+            ('an-local', "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nsite measurement awaits verification),\nCarpet tile east, and Carpet tile north', 24, "observed", False),
+            ("vf-will", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement will need verification)", 24, "observed", False),
+            ("vf-must", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement must undergo verification)", 24, "observed", False),
+            ("vf-due", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement is due for verification)", 24, "observed", False),
+            ("vf-none", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement needs no further verification)", 24, "observed", True),
+            ("pf-fut", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the measurement will be verified)", 24, "observed", False),
+            ("pf-yet", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement has yet to undergo verification)", 24, "observed", False),
+            ("pf-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (measurement has not yet been fully verified)", 24, "observed", False),
+            ("pf-dim", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions still require verification)", 24, "observed", False),
+            ("pf-event", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification will be completed)", 24, "observed", False),
+            ("pf-part", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions have been partially verified)", 24, "observed", False),
+            ("pf-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurements have been fully independently verified)", 24, "observed", True),
+            ("pf-none", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions do not require verification)", 24, "observed", True),
+            ("pf-inv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice will be verified)", 24, "observed", True),
+            ("pf-value", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice value is awaiting verification)", 24, "observed", True),
+            ("op-pass", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has been revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-pass-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\nCarpet tile east has been revised to 4 sqm,\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-note", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[revise Carpet tile east to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-note-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\n[revise Carpet tile east to 4 sqm]\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-value", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at (5 sqm)),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-local", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[now measured at 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", False),
+            ("op-both", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[Carpet tile east has been revised to 4 sqm]\n[now measured at 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", False),
+            ("op-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with [Carpet tile north at 5 sqm]\n[revise Carpet tile east to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-s", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm;\nCarpet tile east needs to be revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-d", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm.\nCarpet tile east needs to be revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-l", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\nCarpet tile east needs to be revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-r", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\nCarpet tile east needs to be revised to 4 sqm\ncompared with Carpet tile north at 5 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-need-n", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\n[Carpet tile east needs to be revised to 4 sqm]),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("op-since", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has since been corrected to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pd-planned", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Onsite verification is planned)", 24, "observed", False),
+            ("pd-all", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions haven't all been verified)", 24, "observed", False),
+            ("pd-only", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions will only be verified after installation)", 24, "observed", False),
+            ("pd-half", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are only half verified)", 24, "observed", False),
+            ("pd-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions have all been independently verified)", 24, "observed", True),
+            ("pd-no", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (onsite verification is no longer planned or required)", 24, "observed", True),
+            ("pd-inv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification is planned)", 24, "observed", True),
+            ("pa-colon", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has been revised: 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pa-neg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm,\nCarpet tile east has not yet been revised to 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pa-inner", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at (5 sqm\n[revise Carpet tile east to 4 sqm])),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pa-local", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at 5 sqm\nnow measured at 4 sqm),\nCarpet tile east, and Carpet tile north", 24, "observed", False),
+            ("pa-value", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample boards: 2 sqm, separate from Carpet tile west (\ncompared with Carpet tile north at (5 sqm\n[printed value])),\nCarpet tile east, and Carpet tile north", 24, "observed", True),
+            ("pd-asig", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions are awaiting sign-off)", 24, "observed", False),
+            ("pd-asub", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the final floor dimensions are still subject to approval)", 24, "observed", False),
+            ("pd-aevt", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (sign-off of the flooring dimensions is planned)", 24, "observed", False),
+            ("pd-aneg", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the floor dimensions haven't been signed off)", 24, "observed", False),
+            ("pd-adone", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions have already been signed off)", 24, "observed", True),
+            ("pd-aven", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (venue approval is pending)", 24, "observed", True),
+            ("pd-aobj", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions are subject to approval of the venue)", 24, "observed", True),
+            ("pd-ainv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice approval is pending)", 24, "observed", True),
+            ("pd-agent", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are awaiting the surveyor's approval)", 24, "observed", False),
+            ("pd-passive", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are still waiting to be verified)", 24, "observed", False),
+            ("pd-partial", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions were only verified in part)", 24, "observed", False),
+            ("pd-obligation", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still need to verify the flooring dimensions)", 24, "observed", False),
+            ("pd-unapproved", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are unapproved)", 24, "observed", False),
+            ("pd-conditional", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions have been approved pending site verification)", 24, "observed", False),
+            ("pd-agent-object", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions await the site manager's approval of the invoice)", 24, "observed", True),
+            ("pd-active-no", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we no longer need to verify the flooring dimensions)", 24, "observed", True),
+            ("pd-cond-inv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions were approved pending verification of the invoice)", 24, "observed", True),
+            ("pd-east-subject", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Carpet tile east dimensions are waiting to be signed off)", 24, "observed", True),
+            ("pd-east-object", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still have to verify the dimensions of Carpet tile east)", 24, "observed", True),
+            ("pd-east-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (Carpet tile east dimensions have been approved)", 24, "observed", True),
+            ("pd-fut-adv", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions still waiting to be fully verified)", 24, "observed", False),
+            ("pd-aspect", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (flooring dimensions have only been verified in part)", 24, "observed", False),
+            ("pd-duty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we are still required to verify flooring dimensions)", 24, "observed", False),
+            ("pd-named", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor still needs to verify flooring dimensions)", 24, "observed", False),
+            ("pd-east-for", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still have to verify the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-ongoing", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the measurements are still being independently checked)", 24, "observed", False),
+            ("pd-compound", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions will soon have to be independently validated)", 24, "observed", False),
+            ("pd-east-on", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the installer hasn't yet fully checked the dimensions on Carpet tile east)", 24, "observed", True),
+            ("pd-east-part", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the engineer only checked the dimensions of Carpet tile east in part)", 24, "observed", True),
+            ("pd-east-cond", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the crew confirmed the dimensions for Carpet tile east subject to field validation)", 24, "observed", True),
+            ("pd-actor-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has already fully verified the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-duty-no", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the engineer will not need to verify the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-no-pass", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions are no longer required to be independently verified)", 24, "observed", True),
+            ("pd-inv-duty", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor is still required to verify the invoice for Carpet tile east)", 24, "observed", True),
+            ("pd-other-actor", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the Carpet tile east team still needs to verify the flooring dimensions)", 24, "observed", False),
+            ("pd-part-front", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (only some of the dimensions for Carpet tile east have been verified independently)", 24, "observed", True),
+            ("pd-part-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions have been independently verified only in part)", 24, "observed", False),
+            ("pd-east-wrap", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we are checking the dimensions on [Carpet tile east])", 24, "observed", True),
+            ("pd-asp-tail", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the engineering crew has so far verified the dimensions on Carpet tile east only in part)", 24, "observed", True),
+            ("pd-chain", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor is going to have to independently verify the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-chain-pass", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the flooring dimensions are going to have to be independently verified)", 24, "observed", False),
+            ("pd-unfinished", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has not yet finished verifying the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-finish", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor must still finish verifying the flooring dimensions)", 24, "observed", False),
+            ("pd-cond-comma", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has already approved the dimensions for Carpet tile east, subject to independent site verification)", 24, "observed", True),
+            ("pd-obj-list", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor must still verify the dimensions for Carpet tile west and Carpet tile east)", 24, "observed", False),
+            ("pd-subj-list", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions for Carpet tile west and Carpet tile east have only been verified in part)", 24, "observed", False),
+            ("pd-finished", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has finished independently verifying the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-list-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions for Carpet tile west and Carpet tile east have been fully verified)", 24, "observed", True),
+            ("pd-linear", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved 6 m of sample tape", 24, "observed", False),
+            ("pd-head-len", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample stock: the surveyor moved 6 m of sample tape", 24, "observed", True),
+            ("pd-started", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (independent verification of the dimensions for Carpet tile east has started)", 24, "observed", True),
+            ("pd-not-started", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (independent verification of the dimensions for Carpet tile east has not started)", 24, "observed", True),
+            ("pd-event-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (independent verification of the dimensions for Carpet tile east has finished)", 24, "observed", True),
+            ("pd-event-execute", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor still needs to carry out verification of the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-event-gerund", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has not yet started verifying the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-event-unneeded", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor no longer needs to carry out verification of the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-cond-review", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor approved the dimensions for Carpet tile east, subject to independent review of the site measurements)", 24, "observed", True),
+            ("pd-cond-inv-rev", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor approved the dimensions for Carpet tile east, subject to independent review of the invoice)", 24, "observed", True),
+            ("pd-both-shared", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions for both Carpet tile west and Carpet tile east are still being checked)", 24, "observed", False),
+            ("pd-both-poss", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor must still verify Carpet tile west and Carpet tile east's dimensions)", 24, "observed", False),
+            ("pd-both-ref", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor must still verify the dimensions of Carpet tile west and those of Carpet tile east)", 24, "observed", False),
+            ("pd-ref-clause", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions for Carpet tile west are complete, and those for Carpet tile east still require verification)", 24, "observed", True),
+            ("pd-linear-hyphen", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved a 6-metre sample tape", 24, "observed", False),
+            ("pd-linear-inch", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "the surveyor moved 6 inches of sample tape", 24, "observed", False),
+            ("pd-head-hyphen", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Sample stock: the surveyor moved a 6-metre sample tape", 24, "observed", True),
+            ("pd-carry-cond", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has carried out verification of the dimensions for Carpet tile east, subject to independent review of the site measurements)", 24, "observed", True),
+            ("pd-done-cond", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has completed verification of the dimensions for Carpet tile east, subject to independent review of the site measurements)", 24, "observed", True),
+            ("pd-carried-clear", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the surveyor has carried out verification of the dimensions for Carpet tile east)", 24, "observed", True),
+            ("pd-head-obj", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we still need to verify the dimensions of Carpet tile west and the dimensions of Carpet tile east)", 24, "observed", False),
+            ("pd-head-sub", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (the dimensions of Carpet tile west and the dimensions of Carpet tile east have not been verified)", 24, "observed", False),
+            ("pd-poss-pair", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (we must still verify Carpet tile west's and Carpet tile east's dimensions)", 24, "observed", False),
+            ("pd-quoted-label", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'the customer selected the label "Option 6"', 24, "observed", True),
+            ("pd-inch-symbol", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'the fabricator brought a 6" sample', 24, "observed", False),
+            ("pd-head-inch", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", 'Sample stock: the fabricator brought a 6" sample', 24, "observed", True),
+            ("st-done", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site verification completed)", 24, "observed", True),
+            ("st-invoice", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (invoice verification outstanding)", 24, "observed", True),
+            ("rev-repeat", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 24 sqm (site measurement)", 24, "observed", True),
+            ("qty-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "4 to 6 sqm", 24, "observed", False),
+            ("same-subj", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west will require 4 sqm of flooring", 24, "observed", False),
+            ("est-chain", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: estimated 24 sqm", 24, "observed", False),
+            ("geo-chain", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: assumed 6 m x 4 m, full coverage", 24, "observed", False),
+            ("est-sep", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: estimated 24 sqm", 24, "observed", False),
+            ("bracket-geo", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: [estimated] 6 m x 4 m, full coverage", 24, "observed", False),
+            ("paren-val", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: (PROVISIONAL) - 24 sqm", 24, "observed", False),
+            ("brace-geo", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: {AsSuMeD}: 6 m x 4 m, full coverage", 24, "observed", False),
+            ("wrap-geo", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: [estimated from drawings] 6 m x 4 m, full coverage", 24, "observed", False),
+            ("wrap-val", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: (estimated from drawings) 24 sqm", 24, "observed", False),
+            ("wrap-brace", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: {AsSuMeD from drawings}: 24 sqm", 24, "observed", False),
+            ("same-line-range", "Carpet tile west", "Carpet tile west", "Carpet tile west: 24 sqm", "Carpet tile west: 4 to 6 sqm", 24, "observed", False),
+            ("free-geometry", label + " at west", label + " at west", f"{label} at west: 24 sqm", f"{label} at west: width about 4 m, depth still below 6 m", 24, "observed", False),
+            ("annotated-repeat", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24.0 SQM (site measurement)", 24, "observed", True),
+            ("annotated-alone", label, label, f"{label}: 24 sqm (site measurement)", "", 24, "observed", False),
+            ("independent-ambiguity", label, label, f"{label}: 24 sqm", f"{label} at west: 1.200,0 sqm", 24, "observed", True),
+            ("non-measurement", label, label, f"{label}: 24 sqm", f"{label}: 4 installers required", 24, "observed", True),
+            ("provisional-annotation", label, label, f"{label}: 24 sqm", f"{label}: 24 sqm (using the assumed booth footprint)", 24, "observed", False),
+            ("extent-conflict", label, label, f"{label}: 6 m x 4 m, full coverage", f"{label}: 8 m x 3 m, full coverage", 24, "derived", False),
+            ("annotated-extent", label, label, f"{label}: 6 m x 4 m, full coverage", f"{label}: 8 m x 3 m, full coverage (final)", 24, "derived", False),
+            ("derived-repeat", label, label, f"{label}: 6 m x 4 m, full coverage", f"{label}: 6 m x 4 m, full coverage (survey)", 24, "derived", True),
+            ("uncertain-extent", label, label, f"{label}: 24 sqm", f"{label}: W 6 m x D 4 m, partial coverage", 24, "observed", False),
+            ("duplicate", label, label, f"{label}: 24 sqm", f"{label.upper()}: 24 SQM", 24, "observed", False),
+        )
+        scoped_verification = {
+            "vf-await", "vf-of", "vf-yet", "vf-tail", "vf-for", "vf-need", "vf-neg", "vf-done", "vf-inv", "vf-invpre",
+            "vf-will", "vf-must", "vf-due", "vf-none",
+            "pf-fut", "pf-yet", "pf-neg", "pf-dim", "pf-event", "pf-part", "pf-done", "pf-none", "pf-inv", "pf-value",
+            "pd-planned", "pd-all", "pd-only", "pd-half", "pd-done", "pd-no", "pd-inv",
+            "pd-asig", "pd-asub", "pd-aevt", "pd-aneg", "pd-adone", "pd-aven", "pd-aobj", "pd-ainv",
+            "pd-agent", "pd-passive", "pd-partial", "pd-obligation", "pd-unapproved", "pd-conditional",
+            "pd-agent-object", "pd-active-no", "pd-cond-inv", "pd-east-subject", "pd-east-object", "pd-east-done",
+            "pd-fut-adv", "pd-aspect", "pd-duty", "pd-named", "pd-east-for", "pd-ongoing", "pd-compound",
+            "pd-east-on", "pd-east-part", "pd-east-cond", "pd-actor-done", "pd-duty-no", "pd-no-pass", "pd-inv-duty",
+            "pd-other-actor", "pd-part-front", "pd-part-tail", "pd-east-wrap",
+            "pd-asp-tail", "pd-chain", "pd-chain-pass", "pd-unfinished", "pd-finish", "pd-cond-comma",
+            "pd-obj-list", "pd-subj-list", "pd-finished", "pd-list-done", "pd-linear", "pd-head-len",
+            "pd-started", "pd-not-started", "pd-event-done", "pd-event-execute", "pd-event-unneeded",
+            "pd-event-gerund", "pd-ref-clause",
+            "pd-cond-review", "pd-cond-inv-rev", "pd-both-shared", "pd-both-poss", "pd-both-ref",
+            "pd-linear-hyphen", "pd-linear-inch", "pd-head-hyphen",
+            "pd-carry-cond", "pd-done-cond", "pd-carried-clear", "pd-head-obj",
+            "pd-head-sub", "pd-poss-pair", "pd-quoted-label", "pd-inch-symbol", "pd-head-inch",
+        }
+        # Keep both seal and workbook assertions for each input route.
+        west = "Carpet tile west"
+        east = "Carpet tile east"
+        west_statement = f"{west}: 24 sqm"
+        east_statement = f"{east}: 10 sqm"
+        role_cases = (
+            ("condition-comma-list", f"the dimensions for {east} are approved when the invoice clears, the deposit is paid, the site measurements are verified", True, False),
+            ("condition-comma-list-leading", f"when the invoice clears, the deposit is paid, the site measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-comma-list-completed", f"the dimensions for {east} were approved after the invoice cleared, the deposit was paid, the site measurements had been verified", True, True),
+            ("condition-comma-list-invoice", f"the dimensions for {east} were approved when the invoice cleared, the deposit was paid, the invoice was verified", True, True),
+            ("pronoun-demonstrative-measured", f"we checked the dimensions for {east}. Those dimensions have not been verified", True, False),
+            ("pronoun-demonstrative-explicit", f"we checked the dimensions for {east}. Those dimensions for {west} have not been verified", False, True),
+            ("pronoun-demonstrative-completed", f"we checked the dimensions for {east}. Those dimensions had been verified", True, True),
+            ("pronoun-implicit-verification", f"we checked the dimensions for {east}. Verification is still pending", True, False),
+            ("nested-measured-pending", f"(((the dimensions for {east} were partially verified)))", True, False),
+            ("nested-measured-completed", f"(((the dimensions for {east} had already been verified)))", True, True),
+            ("nested-pending", f"survey note (the dimensions for {east} remain unverified)", True, False),
+            ("nested-completed", f"survey note (the dimensions for {east} had been verified)", True, True),
+            ("aside-pending", f"the dimensions for {east} (drawing reference) remain unverified", True, False),
+            ("aside-completed", f"the dimensions for {east} [drawing reference] had been verified", True, True),
+            ("aside-demonstrative", f"we checked the dimensions for {east}. (Those dimensions remain unverified)", True, False),
+            ("aside-implicit-event", f"survey note (the dimensions for {east} (still pending verification))", True, False),
+            ("aside-implicit-status", f"survey note (the dimensions for {east} (remain unverified))", True, False),
+            ("aside-pronoun", f"we checked the dimensions for {east}. [They have yet to be verified]", True, False),
+            ("aside-object-pronoun", f"we checked the dimensions for {east}. (We still have to verify them)", True, False),
+            ("aside-wrapper", f"we checked the dimensions for {east}. ([(still pending verification)])", True, False),
+            ("aside-completed", f"we checked the dimensions for {east}. (Those dimensions had been verified)", True, True),
+            ("aside-future", f"the dimensions for {east} [will be verified tomorrow]", True, False),
+            ("aside-nested-demonstrative", f"we checked the dimensions for {east}. (Those dimensions (remain unverified))", True, False),
+            ("aside-in-leading-condition", f"after the dimensions for {east} (remain unverified) were verified, we issued the report", True, False),
+            ("aside-in-trailing-condition", f"we issued the report after the dimensions for {east} (remain unverified) were verified", True, False),
+            ("aside-after-condition", f"after the dimensions for {east} were verified (those dimensions remain unverified), we issued the report", True, False),
+            ("aside-topic-barrier", f"we checked the dimensions for {east}. We sent invoices (they have not been verified)", True, True),
+            ("aside-explicit-event", f"we checked the dimensions for {east} (pending verification of the invoice)", True, True),
+            ("aside-measured-demonstrative", f"we checked the dimensions for {east}. We sent invoices (those dimensions remain unverified)", True, False),
+            ("aside-object-barrier", f"we checked the dimensions for {east} and sent the invoices (they have not been verified) to the client", True, True),
+            ("aside-explicit-wait", f"the dimensions for {east} (we are still awaiting verification of the dimensions for {west}) were checked", False, True),
+            ("negative-partitive-pronoun", f"we checked the dimensions for {east}. (None of them have been verified)", True, False),
+            ("negative-measured-subject", f"none of the dimensions for {east} were verified", True, False),
+            ("aside-record-barrier", f"we checked the dimensions for {east}; the invoices were sent (they have not been verified)", True, True),
+            ("aside-ordered", f"the dimensions for {east} (remain unverified) were checked. The dimensions for {west} were verified", True, False),
+            ("aside-sibling", f"the dimensions for {east} (the dimensions for {west} were verified) (remain unverified)", True, False),
+            ("aside-inner-override", f"the dimensions for {east} (the dimensions for {west} (remain unverified))", False, True),
+            ("aside-before-barrier", f"we checked the dimensions for {east}. (They remain unverified) The invoices were sent", True, False),
+            ("modifier-negative-actor", f"we checked the dimensions for {east}. So far nobody has verified them", True, False),
+            ("modifier-positive-actor", f"we checked the dimensions for {east}. So far a surveyor has verified them", True, True),
+            ("modifier-negative-documents", f"we checked the dimensions for {east}. The drawing and the report were sent. So far nobody has verified them", True, True),
+            ("coordinated-ordinary-aside", f"we checked the dimensions for {east}. The drawing and the report (they remain unverified) were sent", True, True),
+            ("ordinary-coordination-new-record", f"we checked the dimensions for {east}; the drawing and report (they remain unverified) were sent", True, True),
+            ("coordinated-elided-determiner", f"we checked the dimensions for {east}. The drawing and report (they remain unverified) were sent", True, True),
+            ("coordination-after-aside", f"we checked the dimensions for {east}. The drawing (they remain unverified) and the report were sent", True, False),
+            ("coordinate-subordinate-documents", f"we checked the dimensions for {east} after the drawing and the report (they remain unverified) were sent", True, True),
+            ("coordinated-demonstrative", f"we checked the dimensions for {east}. The drawing and the report (those dimensions remain unverified) were sent", True, False),
+            ("coordinated-three-ordinary", f"we checked the dimensions for {east}. The drawing, the invoice, and the report (they remain unverified) were sent", True, True),
+            ("measured-member-status", f"the dimensions for {east} (remain unverified) and the dimensions for {west} were verified", True, False),
+            ("measured-member-event", f"the dimensions for {east} (still pending verification) and the dimensions for {west} were verified", True, False),
+            ("measured-member-complete", f"the dimensions for {east} (already verified) and the dimensions for {west} were verified", True, True),
+            ("measured-second-member", f"the dimensions for {east} and the dimensions for {west} (remain unverified) were verified", False, True),
+            ("measured-shared-noun", f"the dimensions for {east} and {west} (remain unverified) were verified", False, False),
+            ("measured-shared-predicate", f"the dimensions for {east} and the dimensions for {west} were verified (those dimensions remain unverified)", False, False),
+            ("measured-members-pending", f"the dimensions for {east} (remain unverified) and the dimensions for {west} (still pending verification) were verified", False, False),
+            ("subordinate-reviewed-local", f"we checked the dimensions for {east} after the dimensions for {west} (remain unverified) were reviewed", False, True),
+            ("subordinate-verified-local", f"we checked the dimensions for {east} after the dimensions for {west} (remain unverified) were verified", False, True),
+            ("subordinate-future-review", f"we checked the dimensions for {east} after the dimensions for {west} (still pending verification) will be reviewed", False, False),
+            ("subordinate-document-local", f"we checked the dimensions for {east} after the invoices (they remain unverified) were sent", True, True),
+            ("subordinate-complete-control", f"we checked the dimensions for {east} after the dimensions for {west} (already verified) were reviewed", True, True),
+            ("negative-indefinite", f"we checked the dimensions for {east}. Nobody has verified them yet", True, False),
+            ("negative-two-words", f"we checked the dimensions for {east}. (No one has verified them yet)", True, False),
+            ("negative-determiner", f"no surveyor has verified the dimensions for {east} yet", True, False),
+            ("negative-neither", f"neither of the surveyors verified the dimensions for {east}", True, False),
+            ("negative-unrelated", f"we checked the dimensions for {east}. No surveyor has verified the invoice yet", True, True),
+            ("negative-competing-topic", f"we checked the dimensions for {east}. The invoices were sent. Nobody verified them yet", True, True),
+            ("positive-actor", f"a surveyor has already verified the dimensions for {east}", True, True),
+            ("demo-topic", f"we checked the dimensions for {east}. The invoice was sent. Those dimensions remain unverified", True, False),
+            ("demo-event", f"we checked the dimensions for {east}. The invoice was sent. Verification of those dimensions is still pending", True, False),
+            ("demo-object", f"we checked the dimensions for {east} and sent the invoice, but we still need to verify those dimensions", True, False),
+            ("demo-complete", f"we checked the dimensions for {east}. The invoice was sent. Those dimensions were verified", True, True),
+            ("bare-plural", f"we checked the dimensions for {east} and sent invoices. They have not been verified", True, True),
+            ("bare-plural-detail", f"we checked the dimensions for {east} and sent invoices for delivery. They have not been verified", True, True),
+            ("leading-named", f"when the dimensions for {east} have been verified, the dimensions for {west} will be approved", False, False),
+            ("leading-completed", f"after the dimensions for {east} had been verified, the dimensions for {west} were approved", True, True),
+            ("trailing-named", f"the dimensions for {west} will be approved after we verify the dimensions for {east}", False, False),
+            ("trailing-neutral", f"the drawings will be released when the dimensions for {east} and {west} have been verified", False, False),
+            ("trailing-completed", f"the drawings were released after the dimensions for {east} and {west} had been verified", True, True),
+            ("pronoun-demonstrative-event", f"we checked the dimensions for {east}. Verification of those dimensions is still pending", True, False),
+            ("pronoun-demonstrative-object", f"we checked the dimensions for {east}. We still need to verify those dimensions", True, False),
+            ("pronoun-demonstrative-event-complete", f"we checked the dimensions for {east}. Verification of those dimensions was completed", True, True),
+            ("pronoun-implicit-completed", f"we checked the dimensions for {east}. Verification was completed", True, True),
+            ("pronoun-implicit-new-topic", f"we checked the dimensions for {east}. The invoice was sent. Invoice verification is still pending", True, True),
+            ("pronoun-implicit-competing-topic", f"we checked the dimensions for {east}. The invoice was sent. Verification is still pending", True, True),
+            ("pronoun-implicit-new-record", f"we checked the dimensions for {east}; verification is still pending", False, True),
+            ("condition-oxford-list", f"the dimensions for {east} are approved when the invoice clears, the deposit is paid, and the site measurements are verified", True, False),
+            ("condition-oxford-completed", f"the dimensions for {east} were approved after the invoice cleared, the deposit was paid, and the site measurements had been verified", True, True),
+            ("condition-oxford-main", f"when site measurements are verified, the dimensions for {east} are approved, and the dimensions for {west} are approved", False, False),
+            ("condition-oxford-leading", f"when the invoice clears, the deposit is paid, and site measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-named-report", f"once we verify the dimensions for {east}, we will issue the survey report", True, False),
+            ("condition-completed-report", f"once we verified the dimensions for {east}, we issued the survey report", True, True),
+            ("condition-partial-report", f"after we had partially verified the dimensions for {east}, we issued the survey report", True, False),
+            ("condition-factual-after", f"the dimensions for {east} were approved after the site measurements had been verified", True, True),
+            ("condition-factual-once", f"the dimensions for {east} were approved once the site measurements had been verified", True, True),
+            ("condition-after-gerund", f"the dimensions for {east} are approved only after verifying the measurements", True, False),
+            ("pronoun-invoice-topic", f"we checked the dimensions for {east} and sent the invoice, but it has not been verified", True, True),
+            ("pronoun-invoice-plural-topic", f"we checked the dimensions for {east} and sent the invoices. They have not been verified", True, True),
+            ("pronoun-same-record", f"we checked the dimensions for {east}. They have not been verified yet", True, False),
+            ("pronoun-new-record", f"we checked the dimensions for {east}; they have not been verified yet", False, True),
+            ("condition-if", f"the dimensions for {east} were approved if the site measurements are verified", True, False),
+            ("condition-upon", f"we approved the dimensions for {east}, conditional upon independent review", True, False),
+            # Both predicates report completed past events.
+            ("condition-once", f"we finished checking the dimensions for {east} once the dimensions were verified", True, True),
+            ("future-when", f"the dimensions for {east} will be approved when the site measurements are verified", True, False),
+            ("future-once", f"the dimensions for {east} will be approved once the site measurements are verified", True, False),
+            ("conditional-when", f"the dimensions for {east} are approved when the site measurements are verified", True, False),
+            ("leading-when", f"when the invoice clears and site measurements are verified, we approve the dimensions for {east}", True, False),
+            ("factual-when", f"the dimensions for {east} were approved when the site measurements were verified", True, True),
+            ("unrelated-when", f"the dimensions for {east} are approved when the invoice is verified", True, True),
+            ("condition-before", f"if the measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-after-event", f"the dimensions for {east} were approved only after site verification", True, False),
+            ("condition-after-clause", f"the dimensions for {east} were approved only after the measurements are verified", True, False),
+            ("condition-after-coordination", f"the dimensions for {east} were approved if the invoice clears and the measurements are verified", True, False),
+            ("condition-after-comma", f"the dimensions for {east} were approved, if the invoice clears and the measurements are verified", True, False),
+            ("condition-before-coordination", f"if the invoice clears and the measurements are verified, the dimensions for {east} are approved", True, False),
+            ("condition-before-trailing", f"if the measurements are verified and the invoice clears, the dimensions for {east} are approved", True, False),
+            ("condition-before-both", f"if the measurements are verified, the dimensions for {east} are approved and the dimensions for {west} are approved", False, False),
+            ("condition-before-independent", f"if the measurements are verified, the dimensions for {east} are approved while the dimensions for {west} are verified", True, False),
+            ("condition-only-invoice", f"the dimensions for {east} were approved only after the invoice is verified", True, True),
+            ("condition-other", f"the dimensions for {east} were approved if the invoice is verified", True, True),
+            ("condition-use", f"the dimensions for {east} were approved if the measurements are used for ordering", True, True),
+            ("condition-scope", f"the dimensions for {east} were approved if the dimensions for {west} are verified", True, False),
+            ("subject-shared", f"the dimensions for {east} were checked but have not been verified", True, False),
+            ("subject-list", f"{west}'s and {east}'s dimensions were checked but not verified", False, False),
+            ("subject-switch", f"the dimensions for {east} were checked but the dimensions for {west} were not verified", False, True),
+            ("subject-invoice", f"the dimensions for {east} were checked but the invoice was not verified", True, True),
+            ("object-pronoun", f"we checked the dimensions for {east} but have not verified them", True, False),
+            ("object-pronoun-yet", f"we checked the dimensions for {east} but have not verified them yet", True, False),
+            ("object-pronoun-actor", f"we checked the dimensions for {east} but we have not verified them yet", True, False),
+            ("subject-pronoun", f"we checked the dimensions for {east}, but they have not been verified", True, False),
+            ("subject-pronoun-intervening", f"we checked the dimensions for {east} and filed the report but they have not been verified", True, False),
+            ("subject-pronoun-switch", f"the dimensions for {east} were checked but they have not been verified, and the dimensions for {west} are complete", True, False),
+            ("object-explicit", f"we checked the dimensions for {east} but have not verified the invoice", True, True),
+            ("subject-complete", f"the dimensions for {east} were checked and independently verified", True, True),
+        )
+        member_case = "member-subject"
+        cases += ((member_case, west, west, west_statement,
+                   f"Sample boards: 2 sqm, separate from {west} (the dimensions for {east} were checked but not verified)",
+                   24, "observed", True),)
+        quote_cases = (
+            ("wrapped-quoted-label", 'the owner selected "Option 6" wide panels and marked "Aisle 4"', True, True),
+            ("wrapped-real-inch", "the note reads 'the gap is 6' wide'", False, True),
+            ("wrapped-ambiguous-heading", "Survey status: estimated area 20 to 25 sqm", False, True),
+            ("headed-real-inch", "Sample stock: a spare strip is 6 inches wide", True, True),
+            ("quote-label", "the owner selected the label 'Option 6'", True, True),
+            ("quote-label-adjective", "the owner selected 'Option 6' wide panels and marked 'Aisle 4'", True, True),
+            ("quote-label-adjective-double", 'the owner selected "Option 6" wide panels and marked "Aisle 4"', True, True),
+            ("quote-length-same-delimiter", "the note reads 'the gap is 6' wide'", False, True),
+            ("quote-possessive", "the owner selected the label 'installers' Option 6'", True, True),
+            ("quote-nested", "the owner selected the label 'the installer said \"Option 6\"'", True, True),
+            ("quote-length", "the note reads 'the gap is 6\" wide'", False, True),
+            ("quote-final-length", "the note reads 'the gap is 6\"'", False, True),
+            ("quote-headed-length", "Sample stock: the note reads 'the gap is 6\" wide'", True, True),
+        )
+        separate_cases = (
+            ("separate-role", f"the dimensions for {east} were checked but are unverified", True, False),
+            ("separate-after", f"the dimensions for {east} were checked but are unverified", True, False),
+            ("separate-unbound", "the dimensions were checked but are unverified", True, True),
+            ("separate-headed", f"Survey status: the dimensions for {east} have not been verified", True, False),
+            ("separate-heading-bound", f"{east}: verification pending", True, False),
+        )
+        correction_east = {name: east_priced for name, _, _, east_priced in role_cases + quote_cases + separate_cases}
+        correction_east[member_case] = False
+        member_aside = "member-aside"
+        cases += ((member_aside, west, west, west_statement,
+                   f"Sample boards: 2 sqm, separate from {west} (we checked the dimensions for {east}. "
+                   "(Those dimensions remain unverified))", 24, "observed", True),)
+        correction_east[member_aside] = False
+        cases += tuple((name, west, west, west_statement, f"{west_statement} ({note})", 24, "observed", west_priced)
+                       for name, note, west_priced, _ in role_cases)
+        cases += tuple((name, west, west, west_statement, note, 24, "observed", west_priced)
+                       for name, note, west_priced, _ in quote_cases + separate_cases)
+        scoped_annotations = {
+            "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-list", "an-nest", "an-local",
+            "op-pass", "op-pass-r", "op-note", "op-note-r", "op-value", "op-local", "op-both", "op-wrap",
+            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
+            "pa-colon", "pa-neg", "pa-inner", "pa-local", "pa-value",
+        }
+        dotted_comparisons = {"mem-dot-neutral", "mem-dot-first", "mem-dot-mid"}
+        wrapped_comparisons = {"mem-line-neutral", "mem-line-first", "mem-line-mid"}
+        three_area_lists = {"list-comma", "list-ox", "list-all", "list-sep", "list-embed", "list-qty", "list-unc",
+                            "mem-first", "mem-mid", "mem-last", "mem-wait", "mem-neutral", "mem-other",
+                            "mem-compare", "mem-mixed", "mem-break"} | dotted_comparisons | wrapped_comparisons | scoped_annotations
+        north_cases = {"est-chain", "geo-chain", "est-sep", "bracket-geo", "paren-val", "brace-geo",
+                       "wrap-geo", "wrap-val", "wrap-brace"} | three_area_lists
+        embedded_revisions = {"re-embed", "re-later", "re-title", "re-amount", "re-mixed", "re-mixqty"}
+        semicolon_cases = {"free-prose", "prose-sep", "qty-prose", "qty-present", "qty-past", "qty-request",
+                           "qty-estimate", "qty-note", "qty-heading", "qty-heading-range", "qty-same-heading",
+                           "qty-range", "same-subj", "rev-wide", "rev-par", "rev-wrap", "rev-body", "rev-after",
+                           "rev-spat", "sep-spat", "rev-neutral", "prov-tail", "prov-nested", "prov-neg",
+                           "prov-note", "rev-repeat", "re-brack", "re-square", "loc-chain", "loc-level",
+                           "ref-split", "ref-prose", "ref-head", "ref-both", "ref-clause", "ref-neg", "ref-excl", "st-site", "st-unver", "st-field",
+                           "st-still", "st-source", "st-key", "st-survey", "list-both",
+                           "st-noverify", "st-await", "st-open", "st-done", "st-invoice",
+                           "st-required", "st-needed", "st-inv-req"} | embedded_revisions | scoped_verification | correction_east.keys()
+        aside_cases = ({"assume-dot", "assume-soft", "assume-open", "assume-tail", "free-assume", "free-inline",
+                        "pending-dot", "subject-dot", "prose-hold"} | semicolon_cases)
+        qualifier_cases = aside_cases | north_cases
+        framing_cases = {"question", "q-wrap", "q-geometry", "width-pair", "i-aside", "w-aside", "i-limit", "w-limit", "split-end", "paren-label", "brace-label",
+                         "square-label", "open-zone", "roof", "bare-roof", "revision", "confirm", "plain-wrap", "dash-wrap",
+                         "roof-open", "roof-unbound", "adjacent", "embedded", "emb-wrap", "adj-wrap",
+                         "prefix-inline", "prefix-wrap", "title-bare", "title-sep", "abbrev", "abbr-inline", "abbr-sep",
+                         "initialism", "list-dot", "number-dot", "prose-dot"} | qualifier_cases
+        west_cases = {"range", "approximation", "opaque-area", "wrapped-range", "same-line-range", "free-geometry",
+                      "punctuated-wrap", "range-suffix", "short-pair", "sentence-end", "after-prose", "open-note", "open-att", "approx-pair"}
+        inline_cases = {"same-line-range", "sentence-two", "sentence-end", "after-prose", "open-note", "open-att", "approx-pair"} | framing_cases
+        dual_cases = west_cases | {"sentence-two"} | framing_cases
+        config = synthetic_configuration(credential="synthetic")
+        with (mock.patch.object(webapp, "read_dotenv_value", side_effect=config.get),
+              mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
+              mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only")),
+              tempfile.TemporaryDirectory() as temp):
+            root = Path(temp)
+            for route in ("notes", "pdf", "batch"):
+                for case_index, (name, basis, item, statement, other, quantity, kind, allowed) in enumerate(cases):
+                    if (name in correction_east) != correction_cases:
+                        continue
+                    with self.subTest(route=route, name=name):
+                        east_label = "Carpet tile east" if name in inline_cases else f"{label} at east"
+                        east_statement = f"{east_label}: 10 sqm"
+                        north_label = "Carpet tile north"
+                        north_statement = f"{north_label}: 5 sqm"
+                        sources = [statement, other] if other else [statement]
+                        if name == "derived-wrapped":
+                            sources = [statement.replace(", full coverage", ",\nfull coverage")]
+                        if route == "batch":
+                            sources.reverse()
+                        if name == "annotated-reversed":
+                            sources.reverse()
+                        if name in dual_cases:
+                            sources.append(east_statement)
+                        if name == "same-line-range":
+                            sources = ["; ".join(sources)]
+                        elif name == "sentence-two":
+                            sources = [f"{statement}. {east_statement}."]
+                        elif name == "sentence-end":
+                            sources = [statement, f"{east_statement}. {other}."]
+                        elif name == "open-note":
+                            sources = [statement, f"{east_statement};\n{other}"]
+                        elif name == "open-att":
+                            sources = [statement, f"{east_statement}\n{other}"]
+                        elif name == "roof":
+                            sources = [f"{statement};\n{other}", east_statement]
+                        elif name in {"bare-roof", "revision", "confirm"}:
+                            sources = [f"{statement}\n{other}", east_statement]
+                        elif name in {"roof-open", "roof-unbound"}:
+                            sources = [other, statement, east_statement]
+                        elif name in {"adjacent", "embedded"}:
+                            sources = [statement, f"{other} {east_statement}"]
+                        elif name in {"adj-wrap", "emb-wrap"}:
+                            sources = [statement, f"{other}\n{east_statement}"]
+                        elif name == "prefix-inline":
+                            sources = [f"{other} {statement}", east_statement]
+                        elif name == "abbr-inline":
+                            sources = [f"{other} {statement}", east_statement]
+                        elif name in {"abbrev", "initialism", "list-dot", "number-dot", "prose-dot"}:
+                            sources = [f"{other}\n{statement}", east_statement]
+                        elif name == "abbr-sep":
+                            sources = [f"{other};\n{statement}", east_statement]
+                        elif name in embedded_revisions:
+                            sources = [f"{statement};\n{east_statement} ({other})"]
+                        elif name == "separate-after":
+                            sources = [f"{statement};\n{east_statement};\n{other}"]
+                        elif name in {"wrapped-quoted-label", "wrapped-real-inch", "wrapped-ambiguous-heading"}:
+                            sources = [f"{statement}\n{other}; {east_statement}"]
+                        elif name in aside_cases:
+                            terminal = ";" if name in semicolon_cases else "" if name == "assume-soft" else "."
+                            wrap = " " if name == "free-inline" else "\n"
+                            sources = [f"{statement}{terminal}{wrap}{other};\n{east_statement}"]
+                        elif name in dotted_comparisons | wrapped_comparisons:
+                            separator = "\n"
+                            if name in dotted_comparisons:
+                                separator = ".\n" if route == "pdf" else ". "
+                            wrapped_other = other.replace(", Carpet tile east", ",\nCarpet tile east")
+                            sources = [separator.join((statement, east_statement, north_statement, wrapped_other))]
+                        elif name in three_area_lists:
+                            sources = [f"{statement};\n{other};\n{east_statement};\n{north_statement}"]
+                        elif name in north_cases:
+                            terminal = ";" if name == "est-sep" else "."
+                            sources = [f"{other}{terminal}\n{east_statement}{terminal}\n{north_statement}"]
+                        elif name == "prefix-wrap" or (name == "title-bare" and route != "pdf"):
+                            sources = [f"{other}\n{statement}", east_statement]
+                        elif name == "title-sep" and route != "pdf":
+                            sources = [other, statement, east_statement]
+                        elif name in {"title-bare", "title-sep"}:
+                            sources = [statement, east_statement]
+                        elif name == "independent-ambiguity":
+                            sources = [f"{statement};\n{other}"]
+                        elif name in {"paren-label", "brace-label", "square-label"}:
+                            sources = [statement, f"{east_statement}\n{other}"]
+                        source_label = "Quote notes" if route == "notes" else "Reference 1, PDF page 1"
+                        payload = self._ledger_draft_payload(f"quote-scope-{route[0]}-{case_index}")
+                        if route == "notes":
+                            payload["notes"] = "; ".join(sources)
+                        elif route == "pdf":
+                            path = root / "survey.pdf"
+                            title = "Synthetic survey" if name == "title-bare" else "Synthetic survey;"
+                            lines = ";\n".join(sources).splitlines()
+                            # The fixture writer clips each physical line at 110 characters.
+                            write_text_pdf(path, title, [segment for line in lines
+                                                        for segment in (wrap_pdf_line(line, 90) if len(line) > 110 else [line])])
+                            if name in {"quote-label", "quote-possessive"}:
+                                import pypdfium2
+
+                                with pypdfium2.PdfDocument(path) as pdf:
+                                    page = pdf[0]
+                                    text_page = page.get_textpage()
+                                    try:
+                                        extracted = text_page.get_text_range()
+                                    finally:
+                                        text_page.close()
+                                        page.close()
+                                label_text = "'Option 6'" if name == "quote-label" else "'installers' Option 6'"
+                                self.assertIn(label_text.replace("'", "\u2019"), extracted)
+                            payload["images"] = [{"name": path.name, "data_url": "data:application/pdf;base64," +
+                                                  base64.b64encode(path.read_bytes()).decode("ascii")}]
+                        else:
+                            payload["images"] = [{"name": "synthetic.pdf", "data_url": synthetic_pdf(13)}]
+                        floor = {"id": "floor", "tag": "Confirm", "text": basis, "quantity": quantity, "unit": "sqm",
+                                 "confidence_pct": 90, "scope_kind": "physical", "pricing_keyword": self.LEDGER_CARPET,
+                                 "measurement_evidence": {"kind": kind, "source": source_label, "statement": statement}}
+                        item_row = {"source_basis_line_id": "floor", "section": "Floors", "description": item,
+                                    "quantity": quantity, "unit": "sqm", "pricing_keyword": self.LEDGER_CARPET}
+                        floors, items = [floor], [item_row]
+                        if name in dual_cases:
+                            floors.append({**floor, "id": "east", "text": east_label, "quantity": 10,
+                                           "measurement_evidence": {"kind": "observed", "source": source_label, "statement": east_statement}})
+                            items.append({**item_row, "source_basis_line_id": "east", "description": east_label, "quantity": 10})
+                        if name in north_cases:
+                            floors.append({**floor, "id": "north", "text": north_label, "quantity": 5,
+                                           "measurement_evidence": {"kind": "observed", "source": source_label, "statement": north_statement}})
+                            items.append({**item_row, "source_basis_line_id": "north", "description": north_label, "quantity": 5})
+                        if name == "duplicate":
+                            floors.append({**floor, "id": "copied", "text": basis.upper(),
+                                           "measurement_evidence": {**floor["measurement_evidence"], "statement": other}})
+                            items.append({**item_row, "source_basis_line_id": "copied", "description": item.upper()})
+                        provider = {"quote_basis_sections": [
+                            {"id": "floors", "title": "Floors", "lines": floors},
+                            {"id": "lighting", "title": "Lighting and AV", "lines": [
+                                {"id": "spot", "tag": "Confirm", "text": "Synthetic spotlight 6 inch", "quantity": 2,
+                                 "unit": "nos", "confidence_pct": 90, "pricing_keyword": spot}]},
+                        ], "line_items": [*items, {"source_basis_line_id": "spot", "section": "Lighting and AV",
+                            "description": "Synthetic spotlight 6 inch", "quantity": 2, "unit": "nos", "pricing_keyword": spot}]}
+                        transport = EvidenceTransport(provider_result=provider, measurement_note="; ".join(sources))
+                        with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
+                            draft = webapp.request_openai_quote_basis(payload, "synthetic")
+                        final = webapp.finalized_remote_draft_result(payload, draft, "openai", "OpenAI",
+                                                                    webapp.booth_dimensions_from_payload(payload), [])
+                        seal = final["pricing_analysis_seal"]
+                        self.assertEqual(len(transport.calls), 4 if route == "batch" else 1)
+                        entries = {entry["id"]: entry for entry in seal["rows"]}
+                        self.assertEqual(entries["floor"].get("catalog_item_id"), self.LEDGER_CARPET if allowed else None)
+                        self.assertEqual(entries["floor"]["measurement"]["disposition"], "measured" if allowed else "review")
+                        if allowed:
+                            self.assertEqual(entries["floor"]["measurement"]["claim_version"], webapp.AREA_EVIDENCE_CLAIM_VERSION)
+                        else:
+                            self.assertEqual(entries["floor"]["measurement"], {"disposition": "review"})
+                        if name == "duplicate":
+                            self.assertEqual(entries["copied"]["measurement"], {"disposition": "review"})
+                        self.assertEqual(entries["spot"]["catalog_item_id"], spot)
+                        east_priced = correction_east.get(name, name in dual_cases and name not in {
+                            "open-att", "embedded", "emb-wrap", "re-mixed", "re-mixqty", "ref-clause", "list-unc",
+                            "mem-mid", "mem-wait", "mem-dot-mid", "mem-line-mid",
+                            "an-ce", "an-ec", "an-and", "an-semi", "an-dot", "an-both", "an-nest",
+                            "op-pass", "op-pass-r", "op-note", "op-note-r", "op-both", "op-wrap",
+                            "op-need-s", "op-need-d", "op-need-l", "op-need-r", "op-need-n", "op-since",
+                            "pa-colon", "pa-neg", "pa-inner",
+                            "pd-east-subject", "pd-east-object", "pd-east-for", "pd-east-on", "pd-east-part",
+                            "pd-east-cond", "pd-part-front", "pd-east-wrap",
+                            "pd-asp-tail", "pd-chain", "pd-unfinished", "pd-cond-comma", "pd-obj-list", "pd-subj-list",
+                            "pd-started", "pd-not-started", "pd-event-execute", "pd-cond-review",
+                            "pd-event-gerund", "pd-ref-clause",
+                            "pd-both-shared", "pd-both-poss", "pd-both-ref",
+                            "pd-carry-cond", "pd-done-cond", "pd-head-obj", "pd-head-sub", "pd-poss-pair",
+                        })
+                        north_priced = name in north_cases and name not in {
+                            "list-sep", "list-embed", "list-qty", "list-unc", "mem-last", "mem-other", "mem-break",
+                        }
+                        if name in dual_cases:
+                            self.assertEqual(entries["east"].get("catalog_item_id"), self.LEDGER_CARPET if east_priced else None)
+                            self.assertEqual(entries["east"]["measurement"]["disposition"], "measured" if east_priced else "review")
+                        if name in north_cases:
+                            self.assertEqual(entries["north"].get("catalog_item_id"), self.LEDGER_CARPET if north_priced else None)
+                            self.assertEqual(entries["north"]["measurement"]["disposition"], "measured" if north_priced else "review")
+                        workbook_cases = {"approved", "decimal", "grouped", "derived-wrapped", "grouped-not-decimal", "annotated-conflict",
+                                          "mixed-format", "range", "approximation", "punctuated-wrap", "range-suffix",
+                                          "short-pair", "sentence-two", "sentence-end", "after-prose", "open-note", "open-att", "approx-pair"} | framing_cases
+                        if (route == "pdf" and name in workbook_cases) or name in qualifier_cases:
+                            include = {"floor", "spot"} if allowed else {"spot"}
+                            if east_priced:
+                                include.add("east")
+                            if north_priced:
+                                include.add("north")
+                            sections = copy.deepcopy(final["quote_basis_sections"])
+                            for section in sections:
+                                for line in section["lines"]:
+                                    line["tag"] = "Include" if line["id"] in include else "Exclude"
+                            generation = {**payload, "quote_basis_sections": sections, "quote_basis": webapp.quote_basis_from_sections(sections),
+                                          "pricing_analysis_seal": seal, "line_items": [row for row in final["line_items"]
+                                            if row["source_basis_line_id"] in include]}
+                            output_root = root / f"{route[0]}-{case_index}"
+                            result = webapp.run_quote_job(generation, output_root=output_root, tmp_root=root / "tmp")
+                            self.assertEqual(result["status"], "completed", result.get("errors"))
+                            [xlsx] = list(output_root.rglob("quotation.xlsx"))
+                            values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                            [total] = [row for row in values if "Total" in row]
+                            priced_area = (10 if east_priced else 0) + (5 if north_priced else 0) + (quantity if allowed else 0)
+                            expected = round(2 * koncept_catalog_sale_unit_price(spot) +
+                                             priced_area * koncept_catalog_sale_unit_price(self.LEDGER_CARPET), 2)
+                            self.assertIn(expected, total)
+                            if name in correction_east:
+                                [grand_total] = [row for row in values if "Total including GST" in row]
+                                self.assertIn({
+                                    (False, False): 31.17,
+                                    (False, True): 188.13,
+                                    (True, False): 407.88,
+                                    (True, True): 564.84,
+                                }[allowed, east_priced], grand_total)
+                            if name in dual_cases:
+                                self.assertEqual(any("10 sqm" in row and 144 in row for row in values), east_priced)
+                                self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
+                                if quantity == 24:
+                                    self.assertEqual(any("24 sqm" in row and 345.60 in row for row in values), allowed)
+                                if name == "list-dot":
+                                    # Column A's numbering shares this fixture's "1." prefix.
+                                    for row in values:
+                                        if len(row) > 2 and isinstance(row[2], str):
+                                            self.assertNotIn(other, row[2])
+                                elif other:
+                                    self.assertFalse(any(other in str(cell) for row in values for cell in row))
+                            if name in north_cases:
+                                self.assertEqual(any("5 sqm" in row and 72 in row for row in values), north_priced)
+
+    def test_pdf_pricing_evidence_requires_complete_bounded_page_text(self):
+        import socket
+        from scripts.generate_quote import pdf_escape, read_first_sheet_rows_with_numbers
+        from tests.gateway_test_support import synthetic_configuration
+        from tests.test_basis_quantity_retention import EvidenceTransport
+        from webapp import ai_gateway
+
+        def reference(first_page, second_page, batched):
+            pages = [first_page] if second_page is None else [first_page, second_page]
+            if batched:
+                pages.extend([] for _ in range(13 - len(pages)))
+            kids = " ".join(f"{4 + index * 2} 0 R" for index in range(len(pages)))
+            objects = ["<< /Type /Catalog /Pages 2 0 R >>",
+                       f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>",
+                       "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+            for index, lines in enumerate(pages):
+                height = max(100, 20 + 5 * len(lines))
+                commands = ["BT", "/F1 4 Tf", f"12 {height - 10} Td"]
+                for line in lines:
+                    commands.extend((f"({pdf_escape(line)}) Tj", "0 -5 Td"))
+                stream = "\n".join(commands + ["ET"])
+                objects.extend((
+                    f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 {height}] "
+                    f"/Resources << /Font << /F1 3 0 R >> >> /Contents {5 + index * 2} 0 R >>",
+                    f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream",
+                ))
+            document = bytearray(b"%PDF-1.4\n")
+            offsets = []
+            for number, obj in enumerate(objects, 1):
+                offsets.append(len(document))
+                document.extend(f"{number} 0 obj\n{obj}\nendobj\n".encode("ascii"))
+            xref = len(document)
+            document.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii"))
+            for offset in offsets:
+                document.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+            document.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii"))
+            return {"name": "survey.pdf", "data_url": "data:application/pdf;base64," + base64.b64encode(document).decode("ascii")}
+
+        west, east = "Carpet tile west", "Carpet tile east"
+        west_statement, east_statement = f"{west}: 24 sqm", f"{east}: 10 sqm"
+        conflict = f"{west}: 4 sqm;"
+        context = "Administrative drawing context remains unchanged for the quoted exhibition and sample stock record;"
+        regular, over_budget = [context] * 90, [context] * 390
+        west_record = west_statement + ";"
+        cases = (
+            ("early", [west_record, conflict, *regular], False, False),
+            ("late", [west_record, *regular, conflict], False, False),
+            ("tail", [*regular, west_record], True, False),
+            ("neutral", [west_record, *regular], True, False),
+            ("over", [west_record, *over_budget, conflict], False, False),
+            ("independent", over_budget, True, True),
+            ("raster", [], False, False),
+        )
+        spot = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        with (mock.patch.object(webapp, "read_dotenv_value", side_effect=synthetic_configuration(credential="synthetic").get),
+              mock.patch.object(webapp, "catalog_visual_image_entries_for_payload", return_value=[]),
+              mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only")),
+              tempfile.TemporaryDirectory(prefix="sq-") as temp):
+            root = Path(temp)
+            for batched in (False, True):
+                for name, first_page, west_allowed, independent in cases:
+                    with self.subTest(batched=batched, name=name):
+                        expected_west = west_allowed or (batched and name == "raster")
+                        payload = self._ledger_draft_payload(f"quote-dense-{int(batched)}-{name}")
+                        second_page = [east_statement + ";"] if name in {"over", "independent"} else None
+                        payload["notes"] = west_statement if independent else (east_statement if second_page is None else "")
+                        payload["images"] = [reference(first_page, second_page, batched)]
+                        lines, items = [], []
+                        for row_id, label, amount, unit, keyword, source in (
+                            ("west", west, 24, "sqm", self.LEDGER_CARPET,
+                             "Quote notes" if independent else "Reference 1, PDF page 1"),
+                            ("east", east, 10, "sqm", self.LEDGER_CARPET,
+                             "Quote notes" if second_page is None else "Reference 1, PDF page 2"),
+                            ("spot", "Synthetic spotlight 6 inch", 2, "nos", spot, ""),
+                        ):
+                            line = {"id": row_id, "tag": "Confirm", "text": label, "quantity": amount, "unit": unit,
+                                    "confidence_pct": 90, "scope_kind": "physical", "pricing_keyword": keyword}
+                            if source:
+                                line["measurement_evidence"] = {"kind": "observed", "source": source,
+                                                                "statement": f"{label}: {amount} {unit}"}
+                            lines.append(line)
+                            items.append({"source_basis_line_id": row_id, "section": "Floors" if source else "Lighting and AV",
+                                          "description": label, "quantity": amount, "unit": unit, "pricing_keyword": keyword})
+                        provider = {"quote_basis_sections": [{"id": "scope", "title": "Scope", "lines": lines}],
+                                    "line_items": items}
+                        transport = EvidenceTransport(provider_result=provider, measurement_note=west_statement)
+                        with mock.patch.object(ai_gateway, "BoundedHttpsTransport", return_value=transport):
+                            draft = webapp.request_openai_quote_basis(payload, "synthetic")
+                        final = webapp.finalized_remote_draft_result(payload, draft, "openai", "OpenAI",
+                                                                    webapp.booth_dimensions_from_payload(payload), [])
+                        self.assertEqual(len(transport.calls), 4 if batched else 1)
+                        for call in transport.calls:
+                            self.assertFalse(any(context in part.get("text", "") for part in call["input"][0]["content"]))
+                        seal = final["pricing_analysis_seal"]
+                        signed = {row["id"]: row for row in seal["rows"]}
+                        self.assertEqual(signed["west"]["measurement"]["disposition"], "measured" if expected_west else "review")
+                        self.assertEqual(signed["east"]["measurement"]["disposition"], "measured")
+                        self.assertEqual(signed["spot"]["catalog_item_id"], spot)
+                        sections = copy.deepcopy(final["quote_basis_sections"])
+                        include = {"west", "east", "spot"} if expected_west else {"east", "spot"}
+                        for section in sections:
+                            for line in section["lines"]:
+                                line["tag"] = "Include" if line["id"] in include else "Exclude"
+                        generation = {**payload, "quote_basis_sections": sections,
+                                      "quote_basis": webapp.quote_basis_from_sections(sections), "pricing_analysis_seal": seal,
+                                      "line_items": [row for row in final["line_items"] if row["source_basis_line_id"] in include]}
+                        output = root / f"{int(batched)}-{name}"
+                        result = webapp.run_quote_job(generation, output_root=output, tmp_root=root / "t")
+                        self.assertEqual(result["status"], "completed", result.get("errors"))
+                        [xlsx] = list(output.rglob("quotation.xlsx"))
+                        values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                        [subtotal] = [row for row in values if "Total" in row]
+                        self.assertIn(518.20 if expected_west else 172.60, subtotal)
+                        self.assertEqual(any("24 sqm" in row for row in values), expected_west)
+                        self.assertTrue(any("10 sqm" in row and 144 in row for row in values))
+                        self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
+
+    def test_ledger_rejects_reused_scope_across_signed_analyses(self):
+        label = "Synthetic carpet tile flooring at east"
+        statement = f"{label}: 24 sqm"
+        carpet = self.LEDGER_CARPET
+
+        def provider(row_id):
+            return {"quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+                {"id": row_id, "tag": "Confirm", "text": label, "quantity": 24, "unit": "sqm",
+                 "confidence_pct": 90, "scope_kind": "physical", "pricing_keyword": carpet,
+                 "measurement_evidence": {"kind": "observed", "source": "Quote notes", "statement": statement}},
+            ]}], "line_items": [{"source_basis_line_id": row_id, "section": "Floors", "description": label,
+                                 "quantity": 24, "unit": "sqm", "pricing_keyword": carpet}]}
+
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            session_id = "quote-reused-measurement"
+            payload = self._ledger_draft_payload(session_id)
+            sources = {"Quote notes": [statement]}
+            initial = self._ledger_carry_draft(payload, self._ledger_draft(
+                runner, headers, payload, provider("initial"), measurement_sources=sources))
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", initial)["status"], 200)
+            self.assertEqual(self._ledger_price(self._ledger_brief_rows(initial), "initial"), koncept_catalog_sale_unit_price(carpet))
+            repeat = self._ledger_carry_draft(payload, self._ledger_draft(
+                runner, headers, payload, provider("repeated"), measurement_sources=sources))
+            self.assertEqual(self._ledger_price(self._ledger_brief_rows(repeat), "repeated"), koncept_catalog_sale_unit_price(carpet))
+            repeated_section = next(section for section in repeat["quote_basis_sections"] if any(
+                line["id"] == "repeated" for line in section["lines"]))
+            repeated_section["lines"].append(copy.deepcopy(self._ledger_line(initial, "initial")))
+            repeat["line_items"].append(copy.deepcopy(initial["line_items"][0]))
+            self._ledger_sync(repeat)
+            for row_id in ("initial", "repeated"):
+                self.assertIsNone(self._ledger_price(self._ledger_brief_rows(repeat), row_id))
+            self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", repeat)["status"], 200)
+            reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+            self.assertEqual(reopened["status"], 200)
+            rows = reopened["body"]["quote_session"]["draft_state"]["lineItems"]
+            self.assertEqual({row["source_basis_line_id"] for row in rows}, {"initial", "repeated"})
+            for row_id in ("initial", "repeated"):
+                self.assertIsNone(self._ledger_price(rows, row_id))
+
+    def test_ledger_admitted_scope_survives_save_selection_and_workbook(self):
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers
+
+        carpet = self.LEDGER_CARPET
+        spot = "synthetic-lighting-and-av-synthetic-spotlight-6-inch"
+        statement = "Synthetic carpet tile flooring at east: 24 sqm"
+        specifications = (
+            ("floor", "Synthetic carpet tile flooring at east", 24, "sqm", carpet),
+            ("review", "Synthetic carpet tile flooring at west", 36, "sqm", carpet),
+            ("spot", "Synthetic spotlight 6 inch", 2, "nos", spot),
+        )
+        lines, rows = [], []
+        for row_id, description, quantity, unit, keyword in specifications:
+            lines.append({"id": row_id, "tag": "Confirm", "text": description, "quantity": quantity, "unit": unit,
+                          "confidence_pct": 90, "pricing_keyword": keyword, "scope_kind": "physical"})
+            rows.append({"source_basis_line_id": row_id, "section": "Lighting and AV" if row_id == "spot" else "Floors", "description": description,
+                         "quantity": quantity, "unit": unit, "pricing_keyword": keyword})
+        lines[0]["measurement_evidence"] = {"kind": "observed", "source": "Quote notes", "statement": statement}
+        disputed = "Synthetic carpet tile flooring at west: 36 sqm"
+        lines[1]["measurement_evidence"] = {"kind": "observed", "source": "Quote notes", "statement": disputed}
+        lines.append({"id": "info", "tag": "Confirm", "text": "Dimensions for venue orientation", "confidence_pct": 90,
+                      "scope_kind": "informational"})
+        provider = {"quote_basis_sections": [
+            {"id": "floors", "title": "Floors", "lines": [line for line in lines if line["id"] != "spot"]},
+            {"id": "lighting", "title": "Lighting and AV", "lines": [line for line in lines if line["id"] == "spot"]},
+        ], "line_items": rows}
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            session_id = "quote-admitted-scope-ledger"
+            payload = self._ledger_draft_payload(session_id)
+            old_sources = {"Quote notes": [
+                statement, disputed, f"{disputed} (provisional in drawing)",
+                f"{statement} (we checked the dimensions for {specifications[0][1]}. "
+                "(Those dimensions remain unverified))",
+            ]}
+            # Reproduce a v27 grant from a nested qualification missed by that reader.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 27),
+                  mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
+                old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
+            stale = self._ledger_carry_draft(payload, old_draft)
+            self.assertEqual(self._ledger_price(old_draft["line_items"], "floor"), koncept_catalog_sale_unit_price(carpet))
+            self.assertIsNone(self._ledger_price(self._ledger_normalize(runner, headers, stale), "floor"))
+            self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, stale), "spot"),
+                             koncept_catalog_sale_unit_price(spot))
+            self._ledger_line(stale, "floor")["tag"] = "Include"
+            self._ledger_line(stale, "spot")["tag"] = "Include"
+            self._ledger_line(stale, "review")["tag"] = "Exclude"
+            stale["line_items"] = [row for row in stale["line_items"] if row["source_basis_line_id"] != "review"]
+            stale_state = stale["quote_session"]["draft_state"]
+            stale_state["originalAnalysisSnapshot"].update(
+                quote_basis_sections=copy.deepcopy(old_draft["quote_basis_sections"]),
+                line_items=copy.deepcopy(old_draft["line_items"]),
+            )
+            stale_state["originalOutputRows"] = copy.deepcopy(stale["line_items"])
+            details = stale_state["quoteDetails"]
+            details["company"]["logo_data_url"] = synthetic_image()
+            details["quote_text"].update(payload["quote_text"])
+            details["signature"].update(company_signatory="Synthetic signatory", company_title="Synthetic title")
+            details["commercial_snapshot"]["presence"] = {
+                key: "captured" if webapp.quote_commercial_value_is_present(value) else "intentional_empty"
+                for key, value in webapp.quote_commercial_snapshot_raw_values(details).items()
+            }
+            self._ledger_sync(stale)
+
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                # Save before any current-version request can demote the old signed grant.
+                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 27):
+                    self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
+                    saved_v27 = webapp.read_quote_session_metadata(session_id)
+                    saved_floor = saved_v27["pricing_ledger"]["rows"]["floor"]
+                    self.assertEqual(saved_floor["measurement"]["claim_version"], 27)
+                    self.assertEqual(saved_floor["grant"]["state"], "live")
+                for path in ("seal", "ledger"):
+                    with self.subTest(path=path):
+                        self.assertIsNone(self._ledger_price(self._ledger_brief_rows(stale), "floor"))
+                        blocked = webapp.run_quote_job(copy.deepcopy(stale), output_root=root / path, tmp_root=root / "tmp")
+                        self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
+                        self.assertFalse(list((root / path).rglob("quotation.xlsx")))
+                        if path == "seal":
+                            webapp.write_quote_session_metadata(saved_v27)
+                            stale.pop("pricing_analysis_seal")
+                            stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+                reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                self.assertEqual(reopened["status"], 200)
+                reopened_state = reopened["body"]["quote_session"]["draft_state"]
+                for reset_rows in (reopened_state["lineItems"], reopened_state["originalOutputRows"],
+                                   reopened_state["originalAnalysisSnapshot"]["line_items"]):
+                    reset = copy.deepcopy(stale)
+                    self.assertIsNone(self._ledger_price(reset_rows, "floor"))
+                    self.assertEqual(self._ledger_price(reset_rows, "spot"), koncept_catalog_sale_unit_price(spot))
+                    reset["line_items"] = copy.deepcopy(reset_rows)
+                    self._ledger_sync(reset)
+                    self.assertIsNone(self._ledger_price(self._ledger_brief_rows(reset), "floor"))
+                    self.assertEqual(self._ledger_price(self._ledger_brief_rows(reset), "spot"), koncept_catalog_sale_unit_price(spot))
+                # An explicit exclusion lets the independently priced row reach Excel.
+                self._ledger_line(reset, "floor")["tag"] = "Exclude"
+                reset["line_items"] = [row for row in reset["line_items"] if row["source_basis_line_id"] == "spot"]
+                self._ledger_sync(reset)
+                reset_result = webapp.run_quote_job(reset, output_root=root / "reset", tmp_root=root / "tmp")
+                self.assertEqual(reset_result["status"], "completed", reset_result.get("errors"))
+                [reset_xlsx] = list((root / "reset").rglob("quotation.xlsx"))
+                reset_values = [row for _, row in read_first_sheet_rows_with_numbers(reset_xlsx)]
+                self.assertFalse(any("24 sqm" in row for row in reset_values))
+                self.assertTrue(any("2 nos" in row and 28.60 in row for row in reset_values))
+                webapp.write_quote_session_metadata(saved_v27)
+                self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
+                stale_floor = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["floor"]
+                self.assertEqual(stale_floor["measurement"], {"disposition": "review"})
+                self.assertIsNone(stale_floor["grant"])
+                review_metadata = webapp.read_quote_session_metadata(session_id)
+                for variant, price in (("manual", 7), ("included", 0)):
+                    with self.subTest(variant=variant):
+                        repaired = copy.deepcopy(stale)
+                        floor = next(row for row in repaired["line_items"] if row["source_basis_line_id"] == "floor")
+                        floor["pricing_authority"] = webapp.build_pricing_authority(
+                            variant, floor, price=price, reference_authority=webapp.exact_pricing_reference_authority(repaired),
+                        )
+                        if variant == "included":
+                            floor.update(price_mode="Included", display_price="Included",
+                                         pricing_basis_amount=0, approved_quote_amount=0)
+                        self._ledger_sync(repaired)
+                        # Replay each operator decision from the same saved review state.
+                        webapp.write_quote_session_metadata(review_metadata)
+                        workbook = webapp.run_quote_job(repaired, output_root=root / variant, tmp_root=root / "tmp")
+                        self.assertEqual(workbook["status"], "completed", workbook.get("errors"))
+                        [xlsx] = list((root / variant).rglob("quotation.xlsx"))
+                        values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                        [total] = [row for row in values if "Total" in row]
+                        self.assertIn(round(24 * price + 2 * koncept_catalog_sale_unit_price(spot), 2), total)
+                        [floor_values] = [row for row in values if any(
+                            isinstance(cell, str) and "carpet tile" in cell.casefold() for cell in row
+                        )]
+                        if variant == "included":
+                            self.assertIn(0, floor_values)
+                            self.assertNotIn(24 * koncept_catalog_sale_unit_price(carpet), floor_values)
+                        else:
+                            self.assertIn("24 sqm", floor_values)
+                            self.assertIn(24 * price, floor_values)
+            reanalysed = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
+            self.assertIsNone(self._ledger_price(reanalysed["line_items"], "floor"))
+            self.assertEqual(self._ledger_price(reanalysed["line_items"], "spot"), koncept_catalog_sale_unit_price(spot))
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
+                statement, disputed, "Synthetic carpet tile flooring at west: 4 to 6 sqm (site survey range)",
+            ]})
+            self.assertEqual(drafted["pricing_analysis_seal"]["schema"], webapp.PRICING_ANALYSIS_MEASUREMENT_SCHEMA)
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
+                statement, disputed, f"{disputed}\npending site verification",
+            ]})
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
+                statement, disputed, f"{disputed}.\nUsing the assumed booth footprint",
+            ]})
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
+                f"{statement}; Installer will bring 2 sqm of sample boards",
+                disputed, f"{disputed}.\nQuantity subject to confirmation",
+            ]})
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "floor"))
+            drafted = self._ledger_draft(runner, headers, payload, provider, measurement_sources={"Quote notes": [
+                f"{statement}; Sample boards: Installer will bring 2 sqm",
+                disputed, f"{disputed}.\nQuantity subject to confirmation",
+            ]})
+            self.assertIsNone(self._ledger_price(drafted["line_items"], "review"))
+            request = self._ledger_carry_draft(payload, drafted)
+            self._ledger_line(request, "floor")["tag"] = "Include"
+            self._ledger_line(request, "spot")["tag"] = "Include"
+            self._ledger_line(request, "review")["tag"] = "Exclude"
+            request["line_items"] = [row for row in request["line_items"] if row["source_basis_line_id"] != "review"]
+            draft_state = request["quote_session"]["draft_state"]
+            draft_state["originalAnalysisSnapshot"].update(
+                quote_basis_sections=copy.deepcopy(drafted["quote_basis_sections"]),
+                line_items=copy.deepcopy(drafted["line_items"]),
+            )
+            draft_state["originalOutputRows"] = copy.deepcopy(request["line_items"])
+            draft_state["quoteDetails"] = copy.deepcopy(stale_state["quoteDetails"])
+            self._ledger_sync(request)
+            saved = self._ledger_post(runner, headers, "/api/quote-sessions", request)
+            self.assertEqual(saved["status"], 200)
+            metadata = webapp.read_quote_session_metadata(session_id)
+            ledger = metadata["pricing_ledger"]
+            self.assertEqual(ledger["schema"], webapp.PRICING_LEDGER_MEASUREMENT_SCHEMA)
+            self.assertEqual(ledger["rows"]["review"]["measurement"], {"disposition": "review"})
+            self.assertEqual(ledger["rows"]["info"]["measurement"], {"disposition": "informational"})
+            self.assertEqual(ledger["rows"]["floor"]["measurement"]["quantity"], 24)
+            self.assertEqual(ledger["rows"]["floor"]["measurement"]["scope"], "synthetic carpet tile flooring at east")
+            self.assertEqual(ledger["rows"]["spot"]["grant"]["state"], "live")
+            earlier = copy.deepcopy(ledger)
+            for version in range(1, webapp.AREA_EVIDENCE_CLAIM_VERSION):
+                earlier["rows"]["floor"]["measurement"]["claim_version"] = version
+                readable = webapp.normalized_pricing_ledger(earlier)
+                self.assertEqual(readable["rows"]["floor"]["measurement"], {"disposition": "review"})
+                self.assertIsNone(readable["rows"]["floor"]["grant"])
+                self.assertEqual(readable["rows"]["spot"]["grant"]["state"], "live")
+            earlier["rows"]["floor"]["measurement"].pop("claim_version")
+            self.assertIsNone(webapp.normalized_pricing_ledger(earlier)["rows"]["floor"]["grant"])
+            for key in ("scope", "basis_scope", "item_scope"):
+                earlier["rows"]["floor"]["measurement"].pop(key)
+            self.assertIsNone(webapp.normalized_pricing_ledger(earlier)["rows"]["floor"]["grant"])
+            request.pop("pricing_analysis_seal")
+            request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+            stale_metadata = copy.deepcopy(metadata)
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 27
+            webapp.write_quote_session_metadata(stale_metadata)
+            try:
+                legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+                self.assertEqual(legacy["status"], 200)
+                legacy_state = legacy["body"]["quote_session"]["draft_state"]
+                for legacy_rows in (legacy_state["lineItems"], legacy_state["originalOutputRows"],
+                                    legacy_state["originalAnalysisSnapshot"]["line_items"]):
+                    self.assertIsNone(self._ledger_price(legacy_rows, "floor"))
+                    self.assertEqual(self._ledger_price(legacy_rows, "spot"), koncept_catalog_sale_unit_price(spot))
+                self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "floor"))
+            finally:
+                webapp.write_quote_session_metadata(metadata)
+            self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "floor"), koncept_catalog_sale_unit_price(carpet))
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                generation = copy.deepcopy(request)
+                result = webapp.run_quote_job(generation, output_root=root / "out", tmp_root=root / "tmp")
+                self.assertEqual(result["status"], "completed", result.get("errors"))
+                [xlsx] = list((root / "out").rglob("quotation.xlsx"))
+                values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                [total] = [row for row in values if "Total" in row]
+                self.assertIn(round(24 * koncept_catalog_sale_unit_price(carpet) + 2 * koncept_catalog_sale_unit_price(spot), 2), total)
+                [grand_total] = [row for row in values if "Total including GST" in row]
+                self.assertIn(407.88, grand_total)
+                self.assertFalse(any("36 sqm" in row or "Dimensions for venue orientation" in str(row) for row in values))
+            self.assertEqual(webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"]["grant"]["state"], "live")
+            harmless = copy.deepcopy(request)
+            harmless_line = self._ledger_line(harmless, "floor")
+            harmless_line["text"] = harmless_line["text"].upper() + "."
+            self._ledger_sync(harmless)
+            same = self._ledger_post(runner, headers, "/api/quote-sessions", harmless)
+            self.assertEqual(self._ledger_revision(same, "floor"), self._ledger_revision(saved, "floor"))
+            self.assertEqual(self._ledger_price(self._ledger_brief_rows(harmless), "floor"), koncept_catalog_sale_unit_price(carpet))
+            changed_wrapper = copy.deepcopy(request)
+            wrapped = self._ledger_line(changed_wrapper, "floor")
+            _, detail = webapp.bracketed_catalog_reference_parts(wrapped["text"])
+            wrapped["text"] = f"[ Synthetic carpet tile flooring at west ] - {detail}"
+            self._ledger_sync(changed_wrapper)
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(changed_wrapper), "floor"))
+            changed_prefix = copy.deepcopy(request)
+            self._ledger_line(changed_prefix, "floor")["text"] = "25 sqm Synthetic carpet tile flooring at east"
+            self._ledger_sync(changed_prefix)
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(changed_prefix), "floor"))
+            changed_quantity = copy.deepcopy(request)
+            self._ledger_line(changed_quantity, "floor")["quantity"] = 25
+            for row in changed_quantity["line_items"]:
+                if row["source_basis_line_id"] == "floor":
+                    row["quantity"] = 25
+            self._ledger_sync(changed_quantity)
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(changed_quantity), "floor"))
+            changed = copy.deepcopy(request)
+            self._ledger_line(changed, "floor")["text"] = "Synthetic carpet tile flooring at west"
+            for row in changed["line_items"]:
+                if row["source_basis_line_id"] == "floor":
+                    row["description"] = "Synthetic carpet tile flooring at west"
+            self._ledger_sync(changed)
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(changed), "floor"))
+            pending = self._ledger_post(runner, headers, "/api/quote-sessions", changed)
+            self.assertGreater(self._ledger_revision(pending, "floor"), self._ledger_revision(saved, "floor"))
+            reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
+            self.assertEqual(reopened["status"], 200)
+            reopened_state = reopened["body"]["quote_session"]["draft_state"]
+            for reopened_rows in (reopened_state["lineItems"], reopened_state["originalOutputRows"],
+                                  reopened_state["originalAnalysisSnapshot"]["line_items"]):
+                self.assertIsNone(self._ledger_price(reopened_rows, "floor"))
+                self.assertIsNone(self._ledger_price(reopened_rows, "review"))
+            self.assertEqual(webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"]["grant"]["state"], "live")
+            selection = self._ledger_select(runner, headers, changed, "floor", carpet, self._ledger_revision(pending, "floor"))
+            self.assertEqual(selection["body"]["selections"], [
+                {"source_basis_line_id": "floor", "status": "refused", "reason": "unit_review_required"},
+            ])
+            restored = copy.deepcopy(request)
+            self.assertIsNone(self._ledger_price(self._ledger_brief_rows(restored), "floor"))
+            self.assertEqual(self._ledger_price(self._ledger_brief_rows(restored), "spot"), koncept_catalog_sale_unit_price(spot),
+                             webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["spot"])
+            [floor] = [row for row in changed["line_items"] if row["source_basis_line_id"] == "floor"]
+            for mode, price in (("manual", 7), ("included", 0)):
+                floor["pricing_authority"] = webapp.build_pricing_authority(
+                    mode, floor, price=price, reference_authority=webapp.exact_pricing_reference_authority(changed),
+                )
+                self._ledger_sync(changed)
+                [priced] = [row for row in self._ledger_brief_rows(changed) if row["source_basis_line_id"] == "floor"]
+                self.assertEqual(priced["pricing_authority"]["variant"], mode)
+                self.assertEqual(priced["pricing_authority"]["price"], price)
+
+    def test_ledger_structured_linked_pair_seals_like_an_equivalent_prefix(self):
+        from scripts.generate_quote import read_first_sheet_rows_with_numbers
+
+        scope = "Synthetic carpet tile flooring across the full booth footprint"
+        price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
+        cases = (
+            ("structured", scope, 24, "m2", scope, "sqm", price),
+            ("prefix", f"24 sqm {scope}", None, "", scope, "sqm", price),
+            ("no-unit", scope, 24, "", scope, "", None),
+            ("split-fields", scope, 24, "", scope, "sqm", None),
+            ("wrong-unit", scope, 24, "nos", scope, "nos", None),
+            ("wrong-scope", scope + " in the storage area", 24, "sqm", scope, "", None),
+        )
+        with mock.patch.dict(os.environ, self._ledger_env(), clear=False), LocalRunnerServer() as runner:
+            headers = self._ledger_runner_headers(runner)
+            for name, basis_text, quantity, basis_unit, item_text, expected_unit, expected_price in cases:
+                with self.subTest(name=name):
+                    payload = self._ledger_draft_payload(f"quote-linked-pair-{name}")
+                    line = {"id": "linked-floor", "tag": "Confirm", "text": basis_text,
+                            "quantity": quantity, "unit": basis_unit, "confidence_pct": 82}
+                    row = {"section": "Floors", "source_basis_line_id": "linked-floor", "description": item_text,
+                           "quantity": None, "unit": "sqm" if name == "split-fields" else "",
+                           "pricing_keyword": self.LEDGER_CARPET}
+                    provider = {"quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [line]}],
+                                "line_items": [row]}
+                    if name == "structured":
+                        for wrong_row in ({**row, "source_basis_line_id": "absent-link"},
+                                          {**row, "quantity": 23}, {**row, "unit": "nos"}):
+                            with self.assertRaises(webapp.AIModelOutputError):
+                                webapp.admit_provider_quote_draft({**provider, "line_items": [wrong_row]}, require_confidence=True)
+                        with self.assertRaises(webapp.AIModelOutputError):
+                            webapp.admit_provider_quote_draft({
+                                **provider, "quote_basis_sections": [{"id": "floors", "title": "Floors", "lines": [
+                                    {**line, "text": f"25 sqm {scope}"}]}],
+                            }, require_confidence=True)
+                    drafted = self._ledger_draft(runner, headers, payload, provider)
+                    [entry] = [entry for entry in drafted["pricing_analysis_seal"]["rows"] if entry["id"] == "linked-floor"]
+                    self.assertEqual(entry["unit"], expected_unit)
+                    self.assertEqual(entry.get("catalog_item_id"), self.LEDGER_CARPET if expected_price else None)
+                    request = self._ledger_carry_draft(payload, drafted)
+                    self.assertEqual(self._ledger_price(self._ledger_normalize(runner, headers, request), "linked-floor"), expected_price)
+                    if expected_price is not None:
+                        self._ledger_line(request, "linked-floor")["tag"] = "Include"
+                        self._ledger_sync(request)
+                        self.assertEqual(self._ledger_price(self._ledger_brief_rows(request), "linked-floor"), price)
+                        with tempfile.TemporaryDirectory() as temp:
+                            root = Path(temp)
+                            generation = {**request, "quote_session": {"session_id": request["quote_session"]["session_id"]}}
+                            result = webapp.run_quote_job(generation, output_root=root / "out", tmp_root=root / "tmp")
+                            self.assertEqual(result["status"], "completed", result.get("errors"))
+                            [xlsx] = list((root / "out").rglob("quotation.xlsx"))
+                            values = [row for _, row in read_first_sheet_rows_with_numbers(xlsx)]
+                            [item] = [row for row in values if "24 sqm" in row]
+                            [total] = [row for row in values if "Total" in row]
+                            self.assertIn(round(24 * price, 2), item)
+                            self.assertIn(round(24 * price, 2), total)
 
     def _ledger_laundering_payload(self, session_id):
         """A request row carrying a self-built current catalogue authority, and a degenerate provider result naming it."""

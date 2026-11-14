@@ -60,7 +60,7 @@ owner approval and eligibility qualification; fake transports prove no endpoint
 capability, Responses schema subset, model accuracy or cost saving.
 
 When enabled, standard and High Quality final drafts, including batched synthesis,
-send `text.format` with `type=json_schema`, `name=draft_synthesis_v1`, `strict=true`
+send `text.format` with `type=json_schema`, `name=draft_synthesis_v2`, `strict=true`
 and the generated schema. Page observations, basis chat, pricing import and
 matching metadata retain their own existing contracts. A trusted contract identity
 is checked separately from the operation and body. Missing, modified or unexpected
@@ -80,6 +80,101 @@ Exact-object JSON parsing, duplicate-key rejection and local shape checks preced
 the existing identity, quantity, coverage, catalogue and sealing guards. Ranges,
 positive values and nonblank text are checked locally; unsupported range/pattern
 schema keywords are not assumed to work at an unqualified endpoint.
+
+An area can receive automatic catalogue pricing when its basis row has a
+matching measurement statement from a source known to the server. Direct drafts
+can cite text in the supplied PDF or quote notes. Batch synthesis can also cite
+the earlier observation for a specific visual. A text-bearing PDF page can
+supply evidence only when its complete text fits the 32,768-character proof
+budget per page, including after normalisation. The 96-page preflight also
+bounds the total evidence. An over-budget or unreadable text layer leaves that
+page available as a visual and its measurement in review. Its batch observation
+cannot replace the incomplete layer. Independent sources remain usable and a
+genuinely raster-only page can still supply a batch observation. The source label, basis line and
+linked item must identify the same physical scope, including location and extent.
+Conflicting or reused evidence stays in pricing review. Write each record with
+its exact scope label followed by a colon. Separate records can share a line.
+Area units or dimension markers anywhere in a record identify a claim, including
+ranges and dimensions with uncertain components. Wrapped labels and measurement
+lines stay together. Wrapped qualifiers and ranges keep their meaning when the
+source wraps onto the next line. A question mark keeps a measurement in review.
+A label inside an annotation can flag a conflict for its own scope. A rate
+requires clearly framed proof. Use a semicolon before an ordinary dimensional
+heading outside the quoted scopes to start a separate record. A new line alone
+does not separate an unbound dimensional heading from the preceding scope. The same rule applies
+before an exact measurement label. A first measurement after an unpunctuated
+PDF title stays in pricing review unless the source has a clear record boundary
+or supplies the measurement in a separate entry. Independently supported scopes
+can still price. A full stop in unmarked prose, an abbreviation or a numbered
+heading does not establish proof. Unmarked prose after a measurement stays
+with it across a full stop. A semicolon can separate prose that adds no
+dimensional claim. A note with its own area or dimensions needs a distinct
+heading after the semicolon or a separate source entry. An unbound measurement
+fragment, range or quantity-bearing sentence keeps the preceding scope in
+pricing review.
+A dimensional heading or its body can still name a quoted scope. An expanded
+label, a wrapped reference or a scope named in the body flags an unresolved
+claim when it lacks the exact label and value needed for proof. The longest
+explicit scope label identifies the affected row when labels overlap. A heading
+with a distinct spatial qualifier can describe a separate area, including a
+chain of location relations or a level in brackets. An explicit comparison or
+exclusion describes the measurement it qualifies. A heading with its own
+complete measured shape and an explicit comparison to a named scope starts
+a comparison record after a complete measured statement, including after a
+full stop or line break. The mentioned areas keep their own evidence, including
+in lists with commas, conjunctions or explicit quantifiers. A balanced measurement annotation immediately after a list
+member can hold that member, while the rest of the list still describes
+comparison or exclusion. Read each clause in the annotation independently.
+An explicit revision holds its named scope, including a requested change or
+a completed revision. Within a comparison annotation, a named revision on the
+next line still holds that scope. A local amount or qualification holds the
+enclosing member. Comparison operands contribute no measurement claim. A
+balanced note beside an operand can still revise a named scope or qualify the
+enclosing member. An uncertain separation leaves the
+affected measurements in review. A new unwrapped dimensional statement can
+still end the list and flag a conflict for the scope it names.
+An unheaded correction in a separate source entry can also flag a conflict when
+it names the scope and includes an area or dimensions.
+After a complete value, a balanced annotation with a separately stated value
+for another scope can hold that other scope. If the annotation also makes the
+outer measurement uncertain, keep both affected scopes in review.
+A structurally complete measurement can frame the next exact label even if its
+own value has an estimated or assumed qualifier in a balanced wrapper with
+explanatory text.
+Keep repeat context in brackets or parentheses so a trailing range cannot look
+like a second exact amount. A neutral annotation can corroborate a separately
+proven equal value. A provisional status or unresolved verification of the
+measurement keeps that scope in review, even when the amount agrees. The
+qualification can name the measured area or its dimensions as waiting for
+verification or sign-off. Future, partial and expressly incomplete verification
+or approval of the dimensions also keep the row in review, including work that
+has started, has yet to start, has paused, or is still required of a named
+person. A completion or approval with a further measurement condition stays
+in review, including when the condition follows a comma. A shared or
+coordinated measured subject or object holds each named area it describes.
+An unheaded clause containing a single length follows the same separation rule
+as a clause containing an area or a dimension pair, including hyphenated units
+and lengths expressed in inches. Quote marks that close a quoted label are
+ordinary prose. Unconditional completed verification and
+approval, an explicit statement that verification is no longer required, and
+unrelated invoice or document checks remain neutral context. A derived
+area requires both dimensions in metres and full coverage of the same scope. A comma
+may group thousands in sets of three and a dot may mark the decimal point.
+Ambiguous number formats stay in pricing review.
+An image without corroborating measurement text can still suggest an editable
+quantity for pricing review. Informational rows remain in Quote Basis and stay
+out of the bill. The server signs the admitted record with the row, quantity,
+unit, quote session and catalogue reference. The saved pricing ledger retains
+the record and the catalogue presentation it can use. A change in location or
+extent invalidates the rate and advances the row revision. Case, spacing and
+trailing punctuation differences in the same scope preserve eligibility.
+
+Existing drafts and publications remain readable. Older ledger records retain
+their historical interpretation and check current and reset snapshots for
+provisional measurements. Earlier structured area records without a scope
+binding or complete claim comparison reopen for pricing review. Older application versions do not recognise the
+measurement seal or ledger version. Finish stopping older writers before serving
+the same draft data with this version.
 
 For schema-bearing calls, HTTP 400/404/405/415/422 or closed schema parameter/code
 errors terminate as `response_schema_rejected` at `provider_response_schema`.

@@ -20,6 +20,8 @@ from scripts import pricing_reference_cleanup, pricing_reference_enrichment
 class PreparedDraftMedia:
     single_send: list[dict[str, Any]]
     batches: list[list[tuple[str, dict[str, Any]]]]
+    # An empty text layer permits visual observations; unavailable PDF text does not.
+    measurement_sources: dict[str, str | None] | None = None
 
 
 class QuoteDraftRunner:
@@ -153,8 +155,8 @@ def bracketed_reference_matches_catalog_item(value: Any, item: dict[str, Any]) -
     )
 
 
-def catalog_spatial_context_parts(value: Any) -> tuple[str, str] | None:
-    """Split only a single, unambiguous spatial relation in independent wording.
+def catalog_spatial_context_parts(value: Any, *, allow_chain: bool = False) -> tuple[str, str] | None:
+    """Split an unambiguous spatial description from its subject.
 
     This recognises grammar, not catalogue objects. Negation, coordination and
     punctuation leave the existing conservative family checks in charge.
@@ -168,7 +170,9 @@ def catalog_spatial_context_parts(value: Any) -> tuple[str, str] | None:
     if re.search(r"\b(?:no|not|never|nowhere|without|neither|nor|except|excluding|excluded|removed|omitted|deleted|absent|and|or|only)\b|\b[a-z]+n['\u2019]t\b|[,;:!?()\[\]/&+]", text, re.IGNORECASE):
         return None
     relations = list(re.finditer(r"\b(?:in front of|next to|at|around|near|beside|behind)\b", text, re.IGNORECASE))
-    if len(relations) != 1:
+    if not relations or (not allow_chain and len(relations) != 1):
+        return None
+    if any(not text[left.end():right.start()].strip() for left, right in zip(relations, relations[1:])):
         return None
     relation = relations[0]
     primary, context = text[:relation.start()].strip(), text[relation.end():].strip()

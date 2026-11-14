@@ -350,6 +350,7 @@ class PricingSpatialContextTest(unittest.TestCase):
                     snapshot.update(quote_basis_sections=copy.deepcopy(payload['quote_basis_sections']), line_items=copy.deepcopy(recovered))
                     snapshot['pricing_analysis_seal'] = webapp.issue_pricing_analysis_seal(
                         payload, recovered, source_units={row_id: recovered[0]['unit']},
+                        source_quantities={row_id: float(recovered[0]['quantity'])},
                     )
                     if case == 'legacy-forged':
                         snapshot['pricing_analysis_seal']['mac'] = '0' * 64
@@ -644,6 +645,7 @@ function setup(count, ordinary = 0, version = baseline) {
                     section['lines'] = [{**line, 'id': row_id, 'tag': 'Confirm'} for row_id in row_ids]
                     payload['pricing_analysis_seal'] = webapp.issue_pricing_analysis_seal(
                         payload, payload['line_items'], source_units={row_id: 'nos' for row_id in row_ids},
+                        source_quantities={row_id: float(row['quantity']) for row_id in row_ids},
                     )
                     storage = webapp.LocalSqagStorage()
                     storage.create_or_update_quote_session(self.fixture._ledger_sync(payload))
@@ -710,6 +712,70 @@ function setup(count, ordinary = 0, version = baseline) {
                 _, result = self.fixture._owner_server_selection(payload, item, f'quote-spatial-negative-{index}')
                 self.assertEqual(result['selections'][0]['reason'], reason)
                 self.assertIsNone(self.fixture._ledger_price(result['line_items'], 'selected-row'))
+
+    def test_missing_output_fields_keep_distinct_deferred_evidence(self):
+        for quantity, unit, expected in ((None, "", (1, "nos")), (None, "sqm", (1, "sqm")),
+                                         (3, "", (3, "nos")), (3, "nos", (3, "nos"))):
+            with self.subTest(quantity=quantity, unit=unit):
+                payload, _ = self.fixture._owner_possible_match_payload(False, "Synthetic kinetic sculpture")
+                payload["quote_session"] = {"session_id": "quote-defaulted-synthetic"}
+                row = payload["line_items"][0]
+                row.update(section="Special Effects", quantity=quantity, unit=unit)
+                row["pricing_authority"] = webapp.build_pricing_authority("none", row)
+                line = {"id": row["source_basis_line_id"], "tag": "Custom", "text": row["description"],
+                        "custom_pricing": True, "quantity": quantity, "unit": unit}
+                payload["quote_basis_sections"] = [{"id": "special-effects", "title": "Special Effects", "lines": [line]}]
+                [offered] = webapp.project_deferred_pricing(
+                    payload, [row], offer=True, source_measurements={line["id"]: [quantity, unit]},
+                )
+                self.assertEqual((line["quantity"], line["unit"]), (quantity, unit))
+                self.assertEqual((offered["quantity"], offered["unit"]), expected)
+                receipt = offered["unmatched_pricing_offer"]
+                payload["line_items"] = [{**offered, "deferred_pricing": receipt}]
+                line["custom_confirmed"] = True
+                for normalizer in (webapp.normalize_line_items_for_quote_basis_review, webapp.normalize_line_items_for_final_brief):
+                    [final] = normalizer(payload)
+                    self.assertEqual((final["quantity"], final["unit"]), expected)
+                    self.assertEqual(final.get("deferred_pricing"), receipt)
+                    self.assertNotIn("approved_quote_amount", final)
+                if (quantity, unit) != expected:
+                    line.update(quantity=expected[0], unit=expected[1])
+                    [final] = webapp.normalize_line_items_for_final_brief(payload)
+                    self.assertNotIn("deferred_pricing", final)
+
+    def test_final_brief_rejects_invalid_included_measurements(self):
+        payload, _ = self.fixture._owner_possible_match_payload(False, "Synthetic delivery")
+        row = payload["line_items"][0]
+        row.update(price_mode="Included", pricing_keyword="", quantity=1, unit="nos")
+        row["pricing_authority"] = webapp.build_pricing_authority("included", row)
+        payload["quote_basis_sections"] = []
+        [valid] = webapp.payload_to_brief(payload)["line_items"]
+        self.assertEqual(valid["approved_quote_amount"], 0)
+        for field, value in (("quantity", None), ("quantity", 0), ("quantity", True),
+                             ("quantity", "1,2"), ("quantity", "25%"), ("unit", ""), ("unit", 7)):
+            with self.subTest(field=field, value=value):
+                original = row[field]
+                row[field] = value
+                row["pricing_authority"] = webapp.build_pricing_authority("included", row)
+                self.assertIn(webapp.OUTPUT_MEASUREMENT_ERROR, webapp.validate_generation_payload(payload))
+                with self.assertRaisesRegex(webapp.QuoteCommercialStateError, "positive quantity"):
+                    webapp.payload_to_brief(payload)
+                row[field] = original
+
+    def test_note_cannot_become_catalogue_scope_through_provider_link(self):
+        for note in ("Provisional booth footprint: 6m x 4m", "Clarification only: confirm venue approval"):
+            with self.subTest(note=note):
+                payload, catalog_item = self.fixture._owner_possible_match_payload(False, note)
+                row = payload["line_items"][0]
+                row["pricing_keyword"] = catalog_item["id"]
+                line = payload["quote_basis_sections"][0]["lines"][0]
+                line.update(text=note, tag="Include", pricing_keyword=catalog_item["id"])
+                self.assertTrue(webapp.is_informational_dimension_basis_line(line))
+                self.assertEqual(webapp.normalize_line_items_for_final_brief(payload), [])
+                self.assertEqual(webapp.normalize_line_items_for_quote_basis_review(payload), [])
+                webapp.require_provider_row_coverage([row], payload["quote_basis_sections"], [], payload["quote_basis_sections"])
+                with self.assertRaises(webapp.OpenAIAnalysisError):
+                    webapp.require_provider_row_coverage([row], payload["quote_basis_sections"], [], [])
 
     def test_deferred_pricing_binds_scope_measurements_session_and_current_catalogue(self):
         payload, _ = self.fixture._owner_possible_match_payload(False, 'Synthetic kinetic sculpture')

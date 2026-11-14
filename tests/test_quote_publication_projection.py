@@ -389,6 +389,34 @@ class PublicationProjectionTest(unittest.TestCase):
         self.assertFalse(exported["verified"])
         self.assertNotIn("quotation.pdf", [item["name"] for item in result["result"].get("files", [])])
 
+    def test_reopened_legacy_output_gets_defaults_without_rewriting_saved_state(self):
+        with self.case("local"):
+            payload = copy.deepcopy(self.payload)
+            draft = payload["quote_session"]["draft_state"]
+            row = {"source_basis_line_id": "synthetic-included", "section": "Services",
+                   "description": "Synthetic delivery", "price_mode": "Included", "quantity": None, "unit": ""}
+            row["pricing_authority"] = s.build_pricing_authority("included", row)
+            note = {"source_basis_line_id": "synthetic-footprint", "section": "Services",
+                    "description": "Provisional booth footprint: 6m x 4m", "quantity": 24, "unit": "sqm"}
+            draft.update(outputRows=[row, note], originalOutputRows=[row, note])
+            self.storage.create_or_update_quote_session(payload)
+            stored = self.metadata()
+            opened = self.storage.get_quote_session(self.session_id, include_draft_state=True)
+            [editor_row] = opened["draft_state"]["outputRows"]
+            self.assertEqual((editor_row["quantity"], editor_row["unit"]), (1, "nos"))
+            self.assertEqual((editor_row["price_mode"], editor_row["approved_quote_amount"]), ("Included", 0))
+            self.assertEqual(editor_row["pricing_authority"]["variant"], "included")
+            self.assertTrue(s.pricing_authority_context_matches(editor_row["pricing_authority"], editor_row))
+            self.assertEqual(stored, self.metadata())
+            scope = s.pricing_ledger_scope_for_storage(self.storage)
+            self.assertEqual(opened["draft_version"], s.quote_session_draft_version(stored, scope))
+            self.assertEqual([editor_row], opened["draft_state"]["originalOutputRows"])
+            draft.update(outputRows=[editor_row], originalOutputRows=[editor_row])
+            payload["expected_draft_version"] = opened["draft_version"]
+            s.save_quote_session_from_browser(payload, self.storage)
+            with self.assertRaises(s.PricingSelectionConflict):
+                s.save_quote_session_from_browser(payload, self.storage)
+
     def test_versioned_generation_preserves_winning_draft_and_publication(self):
         for mode in ("local", "database", "object"):
             with self.subTest(mode=mode), self.case(mode):
