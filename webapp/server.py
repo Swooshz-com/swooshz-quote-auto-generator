@@ -27020,26 +27020,32 @@ def area_local_qualification_scopes(
         for index, (begin, end) in enumerate(roles):
             seed_children(begin)
             boundary = roles[index + 1][0] if index + 1 < len(roles) else last
+            reference = bisect_left(references, begin, key=area_reference_start)
+            member = bisect_left(member_starts, begin)
+            member_targets: set[str] = set()
+            local_scopes = frozenset()
             while child_index < len(children) and (opener := children[child_index][0]) < boundary:
                 if claim.result_end is not None and opener >= claim.result_end:
                     seed_children(boundary, topic=claim)
                     break
-                # Masking keeps coordinated names intact for the shared predicate.
-                # A child sees only names already read, starting with its local member.
+                # Advance through the exact names once as children encounter them.
+                # A repeated measured phrase starts a new member of the shared predicate.
                 position = min(end, opener)
-                reference = bisect_left(references, position, key=area_reference_start) - 1
-                if opener < end and (reference < 0 or references[reference].start("label") < begin
-                                     or references[reference].end("label") > opener):
+                while reference < len(references) and references[reference].end("label") <= position:
+                    label = references[reference]["label"]
+                    if member < len(member_starts) and member_starts[member] == area_reference_start(references[reference]):
+                        member_targets.clear()
+                        member += 1
+                    member_targets.update(patterns.reference_scopes[area_scope_reference_key(label)])
+                    reference += 1
+                if opener < end and not member_targets:
                     seed_children(opener + 1)
                     continue
-                member = bisect_left(member_starts, position) - 1
-                member_begin = max(begin, member_starts[member]) if member >= 0 else begin
-                topic = replace(claim, roles=((member_begin, position),))
-                if opener >= end and len(roles) == 1 and member_begin == begin:
-                    boundary_of_predicate = claim.result_end if claim.result_end is not None else boundary
-                    seed_children(min(boundary, boundary_of_predicate), topic=topic)
-                else:
-                    seed_children(opener + 1, topic=topic)
+                if member_targets != local_scopes:
+                    local_scopes = frozenset(member_targets)
+                topic = replace(claim, roles=(local_scopes,))
+                before = opener + 1 if opener < end else min(boundary, claim.result_end or boundary)
+                seed_children(before, topic=topic)
 
     def remember(claim: AreaQualification, first: int, last: int, stop: int) -> None:
         nonlocal antecedent

@@ -43813,6 +43813,20 @@ main().catch((error) => {
         self.assertEqual(webapp.area_qualification_scopes(text, {west}, patterns, paired_only=True), {east})
         self.assertIsNone(webapp.AREA_QUALIFICATION_BREAK.search(" " * (count * 3)))
 
+    def test_coordinated_area_asides_resolve_each_exact_label_once(self):
+        east, west = "carpet tile east", "carpet tile west"
+        patterns = webapp.area_scope_patterns({east, west})
+        first = f"{east} (drawing)"
+        last = f"{west} (remain unverified)"
+        prefix, suffix = "the dimensions for ", " were verified"
+        budget = webapp.MAX_PDF_MEASUREMENT_CHARS_PER_PAGE - len(prefix + last + suffix)
+        count = budget // len(first + " and ")
+        note = prefix + (first + " and ") * count + last + suffix
+        with mock.patch.object(webapp, "area_scope_reference_key",
+                               wraps=webapp.area_scope_reference_key) as read:
+            self.assertEqual(webapp.area_qualification_scopes(note, set(), patterns), {east, west})
+        self.assertLessEqual(read.call_count, 3 * (count + 1))
+
     def test_area_qualification_resolves_complete_named_roles_before_fallback(self):
         west = "carpet tile west"
         east = "carpet and vinyl east near the registration desk"
