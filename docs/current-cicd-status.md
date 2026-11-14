@@ -7,6 +7,9 @@ and the two Toolkit Programme Sweep workflows.
 
 The cloud programme sweep runs on pushes to `main` or by dispatch. The hourly
 gate also starts it on `main` after eligible repository activity or CI.
+The gate can read check annotations with the built-in token. Hourly and
+manual gate runs flag three consecutive held sweeps, sweeps skipped for the
+same reason, or hourly gates skipped because governance is off.
 The sweep checks the selected ref and programme binding before minting
 separate GitHub App tokens for the quote repository and its private evidence
 store. Both use the existing App variable and secret. An off-main run or
@@ -15,9 +18,14 @@ invalid binding leaves both token steps skipped.
 The sweep reads large state documents by Git blob ID when GitHub truncates
 them in the bulk response, within the sweep's request budget. After writing
 nested state, it verifies the saved blob IDs against the bytes it wrote.
-Footer cleanup requires both tokens and a refresh that ran on the same
-commit. It skips queued runs and passes stopped at the App rate limit.
-These workflows maintain programme records.
+Footer cleanup requires both tokens and a saved refresh from the same commit.
+It skips queued runs, runs that save nothing, and runs that hit the App rate
+limit, including when that limit prevents recovery of a truncated document.
+
+After this refresh merges, verify the first App-backed sweep on the merged
+main commit. Check that both token steps succeed, the refresh saves without
+holds, the saved state revision matches the programme board, and footer
+cleanup reports counts or a skip reason.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.
