@@ -43799,8 +43799,19 @@ main().catch((error) => {
                         self.assertEqual(webapp.area_qualification_scopes(text, {west}, patterns, paired_only=True), {east})
                     self.assertEqual(
                         [args[0].strip() for args, _ in parse.call_args_list],
-                        [local + assertion] + ([local.strip()] * (depth - 1) if local else []),
+                        ([local.strip()] * (depth - 1) if local else []) + [local + assertion],
                     )
+
+    def test_wide_area_notes_walk_collapsed_whitespace_once(self):
+        west, east = "carpet tile west", "carpet tile east"
+        patterns = webapp.area_scope_patterns({west, east})
+        prefix = f"We checked the dimensions for {east}. "
+        retained = "(Those dimensions remain unverified)"
+        aside = "(drawing reference) "
+        count = (webapp.MAX_PDF_MEASUREMENT_CHARS_PER_PAGE - len(prefix + retained)) // len(aside)
+        text = (prefix + aside * count + retained).casefold()
+        self.assertEqual(webapp.area_qualification_scopes(text, {west}, patterns, paired_only=True), {east})
+        self.assertIsNone(webapp.AREA_QUALIFICATION_BREAK.search(" " * (count * 3)))
 
     def test_area_qualification_resolves_complete_named_roles_before_fallback(self):
         west = "carpet tile west"
@@ -44350,6 +44361,37 @@ main().catch((error) => {
             ("nested-completed", f"survey note (the dimensions for {east} had been verified)", True, True),
             ("aside-pending", f"the dimensions for {east} (drawing reference) remain unverified", True, False),
             ("aside-completed", f"the dimensions for {east} [drawing reference] had been verified", True, True),
+            ("aside-demonstrative", f"we checked the dimensions for {east}. (Those dimensions remain unverified)", True, False),
+            ("aside-implicit-event", f"survey note (the dimensions for {east} (still pending verification))", True, False),
+            ("aside-implicit-status", f"survey note (the dimensions for {east} (remain unverified))", True, False),
+            ("aside-pronoun", f"we checked the dimensions for {east}. [They have yet to be verified]", True, False),
+            ("aside-object-pronoun", f"we checked the dimensions for {east}. (We still have to verify them)", True, False),
+            ("aside-wrapper", f"we checked the dimensions for {east}. ([(still pending verification)])", True, False),
+            ("aside-completed", f"we checked the dimensions for {east}. (Those dimensions had been verified)", True, True),
+            ("aside-future", f"the dimensions for {east} [will be verified tomorrow]", True, False),
+            ("aside-nested-demonstrative", f"we checked the dimensions for {east}. (Those dimensions (remain unverified))", True, False),
+            ("aside-in-leading-condition", f"after the dimensions for {east} (remain unverified) were verified, we issued the report", True, False),
+            ("aside-in-trailing-condition", f"we issued the report after the dimensions for {east} (remain unverified) were verified", True, False),
+            ("aside-after-condition", f"after the dimensions for {east} were verified (those dimensions remain unverified), we issued the report", True, False),
+            ("aside-topic-barrier", f"we checked the dimensions for {east}. We sent invoices (they have not been verified)", True, True),
+            ("aside-explicit-event", f"we checked the dimensions for {east} (pending verification of the invoice)", True, True),
+            ("aside-measured-demonstrative", f"we checked the dimensions for {east}. We sent invoices (those dimensions remain unverified)", True, False),
+            ("aside-object-barrier", f"we checked the dimensions for {east} and sent the invoices (they have not been verified) to the client", True, True),
+            ("aside-explicit-wait", f"the dimensions for {east} (we are still awaiting verification of the dimensions for {west}) were checked", False, True),
+            ("negative-partitive-pronoun", f"we checked the dimensions for {east}. (None of them have been verified)", True, False),
+            ("negative-measured-subject", f"none of the dimensions for {east} were verified", True, False),
+            ("aside-record-barrier", f"we checked the dimensions for {east}; the invoices were sent (they have not been verified)", True, True),
+            ("aside-ordered", f"the dimensions for {east} (remain unverified) were checked. The dimensions for {west} were verified", True, False),
+            ("aside-sibling", f"the dimensions for {east} (the dimensions for {west} were verified) (remain unverified)", True, False),
+            ("aside-inner-override", f"the dimensions for {east} (the dimensions for {west} (remain unverified))", False, True),
+            ("aside-before-barrier", f"we checked the dimensions for {east}. (They remain unverified) The invoices were sent", True, False),
+            ("negative-indefinite", f"we checked the dimensions for {east}. Nobody has verified them yet", True, False),
+            ("negative-two-words", f"we checked the dimensions for {east}. (No one has verified them yet)", True, False),
+            ("negative-determiner", f"no surveyor has verified the dimensions for {east} yet", True, False),
+            ("negative-neither", f"neither of the surveyors verified the dimensions for {east}", True, False),
+            ("negative-unrelated", f"we checked the dimensions for {east}. No surveyor has verified the invoice yet", True, True),
+            ("negative-competing-topic", f"we checked the dimensions for {east}. The invoices were sent. Nobody verified them yet", True, True),
+            ("positive-actor", f"a surveyor has already verified the dimensions for {east}", True, True),
             ("demo-topic", f"we checked the dimensions for {east}. The invoice was sent. Those dimensions remain unverified", True, False),
             ("demo-event", f"we checked the dimensions for {east}. The invoice was sent. Verification of those dimensions is still pending", True, False),
             ("demo-object", f"we checked the dimensions for {east} and sent the invoice, but we still need to verify those dimensions", True, False),
@@ -44446,6 +44488,11 @@ main().catch((error) => {
         )
         correction_east = {name: east_priced for name, _, _, east_priced in role_cases + quote_cases + separate_cases}
         correction_east[member_case] = False
+        member_aside = "member-aside"
+        cases += ((member_aside, west, west, west_statement,
+                   f"Sample boards: 2 sqm, separate from {west} (we checked the dimensions for {east}. "
+                   "(Those dimensions remain unverified))", 24, "observed", True),)
+        correction_east[member_aside] = False
         cases += tuple((name, west, west, west_statement, f"{west_statement} ({note})", 24, "observed", west_priced)
                        for name, note, west_priced, _ in role_cases)
         cases += tuple((name, west, west, west_statement, note, 24, "observed", west_priced)
@@ -44688,6 +44735,10 @@ main().catch((error) => {
                             expected = round(2 * koncept_catalog_sale_unit_price(spot) +
                                              priced_area * koncept_catalog_sale_unit_price(self.LEDGER_CARPET), 2)
                             self.assertIn(expected, total)
+                            if name in correction_east and allowed and not east_priced:
+                                self.assertIn(374.20, total)
+                                [grand_total] = [row for row in values if "Total including GST" in row]
+                                self.assertIn(407.88, grand_total)
                             if name in dual_cases:
                                 self.assertEqual(any("10 sqm" in row and 144 in row for row in values), east_priced)
                                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in values))
@@ -44892,11 +44943,11 @@ main().catch((error) => {
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [
                 statement, disputed, f"{disputed} (provisional in drawing)",
-                f"{statement} (the drawings will be released when the dimensions for "
-                f"{specifications[0][1]} have been verified)",
+                f"{statement} (we checked the dimensions for {specifications[0][1]}. "
+                "(Those dimensions remain unverified))",
             ]}
-            # Reproduce a v26 grant from a trailing measurement check missed by that reader.
-            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 26),
+            # Reproduce a v27 grant from a nested qualification missed by that reader.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 27),
                   mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
@@ -44926,6 +44977,13 @@ main().catch((error) => {
 
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
+                # Save before any current-version request can demote the old signed grant.
+                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 27):
+                    self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
+                    saved_v27 = webapp.read_quote_session_metadata(session_id)
+                    saved_floor = saved_v27["pricing_ledger"]["rows"]["floor"]
+                    self.assertEqual(saved_floor["measurement"]["claim_version"], 27)
+                    self.assertEqual(saved_floor["grant"]["state"], "live")
                 for path in ("seal", "ledger"):
                     with self.subTest(path=path):
                         self.assertIsNone(self._ledger_price(self._ledger_brief_rows(stale), "floor"))
@@ -44933,8 +44991,7 @@ main().catch((error) => {
                         self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
                         self.assertFalse(list((root / path).rglob("quotation.xlsx")))
                         if path == "seal":
-                            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 26):
-                                self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
+                            webapp.write_quote_session_metadata(saved_v27)
                             stale.pop("pricing_analysis_seal")
                             stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
                 reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
@@ -44943,10 +45000,23 @@ main().catch((error) => {
                 for reset_rows in (reopened_state["lineItems"], reopened_state["originalOutputRows"],
                                    reopened_state["originalAnalysisSnapshot"]["line_items"]):
                     reset = copy.deepcopy(stale)
+                    self.assertIsNone(self._ledger_price(reset_rows, "floor"))
+                    self.assertEqual(self._ledger_price(reset_rows, "spot"), koncept_catalog_sale_unit_price(spot))
                     reset["line_items"] = copy.deepcopy(reset_rows)
                     self._ledger_sync(reset)
                     self.assertIsNone(self._ledger_price(self._ledger_brief_rows(reset), "floor"))
                     self.assertEqual(self._ledger_price(self._ledger_brief_rows(reset), "spot"), koncept_catalog_sale_unit_price(spot))
+                # An explicit exclusion lets the independently priced row reach Excel.
+                self._ledger_line(reset, "floor")["tag"] = "Exclude"
+                reset["line_items"] = [row for row in reset["line_items"] if row["source_basis_line_id"] == "spot"]
+                self._ledger_sync(reset)
+                reset_result = webapp.run_quote_job(reset, output_root=root / "reset", tmp_root=root / "tmp")
+                self.assertEqual(reset_result["status"], "completed", reset_result.get("errors"))
+                [reset_xlsx] = list((root / "reset").rglob("quotation.xlsx"))
+                reset_values = [row for _, row in read_first_sheet_rows_with_numbers(reset_xlsx)]
+                self.assertFalse(any("24 sqm" in row for row in reset_values))
+                self.assertTrue(any("2 nos" in row and 28.60 in row for row in reset_values))
+                webapp.write_quote_session_metadata(saved_v27)
                 self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
                 stale_floor = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["floor"]
                 self.assertEqual(stale_floor["measurement"], {"disposition": "review"})
@@ -45045,7 +45115,7 @@ main().catch((error) => {
             request.pop("pricing_analysis_seal")
             request["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
             stale_metadata = copy.deepcopy(metadata)
-            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 24
+            stale_metadata["pricing_ledger"]["rows"]["floor"]["measurement"]["claim_version"] = 27
             webapp.write_quote_session_metadata(stale_metadata)
             try:
                 legacy = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)

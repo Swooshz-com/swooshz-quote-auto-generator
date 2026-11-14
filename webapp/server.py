@@ -25585,7 +25585,7 @@ def admit_provider_quote_draft(parsed: Any, *, require_confidence: bool, _missin
 
 AREA_EVIDENCE_NUMBER = r"(?:[1-9][0-9]{0,2}(?:,[0-9]{3})+|0|[1-9][0-9]*)(?:\.[0-9]+)?"
 AREA_EVIDENCE_UNITS = frozenset({"sqm", "sqft", "ft2", "sq ft"})
-AREA_EVIDENCE_CLAIM_VERSION = 27
+AREA_EVIDENCE_CLAIM_VERSION = 28
 # Recognition is deliberately wider than the number grammar that can support a rate.
 AREA_CLAIM_NUMBER = r"(?:[~\u2248+\-\u2212]\s*)?[0-9][0-9.,'_ ]*(?:[eE][+-]?[0-9]+)?"
 AREA_CLAIM_UNIT = "|".join(re.escape(alias).replace(r"\ ", r"\s+") for alias in sorted(
@@ -25674,6 +25674,7 @@ AREA_VERIFICATION_EVENT_STATUS = (
     rf"|{AREA_VERIFICATION_FUTURE}\s+(?:{AREA_VERIFICATION_TIMING}\s+)?(?:occur|happen|begin|take\s+place)\b)"
 )
 AREA_PARTIAL_SUBJECT = r"(?:only\s+)?(?:some|half|parts?|a\s+portion|not\s+all)\s+(?:of\s+)?"
+AREA_NEGATIVE_SUBJECT = r"(?:no\s+|(?:none|neither)\s+of\s+)"
 AREA_MEASUREMENT_RESULT = rf"(?:{AREA_VERIFICATION_RESULT}|{AREA_APPROVAL_RESULT})"
 AREA_NOMINAL_QUALIFICATIONS = tuple(re.compile(form, re.I) for form in (
     rf"{AREA_WAITING_ACTION}\s+(?P<object>{AREA_MEASUREMENT_EVENT}|{AREA_MEASURE_TOPIC})",
@@ -25684,12 +25685,15 @@ AREA_NOMINAL_QUALIFICATIONS = tuple(re.compile(form, re.I) for form in (
     rf"(?=$|[.!?]|\s+(?:in|from|using|until|pending|for|at|as|per|{AREA_MEASURE_TOPIC}"
     r"|drawings?|plans?|sketch(?:es)?|models?)\b)",
 ))
-AREA_QUALIFICATION_SUBJECT = re.compile(rf"(?P<partial>{AREA_PARTIAL_SUBJECT})?(?P<topic>{AREA_STATUS_TOPIC})(?=[\s:\-]|$)", re.I)
+AREA_QUALIFICATION_SUBJECT = re.compile(
+    rf"(?:(?P<partial>{AREA_PARTIAL_SUBJECT})|(?P<negative>{AREA_NEGATIVE_SUBJECT}))?"
+    rf"(?P<topic>{AREA_STATUS_TOPIC})(?=[\s:\-]|$)", re.I,
+)
 AREA_DEMONSTRATIVE_MEASUREMENT = (
     rf"(?:this|that|these|those)\s+{AREA_DIMENSION_NOUN_PHRASE}"
 )
 AREA_REFERENTIAL_MEASUREMENT = re.compile(
-    rf"(?:(?:{AREA_VERIFICATION_EVENT}|{AREA_APPROVAL_EVENT}|review)\s+(?:of|for|on)\s+)?"
+    rf"(?:(?:{AREA_VERIFICATION_EVENT}|{AREA_APPROVAL_EVENT}|review|(?:to\s+)?{AREA_ACTIVE_ACTION})\s+(?:(?:of|for|on)\s+)?)?"
     rf"(?P<measurement>{AREA_DEMONSTRATIVE_MEASUREMENT})", re.I,
 )
 AREA_IMPLICIT_VERIFICATION = re.compile(
@@ -25699,7 +25703,13 @@ AREA_REFERENTIAL_SUBJECT = re.compile(
     rf"(?P<partial>{AREA_PARTIAL_SUBJECT})?(?P<topic>(?:those|that)\s+{AREA_TOPIC_LINK}{AREA_MASKED_REFERENCE})"
     r"(?=[\s:\-]|$)", re.I,
 )
-AREA_SUBJECT_PRONOUN = re.compile(r"(?P<topic>it|they)(?=\s)", re.I)
+AREA_NEGATIVE_ACTOR = re.compile(
+    r"(?:nobody|no[\s-]+one|none|neither)\b"
+    r"|no\s+(?!(?:longer|further|more|need|reason|requirement)\b)[^\W\d_][\w-]*\b", re.I,
+)
+AREA_SUBJECT_PRONOUN = re.compile(
+    r"(?:(?P<negative>(?:none|neither)\s+of\s+)them|(?P<topic>it|they))(?=\s)", re.I,
+)
 AREA_OBJECT_PRONOUN = re.compile(r"\s+(?P<topic>it|them)\b", re.I)
 AREA_QUALIFICATION_WORD = re.compile(r"[^\W\d_][\w'\u2019-]*", re.I)
 AREA_ACTION = re.compile(rf"(?P<ongoing>{AREA_ONGOING_ACTION})|(?P<result>{AREA_MEASUREMENT_RESULT})|{AREA_ACTIVE_ACTION}", re.I)
@@ -25743,7 +25753,7 @@ AREA_COMPLETED_ACTION = re.compile(rf"\b{AREA_MEASUREMENT_RESULT}", re.I)
 AREA_MEASUREMENT_ACTION = re.compile(rf"\b(?:{AREA_MEASUREMENT_RESULT}|{AREA_ACTIVE_ACTION}|{AREA_ONGOING_ACTION})", re.I)
 AREA_CLAUSE_COORDINATOR = re.compile(r"(?:and|but|while|whereas|nor|or)\s+", re.I)
 AREA_CONTINUATION = re.compile(
-    rf"\s*(?=$|[,;.!?]|(?:by|yet\b|in\s+part|only\s+in\s+part|"
+    rf"\s*(?=$|[,;.!?]|(?:by|yet\b|today\b|tomorrow\b|{AREA_VERIFICATION_TIMING}\b|in\s+part|only\s+in\s+part|"
     rf"{AREA_CONDITION_PREFIX}|{AREA_CONDITION_CLAUSE}|{AREA_MANNER_ADVERB}\b))", re.I,
 )
 AREA_RESULT_MODIFIERS = re.compile(
@@ -25784,6 +25794,7 @@ AREA_EXPLICIT_NOUN = re.compile(r"\b(?:the|an?|this|that|these|those|their|our|i
 AREA_TRAILING_TOPIC_WORD = re.compile(r"(?<![\w-])(?P<head>[^\W\d_][\w-]*)(?=\s*(?:$|\b(?:of|for|on|at|with|by|about|from|to|in)\b))", re.I)
 AREA_TOPIC_WORD = re.compile(r"[^\W\d_][\w-]*")
 AREA_TOPIC_END = re.compile(r"\b(?:of|for|on|at|with|by)\b", re.I)
+AREA_ORDINARY_TOPIC_END = re.compile(r"\b(?:of|for|on|at|with|by|to|from|about|in)\b", re.I)
 AREA_SYMBOL_DIMENSION = re.compile(r"\s*(?:long|wide|deep|high|tall|thick)\b", re.I)
 AREA_UNIT_MARKER = re.compile(
     rf"(?<![^\W\d_])(?:{AREA_CLAIM_UNIT}|square\s+(?:{SCOPE_LENGTH_UNIT}|units?)"
@@ -25801,7 +25812,8 @@ AREA_FRAME_ASIDE_SPACE = re.compile(r"[\s.,!?]*")
 AREA_LINE_BREAK = re.compile(r"\r?\n")
 AREA_HEADING_COLON = re.compile(":")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
-AREA_QUALIFICATION_BREAK = re.compile(r",(?!\d)|;|[.!?](?=\s|$)|\s+(?:and|but|whereas|while|or|nor)\s+", re.I)
+# A closed aside becomes whitespace. Test a whitespace run once when looking for conjunctions.
+AREA_QUALIFICATION_BREAK = re.compile(r",(?!\d)|;|[.!?](?=\s|$)|(?<!\s)\s++(?:and|but|whereas|while|or|nor)\s+", re.I)
 AREA_ANNOTATION_BREAK = re.compile(rf"{AREA_QUALIFICATION_BREAK.pattern}|\s+then\s+|\r?\n", re.I)
 AREA_SCOPE_WRAPPERS = str.maketrans("()[]{}", "      ")
 AREA_CONTEXT_RELATION_SPAN = re.compile(
@@ -25876,13 +25888,24 @@ class AreaScopePatterns:
     reference_scopes: dict[str, set[str]]
 
 
+# A measured role is a local source span or scopes already resolved in an enclosing frame.
+AreaQualificationRole = tuple[int, int] | frozenset[str]
+
+
 @dataclass(frozen=True)
 class AreaQualification:
-    roles: tuple[tuple[int, int], ...]
+    roles: tuple[AreaQualificationRole, ...]
     pending: bool = False
     result_end: int | None = None
     past: bool = False
     number: str = ""
+
+
+@dataclass(frozen=True)
+class AreaQualificationContext:
+    antecedent: AreaQualification | None
+    measured_topics: Mapping[str, AreaQualification]
+    intervening_topics: frozenset[str]
 
 
 def pricing_measurement_scope(value: Any) -> str:
@@ -26062,7 +26085,7 @@ class AreaSourceSpans:
             if self.pairs[opener] < stop:
                 yield opener, self.pairs[opener]
 
-    def frame_texts(self, patterns: AreaScopePatterns):
+    def frame_texts(self, patterns: AreaScopePatterns, *, include_empty: bool = False):
         """Read only local text, carrying the offsets of labels lifted out of wrappers."""
         labels = {}
         # The bracket index inserts a pair when it closes, so children precede parents.
@@ -26086,7 +26109,7 @@ class AreaSourceSpans:
                 if patterns.reference.fullmatch(local, left, right):
                     labels[group] = (local[left:right], offsets[left:right])
                     continue
-            if local.strip(".,!? "):
+            if include_empty or local.strip(".,!? "):
                 yield group, local, offsets
 
     def linear_operand(self, start: int, stop: int) -> bool:
@@ -26268,7 +26291,10 @@ def area_member_clauses(annotation: str, patterns: AreaScopePatterns):
             local_revision = AREA_LOCAL_MEASUREMENT_ASSERTION.match(following) and area_claim_kind(following)
             if named_revision is None and not local_revision:
                 continue
-        if separator == "." and re.search(r"\bvs$", clause):
+        if separator == "." and (re.search(r"\bvs$", clause)
+                                 or (not area_claim_kind(clause) and area_qualification_claim(
+                                     qualification_text, left - len(annotation[start:left].lstrip()), left, None,
+                                 ) is not None)):
             continue
         if separator == "or" and re.search(r"\d$", clause) and re.match(r"[~+-]?\s*\d", annotation[right:]):
             continue
@@ -26609,7 +26635,7 @@ def area_measurement_condition(text: str, start: int, stop: int, previous: AreaQ
     return None
 
 
-def area_verification_result(text: str, end: int, stop: int, roles: tuple[tuple[int, int], ...],
+def area_verification_result(text: str, end: int, stop: int, roles: tuple[AreaQualificationRole, ...],
                              unfinished: bool, *, past: bool) -> AreaQualification:
     """Preserve the measured roles and the point where a condition can begin."""
     return AreaQualification(roles, unfinished or bool(AREA_RESULT_TAIL.match(text, end, stop)), end, past)
@@ -26629,20 +26655,25 @@ def area_reference_start(reference: re.Match[str]) -> int:
     return reference.start("label")
 
 
-def area_qualification_targets(roles: tuple[tuple[int, int], ...], references: list[re.Match[str]],
+def area_qualification_targets(roles: tuple[AreaQualificationRole, ...], references: list[re.Match[str]],
                                patterns: AreaScopePatterns) -> set[str]:
     """Resolve exact references in the measured roles, separately from the predicate."""
-    if not roles:
-        return set()
-    return {scope for start, end in roles for reference in references[
-                bisect_left(references, start, key=area_reference_start):
-                bisect_left(references, end, key=area_reference_start)]
-            for scope in patterns.reference_scopes[area_scope_reference_key(reference["label"])]}
+    scopes = set()
+    for role in roles:
+        if isinstance(role, frozenset):
+            scopes.update(role)
+            continue
+        start, end = role
+        for index in range(bisect_left(references, start, key=area_reference_start),
+                           bisect_left(references, end, key=area_reference_start)):
+            key = area_scope_reference_key(references[index]["label"])
+            scopes.update(patterns.reference_scopes[key])
+    return scopes
 
 
 def area_qualification_predicate(
     text: str, start: int, stop: int, subject: re.Match[str] | None,
-    *, inherited_roles: tuple[tuple[int, int], ...] | None = None,
+    *, inherited_roles: tuple[AreaQualificationRole, ...] | None = None,
 ) -> AreaQualification | None:
     """Scan the verb phrase once, resolving modality, aspect and polarity at the action."""
     position = subject.end() if subject else start
@@ -26652,9 +26683,14 @@ def area_qualification_predicate(
         subject_roles = inherited_roles or ()
     carry_roles = subject_roles if subject else inherited_roles
     partial = bool(subject and not pronoun_subject and subject["partial"])
-    event_subject = bool(subject and AREA_EVENT_SUBJECT.fullmatch(subject["topic"]))
-    negative = future = ongoing = duty = started = expired_duty = False
+    event_subject = bool(subject and not pronoun_subject and AREA_EVENT_SUBJECT.fullmatch(subject["topic"]))
+    negative_actor = AREA_NEGATIVE_ACTOR.match(text, start, stop) if subject is None else None
+    negative = negative_actor is not None or bool(subject and subject.groupdict().get("negative"))
+    future = ongoing = duty = started = expired_duty = False
     actor_words = 0
+    if negative_actor:
+        position = negative_actor.end()
+        actor_words = 1
     tense = ""
     while position < stop:
         if separator := AREA_WORD_SEPARATOR.match(text, position, stop):
@@ -26664,14 +26700,24 @@ def area_qualification_predicate(
         if event_subject and not expired_duty and AREA_EVENT_PROGRESS.match(text, position, stop):
             return AreaQualification(subject_roles, pending=True)
         if carry_roles is not None and not negative:
-            if AREA_STATUS_WORD.match(text, position, stop) or (event_subject and AREA_EVENT_STATUS.match(text, position, stop)):
+            if subject and (AREA_STATUS_WORD.match(text, position, stop)
+                            or (event_subject and AREA_EVENT_STATUS.match(text, position, stop))):
                 return AreaQualification(carry_roles, pending=True)
             for form in AREA_NOMINAL_QUALIFICATIONS[:2]:
                 if event := form.match(text, position, stop):
-                    return AreaQualification(carry_roles + (event.span("object"),), pending=True)
+                    role = event.span("object")
+                    roles = (*carry_roles, role) if subject or not actor_words else (role,)
+                    return AreaQualification(roles, pending=True)
+            if not subject and not actor_words:
+                if event := AREA_NOMINAL_QUALIFICATIONS[2].match(text, position, stop):
+                    return AreaQualification((event.span("object"),), pending=True)
+                if AREA_NOMINAL_QUALIFICATIONS[3].match(text, position, stop):
+                    return AreaQualification(carry_roles, pending=True)
             if waiting := AREA_WAITING_VERB.match(text, position, stop):
                 if approval := AREA_APPROVAL_NOUN.match(text, waiting.end(), stop):
-                    return AreaQualification(carry_roles + (approval.span(1),), pending=True)
+                    role = approval.span(1)
+                    roles = (*carry_roles, role) if subject or not actor_words else (role,)
+                    return AreaQualification(roles, pending=True)
         token = AREA_QUALIFICATION_WORD.match(text, position, stop)
         if not token:
             break
@@ -26783,29 +26829,41 @@ def area_qualification_claim(
             return None
         inherited_roles = None
     claim = area_qualification_predicate(text, first, last, subject, inherited_roles=inherited_roles)
-    if claim is not None:
-        number = previous.number if previous and claim.roles == previous.roles else ""
-        if len(claim.roles) == 1 and claim.roles != inherited_roles:
-            begin, end = claim.roles[0]
-            begin = AREA_FRAME_SPACE.match(text, begin, end).end()
-            number = area_topic_number(text, begin, end)
-            if demonstrative := AREA_REFERENTIAL_MEASUREMENT.fullmatch(text, begin, end):
-                number = area_topic_number(text, demonstrative.start("measurement"), end)
-                reference = (measured_topics or {}).get(number)
-                if reference is None and previous and previous.number == number:
-                    reference = previous
-                if reference is not None:
-                    return replace(claim, roles=reference.roles, number=reference.number)
-                if measured_topics:
+    if claim is None:
+        for form in AREA_NOMINAL_QUALIFICATIONS:
+            if match := form.match(text, first, last):
+                roles = (match.span("object"),) if "object" in match.groupdict() else inherited_roles or ()
+                if not roles and previous is not None and not previous.roles:
                     return None
-            elif previous is not None and AREA_IMPLICIT_VERIFICATION.fullmatch(text, begin, end):
-                return replace(claim, roles=previous.roles, number=previous.number) if previous.roles else None
-        return replace(claim, number=number)
-    for form in AREA_NOMINAL_QUALIFICATIONS:
-        if match := form.match(text, first, last):
-            roles = (match.span("object"),) if "object" in match.groupdict() else inherited_roles or ()
-            return AreaQualification(roles, pending=True)
-    return None
+                claim = AreaQualification(roles, pending=True)
+                break
+    if claim is None:
+        return None
+    return area_bind_qualification_roles(text, claim, previous, measured_topics or {})
+
+
+def area_bind_qualification_roles(
+    text: str, claim: AreaQualification, previous: AreaQualification | None,
+    measured_topics: Mapping[str, AreaQualification],
+) -> AreaQualification | None:
+    number = previous.number if previous and claim.roles == previous.roles else claim.number
+    inherited_roles = previous.roles if previous else None
+    if len(claim.roles) == 1 and claim.roles != inherited_roles and isinstance(claim.roles[0], tuple):
+        begin, end = claim.roles[0]
+        begin = AREA_FRAME_SPACE.match(text, begin, end).end()
+        number = area_topic_number(text, begin, end)
+        if demonstrative := AREA_REFERENTIAL_MEASUREMENT.fullmatch(text, begin, end):
+            number = area_topic_number(text, demonstrative.start("measurement"), end)
+            reference = measured_topics.get(number)
+            if reference is None and previous and previous.number == number:
+                reference = previous
+            if reference is not None:
+                return replace(claim, roles=reference.roles, number=reference.number)
+            if measured_topics:
+                return None
+        elif previous is not None and AREA_IMPLICIT_VERIFICATION.fullmatch(text, begin, end):
+            return replace(claim, roles=previous.roles, number=previous.number) if previous.roles else None
+    return replace(claim, number=number)
 
 
 def area_topic_number(text: str, start: int, stop: int) -> str:
@@ -26818,21 +26876,27 @@ def area_topic_number(text: str, start: int, stop: int) -> str:
     return "plural" if head.endswith("s") and not head.endswith(("ss", "us")) else "singular"
 
 
-def area_intervening_topic(text: str, start: int, stop: int) -> str:
-    """Identify an ordinary subject or object that can own a later pronoun."""
+def area_intervening_topic(text: str, start: int, stop: int) -> tuple[str, int]:
+    """Locate an ordinary topic where it can first replace a measured reference."""
     noun = None
     for match in AREA_EXPLICIT_NOUN.finditer(text, start, stop):
-        noun = match
+        if not noun or not AREA_ORDINARY_TOPIC_END.fullmatch(text[noun.end():match.start()].strip()):
+            noun = match
     if noun is not None and not AREA_MEASURE_TOPIC_PHRASE.match(text, noun.start(), stop):
         predicate = AREA_FINITE_BRIDGE.search(text, noun.end(), stop)
-        return area_topic_number(text, noun.start("start"), predicate.start() if predicate else stop)
+        end = predicate.start() if predicate else stop
+        if relation := AREA_ORDINARY_TOPIC_END.search(text, noun.end(), end):
+            end = relation.start()
+        while end > noun.end() and text[end - 1].isspace():
+            end -= 1
+        return area_topic_number(text, noun.start("start"), end), end
     if noun is None and not AREA_MEASURE_TOPIC_PHRASE.match(text, start, stop):
         predicate = AREA_FINITE_BRIDGE.search(text, start, stop)
         end = predicate.start() if predicate else stop
         head = AREA_TRAILING_TOPIC_WORD.search(text, start, end)
         if head and area_topic_number(text, head.start("head"), head.end("head")) == "plural":
-            return "plural"
-    return ""
+            return "plural", head.end("head")
+    return "", stop
 
 
 def area_qualification_clauses(source: AreaSourceSpans, text: str):
@@ -26851,16 +26915,16 @@ def area_qualification_clauses(source: AreaSourceSpans, text: str):
         first = stop - len(clause.lstrip())
         last = start + len(clause.rstrip())
         coordinator = AREA_CLAUSE_COORDINATOR.match(text, first, last)
-        spans.append((coordinator.end() if coordinator else first, last, coordinator, separator))
+        spans.append((coordinator.end() if coordinator else first, last, coordinator, separator, stop))
     list_comma = False
     for index in range(len(spans) - 2, -1, -1):
-        first, last, coordinator, separator = spans[index]
+        first, last, coordinator, separator, stop = spans[index]
         next_coordinator = spans[index + 1][2]
         list_comma = separator == "," and (
             list_comma or (next_coordinator and next_coordinator[0].strip() in {"and", "or", "nor"})
         )
         if list_comma:
-            spans[index] = (first, last, coordinator, "list")
+            spans[index] = (first, last, coordinator, "list", stop)
     return spans
 
 
@@ -26872,19 +26936,62 @@ def area_measure_condition_result(text: str, first: int, last: int) -> bool:
     return AREA_APPROVAL_RESULT_WORD.search(text, first, claim.result_end) is not None
 
 
-def area_local_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScopePatterns) -> set[str]:
+def area_local_qualification_scopes(
+    text: str, enclosing: set[str], patterns: AreaScopePatterns, *,
+    inherited: AreaQualificationContext | None = None,
+    children: tuple[tuple[int, int], ...] = (),
+    contexts: dict[int, AreaQualificationContext] | None = None,
+) -> set[str]:
     """An unfinished assertion disputes its measured subject or object within this frame."""
     source = AreaSourceSpans(text)
     text, references = area_qualification_text(text, patterns)
     affected = set()
-    previous = antecedent = None
-    intervening_topics = set()
+    previous = None
+    antecedent = inherited.antecedent if inherited else None
+    intervening_topics = set(inherited.intervening_topics) if inherited else set()
     conditional_result = condition = leading_dependency = None
-    measured_topics: dict[str, AreaQualification] = {}
-    dependency_roles = set()
+    measured_topics = dict(inherited.measured_topics) if inherited else {}
+    dependency_roles: set[AreaQualificationRole] = set()
+    child_index = 0
+    resolved: dict[tuple[AreaQualificationRole, ...], tuple[AreaQualificationRole, ...]] = {}
     has_dependency = leading_bound = trailing_condition = False
     reading_condition = temporal_condition = False
     separator = ""
+
+    def resolve(claim: AreaQualification | None) -> AreaQualification | None:
+        if claim is None:
+            return None
+        if not claim.roles or all(isinstance(role, frozenset) for role in claim.roles):
+            return replace(claim, result_end=None)
+        if claim.roles not in resolved:
+            resolved[claim.roles] = (frozenset(area_qualification_targets(claim.roles, references, patterns)),)
+        return replace(claim, roles=resolved[claim.roles], result_end=None)
+
+    def seed_children(before: int, *, topic: AreaQualification | None = None) -> None:
+        nonlocal child_index
+        if contexts is None or child_index == len(children) or children[child_index][0] >= before:
+            return
+        topics = {number: resolve(claim) for number, claim in measured_topics.items()}
+        barriers = frozenset(intervening_topics)
+        if topic is not None:
+            if topic.number:
+                topics[topic.number] = resolve(topic)
+            barriers -= {topic.number}
+        context = AreaQualificationContext(resolve(topic or antecedent), topics, barriers)
+        while child_index < len(children) and children[child_index][0] < before:
+            contexts[children[child_index][1]] = context
+            child_index += 1
+
+    def remember(claim: AreaQualification, first: int, last: int) -> None:
+        nonlocal antecedent
+        spans = [role for role in claim.roles if isinstance(role, tuple) and first <= role[0] < last]
+        # The aside can only see a measured phrase once its subject or object has been read.
+        seed_children(max((end for _, end in spans), default=first))
+        if spans:
+            intervening_topics.discard(claim.number)
+        if claim.number and claim.roles:
+            measured_topics[claim.number] = claim
+        antecedent = claim
 
     def dispute(claim: AreaQualification, dependency: AreaQualification | None = None) -> None:
         targets = area_qualification_targets(claim.roles, references, patterns)
@@ -26895,10 +27002,17 @@ def area_local_qualification_scopes(text: str, enclosing: set[str], patterns: Ar
     def is_dependency(claim: AreaQualification | None) -> bool:
         return claim is not None and (not temporal_condition or not claim.past or claim.pending)
 
-    def retain_condition(claim: AreaQualification | None) -> None:
+    def retain_condition(claim: AreaQualification | None, first: int, last: int) -> None:
         nonlocal has_dependency, condition
         if claim is not None:
             condition = claim
+            if child_index < len(children) and children[child_index][0] < last:
+                # A measured prerequisite can supply a topic to its own aside.
+                # That topic does not replace the main clause's antecedent.
+                spans = [role for role in claim.roles if isinstance(role, tuple) and first <= role[0] < last]
+                if spans:
+                    seed_children(max(end for _, end in spans))
+                    seed_children(last, topic=claim)
         if is_dependency(claim):
             has_dependency = True
             dependency_roles.update(claim.roles)
@@ -26923,7 +27037,8 @@ def area_local_qualification_scopes(text: str, enclosing: set[str], patterns: Ar
             # A named pending verification is relevant even if the main action is unrelated.
             affected.update(area_qualification_targets(dependency.roles, references, patterns))
 
-    for first, last, coordinator, following in area_qualification_clauses(source, text):
+    for first, last, coordinator, following, stop in area_qualification_clauses(source, text):
+        seed_children(first)
         if first < last:
             # In a trailing condition, an uncoordinated comma can separate listed
             # prerequisites. The condition still owns these clauses if no new result starts.
@@ -26936,12 +27051,14 @@ def area_local_qualification_scopes(text: str, enclosing: set[str], patterns: Ar
                 leading_dependency = finish_condition()
                 leading_bound = False
             if reading_condition:
-                retain_condition(area_qualification_claim(text, first, last, condition, measured_topics=measured_topics))
+                retain_condition(area_qualification_claim(text, first, last, condition, measured_topics=measured_topics),
+                                 first, stop)
             elif intro := area_condition_start(text, first, last):
                 conditional_result = previous if separator == "," else None
                 trailing_condition = conditional_result is not None
                 temporal_condition = bool(intro["temporal"])
-                retain_condition(area_measurement_condition(text, first, last, antecedent, measured_topics=measured_topics))
+                retain_condition(area_measurement_condition(text, first, last, antecedent, measured_topics=measured_topics),
+                                 first, stop)
                 reading_condition = True
             elif previous and separator == "," and (dependency := area_measurement_condition(
                 text, first, last, antecedent, measured_topics=measured_topics,
@@ -26971,17 +27088,14 @@ def area_local_qualification_scopes(text: str, enclosing: set[str], patterns: Ar
                     if claim.pending or leading_dependency:
                         dispute(claim, leading_dependency)
                         leading_bound = leading_bound or leading_dependency is not None
-                    if claim.roles and any(first <= left < last for left, _ in claim.roles):
-                        intervening_topics.discard(claim.number)
-                    if claim.number and claim.roles:
-                        measured_topics[claim.number] = claim
-                    previous = antecedent = claim
+                    remember(claim, first, last)
+                    previous = claim
                     if claim.result_end is not None:
                         intro = area_condition_start(text, claim.result_end, last)
                         temporal_condition = bool(intro and intro["temporal"])
                         retain_condition(area_measurement_condition(
                             text, claim.result_end, last, claim, measured_topics=measured_topics,
-                        ))
+                        ), claim.result_end, stop)
                         reading_condition = bool(condition or intro)
                         if reading_condition:
                             conditional_result = claim
@@ -26993,12 +27107,25 @@ def area_local_qualification_scopes(text: str, enclosing: set[str], patterns: Ar
                         temporal_condition = bool(intro["temporal"])
                         retain_condition(area_measurement_condition(
                             text, intro.start(), last, prior, measured_topics=measured_topics,
-                        ))
+                        ), intro.start(), stop)
                         reading_condition = trailing_condition = True
                     topic_stop = intro.start() if intro else last
-                    if antecedent and not pronoun:
-                        if number := area_intervening_topic(text, first, topic_stop):
+                    child_here = child_index < len(children) and children[child_index][0] < stop
+                    if child_here:
+                        # An aside can supply the whole predicate of a measured subject.
+                        subject = area_measured_subject(text, first, topic_stop)
+                        if subject:
+                            role = subject.span("topic")
+                            topic = area_bind_qualification_roles(text, AreaQualification((role,)), prior, measured_topics)
+                            if topic is not None:
+                                seed_children(role[1])
+                                remember(topic, first, topic_stop)
+                    if (antecedent or child_here) and not pronoun:
+                        number, end = area_intervening_topic(text, first, topic_stop)
+                        if number:
+                            seed_children(end)
                             intervening_topics.add(number)
+        seed_children(stop)
         separator = following
         if separator in {";", ".", "!", "?", ""}:
             finish_leading(leading_dependency)
@@ -27009,16 +27136,33 @@ def area_local_qualification_scopes(text: str, enclosing: set[str], patterns: Ar
                 antecedent = None
                 measured_topics.clear()
                 intervening_topics.clear()
+    seed_children(len(text) + 1)
     return affected
 
 
 def area_qualification_scopes(text: str, enclosing: set[str], patterns: AreaScopePatterns,
                               *, paired_only: bool = False) -> set[str]:
     source = AreaSourceSpans(text)
-    if not source.pairs and not paired_only:
-        return area_local_qualification_scopes(text, enclosing, patterns)
-    return {scope for group, local, _ in source.frame_texts(patterns) if group >= 0 or not paired_only
-            for scope in area_local_qualification_scopes(local, enclosing, patterns)}
+    if not source.pairs:
+        return set() if paired_only else area_local_qualification_scopes(text, enclosing, patterns)
+    frames = {group: (local, offsets) for group, local, offsets in source.frame_texts(patterns, include_empty=True)}
+    contexts: dict[int, AreaQualificationContext] = {}
+    affected = set()
+    # The index is built inside-out to lift wrapped labels. Read contexts outside-in.
+    for group in reversed(frames):
+        local, offsets = frames[group]
+        inherited = contexts.pop(group, None)
+        children = tuple((bisect_left(offsets, opener), opener) for opener in source.children.get(group, ())
+                         if opener in frames)
+        if local.strip(".,!? "):
+            targets = area_local_qualification_scopes(local, enclosing, patterns, inherited=inherited,
+                                                      children=children, contexts=contexts)
+            if group >= 0 or not paired_only:
+                affected.update(targets)
+        elif inherited is not None:
+            for _, opener in children:
+                contexts[opener] = inherited
+    return affected
 
 
 def area_paired_asides(text: str) -> bool:
