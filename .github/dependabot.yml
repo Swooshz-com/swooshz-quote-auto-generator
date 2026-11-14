@@ -5,6 +5,14 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      aws-sdk-patch-and-minor:
+        patterns: ["boto3", "botocore"]
+        update-types: ["patch", "minor"]
+      pip-patch-and-minor:
+        patterns: ["*"]
+        exclude-patterns: ["boto3", "botocore"]
+        update-types: ["patch", "minor"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -13,6 +21,7 @@ updates:
       default-days: 7
     groups:
       github-actions-patch-and-minor:
+        patterns: ["*"]
         update-types: ["patch", "minor"]
   - package-ecosystem: "npm"
     directory: "/"
@@ -22,4 +31,5 @@ updates:
       default-days: 3
     groups:
       npm-patch-and-minor:
+        patterns: ["*"]
         update-types: ["patch", "minor"]
