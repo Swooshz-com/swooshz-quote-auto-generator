@@ -25855,7 +25855,7 @@ AREA_FRAME_SPACE = re.compile(r"\s*")
 AREA_FRAME_QUALIFIER_SPACE = re.compile(r"[\s:,-]*")
 AREA_FRAME_ASIDE_SPACE = re.compile(r"[\s.,!?]*")
 AREA_LINE_BREAK = re.compile(r"\r?\n")
-AREA_HEADING_COLON = re.compile(":")
+AREA_HEADING_COLON = re.compile(r"(?<![0-9]):|:(?![0-9])")
 AREA_RECORD_BREAK = re.compile(r";|[.!?](?=\s|$)")
 # A closed aside becomes whitespace. Test a whitespace run once when looking for conjunctions.
 AREA_QUALIFICATION_BREAK = re.compile(r",(?!\d)|;|[.!?](?=\s|$)|(?<!\s)\s++(?:and|but|whereas|while|or|nor)\s+", re.I)

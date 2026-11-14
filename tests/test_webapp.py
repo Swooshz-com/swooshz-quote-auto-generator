@@ -43915,6 +43915,21 @@ main().catch((error) => {
             with self.subTest(clause=clause):
                 self.assertEqual(webapp.area_qualification_scopes(documents + clause, {west}, patterns), expected)
 
+    def test_clock_punctuation_preserves_area_attribution_in_source_records(self):
+        east, west = "east floor", "west floor"
+        patterns = webapp.area_scope_patterns({east, west})
+        amounts = f"{east}: 10 sqm; {west}: 14 sqm; "
+        checked = f"We checked the dimensions for {east}. "
+        for time in ("09:30", "09:30:45", "9 pm"):
+            for actor, eligible in (("Nobody", False), ("The surveyor", True)):
+                with self.subTest(time=time, actor=actor):
+                    note = amounts + checked + f"By {time} {actor} has verified them."
+                    claims = list(webapp.area_source_claims(note, patterns))
+                    self.assertEqual({claim.scope for claim in claims if not claim.eligible},
+                                     set() if eligible else {east})
+                    self.assertEqual({claim.scope for claim in claims if claim.eligible}, {east, west})
+        self.assertEqual(webapp.area_heading_colon("At 09:30 the drawing status: pending"), 27)
+
     def test_area_verification_actor_and_object_stay_in_the_current_clause(self):
         east, west = "east flooring", "west flooring"
         patterns = webapp.area_scope_patterns({east, west})
