@@ -43790,12 +43790,17 @@ main().catch((error) => {
         west, east = "carpet tile west", "carpet tile east"
         patterns = webapp.area_scope_patterns({west, east})
         for depth in (8, 128, 512):
-            with self.subTest(depth=depth):
-                text = "(" * depth + f"the dimensions for {east} remain unverified" + ")" * depth
-                with mock.patch.object(webapp, "area_qualification_scopes",
-                                       wraps=webapp.area_qualification_scopes) as parse:
-                    self.assertEqual(webapp.area_paired_qualification_scopes(text, {west}, patterns), {east})
-                parse.assert_called_once()
+            for local in ("", "site note "):
+                with self.subTest(depth=depth, local=local):
+                    assertion = f"the dimensions for {east} remain unverified"
+                    text = f"({local}" * depth + assertion + ")" * depth
+                    with mock.patch.object(webapp, "area_local_qualification_scopes",
+                                           wraps=webapp.area_local_qualification_scopes) as parse:
+                        self.assertEqual(webapp.area_qualification_scopes(text, {west}, patterns, paired_only=True), {east})
+                    self.assertEqual(
+                        [args[0].strip() for args, _ in parse.call_args_list],
+                        [local + assertion] + ([local.strip()] * (depth - 1) if local else []),
+                    )
 
     def test_area_qualification_resolves_complete_named_roles_before_fallback(self):
         west = "carpet tile west"
@@ -44339,8 +44344,23 @@ main().catch((error) => {
             ("pronoun-demonstrative-explicit", f"we checked the dimensions for {east}. Those dimensions for {west} have not been verified", False, True),
             ("pronoun-demonstrative-completed", f"we checked the dimensions for {east}. Those dimensions had been verified", True, True),
             ("pronoun-implicit-verification", f"we checked the dimensions for {east}. Verification is still pending", True, False),
-            ("nested-measured-pending", f"(((the dimensions for {east} were partially verified)))", False, False),
-            ("nested-measured-completed", f"(((the dimensions for {east} had already been verified)))", False, True),
+            ("nested-measured-pending", f"(((the dimensions for {east} were partially verified)))", True, False),
+            ("nested-measured-completed", f"(((the dimensions for {east} had already been verified)))", True, True),
+            ("nested-pending", f"survey note (the dimensions for {east} remain unverified)", True, False),
+            ("nested-completed", f"survey note (the dimensions for {east} had been verified)", True, True),
+            ("aside-pending", f"the dimensions for {east} (drawing reference) remain unverified", True, False),
+            ("aside-completed", f"the dimensions for {east} [drawing reference] had been verified", True, True),
+            ("demo-topic", f"we checked the dimensions for {east}. The invoice was sent. Those dimensions remain unverified", True, False),
+            ("demo-event", f"we checked the dimensions for {east}. The invoice was sent. Verification of those dimensions is still pending", True, False),
+            ("demo-object", f"we checked the dimensions for {east} and sent the invoice, but we still need to verify those dimensions", True, False),
+            ("demo-complete", f"we checked the dimensions for {east}. The invoice was sent. Those dimensions were verified", True, True),
+            ("bare-plural", f"we checked the dimensions for {east} and sent invoices. They have not been verified", True, True),
+            ("bare-plural-detail", f"we checked the dimensions for {east} and sent invoices for delivery. They have not been verified", True, True),
+            ("leading-named", f"when the dimensions for {east} have been verified, the dimensions for {west} will be approved", False, False),
+            ("leading-completed", f"after the dimensions for {east} had been verified, the dimensions for {west} were approved", True, True),
+            ("trailing-named", f"the dimensions for {west} will be approved after we verify the dimensions for {east}", False, False),
+            ("trailing-neutral", f"the drawings will be released when the dimensions for {east} and {west} have been verified", False, False),
+            ("trailing-completed", f"the drawings were released after the dimensions for {east} and {west} had been verified", True, True),
             ("pronoun-demonstrative-event", f"we checked the dimensions for {east}. Verification of those dimensions is still pending", True, False),
             ("pronoun-demonstrative-object", f"we checked the dimensions for {east}. We still need to verify those dimensions", True, False),
             ("pronoun-demonstrative-event-complete", f"we checked the dimensions for {east}. Verification of those dimensions was completed", True, True),
@@ -44872,11 +44892,11 @@ main().catch((error) => {
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [
                 statement, disputed, f"{disputed} (provisional in drawing)",
-                f"The dimensions for {specifications[0][1]} are approved when the invoice clears, "
-                "the deposit is paid, and the site measurements are verified",
+                f"{statement} (the drawings will be released when the dimensions for "
+                f"{specifications[0][1]} have been verified)",
             ]}
-            # Reproduce the v25 grant on a source whose trailing condition v25 missed.
-            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 25),
+            # Reproduce a v26 grant from a trailing measurement check missed by that reader.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 26),
                   mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
@@ -44913,7 +44933,7 @@ main().catch((error) => {
                         self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
                         self.assertFalse(list((root / path).rglob("quotation.xlsx")))
                         if path == "seal":
-                            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 25):
+                            with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 26):
                                 self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
                             stale.pop("pricing_analysis_seal")
                             stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
