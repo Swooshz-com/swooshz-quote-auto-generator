@@ -44933,6 +44933,9 @@ main().catch((error) => {
             (f"{checked} As of yet nobody has verified them.", {"west"}, (230.20, 250.92)),
             (f"{checked} To this point nobody has verified them.", {"west"}, (230.20, 250.92)),
             (f"{checked} We sent drawing and report (they remain unverified).", {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} By 09:30 nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} The surveyor who met the installer who spoke to the foreman has not verified them.",
+             {"west"}, (230.20, 250.92)),
         )
         config = synthetic_configuration(credential="synthetic")
         with (mock.patch.dict(os.environ, self._ledger_env()),
