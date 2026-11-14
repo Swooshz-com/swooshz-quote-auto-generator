@@ -21,6 +21,8 @@ nested state, it verifies the saved blob IDs against the bytes it wrote.
 Footer cleanup requires both tokens and a saved refresh from the same commit.
 It skips queued runs, runs that save nothing, and runs that hit the App rate
 limit, including when that limit prevents recovery of a truncated document.
+If saved state cannot be verified on read-back, the sweep reports a hold and
+leaves footer cleanup skipped.
 
 After this refresh merges, verify the first App-backed sweep on the merged
 main commit. Check that both token steps succeed, the refresh saves without

@@ -1,4 +1,4 @@
-# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep-gate toolkit=2d52ca3ee0f65acdb9cfce111b9f08df9497c502 sha256=85c594291a33
+# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep-gate toolkit=199836b83342ede87101ba41fc64376aa542a416 sha256=64e15d8cbb62
 # A copy of the Toolkit's own workflow, pinned to the Toolkit commit above. Do not edit it here: refresh the repository rules to update it.
 # Toolkit Programme Sweep Gate: starts the cloud sweep only when there is work.
 #
@@ -66,7 +66,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: weijunswj/ai-agent-toolkit
-          ref: 2d52ca3ee0f65acdb9cfce111b9f08df9497c502
+          ref: 199836b83342ede87101ba41fc64376aa542a416
           path: .toolkit
           persist-credentials: false
           sparse-checkout: repo/scripts/toolkit-programme-sweep-gate.cjs
