@@ -27070,7 +27070,7 @@ def area_local_qualification_scopes(
                     else:
                         remember(topic, first, last, stop)
                     return False
-        if not antecedent and (child_index == len(children) or children[child_index][0] >= stop):
+        if not antecedent and child_index == len(children):
             return False
         conjunct = condition_ordinary_conjunct if temporary else ordinary_conjunct
         joined = conjunct and (separator == "and" or (

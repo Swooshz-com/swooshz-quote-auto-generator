@@ -44403,6 +44403,7 @@ main().catch((error) => {
             ("modifier-positive-actor", f"we checked the dimensions for {east}. So far a surveyor has verified them", True, True),
             ("modifier-negative-documents", f"we checked the dimensions for {east}. The drawing and the report were sent. So far nobody has verified them", True, True),
             ("coordinated-ordinary-aside", f"we checked the dimensions for {east}. The drawing and the report (they remain unverified) were sent", True, True),
+            ("ordinary-coordination-new-record", f"we checked the dimensions for {east}; the drawing and report (they remain unverified) were sent", True, True),
             ("coordinated-elided-determiner", f"we checked the dimensions for {east}. The drawing and report (they remain unverified) were sent", True, True),
             ("coordination-after-aside", f"we checked the dimensions for {east}. The drawing (they remain unverified) and the report were sent", True, False),
             ("coordinate-subordinate-documents", f"we checked the dimensions for {east} after the drawing and the report (they remain unverified) were sent", True, True),
