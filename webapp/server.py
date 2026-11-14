@@ -25773,8 +25773,11 @@ AREA_CLAUSE_COORDINATOR = re.compile(rf"{AREA_CLAUSE_CONNECTOR}\s+", re.I)
 AREA_ADDITIVE_COORDINATOR = re.compile(AREA_ADDITIVE_CONNECTOR, re.I)
 AREA_CALENDAR_PERIOD = r"(?:morning|afternoon|evening|night|day|week|month|quarter|year)"
 AREA_TIME_PERIOD = rf"(?:this|that|last|next|the\s+(?:previous|current|following))\s+{AREA_CALENDAR_PERIOD}"
+AREA_CLOCK_TIME = (
+    r"(?:(?:[01]?[0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?(?:\s*[ap]m)?|(?:0?[1-9]|1[0-2])\s*[ap]m)"
+)
 AREA_TEMPORAL_POINT = (
-    rf"(?:now|today|yesterday|tomorrow|then|yet|date|noon|midnight|dawn|dusk|{AREA_TIME_PERIOD}"
+    rf"(?:now|today|yesterday|tomorrow|then|yet|date|noon|midnight|dawn|dusk|{AREA_CLOCK_TIME}|{AREA_TIME_PERIOD}"
     r"|(?:this|that|the\s+(?:present|current))\s+(?:stage|point|moment|time)"
     rf"|the\s+(?:start|beginning|middle|end|close)\s+of\s+{AREA_TIME_PERIOD})"
 )
@@ -26730,7 +26733,18 @@ def area_predicate_after_relative(text: str, start: int, stop: int) -> int | Non
     """Resume at a finite outer predicate after a bounded subject relative."""
     saw_auxiliary = saw_predicate = complement = False
     modifier_start = None
-    for index in range(10):
+    at_subject = True
+    for _ in range(16):
+        if relative := AREA_RELATIVE_CLAUSE.match(text, start, stop):
+            if not saw_predicate or complement:
+                return None
+            # An object of the preceding relative can have its own subject
+            # relative. Its verification action remains inside the same actor.
+            at_subject = True
+            saw_auxiliary = saw_predicate = False
+            modifier_start = None
+            start = relative.end()
+            continue
         word = AREA_QUALIFICATION_WORD.match(text, start, stop)
         if word is None or AREA_EMBEDDED_CLAUSE.match(text, start, stop):
             break
@@ -26745,11 +26759,19 @@ def area_predicate_after_relative(text: str, start: int, stop: int) -> int | Non
         elif plain in {"to", "be", "been", "being"}:
             complement = plain in {"to", "being"}
         elif plain not in {"not", "never", "yet"} and not AREA_QUALIFICATION_ADVERB.fullmatch(plain):
-            if saw_predicate and not complement and AREA_ACTION.match(text, start, stop):
+            if (saw_predicate and not complement and (action := AREA_ACTION.match(text, start, stop))
+                    and not action["ongoing"]):
                 return modifier_start if modifier_start is not None else start
-            saw_predicate = saw_predicate or saw_auxiliary or bool(AREA_ACTION.match(text, start, stop)) or (
-                index == 0 and (plain.endswith("ed") or plain.endswith("s"))
+            # The first lexical verb after a subject relative may be irregular.
+            # A nearby nominal subject or auxiliary instead marks an object relative.
+            following = AREA_FRAME_SPACE.match(text, word.end(), stop).end()
+            lexical_subject_verb = at_subject and not (
+                AREA_EXPLICIT_NOUN.match(text, start, stop)
+                or AREA_SUBJECT_PRONOUN.match(text, start, stop)
+                or (not plain.endswith("ed") and AREA_FINITE_BRIDGE.match(text, following, stop))
             )
+            saw_predicate = saw_predicate or saw_auxiliary or lexical_subject_verb
+            at_subject = False
             complement = False
             modifier_start = None
         elif saw_predicate and modifier_start is None:

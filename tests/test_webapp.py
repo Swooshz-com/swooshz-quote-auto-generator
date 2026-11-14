@@ -43890,7 +43890,8 @@ main().catch((error) => {
         measured = f"we checked the dimensions for {east}. "
         for prefix in ("", "as of this morning ", "up to last week ", "at this stage, ",
                        "for the time being ", "by the end of this week\n", "in the meantime ",
-                       "as of yet ", "to this point ", "by midnight ", "before noon "):
+                       "as of yet ", "to this point ", "by midnight ", "before noon ",
+                       "by 09:30 ", "before 9 pm "):
             for clause, expected in (
                 ("nobody has verified them", {east}),
                 ("no independent surveyor has verified them", {east}),
@@ -43927,6 +43928,8 @@ main().catch((error) => {
             ("The supervisor who has not verified them sent the report", set()),
             ("Nobody who attended has verified them", {east}),
             ("Nobody who attended verified them", {east}),
+            ("The surveyor who met the installer who spoke to the foreman has not verified them", {east}),
+            ("The supervisor who met the installer who verified them has sent the report", set()),
             ("The surveyor who attended never verified them", {east}),
             ("The supervisor who planned to verify them has sent the report", set()),
             ("The supervisor who started verifying them has sent a report", set()),
