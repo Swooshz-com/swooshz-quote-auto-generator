@@ -13760,48 +13760,43 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_openai_request_resolves_bundled_catalog_visual_paths(self):
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
+        reference_id = "synthetic-bundled-visual"
+        image_url = synthetic_image(color="blue")
+        payload = valid_payload()
+        payload.update(
+            pricing_reference_id=reference_id,
+            pricing_reference_source="bundled",
+            pricing_reference={"id": reference_id, "source": "bundled"},
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            reference_dir = Path(tmp)
-            image_path = reference_dir / "pricing-catalog-images" / "chair.png"
-            image_path.parent.mkdir(parents=True)
-            image_path.write_bytes(base64.b64decode(synthetic_image().split(",")[1]))
-            catalog_path = reference_dir / "pricing-catalog.json"
-            catalog_path.write_text(json.dumps({
-                "schema_version": 1,
-                "items": [{
-                    "id": "furniture.white-chair",
-                    "section": "Furniture Rental",
-                    "description": "nos. White chair",
-                    "unit_hint": "nos",
-                    "internal_cost": 30,
-                    "markup_multiplier": 1.5,
-                    "visual_references": [{
-                        "source": "xl/media/image4.png",
-                        "path": "pricing-catalog-images/chair.png",
-                        "anchor_row": 20,
-                    }],
+            root = Path(tmp)
+            reference_dir = write_test_pricing_reference(root, reference_id, [{
+                "id": "furniture.white-chair",
+                "section": "Furniture Rental",
+                "description": "nos. White chair",
+                "unit_hint": "nos",
+                "internal_cost": 30,
+                "markup_multiplier": 1.5,
+                "visual_references": [{
+                    "source": "xl/media/image4.png",
+                    "path": "pricing-catalog-images/chair.png",
+                    "anchor_row": 20,
                 }],
-            }), encoding="utf-8")
+            }])
+            image_path = reference_dir / "pricing-catalog-images" / "chair.png"
+            image_path.parent.mkdir()
+            image_path.write_bytes(base64.b64decode(image_url.split(",", 1)[1]))
 
-            pack = mock.MagicMock()
-            pack.directory = reference_dir
-            pack.pricing_catalog_path = catalog_path
-            pack.public_detail.return_value = {
-                "id": "synthetic-exhibition-fixture-pricing",
-                "source": "local",
-                "currency": "SGD",
-                "items": [],
-            }
             with (
-                mock.patch.object(webapp, "load_pricing_reference_pack", return_value=pack),
-                mock.patch.object(webapp.PricingReferencePack, "resolve_exact", return_value=pack),
+                mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root),
+                mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen,
             ):
-                with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                    webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
+                webapp.request_openai_quote_basis(payload, "sk-test-redacted")
 
+        urlopen.assert_called_once()
         content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
         self.assertIn("Internal catalog reference images follow", content[-2]["text"])
-        self.assertEqual(content[-1]["image_url"], synthetic_image())
+        self.assertEqual(content[-1]["image_url"], image_url)
 
     def test_openai_prompt_uses_compact_profile_context_without_logo_or_presets(self):
         prompt = webapp.build_quote_draft_prompt(valid_payload())
@@ -33188,27 +33183,38 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
     def test_run_quote_job_never_passes_payload_pdf_mode_to_generator(self):
         payload = valid_payload()
         payload["pdf_mode"] = "auto"
+        job_id = "job-xlsx-only"
+        expected_catalog = json.loads(KONCEPT_CATALOG.read_bytes())
+        observed_catalog = None
 
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_catalog = root / "tmp" / job_id / "pricing-catalog.json"
             completed = webapp.subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
                 stdout="Wrote quotation.xlsx\nPDF export status: skipped\n",
                 stderr="",
             )
-            with mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run:
+
+            def execute_generator(command, **_kwargs):
+                nonlocal observed_catalog
+                template = Path(command[command.index("--template") + 1])
+                observed_catalog = json.loads(template.read_bytes())
+                write_generator_diagnostic_fixture(command)
+                return completed
+
+            with mock.patch.object(webapp.subprocess, "run", side_effect=execute_generator) as run:
                 result = webapp.run_quote_job(
-                    payload,
-                    output_root=Path(tmp) / "out",
-                    tmp_root=Path(tmp) / "tmp",
+                    payload, output_root=root / "out", tmp_root=root / "tmp", job_id=job_id,
                 )
 
+        run.assert_called_once()
         command = run.call_args.args[0]
         self.assertEqual(result["status"], "completed")
-        self.assertIn("--template", command)
-        self.assertIn(str(KONCEPT_CATALOG), command)
-        self.assertIn("--layout-template", command)
-        self.assertIn(str(KONCEPT_LAYOUT), command)
+        self.assertEqual(Path(command[command.index("--template") + 1]), job_catalog)
+        self.assertEqual(observed_catalog, expected_catalog)
+        self.assertEqual(Path(command[command.index("--layout-template") + 1]), KONCEPT_LAYOUT)
         self.assertNotIn("--pdf-mode", command)
         self.assertNotIn("quotation.pdf", command)
 
