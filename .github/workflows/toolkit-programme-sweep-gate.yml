@@ -1,4 +1,4 @@
-# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep-gate toolkit=da1df8397e449d475793710f5b48f6a79bfd96ed sha256=38655d20f12a
+# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep-gate toolkit=2c459ea4a39fbe3bf3bbd3b926a20a040ecca529 sha256=41d6b3d9d06a
 # A copy of the Toolkit's own workflow, pinned to the Toolkit commit above. Do not edit it here: refresh the repository rules to update it.
 # Toolkit Programme Sweep Gate: starts the cloud sweep only when there is work.
 #
@@ -14,7 +14,8 @@
 # follows a CI workflow), or when six hours have passed. A green run that made no pass (queued behind
 # another sweep's lease, main moved, off the default branch) is not a sweep here; one paused at
 # GitHub's hourly App limit still is, so its reset wait holds. A start from activity waits until an hour
-# after the newest sweep run, one that made no pass included; the hourly start then picks the change up. Activity during a running sweep
+# after the newest sweep run, one that made no pass included; the hourly start then picks the change up. A closed issue starts the
+# sweep at once instead, unless the last pass paused at GitHub's hourly App limit before it reset. Activity during a running sweep
 # queues one more behind it. Nothing starts while a sweep is already queued.
 #
 # Activity from bots, the sweep's own App included, is ignored before a runner starts, so the
@@ -68,7 +69,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: weijunswj/ai-agent-toolkit
-          ref: da1df8397e449d475793710f5b48f6a79bfd96ed
+          ref: 2c459ea4a39fbe3bf3bbd3b926a20a040ecca529
           path: .toolkit
           persist-credentials: false
           sparse-checkout: repo/scripts/toolkit-programme-sweep-gate.cjs
@@ -78,5 +79,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
           CI_WORKFLOW: ci.yml
         run: node .toolkit/repo/scripts/toolkit-programme-sweep-gate.cjs

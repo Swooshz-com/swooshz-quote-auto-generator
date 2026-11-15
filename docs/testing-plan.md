@@ -92,6 +92,43 @@ intervening changes block restoration. Treat inventories and rollback receipts a
 private operational material. The script cannot read or write a database; any live
 inventory, mapping, cutover or rollback requires separate exact owner approval.
 
+## Programme sweep and gate
+
+Use the Toolkit revision pinned in both managed workflows. Install its
+lockfile dependencies in a disposable local copy with
+npm ci --ignore-scripts --no-audit --no-fund. Run these suites with node --test
+from that copy. On Windows, set `USERPROFILE` to an empty temporary directory
+for the test process only. That lets the generator fixture use its own Git
+history without picking up the machine's managed Toolkit checkout.
+
+- **Order authority**. Run programme-holder-order and programme-order-queue
+  under repo/tests. Verify that an eligible order runs inside the cloud lease,
+  a rehearsal leaves state alone, and expired, stale or forbidden operations
+  are refused. Advance the clock during an eligible order to verify the first
+  write and receipt survive, the next operation is blocked, and a later pass
+  leaves the completed work alone. Check retry after a transient failure and
+  keep the pending file until the result can be read back. Interrupt pending
+  file removal after that read-back and retry after expiry. Check that a
+  completed order keeps one result and a partly applied order keeps its
+  recorded operations, with only the pending file removed on retry.
+- **Dispatch and state**. Run toolkit-programme-sweep-workflow,
+  toolkit-cloud-workflows, programme-sweep-lease, programme-sweep-store,
+  programme-graph-state and toolkit-programme-redraw-hold under repo/tests.
+  Check main-only activity and CI dispatch, the issue-close path, a verified
+  save and graph redraw, and suppression of the refresh signal on an unsaved
+  hold, failed state read-back or a board rendered by a newer Toolkit. Exercise
+  the pinned worker's parent, child and sweep-history validators offline. For
+  a compatibility check against private snapshots, keep all data in the
+  local evidence store and report only document and result counts.
+- **Repository checks**. Run the Toolkit cloud workflow generator with
+  --check and the plain-text installer with --workflow --check against this
+  checkout, then run the local plain-text and Nixpacks contract checks.
+
+The offline suites use a synthetic GitHub transport. After an approved merge,
+the controller verifies a real App-backed sweep on main by reading back the
+landed store commit and matching the changed graph revision and hash to the
+rendered board.
+
 ## Required Impact Pass
 
 Before finishing a change:

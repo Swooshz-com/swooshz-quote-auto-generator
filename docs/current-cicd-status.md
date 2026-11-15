@@ -8,8 +8,9 @@ and the two Toolkit Programme Sweep workflows
 
 The cloud programme sweep runs on pushes to `main` or by dispatch. The hourly
 gate also starts it on `main` after eligible repository activity or CI.
-When no sweep is running, an activity trigger waits an hour after the latest
-green run.
+When no sweep is running, most activity waits an hour after the latest sweep
+run. Closing an issue can start a sweep immediately unless one is already queued
+or the GitHub App rate limit still applies.
 The hourly check measures activity from the last run that did work, so a later run that
 finished green while waiting for the sweep lease cannot hide pending changes.
 A pause at the GitHub App rate limit still holds retries until the limit resets.
@@ -24,16 +25,29 @@ invalid binding leaves both token steps skipped.
 The sweep reads large state documents by Git blob ID when GitHub truncates
 them in the bulk response, within the sweep's request budget. After writing
 nested state, it verifies the saved blob IDs against the bytes it wrote.
-Footer cleanup requires both tokens and a saved refresh from the same commit.
-It skips queued runs, runs that save nothing, and runs that hit the App rate
-limit, including when that limit prevents recovery of a truncated document.
-If saved state cannot be verified on read-back, the sweep reports a hold and
-leaves footer cleanup skipped.
+After taking its lease, the cloud sweep checks the private evidence store for
+queued controller orders before refreshing the board. Orders must name the
+current programme parent, holder and holder epoch, specify allowed operations,
+and still be within their expiry time. A rehearsal makes no programme writes.
+The worker checks expiry before starting each operation. If the deadline
+passes during an operation, the worker keeps that operation and its receipt,
+stops before the next operation and files the order as stopped. Retries skip
+operations already recorded as complete. The worker removes a pending file
+only after it saves and reads back the result. If removal is interrupted, a
+later pass preserves the verified result for that queued file and retries
+only removal, even after expiry. The workflow summary reports counts.
+Order details and receipts stay in the private store.
 
-After this refresh merges, verify the first App-backed sweep on the merged
-main commit. Check that both token steps succeed, the refresh saves without
-holds, the saved state revision matches the programme board, and footer
-cleanup reports counts or a skip reason.
+Footer cleanup requires both App tokens and the refresh signal from the same
+commit. The worker withholds the signal when it waits for the lease, hits the
+App rate limit, cannot verify state read-back, encounters a hold with no saved
+state, or finds a board rendered by a newer Toolkit. A clean run with no
+changes or a partial run with a verified save can still emit the signal.
+
+After the re-pin merges, verify the first App-backed sweep on merged main.
+Check that both token steps succeed, read the changed state at the landed
+store commit, and match its graph revision and hash to the rendered programme
+board. Record the run attempt and the footer cleanup counts or skip reason.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.
