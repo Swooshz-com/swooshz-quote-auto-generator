@@ -1503,6 +1503,117 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertIn("pdf_mode=workbook", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
             self.assertIn("pdf_status=excel_exported", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
 
+    def test_pdf_conversion_hides_only_unoccupied_first_page_padding(self):
+        sheet_name = "xl/worksheets/sheet1.xml"
+        drawing_name = "xl/drawings/print-shapes.xml"
+        relations_name = "xl/worksheets/_rels/sheet1.xml.rels"
+        cases = (
+            ("padding", "", "", "", set(range(47, 56))),
+            ("later formula", '<c r="C53"><f>1+1</f></c>', "", "", {54, 55}),
+            ("populated merge", "", '<mergeCell ref="A46:A51"/>', "", set(range(52, 56))),
+            ("drawing", "", "", "twoCellAnchor", set(range(53, 56))),
+            ("unknown drawing bounds", "", "", "absoluteAnchor", set()),
+            ("automatic break only", "", "", "", set()),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            master = Path(temporary) / "master.xlsx"
+            converted = Path(temporary) / "conversion.xlsx"
+            for name, formula, merge, anchor, expected in cases:
+                with self.subTest(name=name):
+                    contents = {46: '<c r="A46"><v>1</v></c>', 53: formula, 61: '<c r="A61"><v>2</v></c>'}
+                    rows = "".join(
+                        f'<row r="{i}" ht="18.7">{contents.get(i, "")}</row>'
+                        for i in range(46, 62)
+                    )
+                    sheet = (
+                        f'<worksheet xmlns="{NS_MAIN[1:-1]}" xmlns:r="{NS_REL[1:-1]}">'
+                        f'<sheetData>{rows}</sheetData><mergeCells>{merge}</mergeCells>'
+                        f'<rowBreaks><brk id="55" man="{int(name != "automatic break only")}"/>'
+                        '<brk id="95" man="0"/></rowBreaks>'
+                        + ('<drawing r:id="rId7"/>' if anchor else "")
+                        + '</worksheet>'
+                    ).encode()
+                    parts = {sheet_name: sheet}
+                    if anchor:
+                        parts[relations_name] = (
+                            f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}">'
+                            f'<Relationship Id="rId7" Type="{NS_REL[1:-1]}/drawing" '
+                            'Target="../drawings/print-shapes.xml"/></Relationships>'
+                        ).encode()
+                        parts[drawing_name] = (
+                            f'<wsDr xmlns="{NS_DRAWING[1:-1]}"><{anchor}>'
+                            '<from><row>48</row></from><to><row>51</row></to>'
+                            f'</{anchor}><twoCellAnchor><from><row>56</row></from>'
+                            '<to><row>60</row></to></twoCellAnchor></wsDr>'
+                        ).encode()
+                    with zipfile.ZipFile(master, "w") as archive:
+                        for part, data in parts.items():
+                            archive.writestr(part, data)
+                    before = master.read_bytes()
+                    quote.write_pdf_conversion_workbook(master, converted)
+                    self.assertEqual(master.read_bytes(), before)
+                    with zipfile.ZipFile(converted) as archive:
+                        result = ET.fromstring(archive.read(sheet_name))
+                        for part in parts.keys() - {sheet_name}:
+                            self.assertEqual(archive.read(part), parts[part])
+                    hidden = set()
+                    for row in result.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row"):
+                        if row.attrib.pop("hidden", None) == "1":
+                            hidden.add(int(row.get("r")))
+                    self.assertEqual(hidden, expected)
+                    self.assertEqual(ET.tostring(result), ET.tostring(ET.fromstring(sheet)))
+
+    def test_native_pdf_keeps_quotation_and_signature_without_blank_padding_page(self):
+        renderer = "libreoffice_exported" if quote.libreoffice_candidates() else "excel_exported"
+        if renderer == "excel_exported" and os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+            self.fail("LibreOffice is required for the native PDF pagination regression in CI.")
+        if renderer == "excel_exported" and not (
+            os.name == "nt" and shutil.which("powershell")
+            and any((Path(os.environ.get(root, "")) / "Microsoft Office/root/Office16/EXCEL.EXE").is_file()
+                    for root in ("ProgramFiles", "ProgramFiles(x86)"))
+        ):
+            self.skipTest("A native workbook PDF renderer is required.")
+
+        import pypdfium2 as pdfium
+
+        brief = commercial_test_brief({
+            "payment_terms": ["Example deposit is due upon acceptance.", "Balance is due after the exhibition."],
+            "standard_notes": [
+                "Example venue access is subject to the approved event schedule.",
+                "The quotation covers only the work listed in the document above.",
+            ],
+        })
+        lines = [
+            quote.QuoteLine(section, qty, unit, label, "", display, None, amount, "manual", [])
+            for section, qty, unit, label, display, amount in (
+                ("Flooring", 24, "sqm", "Example floor covering", "", 346.80),
+                ("Lighting", 4, "nos", "Example spotlight", "", 57.20),
+                ("Lighting", 1, "nos", "Example water feature", "Price to be discussed", None),
+                ("Lighting", 1, "nos", "Example marshal service", "Included", 0),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            xlsx = Path(temporary) / "quotation.xlsx"
+            pdf = xlsx.with_suffix(".pdf")
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, xlsx, brief, lines)
+            before = xlsx.read_bytes()
+            with zipfile.ZipFile(xlsx) as archive:
+                sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                self.assertEqual(row_break_ids(sheet), [quote.FIRST_PRINT_PAGE_END_ROW])
+                self.assertTrue(quote.pdf_first_page_padding(archive, sheet))
+            self.assertEqual(quote.export_layout_pdf(xlsx, pdf), renderer)
+            self.assertEqual(xlsx.read_bytes(), before)
+            with pdfium.PdfDocument(str(pdf)) as document:
+                self.assertEqual(len(document), 2)
+                for index, marker in enumerate(("Example floor covering", "Saved Signatory")):
+                    page = document[index]
+                    text = page.get_textpage()
+                    try:
+                        self.assertIn(marker, text.get_text_range())
+                    finally:
+                        text.close()
+                        page.close()
+
     def test_pdf_conversion_resolves_drawing_theme_fonts_without_changing_master(self):
         drawing = (
             f'<xdr:wsDr xmlns:xdr="{NS_DRAWING[1:-1]}" xmlns:a="{NS_A[1:-1]}" '
@@ -5119,7 +5230,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         self.assertIn("CorruptLoad", script)
         self.assertIn("$workbook.SaveAs($repairedWorkbookPath, 51)", script)
-        self.assertIn("Move-Item -LiteralPath $repairedWorkbookPath -Destination $xlsxPath -Force", script)
+        self.assertNotIn("Move-Item", script)
 
     def test_brief_text_is_written_as_literal_xlsx_text_not_formulas(self):
         brief = {
