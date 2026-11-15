@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 from webapp import server
 from scripts import generate_quote as generator
 from scripts.verify_current_workbook import NS, verify_workbook
+from tests.test_webapp import local_pricing_fixture_root
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/quote-generator"
@@ -243,8 +244,9 @@ for (const result of ['strictXlsx', 'strictCurrentXlsx']) {
         self.assertEqual(payload["line_items"][0]["quantity"], "2")
         # Use the real mapper/normaliser with an accepted explicit price from
         # fixture data. Saved-session catalogue authority is covered by the smoke.
-        with mock.patch.object(server, "profiles_root", return_value=FIXTURES / "profiles"), \
-             mock.patch.object(server, "pricing_references_root", return_value=FIXTURES / "pricing-references"):
+        with local_pricing_fixture_root() as pricing_root, \
+             mock.patch.object(server, "profiles_root", return_value=FIXTURES / "profiles"), \
+             mock.patch.object(server, "pricing_references_root", return_value=pricing_root):
             brief = server.payload_to_brief(payload)
         self.assertEqual([item["pricing_authority"]["variant"] for item in brief["line_items"]], ["manual", "included"])
         self.assertNotIn("currency", payload)

@@ -1260,6 +1260,14 @@ def write_generator_diagnostic_fixture(command):
     generator.write_match_csv(output / "pricing_matches.csv", lines)
 
 
+@contextlib.contextmanager
+def local_pricing_fixture_root():
+    with tempfile.TemporaryDirectory(prefix="fixture-pricing-", dir=test_temp_root()) as temp:
+        destination = Path(temp) / "pricing-references"
+        shutil.copytree(QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references", destination)
+        yield destination
+
+
 class WebappServerTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -1275,11 +1283,7 @@ class WebappServerTest(unittest.TestCase):
         self._empty_bundled_pricing_root = test_temp_root() / "empty-bundled-pricing"
         self._empty_bundled_pricing_root.mkdir(parents=True, exist_ok=True)
         fixture_profiles_root = QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"
-        self._fixture_pricing_root = Path(self.enterContext(
-            tempfile.TemporaryDirectory(prefix="fixture-pricing-", dir=test_temp_root())
-        )) / "pricing-references"
-        shutil.copytree(QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references", self._fixture_pricing_root,
-                        ignore=shutil.ignore_patterns(".locks"))
+        self._fixture_pricing_root = self.enterContext(local_pricing_fixture_root())
         patchers = [
             mock.patch.object(webapp, "DEFAULT_PROFILE_ID", "synthetic-exhibition-fixture-template"),
             mock.patch.object(webapp, "DEFAULT_PRICING_REFERENCE_ID", "synthetic-exhibition-fixture-pricing"),
@@ -28687,6 +28691,7 @@ function extractFunction(name) {
 const constantNames = ["CSRF_HEADER_NAME", "GENERIC_FAILURE_MESSAGE", "PRICING_SELECTION_STALE_MESSAGE", "QUOTE_COMMERCIAL_REVIEW_SCHEMA",
   "QUOTE_COMMERCIAL_REVIEW_VERSION", "QUOTE_COMMERCIAL_REVIEW_STATUS", "QUOTE_COMMERCIAL_REVIEW_MESSAGE",
   "QUOTE_COMMERCIAL_REVIEW_REASONS", "PRICING_REFERENCE_ID_RE", "PRICING_REFERENCE_SOURCES",
+  "PRICING_REFERENCE_ORDER_FIELDS",
   "SERVER_JOB_TYPES", "ACTIVE_JOB_STARTING_MAX_AGE_MS", "ACTIVE_JOB_CLOCK_SKEW_MS",
   "ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS", "ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS",
   "ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS", "ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS"];
@@ -28950,7 +28955,7 @@ const scrollDashboardSessionIntoView = () => {};
 const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "quoteCommercialReviewIdentity",
   "normalizeQuoteCommercialReview", "quoteCommercialReviewRequired", "serverQuoteCommercialReviewFromResponse",
   "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
-  "newClientErrorReference", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
+  "newClientErrorReference", "stringifyPricingReferenceJson", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
   "refreshSessionToken", "postJson", "logClientEvent", "ensureClientQuoteSessionId", "mergeDashboardQuoteSession",
   "quoteAiSpendText", "renderQuoteAiSpend", "refreshQuoteAiSpend",
   "currentQuoteSessionPayload", "currentQuoteSessionDraftState", "quoteSessionDraftComparisonKey",
@@ -30281,6 +30286,9 @@ eval([
   "normalizeCurrencyLabel",
   "orderNumber",
   "pricingReferenceSnapshotItem",
+  "pricingReferenceOrderValue",
+  "comparePricingReferenceOrder",
+  "nextPricingReferenceOrder",
   "sortPricingReferencePreviewItems",
   "pricingReferenceRowStatus",
   "pricingReferenceDuplicateRowKey",
@@ -30799,6 +30807,9 @@ eval([
   "pricingReferenceNoAccessReason",
   "pricingReferenceRowStatus",
   "pricingReferenceSaveBlockReason",
+  "pricingReferenceOrderValue",
+  "comparePricingReferenceOrder",
+  "nextPricingReferenceOrder",
   "sortPricingReferencePreviewItems",
   "normalizePricingReferencePreviewItem",
   "pricingReferenceDuplicateRowKey",
@@ -40732,21 +40743,64 @@ main().catch((error) => {
                 stdout="Wrote quotation.xlsx\nPDF export status: skipped\n",
                 stderr="",
             )
-            expected_catalog_path = str((reference_dir / "pricing-catalog.json").resolve())
+            expected_catalog = json.loads(catalog_path.read_bytes())
+            job_catalog_path = root / "tmp" / "runtime-local" / "pricing-catalog.json"
             expected_layout_path = str((profile_dir / "quotation-layout.xlsx").resolve())
+            observed_catalog = None
+
+            def execute_generator(command, **_kwargs):
+                nonlocal observed_catalog
+                template = Path(command[command.index("--template") + 1])
+                observed_catalog = json.loads(template.read_bytes())
+                write_generator_diagnostic_fixture(command)
+                return completed
+
             with (
                 mock.patch.object(webapp, "profiles_root", return_value=profiles_root),
                 mock.patch.object(webapp, "pricing_references_root", return_value=pricing_root),
-                mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run,
+                mock.patch.object(webapp.subprocess, "run", side_effect=execute_generator) as run,
             ):
-                result = webapp.run_quote_job(payload, output_root=root / "out", tmp_root=root / "tmp")
+                result = webapp.run_quote_job(
+                    payload, output_root=root / "out", tmp_root=root / "tmp", job_id="runtime-local",
+                )
 
         command = run.call_args.args[0]
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(command[command.index("--template") + 1], expected_catalog_path)
+        self.assertEqual(command[command.index("--template") + 1], str(job_catalog_path))
+        self.assertEqual(observed_catalog, expected_catalog)
         self.assertEqual(command[command.index("--layout-template") + 1], expected_layout_path)
         self.assertNotIn(str(KONCEPT_CATALOG), command)
         self.assertNotIn(str(KONCEPT_LAYOUT), command)
+
+    def test_generated_publication_proof_preserves_exact_catalogue_digest(self):
+        from scripts import generate_quote as generator
+
+        payload = valid_payload()
+        reference_id = payload["pricing_reference_id"]
+        reference = webapp.pricing_reference_pack_detail(reference_id, source="local")
+        first, second = reference["items"][:2]
+        first["item_order"] = 9007199254740993
+        second["item_order"] = 9007199254740992
+        saved = webapp.save_pricing_reference_pack(reference)
+        payload["line_items"] = generation_diagnostic_manual_brief()["line_items"]
+        payload["quote_session"] = {
+            "session_id": "quote-exact-order-publication",
+            "draft_state": {"outputRevision": 0},
+        }
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            result = webapp.run_quote_job(
+                payload, output_root=root / "out", tmp_root=root / "tmp", job_id="job-exact-order",
+            )
+            self.assertEqual(result["status"], "completed", result.get("errors"))
+            catalogue = json.loads((root / "tmp" / "job-exact-order" / "pricing-catalog.json").read_bytes())
+            metadata = webapp.read_quote_session_metadata(payload["quote_session"]["session_id"])
+            self.assertEqual(metadata["publication"]["proof"]["pricing_reference"]["digest"],
+                             saved["digest_sha256"].removeprefix("sha256:"))
+        orders = {item["id"]: item["item_order"] for item in catalogue["items"]}
+        self.assertEqual((orders[first["id"]], orders[second["id"]]), (9007199254740993, 9007199254740992))
+        self.assertEqual(generator.catalog_payload_digest(catalogue), saved["digest_sha256"])
+
     def test_exported_quote_company_profile_imports_to_default_company_store(self):
         exported_profile = {
             "schema": "swooshz.quote-company-profile.v1",

@@ -9037,7 +9037,7 @@ class LocalPricingReferenceStore:
         try:
             self.root = pricing_references_root().resolve()
         except (OSError, RuntimeError) as exc:
-            raise SqagStorageAccessError("Saved pricing references are unavailable.") from exc
+            raise PricingReferencePathError("Pricing reference files are unavailable.") from exc
         self.directory = self.root / reference_id
         self.transactions = self.root / self.transaction_directory_name
         self.transaction = self.transactions / reference_id
@@ -9080,9 +9080,16 @@ class LocalPricingReferenceStore:
                     raise PricingReferencePathError("Pricing reference files are unavailable.")
 
     @contextlib.contextmanager
-    def locked(self):
+    def locked(self, *, create: bool = True):
         lock_dir = self.root / ".locks"
         try:
+            if not create and not self._directory_exists(self.directory) and not (
+                self._directory_exists(self.transactions) and self._directory_exists(self.transaction)
+            ):
+                # A writer creates its transaction before promotion and keeps its
+                # identity directory, including throughout a replacement gap.
+                yield None
+                return
             lock_dir.mkdir(parents=True, exist_ok=True)
             self._directory_exists(lock_dir)
             lock_path = lock_dir / ("_" + self.id)
@@ -9320,8 +9327,8 @@ def delete_pricing_reference_pack(reference_id: str, source: str = "local") -> b
         raise ValueError("Only local pricing reference packs can be deleted here.")
     if safe_id == DEFAULT_PRICING_REFERENCE_ID or pricing_reference_is_profile_default(safe_id):
         raise ValueError("Default pricing references cannot be deleted.")
-    store = LocalPricingReferenceStore(safe_id)
     try:
+        store = LocalPricingReferenceStore(safe_id)
         with store.locked():
             if not store._directory_exists(store.directory) or not (
                 PricingReferencePack._contained_path(store.root, store.directory, "reference.json").is_file()
@@ -11959,8 +11966,8 @@ class LocalSqagStorage:
 
     def pricing_reference_save_snapshot(self, reference_id: str, source: str) -> PricingReferenceSaveSnapshot:
         try:
-            with LocalPricingReferenceStore(reference_id).locked() as store:
-                local, revision = store.read()
+            with LocalPricingReferenceStore(reference_id).locked(create=False) as store:
+                local, revision = store.read() if store is not None else (None, None)
                 requested_source = clean_text(source).lower()
                 selected = None
                 if local is not None and requested_source in {"", "local"}:
@@ -18615,15 +18622,22 @@ class PricingReferencePack:
     def read_scope(cls, reference_id: str | None = None, source: str = "", *, exact: bool = False):
         if exact and (
             not isinstance(reference_id, str) or not PROFILE_ID_RE.fullmatch(reference_id)
-            or source not in {"local", "bundled"}
+            or not isinstance(source, str) or source not in {"local", "bundled"}
         ):
             yield None
             return
         resolved_id = safe_resource_id(reference_id, DEFAULT_PRICING_REFERENCE_ID)
         requested_source = clean_text(source).lower()
+        if not resolved_id:
+            if requested_source == "local":
+                yield cls("", pricing_references_root(), {}, "local", b"{}")
+            else:
+                yield cls("", bundled_pricing_references_root(), {}, "bundled", b"{}")
+            return
         if requested_source in {"", "local"}:
-            with LocalPricingReferenceStore(resolved_id).locked() as store:
-                pack, _ = store.read()
+            store = LocalPricingReferenceStore(resolved_id)
+            with store.locked(create=False) as locked_store:
+                pack, _ = locked_store.read() if locked_store is not None else (None, None)
                 if exact:
                     if pack is None or pack.config.get("id") != resolved_id or not pack.catalog()["items"]:
                         yield None
@@ -18806,8 +18820,8 @@ def list_profiles() -> list[dict[str, Any]]:
 
 
 def list_local_pricing_references() -> list[dict[str, Any]]:
-    root = pricing_references_root().resolve()
     try:
+        root = pricing_references_root().resolve()
         candidates = {
             path.name for path in root.iterdir()
             if PROFILE_ID_RE.fullmatch(path.name) and path.is_dir()
@@ -33005,11 +33019,17 @@ def _run_quote_job(
         publication_patch = quote_session_patch_payload(payload)
         publication_draft_state = quote_session_draft_state(publication_patch)
     if quote_session_strict_revision_number(publication_draft_state.get("outputRevision"), -1) >= 0:
+        # Local and company job catalogues already carry the selected projection.
+        # Applying the legacy numeric conversion again would round exact orders.
+        pricing_digest = pricing_reference_catalog_digest(
+            pricing_snapshot_for_publication,
+            exact_order=True if selected_pricing.get("source") in {"local", "company"} else None,
+        )
         result["_publication_authority"] = {
             "pricing_reference": {
                 "id": selected_pricing.get("id") if selected_pricing.get("ok") else "",
                 "source": selected_pricing.get("source") if selected_pricing.get("ok") else "",
-                "digest": pricing_reference_catalog_digest(pricing_snapshot_for_publication),
+                "digest": pricing_digest,
             },
             "profile": {
                 "id": profile_identity_value(selected_profile_id, selected_profile_source),

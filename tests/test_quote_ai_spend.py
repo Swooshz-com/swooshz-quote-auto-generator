@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from tests.gateway_test_support import synthetic_configuration
 from tests.test_openrouter_gateway import RecordingTransport, completed, envelope
-from tests.test_webapp import QUOTE_GENERATOR_FIXTURE_ROOT, valid_payload, wait_for_job
+from tests.test_webapp import local_pricing_fixture_root, valid_payload, wait_for_job
 from webapp import ai_gateway, server
 from webapp.forensics import ForensicStore
 from webapp.internal_password_auth import InternalAuthPolicy
@@ -267,9 +267,10 @@ class QuoteAiSpendTest(unittest.TestCase):
             return {"status": "drafted", "source": "openai", "quote_basis": {}, "line_items": []}
 
         payload["quote_spend"] = {"session_id": "quote-test-other"}
+        pricing_root = self.enterContext(local_pricing_fixture_root())
         with (
             patch.object(server, "draft_quote_basis", side_effect=draft),
-            patch.object(server, "pricing_references_root", return_value=QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"),
+            patch.object(server, "pricing_references_root", return_value=pricing_root),
         ):
             started = server.create_job("draft", payload, requested_job_id=key)
             self.assertEqual(started.get("job_id"), key, started)

@@ -210,7 +210,12 @@ function startServer({ mockProvider = false, dataRoot = quoteDataRoot, logRoot }
         SQAG_LOCAL_PRICING_REFERENCES_ROOT: path.join(dataRoot, "pricing-references"),
         QUOTE_LOG_ROOT: logRoot,
       })
-    : { ...process.env, APP_MODE: "local", QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || quoteDataRoot };
+    : {
+        ...process.env,
+        APP_MODE: "local",
+        QUOTE_DATA_ROOT: process.env.QUOTE_DATA_ROOT || dataRoot,
+        SQAG_LOCAL_PRICING_REFERENCES_ROOT: path.join(dataRoot, "pricing-references"),
+      };
   runtimeEnv.SQAG_QUOTE_API_SERVICE_ENABLED = "false";
   runtimeEnv.SQAG_QUOTE_API_STAFF_TRANSPORT_ENABLED = "false";
   const server = spawn(
@@ -4705,20 +4710,21 @@ async function main() {
     }
   }
 
-  const browser = await chromium.launch({ headless: !options.headed });
-  const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
-  const page = await context.newPage();
+  let browser;
   const consoleProblems = [];
   const networkProblems = [];
-  page.on("console", (message) => {
-    if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
-  });
-  page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
-  context.on("response", (response) => {
-    if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
-  });
 
   try {
+    browser = await chromium.launch({ headless: !options.headed });
+    const context = await browser.newContext({ viewport: { width: 1365, height: 768 } });
+    const page = await context.newPage();
+    page.on("console", (message) => {
+      if (["error", "warning"].includes(message.type())) consoleProblems.push(`${message.type()}: ${message.text()}`);
+    });
+    page.on("pageerror", (error) => consoleProblems.push(`pageerror: ${error.message}`));
+    context.on("response", (response) => {
+      if (response.status() >= 400) networkProblems.push(`${response.status()} ${response.url()}`);
+    });
     await installMockProfiles(page);
     await verifyRecoveredTemplateOwnerFailsClosed(page);
     await verifyFreshPricingAuthorityInitializesBeforeCustomer(page);
@@ -5556,8 +5562,11 @@ async function main() {
       networkProblems,
     }, null, 2));
   } finally {
-    await browser.close();
-    await stopServer(serverInfo);
+    try {
+      await browser?.close();
+    } finally {
+      await stopServer(serverInfo);
+    }
   }
   // Keep real mocked-provider pricing and current XLSX coverage in the default CI path.
   if (!options.screenshots) await runG3PricingScope();

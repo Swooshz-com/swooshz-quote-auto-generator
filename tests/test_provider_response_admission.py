@@ -35,6 +35,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         self.enterContext(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(socket, "create_connection", side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(s.urllib.request, "urlopen", side_effect=AssertionError("NETWORK_DENIED")))
+        self.pricing_root = self.enterContext(existing.local_pricing_fixture_root())
 
     def admit(self, value):
         return s.admit_provider_quote_draft(value, require_confidence=True)
@@ -43,7 +44,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
-             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"):
+             mock.patch.object(s, "pricing_references_root", return_value=self.pricing_root):
             prompt = s.build_quote_draft_prompt(existing.valid_payload())
         for text in ("one unique stable id", "same id in its linked line_items source_basis_line_id",
                      "linked to exactly one physical basis line", "positive JSON numbers",
@@ -60,7 +61,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
-             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
+             mock.patch.object(s, "pricing_references_root", return_value=self.pricing_root), \
              mock.patch.object(s, "catalog_visual_image_entries_for_payload", return_value=[]), \
              mock.patch.object(s, "normalize_ai_draft", return_value={"ok": True}), \
              mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
@@ -84,7 +85,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
-             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
+             mock.patch.object(s, "pricing_references_root", return_value=self.pricing_root), \
              mock.patch.object(s, "catalog_visual_image_entries_for_payload", return_value=[]), \
              mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
             try:

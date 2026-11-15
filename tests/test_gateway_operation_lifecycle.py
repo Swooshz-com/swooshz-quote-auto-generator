@@ -27,7 +27,8 @@ class GatewayOperationLifecycleTest(unittest.TestCase):
         self.enterContext(mock.patch.object(socket.socket,"connect",side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(socket,"create_connection",side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(server,"profiles_root",return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"))
-        self.enterContext(mock.patch.object(server,"pricing_references_root",return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"))
+        pricing_root = self.enterContext(existing.local_pricing_fixture_root())
+        self.enterContext(mock.patch.object(server,"pricing_references_root",return_value=pricing_root))
         self.detail={"id":"synthetic-lifecycle-reference","source":"local","currency":"SGD","tax":{"label":"GST","rate":0},"items":copy.deepcopy(CATALOG)}
         self.detail["digest_sha256"]=server.pricing_reference_catalog_digest(self.detail)
         self.snapshot=server.PricingReferenceSnapshot(source="local",reference_id=self.detail["id"],digest=self.detail["digest_sha256"],currency="SGD",detail_json=json.dumps(self.detail))

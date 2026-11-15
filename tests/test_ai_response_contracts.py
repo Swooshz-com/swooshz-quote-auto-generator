@@ -108,10 +108,11 @@ class ContractDefinitionTest(unittest.TestCase):
 
     def test_real_prompt_uses_generated_strict_fields_without_changing_legacy_wording(self):
         existing = admission_support.existing
-        with mock.patch.dict(server.os.environ, existing.isolated_env(OPENROUTER_API_KEY='synthetic'), clear=True), \
+        with existing.local_pricing_fixture_root() as pricing_root, \
+             mock.patch.dict(server.os.environ, existing.isolated_env(OPENROUTER_API_KEY='synthetic'), clear=True), \
              mock.patch.object(server, 'read_dotenv_value', side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(server, 'profiles_root', return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT/'profiles'), \
-             mock.patch.object(server, 'pricing_references_root', return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT/'pricing-references'):
+             mock.patch.object(server, 'pricing_references_root', return_value=pricing_root):
             prompt = server.build_quote_draft_prompt(existing.valid_payload(), response_contract=contracts.DRAFT_SYNTHESIS)
         self.assertIn(contracts.DRAFT_SYNTHESIS.field_instructions(), prompt)
         self.assertNotIn('Omit analysis_findings', prompt)

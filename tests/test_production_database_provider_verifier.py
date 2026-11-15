@@ -252,11 +252,16 @@ class FakeLivePostgresConnection:
             if key in self.pricing_references:
                 raise RuntimeError("synthetic pricing collision")
             self.pricing_references[key] = {
+                "reference_id": reference_id,
                 "payload_json": payload_json,
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
             return FakeLivePostgresCursor(rowcount=1)
+        if normalized == "select reference_id, payload_json from sqag_pricing_references where workspace_id = ?":
+            return FakeLivePostgresCursor(
+                self._rows_for_workspace(self.pricing_references, params[0])
+            )
         if normalized.startswith("select payload_json from sqag_pricing_references"):
             workspace_id = params[0]
             if "reference_id = ?" in normalized:
