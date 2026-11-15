@@ -31,10 +31,12 @@ current programme parent, holder and holder epoch, specify allowed operations,
 and still be within their expiry time. A rehearsal makes no programme writes.
 The worker checks expiry before starting each operation. If the deadline
 passes during an operation, the worker keeps that operation and its receipt,
-stops before the next operation and files the order as refused. Retries skip
+stops before the next operation and files the order as stopped. Retries skip
 operations already recorded as complete. The worker removes a pending file
-only after it saves and reads back the result. The workflow summary reports
-counts. Order details and receipts stay in the private store.
+only after it saves and reads back the result. If removal is interrupted, a
+later pass preserves the verified result for that queued file and retries
+only removal, even after expiry. The workflow summary reports counts.
+Order details and receipts stay in the private store.
 
 Footer cleanup requires both App tokens and the refresh signal from the same
 commit. The worker withholds the signal when it waits for the lease, hits the
