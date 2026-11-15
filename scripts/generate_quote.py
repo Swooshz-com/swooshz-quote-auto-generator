@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Generate quotation XLSX files with optional PDF export.
 
-This script intentionally uses Python standard library only. It reads the
-structured pricing catalog by default and fills a preserved quote
-layout workbook through ZIP/XML updates so the customer-facing XLSX keeps the
-same styling, print setup, drawings, and pagination rules as the reference
-quotation.
+XLSX generation uses the Python standard library. It fills a quotation layout
+through ZIP/XML updates and preserves its styling, print setup and drawings.
+Optional native PDF export can use PDFium to check and remove a blank spill page.
 """
 
 from __future__ import annotations
@@ -16,10 +14,10 @@ import binascii
 import copy
 import csv
 import datetime as dt
+import hashlib
 import html
 import io
 import json
-import hashlib
 import math
 import os
 import posixpath
@@ -68,6 +66,7 @@ MAX_XLSX_COMPRESSION_RATIO = 200
 MAX_XLSX_COLUMNS = 16_384
 MAX_XLSX_ROWS = 1_048_576
 MAX_XLSX_ENTRIES = 4096
+MAX_PDF_PAGINATION_BYTES = 16 * 1024 * 1024
 XMLNS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 XMLNS_CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 XMLNS_DC = "http://purl.org/dc/elements/1.1/"
@@ -3853,7 +3852,7 @@ def powershell_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
         return None
     with tempfile.TemporaryDirectory(prefix="sqag-excel-") as temp_dir:
         conversion_path = Path(temp_dir) / xlsx_path.name
-        write_pdf_conversion_workbook(xlsx_path, conversion_path, normalize_fonts=False)
+        shutil.copyfile(xlsx_path, conversion_path)
         script = powershell_export_script(conversion_path, pdf_path)
         result = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
@@ -3888,82 +3887,8 @@ def libreoffice_candidates() -> list[str]:
     return result
 
 
-def pdf_first_page_drawing_end(
-    source: zipfile.ZipFile, sheet: ET.Element, page_end: int,
-) -> int | None:
-    """Return the last drawing row on the first page, or None if unknown."""
-    if any(sheet.find(f"{NS_MAIN}{tag}") is not None for tag in ("legacyDrawing", "oleObjects", "controls")):
-        return None
-    drawing = sheet.find(f"{NS_MAIN}drawing")
-    if drawing is None:
-        return 0
-    rels_name = "xl/worksheets/_rels/sheet1.xml.rels"
-    if rels_name not in source.namelist():
-        return None
-    relationships = ET.fromstring(read_bounded_xlsx_part(source, rels_name))
-    matches = [
-        rel for rel in relationships
-        if rel.get("Id") == drawing.get(f"{NS_REL}id")
-        and rel.get("Type") == f"{NS_REL[1:-1]}/drawing"
-        and rel.get("TargetMode", "Internal") == "Internal"
-    ]
-    if len(matches) != 1:
-        return None
-    target = matches[0].get("Target", "")
-    name = posixpath.normpath(target.lstrip("/") if target.startswith("/") else f"xl/worksheets/{target}")
-    if not name.startswith("xl/drawings/") or name not in source.namelist():
-        return None
-    drawing_root = ET.fromstring(read_bounded_xlsx_part(source, name))
-    last_row = 0
-    for anchor in drawing_root:
-        if anchor.tag != f"{NS_DRAWING}twoCellAnchor":
-            return None
-        start = anchor.findtext(f"{NS_DRAWING}from/{NS_DRAWING}row", "")
-        end = anchor.findtext(f"{NS_DRAWING}to/{NS_DRAWING}row", "")
-        if not start.isdecimal() or not end.isdecimal() or int(end) < int(start):
-            return None
-        # Drawing anchors use zero-based rows. Include the ending row
-        # conservatively, even when the anchor ends at its top edge.
-        if int(start) < page_end:
-            last_row = max(last_row, int(end) + 1)
-    return last_row
-
-
-def pdf_first_page_padding(source: zipfile.ZipFile, sheet: ET.Element) -> set[str]:
-    breaks = sheet.findall(f"{NS_MAIN}rowBreaks/{NS_MAIN}brk")
-    page_end = min((int(brk.attrib["id"]) for brk in breaks if brk.get("man") in {"1", "true"}), default=0)
-    if not page_end:
-        return set()
-    drawing_end = pdf_first_page_drawing_end(source, sheet, page_end)
-    if drawing_end is None:
-        return set()
-    payload = [
-        parse_cell_ref(cell.attrib["r"])
-        for cell in sheet.iter(f"{NS_MAIN}c") if ooxml_cell_has_payload(cell)
-    ]
-    last_occupied = max((row for row, _ in payload if row <= page_end), default=0)
-    for merge in sheet.findall(f"{NS_MAIN}mergeCells/{NS_MAIN}mergeCell"):
-        start, end = merge.attrib["ref"].split(":")
-        first_row, first_col = parse_cell_ref(start)
-        final_row, final_col = parse_cell_ref(end)
-        if first_row <= page_end and final_row > last_occupied and any(
-            first_row <= row <= final_row and first_col <= col <= final_col for row, col in payload
-        ):
-            last_occupied = final_row
-    last_occupied = max(last_occupied, drawing_end)
-    if not last_occupied:
-        return set()
-    # Empty first-page padding can overflow into a blank page before the break.
-    return {
-        row.attrib["r"] for row in sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row")
-        if last_occupied < int(row.attrib["r"]) <= page_end and row.get("hidden") not in {"1", "true"}
-    }
-
-
-def write_pdf_conversion_workbook(
-    xlsx_path: Path, conversion_path: Path, *, normalize_fonts: bool = True,
-) -> None:
-    """Prepare PDF layout and font defaults without changing the master."""
+def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> None:
+    """Make ambiguous PDF font defaults explicit without changing the master."""
     with zipfile.ZipFile(xlsx_path) as source:
         entries = source.infolist()
         names = [entry.filename for entry in entries]
@@ -3972,7 +3897,7 @@ def write_pdf_conversion_workbook(
         drawings: dict[str, bytes] = {}
         aliases: set[str] = set()
         for name in names:
-            if not normalize_fonts or not name.startswith("xl/drawings/") or not name.endswith(".xml"):
+            if not name.startswith("xl/drawings/") or not name.endswith(".xml"):
                 continue
             drawing_xml = read_bounded_xlsx_part(source, name)
             drawing = ET.fromstring(drawing_xml)
@@ -3984,23 +3909,12 @@ def write_pdf_conversion_workbook(
                 drawings[name] = drawing_xml
                 aliases.update(referenced)
         rich_text: dict[str, bytes] = {}
-        padding: set[str] = set()
-        padding_xml = b""
-        quote_sheet_name = "xl/worksheets/sheet1.xml"
         default_font: dict[str, str] = {}
         for name in names:
-            if not normalize_fonts and name != quote_sheet_name:
-                continue
             if name != "xl/sharedStrings.xml" and not (name.startswith("xl/worksheets/") and name.endswith(".xml")):
                 continue
             part_xml = read_bounded_xlsx_part(source, name)
             part = ET.fromstring(part_xml)
-            if name == quote_sheet_name:
-                padding = pdf_first_page_padding(source, part)
-                if padding:
-                    padding_xml = part_xml
-            if not normalize_fonts:
-                continue
             partial = [
                 props for container in part.iter()
                 if container.tag in {f"{NS_MAIN}is", f"{NS_MAIN}si"}
@@ -4069,17 +3983,8 @@ def write_pdf_conversion_workbook(
                     if alias in fonts:
                         node.setAttribute("typeface", fonts[alias])
                 replacements[name] = drawing.toxml(encoding="utf-8")
-        if padding:
-            rich_text.setdefault(quote_sheet_name, padding_xml)
         for name, part_xml in rich_text.items():
             with minidom.parseString(part_xml) as part:
-                if name == quote_sheet_name and padding:
-                    for row in part.getElementsByTagNameNS(NS_MAIN[1:-1], "row"):
-                        if row.getAttribute("r") in padding:
-                            row.setAttribute("hidden", "1")
-                if not normalize_fonts:
-                    replacements[name] = part.toxml(encoding="utf-8")
-                    continue
                 for container in part.getElementsByTagNameNS(NS_MAIN[1:-1], "is") + part.getElementsByTagNameNS(NS_MAIN[1:-1], "si"):
                     for run in container.childNodes:
                         if run.namespaceURI != NS_MAIN[1:-1] or run.localName != "r":
@@ -4147,8 +4052,187 @@ def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
     return None
 
 
+def pdf_overflow_text_anchors(xlsx_path: Path) -> tuple[set[str], set[str]] | None:
+    """Identify the two authored print sections on either side of the first break."""
+    try:
+        with zipfile.ZipFile(xlsx_path) as workbook:
+            sheet = ET.fromstring(read_bounded_xlsx_part(workbook, "xl/worksheets/sheet1.xml"))
+            book = ET.fromstring(read_bounded_xlsx_part(workbook, "xl/workbook.xml"))
+    except (KeyError, OSError, ValueError, ET.ParseError, zipfile.BadZipFile):
+        return None
+
+    sheets = book.findall(f"{NS_MAIN}sheets/{NS_MAIN}sheet")
+    breaks = sheet.findall(f"{NS_MAIN}rowBreaks/{NS_MAIN}brk")
+    if (
+        len(sheets) != 1 or sheets[0].get("name") != "Quotation"
+        or len(breaks) != 1
+        or breaks[0].attrib != {"id": str(FIRST_PRINT_PAGE_END_ROW), "max": "16383", "man": "1"}
+        or sheet.find(f"{NS_MAIN}colBreaks") is not None
+    ):
+        return None
+
+    print_names = book.findall(f"{NS_MAIN}definedNames/{NS_MAIN}definedName")
+    if any(name.get("name") == "_xlnm.Print_Titles" for name in print_names):
+        return None
+    areas = [name for name in print_names if name.get("name") == "_xlnm.Print_Area"]
+    if len(areas) != 1 or areas[0].get("localSheetId") != "0":
+        return None
+    area = re.fullmatch(r"Quotation!\$A\$1:\$I\$([1-9][0-9]{0,6})", areas[0].text or "")
+    if area is None:
+        return None
+    last_row = int(area[1])
+    if not FIRST_PRINT_PAGE_END_ROW < last_row < CONTINUATION_PAGE_START_ROW + CONTINUATION_PAGE_HEIGHT:
+        return None
+
+    first_text, next_text = set(), set()
+    last_first_payload = 0
+    for row in sheet.findall(f"{NS_MAIN}sheetData/{NS_MAIN}row"):
+        row_id = row.get("r", "")
+        if not re.fullmatch(r"[1-9][0-9]{0,6}", row_id):
+            return None
+        number = int(row_id)
+        if number > last_row or row.get("hidden") in {"1", "true"}:
+            continue
+        on_first = number <= FIRST_PRINT_PAGE_END_ROW
+        for cell in row.findall(f"{NS_MAIN}c"):
+            if not re.fullmatch(r"[A-I]" + row_id, cell.get("r", "")):
+                continue
+            if on_first and ooxml_cell_has_payload(cell):
+                last_first_payload = max(last_first_payload, number)
+            inline = cell.find(f"{NS_MAIN}is")
+            if inline is not None:
+                value = "".join(node.text or "" for node in inline.iter(f"{NS_MAIN}t"))
+                value = " ".join(value.casefold().split())
+                if len(value) >= 4:
+                    (first_text if on_first else next_text).add(value)
+    first_only, next_only = first_text - next_text, next_text - first_text
+    return (first_only, next_only) if last_first_payload < FIRST_PRINT_PAGE_END_ROW and first_only and next_only else None
+
+
+def pdf_page_export_snapshot(page, pdfium) -> tuple[str, tuple, bytes, bool]:
+    width, height = page.get_size()
+    if not (0 < width <= 1440 and 0 < height <= 1440):
+        raise ValueError("Unsupported PDF page size for pagination.")
+    textpage = page.get_textpage()
+    try:
+        text = textpage.get_text_range()
+    finally:
+        textpage.close()
+    bitmap = page.render(scale=1, force_bitmap_format=pdfium.raw.FPDFBitmap_BGRA)
+    try:
+        pixels = bytes(bitmap.buffer)
+        white = pixels.count(255) == len(pixels)
+        geometry = (page.get_size(), page.get_bbox(), page.get_rotation())
+        return text, geometry, hashlib.sha256(pixels).digest(), white
+    finally:
+        bitmap.close()
+
+
+def pdfium_flat_page_ids(data: bytes) -> list[bytes]:
+    # PDFium's full save expands object streams. Admit its flat, zero-generation
+    # page tree only, so external references to the removed page can be detected.
+    if len(data) > MAX_PDF_PAGINATION_BYTES or re.search(
+        rb"/(?:ObjStm|OpenAction|AA|Names|Dests|Outlines|PageLabels|OCProperties|AcroForm|"
+        rb"Annots|Perms|Encrypt|Collection|PrintPageRange|Threads)(?=[\x00\s/<>\[\]()%])", data
+    ):
+        return []
+    trees = re.findall(rb"(?m)^\d+ 0 obj\r?\n<</Count (\d+)/Kids\[([ 0-9R]+)\][^\r\n]*?/Type/Pages>>\r?$", data)
+    if len(trees) != 1:
+        return []
+    count, kids = trees[0]
+    ids = re.findall(rb"([1-9][0-9]*) 0 R", kids)
+    return ids if count == str(len(ids)).encode("ascii") and len(set(ids)) == len(ids) else []
+
+
+def remove_blank_pdf_overflow(pdf_path: Path, anchors: tuple[set[str], set[str]]) -> None:
+    """Keep the native bytes unless page two is proven to be incidental overflow."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return
+
+    try:
+        with pdf_path.open("rb") as export:
+            original = export.read(MAX_PDF_PAGINATION_BYTES + 1)
+        if len(original) > MAX_PDF_PAGINATION_BYTES:
+            return
+        native = pdfium.raw
+        with pdfium.PdfDocument(original) as document:
+            if (
+                len(document) != 3 or not native.FPDF_DocumentHasValidCrossReferenceTable(document)
+                or next(document.get_toc(), None) is not None
+            ):
+                return
+            with_pages = []
+            for index in (1, 0, 2):
+                page = document[index]
+                try:
+                    if native.FPDFPage_GetAnnotCount(page) != 0:
+                        return
+                    if index == 1 and native.FPDFPage_CountObjects(page) != 0:
+                        return
+                    snapshot = pdf_page_export_snapshot(page, pdfium)
+                finally:
+                    page.close()
+                with_pages.append(snapshot)
+            blank, first, continuation = with_pages
+            if blank[0] or not blank[3]:
+                return
+            first_text = " ".join(first[0].casefold().split())
+            next_text = " ".join(continuation[0].casefold().split())
+            if not all(
+                any(value in expected and value not in other for value in group)
+                for group, expected, other in zip(anchors, (first_text, next_text), (next_text, first_text))
+            ):
+                return
+
+            with io.BytesIO() as expanded:
+                document.save(expanded, flags=native.FPDF_NO_INCREMENTAL)
+                data = expanded.getvalue()
+            page_ids = pdfium_flat_page_ids(data)
+            if len(page_ids) != 3:
+                return
+            removed_id = page_ids[1]
+            ref_pattern = rb"(?<![0-9.])" + removed_id + rb"\s+0\s+R\b"
+            if len(re.findall(ref_pattern, data)) != 1:
+                return
+            blank_dictionary = re.search(rb"(?m)^" + removed_id + rb" 0 obj\r?\n(<</[^\r\n]+)\r?$", data)
+            if blank_dictionary is None or re.search(rb"/StructParents?\b", blank_dictionary[1]):
+                return
+
+            metadata = document.get_metadata_dict()
+            tagged = document.is_tagged()
+            document.del_page(1)
+            with io.BytesIO() as output:
+                document.save(output, flags=native.FPDF_NO_INCREMENTAL)
+                corrected = output.getvalue()
+
+        if pdfium_flat_page_ids(corrected) != [page_ids[0], page_ids[2]]:
+            return
+        with pdfium.PdfDocument(corrected) as document:
+            if len(document) != 2 or document.get_metadata_dict() != metadata or document.is_tagged() != tagged:
+                return
+            for index, expected in enumerate((first, continuation)):
+                page = document[index]
+                try:
+                    if pdf_page_export_snapshot(page, pdfium) != expected:
+                        return
+                finally:
+                    page.close()
+        with tempfile.TemporaryDirectory(prefix="sqag-pdf-", dir=pdf_path.parent) as scratch:
+            candidate = Path(scratch) / pdf_path.name
+            candidate.write_bytes(corrected)
+            candidate.replace(pdf_path)
+    except (OSError, ValueError, pdfium.PdfiumError):
+        # A failed inspection or rewrite must leave the valid native export in place.
+        return
+
+
 def export_layout_pdf(xlsx_path: Path, pdf_path: Path) -> str | None:
-    return libreoffice_pdf_export(xlsx_path, pdf_path) or powershell_pdf_export(xlsx_path, pdf_path)
+    status = libreoffice_pdf_export(xlsx_path, pdf_path) or powershell_pdf_export(xlsx_path, pdf_path)
+    if status and (anchors := pdf_overflow_text_anchors(xlsx_path)):
+        remove_blank_pdf_overflow(pdf_path, anchors)
+    return status
 
 
 def pdf_date_text(value: str) -> str:
