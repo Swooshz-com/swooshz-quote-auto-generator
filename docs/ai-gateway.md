@@ -111,7 +111,12 @@ Nullable fields use null, and empty lists use `[]`.
 Pricing import accepts equivalent whole-number JSON forms such as `1`, `1.0`
 and `1e0` for category order, item order and source row index. It checks those
 numbers exactly before converting them to integers. Fractions are rejected
-even when they would round to a whole number.
+even when they would round to a whole number. The import preview, row editor,
+and save endpoint preserve these orders as exact integers on the wire. Source
+row indices outside the supplied rows use the existing positional fallback.
+Existing catalogue digests keep their original projection. A new save that
+needs exact order arithmetic records that choice in its internal revision
+while preserving the public numeric fields and catalogue filenames.
 
 Matching metadata must return exactly one item for each ID in the requested
 batch. The application applies enrichment only after every batch passes.

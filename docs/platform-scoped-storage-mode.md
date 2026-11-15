@@ -55,6 +55,21 @@ object backend and safe workspace-owned metadata in the database; it must not
 fall back to local artifacts or database BLOB artifacts when the provider is
 missing, incomplete, unauthorized, or failing.
 
+## Local pricing reference saves
+
+The app prepares a complete pricing reference beside its current pack. Its
+per-pack lock covers preparation, publication, and any interrupted save
+recovery. A save takes effect when the complete new pack moves into place.
+An interruption before that point leaves the previous pack or restores it at
+the next app access. After publication, the app keeps the new pack and retries
+cleanup of its old copy if needed. Corrupt storage returns a support reference.
+
+The app uses the same lock for pricing detail, lists, export and quote
+snapshots. Quote generation uses its own copy of the selected catalogue.
+During a rollout, stop any older app writer before using the new save path.
+Direct filesystem tools do not participate in the lock. Process-exit recovery
+is covered by tests. Power-loss durability depends on the filesystem.
+
 ## Migration
 
 SQLite remains the local-UAT migration path. Review the migrations, then apply

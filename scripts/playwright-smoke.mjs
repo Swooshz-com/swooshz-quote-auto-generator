@@ -1808,8 +1808,8 @@ async function installMockProfiles(page) {
   });
 }
 
-async function saveSmokePricingReference(page, internalCost) {
-  return page.evaluate(async ({ internalCost }) => postJson("/api/settings/pricing-references", {
+async function saveSmokePricingReference(page, internalCost, updateExisting) {
+  return page.evaluate(async ({ internalCost, updateExisting }) => postJson("/api/settings/pricing-references", {
     id: "synthetic-exhibition-fixture-pricing",
     label: "Synthetic Exhibition Fixture Pricing",
     source: "local",
@@ -1824,9 +1824,9 @@ async function saveSmokePricingReference(page, internalCost) {
       markup_multiplier: 1.5,
       remarks: "Synthetic smoke fixture row",
     }],
-    update_existing: true,
-    editing_reference_id: "synthetic-exhibition-fixture-pricing",
-  }), { internalCost });
+    update_existing: updateExisting,
+    editing_reference_id: updateExisting ? "synthetic-exhibition-fixture-pricing" : "",
+  }), { internalCost, updateExisting });
 }
 
 function g3PricingItems(multiplier = 1) {
@@ -2247,7 +2247,7 @@ async function verifyServerPricingReferenceReviewDurability(page) {
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.locator("#quoteDashboardPanel").waitFor({ state: "visible", timeout: 15000 });
     await page.waitForFunction(() => state.isBooting === false, null, { timeout: 15000 });
-    const savedA = await saveSmokePricingReference(page, 10);
+    const savedA = await saveSmokePricingReference(page, 10, false);
     if (!savedA.ok || savedA.data?.status !== "saved") {
       throw new Error(`Could not establish smoke pricing catalogue A: ${JSON.stringify(savedA)}.`);
     }
@@ -2323,7 +2323,7 @@ async function verifyServerPricingReferenceReviewDurability(page) {
       throw new Error(`Catalogue A quote was not established with the expected authority: ${JSON.stringify(established)}.`);
     }
 
-    const savedB = await saveSmokePricingReference(page, 11);
+    const savedB = await saveSmokePricingReference(page, 11, true);
     if (!savedB.ok || savedB.data?.status !== "saved") {
       throw new Error(`Could not switch smoke pricing catalogue to B: ${JSON.stringify(savedB)}.`);
     }
@@ -2373,7 +2373,7 @@ async function verifyServerPricingReferenceReviewDurability(page) {
       throw new Error(`The server session did not persist the review and saved A basis: ${JSON.stringify(persisted)}.`);
     }
 
-    const restoredA = await saveSmokePricingReference(page, 10);
+    const restoredA = await saveSmokePricingReference(page, 10, true);
     if (!restoredA.ok || restoredA.data?.status !== "saved") {
       throw new Error(`Could not restore smoke pricing catalogue A: ${JSON.stringify(restoredA)}.`);
     }
@@ -3695,16 +3695,15 @@ async function startSyntheticGatewayProvider() {
           proposal: {
             message: `Synthetic server-backed proposal for: ${editRequest}`,
             replacement_line: { text: replacements.get(editRequest), confidence: 93 },
-            quote_basis_sections: [{ id: "provider-rewrite", lines: [{ text: "must be ignored" }] }],
-            line_items: [{ description: "provider rewrite must be ignored" }],
           },
         });
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({
+        const body = JSON.stringify({
           id: `synthetic-${requests.length}`,
           model: payload.model, status: "completed",
           output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: content }] }],
-        }));
+        });
+        response.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+        response.end(body);
       } catch (error) {
         response.writeHead(500, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: { message: String(error?.message || error) } }));
@@ -3925,6 +3924,8 @@ async function run573LoadedAppOnce(runIndex) {
           }
         }
       }
+      // Start a normal draft identity before constructing a proposal bound to it.
+      ensureClientQuoteSessionId();
       const run586LosslessText = "\r\n  lead\t  middle  \rtrail  \r\n";
       const run586ExpectedText = "\n  lead\t  middle  \ntrail  \n";
       state.quoteBasisSections = canonicalQuoteBasisSections([{
@@ -4006,8 +4007,7 @@ async function run573LoadedAppOnce(runIndex) {
           match_terms: ["selected panel"],
           object_families: ["panel"],
         }],
-        update_existing: true,
-        editing_reference_id: run589ReferenceId,
+        update_existing: false,
       });
       if (!run589ReferenceSave.ok || !["saved", "unchanged"].includes(run589ReferenceSave.data?.status)) {
         throw new Error(`Run-589 pricing reference save failed: ${JSON.stringify(run589ReferenceSave.data)}.`);
@@ -4036,6 +4036,10 @@ async function run573LoadedAppOnce(runIndex) {
         size: 68,
         data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
       });
+      const run589Session = await saveCurrentQuoteSession({ includeDraftState: true });
+      if (run589Session?.session_id !== state.quoteSessionId) {
+        throw new Error("Run-589 could not save the quote used for the provider job.");
+      }
       const run589ExpectedUnrelatedText = "\n  lead\t  middle  \ntrail  \n";
       const run589InitialSections = () => canonicalQuoteBasisSections([{
         id: "run589-target",
@@ -4244,7 +4248,7 @@ async function run573LoadedAppOnce(runIndex) {
           ["session", () => { state.quoteSessionId = `${originalSessionId || "quote-run589"}-stale`; }, () => { state.quoteSessionId = originalSessionId; }],
           ["revision", () => { state.outputRevision = originalRevision + 1; }, () => { state.outputRevision = originalRevision; }],
           ["map", () => { state.quoteBasis = { ...originalBasis, "run589-target": "Confirm: stale map" }; }, () => { state.quoteBasis = originalBasis; }],
-          ["basis", () => { state.quoteBasisSections = cloneQuoteBasisSections(originalSections); state.quoteBasisSections[1].lines[0].metadata.keep = false; state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections); }, () => { state.quoteBasisSections = originalSections; state.quoteBasis = originalBasis; }],
+          ["basis", () => { state.quoteBasisSections = cloneQuoteBasisSections(originalSections); state.quoteBasisSections[1].lines[0].admitted_metadata.keep = false; state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections); }, () => { state.quoteBasisSections = originalSections; state.quoteBasis = originalBasis; }],
           ["target", () => { state.quoteBasisSections = cloneQuoteBasisSections(originalSections); state.quoteBasisSections[0].lines[0].text = "Different selected target"; state.quoteBasis = quoteBasisFromSections(state.quoteBasisSections); }, () => { state.quoteBasisSections = originalSections; state.quoteBasis = originalBasis; }],
         ];
         for (const [label, mutate, restore] of staleCases) {
@@ -4291,10 +4295,21 @@ async function run573LoadedAppOnce(runIndex) {
       }, runIndex);
     } catch (error) {
       const serverLogRoot = path.join(parent, "server-log");
-      const logNames = await fs.readdir(serverLogRoot).catch(() => []);
-      const logExcerpts = await Promise.all(logNames.slice(-5).map(async (name) => {
+      const logNames = await fs.readdir(serverLogRoot, { recursive: true }).catch(() => []);
+      const logExcerpts = await Promise.all(logNames.filter((name) => name.endsWith(".jsonl")).slice(-5).map(async (name) => {
         const content = await fs.readFile(path.join(serverLogRoot, name), "utf8").catch(() => "");
-        return `${name}:\n${content.slice(-4000)}`;
+        return content.trim().split("\n").slice(-10).flatMap((line) => {
+          try {
+            const { event, details = {} } = JSON.parse(line);
+            return JSON.stringify({
+              event, status: details.status, reason: details.reason,
+              error_reference: details.error_reference, error_type: details.error_type,
+              failure_category: details.failure_category, response_contract_reason: details.response_contract_reason,
+            });
+          } catch {
+            return [];
+          }
+        }).join("\n");
       }));
       throw new Error([
         String(error?.message || error),
@@ -4326,8 +4341,7 @@ async function run573LoadedAppOnce(runIndex) {
           match_terms: ["catalog control row"],
           object_families: ["control"],
         }],
-        update_existing: true,
-        editing_reference_id: referenceId,
+        update_existing: false,
       });
       if (!saved.ok || !["saved", "unchanged"].includes(saved.data?.status)) {
         throw new Error(`Exact pricing reference save failed: ${JSON.stringify(saved.data)}.`);
