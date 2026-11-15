@@ -43958,6 +43958,10 @@ main().catch((error) => {
             (f"Nobody has verified the dimensions for {west}", {west}),
             ("It is unclear whether they have been verified", {east}),
             ("We do not know whether the surveyor verified them", {east}),
+            ("We do not know yet whether the surveyor verified them", {east}),
+            ("We are still not sure whether they have been verified", {east}),
+            ("It still remains uncertain whether they have been verified", {east}),
+            ("It was unclear whether they had been verified", set()),
             (f"It is unclear whether the dimensions for {west} were verified", {west}),
             ("It is unclear whether the report has been verified", set()),
             ("Drawing and report (they remain unverified) were sent", set()),
@@ -43997,6 +44001,19 @@ main().catch((error) => {
             ):
                 with self.subTest(clause=clause):
                     self.assertEqual(webapp.area_qualification_scopes(clause, {east}, patterns), expected)
+
+    def test_area_comparison_notes_share_verification_boundaries(self):
+        east, west = "east flooring", "west flooring"
+        patterns = webapp.area_scope_patterns({east, west})
+        dimensions = f"the dimensions for {west}"
+        for clause, expected in (
+            (f"between 9 and 10 am nobody has verified {dimensions}", {west}),
+            (f"nobody who attended and inspected the site has verified {dimensions}", {west}),
+            (f"the surveyor who attended and did not verify {dimensions} filed the report", set()),
+            (f"the surveyor who attended and inspected the site verified {dimensions}", set()),
+        ):
+            with self.subTest(clause=clause):
+                self.assertEqual({claim.scope for claim in webapp.area_member_claims(clause, {east}, patterns)}, expected)
 
     def test_area_length_conflicts_require_a_distinct_source_heading(self):
         west, east = "carpet tile west", "carpet tile east"
@@ -44935,8 +44952,40 @@ main().catch((error) => {
             (f"{checked} We sent drawing and report (they remain unverified).", {"east", "west"}, (374.20, 407.88)),
             (f"{checked} By 09:30 nobody has verified them.", {"west"}, (230.20, 250.92)),
             (f"{checked} Between 9 am and 10 am nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} Between 9 and 10 am nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} From 9 am to 10 nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} Between 9 and 10:30 nobody has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} From 9 to 10 am the surveyor has verified them.", {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} Between 9 and 10 sample boards were inspected while the report remained unverified.",
+             {"east", "west"}, (374.20, 407.88)),
             (f"{checked} The surveyor who met the installer who spoke to the foreman has not verified them.",
              {"west"}, (230.20, 250.92)),
+            (f"{checked} Nobody who attended and inspected the site has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} The surveyor who attended and checked the drawing has not verified them.",
+             {"west"}, (230.20, 250.92)),
+            (f"{checked} The surveyor who checked the report and did not verify the drawing has verified them.",
+             {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} The surveyor whom we met at the briefing has not verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} The surveyor whom our team had met did not verify them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} The surveyor whom we did not brief has verified them.", {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} The surveyor who attended and never verified them left early.", {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} We sent the report. The surveyor who checked it has not verified them.",
+             {"west"}, (230.20, 250.92)),
+            (f"{checked} The surveyor who attended and did not verify the dimensions for {east} filed the report.",
+             {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} It is still unclear whether they have been verified.", {"west"}, (230.20, 250.92)),
+            (f"{checked} We do not yet know whether they have been verified.", {"west"}, (230.20, 250.92)),
+            (f"{checked} Between 9 and 10 am it remains uncertain whether the surveyor who attended and inspected "
+             "the site has verified them.", {"west"}, (230.20, 250.92)),
+            (f"{checked} We sent the drawings. It remains uncertain whether they have been verified.",
+             {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} It is now clear that they have been verified.", {"east", "west"}, (374.20, 407.88)),
+            (f"The dimensions for {east} were checked plus the dimensions for {west} (remain unverified).",
+             {"east"}, (172.60, 188.13)),
+            (f"The dimensions for {east} plus the dimensions for {west} remain unverified.", set(), (28.60, 31.17)),
+            (f"The dimensions for {east} plus the dimensions for {west} were verified.",
+             {"east", "west"}, (374.20, 407.88)),
+            (f"{checked} We sent the drawing plus the report (they remain unverified).", {"east", "west"}, (374.20, 407.88)),
         )
         config = synthetic_configuration(credential="synthetic")
         with (mock.patch.dict(os.environ, self._ledger_env()),
@@ -45226,10 +45275,10 @@ main().catch((error) => {
             payload = self._ledger_draft_payload(session_id)
             old_sources = {"Quote notes": [
                 statement, disputed, f"{disputed} (provisional in drawing)",
-                f"We checked the dimensions for {specifications[0][1]}. As of yet nobody has verified them.",
+                f"We checked the dimensions for {specifications[0][1]}. Between 9 and 10 am nobody has verified them.",
             ]}
-            # Reproduce a v29 grant issued before the actor's polarity was read.
-            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 29),
+            # Reproduce a v30 grant issued after the interval split hid the actor.
+            with (mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 30),
                   mock.patch.object(webapp, "area_qualification_scopes", return_value=set())):
                 old_draft = self._ledger_draft(runner, headers, payload, provider, measurement_sources=old_sources)
             stale = self._ledger_carry_draft(payload, old_draft)
@@ -45260,11 +45309,11 @@ main().catch((error) => {
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 # Save before any current-version request can demote the old signed grant.
-                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 29):
+                with mock.patch.object(webapp, "AREA_EVIDENCE_CLAIM_VERSION", 30):
                     self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
-                    saved_v29 = webapp.read_quote_session_metadata(session_id)
-                    saved_floor = saved_v29["pricing_ledger"]["rows"]["floor"]
-                    self.assertEqual(saved_floor["measurement"]["claim_version"], 29)
+                    saved_v30 = webapp.read_quote_session_metadata(session_id)
+                    saved_floor = saved_v30["pricing_ledger"]["rows"]["floor"]
+                    self.assertEqual(saved_floor["measurement"]["claim_version"], 30)
                     self.assertEqual(saved_floor["grant"]["state"], "live")
                 for path in ("seal", "ledger"):
                     with self.subTest(path=path):
@@ -45273,7 +45322,7 @@ main().catch((error) => {
                         self.assertEqual(blocked["status"], "needs_confirmation", blocked.get("errors"))
                         self.assertFalse(list((root / path).rglob("quotation.xlsx")))
                         if path == "seal":
-                            webapp.write_quote_session_metadata(saved_v29)
+                            webapp.write_quote_session_metadata(saved_v30)
                             stale.pop("pricing_analysis_seal")
                             stale_state["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
                 reopened = self.http_json(runner, "GET", f"/api/quote-sessions/{session_id}", headers=headers)
@@ -45298,7 +45347,7 @@ main().catch((error) => {
                 reset_values = [row for _, row in read_first_sheet_rows_with_numbers(reset_xlsx)]
                 self.assertFalse(any("24 sqm" in row for row in reset_values))
                 self.assertTrue(any("2 nos" in row and 28.60 in row for row in reset_values))
-                webapp.write_quote_session_metadata(saved_v29)
+                webapp.write_quote_session_metadata(saved_v30)
                 self.assertEqual(self._ledger_post(runner, headers, "/api/quote-sessions", stale)["status"], 200)
                 stale_floor = webapp.read_quote_session_metadata(session_id)["pricing_ledger"]["rows"]["floor"]
                 self.assertEqual(stale_floor["measurement"], {"disposition": "review"})
@@ -45334,6 +45383,7 @@ main().catch((error) => {
                             self.assertIn(24 * price, floor_values)
             for pending in (
                 old_sources["Quote notes"][-1],
+                f"We checked the dimensions for {specifications[0][1]}. As of yet nobody has verified them.",
                 f"{statement} (we checked the dimensions for {specifications[0][1]}. "
                 "(Those dimensions remain unverified))",
             ):
