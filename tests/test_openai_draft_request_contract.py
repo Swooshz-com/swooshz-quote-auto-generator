@@ -916,11 +916,17 @@ class DraftRequestContractTest(unittest.TestCase):
     def test_pricing_openai_routes_send_luna_high_and_preserve_json_schema(self):
         cases = (
             (
+                "pricing_import_v1",
                 server.request_openai_pricing_catalog_import,
                 ("synthetic.csv", {"headers": [], "rows": []}, {"label": "GST", "rate": 0}),
-                {"items": [{"section": "Synthetic", "description": "Synthetic panel", "unit_hint": "sqm", "internal_cost": 10, "markup_multiplier": 1.5}]},
+                {"currency": "SGD", "items": [{
+                    "section": "Synthetic", "description": "Synthetic panel", "unit_hint": "sqm",
+                    "internal_cost": 10, "markup_multiplier": 1.5, "remarks": [], "aliases": [],
+                    "category_order": 1, "item_order": 1, "source_row_index": None, "warning": None, "status": None,
+                }]},
             ),
             (
+                "pricing_metadata_v1",
                 server.request_openai_pricing_catalog_metadata,
                 ("synthetic.csv", [{"id": "synthetic-row", "description": "Synthetic panel"}]),
                 {"items": [{"id": "synthetic-row", "match_terms": ["synthetic panel"], "object_families": ["synthetic_panel"]}]},
@@ -930,7 +936,7 @@ class DraftRequestContractTest(unittest.TestCase):
             "OPENROUTER_PRICING_IMPORT_MODEL": "openai/gpt-6-luna",
             "OPENROUTER_PRICING_METADATA_MODEL": "openai/gpt-6-luna",
         }
-        for request_fn, args, output in cases:
+        for contract_name, request_fn, args, output in cases:
             with self.subTest(route=request_fn.__name__):
                 self.send.reset_mock()
                 self.send.side_effect = None
@@ -942,7 +948,10 @@ class DraftRequestContractTest(unittest.TestCase):
                 body = json.loads(request.data)
                 self.assertEqual(body["model"], "openai/gpt-6-luna")
                 self.assertEqual(body["reasoning"], {"effort": "high"})
-                self.assertEqual(parsed, output)
+                self.assertEqual(body["text"]["format"]["name"], contract_name)
+                expected = {**output, "items": [{key: value for key, value in row.items() if value is not None}
+                                                 for row in output["items"]]}
+                self.assertEqual(parsed, expected)
 
 
     def test_invalid_small_route_models_reject_before_provider_transport(self):

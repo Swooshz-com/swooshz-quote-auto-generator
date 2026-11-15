@@ -11118,6 +11118,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_pricing_reference_import_logs_timing_for_messy_ai_path(self):
         raw = "Item,Price\nWhite painted walling per sqm,50\n".encode("utf-8")
         parsed = {
+            "currency": None,
             "items": [{
                 "section": "Structures",
                 "description": "White painted walling",
@@ -11126,6 +11127,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "markup_multiplier": 1.7,
                 "remarks": ["painted wall"],
                 "aliases": ["white wall"],
+                "category_order": 1, "item_order": 1, "source_row_index": 1,
+                "warning": None, "status": None,
             }]
         }
         with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
@@ -11449,11 +11452,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Synthetic Floors", prompt)
         self.assertIn("Synthetic Rentals", prompt)
         self.assertIn("Only create a new section", prompt)
-        self.assertIn("Preserve the source category order and source row order.", prompt)
+        self.assertIn("Preserve the source category and item order as positive integers.", prompt)
         self.assertIn("assign category_order by first-seen section in the source rows and item_order by source row order", prompt)
         self.assertIn("Clean obvious spelling, OCR, spacing, and unit wording errors only when the workbook itself makes the correction unambiguous", prompt)
         self.assertIn("Do not paraphrase, market-polish, simplify, or rename technical catalog descriptions", prompt)
-        self.assertIn("Each item must include section, description, unit_hint, internal_cost, markup_multiplier, remarks, aliases", prompt)
+        self.assertIn("Use JSON numbers for internal_cost and markup_multiplier", prompt)
+        self.assertIn("one-based position of the first contributing entry in the bounded rows array", prompt)
         self.assertIn("Do not generate match_terms or object_families in this import step", prompt)
         self.assertIn("Do not invent a fixed taxonomy", prompt)
         self.assertIn("Preserve source placement", prompt)
@@ -14653,7 +14657,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         return payload
 
     def _gateway_import_output(self):
-        return {"currency":"SGD", "items":[{"section":"Floor Design", "description":"sqm needle punch carpet in colour", "unit_hint":"sqm", "internal_cost":"0", "markup_multiplier":"1", "remarks":"", "aliases":[]}]}
+        return {"currency": "SGD", "items": [{
+            "section": "Floor Design", "description": "sqm needle punch carpet in colour", "unit_hint": "sqm",
+            "internal_cost": 0, "markup_multiplier": 1, "remarks": [], "aliases": [],
+            "category_order": 1, "item_order": 1, "source_row_index": None, "warning": None, "status": None,
+        }]}
 
     def test_gateway_answer_and_quote_edit_use_explicit_answer_route(self):
         for question in ("What does this mean?", "Include all lighting and electrical lines"):
@@ -14708,7 +14716,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertEqual(body["model"],model);self.assertEqual(body["reasoning"],{"effort":"high"})
             self.assertEqual(body["input"][0]["role"],"user")
             self.assertIn("JSON",body["input"][0]["content"][0]["text"])
-            self.assertEqual(result,parsed)
+            self.assertEqual(body["text"]["format"]["name"], suffix.lower() + "_v1")
+            self.assertIs(body["text"]["format"]["strict"], True)
+            expected = {**parsed, "items": [{key: value for key, value in row.items() if value is not None}
+                                             for row in parsed["items"]]}
+            self.assertEqual(result, expected)
 
     def test_gateway_pricing_timeout_is_explicit_and_failure_does_not_fallback(self):
         values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_REQUEST_TIMEOUT_SECONDS":"17"})
@@ -41574,6 +41586,129 @@ main().catch((error) => {
         self.assertIn("ai metadata row-1", catalog["items"][0]["match_terms"])
         self.assertIn("ai_family", catalog["items"][0]["object_families"])
 
+    def test_strict_pricing_import_and_metadata_through_upload_and_save_endpoints(self):
+        import_model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
+        metadata_model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_METADATA_MODEL"]
+        catalogue = Path(self._test_data_root) / "strict-pricing"
+        source = b'Item,Price\n"Synthetic panel; Prices are not inclusive of trim",24\nSynthetic rail,40\n'
+        upload = {"filename": "synthetic-pricing.csv", "currency": "MYR",
+                  "data_url": "data:text/csv;base64," + base64.b64encode(source).decode("ascii")}
+        panel = {"section": "Structures", "description": "Synthetic panel", "unit_hint": "sqm",
+                 "internal_cost": 24, "markup_multiplier": 1.5, "remarks": ["Prices are not inclusive of trim"],
+                 "aliases": [], "category_order": 1, "item_order": 1, "source_row_index": 1,
+                 "warning": None, "status": None}
+        rail = {**panel, "description": "Synthetic rail", "unit_hint": "m", "internal_cost": 40,
+                "remarks": [], "item_order": 2, "source_row_index": 2}
+        valid_import = {"currency": "USD", "items": [rail, panel]}
+        cases = {
+            "malformed": '{"items":[',
+            "extra": json.dumps({"currency": "USD", "items": [{**panel, "match_terms": ["synthetic"]}]}),
+            "missing": json.dumps({"currency": "USD", "items": [{k: v for k, v in panel.items() if k != "internal_cost"}]}),
+            "duplicate": '{"currency":null,"items":[],"items":[]}',
+            "valid": json.dumps(valid_import),
+        }
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin"}, clear=False),
+            mock.patch.object(webapp, "pricing_references_root", return_value=catalogue),
+            mock.patch.object(webapp, "MAX_PRICING_METADATA_BATCH_ITEMS", 1),
+            mock.patch.object(webapp, "write_local_log") as logs,
+            LocalRunnerServer() as runner,
+        ):
+            with urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3) as response:
+                session = json.load(response)
+            endpoint = "/api/settings/pricing-references"
+
+            def post(path, payload):
+                target = urllib.parse.urlsplit(runner.base_url)
+                connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+                try:
+                    connection.request("POST", endpoint + path, json.dumps(payload), {
+                        "Content-Type": "application/json", "Origin": runner.base_url,
+                        session["csrf_header"]: session["csrf_token"],
+                    })
+                    response = connection.getresponse()
+                    result = json.load(response)
+                    self.assertEqual(response.status, 200, result)
+                    return result
+                finally:
+                    connection.close()
+
+            def provider_reply(model, text):
+                return FixtureHttpResponse(responses_envelope(model, text))
+
+            for case, text in cases.items():
+                with self.subTest(operation="import", case=case), mock.patch.object(
+                    webapp.urllib.request, "urlopen", return_value=provider_reply(import_model, text),
+                ) as send:
+                    preview = post("/import-preview", upload)
+                    send.assert_called_once()
+                    request = send.call_args.args[0]
+                    self.assertEqual(request.full_url, OPENROUTER_RESPONSES_URL)
+                    self.assertEqual(json.loads(request.data)["text"]["format"]["name"], "pricing_import_v1")
+                    self.assertFalse(preview["saved"])
+                    if case != "valid":
+                        self.assertFalse(preview["canSave"])
+                        self.assertEqual(preview["items"], [])
+                        self.assertEqual(preview["errors"], webapp.generic_referenced_errors(preview["error_reference"]))
+                    else:
+                        self.assertTrue(preview["canSave"], preview)
+                        self.assertEqual(preview["currency"], "MYR")
+                        self.assertEqual([row["description"] for row in preview["items"]],
+                                         ["Synthetic panel; Prices are not inclusive of trim", "Synthetic rail"])
+                        self.assertEqual(preview["items"][0]["remarks"], [])
+            self.assertFalse(catalogue.exists())
+
+            preview_rows = preview["items"]
+            first_id, second_id = (row["id"] for row in preview_rows)
+            first = {"id": first_id, "match_terms": ["synthetic panel review term"], "object_families": ["review_panel"]}
+            second = {"id": second_id, "match_terms": ["synthetic rail review term"], "object_families": ["review_rail"]}
+            second_batch = {
+                "valid": json.dumps({"items": [second]}),
+                "malformed": '{"items":[',
+                "extra": json.dumps({"items": [second, {**second, "id": "synthetic-unrequested"}]}),
+                "missing": '{"items":[]}',
+                "duplicate": json.dumps({"items": [second, second]}),
+                "wrong-batch": json.dumps({"items": [first]}),
+                "swapped-batches": json.dumps({"items": [first]}),
+            }
+            authoritative_fields = ("id", "section", "description", "unit_hint", "internal_cost",
+                                    "markup_multiplier", "sale_unit_price", "category_order", "item_order")
+            for case, text in second_batch.items():
+                logs.reset_mock()
+                ref_id = "strict-pricing-" + case
+                swapped = case == "swapped-batches"
+                replies = [provider_reply(metadata_model, json.dumps({"items": [second if swapped else first]})),
+                           provider_reply(metadata_model, text)]
+                payload = {"id": ref_id, "label": ref_id, "currency": preview["currency"], "items": preview_rows}
+                with self.subTest(operation="metadata", case=case), mock.patch.object(
+                    webapp.urllib.request, "urlopen", side_effect=replies,
+                ) as send:
+                    result = post("", payload)
+                    self.assertEqual(send.call_count, 1 if swapped else 2)
+                    for call, expected_id in zip(send.call_args_list, (first_id, second_id)):
+                        body = json.loads(call.args[0].data)
+                        self.assertEqual(body["text"]["format"]["name"], "pricing_metadata_v1")
+                        prompt = body["input"][0]["content"][0]["text"]
+                        self.assertEqual([row["id"] for row in json.loads(prompt.split("Pricing rows JSON: ")[1])], [expected_id])
+                    self.assertEqual(result["status"], "saved")
+                    self.assertEqual(result["metadata_enrichment_status"], "completed" if case == "valid" else "failed")
+                    saved = json.loads((catalogue / ref_id / "pricing-catalog.json").read_text(encoding="utf-8"))
+                    self.assertEqual(saved["currency"], "MYR")
+                    self.assertEqual([[row[key] for key in authoritative_fields] for row in saved["items"]],
+                                     [[row[key] for key in authoritative_fields] for row in preview_rows])
+                    self.assertEqual(["review_panel" in row.get("object_families", []) for row in saved["items"]],
+                                     [case == "valid", False])
+                    self.assertEqual("review_rail" in saved["items"][1].get("object_families", []), case == "valid")
+                    attempts = [entry.args[1] for entry in logs.call_args_list if entry.args[0] == "ai_call_attempt"]
+                    expected_attempts = [] if swapped else ["success"]
+                    self.assertEqual([entry["status"] for entry in attempts],
+                                     expected_attempts + ["success" if case == "valid" else "failed"])
+                    self.assertNotIn("synthetic-unrequested", json.dumps(attempts))
+                    if case not in {"valid", "malformed"}:
+                        self.assertEqual(attempts[-1]["response_contract_reason"], "metadata_response_identity")
+
     def test_apply_saved_pricing_reference_ai_metadata_enrichment_updates_pack(self):
         with mock_pricing_metadata_enrichment():
             reference = webapp.normalize_pricing_reference_payload({
@@ -41593,25 +41728,30 @@ main().catch((error) => {
                 })],
             })
 
-        ai_items = [
-            {
-                **reference["items"][0],
-                "match_terms": ["lightbox graphics", "illuminated fabric graphic"],
-                "object_families": ["illuminated_graphics"],
-            }
-        ]
+        row = {"id": "graphics-lightbox", "match_terms": ["lightbox graphics", "illuminated fabric graphic"],
+               "object_families": ["illuminated_graphics"]}
+        model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_METADATA_MODEL"]
 
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(webapp, "pricing_references_root", return_value=Path(tmp)):
                 webapp.save_pricing_reference_pack(reference)
-                with mock.patch.object(webapp, "ai_pricing_reference_metadata_enrichment", return_value=(ai_items, [])) as enrichment:
-                    updated = webapp.apply_saved_pricing_reference_ai_metadata_enrichment("async-ref")
-                catalog = json.loads((Path(tmp) / "async-ref" / "pricing-catalog.json").read_text(encoding="utf-8"))
-                metadata = json.loads((Path(tmp) / "async-ref" / "reference.json").read_text(encoding="utf-8"))
+                catalog_path = Path(tmp) / "async-ref" / "pricing-catalog.json"
+                metadata_path = Path(tmp) / "async-ref" / "reference.json"
+                before = (catalog_path.read_bytes(), metadata_path.read_bytes())
+                with mock.patch.object(webapp.urllib.request, "urlopen", side_effect=[
+                    json_response(model, {"items": [row, {**row, "id": "unrequested-row"}]}),
+                    json_response(model, {"items": [row]}),
+                ]) as send:
+                    self.assertFalse(webapp.apply_saved_pricing_reference_ai_metadata_enrichment("async-ref"))
+                    self.assertEqual((catalog_path.read_bytes(), metadata_path.read_bytes()), before)
+                    self.assertTrue(webapp.apply_saved_pricing_reference_ai_metadata_enrichment("async-ref"))
+                self.assertEqual(send.call_count, 2)
+                catalog = json.loads(catalog_path.read_bytes())
+                metadata = json.loads(metadata_path.read_bytes())
 
-        self.assertTrue(updated)
-        enrichment.assert_called_once()
         self.assertEqual(metadata["label"], "Async Ref")
+        for key in ("id", "description", "unit_hint", "internal_cost", "markup_multiplier", "sale_unit_price"):
+            self.assertEqual(catalog["items"][0][key], reference["items"][0][key])
         self.assertIn("lightbox graphics", catalog["items"][0]["match_terms"])
         self.assertIn("illuminated fabric graphic", catalog["items"][0]["match_terms"])
         self.assertIn("illuminated_graphics", catalog["items"][0]["object_families"])

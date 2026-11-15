@@ -413,6 +413,8 @@ class ProviderAdapterContractTest(unittest.TestCase):
         for route,suffix in cases:
             for mode in ("completed","incomplete","refusal"):
                 parsed={"items":[]} if route in {"import","metadata"} else draft()
+                if route == "import":
+                    parsed["currency"] = None
                 payload={"images":[{"name":"synthetic.png","data_url":synthetic_image()}],
                     "pricing_reference_id":self.detail["id"],"pricing_reference_source":"local",
                     "pricing_reference":self.detail,"_pricing_reference_snapshot":self.snapshot}
@@ -462,17 +464,17 @@ class ProviderAdapterContractTest(unittest.TestCase):
         for operation,suffix in (("basis_line","BASIS_LINE"),("basis_answer","BASIS_ANSWER"),("pricing_import","PRICING_IMPORT"),("pricing_metadata","PRICING_METADATA")):
             for status in ("completed","incomplete"):
                 model=configs["OPENROUTER_"+suffix+"_MODEL"]
-                envelope=responses_envelope(model,json.dumps({"items":[]}),status=status)
+                fixture = {"currency": None, "items": []} if operation == "pricing_import" else {"items": []}
+                envelope=responses_envelope(model,json.dumps(fixture),status=status)
                 response=FixtureHttpResponse(envelope)
-                gateway=s.configured_ai_gateway()
-                route=gateway.configuration.route(operation)
-                with self.subTest(operation=operation,status=status),mock.patch.object(s.urllib.request,"urlopen",return_value=response) as send:
-                    # Recreate the gateway while the exact opener is injected.
+                with (self.subTest(operation=operation,status=status), s.ai_log_tracking_scope({}),
+                      mock.patch.object(s.urllib.request,"urlopen",return_value=response) as send):
                     gateway=s.configured_ai_gateway()
+                    route=gateway.configuration.route(operation)
                     body={"model":route.model,"reasoning":{"effort":route.effort},"input":[{"role":"user","content":[{"type":"input_text","text":"Synthetic request"}]}]}
                     if status=="completed":
                         result=s.gateway_request(gateway,operation,body)
-                        self.assertEqual(s.parse_json_object(s.response_output_text(result)),{"items":[]})
+                        self.assertEqual(s.parse_json_object(s.response_output_text(result)), fixture)
                     else:
                         with self.assertRaises(s.OpenAIAnalysisError):s.gateway_request(gateway,operation,body)
                     self.assertEqual(send.call_count,1)

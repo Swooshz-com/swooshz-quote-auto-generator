@@ -112,7 +112,8 @@ from webapp.quote_ai_spend import (
 )
 from webapp.ai_gateway import (AiGateway, GatewayConfiguration, GatewayError,
     safe_draft_error_param, draft_provider_error_diagnostics, SUPPORTED_REASONING_EFFORTS)
-from webapp.ai_response_contracts import BASIS_TAGS, DRAFT_SYNTHESIS, ContractViolation
+from webapp.ai_response_contracts import BASIS_TAGS, DRAFT_SYNTHESIS, ContractViolation, ResponseContract
+from webapp.pricing_response_contracts import PRICING_IMPORT, PRICING_METADATA
 from webapp.internal_password_auth import (
     INTERNAL_AUTH_MODE, INTERNAL_SESSION_TTL_SECONDS, LOGIN_NONCE_TTL_SECONDS,
     InternalAuthConfigError, InternalAuthPolicy, InternalAuthState,
@@ -1106,8 +1107,7 @@ def ai_failure_metadata(
     elif json_error or boundary == "provider_response_json" or "invalid json" in combined_text:
         failure_kind = "invalid_json"
     elif (
-        "omitted pricing rows" in combined_text
-        or "failed validation" in combined_text
+        "failed validation" in combined_text
         or "mandatory confidence" in combined_text
     ):
         failure_kind = "schema_validation_failed"
@@ -9295,9 +9295,7 @@ def repair_ai_pricing_import_source_placement(raw_items: list[Any], content: Any
             repaired.append(raw_item)
             continue
         item = dict(raw_item)
-        source_index = parse_basis_chat_line_index(
-            item.get("source_row_index") or item.get("row_index") or item.get("source_index")
-        )
+        source_index = parse_basis_chat_line_index(item.get("source_row_index"))
         source_row = source_rows[source_index - 1] if 1 <= source_index <= len(source_rows) else (
             source_rows[index] if index < len(source_rows) else {}
         )
@@ -9504,8 +9502,9 @@ def sort_quote_basis_sections_by_pricing_reference_order(
 def build_pricing_catalog_import_prompt(source_name: str, content: Any, tax: dict[str, Any]) -> str:
     sections = pricing_reference_section_names()
     return (
-        "Normalize an uploaded pricing catalog into Swooshz pricing reference rows. Return only JSON with currency and an items array. "
-        "Each item must include section, description, unit_hint, internal_cost, markup_multiplier, remarks, aliases, and warning/status when useful. "
+        "Normalize an uploaded pricing catalog into Swooshz pricing reference rows. Return only JSON matching the response schema. "
+        "Use JSON numbers for internal_cost and markup_multiplier, and arrays of strings for remarks and aliases, with [] when empty. "
+        "Use null for missing nullable values, including currency, warning and status. Do not invent missing costs or markups. "
         "Identify continuation rows and stitch them into the previous item; do not drop continuation description or remarks. "
         "Do not merge independent priced rows. Preserve short technical rows such as nos. rigging point for Overhead Structure or Aluminium Box Truss. "
         "Preserve source placement: if a bullet or commercial note appears inside the item/description cell or column, keep it in description; "
@@ -9517,7 +9516,8 @@ def build_pricing_catalog_import_prompt(source_name: str, content: Any, tax: dic
         "Do not invent a fixed taxonomy and do not copy terms from unrelated examples. "
         "Use these pricing reference sections first and match each priced row to the closest provided section. "
         "Only create a new section when none of the provided pricing reference sections fits the row. "
-        "Preserve the source category order and source row order. When no category order exists, assign category_order by first-seen section in the source rows and item_order by source row order. "
+        "Preserve the source category and item order as positive integers. When no category order exists, assign category_order by first-seen section in the source rows and item_order by source row order. "
+        "For source_row_index, give the one-based position of the first contributing entry in the bounded rows array, or null if it cannot be located. Do not use the workbook row number. "
         f"Pricing reference sections JSON: {json.dumps(sections, ensure_ascii=True)}. "
         f"Source name: {source_name}. Tax: {json.dumps(tax, ensure_ascii=True)}. Bounded extracted content JSON: {json.dumps(content, ensure_ascii=True)}"
     )
@@ -9525,14 +9525,9 @@ def build_pricing_catalog_import_prompt(source_name: str, content: Any, tax: dic
 
 def pricing_catalog_metadata_prompt_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for item in items[:MAX_PRICING_REFERENCE_ROWS]:
-        if not isinstance(item, dict):
-            continue
-        item_id = clean_text(item.get("id"))
-        if not item_id:
-            continue
+    for item in items:
         rows.append({
-            "id": item_id,
+            "id": item["id"],
             "section": clean_text(item.get("reference_section") or item.get("section")),
             "description": clean_text(item.get("description")),
             "unit_hint": clean_text(item.get("unit_hint")),
@@ -9544,8 +9539,9 @@ def pricing_catalog_metadata_prompt_rows(items: list[dict[str, Any]]) -> list[di
 
 def build_pricing_catalog_metadata_prompt(source_name: str, items: list[dict[str, Any]]) -> str:
     return (
-        "Enrich pricing reference rows with source-backed matching metadata. Return only JSON with an items array. "
-        "For each input id, return id, match_terms, and object_families. Do not change descriptions, prices, units, ids, sections, or remarks. "
+        "Enrich pricing reference rows with source-backed matching metadata. Return only JSON matching the response schema. "
+        "Return exactly one item for every input row, copying its id verbatim. Do not omit, repeat or add ids. "
+        "Return only id, match_terms and object_families in each item. Use arrays of strings and use [] when there are no supported terms or families. "
         "Derive match_terms and object_families only from the row's own wording, nearby technical context implied by that row, section, unit, aliases, remarks, and common industry names for the exact same object/service. "
         "Use metadata to help future quote matching decide whether a proposed thing can be this catalog row. Include useful synonyms only when they are genuinely equivalent for that row; do not use generic overlap alone. "
         "Equivalent-name terms are allowed only when they name the exact same object/service described by that row; narrower rows must not receive broader terms that would make them catch unrelated products. "
@@ -9564,23 +9560,61 @@ def build_pricing_catalog_metadata_prompt(source_name: str, items: list[dict[str
 
 
 
+def _parse_pricing_response(data: dict[str, Any], contract: ResponseContract) -> dict[str, Any]:
+    """Decode the admitted envelope and adapt nullable fields for pricing."""
+    try:
+        return contract.parse(response_output_text(data))
+    except ContractViolation as exc:
+        raise AIModelOutputError("AI pricing response was not accepted.", diagnostics={
+            "failure_boundary": "model_output_json" if exc.reason == "schema_json" else "model_output_contract",
+            "response_contract_name": contract.name,
+            "response_contract_reason": exc.reason,
+        }) from None
+
+
+def _pricing_metadata_rows_by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item_id = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(item_id, str) or not item_id.strip() or item_id in by_id:
+            return None
+        by_id[item_id] = row
+    return by_id
+
+
 @scoped_ai_transport_operation("pricing_reference_import")
 def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: dict[str, Any], api_key: str = "", *, gateway: AiGateway | None = None) -> dict[str, Any]:
     gateway = gateway if gateway is not None else configured_ai_gateway("pricing_reference_import", operation_owner=current_ai_transport_owner())
     route = gateway.configuration.route("pricing_import")
     begin_ai_transport_operation("pricing_reference_import", AI_PROVIDER_OPENROUTER, route.model)
     data = gateway_request(gateway, "pricing_import", {"model":route.model, "input":[{"role":"user", "content":[{"type":"input_text", "text":build_pricing_catalog_import_prompt(source_name, content, tax)}]}], "reasoning":{"effort":route.effort}, "max_output_tokens":4000})
-    return parse_json_object(response_output_text(data))
+    return _parse_pricing_response(data, PRICING_IMPORT)
 
 
 
 @scoped_ai_transport_operation("pricing_reference_metadata_enrichment")
 def request_openai_pricing_catalog_metadata(source_name: str, items: list[dict[str, Any]], api_key: str = "", *, gateway: AiGateway | None = None) -> dict[str, Any]:
+    requested = _pricing_metadata_rows_by_id(items)
+    if requested is None or len(requested) > MAX_PRICING_REFERENCE_ROWS:
+        raise AIModelOutputError("AI matching metadata was not accepted.", diagnostics={
+            "failure_boundary": "request_validation",
+            "attempt_number": 0,
+            "response_contract_name": PRICING_METADATA.name,
+            "response_contract_reason": "metadata_request_identity",
+        })
     gateway = gateway if gateway is not None else configured_ai_gateway("pricing_reference_metadata_enrichment", operation_owner=current_ai_transport_owner())
     route = gateway.configuration.route("pricing_metadata")
     begin_ai_transport_operation("pricing_reference_metadata_enrichment", AI_PROVIDER_OPENROUTER, route.model)
     data = gateway_request(gateway, "pricing_metadata", {"model":route.model, "input":[{"role":"user", "content":[{"type":"input_text", "text":build_pricing_catalog_metadata_prompt(source_name, items)}]}], "reasoning":{"effort":route.effort}, "max_output_tokens":12000})
-    return parse_json_object(response_output_text(data))
+    parsed = _parse_pricing_response(data, PRICING_METADATA)
+    returned = _pricing_metadata_rows_by_id(parsed["items"])
+    if returned is None or returned.keys() != requested.keys():
+        raise AIModelOutputError("AI matching metadata was not accepted.", diagnostics={
+            "failure_boundary": "model_output_contract",
+            "response_contract_name": PRICING_METADATA.name,
+            "response_contract_reason": "metadata_response_identity",
+        })
+    return parsed
 
 
 
@@ -9601,24 +9635,15 @@ def merge_pricing_reference_ai_metadata(
     items: list[dict[str, Any]],
     raw_metadata_items: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    source_ids = [clean_text(item.get("id")) for item in items if clean_text(item.get("id"))]
-    metadata_by_id: dict[str, dict[str, Any]] = {}
-    for raw in raw_metadata_items:
-        if not isinstance(raw, dict):
-            continue
-        item_id = clean_text(raw.get("id"))
-        if item_id and item_id in source_ids:
-            metadata_by_id[item_id] = raw
-    missing_ids = [item_id for item_id in source_ids if item_id not in metadata_by_id]
-    if missing_ids:
-        preview = ", ".join(missing_ids[:5])
-        suffix = f" and {len(missing_ids) - 5} more" if len(missing_ids) > 5 else ""
-        return items, [f"AI metadata enrichment omitted pricing rows: {preview}{suffix}."]
+    source = _pricing_metadata_rows_by_id(items)
+    metadata_by_id = _pricing_metadata_rows_by_id(raw_metadata_items)
+    if source is None or metadata_by_id is None or metadata_by_id.keys() != source.keys():
+        return items, ["AI matching metadata did not match the requested pricing rows."]
 
     enriched: list[dict[str, Any]] = []
     for item in items:
         next_item = copy.deepcopy(item)
-        metadata = metadata_by_id.get(clean_text(item.get("id")), {})
+        metadata = metadata_by_id[item["id"]]
         ai_match_terms = sanitize_pricing_reference_terms(metadata.get("match_terms"))
         next_item["match_terms"] = unique_clean_list(ai_match_terms)[:36]
         ai_families = sanitize_pricing_reference_families(metadata.get("object_families"))
@@ -9652,9 +9677,6 @@ def ai_pricing_reference_metadata_enrichment(filename: str, items: list[dict[str
             batch_started = time.perf_counter()
             try:
                 parsed = request_openai_pricing_catalog_metadata(batch_name, batch, gateway=gateway)
-                rows = parsed.get("items")
-                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                    raise AIModelOutputError("AI matching metadata was not accepted.")
             except OpenAIAnalysisError as exc:
                 failure = ai_failure_metadata(exc, provider=AI_PROVIDER_OPENROUTER)
                 log_ai_call_attempt(feature="pricing_reference_metadata_enrichment", provider=AI_PROVIDER_OPENROUTER,
@@ -9662,7 +9684,7 @@ def ai_pricing_reference_metadata_enrichment(filename: str, items: list[dict[str
                                     **metadata, **failure)
                 attempts.append({"status":"failed", "batch_index":index, **failure})
                 raise
-            raw_metadata.extend(rows)
+            raw_metadata.extend(parsed["items"])
             log_ai_call_attempt(feature="pricing_reference_metadata_enrichment", provider=AI_PROVIDER_OPENROUTER,
                                 model=route.model, status="success", duration_ms=elapsed_milliseconds(batch_started), **metadata)
             attempts.append({"status":"success", "batch_index":index})
