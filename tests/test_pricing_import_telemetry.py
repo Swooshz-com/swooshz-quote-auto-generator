@@ -13,7 +13,11 @@ from webapp.ai_gateway import OPENROUTER_RESPONSES_URL
 
 
 def imported_rows():
-    return {"currency":"SGD", "items":[{"section":"Synthetic structures", "description":"Synthetic panel PRIVATE_IMPORTED_DESCRIPTION", "unit_hint":"sqm", "internal_cost":50, "markup_multiplier":1.7, "remarks":[], "aliases":[]}]}
+    return {"currency":"SGD", "items":[{
+        "section":"Synthetic structures", "description":"Synthetic panel PRIVATE_IMPORTED_DESCRIPTION",
+        "unit_hint":"sqm", "internal_cost":50, "markup_multiplier":1.7, "remarks":[], "aliases":[],
+        "category_order":1, "item_order":1, "source_row_index":None, "warning":None, "status":None,
+    }]}
 
 
 class PricingImportTelemetryTest(unittest.TestCase):
@@ -110,5 +114,4 @@ class PricingImportTelemetryTest(unittest.TestCase):
                     self.assertEqual(len(actual),1)
                     self.assertEqual(actual[0]["attempt_number"],1)
                     self.assertEqual(len(rollup["provider_attempts"]),1)
-                    # A completed Responses send can precede failed inner JSON admission.
-                    self.assertEqual(actual[0]["status"],"success" if case=="model_json" else "failed")
+                    self.assertEqual(actual[0]["status"],"failed")

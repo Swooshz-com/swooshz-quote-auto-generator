@@ -19,6 +19,7 @@ from webapp.image_observation_contract import (
     admit_image_observations,
     is_image_batch_input,
 )
+from webapp.pricing_response_contracts import PRICING_RESPONSE_CONTRACTS
 
 OPENROUTER_RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 ROUTE_KEYS = MappingProxyType({
@@ -89,7 +90,7 @@ def _response_state(data):
     return None
 
 
-def _image_schema_rejected(data):
+def _explicit_schema_rejected(data):
     if not isinstance(data, dict):
         return False
     error = data.get("error")
@@ -108,13 +109,13 @@ def _image_schema_rejected(data):
     return any(marker in SCHEMA_SPECIFIC_CODES for marker in markers)
 
 
-def schema_rejected(data, error, *, strict_image_observations):
+def schema_rejected(data, error, *, require_explicit_evidence):
     """Classify machine evidence. Synthesis retains its existing status rule."""
     if error.response_state is not None:
         return False
-    if strict_image_observations:
+    if require_explicit_evidence:
         if data is not None:
-            return _image_schema_rejected(data)
+            return _explicit_schema_rejected(data)
         return error.image_schema_rejected
     diagnostics = error.diagnostics
     metadata = draft_provider_error_diagnostics(data)
@@ -524,7 +525,7 @@ class BoundedHttpsTransport:
         error = GatewayError("http_error", boundary="provider_http", http_status=status,
                              retryable=http_error_retryable(status, parsed, response_state=response_state),
                              response_state=response_state)
-        error.image_schema_rejected = status >= 400 and response_state is None and _image_schema_rejected(parsed)
+        error.image_schema_rejected = status >= 400 and response_state is None and _explicit_schema_rejected(parsed)
         error.diagnostics.update(draft_provider_error_diagnostics(parsed))
         error.diagnostics.update(_response_state_diagnostics(parsed, response_state))
         # Keep the billing fields out of diagnostics and business output.
@@ -647,6 +648,14 @@ def admit_response(data,route, *, strict_image_observations=False):
                 }.get(exc.reason, "batch_provider_failure"),
             )
             raise error from None
+    pricing_contract = PRICING_RESPONSE_CONTRACTS.get(route.operation)
+    if pricing_contract is not None:
+        try:
+            pricing_contract.parse(texts[0])
+        except ContractViolation as exc:
+            error = GatewayError("response_pricing_contract", boundary="provider_response_contract")
+            error.diagnostics["response_contract_reason"] = exc.reason
+            raise error from None
     # The caller still performs business admission.
     result={"status":"completed","output":copy.deepcopy(output),"model":route.model}
     usage=admitted_usage(data.get("usage"))
@@ -689,8 +698,12 @@ class AiGateway:
             if set(envelope) != {"model", "input", "reasoning"} or not is_image_batch_input(envelope["input"]):
                 raise GatewayError("envelope_invalid")
             contract = IMAGE_OBSERVATIONS
+        pricing_contract = PRICING_RESPONSE_CONTRACTS.get(operation)
+        if pricing_contract is not None:
+            contract = pricing_contract
         body=copy.deepcopy(envelope)
-        if strict_image_observations:
+        gateway_owns_contract = strict_image_observations or pricing_contract is not None
+        if gateway_owns_contract:
             body["text"] = contract.text_format()
         body["provider"]=self.configuration.provider_policy(operation)
         body["store"]=False
@@ -727,14 +740,14 @@ class AiGateway:
                     if spend is not None:
                         spend.settle(ordinal, cost)
             except GatewayError as exc:
-                if strict_image_observations:
+                if gateway_owns_contract:
                     exc.diagnostics.setdefault("response_contract_name", contract.name)
                     exc.diagnostics.setdefault("response_contract_reason", exc.reason)
+                if strict_image_observations:
                     exc.diagnostics.setdefault("batch_failure_reason", "batch_provider_failure")
                 if (contract is not None
                         and exc.reason not in {"response_partial", "response_size", "response_framing", "redirect_or_status"}
-                        and schema_rejected(data, exc,
-                                            strict_image_observations=strict_image_observations)):
+                        and schema_rejected(data, exc, require_explicit_evidence=gateway_owns_contract)):
                     exc.reason = "response_schema_rejected"
                     exc.retryable = False
                     exc.diagnostics.update(failure_boundary="provider_response_schema",

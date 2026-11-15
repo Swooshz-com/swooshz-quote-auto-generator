@@ -26,8 +26,10 @@ def envelope(route):
     return {"model":route.model,"reasoning":{"effort":route.effort},"input":[{"role":"user","content":[{"type":"input_text","text":"synthetic request"}]}]}
 
 
-def completed(route, **changes):
-    return {"model":route.model,"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"{\"items\":[]}"}]}],**changes}
+def completed(route, *, text=None, **changes):
+    if text is None:
+        text = '{"currency":null,"items":[]}' if route.operation == "pricing_import" else '{"items":[]}'
+    return {"model":route.model,"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}],**changes}
 
 
 class RecordingTransport:
@@ -307,6 +309,135 @@ class OpenRouterGatewayTest(unittest.TestCase):
         self.assertEqual(gateway.admitted_usage({"input_tokens":2,"output_tokens":3,"total_tokens":5,"private":"canary"}),{"input_tokens":2,"output_tokens":3,"total_tokens":5})
         for value in [None,[],{}, {"input_tokens":True},{"input_tokens":-1},{"total_tokens":float("inf")},{"total_tokens":"3"},{"input_tokens":2,"output_tokens":3,"total_tokens":4},{"output_tokens":2,"output_tokens_details":{"reasoning_tokens":3}}]:
             with self.subTest(kind=type(value).__name__): self.assertIsNone(gateway.admitted_usage(value))
+
+
+class PricingGatewayContractTest(unittest.TestCase):
+    def setUp(self):
+        self.config = gateway.GatewayConfiguration.capture(synthetic_configuration().get)
+        self.payloads = {
+            "pricing_import": {"currency": "SGD", "items": [{
+                "section": "Synthetic section", "description": "Synthetic panel", "unit_hint": None,
+                "internal_cost": None, "markup_multiplier": 1.25, "remarks": [], "aliases": [],
+                "category_order": 1, "item_order": 2, "source_row_index": 3,
+                "warning": None, "status": None,
+            }]},
+            "pricing_metadata": {"items": [{
+                "id": "synthetic-panel-2", "match_terms": ["synthetic panel"], "object_families": [],
+            }]},
+        }
+
+    def test_pricing_requests_choose_distinct_closed_schemas_and_keep_response_envelopes(self):
+        names = set()
+        for operation, payload in self.payloads.items():
+            with self.subTest(operation=operation):
+                route = self.config.route(operation)
+                request = envelope(route) | {"max_output_tokens": 4000 if operation == "pricing_import" else 12000}
+                response = completed(route, text=json.dumps(payload))
+                transport = RecordingTransport([response])
+                subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transport)
+                self.assertEqual(subject.request(operation, request), response)
+                (body, options), = transport.calls
+                output_format = body["text"]["format"]
+                names.add(output_format["name"])
+                self.assertEqual(output_format["type"], "json_schema")
+                self.assertIs(output_format["strict"], True)
+                schema = output_format["schema"]
+                for shape, value in ((schema, payload), (schema["properties"]["items"]["items"], payload["items"][0])):
+                    self.assertFalse(shape["additionalProperties"])
+                    self.assertEqual(set(shape["properties"]), set(value))
+                    self.assertEqual(set(shape["required"]), set(value))
+                self.assertEqual({key: body[key] for key in request}, request)
+                self.assertNotIn("text", request)
+                self.assertEqual(body["provider"], self.config.provider_policy(operation))
+                self.assertIs(body["store"], False)
+                self.assertEqual(options["timeout"], self.config.timeout_seconds)
+
+                other_operation = next(key for key in self.payloads if key != operation)
+                other_route = self.config.route(other_operation)
+                credential = mock.Mock()
+                blocked = RecordingTransport([])
+                subject = gateway.AiGateway(self.config, credential_reader=credential, transport=blocked)
+                for supplied, keywords in ((envelope(other_route) | {"text": body["text"]}, {}),
+                                           (envelope(other_route), {"response_contract": output_format["name"]})):
+                    with self.assertRaises(gateway.GatewayError) as caught:
+                        subject.request(other_operation, supplied, **keywords)
+                    self.assertEqual(caught.exception.reason, "envelope_invalid")
+                credential.assert_not_called()
+                self.assertEqual(blocked.calls, [])
+        self.assertEqual(names, {"pricing_import_v1", "pricing_metadata_v1"})
+
+    def test_pricing_responses_fail_closed_without_resends_and_keep_billing(self):
+        usage = {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+        for operation, payload in self.payloads.items():
+            route = self.config.route(operation)
+            row = payload["items"][0]
+            required_key = "description" if operation == "pricing_import" else "id"
+            wrong_value = {"internal_cost": True} if operation == "pricing_import" else {"match_terms": [1]}
+            malformed = {
+                "extra": json.dumps({**payload, "items": [{**row, "synthetic_private_key": "synthetic_private_value"}]}),
+                "missing": json.dumps({**payload, "items": [{k: v for k, v in row.items() if k != required_key}]}),
+                "missing_root": '{}',
+                "wrong_type": json.dumps({**payload, "items": [{**row, **wrong_value}]}),
+                "malformed": '{"items":synthetic_private_value}',
+                "duplicate": json.dumps(payload)[:-1] + ',"items":[]}',
+                "truncated_json": json.dumps(payload)[:-1],
+            }
+            responses = [(case, completed(route, text=raw), "response_pricing_contract",
+                          "schema_shape" if case in {"extra", "missing", "missing_root", "wrong_type"} else "schema_json")
+                         for case, raw in malformed.items()]
+            valid_text = json.dumps(payload)
+            responses += [
+                ("incomplete", completed(route, text=valid_text, status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"}), "response_incomplete", "response_incomplete"),
+                ("refused", completed(route, text=valid_text, refusal="synthetic_private_value"),
+                    "response_refused", "response_refused"),
+            ]
+            for case, response, reason, contract_reason in responses:
+                with self.subTest(operation=operation, case=case):
+                    transport = RecordingTransport([response | {"usage": usage | {"cost": 0.0025}}])
+                    terminal = mock.Mock()
+                    sleep = mock.Mock()
+                    budget = mock.Mock()
+                    spend = mock.Mock()
+                    subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic", transport=transport,
+                                                telemetry=terminal, sleep=sleep, quote_spend=spend)
+                    with self.assertRaises(gateway.GatewayError) as caught:
+                        subject.request(operation, envelope(route), send_budget=budget)
+                    self.assertEqual(caught.exception.reason, reason)
+                    self.assertEqual(caught.exception.diagnostics["response_contract_reason"], contract_reason)
+                    self.assertEqual(caught.exception.diagnostics["response_contract_name"], operation + "_v1")
+                    self.assertEqual(caught.exception.diagnostics["failure_boundary"], "provider_response_contract")
+                    self.assertEqual(len(transport.calls), 1)
+                    sleep.assert_not_called()
+                    budget.claim.assert_called_once_with(operation, route.model)
+                    budget.finish.assert_called_once_with(usage, cost_usd=0.0025)
+                    spend.settle.assert_called_once_with(spend.reserve.return_value, 0.0025)
+                    terminal.assert_called_once()
+                    self.assertEqual(terminal.call_args.args[:3], (operation, 1, "failed"))
+                    self.assertNotIn("synthetic_private", str(caught.exception) + json.dumps(terminal.call_args.args))
+
+    def test_pricing_schema_rejection_keeps_the_pinned_request_and_safe_error(self):
+        error_body = {"error": {"type": "invalid_request_error", "code": "unsupported_schema",
+                                "param": "text.format.schema", "message": "synthetic_private_value"}}
+        for operation in self.payloads:
+            route = self.config.route(operation)
+            for provider_status, reason in ((422, "response_schema_rejected"), (400, "http_error")):
+                with self.subTest(operation=operation, provider_status=provider_status):
+                    value = error_body if provider_status == 422 else {"error": {"code": "invalid_value", "param": "input"}}
+                    opener = mock.Mock()
+                    opener.open.side_effect = urllib.error.HTTPError(gateway.OPENROUTER_RESPONSES_URL,
+                        provider_status, "synthetic_private_value", {}, io.BytesIO(json.dumps(value).encode()))
+                    sleep = mock.Mock()
+                    subject = gateway.AiGateway(self.config, credential_reader=lambda: "synthetic",
+                                                transport=gateway.BoundedHttpsTransport(opener=opener), sleep=sleep)
+                    with self.assertRaises(gateway.GatewayError) as caught:
+                        subject.request(operation, envelope(route))
+                    self.assertEqual(caught.exception.reason, reason)
+                    self.assertNotIn("synthetic_private", str(caught.exception) + json.dumps(caught.exception.diagnostics))
+                    opener.open.assert_called_once()
+                    sent = json.loads(opener.open.call_args.args[0].data)
+                    self.assertIs(sent["text"]["format"]["strict"], True)
+                    sleep.assert_not_called()
 
 
 class LoopbackResponseTest(unittest.TestCase):
