@@ -1517,8 +1517,18 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 ("no first-page padding", owned, 61, "", "Quotation", "Quotation", False),
                 ("no printable continuation", owned, 80, "", "Quotation", "Quotation", False),
                 ("empty column breaks", owned, 61, '<colBreaks count="0"/>', "Quotation", "Quotation", True),
+                ("padded zero counts", owned, 61, '<colBreaks count="00" manualBreakCount="000"/>', "Quotation", "Quotation", True),
+                ("signed zeros with XML space", owned, 61, '<colBreaks count=" +00 " manualBreakCount="&#x9;-0&#xA;"/>', "Quotation", "Quotation", True),
                 ("missing break record", owned, 61, '<colBreaks count="1"/>', "Quotation", "Quotation", False),
+                ("nonzero manual break count", owned, 61, '<colBreaks count="00" manualBreakCount="01"/>', "Quotation", "Quotation", False),
+                ("negative break count", owned, 61, '<colBreaks count="-01"/>', "Quotation", "Quotation", False),
                 ("invalid break count", owned, 61, '<colBreaks manualBreakCount="invalid"/>', "Quotation", "Quotation", False),
+                ("empty break count", owned, 61, '<colBreaks count=""/>', "Quotation", "Quotation", False),
+                ("underscore in break count", owned, 61, '<colBreaks count="0_0"/>', "Quotation", "Quotation", False),
+                ("space within break count", owned, 61, '<colBreaks count="0 0"/>', "Quotation", "Quotation", False),
+                ("non-ASCII break count", owned, 61, '<colBreaks count="&#x0660;"/>', "Quotation", "Quotation", False),
+                ("foreign break attribute", owned, 61, '<colBreaks count="00" other="0"/>', "Quotation", "Quotation", False),
+                ("unexpected break text", owned, 61, '<colBreaks count="00">0</colBreaks>', "Quotation", "Quotation", False),
                 ("hidden break record", owned, 61, '<colBreaks count="0"><brk id="4"/></colBreaks>', "Quotation", "Quotation", False),
                 ("duplicated break element", owned, 61, '<colBreaks/><colBreaks/>', "Quotation", "Quotation", False),
             ):
@@ -1658,8 +1668,15 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 ("Lighting", 1, "nos", "Example marshal service", "Included", 0),
             )
         ]
+        break_counts = {
+            "empty column breaks": ("0", "0"),
+            "padded zero column breaks": ("00", "00"),
+            "signed zero column breaks": (" +00 ", "-000"),
+            "column break": ("1", "1"),
+        }
+
         def with_print_style(template, variant):
-            if variant not in {"centred", "gridlines", "row fill", "empty column breaks", "case-equivalent sheet", "column break"}:
+            if variant not in {"centred", "gridlines", "row fill", "case-equivalent sheet"} and variant not in break_counts:
                 return KONCEPT_LAYOUT
             with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
                 parts = {name: source.read(name) for name in source.namelist()}
@@ -1682,11 +1699,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 parts["xl/styles.xml"] = quote.serialize_excel_styles(styles)
             elif variant == "case-equivalent sheet":
                 parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(b'name="Quotation"', b'name="QUOTATION"')
-            elif variant in {"empty column breaks", "column break"}:
-                count = "1" if variant == "column break" else "0"
+            elif variant in break_counts:
+                count, manual_count = break_counts[variant]
                 breaks = quote.ensure_worksheet_child(sheet, "colBreaks")
-                breaks.attrib.update(count=count, manualBreakCount=count)
-                if count == "1":
+                breaks.attrib.update(count=count, manualBreakCount=manual_count)
+                if variant == "column break":
                     ET.SubElement(breaks, f"{NS_MAIN}brk", id="4", min="0", max="1048575", man="1")
             else:
                 option = "verticalCentered" if variant == "centred" else "gridLines"
@@ -1721,7 +1738,10 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         native_export = getattr(quote, native_name)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            corrected = ("baseline", "row fill", "centred", "empty column breaks", "case-equivalent sheet", "repeated text")
+            corrected = (
+                "baseline", "row fill", "centred", "empty column breaks", "padded zero column breaks",
+                "signed zero column breaks", "case-equivalent sheet", "repeated text",
+            )
             for variant in (*corrected, "column break", "gridlines", "long static", "single page"):
                 with self.subTest(variant=variant):
                     work = root / variant
@@ -1753,6 +1773,11 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                         selected_lines = lines[:1]
                     quote.write_quote_layout_xlsx(template, workbook, selected_brief, selected_lines)
                     master = workbook.read_bytes()
+                    if variant in break_counts:
+                        with zipfile.ZipFile(workbook) as archive:
+                            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                        breaks = sheet.find(f"{NS_MAIN}colBreaks")
+                        self.assertEqual((breaks.get("count"), breaks.get("manualBreakCount")), break_counts[variant])
                     rendered = []
 
                     def capture(source, output, **kwargs):

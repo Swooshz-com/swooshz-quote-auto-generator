@@ -4104,9 +4104,13 @@ def pdf_overflow_boundary(xlsx_path: Path) -> PdfOverflowBoundary | None:
         return None
     if col_breaks:
         column_break = col_breaks[0]
+        # Accept XML unsignedInt spellings of zero without converting untrusted counts to integers.
         if (
             column_break.tag != f"{NS_MAIN}colBreaks" or len(column_break) or (column_break.text or "").strip()
-            or any(key not in {"count", "manualBreakCount"} or value != "0" for key, value in column_break.attrib.items())
+            or any(
+                key not in {"count", "manualBreakCount"} or not re.fullmatch(r"[+-]?0+", value.strip(" \t\r\n"))
+                for key, value in column_break.attrib.items()
+            )
         ):
             return None
 

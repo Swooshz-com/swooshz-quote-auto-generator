@@ -1025,8 +1025,9 @@ blank second page, the same renderer must reproduce the first two pages from a
 copy limited to the authored first print section. The continuation must remain
 visible in the original export. The proof also works when acceptance text
 appears on both pages, the sheet name differs in case from the print area, or
-the column-break list is empty. Real or malformed column breaks, printed
-gridlines, unrelated blanks and unverifiable PDFs keep their original export.
+the column-break list is empty with equivalent zero counts, including leading
+zeros, signs and surrounding XML whitespace. Real or malformed column breaks,
+printed gridlines, unrelated blanks and unverifiable PDFs keep their original export.
 The regression compares the retained text, geometry and pixels, including for
 row fill and vertical centring. The XLSX master must remain byte-for-byte
 identical. Run the native regression in Validate app on Ubuntu 24.04 with
