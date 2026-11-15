@@ -1020,14 +1020,17 @@ each visible terminal label, exactly one generation, polling, zero navigation an
 retained interruption identity on its own server and browser.
 The smoke uses Playwright Chromium locally as well as in CI. Screenshot mode
 runs the broad visual journey without the isolated G3 tail; default CI retains it.
-Native workbook PDF export uses a disposable conversion copy. The generator
-can remove a blank second page only when it belongs to the first quotation
-page's overflow and the following page matches the workbook continuation.
-The regression compares the retained text, page geometry and rendered pixels
-with the native result for the four-line quote, a row fill and vertical
-centring. Printed gridlines, long layouts, single-page exports and uncertain
-PDFs keep their native bytes. The XLSX master must remain byte-for-byte
-identical. Run with LibreOffice in CI or Microsoft Excel on Windows.
+Native workbook PDF export uses a disposable conversion copy. Before removing a
+blank second page, the same renderer must reproduce the first two pages from a
+copy limited to the authored first print section. The continuation must remain
+visible in the original export. The proof also works when acceptance text
+appears on both pages, the sheet name differs in case from the print area, or
+the column-break list is empty. Real or malformed column breaks, printed
+gridlines, unrelated blanks and unverifiable PDFs keep their original export.
+The regression compares the retained text, geometry and pixels, including for
+row fill and vertical centring. The XLSX master must remain byte-for-byte
+identical. Run the native regression in Validate app on Ubuntu 24.04 with
+LibreOffice Calc or locally on Windows with Microsoft Excel.
 
 Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
 eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity

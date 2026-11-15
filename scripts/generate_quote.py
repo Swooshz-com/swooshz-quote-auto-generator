@@ -26,6 +26,7 @@ import shutil
 import tempfile
 import subprocess
 import textwrap
+import time
 import unicodedata
 import zipfile
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -67,6 +68,9 @@ MAX_XLSX_COLUMNS = 16_384
 MAX_XLSX_ROWS = 1_048_576
 MAX_XLSX_ENTRIES = 4096
 MAX_PDF_PAGINATION_BYTES = 16 * 1024 * 1024
+MAX_PDF_PROOF_WORKBOOK_BYTES = 64 * 1024 * 1024
+MAX_PDF_PROOF_SECONDS = 15
+PDF_PROOF_DEADLINE_SECONDS = 75
 XMLNS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 XMLNS_CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 XMLNS_DC = "http://purl.org/dc/elements/1.1/"
@@ -3847,7 +3851,7 @@ try {{
 """
 
 
-def powershell_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
+def powershell_pdf_export(xlsx_path: Path, pdf_path: Path, *, timeout: float = 120) -> str | None:
     if os.name != "nt" or shutil.which("powershell") is None:
         return None
     with tempfile.TemporaryDirectory(prefix="sqag-excel-") as temp_dir:
@@ -3859,7 +3863,7 @@ def powershell_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
-            timeout=120,
+            timeout=timeout,
         )
     return "excel_exported" if result.returncode == 0 and pdf_path.exists() else None
 
@@ -4019,7 +4023,7 @@ def write_pdf_conversion_workbook(xlsx_path: Path, conversion_path: Path) -> Non
                         shutil.copyfileobj(incoming, outgoing)
 
 
-def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
+def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path, *, timeout: float = 120) -> str | None:
     executables = libreoffice_candidates()
     if not executables:
         return None
@@ -4042,7 +4046,7 @@ def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            timeout=120,
+            timeout=timeout,
         )
     converted = pdf_path.parent / f"{xlsx_path.stem}.pdf"
     if result.returncode == 0 and converted.exists():
@@ -4052,33 +4056,71 @@ def libreoffice_pdf_export(xlsx_path: Path, pdf_path: Path) -> str | None:
     return None
 
 
-def pdf_overflow_text_anchors(xlsx_path: Path) -> tuple[set[str], set[str]] | None:
-    """Identify the two authored print sections on either side of the first break."""
+@dataclass(frozen=True)
+class PdfOverflowBoundary:
+    print_area: str
+    first_text: set[str]
+    continuation_text: set[str]
+
+
+def pdf_overflow_boundary(xlsx_path: Path) -> PdfOverflowBoundary | None:
+    """Find the single authored boundary on the printed worksheet."""
+    book_part = "xl/workbook.xml"
+    sheet_part = "xl/worksheets/sheet1.xml"
     try:
         with zipfile.ZipFile(xlsx_path) as workbook:
-            sheet = ET.fromstring(read_bounded_xlsx_part(workbook, "xl/worksheets/sheet1.xml"))
-            book = ET.fromstring(read_bounded_xlsx_part(workbook, "xl/workbook.xml"))
-    except (KeyError, OSError, ValueError, ET.ParseError, zipfile.BadZipFile):
+            sheet = ET.fromstring(read_bounded_xlsx_part(workbook, sheet_part))
+            book = ET.fromstring(read_bounded_xlsx_part(workbook, book_part))
+            rels = ET.fromstring(read_bounded_xlsx_part(workbook, "xl/_rels/workbook.xml.rels"))
+    except (KeyError, OSError, ValueError, RuntimeError, ET.ParseError, zipfile.BadZipFile):
         return None
 
     sheets = book.findall(f"{NS_MAIN}sheets/{NS_MAIN}sheet")
-    breaks = sheet.findall(f"{NS_MAIN}rowBreaks/{NS_MAIN}brk")
+    if len(sheets) != 1 or sheets[0].get("state", "visible") != "visible":
+        return None
+    sheet_name = sheets[0].get("name", "")
+    rel_id = sheets[0].get(f"{NS_REL}id")
+    sheet_rels = [rel for rel in rels.findall(f"{NS_PACKAGE_REL}Relationship") if rel.get("Id") == rel_id]
+    if not sheet_name or not rel_id or len(sheet_rels) != 1:
+        return None
+    rel = sheet_rels[0]
+    target = rel.get("Target", "")
+    target_path = posixpath.normpath(target[1:] if target.startswith("/") else f"xl/{target}")
     if (
-        len(sheets) != 1 or sheets[0].get("name") != "Quotation"
-        or len(breaks) != 1
-        or breaks[0].attrib != {"id": str(FIRST_PRINT_PAGE_END_ROW), "max": "16383", "man": "1"}
-        or sheet.find(f"{NS_MAIN}colBreaks") is not None
+        rel.get("Type") != f"{NS_REL[1:-1]}/worksheet"
+        or rel.get("TargetMode", "Internal") != "Internal"
+        or target_path != sheet_part
     ):
         return None
 
-    print_names = book.findall(f"{NS_MAIN}definedNames/{NS_MAIN}definedName")
-    if any(name.get("name") == "_xlnm.Print_Titles" for name in print_names):
+    row_breaks = sheet.findall(f"{NS_MAIN}rowBreaks")
+    col_breaks = [node for node in sheet if node.tag.rsplit("}", 1)[-1].casefold() == "colbreaks"]
+    if (
+        len(row_breaks) != 1 or len(row_breaks[0]) != 1
+        or row_breaks[0][0].tag != f"{NS_MAIN}brk"
+        or row_breaks[0][0].attrib != {"id": str(FIRST_PRINT_PAGE_END_ROW), "max": "16383", "man": "1"}
+        or len(col_breaks) > 1
+    ):
         return None
-    areas = [name for name in print_names if name.get("name") == "_xlnm.Print_Area"]
+    if col_breaks:
+        column_break = col_breaks[0]
+        if (
+            column_break.tag != f"{NS_MAIN}colBreaks" or len(column_break) or (column_break.text or "").strip()
+            or any(key not in {"count", "manualBreakCount"} or value != "0" for key, value in column_break.attrib.items())
+        ):
+            return None
+
+    print_names = book.findall(f"{NS_MAIN}definedNames/{NS_MAIN}definedName")
+    if any(name.get("name", "").casefold() == "_xlnm.print_titles" for name in print_names):
+        return None
+    areas = [name for name in print_names if name.get("name", "").casefold() == "_xlnm.print_area"]
     if len(areas) != 1 or areas[0].get("localSheetId") != "0":
         return None
-    area = re.fullmatch(r"Quotation!\$A\$1:\$I\$([1-9][0-9]{0,6})", areas[0].text or "")
-    if area is None:
+    print_area = areas[0].text or ""
+    reference, _, cells = print_area.rpartition("!")
+    quoted_sheet_name = "'" + sheet_name.replace("'", "''") + "'"
+    area = re.fullmatch(r"\$A\$1:\$I\$([1-9][0-9]{0,6})", cells)
+    if area is None or reference.casefold() not in {sheet_name.casefold(), quoted_sheet_name.casefold()}:
         return None
     last_row = int(area[1])
     if not FIRST_PRINT_PAGE_END_ROW < last_row < CONTINUATION_PAGE_START_ROW + CONTINUATION_PAGE_HEIGHT:
@@ -4105,8 +4147,66 @@ def pdf_overflow_text_anchors(xlsx_path: Path) -> tuple[set[str], set[str]] | No
                 value = " ".join(value.casefold().split())
                 if len(value) >= 4:
                     (first_text if on_first else next_text).add(value)
-    first_only, next_only = first_text - next_text, next_text - first_text
-    return (first_only, next_only) if last_first_payload < FIRST_PRINT_PAGE_END_ROW and first_only and next_only else None
+    if last_first_payload >= FIRST_PRINT_PAGE_END_ROW or not first_text or not next_text:
+        return None
+    return PdfOverflowBoundary(print_area, first_text, next_text)
+
+
+def pdf_first_section_matches(
+    xlsx_path: Path,
+    print_area: str,
+    native_export: Callable[[Path, Path], str | None],
+    expected: tuple[tuple[str, tuple, bytes, bool], ...],
+    pdfium,
+) -> bool:
+    """Render just the authored first section and compare its native pages."""
+    original_area = f">{print_area}</".encode("utf-8")
+    first_section = print_area.rsplit("$", 1)[0] + f"${FIRST_PRINT_PAGE_END_ROW}"
+    first_area = f">{first_section}</".encode("utf-8")
+    book_part = "xl/workbook.xml"
+    with tempfile.TemporaryDirectory(prefix="sqag-pdf-boundary-") as work:
+        workbook_path = Path(work) / "input" / xlsx_path.name
+        workbook_path.parent.mkdir()
+        with zipfile.ZipFile(xlsx_path) as source:
+            entries = source.infolist()
+            if (
+                len(entries) > MAX_XLSX_ENTRIES
+                or len({entry.filename for entry in entries}) != len(entries)
+                or sum(entry.file_size for entry in entries) > MAX_PDF_PROOF_WORKBOOK_BYTES
+            ):
+                return False
+            book = read_bounded_xlsx_part(source, book_part)
+            if book.count(original_area) != 1:
+                return False
+            with zipfile.ZipFile(workbook_path, "w") as workbook:
+                for entry in entries:
+                    if entry.filename == book_part:
+                        workbook.writestr(copy.copy(entry), book.replace(original_area, first_area, 1))
+                    else:
+                        with source.open(entry) as incoming, workbook.open(copy.copy(entry), "w") as outgoing:
+                            shutil.copyfileobj(incoming, outgoing)
+
+        probe_path = Path(work) / workbook_path.with_suffix(".pdf").name
+        if not native_export(workbook_path, probe_path):
+            return False
+        with probe_path.open("rb") as probe:
+            data = probe.read(MAX_PDF_PAGINATION_BYTES + 1)
+        if len(data) > MAX_PDF_PAGINATION_BYTES:
+            return False
+        native = pdfium.raw
+        with pdfium.PdfDocument(data) as document:
+            if len(document) != len(expected) or not native.FPDF_DocumentHasValidCrossReferenceTable(document):
+                return False
+            for index, snapshot in enumerate(expected):
+                page = document[index]
+                try:
+                    if native.FPDFPage_GetAnnotCount(page) != 0 or pdf_page_export_snapshot(page, pdfium) != snapshot:
+                        return False
+                    if index == 1 and native.FPDFPage_CountObjects(page) != 0:
+                        return False
+                finally:
+                    page.close()
+    return True
 
 
 def pdf_page_export_snapshot(page, pdfium) -> tuple[str, tuple, bytes, bool]:
@@ -4144,7 +4244,12 @@ def pdfium_flat_page_ids(data: bytes) -> list[bytes]:
     return ids if count == str(len(ids)).encode("ascii") and len(set(ids)) == len(ids) else []
 
 
-def remove_blank_pdf_overflow(pdf_path: Path, anchors: tuple[set[str], set[str]]) -> None:
+def remove_blank_pdf_overflow(
+    xlsx_path: Path,
+    pdf_path: Path,
+    boundary: PdfOverflowBoundary,
+    native_export: Callable[[Path, Path], str | None],
+) -> None:
     """Keep the native bytes unless page two is proven to be incidental overflow."""
     try:
         import pypdfium2 as pdfium
@@ -4181,8 +4286,8 @@ def remove_blank_pdf_overflow(pdf_path: Path, anchors: tuple[set[str], set[str]]
             first_text = " ".join(first[0].casefold().split())
             next_text = " ".join(continuation[0].casefold().split())
             if not all(
-                any(value in expected and value not in other for value in group)
-                for group, expected, other in zip(anchors, (first_text, next_text), (next_text, first_text))
+                any(value in text for value in group)
+                for group, text in ((boundary.first_text, first_text), (boundary.continuation_text, next_text))
             ):
                 return
 
@@ -4198,6 +4303,12 @@ def remove_blank_pdf_overflow(pdf_path: Path, anchors: tuple[set[str], set[str]]
                 return
             blank_dictionary = re.search(rb"(?m)^" + removed_id + rb" 0 obj\r?\n(<</[^\r\n]+)\r?$", data)
             if blank_dictionary is None or re.search(rb"/StructParents?\b", blank_dictionary[1]):
+                return
+
+            # Only a native match for both pages places the white page before
+            # the authored break. A blank at the start of the continuation fails
+            # this proof even when the surrounding pages contain matching text.
+            if not pdf_first_section_matches(xlsx_path, boundary.print_area, native_export, (first, blank), pdfium):
                 return
 
             metadata = document.get_metadata_dict()
@@ -4223,15 +4334,26 @@ def remove_blank_pdf_overflow(pdf_path: Path, anchors: tuple[set[str], set[str]]
             candidate = Path(scratch) / pdf_path.name
             candidate.write_bytes(corrected)
             candidate.replace(pdf_path)
-    except (OSError, ValueError, pdfium.PdfiumError):
-        # A failed inspection or rewrite must leave the valid native export in place.
+    except (KeyError, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, zipfile.BadZipFile, pdfium.PdfiumError):
+        # A failed inspection, proof or rewrite must leave the valid native export in place.
         return
 
 
 def export_layout_pdf(xlsx_path: Path, pdf_path: Path) -> str | None:
-    status = libreoffice_pdf_export(xlsx_path, pdf_path) or powershell_pdf_export(xlsx_path, pdf_path)
-    if status and (anchors := pdf_overflow_text_anchors(xlsx_path)):
-        remove_blank_pdf_overflow(pdf_path, anchors)
+    deadline = time.monotonic() + PDF_PROOF_DEADLINE_SECONDS
+    native_export = libreoffice_pdf_export
+    status = native_export(xlsx_path, pdf_path)
+    if not status:
+        native_export = powershell_pdf_export
+        status = native_export(xlsx_path, pdf_path)
+    if status and (boundary := pdf_overflow_boundary(xlsx_path)):
+        # The web generator has a 90-second deadline. Leave time to publish
+        # the native PDF if the additional render is too slow to prove ownership.
+        def export_first_section(source: Path, output: Path) -> str | None:
+            timeout = min(MAX_PDF_PROOF_SECONDS, deadline - time.monotonic())
+            return native_export(source, output, timeout=timeout) if timeout > 0 else None
+
+        remove_blank_pdf_overflow(xlsx_path, pdf_path, boundary, export_first_section)
     return status
 
 
