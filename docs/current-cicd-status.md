@@ -1,12 +1,18 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-14
+Last updated: 2026-11-15
 
 Sources of truth: `.github/workflows/ci.yml`, `.github/workflows/plain-text.yml`,
-and the two Toolkit Programme Sweep workflows.
+and the two Toolkit Programme Sweep workflows
+(`toolkit-programme-sweep-gate.yml` and `toolkit-programme-sweep.yml`).
 
 The cloud programme sweep runs on pushes to `main` or by dispatch. The hourly
 gate also starts it on `main` after eligible repository activity or CI.
+When no sweep is running, an activity trigger waits an hour after the latest
+green run.
+The hourly check measures activity from the last run that did work, so a later run that
+finished green while waiting for the sweep lease cannot hide pending changes.
+A pause at the GitHub App rate limit still holds retries until the limit resets.
 The gate can read check annotations with the built-in token. Hourly and
 manual gate runs flag three consecutive held sweeps, sweeps skipped for the
 same reason, or hourly gates skipped because governance is off.
