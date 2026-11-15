@@ -440,9 +440,17 @@ class DraftBatchParallelismTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])
 
     def test_optional_batch_effort_does_not_change_other_route_requests(self):
+        def callback(body):
+            schema_name = body.get("text", {}).get("format", {}).get("name")
+            if schema_name == "pricing_import_v1":
+                return {"currency": None, "items": []}
+            if schema_name == "pricing_metadata_v1":
+                return {"items": []}
+            return self.response(body)
+
         self.values["OPENROUTER_DRAFT_BATCH_REASONING_EFFORT"] = "medium"
         config = ai_gateway.GatewayConfiguration.capture(self.values.get)
-        transport = FakeTransport(self.response)
+        transport = FakeTransport(callback)
         gateway = ai_gateway.AiGateway(config, credential_reader=lambda: "synthetic", transport=transport)
         for operation in ai_gateway.ROUTE_KEYS:
             route = config.route(operation)
