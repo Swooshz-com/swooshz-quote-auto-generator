@@ -108,10 +108,19 @@ imports and `pricing_metadata_v1` to matching metadata requests. It validates
 the returned JSON against the corresponding schema before the application
 uses it. Objects require all declared fields and reject extra fields.
 Nullable fields use null, and empty lists use `[]`.
+Pricing import accepts equivalent whole-number JSON forms such as `1`, `1.0`
+and `1e0` for category order, item order and source row index. It checks those
+numbers exactly before converting them to integers. Fractions are rejected
+even when they would round to a whole number.
 
 Matching metadata must return exactly one item for each ID in the requested
 batch. The application applies enrichment only after every batch passes.
-If enrichment fails, the base catalogue stays intact.
+If enrichment fails, an otherwise valid save can still write the reviewed
+catalogue. Each save checks the destination it saw when the request started
+under the same lock or transaction that writes the catalogue. If another
+request has changed that destination, the save returns a conflict and a support
+reference before changing catalogue files or images. Reload the reference before
+retrying.
 
 Each pricing call sends once. A provider schema rejection requires a
 recognised machine code or schema parameter. Qualify each configured pricing

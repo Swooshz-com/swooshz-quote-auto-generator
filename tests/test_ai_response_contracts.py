@@ -14,6 +14,8 @@ from tests.test_basis_quantity_retention import draft
 from tests.test_openrouter_gateway import RecordingTransport, envelope
 from tests import test_synthesis_contract_repair as repair_support
 from tests import test_provider_response_admission as admission_support
+from webapp.ai_response_contracts import ContractViolation
+from webapp.pricing_response_contracts import PRICING_IMPORT
 from webapp import ai_gateway, ai_response_contracts as contracts, server
 SynthesisTransport = repair_support.SynthesisTransport
 CANARY = repair_support.CANARY
@@ -478,3 +480,35 @@ class StrictDraftHTTPTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PricingImportNumberContractTest(unittest.TestCase):
+    def test_order_fields_admit_exact_positive_integers_only(self):
+        fields = ("category_order", "item_order", "source_row_index")
+        row = dict.fromkeys(fields, 1)
+        row.update(section="Structures", description="Synthetic panel", unit_hint="sqm",
+                   internal_cost=24.25, markup_multiplier=1.5, remarks=[], aliases=[], warning=None, status=None)
+        for key in fields:
+            text = json.dumps({"currency": "MYR", "items": [{**row, key: "__order__"}]})
+            for token, expected in {
+                "1": 1, "1.0": 1, "1e0": 1, "10e-1": 1, "9007199254740993.0": 9007199254740993,
+            }.items():
+                with self.subTest(field=key, token=token):
+                    parsed = PRICING_IMPORT.parse(text.replace('"__order__"', token))["items"][0]
+                    self.assertEqual(parsed[key], expected)
+                    self.assertIs(type(parsed[key]), int)
+                    self.assertEqual((parsed["internal_cost"], parsed["markup_multiplier"]), (24.25, 1.5))
+                    self.assertIs(type(parsed["internal_cost"]), float)
+                    self.assertIs(type(parsed["markup_multiplier"]), float)
+            for token in (
+                "1.25", "1.0000000000000000001", "0.9999999999999999999", "1e-500",
+                '"1"', "true", "false", "NaN", "Infinity", "-Infinity", "0", "-1",
+            ):
+                with self.subTest(field=key, token=token), self.assertRaises(ContractViolation):
+                    PRICING_IMPORT.parse(text.replace('"__order__"', token))
+            if key == "source_row_index":
+                parsed = PRICING_IMPORT.parse(text.replace('"__order__"', "null"))["items"][0]
+                self.assertNotIn(key, parsed)
+            else:
+                with self.assertRaises(ContractViolation):
+                    PRICING_IMPORT.parse(text.replace('"__order__"', "null"))

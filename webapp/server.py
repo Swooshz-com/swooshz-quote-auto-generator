@@ -8966,9 +8966,96 @@ def pricing_reference_pack_config(reference: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def save_pricing_reference_pack(reference: dict[str, Any]) -> dict[str, Any]:
+PRICING_REFERENCE_SAVE_REVISION_KEY = "_save_revision"
+
+
+@dataclass(frozen=True)
+class PricingReferenceSaveSnapshot:
+    selected: dict[str, Any] | None
+    destination_revision: str | None
+
+    def require_current(self, revision: str | None) -> None:
+        if revision != self.destination_revision:
+            raise pricing_reference_revision_conflict()
+
+
+def pricing_reference_revision_conflict() -> SqagStorageAccessError:
+    return SqagStorageAccessError(
+        "This pricing reference changed. Reload it before saving again.",
+        status=409,
+        reason="pricing_reference_revision_conflict",
+    )
+
+
+@contextlib.contextmanager
+def local_pricing_reference_lock(reference_dir: Path):
+    # Keep the lock identity outside the pack so deleting the pack cannot replace it.
+    lock_dir = reference_dir.parent / ".locks"
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        with (lock_dir / ("_" + reference_dir.name)).open("a+b") as lock:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                yield
+    except OSError as exc:
+        raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+
+
+def read_local_pricing_reference_for_save(
+    reference_id: str, reference_dir: Path,
+) -> tuple[PricingReferencePack | None, dict[str, Any], str | None]:
+    try:
+        reference_dir.stat()
+    except FileNotFoundError:
+        return None, {}, None
+    try:
+        root = reference_dir.parent
+        raw_config = PricingReferencePack._contained_path(root, reference_dir, "reference.json").read_bytes()
+        config = json.loads(raw_config)
+        if not isinstance(config, dict) or not config:
+            raise ValueError
+        stored_id = safe_resource_id(config.get("id"), reference_id)
+        if stored_id != reference_id:
+            raise ValueError
+        pack = PricingReferencePack(stored_id, reference_dir, config, "local")
+        raw_catalog = pack.pricing_catalog_path.read_bytes()
+        catalog = json.loads(raw_catalog)
+        if not isinstance(catalog, dict) or not isinstance(catalog.get("items"), list):
+            raise ValueError
+    except (OSError, ValueError, PricingReferencePathError) as exc:
+        raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+    revision = clean_text(config.get(PRICING_REFERENCE_SAVE_REVISION_KEY))
+    if not revision:
+        revision = "legacy:" + hashlib.sha256(raw_config + b"\0" + raw_catalog).hexdigest()
+    return pack, catalog, revision
+
+
+def save_pricing_reference_pack(
+    reference: dict[str, Any], *, before_save: PricingReferenceSaveSnapshot | None = None,
+) -> dict[str, Any]:
     reference_id = safe_resource_id(reference.get("id") or reference.get("label"), "")
     reference_dir = pricing_reference_pack_dir(reference_id)
+    with local_pricing_reference_lock(reference_dir):
+        if before_save is not None:
+            _, _, revision = read_local_pricing_reference_for_save(reference_id, reference_dir)
+            before_save.require_current(revision)
+        return write_local_pricing_reference_pack(reference_id, reference_dir, reference)
+
+
+def write_local_pricing_reference_pack(
+    reference_id: str, reference_dir: Path, reference: dict[str, Any],
+) -> dict[str, Any]:
     stored = persist_pricing_reference_visuals_to_directory(
         reference,
         reference_dir / "pricing-catalog-images",
@@ -8976,10 +9063,6 @@ def save_pricing_reference_pack(reference: dict[str, Any]) -> dict[str, Any]:
     )
     reference_dir.mkdir(parents=True, exist_ok=True)
     catalog_payload = pricing_reference_catalog_payload(stored)
-    (reference_dir / "reference.json").write_text(
-        json.dumps(pricing_reference_pack_config(stored), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
     (reference_dir / "pricing-catalog.json").write_text(
         json.dumps(catalog_payload, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -8988,7 +9071,10 @@ def save_pricing_reference_pack(reference: dict[str, Any]) -> dict[str, Any]:
         pricing_reference_catalog_ai_markdown(catalog_payload, "pricing-catalog.json"),
         encoding="utf-8",
     )
-    summary = load_pricing_reference_pack(reference_id, source="local").public_summary()
+    config = pricing_reference_pack_config(stored)
+    config[PRICING_REFERENCE_SAVE_REVISION_KEY] = secrets.token_hex(16)
+    atomic_write_text(reference_dir / "reference.json", json.dumps(config, indent=2, sort_keys=True))
+    summary = PricingReferencePack(reference_id, reference_dir, config, "local").public_summary(catalog_payload)
     summary["item_count"] = len(stored.get("items") if isinstance(stored.get("items"), list) else [])
     return summary
 
@@ -9051,60 +9137,6 @@ def pricing_reference_with_ai_metadata_before_save(reference: dict[str, Any]) ->
     return enriched_reference, "completed"
 
 
-def apply_saved_pricing_reference_ai_metadata_enrichment(reference_id: str) -> bool:
-    safe_id = safe_resource_id(reference_id, "")
-    if not safe_id:
-        raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
-    detail = pricing_reference_pack_detail(safe_id)
-    if not detail:
-        return False
-    initial_saved_at = clean_text(detail.get("saved_at"))
-    items = [dict(item) for item in (detail.get("items") if isinstance(detail.get("items"), list) else []) if isinstance(item, dict)]
-    if not items:
-        return False
-    enriched_items, errors = ai_pricing_reference_metadata_enrichment(
-        clean_text(detail.get("label")) or safe_id,
-        items,
-        reference_id=safe_id,
-    )
-    if errors or not enriched_items:
-        write_local_log(
-            "server_error",
-            {
-                "source": "pricing_reference_metadata_enrichment",
-                "reference_id": safe_id,
-                "errors": safe_error_messages(errors or ["AI pricing metadata enrichment returned no rows."]),
-            },
-        )
-        return False
-    pricing_reference_enrichment.enrich_pricing_reference_items(enriched_items)
-    metadata_errors = pricing_reference_metadata_quality_errors(enriched_items)
-    if metadata_errors:
-        write_local_log(
-            "server_error",
-            {
-                "source": "pricing_reference_metadata_enrichment",
-                "reference_id": safe_id,
-                "errors": safe_error_messages(metadata_errors),
-            },
-        )
-        return False
-    latest_detail = pricing_reference_pack_detail(safe_id)
-    if not latest_detail or clean_text(latest_detail.get("saved_at")) != initial_saved_at:
-        return False
-    save_pricing_reference_pack({
-        "id": safe_id,
-        "label": clean_text(detail.get("label")) or safe_id,
-        "description": clean_text(detail.get("description")),
-        "tax": normalized_tax_config(detail.get("tax")),
-        "currency": normalize_currency_label(detail.get("currency")),
-        "schema_version": int(parse_pricing_number(detail.get("schema_version")) or 1),
-        "items": enriched_items,
-        "saved_at": utc_timestamp(),
-    })
-    return True
-
-
 def pricing_reference_is_profile_default(reference_id: str) -> bool:
     safe_id = safe_resource_id(reference_id, "")
     if not safe_id:
@@ -9124,10 +9156,11 @@ def delete_pricing_reference_pack(reference_id: str, source: str = "local") -> b
     if safe_id == DEFAULT_PRICING_REFERENCE_ID or pricing_reference_is_profile_default(safe_id):
         raise ValueError("Default pricing references cannot be deleted.")
     reference_dir = pricing_reference_pack_dir(safe_id)
-    if not reference_dir.exists() or not (reference_dir / "reference.json").is_file():
-        return False
-    shutil.rmtree(reference_dir)
-    return True
+    with local_pricing_reference_lock(reference_dir):
+        if not (reference_dir / "reference.json").is_file():
+            return False
+        shutil.rmtree(reference_dir)
+        return True
 
 
 def profile_payload_from_export(payload: dict[str, Any]) -> dict[str, Any]:
@@ -11577,6 +11610,13 @@ def safe_auth_session_for_async(session: dict[str, Any] | None) -> dict[str, Any
 def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
+    if exc.reason in {"pricing_reference_revision_conflict", "pricing_reference_missing"}:
+        return {
+            "status": "blocked",
+            "errors": generic_referenced_errors(error_reference),
+            "reason": exc.reason,
+            "error_reference": error_reference,
+        }
     message = (
         QUOTE_SESSION_RETIRED_MESSAGE
         if exc.reason == "quote_session_retired"
@@ -11745,8 +11785,22 @@ class LocalSqagStorage:
     def list_pricing_references(self) -> list[dict[str, Any]]:
         return list_pricing_references(self.company_id())
 
-    def save_pricing_reference(self, reference: dict[str, Any]) -> dict[str, Any]:
-        return save_pricing_reference_pack(reference)
+    def pricing_reference_save_snapshot(self, reference_id: str, source: str) -> PricingReferenceSaveSnapshot:
+        reference_dir = pricing_reference_pack_dir(reference_id)
+        with local_pricing_reference_lock(reference_dir):
+            local, catalog, revision = read_local_pricing_reference_for_save(reference_id, reference_dir)
+            requested_source = clean_text(source).lower()
+            selected = None
+            if local is not None and requested_source in {"", "local"}:
+                selected = local.public_detail(catalog)
+            elif requested_source != "local":
+                selected = pricing_reference_pack_detail(reference_id, source="bundled")
+            return PricingReferenceSaveSnapshot(selected, revision)
+
+    def save_pricing_reference(
+        self, reference: dict[str, Any], *, before_save: PricingReferenceSaveSnapshot | None = None,
+    ) -> dict[str, Any]:
+        return save_pricing_reference_pack(reference, before_save=before_save)
 
     def delete_pricing_reference(self, reference_id: str, source: str = "local") -> bool:
         return delete_pricing_reference_pack(reference_id, source=source)
@@ -12942,23 +12996,65 @@ class DatabaseSqagStorage:
         company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("sqag_pricing_references", "reference_id")]
         return sorted(company_references, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("source")).casefold(), clean_text(item.get("id")).casefold()))
 
-    def save_pricing_reference(self, reference: dict[str, Any]) -> dict[str, Any]:
+    def _read_pricing_reference_for_save(
+        self, connection: Any, reference_id: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        row = connection.execute(
+            "select payload_json from sqag_pricing_references where workspace_id = ? and reference_id = ?",
+            (self.workspace_id, reference_id),
+        ).fetchone()
+        if row is None:
+            return None, None
+        raw = row["payload_json"]
+        try:
+            reference = json.loads(raw)
+            if not isinstance(reference, dict):
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+        revision = clean_text(reference.get(PRICING_REFERENCE_SAVE_REVISION_KEY))
+        return reference, revision or ("legacy:" + hashlib.sha256(raw.encode("utf-8")).hexdigest())
+
+    def pricing_reference_save_snapshot(self, reference_id: str, source: str) -> PricingReferenceSaveSnapshot:
+        if not reference_id:
+            raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
+        try:
+            with self.connection() as connection:
+                reference, revision = self._read_pricing_reference_for_save(connection, reference_id)
+        except SqagStorageAccessError:
+            raise
+        except Exception as exc:
+            if not self._expected_storage_failure(exc):
+                raise
+            raise self._storage_unavailable_error(exc) from exc
+        selected = (
+            self._company_pricing_reference_detail(reference)
+            if reference is not None and clean_text(source).lower() in {"", "company"}
+            else None
+        )
+        return PricingReferenceSaveSnapshot(selected, revision)
+
+    def save_pricing_reference(
+        self, reference: dict[str, Any], *, before_save: PricingReferenceSaveSnapshot | None = None,
+    ) -> dict[str, Any]:
         reference_id = safe_resource_id(reference.get("id") or reference.get("label"), "")
         if not reference_id:
             raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
         stored = copy.deepcopy(reference)
         stored["id"] = reference_id
+        stored[PRICING_REFERENCE_SAVE_REVISION_KEY] = secrets.token_hex(16)
         artifact_mode = configured_artifact_storage_mode()
-        if artifact_mode not in {"database", "object"}:
-            self._upsert_payload("sqag_pricing_references", "reference_id", reference_id, stored)
-            return public_company_pricing_reference(stored)
 
-        stored, items, retained_kinds = self._prepare_pricing_visual_artifacts(
-            reference_id,
-            stored,
-        )
+        def require_current(connection: Any) -> None:
+            if before_save is not None:
+                _, revision = self._read_pricing_reference_for_save(connection, reference_id)
+                before_save.require_current(revision)
+
+        if artifact_mode in {"database", "object"}:
+            stored, items, retained_kinds = self._prepare_pricing_visual_artifacts(reference_id, stored)
         if artifact_mode == 'object':
             def prepare_object_pricing(connection: Any):
+                require_current(connection)
                 managed_kinds = set(retained_kinds)
                 managed_kinds.update(
                     clean_text(row['artifact_kind'])
@@ -13012,6 +13108,8 @@ class DatabaseSqagStorage:
                     prepare_object_pricing,
                     persist_object_pricing,
                 )
+            except SqagStorageAccessError:
+                raise
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
                     raise
@@ -13021,21 +13119,20 @@ class DatabaseSqagStorage:
             return public_company_pricing_reference(stored)
 
         def persist_pricing(connection: Any) -> None:
-            self._execute_delete_database_pricing_visuals_except(
-                connection,
-                reference_id,
-                retained_kinds,
-            )
-            for item in items:
-                self._execute_upsert_file_artifact(
-                    connection,
-                    "pricing_reference",
-                    reference_id,
-                    item.artifact_kind,
-                    item.filename,
-                    item.content_type,
-                    item.content,
-                )
+            self._begin_object_lifecycle_transaction(connection, "pricing_reference", reference_id)
+            require_current(connection)
+            if artifact_mode == "database":
+                self._execute_delete_database_pricing_visuals_except(connection, reference_id, retained_kinds)
+                for item in items:
+                    self._execute_upsert_file_artifact(
+                        connection,
+                        "pricing_reference",
+                        reference_id,
+                        item.artifact_kind,
+                        item.filename,
+                        item.content_type,
+                        item.content,
+                    )
             self._execute_upsert_payload(
                 connection,
                 "sqag_pricing_references",
@@ -13046,6 +13143,8 @@ class DatabaseSqagStorage:
 
         try:
             self._run_storage_transaction(persist_pricing)
+        except SqagStorageAccessError:
+            raise
         except Exception as exc:
             if not self._expected_storage_failure(exc):
                 raise
@@ -13079,6 +13178,7 @@ class DatabaseSqagStorage:
                 raise self._storage_unavailable_error(exc) from exc
 
         def delete_pricing_owner(connection: Any) -> bool:
+            self._begin_object_lifecycle_transaction(connection, "pricing_reference", safe_id)
             if artifact_mode == "database":
                 connection.execute(
                     "delete from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
@@ -13105,8 +13205,10 @@ class DatabaseSqagStorage:
         if requested_source not in {"", "company"}:
             return None
         reference = self._read_payload("sqag_pricing_references", "reference_id", safe_id)
-        if reference is None:
-            return None
+        return self._company_pricing_reference_detail(reference) if reference is not None else None
+
+    @staticmethod
+    def _company_pricing_reference_detail(reference: dict[str, Any]) -> dict[str, Any]:
         detail = public_company_pricing_reference(reference)
         items = [dict(item) for item in (reference.get("items") if isinstance(reference.get("items"), list) else []) if isinstance(item, dict)]
         ensure_pricing_reference_order_fields(items)
@@ -18374,8 +18476,9 @@ class PricingReferencePack:
             "authority_items": pricing_reference_authority_items(catalog),
         }
 
-    def public_detail(self) -> dict[str, Any]:
-        catalog = load_json_file(self.pricing_catalog_path)
+    def public_detail(self, catalog: dict[str, Any] | None = None) -> dict[str, Any]:
+        if catalog is None:
+            catalog = load_json_file(self.pricing_catalog_path)
         raw_items = catalog.get("items") if isinstance(catalog.get("items"), list) else []
         items = [dict(item) for item in raw_items if isinstance(item, dict)]
         ensure_pricing_reference_order_fields(items)
@@ -18638,12 +18741,6 @@ def pricing_reference_payload_matches_existing_pack(payload: dict[str, Any], exi
     payload_signature = pricing_reference_visible_signature(payload)
     existing_signature = pricing_reference_visible_signature(existing)
     return payload_signature == existing_signature
-
-
-def pricing_reference_unchanged_save_summary(storage: SqagStorage, reference_id: str, source: str, existing: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(storage, DatabaseSqagStorage):
-        return public_company_pricing_reference(existing)
-    return load_pricing_reference_pack(reference_id, source=source).public_summary()
 
 
 def pricing_reference_payload_updates_existing_pack(payload: dict[str, Any], reference_id: str) -> bool:
@@ -33653,21 +33750,32 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 storage = self.current_app_storage()
                 if storage is None:
                     return
-                existing = storage.pricing_reference_detail(reference_id, source=source) if reference_id else None
+                before_save = storage.pricing_reference_save_snapshot(reference_id, source)
+                existing = before_save.selected
+                updates_existing = pricing_reference_payload_updates_existing_pack(payload, reference_id)
+                if payload.get("update_existing") is True:
+                    if not updates_existing:
+                        raise ValueError("The selected pricing reference does not match the requested edit.")
+                    if existing is None:
+                        raise SqagStorageAccessError(
+                            "The selected pricing reference is unavailable.",
+                            status=404, reason="pricing_reference_missing",
+                        )
                 if existing and pricing_reference_payload_matches_existing_pack(payload, existing):
-                    pricing_reference_summary = pricing_reference_unchanged_save_summary(storage, reference_id, source, existing)
-                    self.send_json({
-                        "status": "unchanged",
-                        "pricing_reference": pricing_reference_summary,
-                        "unchanged": True,
-                    })
+                    summary = (
+                        public_company_pricing_reference(existing) if existing["source"] == "company"
+                        else {key: value for key, value in existing.items() if key not in {"items", "schema_version"}}
+                    )
+                    self.send_json({"status": "unchanged", "pricing_reference": summary, "unchanged": True})
                     return
-                if existing and not pricing_reference_payload_updates_existing_pack(payload, reference_id):
+                if existing and not updates_existing:
                     label = clean_text(existing.get("label")) or reference_id
                     raise ValueError(
                         f'A pricing reference named "{label}" already exists. '
                         "Choose a different pricing reference name, or switch to Manage to edit it."
                     )
+                if before_save.destination_revision is not None and (not existing or existing["source"] == "bundled"):
+                    raise pricing_reference_revision_conflict()
                 reference = normalize_pricing_reference_payload(payload)
                 if pricing_reference_payload_has_visual_artifacts(reference):
                     try:
@@ -33680,7 +33788,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     auth_session=auth_session,
                 ):
                     reference, metadata_enrichment_status = pricing_reference_with_ai_metadata_before_save(reference)
-                saved = storage.save_pricing_reference(reference)
+                saved = storage.save_pricing_reference(reference, before_save=before_save)
                 append_runtime_telemetry(
                     auth_session,
                     "pricing_change",

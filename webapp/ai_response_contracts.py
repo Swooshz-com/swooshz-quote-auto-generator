@@ -6,6 +6,7 @@ Business identity, measurement, catalogue and pricing guards remain in server.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import json
 import math
 
@@ -42,6 +43,7 @@ class Field:
     maximum: int | None = None
     nonblank: bool = False
     positive: bool = False
+    decimal_wire: bool = False
 
     def schema(self):
         result = {"type": [self.kind, "null"] if self.nullable else self.kind}
@@ -82,8 +84,13 @@ class Field:
         valid = {"object": lambda: isinstance(value, dict),
                  "array": lambda: isinstance(value, list),
                  "string": lambda: isinstance(value, str),
-                 "integer": lambda: type(value) is int,
-                 "number": lambda: finite_number(value)}[self.kind]()
+                 "integer": lambda: type(value) is int or (
+                     self.decimal_wire and isinstance(value, Decimal) and value.is_finite()
+                     and value == value.to_integral_value()
+                 ),
+                 "number": lambda: finite_number(
+                     float(value) if self.decimal_wire and isinstance(value, Decimal) else value
+                 )}[self.kind]()
         if not valid or (self.enum and value not in self.enum):
             raise ContractViolation()
         if ((self.minimum is not None and value < self.minimum)
@@ -112,6 +119,8 @@ class Field:
                     if key in value and not (field.nullable and value[key] is None)}
         if self.kind == "array":
             return [self.item.adapt(entry) for entry in value]
+        if self.decimal_wire and isinstance(value, Decimal):
+            return int(value) if self.kind == "integer" else float(value)
         return value
 
 
@@ -123,6 +132,7 @@ def obj(**fields):
 class ResponseContract:
     name: str
     root: Field
+    exact_decimals: bool = False
 
     def text_format(self):
         return {"format": {"type": "json_schema", "name": self.name, "strict": True,
@@ -166,12 +176,14 @@ class ResponseContract:
             value = float(token)
             if not math.isfinite(value):
                 raise ContractViolation("schema_json")
-            return value
+            # Preserve the token for contracts that need to distinguish fractions
+            # from values that merely round to an integer in binary floating point.
+            return Decimal(token) if self.exact_decimals else value
 
         try:
             value = json.loads(text, object_pairs_hook=unique, parse_constant=invalid, parse_float=number)
             return value
-        except (ValueError, TypeError, RecursionError, OverflowError) as exc:
+        except (ValueError, TypeError, RecursionError, OverflowError, InvalidOperation) as exc:
             if isinstance(exc, ContractViolation):
                 raise
             raise ContractViolation("schema_json") from None

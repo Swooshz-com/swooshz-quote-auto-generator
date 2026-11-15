@@ -5,9 +5,9 @@ from webapp.ai_response_contracts import Field, ResponseContract, obj
 
 
 _OPTIONAL_TEXT = Field("string", nullable=True)
-_OPTIONAL_NUMBER = Field("number", nullable=True)
+_OPTIONAL_NUMBER = Field("number", nullable=True, decimal_wire=True)
 _STRING_LIST = Field("array", item=Field("string"))
-_ORDER = Field("integer", positive=True)
+_ORDER = Field("integer", positive=True, decimal_wire=True)
 
 PRICING_IMPORT = ResponseContract("pricing_import_v1", obj(
     currency=_OPTIONAL_TEXT,
@@ -21,11 +21,11 @@ PRICING_IMPORT = ResponseContract("pricing_import_v1", obj(
         aliases=_STRING_LIST,
         category_order=_ORDER,
         item_order=_ORDER,
-        source_row_index=Field("integer", nullable=True, positive=True),
+        source_row_index=Field("integer", nullable=True, positive=True, decimal_wire=True),
         warning=_OPTIONAL_TEXT,
         status=_OPTIONAL_TEXT,
     )),
-))
+), exact_decimals=True)
 
 PRICING_METADATA = ResponseContract("pricing_metadata_v1", obj(
     items=Field("array", item=obj(
