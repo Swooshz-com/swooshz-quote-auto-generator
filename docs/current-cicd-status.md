@@ -44,10 +44,14 @@ App rate limit, cannot verify state read-back, encounters a hold with no saved
 state, or finds a board rendered by a newer Toolkit. A clean run with no
 changes or a partial run with a verified save can still emit the signal.
 
-After the re-pin merges, verify the first App-backed sweep on merged main.
-Check that both token steps succeed, read the changed state at the landed
-store commit, and match its graph revision and hash to the rendered programme
-board. Record the run attempt and the footer cleanup counts or skip reason.
+The programme board lists unblocked assigned or active work first in
+Waiting on and In progress. If an owner test is still owed on an earlier
+pull request, the board lists it after that gate.
+
+After an approved merge, verify the first eligible App-backed sweep on
+`main` using the [programme sweep checks](testing-plan.md#programme-sweep-and-gate).
+A green run or a refresh signal alone is insufficient evidence of a saved
+board change.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.

@@ -94,19 +94,21 @@ inventory, mapping, cutover or rollback requires separate exact owner approval.
 
 ## Programme sweep and gate
 
-Use the Toolkit revision pinned in both managed workflows. Install its
-lockfile dependencies in a disposable local copy with
-npm ci --ignore-scripts --no-audit --no-fund. Run these suites with node --test
-from that copy. On Windows, set `USERPROFILE` to an empty temporary directory
-for the test process only. That lets the generator fixture use its own Git
-history without picking up the machine's managed Toolkit checkout.
+Use the Toolkit revision pinned in both managed workflows. Keep the Toolkit
+repository as the disposable Git checkout's origin. Install the lockfile
+dependencies with `npm ci --ignore-scripts --no-audit --no-fund`. Run each named
+`repo/tests/<suite>.test.cjs` with `node --test` from that checkout. On Windows,
+set `USERPROFILE` to an empty temporary directory for the test process only so
+the generator fixture uses its synthetic Git history.
 
 - **Order authority**. Run programme-holder-order and programme-order-queue
-  under repo/tests. Verify that an eligible order runs inside the cloud lease,
-  a rehearsal leaves state alone, and expired, stale or forbidden operations
-  are refused. Advance the clock during an eligible order to verify the first
-  write and receipt survive, the next operation is blocked, and a later pass
-  leaves the completed work alone. Check retry after a transient failure and
+  under repo/tests. Verify that an eligible order runs inside the cloud lease
+  and that expired, stale or forbidden operations are refused. Rehearse with
+  a `.dry-run.json` queue file and check for a receipt in the synthetic store
+  and zero programme writes from the order. Advance the clock during an
+  eligible order to verify the first write and receipt survive, the next
+  operation is blocked, and a later pass leaves the completed work alone.
+  Check retry after a transient failure and
   keep the pending file until the result can be read back. Interrupt pending
   file removal after that read-back and retry after expiry. Check that a
   completed order keeps one result and a partly applied order keeps its
@@ -120,14 +122,25 @@ history without picking up the machine's managed Toolkit checkout.
   the pinned worker's parent, child and sweep-history validators offline. For
   a compatibility check against private snapshots, keep all data in the
   local evidence store and report only document and result counts.
+- **Board order**. Run programme-parent-layout and toolkit-programme-state.
+  Check Waiting on and In progress with an unblocked assigned or active
+  builder and pending owner UAT on an earlier merged pull request. The
+  builder comes first and the owed test follows. A submitted, interrupted,
+  retired or blocked gate leaves the test current, and a pending owner
+  decision takes precedence.
 - **Repository checks**. Run the Toolkit cloud workflow generator with
   --check and the plain-text installer with --workflow --check against this
   checkout, then run the local plain-text and Nixpacks contract checks.
 
 The offline suites use a synthetic GitHub transport. After an approved merge,
-the controller verifies a real App-backed sweep on main by reading back the
-landed store commit and matching the changed graph revision and hash to the
-rendered board.
+the controller records the current graph revision and hash, then observes a
+real App-backed sweep on `main`. Record the run and attempt, repository commit,
+Toolkit pin, both App token step outcomes, and the footer cleanup counts or skip
+reason. Independently read the landed private store commit. Verify that the
+board graph revision advances and that the rendered graph revision and hash
+match the saved state. Confirm the order above on a real task with a builder
+at work and an earlier owner test still owed. If no such task exists during
+the sweep, keep this verification pending until a qualifying run.
 
 ## Required Impact Pass
 
