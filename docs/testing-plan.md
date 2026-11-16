@@ -136,6 +136,11 @@ the generator fixture uses its synthetic Git history.
   builder comes first and the owed test follows. A submitted, interrupted,
   retired or blocked gate leaves the test current, and a pending owner
   decision takes precedence.
+- **Evidence store recovery**. Run toolkit-store, toolkit-store-recovery and
+  toolkit-store-recovery-checks against disposable local Git repositories.
+  Check that failed pushes preserve commits for retry, a timed-out push is
+  read back before resending, and a conflict keeps both copies. Verify that
+  retries recheck pending commits and refuse disallowed paths or content.
 - **Repository checks**. Run the Toolkit cloud workflow generator with
   --check and the plain-text installer with --workflow --check against this
   checkout, then run the local plain-text and Nixpacks contract checks.
@@ -145,12 +150,14 @@ the controller records the current graph revision and hash, then observes a
 real App-backed sweep on `main`. Record the run and attempt, repository commit,
 Toolkit pin, both App token step outcomes, and the footer cleanup counts or skip
 reason. Independently read the landed private store commit. For the replacement
-case, confirm that the saved child follows the expected live claiming pull
-request at its observed head and state. Verify that the saved graph revision
-advances and that the published board shows the same pull request, graph
-revision and hash. Record a queued run or a held run without a verified save
-as pending, even if the workflow is green. A hold with a partial save still
-requires that same child and board read-back. Confirm the order above on a
+case, record the eligible claiming pull request and its head and state at the
+time of the sweep. Confirm that the saved child and published board follow that
+pull request. If no eligible claimant exists, replacement verification stays
+pending. Verify that the saved graph revision advances and that the published
+board shows the same graph revision and hash. Use a run at the newly installed
+pin. Record a queued run or a held run without a verified save as pending,
+even if the workflow is green. A hold with a partial save still requires
+the graph and board read-back. Confirm the order above on a
 real task with a builder at work and an earlier owner test still owed. If no
 such task exists during the sweep, keep the board-order check pending until a
 qualifying run.

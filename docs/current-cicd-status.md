@@ -48,7 +48,7 @@ The programme board lists unblocked assigned or active work first in
 Waiting on and In progress. If an owner test is still owed on an earlier
 pull request, the board lists it after that gate.
 
-Both managed workflows pin Toolkit 3.141.1 (`a3a77e5`). For an unfinished task,
+Both managed workflows pin Toolkit 3.143.0 (`db521ae`). For an unfinished task,
 the sweep can follow a single newer open pull request that explicitly claims
 the task after its tracked pull request is closed or merged. If the tracked
 pull request closed unmerged and there is no eligible open replacement, the
@@ -59,9 +59,11 @@ tracked pull request.
 
 After an approved merge, verify the first eligible App-backed sweep on
 `main` using the [programme sweep checks](testing-plan.md#programme-sweep-and-gate).
-Read back the replacement from the saved child and match the saved graph to the
-published board. A queued or held run stays pending until the save and redraw
-are verified.
+Read back an actual graph advance from the saved state and match its revision and
+hash to the published board. To verify replacement, record an eligible claimant
+at the time of the sweep and confirm the saved child follows it. Verify the
+installed worker with a run at the new pin. A queued or held run stays pending
+until the save and redraw are verified.
 
 Python discovery includes `tests.test_quote_api_auth` and
 `tests.test_quote_api_tenancy` for the disabled admission boundary.
