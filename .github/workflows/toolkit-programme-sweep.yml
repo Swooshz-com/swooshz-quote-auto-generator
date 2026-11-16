@@ -1,4 +1,4 @@
-# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep toolkit=db521aeb18d1c3f2fb11ad23dd43d38e1d0c5342 sha256=e3d87409e9cc
+# AI-AGENT-TOOLKIT:cloud-workflows:RENDERED programme-sweep toolkit=d667ad5d05304776e67d8789bf83924e71086485 sha256=57249df4b241
 # A copy of the Toolkit's own workflow, pinned to the Toolkit commit above. Do not edit it here: refresh the repository rules to update it.
 # Toolkit Programme Sweep: the programme refresh, run on GitHub instead of a computer.
 #
@@ -82,7 +82,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: weijunswj/ai-agent-toolkit
-          ref: db521aeb18d1c3f2fb11ad23dd43d38e1d0c5342
+          ref: d667ad5d05304776e67d8789bf83924e71086485
           path: .toolkit
           persist-credentials: false
 
@@ -161,7 +161,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: weijunswj/ai-agent-toolkit
-          ref: db521aeb18d1c3f2fb11ad23dd43d38e1d0c5342
+          ref: d667ad5d05304776e67d8789bf83924e71086485
           path: .toolkit
           persist-credentials: false
           sparse-checkout: repo/scripts/toolkit-programme-sweep-gate.cjs
