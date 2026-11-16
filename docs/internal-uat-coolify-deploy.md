@@ -20,6 +20,33 @@ ecommerce or public SaaS. Koncept profile, pricing, and layout packs are
 workspace-imported tenant data only. A new workspace starts with no real
 Koncept pack until an authorized import or seed action targets that workspace.
 
+## Internal redeployment flow
+
+Promote releases to `quote-internal` manually after testing the upgrade in a
+fresh container. Before the first rehearsal, verify that Git pushes, CI and
+deployment webhooks cannot deploy to `quote-internal` without approval.
+
+1. Record the image digest currently serving `quote-internal`, the candidate
+   source commit and its built image digest. Keep the current image available
+   for rollback.
+2. Start a fresh test container on the current release image. Reuse the test
+   app definition and mirror the release runtime settings, proxy behaviour and
+   feature flags. Use a separate test workspace, database, artifact storage
+   and credentials with synthetic data. Use an access-controlled temporary
+   HTTPS URL for browser testing.
+3. Seed a synthetic quote on the current image, then upgrade the test container
+   to the candidate digest. Verify sign-in, reopen the seeded quote, generate a
+   new quote from test images and download its XLSX and PDF. Check image
+   analysis with the feature settings intended for the release. Record the
+   digest and results. A failed check holds promotion.
+4. After approval, manually deploy the same tested digest to `quote-internal`
+   with the intended release settings. Verify the running digest, health and
+   a protected browser smoke check. If verification fails, use the previous
+   release image and its recorded settings to roll back.
+5. After release verification, remove the test container and retain the test
+   app definition and validation record for the next rehearsal. Clean up test
+   database and object data under their own reset and retention policy.
+
 ## Hosted Object Artifact Posture
 
 The hosted internal-alpha deploy scaffold uses database metadata plus object
