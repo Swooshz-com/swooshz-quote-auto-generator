@@ -41666,12 +41666,12 @@ async function run() {
     await page.goto(base, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => !state.isBooting && canManagePricingReferences());
     async function openManage() {
-      await page.evaluate(async () => {
-        openPricingReferenceModal({ preserveMode: true });
-        const reference = state.pricingReferences.find(item => item.id === 'synthetic-editor-append');
-        selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference));
-        await editSelectedPricingReference({ openTable: true });
-      });
+      await page.locator('#settingsButton').click();
+      const selection = page.locator('#deletePricingReferenceSelect');
+      const value = 'local::synthetic-editor-append';
+      if (await selection.inputValue() !== value) await selection.selectOption(value);
+      // Manage renders Review only after the selected reference's editable rows load.
+      await page.locator('#pricingReferenceManageStatus [data-pricing-reference-table-open]').click();
     }
     const field = name => page.locator(`#pricingReferenceTableBody [data-preview-field="${name}"]`);
     const descriptions = () => field('description').evaluateAll(rows => rows.map(row => row.value));
@@ -41713,6 +41713,7 @@ async function run() {
       assert.deepEqual(items.map(row => row.category_order_tie || 0), [0, 0, 0, 0, 0, 1, 1]);
     }
     await page.waitForFunction(() => !state.pricingReferenceSaveBusy);
+    await page.locator('#pricingReferenceCloseButton').click();
     await openManage();
     assert.deepEqual(await descriptions(), expected);
     assert.equal(await page.evaluate(() => pricingReferenceHasPendingChanges()), false);
