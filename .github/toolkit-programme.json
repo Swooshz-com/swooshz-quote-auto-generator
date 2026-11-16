@@ -11,5 +11,6 @@
     "branch": "main",
     "path": "state/Swooshz-com/swooshz-quote-auto-generator/"
   },
-  "required_checks": []
+  "required_checks": [],
+  "task_prs": { "auto_merge": "after-gates" }
 }

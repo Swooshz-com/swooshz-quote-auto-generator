@@ -92,6 +92,76 @@ intervening changes block restoration. Treat inventories and rollback receipts a
 private operational material. The script cannot read or write a database; any live
 inventory, mapping, cutover or rollback requires separate exact owner approval.
 
+## Programme sweep and gate
+
+Use the Toolkit revision pinned in both managed workflows. Keep the Toolkit
+repository as the disposable Git checkout's origin. Install the lockfile
+dependencies with `npm ci --ignore-scripts --no-audit --no-fund`. Run each named
+`repo/tests/<suite>.test.cjs` with `node --test` from that checkout. On Windows,
+set `USERPROFILE` to an empty temporary directory for the test process only so
+the generator fixture uses its synthetic Git history.
+
+- **Order authority**. Run programme-holder-order and programme-order-queue
+  under repo/tests. Verify that an eligible order runs inside the cloud lease
+  and that expired, stale or forbidden operations are refused. Rehearse with
+  a `.dry-run.json` queue file and check for a receipt in the synthetic store
+  and zero programme writes from the order. Advance the clock during an
+  eligible order to verify the first write and receipt survive, the next
+  operation is blocked, and a later pass leaves the completed work alone.
+  Check retry after a transient failure and
+  keep the pending file until the result can be read back. Interrupt pending
+  file removal after that read-back and retry after expiry. Check that a
+  completed order keeps one result and a partly applied order keeps its
+  recorded operations, with only the pending file removed on retry.
+- **Dispatch and state**. Run toolkit-programme-sweep-workflow,
+  toolkit-cloud-workflows, programme-sweep-lease, programme-sweep-store,
+  programme-graph-state and toolkit-programme-redraw-hold under repo/tests.
+  Check main-only activity and CI dispatch, the issue-close path, a verified
+  save and graph redraw, and suppression of the refresh signal on an unsaved
+  hold, failed state read-back or a board rendered by a newer Toolkit. Exercise
+  the pinned worker's parent, child and sweep-history validators offline. For
+  a compatibility check against private snapshots, keep all data in the
+  local evidence store and report only document and result counts.
+- **Replacement pull requests**. Run programme-graph-state and the focused
+  toolkit-programme-custody checks. Exercise closed unmerged to newer merged
+  and unfinished merged to newer open replacements. Verify that bare mentions,
+  older pull requests, multiple eligible open pull requests and retired tasks
+  leave the tracked pull request in place. Verify that a finished task moves
+  only from closed unmerged to newer merged, and that incomplete discovery or
+  a changed replacement state leaves the decision for another pass. Confirm
+  that review and gate acceptance depend on evidence at the replacement head.
+- **Board order**. Run programme-parent-layout and toolkit-programme-state.
+  Check Waiting on and In progress with an unblocked assigned or active
+  builder and pending owner UAT on an earlier merged pull request. The
+  builder comes first and the owed test follows. A submitted, interrupted,
+  retired or blocked gate leaves the test current, and a pending owner
+  decision takes precedence.
+- **Evidence store recovery**. Run toolkit-store, toolkit-store-recovery and
+  toolkit-store-recovery-checks against disposable local Git repositories.
+  Check that failed pushes preserve commits for retry, a timed-out push is
+  read back before resending, and a conflict keeps both copies. Verify that
+  retries recheck pending commits and refuse disallowed paths or content.
+- **Repository checks**. Run the Toolkit cloud workflow generator with
+  --check and the plain-text installer with --workflow --check against this
+  checkout, then run the local plain-text and Nixpacks contract checks.
+
+The offline suites use a synthetic GitHub transport. After an approved merge,
+the controller records the current graph revision and hash, then observes a
+real App-backed sweep on `main`. Record the run and attempt, repository commit,
+Toolkit pin, both App token step outcomes, and the footer cleanup counts or skip
+reason. Independently read the landed private store commit. For the replacement
+case, record the eligible claiming pull request and its head and state at the
+time of the sweep. Confirm that the saved child and published board follow that
+pull request. If no eligible claimant exists, replacement verification stays
+pending. Verify that the saved graph revision advances and that the published
+board shows the same graph revision and hash. Use a run at the newly installed
+pin. Record a queued run or a held run without a verified save as pending,
+even if the workflow is green. A hold with a partial save still requires
+the graph and board read-back. Confirm the order above on a
+real task with a builder at work and an earlier owner test still owed. If no
+such task exists during the sweep, keep the board-order check pending until a
+qualifying run.
+
 ## Required Impact Pass
 
 Before finishing a change:
@@ -1029,10 +1099,18 @@ each visible terminal label, exactly one generation, polling, zero navigation an
 retained interruption identity on its own server and browser.
 The smoke uses Playwright Chromium locally as well as in CI. Screenshot mode
 runs the broad visual journey without the isolated G3 tail; default CI retains it.
-On Windows, native Excel COM PDF export may rewrite the workbook tax formula's
-expression while preserving its value. The post-PDF exact formula assertion
-still rejects such a rewrite; record it as a local converter qualification gap.
-CI's LibreOffice path and the verifier's formula requirements remain unchanged.
+Native workbook PDF export uses a disposable conversion copy. Before removing a
+blank second page, the same renderer must reproduce the first two pages from a
+copy limited to the authored first print section. The continuation must remain
+visible in the original export. The proof also works when acceptance text
+appears on both pages, the sheet name differs in case from the print area, or
+the column-break list is empty with equivalent zero counts, including leading
+zeros, signs and surrounding XML whitespace. Real or malformed column breaks,
+printed gridlines, unrelated blanks and unverifiable PDFs keep their original export.
+The regression compares the retained text, geometry and pixels, including for
+row fill and vertical centring. The XLSX master must remain byte-for-byte
+identical. Run the native regression in Validate app on Ubuntu 24.04 with
+LibreOffice Calc or locally on Windows with Microsoft Excel.
 
 Each eligible saved/job/resume read verifies at most one actual PDF body; a list of N
 eligible rows verifies at most N PDF bodies. Invalid auth, proof or expected identity
