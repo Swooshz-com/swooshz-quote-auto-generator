@@ -150,6 +150,7 @@ from webapp.quote_engine import (
     normalize_pricing_unit,
     parse_float_or_none,
     parse_pricing_number,
+    catalogue_order_number,
     pricing_catalog_runtime_lookup,
     pricing_reference_order_number,
     pricing_reference_sale_unit_price,
@@ -6549,20 +6550,6 @@ PRICING_REFERENCE_ITEM_ORDER_KEYS = (
 )
 
 
-def catalogue_order_number(value: Any) -> int | None:
-    # Provider decimals and exponents have already been admitted as Python ints.
-    if type(value) is int:
-        return value if value > 0 else None
-    if isinstance(value, str):
-        digits = value.replace(",", "").strip()
-        if digits.isascii() and digits.isdigit():
-            try:
-                return int(digits) or None
-            except ValueError:
-                return None
-    return pricing_reference_order_number(value)
-
-
 def pricing_reference_order_from_raw(raw: dict[str, Any], keys: tuple[str, ...]) -> int | None:
     for key in keys:
         if key not in raw:
@@ -9624,11 +9611,11 @@ def line_item_pricing_reference_order(
     fallback_index: int,
 ) -> tuple[int, int, int, str, str]:
     category_order = (
-        pricing_reference_order_number(item.get("category_order"))
+        catalogue_order_number(item.get("category_order"))
         or pricing_reference_section_order_value(item.get("section") or item.get("reference_section"), section_order)
         or 999999
     )
-    item_order = pricing_reference_order_number(item.get("item_order")) or 999999
+    item_order = catalogue_order_number(item.get("item_order")) or 999999
     return (
         category_order,
         item_order,
@@ -9660,11 +9647,11 @@ def quote_basis_line_order(
     fallback_index: int,
 ) -> tuple[int, int, int, str]:
     category_order = (
-        pricing_reference_order_number(line.get("category_order"))
+        catalogue_order_number(line.get("category_order"))
         or pricing_reference_section_order_value(section_title, section_order)
         or 999999
     )
-    item_order = pricing_reference_order_number(line.get("item_order")) or 999999
+    item_order = catalogue_order_number(line.get("item_order")) or 999999
     return (category_order, item_order, fallback_index, clean_text(line.get("text")).casefold())
 
 
@@ -9675,9 +9662,8 @@ def quote_basis_section_order(
 ) -> tuple[int, int, str]:
     title = clean_basis_section_title(section.get("title"))
     line_category_orders = [
-        pricing_reference_order_number(line.get("category_order"))
-        for line in section.get("lines") or []
-        if isinstance(line, dict) and pricing_reference_order_number(line.get("category_order")) is not None
+        order for line in section.get("lines") or []
+        if isinstance(line, dict) and (order := catalogue_order_number(line.get("category_order"))) is not None
     ]
     category_order = min(line_category_orders) if line_category_orders else None
     category_order = category_order or pricing_reference_section_order_value(title, section_order) or 999999
@@ -19855,6 +19841,13 @@ def normalize_owned_line_item(
         item["status"] = "unmatched"
     trusted_price = pricing_authority_price(authority)
     authority_variant = clean_text(authority.get("variant")).lower()
+    if authority_variant == "catalog" and catalog_item:
+        # A validated catalogue match can restore orders that the quote draft
+        # wire format cannot carry. Keep that format's limit on caller values.
+        for order_key in ("category_order", "item_order"):
+            order = catalogue_order_number(catalog_item.get(order_key))
+            if order is not None and order > PRIMARY_ORDER_MAX:
+                item[order_key] = order
     authority_is_untrusted = raw_authority_present and authority_variant not in PRICING_AUTHORITY_TRUSTED_VARIANTS
     if authority_is_untrusted:
         for stale_key in (
@@ -20228,7 +20221,7 @@ def normalize_line_items(
             "source_basis_line_id": safe_resource_id(raw.get("source_basis_line_id"), ""),
         }
         for order_key in ("category_order", "item_order"):
-            order_value = pricing_reference_order_number((catalog_item or {}).get(order_key)) or raw.get(order_key)
+            order_value = catalogue_order_number((catalog_item or {}).get(order_key)) or raw.get(order_key)
             if order_value is not None:
                 item[order_key] = order_value
         if raw.get("basis_order") is not None:
@@ -21120,8 +21113,8 @@ def pricing_catalog_prompt_rows_from_reference(reference: dict[str, Any]) -> lis
         row = {
             "id": clean_text(item.get("id")),
             "section": clean_text(item.get("section")),
-            "category_order": pricing_reference_order_number(item.get("category_order")),
-            "item_order": pricing_reference_order_number(item.get("item_order")),
+            "category_order": catalogue_order_number(item.get("category_order")),
+            "item_order": catalogue_order_number(item.get("item_order")),
             "unit_hint": clean_text(item.get("unit_hint")),
             "description": clean_customer_quote_line_text(item.get("description"))[:MAX_PROMPT_CATALOG_DESCRIPTION_CHARS],
             "remarks": [
@@ -21190,8 +21183,8 @@ def local_pricing_reference_items(
             "id": clean_text(raw.get("id")) or f"local-item-{len(items) + 1}",
             "section": clean_text(raw.get("section")),
             "reference_section": clean_basis_section_title(raw.get("reference_section") or raw.get("section")),
-            "category_order": pricing_reference_order_number(raw.get("category_order")),
-            "item_order": pricing_reference_order_number(raw.get("item_order")),
+            "category_order": catalogue_order_number(raw.get("category_order")),
+            "item_order": catalogue_order_number(raw.get("item_order")),
             "unit_hint": clean_text(raw.get("unit_hint")),
             "description": clean_customer_quote_line_text(description),
             "internal_cost": cost,
@@ -21298,8 +21291,8 @@ def catalog_visual_image_entries_for_items(
         if not refs:
             continue
         label = clean_text(f"{item.get('id')}: {item.get('description')}")
-        category_order = pricing_reference_order_number(item.get("category_order")) or 10**9
-        item_order = pricing_reference_order_number(item.get("item_order")) or 10**9
+        category_order = catalogue_order_number(item.get("category_order")) or 10**9
+        item_order = catalogue_order_number(item.get("item_order")) or 10**9
         for ref in refs:
             data_url = clean_text(ref.get("data_url"))
             if not data_url:
@@ -22560,7 +22553,7 @@ def quote_basis_sections_with_catalog_exact_lines(
         if catalog_unit_price is not None:
             line["catalog_unit_price"] = catalog_unit_price
         for order_key in ("category_order", "item_order"):
-            order_value = pricing_reference_order_number(item.get(order_key))
+            order_value = catalogue_order_number(item.get(order_key))
             if order_value is not None:
                 line[order_key] = order_value
         display_detail_source = display_detail_source_for_catalog_line(line, catalog_description, item.get("description"))
@@ -23064,9 +23057,9 @@ def line_items_with_resolved_basis_catalog(
             next_item["catalog_unit_price"] = catalog_unit_price
         for order_key in ("category_order", "item_order"):
             order_value = (
-                pricing_reference_order_number(basis_line.get(order_key))
-                or pricing_reference_order_number(catalog_item.get(order_key))
-                or pricing_reference_order_number(item.get(order_key))
+                catalogue_order_number(basis_line.get(order_key))
+                or catalogue_order_number(catalog_item.get(order_key))
+                or catalogue_order_number(item.get(order_key))
             )
             if order_value is not None:
                 next_item[order_key] = order_value
@@ -23418,9 +23411,9 @@ def line_items_aligned_to_quote_basis(
                     next_item["pricing_authority"] = build_pricing_authority("none", next_item)
             for order_key in ("category_order", "item_order"):
                 order_value = (
-                    pricing_reference_order_number(line.get(order_key))
-                    or pricing_reference_order_number((catalog_item or {}).get(order_key))
-                    or pricing_reference_order_number(existing.get(order_key))
+                    catalogue_order_number(line.get(order_key))
+                    or catalogue_order_number((catalog_item or {}).get(order_key))
+                    or catalogue_order_number(existing.get(order_key))
                 )
                 if order_value is not None:
                     next_item[order_key] = order_value
@@ -24191,7 +24184,7 @@ def line_items_with_confirmed_basis_selections(
             next_item["pricing_basis_amount"], quote_exchange_rate_from_payload(payload) or 1,
         )
         for key in ("category_order", "item_order"):
-            value = pricing_reference_order_number(catalog_item.get(key))
+            value = catalogue_order_number(catalog_item.get(key))
             if value is not None:
                 next_item[key] = value
         result.append(next_item)
@@ -24673,7 +24666,7 @@ def apply_pricing_selections(
             # Same contract as /api/line-items/normalize, plus each selection's outcome.
             "status": "normalized",
             "selections": outcomes,
-            "line_items": line_items,
+            "line_items": [canonicalize_primary_order_fields(row) for row in line_items],
             "quote_session": {**saved, "pricing_ledger": public_pricing_ledger(persisted)},
         }
 
@@ -26730,6 +26723,15 @@ def completed_draft_with_pricing_reference_snapshot(
             {**payload, "quote_basis_sections": completed.get("quote_basis_sections", [])},
             completed["line_items"], auth_session, offer=True, source_measurements=measurements,
         )
+    # Exact catalogue values have already served as sort keys. The quote wire
+    # format still admits only JavaScript-safe primary orders.
+    if isinstance(completed.get("line_items"), list):
+        completed["line_items"] = [canonicalize_primary_order_fields(row) for row in completed["line_items"]]
+    if isinstance(completed.get("quote_basis_sections"), list):
+        completed["quote_basis_sections"] = [
+            {**section, "lines": [canonicalize_primary_order_fields(line) for line in section["lines"]]}
+            for section in completed["quote_basis_sections"]
+        ]
     return completed
 
 
@@ -34181,7 +34183,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
-            self.send_json({"status": "normalized", "line_items": line_items})
+            self.send_json({
+                "status": "normalized",
+                "line_items": [canonicalize_primary_order_fields(row) for row in line_items],
+            })
             return
 
         if parsed.path == "/api/quote-sessions/pricing-selections":

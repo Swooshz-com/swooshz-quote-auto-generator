@@ -41626,9 +41626,11 @@ main().catch((error) => {
                 ("Synthetic panel", 24, "__HIGH__", 1), ("Synthetic rail", 40, "__LOW__", "__OUTSIDE__"),
             )
         ]})
+        exponent = (sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits) - 1
+        boundary = 10 ** exponent
         for key, token in {
-            "__CATEGORY__": "9007199254740993", "__HIGH__": "9007199254740993.0",
-            "__LOW__": "9007199254740992e0", "__OUTSIDE__": "9007199254740993",
+            "__CATEGORY__": str(boundary + 1), "__HIGH__": f"{boundary + 1}.0",
+            "__LOW__": f"1e{exponent}", "__OUTSIDE__": f"1e{exponent}",
         }.items():
             raw = raw.replace(json.dumps(key), token)
         model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
@@ -41638,8 +41640,9 @@ const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
 const base = process.argv[2];
 const endpoint = base + '/api/settings/pricing-references';
-const orders = ['9007199254740992', '9007199254740993'];
-const category = '9007199254740993';
+const boundary = 10n ** BigInt(process.argv[3]);
+const orders = [String(boundary), String(boundary + 1n)];
+const category = orders[1];
 function exact(raw) {
   return JSON.parse(raw, (key, value, context) => {
     if (!['item_order', 'category_order'].includes(key)) return value;
@@ -41648,7 +41651,7 @@ function exact(raw) {
   });
 }
 async function run() {
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ channel: process.env.SQAG_TEST_PLAYWRIGHT_CHANNEL || undefined });
   try {
     const context = await browser.newContext({ serviceWorkers: 'block' });
     await context.route('**/*', route => new URL(route.request().url()).origin === base ? route.continue() : route.abort());
@@ -41684,7 +41687,7 @@ async function run() {
     await page.evaluate(() => openPricingReferenceTableOverlay());
     assert.deepEqual(await page.locator('#pricingReferenceTableBody [data-preview-field="description"]').evaluateAll(rows => rows.map(row => row.value)), ['Synthetic rail', 'Synthetic panel']);
     await page.locator('#pricingReferenceAddRowButton').click();
-    assert.deepEqual(await browserOrders(), [...orders, '9007199254740994']);
+    assert.deepEqual(await browserOrders(), [...orders, String(boundary + 2n)]);
     await page.locator('#pricingReferenceUndoButton').click();
     assert.deepEqual(await browserOrders(), orders);
     await page.locator('#pricingReferenceTableCloseButton').click();
@@ -41745,7 +41748,7 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
             LocalRunnerServer() as runner,
         ):
             completed = subprocess.run(
-                [node, "-", runner.base_url], cwd=ROOT, input=browser, text=True, encoding="utf-8",
+                [node, "-", runner.base_url, str(exponent)], cwd=ROOT, input=browser, text=True, encoding="utf-8",
                 capture_output=True, timeout=60,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr[-4000:])
@@ -42051,6 +42054,90 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
                 self.assertEqual(status, 503, result)
                 send.assert_not_called()
                 self.assertEqual(files(unreadable), before)
+
+    def test_pricing_import_wire_order_has_exact_numeric_form_parity(self):
+        model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
+        catalogue = Path(self._test_data_root) / "wire-pricing"
+        source = base64.b64encode(b"Item,Price\nSynthetic rail,40\n").decode("ascii")
+        upload = {"filename": "synthetic-rail.csv", "currency": "MYR",
+                  "data_url": "data:text/csv;base64," + source}
+        row = {"section": "Structures", "description": "Synthetic rail", "unit_hint": "sqm",
+               "internal_cost": 40, "markup_multiplier": 1.5, "remarks": [], "aliases": [],
+               "category_order": 1, "item_order": 1, "source_row_index": 1,
+               "warning": None, "status": None}
+        limit = sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits
+        boundary = "9" * limit
+        expanded = "1" + "0" * (limit - 1)
+        order_fields = ("category_order", "item_order", "source_row_index")
+
+        def wire(token, fields=order_fields):
+            return json.dumps({"currency": None, "items": [
+                {**row, **dict.fromkeys(fields, "WIRE_NUMBER")},
+            ]}).replace('"WIRE_NUMBER"', token)
+
+        cases = [
+            ("plain", wire(boundary), int(boundary)),
+            ("decimal", wire(boundary + ".00"), int(boundary)),
+            ("negative-exponent", wire(boundary + "0e-1"), int(boundary)),
+            ("expanded-plain", wire(expanded), int(expanded)),
+            ("expanded-decimal", wire("0.01e" + str(limit + 1)), int(expanded)),
+            ("expanded-exponent", wire(f"1e{limit - 1}"), int(expanded)),
+            ("over-limit-integer", wire("1" + "0" * limit), None),
+            ("over-limit-expansion", wire(f"1e{limit}"), None),
+            ("over-limit-precision", wire("1." + boundary), None),
+            ("extreme-exponent", wire("1e999999999999999999"), None),
+            ("integer-shaped-fraction", wire("1.00000000000000000001"), None),
+            ("underflowing-fraction", wire("1e-9999"), None),
+            ("negative-integer", wire("-1e0"), None),
+            ("bad-leading-zero", wire("01e0"), None),
+            ("missing-exponent", wire("1e+"), None),
+            ("duplicate-order", wire('1,"category_order":2', ("category_order",)), None),
+            ("nonfinite-constant", wire("NaN"), None),
+            ("nonfinite-cost", wire("1e309", ("internal_cost",)), None),
+            ("nonfinite-markup", wire("1e309", ("markup_multiplier",)), None),
+        ]
+        self.addCleanup(self.reset_rate_limit_state)
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local"}),
+            mock.patch.object(webapp, "pricing_references_root", return_value=catalogue),
+            mock.patch.object(webapp, "write_local_log"),
+            mock.patch.object(webapp, "repair_ai_pricing_import_source_placement",
+                              wraps=webapp.repair_ai_pricing_import_source_placement) as placement,
+            LocalRunnerServer() as runner,
+        ):
+            with urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3) as response:
+                session = json.load(response)
+            for case, text, expected in cases:
+                self.reset_rate_limit_state()
+                placement.reset_mock()
+                with self.subTest(case=case), mock.patch.object(
+                    webapp.urllib.request, "urlopen",
+                    return_value=FixtureHttpResponse(responses_envelope(model, text)),
+                ) as send:
+                    connection = http.client.HTTPConnection(*runner.server.server_address, timeout=5)
+                    try:
+                        connection.request("POST", "/api/settings/pricing-references/import-preview", json.dumps(upload), {
+                            "Content-Type": "application/json", "Origin": runner.base_url,
+                            session["csrf_header"]: session["csrf_token"],
+                        })
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, 200)
+                        preview = json.load(response)
+                    finally:
+                        connection.close()
+                    send.assert_called_once()
+                    self.assertFalse(preview["saved"])
+                    self.assertFalse(catalogue.exists())
+                    self.assertEqual(preview["canSave"], expected is not None)
+                    if expected is None:
+                        placement.assert_not_called()
+                        self.assertEqual(preview["items"], [])
+                        self.assertEqual(preview["errors"], webapp.generic_referenced_errors(preview["error_reference"]))
+                    else:
+                        placement.assert_called_once()
+                        self.assertTrue(placement.call_args.args[0][0]["source_row_index"] == expected)
+                        for field in ("category_order", "item_order"):
+                            self.assertTrue(preview["items"][0][field] == expected)
 
     def test_strict_pricing_import_and_metadata_through_upload_and_save_endpoints(self):
         import_model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
@@ -43487,6 +43574,98 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
             self.assertIsNone(self._ledger_price(rows, "letters-row"))
             self.assertEqual(self._ledger_price(rows, "carpet-row"), koncept_catalog_sale_unit_price(self.LEDGER_CARPET))
             self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "letters-row"))
+
+    def test_exact_catalogue_order_survives_quote_seal_and_workbook_generation(self):
+        import generate_quote as quote
+        from tests.test_generate_quote import find_cell_ref
+
+        exponent = (sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits) - 1
+        boundary = 10 ** exponent
+        reference_id = "synthetic-quote-order"
+        source_rows = [
+            ("first-section", "Furniture", "Synthetic high-back chair", boundary, boundary, 18),
+            ("first-item", "Lighting", "Synthetic spotlight arm", boundary + 1, boundary, 24),
+            ("second-item", "Lighting", "Synthetic pendant fixture", boundary + 1, boundary + 1, 40),
+        ]
+        items = [with_required_pricing_metadata({
+            "id": item_id, "section": section, "description": description,
+            "unit_hint": "nos", "internal_cost": cost, "markup_multiplier": 1.5,
+            "category_order": category_order, "item_order": item_order,
+            "visual_references": [{"source": f"xl/media/{item_id}.png", "data_url": synthetic_image(size=(index, 1))}],
+        }) for index, (item_id, section, description, category_order, item_order, cost)
+                 in enumerate(reversed(source_rows), start=1)]
+        selection = {"pricing_reference_id": reference_id, "pricing_reference_source": "local",
+                     "pricing_reference": {"id": reference_id, "source": "local", "currency": "SGD"}}
+        self.addCleanup(self.reset_rate_limit_state)
+        with (
+            mock.patch.dict(os.environ, self._ledger_env()),
+            mock.patch.object(webapp, "write_local_log"),
+            LocalRunnerServer() as runner,
+        ):
+            saved = webapp.save_pricing_reference_pack(webapp.normalize_pricing_reference_payload({
+                "id": reference_id, "label": "Synthetic quote order", "currency": "SGD", "items": items,
+            }))
+            snapshot = webapp.capture_pricing_reference_snapshot(selection)
+            expected = [row[0] for row in source_rows]
+            prompts = webapp.pricing_catalog_prompt_rows_from_reference(snapshot.detail())
+            self.assertEqual([row["id"] for row in prompts], expected)
+            images = webapp.catalog_visual_image_entries_for_payload({**selection, "_pricing_reference_snapshot": snapshot})
+            self.assertEqual([image["id"] for image in images], expected)
+            lookup = webapp.pricing_catalog_runtime_lookup_for_payload(selection)
+            local = webapp.local_pricing_reference_items({**selection, "_pricing_reference_snapshot": snapshot})
+            self.assertEqual([row["id"] for row in local], expected)
+            for actual in (prompts, [lookup[item_id] for item_id in expected], local):
+                for row, (_, _, _, category_order, item_order, _) in zip(actual, source_rows, strict=True):
+                    self.assertTrue(row["category_order"] == category_order)
+                    self.assertTrue(row["item_order"] == item_order)
+
+            request, draft = self._ledger_analysis([
+                (item_id, section, description, 2, "nos", item_id)
+                for item_id, section, description, *_ in reversed(source_rows)
+            ], session_id="quote-wide-catalogue", payload={**valid_payload(), **selection})
+            self.assertEqual([row["source_basis_line_id"] for row in draft["line_items"]], expected)
+            self.assertEqual([[line["id"] for line in section["lines"]] for section in draft["quote_basis_sections"]],
+                             [["first-section"], ["first-item", "second-item"]])
+            identity = {"id": reference_id, "source": "local", "currency": "SGD", "digest": saved["digest_sha256"]}
+            state = request["quote_session"]["draft_state"]
+            state["quoteDetails"]["commercial_snapshot"]["pricing_basis"] = identity
+            completed = webapp.completed_draft_with_pricing_reference_snapshot(
+                {**request, "_pricing_reference_snapshot": snapshot}, {**draft, "source": "openai"},
+            )
+            self.assertEqual(completed["pricing_analysis_seal"], draft["pricing_analysis_seal"])
+            request["quote_basis_sections"] = completed["quote_basis_sections"]
+            request["line_items"] = list(reversed(completed["line_items"]))
+            for row in request["line_items"]:
+                self.assertNotIn("category_order", row)
+                self.assertNotIn("item_order", row)
+            self._ledger_sync(request)
+            headers = self._ledger_runner_headers(runner)
+            unsealed = copy.deepcopy(request)
+            unsealed.pop("pricing_analysis_seal")
+            unsealed["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+            self.assertTrue(all(self._ledger_price(self._ledger_brief_rows(unsealed), item_id) is None
+                                for item_id in expected))
+            rows = self._ledger_normalize(runner, headers, request)
+            self.assertEqual([row["source_basis_line_id"] for row in rows], expected)
+            self.assertEqual([self._ledger_price(rows, item_id) for item_id in expected], [27, 36, 60])
+
+            brief = webapp.payload_to_brief(request)
+            self.assertEqual([row["source_basis_line_id"] for row in brief["line_items"]], expected)
+            job = Path(self._test_data_root) / "wide-order-xlsx"
+            job.mkdir(parents=True)
+            pricing_file = webapp.pricing_catalog_path_for_payload({**request, "_pricing_reference_snapshot": snapshot}, job)
+            self.assertEqual(quote.catalog_payload_digest(json.loads(pricing_file.read_bytes())), identity["digest"])
+            lines = quote.prepare_lines(brief, quote.extract_price_rows(pricing_file), allow_ambiguous=False,
+                                        authority_required=True, trusted_pricing_reference=identity)
+            self.assertEqual([line.match_status for line in lines], ["matched"] * len(expected))
+            output = job / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, output, brief, lines)
+            with zipfile.ZipFile(output) as archive:
+                sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            cells = [find_cell_ref(sheet, row[2]) for row in source_rows]
+            self.assertTrue(all(cells))
+            worksheet_rows = [quote.parse_cell_ref(cell)[0] for cell in cells]
+            self.assertEqual(worksheet_rows, sorted(set(worksheet_rows)))
 
     def test_ledger_analysis_matches_price_through_the_server_seal_only(self):
         price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)

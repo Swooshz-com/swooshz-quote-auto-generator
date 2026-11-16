@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import json
 import math
+import sys
 
 
 BASIS_TAGS = frozenset({"Include", "Confirm", "Custom", "Exclude"})
@@ -28,6 +29,33 @@ class ContractViolation(ValueError):
         super().__init__("AI response does not match its contract.")
         self.reason = reason
         self.missing_path = missing_path
+
+
+def _integer_digit_limit() -> int:
+    # Reuse the JSON integer I/O limit so admitted orders remain serialisable.
+    return sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits
+
+
+def _bounded_json_integer(token: str) -> int:
+    if len(token.lstrip("-")) > _integer_digit_limit():
+        raise ContractViolation("schema_json")
+    return int(token)
+
+
+def _bounded_json_decimal(token: str) -> Decimal:
+    # The JSON decoder has already recognised the number syntax. Remove
+    # insignificant zeros before constructing a bounded Decimal coefficient.
+    mantissa, _, exponent = token.lower().partition("e")
+    sign = "-" if mantissa.startswith("-") else ""
+    whole, _, fraction = mantissa.removeprefix("-").partition(".")
+    digits = (whole + fraction).lstrip("0")
+    coefficient = digits.rstrip("0")
+    if len(coefficient) > _integer_digit_limit():
+        raise ContractViolation("schema_json")
+    # Let Decimal bound the exponent without converting its text to a large int.
+    scale = Decimal("1e" + exponent).as_tuple().exponent if exponent else 0
+    scale += len(digits) - len(coefficient) - len(fraction)
+    return Decimal(f"{sign}{coefficient or '0'}e{scale}")
 
 
 @dataclass(frozen=True)
@@ -86,6 +114,7 @@ class Field:
                  "string": lambda: isinstance(value, str),
                  "integer": lambda: type(value) is int or (
                      self.decimal_wire and isinstance(value, Decimal) and value.is_finite()
+                     and value.adjusted() < _integer_digit_limit()
                      and value == value.to_integral_value()
                  ),
                  "number": lambda: finite_number(
@@ -176,13 +205,14 @@ class ResponseContract:
             value = float(token)
             if not math.isfinite(value):
                 raise ContractViolation("schema_json")
-            # Preserve the token for contracts that need to distinguish fractions
-            # from values that merely round to an integer in binary floating point.
-            return Decimal(token) if self.exact_decimals else value
+            return value
 
         try:
-            value = json.loads(text, object_pairs_hook=unique, parse_constant=invalid, parse_float=number)
-            return value
+            return json.loads(
+                text, object_pairs_hook=unique, parse_constant=invalid,
+                parse_int=_bounded_json_integer if self.exact_decimals else int,
+                parse_float=_bounded_json_decimal if self.exact_decimals else number,
+            )
         except (ValueError, TypeError, RecursionError, OverflowError, InvalidOperation) as exc:
             if isinstance(exc, ContractViolation):
                 raise
