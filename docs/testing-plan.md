@@ -343,7 +343,9 @@ the owner-approved CI lane.
 - Pricing save recovery and integrity: run `tests.test_pricing_reference_storage`
   on Windows and Linux with disposable data. It covers process exits during
   create and edit, publication and cleanup, concurrent readers, corrupt
-  records, legacy digests, and generator input. Run the rendered exact-order
+  records, legacy digests, and generator input. Its HTTP cases check that a
+  damaged local pack or database row stays out of the profile and settings
+  lists while its detail and export return 503 with a support reference. Run the rendered exact-order
   and HTTP failure cases in `tests.test_webapp`. SQLite covers metadata, BLOB
   and object modes. PostgreSQL 17 covers metadata and object modes with
   synthetic object bytes.

@@ -63,6 +63,11 @@ recovery. A save takes effect when the complete new pack moves into place.
 An interruption before that point leaves the previous pack or restores it at
 the next app access. After publication, the app keeps the new pack and retries
 cleanup of its old copy if needed. Corrupt storage returns a support reference.
+Pricing lists leave out a damaged local pack or database row and log a support
+reference for it, so one bad pack cannot stop profiles and pricing loading.
+Detail, export, edit and quote use of that pack still fail closed with a support
+reference. A confirmed delete also removes the pack's recovery folder, so lists
+stop checking deleted packs.
 
 The app uses the same lock for pricing detail, lists, export and quote
 snapshots. Quote generation uses its own copy of the selected catalogue.

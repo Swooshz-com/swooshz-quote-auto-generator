@@ -1,5 +1,6 @@
 """Pricing save preconditions on disposable databases and synthetic objects."""
 import base64
+import http.client
 import io
 import json
 import os
@@ -495,11 +496,16 @@ class PricingReferenceStorageCases:
                             for read in (
                                 lambda: writer.pricing_reference_save_snapshot(REFERENCE_ID, "company"),
                                 lambda: writer.pricing_reference_detail(REFERENCE_ID),
-                                writer.list_pricing_references,
                             ):
                                 with self.assertRaises(server.SqagStorageAccessError) as error:
                                     read()
                                 self.assertEqual(error.exception.status, 503)
+                            # One damaged row stays out of the list instead of failing it.
+                            with mock.patch.object(server, "write_local_log") as log:
+                                self.assertEqual(writer.list_pricing_references(), [])
+                            self.assertEqual(log.call_args.args[1]["reference_id"], REFERENCE_ID)
+                            self.assertTrue(log.call_args.args[1]["error_reference"])
+                            self.assertEqual([pack["id"] for pack in other.list_pricing_references()], [REFERENCE_ID])
                             for expected in (edit, server.PricingReferenceSaveSnapshot(None, None), None):
                                 with self.assertRaises(server.SqagStorageAccessError) as error:
                                     writer.save_pricing_reference(pricing_reference(20), before_save=expected)
@@ -532,3 +538,122 @@ class PostgresPricingReferenceStorageTest(PricingReferenceStorageCases, unittest
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
         self.database_url = runtime.safe_postgres_url("sqag_runtime", fixture.database_name)
+
+
+class DamagedPricingReferenceHttpTest(unittest.TestCase):
+    """One damaged saved pack must not take down the boot and settings lists."""
+
+    LIST_PATHS = ("/api/profiles", "/api/settings", "/api/settings/pricing-references")
+
+    def setUp(self):
+        # Module access keeps unittest from collecting the shared fixture class here.
+        from tests import test_webapp
+
+        self.webapp_tests = test_webapp
+        self.fixture = test_webapp.WebappServerTest()
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
+        self.logs = self.enterContext(mock.patch.object(server, "write_local_log"))
+
+    @staticmethod
+    def get(runner, path, cookie=None):
+        host, port = runner.server.server_address
+        connection = http.client.HTTPConnection(host, port, timeout=20)
+        try:
+            connection.request("GET", path, headers={"Cookie": cookie} if cookie else {})
+            response = connection.getresponse()
+            body = response.read()
+            if response.getheader("Content-Type", "").startswith("application/json"):
+                return response.status, json.loads(body)
+            return response.status, body
+        finally:
+            connection.close()
+
+    def assert_lists_survive(self, runner, cookie=None):
+        for path in self.LIST_PATHS:
+            with self.subTest(path=path):
+                self.logs.reset_mock()
+                status, body = self.get(runner, path, cookie)
+                self.assertEqual(status, 200, body)
+                ids = {reference["id"] for reference in body["pricing_references"]}
+                self.assertIn("healthy-pack", ids)
+                self.assertNotIn("damaged-pack", ids)
+                logged = [call.args[1] for call in self.logs.call_args_list
+                          if call.args[0] == "server_error" and call.args[1].get("source") == "pricing_reference_listing"]
+                self.assertEqual([entry["reference_id"] for entry in logged], ["damaged-pack"])
+                self.assertTrue(logged[0]["error_reference"])
+
+    def assert_damaged_reads_fail_closed(self, runner, source, cookie=None):
+        base = "/api/settings/pricing-references/damaged-pack"
+        for path in (base, base + "/export.xlsx"):
+            with self.subTest(path=path):
+                self.logs.reset_mock()
+                status, body = self.get(runner, f"{path}?source={source}", cookie)
+                self.assertEqual(status, 503, body)
+                self.assertEqual(body["status"], "failed")
+                self.assertTrue(body["error_reference"])
+                self.assertTrue(any(
+                    call.args[1].get("error_reference") == body["error_reference"]
+                    for call in self.logs.call_args_list if call.args[0] == "server_error"
+                ))
+        status, body = self.get(runner, f"/api/settings/pricing-references/healthy-pack?source={source}", cookie)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["pricing_reference"]["id"], "healthy-pack")
+
+    def test_local_damaged_pack_is_left_out_and_reads_fail_closed(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="pricing-damaged-", dir=test_temp_root())))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local",
+        }))
+        self.enterContext(mock.patch.object(server, "pricing_references_root", return_value=root))
+        for reference_id in ("healthy-pack", "damaged-pack", "deleted-pack"):
+            server.save_pricing_reference_pack(self.webapp_tests.workspace_pricing_reference(reference_id))
+        catalogue = root / "damaged-pack" / "pricing-catalog.json"
+        catalogue.write_text('{"items": [', encoding="utf-8")
+        damaged_bytes = catalogue.read_bytes()
+        self.assertTrue(server.delete_pricing_reference_pack("deleted-pack"))
+        # A confirmed delete leaves nothing to recover, so the id stops being a listing candidate.
+        self.assertNotIn("deleted-pack", server.LocalPricingReferenceStore.transaction_ids(root))
+        (root / ".locks" / "_deleted-pack").unlink()
+        locks_before = sorted(path.name for path in (root / ".locks").iterdir())
+
+        with self.webapp_tests.LocalRunnerServer() as runner:
+            self.assert_lists_survive(runner)
+            self.assert_damaged_reads_fail_closed(runner, "local")
+
+        self.assertEqual(catalogue.read_bytes(), damaged_bytes)
+        # Listing never creates a lock file for an id that has no pack.
+        self.assertEqual(sorted(path.name for path in (root / ".locks").iterdir()), locks_before)
+
+    def test_database_damaged_row_is_left_out_and_reads_fail_closed(self):
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="pricing-damaged-db-", dir=test_temp_root())))
+        url = "sqlite:///" + (folder / "pricing.sqlite3").as_posix()
+        auth = self.fixture.platform_auth_session("workspace-damaged-listing", membership_role="admin")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "database",
+            "SQAG_DATABASE_URL": url, "SESSION_SECRET": "fixture-session-only",
+            "QUOTE_DATA_ROOT": os.environ["QUOTE_DATA_ROOT"], "SQAG_DISABLE_DOTENV": "1",
+        }, clear=True))
+        server.apply_sqag_storage_migrations(url)
+        storage = server.app_storage_for_auth_session(auth)
+        for reference_id in ("healthy-pack", "damaged-pack"):
+            storage.save_pricing_reference(self.webapp_tests.workspace_pricing_reference(reference_id))
+        damaged = '{"items":"bad"}'
+        with storage.connection() as connection:
+            connection.execute(
+                "update sqag_pricing_references set payload_json = ? where workspace_id = ? and reference_id = ?",
+                (damaged, storage.workspace_id, "damaged-pack"),
+            )
+            connection.commit()
+        cookie = f"{server.SESSION_COOKIE_NAME}={server.signed_cookie_value(auth)}"
+
+        with self.webapp_tests.LocalRunnerServer() as runner:
+            self.assert_lists_survive(runner, cookie)
+            self.assert_damaged_reads_fail_closed(runner, "company", cookie)
+
+        with storage.connection() as connection:
+            row = connection.execute(
+                "select payload_json from sqag_pricing_references where workspace_id = ? and reference_id = ?",
+                (storage.workspace_id, "damaged-pack"),
+            ).fetchone()
+        self.assertEqual(row["payload_json"], damaged)

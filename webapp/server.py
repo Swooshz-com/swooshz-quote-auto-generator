@@ -9358,6 +9358,10 @@ def delete_pricing_reference_pack(reference_id: str, source: str = "local") -> b
             if store._directory_exists(store.previous) or store._directory_exists(store.stage):
                 raise SqagStorageAccessError("Saved pricing reference recovery is unavailable.")
             shutil.rmtree(store.directory)
+            # No stage or previous copy remains, so the identity directory has
+            # nothing left to recover. The next save recreates it before renaming.
+            # The lock file stays: another waiter may already hold its handle.
+            store._discard(store.transaction)
             return True
     except PricingReferencePathError as exc:
         raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
@@ -13245,13 +13249,14 @@ class DatabaseSqagStorage:
                 "select reference_id, payload_json from sqag_pricing_references where workspace_id = ?",
                 (self.workspace_id,),
             ).fetchall()
-        company_references = [
-            public_company_pricing_reference({
-                **read_stored_pricing_reference(row["payload_json"], row["reference_id"]),
-                "id": row["reference_id"],
-            })
-            for row in rows
-        ]
+        company_references = []
+        for row in rows:
+            try:
+                stored = read_stored_pricing_reference(row["payload_json"], row["reference_id"])
+            except SqagStorageAccessError as exc:
+                log_unavailable_listed_pricing_reference(row["reference_id"], "company", exc)
+                continue
+            company_references.append(public_company_pricing_reference({**stored, "id": row["reference_id"]}))
         return sorted(company_references, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("source")).casefold(), clean_text(item.get("id")).casefold()))
 
     def _read_pricing_reference_for_save(
@@ -18900,15 +18905,32 @@ def list_local_pricing_references() -> list[dict[str, Any]]:
     references = []
     for reference_id in sorted(candidates):
         try:
-            with LocalPricingReferenceStore(reference_id).locked() as store:
-                if not (store.directory / "reference.json").is_file():
+            # Listing never creates a lock for an id that has no pack or identity.
+            with LocalPricingReferenceStore(reference_id).locked(create=False) as store:
+                if store is None or not (store.directory / "reference.json").is_file():
                     continue
                 pack, _ = store.read()
                 if pack is not None:
                     references.append(pack.public_summary())
         except PricingReferencePathError:
             continue
+        except (OSError, SqagStorageAccessError) as exc:
+            log_unavailable_listed_pricing_reference(reference_id, "local", exc)
     return sorted(references, key=lambda item: (item["label"].casefold(), item["id"].casefold()))
+
+
+def log_unavailable_listed_pricing_reference(reference_id: str, source: str, exc: Exception) -> str:
+    """Keep one damaged pack out of a listing without hiding it from support."""
+    error_reference = new_error_reference()
+    write_local_log("server_error", {
+        "source": "pricing_reference_listing",
+        "error_reference": error_reference,
+        "reference_id": reference_id,
+        "pricing_reference_source": source,
+        "reason": getattr(exc, "reason", "storage_unavailable"),
+        "errors": safe_error_messages([str(exc)]),
+    })
+    return error_reference
 
 
 def list_bundled_pricing_references() -> list[dict[str, Any]]:
@@ -33786,33 +33808,38 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_app_storage()
             if storage is None:
                 return
-            workspace = storage.workspace()
-            company_profiles = []
-            if self.current_permissions().get("canGenerateQuote"):
-                company_profiles = [
-                    public_database_profile_summary(profile)
-                    for profile in storage.list_company_profiles()
-                    if isinstance(profile, dict)
-                    and safe_resource_id(profile.get("id") or profile.get("label"), "")
-                ]
-                company_profiles.sort(
-                    key=lambda item: (
-                        clean_text(item.get("label") or item.get("id")).casefold(),
-                        clean_text(item.get("id")).casefold(),
+            try:
+                workspace = storage.workspace()
+                company_profiles = []
+                if self.current_permissions().get("canGenerateQuote"):
+                    company_profiles = [
+                        public_database_profile_summary(profile)
+                        for profile in storage.list_company_profiles()
+                        if isinstance(profile, dict)
+                        and safe_resource_id(profile.get("id") or profile.get("label"), "")
+                    ]
+                    company_profiles.sort(
+                        key=lambda item: (
+                            clean_text(item.get("label") or item.get("id")).casefold(),
+                            clean_text(item.get("id")).casefold(),
+                        )
                     )
-                )
-            available_profiles = storage.list_profiles()
-            default_profile_id = workspace_profile_pack_id(workspace)
-            if isinstance(storage, DatabaseSqagStorage) and not any(
-                item["id"] == default_profile_id for item in available_profiles
-            ):
-                default_profile_id = ""
-                workspace = copy.deepcopy(workspace)
-                workspace.get("defaults", {}).pop("profile_id", None)
+                available_profiles = storage.list_profiles()
+                default_profile_id = workspace_profile_pack_id(workspace)
+                if isinstance(storage, DatabaseSqagStorage) and not any(
+                    item["id"] == default_profile_id for item in available_profiles
+                ):
+                    default_profile_id = ""
+                    workspace = copy.deepcopy(workspace)
+                    workspace.get("defaults", {}).pop("profile_id", None)
+                pricing_references = storage.list_pricing_references()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             self.send_json({
                 "profiles": available_profiles,
                 "company_profiles": company_profiles,
-                "pricing_references": storage.list_pricing_references(),
+                "pricing_references": pricing_references,
                 "pricing_reference_order_digit_limit": integer_digit_limit(),
                 "default_profile_id": default_profile_id,
                 "default_pricing_reference_id": workspace_pricing_reference_id(workspace),
@@ -33828,14 +33855,20 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_app_storage()
             if storage is None:
                 return
-            workspace = storage.workspace()
+            try:
+                workspace = storage.workspace()
+                pricing_references = storage.list_pricing_references()
+                profiles = storage.list_profiles()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             self.send_json({
                 "status": "ok",
                 "company_id": workspace["company"]["id"],
                 "workspace": workspace,
                 "permissions": self.current_permissions(),
-                "pricing_references": storage.list_pricing_references(),
-                "profiles": storage.list_profiles(),
+                "pricing_references": pricing_references,
+                "profiles": profiles,
             })
             return
         if path == "/api/settings/pricing-references":
@@ -33846,7 +33879,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_app_storage()
             if storage is None:
                 return
-            self.send_json({"pricing_references": storage.list_pricing_references()})
+            try:
+                pricing_references = storage.list_pricing_references()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            self.send_json({"pricing_references": pricing_references})
             return
         pricing_reference_export_match = re.fullmatch(r"/api/settings/pricing-references/([A-Za-z0-9_-]+)/export\.xlsx", path)
         if pricing_reference_export_match:
@@ -33861,6 +33899,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if storage is None:
                     return
                 export = storage.pricing_reference_export_xlsx(pricing_reference_export_match.group(1), source=source)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             except ValueError as exc:
                 self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
                 return
@@ -33883,6 +33924,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if storage is None:
                     return
                 detail = storage.pricing_reference_detail(pricing_reference_detail_match.group(1), source=source)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             except ValueError as exc:
                 self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
                 return
