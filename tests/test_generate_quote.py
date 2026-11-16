@@ -1503,6 +1503,328 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             self.assertIn("pdf_mode=workbook", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
             self.assertIn("pdf_status=excel_exported", (out_dir / "export_status.txt").read_text(encoding="utf-8"))
 
+    def test_pdf_overflow_requires_the_owned_first_page_break(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "quotation.xlsx"
+            owned = '<brk id="55" max="16383" man="1"/>'
+            for name, breaks, continuation, columns, sheet_name, reference, expected in (
+                ("owned boundary", owned, 61, "", "Quotation", "Quotation", True),
+                ("case-equivalent print area", owned, 61, "", "QUOTATION", "'quotation'", True),
+                ("different worksheet", owned, 61, "", "Example", "Quotation", False),
+                ("automatic only", owned.replace('man="1"', 'man="0"'), 61, "", "Quotation", "Quotation", False),
+                ("different boundary", owned.replace('id="55"', 'id="54"'), 61, "", "Quotation", "Quotation", False),
+                ("more breaks", owned + '<brk id="116" max="16383" man="1"/>', 125, "", "Quotation", "Quotation", False),
+                ("no first-page padding", owned, 61, "", "Quotation", "Quotation", False),
+                ("no printable continuation", owned, 80, "", "Quotation", "Quotation", False),
+                ("empty column breaks", owned, 61, '<colBreaks count="0"/>', "Quotation", "Quotation", True),
+                ("padded zero counts", owned, 61, '<colBreaks count="00" manualBreakCount="000"/>', "Quotation", "Quotation", True),
+                ("signed zeros with XML space", owned, 61, '<colBreaks count=" +00 " manualBreakCount="&#x9;-0&#xA;"/>', "Quotation", "Quotation", True),
+                ("missing break record", owned, 61, '<colBreaks count="1"/>', "Quotation", "Quotation", False),
+                ("nonzero manual break count", owned, 61, '<colBreaks count="00" manualBreakCount="01"/>', "Quotation", "Quotation", False),
+                ("negative break count", owned, 61, '<colBreaks count="-01"/>', "Quotation", "Quotation", False),
+                ("invalid break count", owned, 61, '<colBreaks manualBreakCount="invalid"/>', "Quotation", "Quotation", False),
+                ("empty break count", owned, 61, '<colBreaks count=""/>', "Quotation", "Quotation", False),
+                ("underscore in break count", owned, 61, '<colBreaks count="0_0"/>', "Quotation", "Quotation", False),
+                ("space within break count", owned, 61, '<colBreaks count="0 0"/>', "Quotation", "Quotation", False),
+                ("non-ASCII break count", owned, 61, '<colBreaks count="&#x0660;"/>', "Quotation", "Quotation", False),
+                ("foreign break attribute", owned, 61, '<colBreaks count="00" other="0"/>', "Quotation", "Quotation", False),
+                ("unexpected break text", owned, 61, '<colBreaks count="00">0</colBreaks>', "Quotation", "Quotation", False),
+                ("hidden break record", owned, 61, '<colBreaks count="0"><brk id="4"/></colBreaks>', "Quotation", "Quotation", False),
+                ("duplicated break element", owned, 61, '<colBreaks/><colBreaks/>', "Quotation", "Quotation", False),
+            ):
+                with self.subTest(name=name):
+                    first = 55 if name == "no first-page padding" else 46
+                    sheet = (
+                        f'<worksheet xmlns="{NS_MAIN[1:-1]}"><sheetData>'
+                        f'<row r="{first}"><c r="A{first}" t="inlineStr"><is><t>Quotation body</t></is></c></row>'
+                        f'<row r="{continuation}"><c r="A{continuation}" t="inlineStr"><is><t>Continuation body</t></is></c></row>'
+                        f'</sheetData><rowBreaks>{breaks}</rowBreaks>{columns}</worksheet>'
+                    )
+                    workbook = (
+                        f'<workbook xmlns="{NS_MAIN[1:-1]}" xmlns:r="{NS_REL[1:-1]}">'
+                        f'<sheets><sheet name="{sheet_name}" r:id="rId1"/></sheets>'
+                        '<definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">'
+                        f'{reference}!$A$1:$I$70</definedName></definedNames></workbook>'
+                    )
+                    target = "worksheets/sheet1.xml"
+                    rels = (
+                        f'<Relationships xmlns="{NS_PACKAGE_REL[1:-1]}"><Relationship '
+                        f'Id="rId1" Type="{NS_REL[1:-1]}/worksheet" Target="{target}"/></Relationships>'
+                    )
+                    with zipfile.ZipFile(path, "w") as archive:
+                        archive.writestr("xl/worksheets/sheet1.xml", sheet)
+                        archive.writestr("xl/workbook.xml", workbook)
+                        archive.writestr("xl/_rels/workbook.xml.rels", rels)
+                    self.assertEqual(bool(quote.pdf_overflow_boundary(path)), expected)
+
+    def test_pdf_overflow_holds_uncertain_or_nonblank_pages_byte_for_byte(self):
+        def synthetic_pdf(objects):
+            result = bytearray(b"%PDF-1.4\n")
+            offsets = [0]
+            for number, obj in enumerate(objects, 1):
+                offsets.append(len(result))
+                result.extend(f"{number} 0 obj\n{obj}\nendobj\n".encode("ascii"))
+            xref = len(result)
+            result.extend(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode("ascii"))
+            for offset in offsets[1:]:
+                result.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+            result.extend(f"trailer\n<</Size {len(offsets)}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n".encode("ascii"))
+            return bytes(result)
+
+        def stream(content):
+            return f"<</Length {len(content)}>>\nstream\n{content}\nendstream"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pdf = Path(temporary) / "quotation.pdf"
+            workbook = pdf.with_suffix(".xlsx")
+            area = "Quotation!$A$1:$I$70"
+            with zipfile.ZipFile(workbook, "w") as archive:
+                archive.writestr("xl/workbook.xml", f"<definedName>{area}</definedName>")
+            master = workbook.read_bytes()
+            boundary = quote.PdfOverflowBoundary(area, {"quotation body"}, {"continuation body"})
+            for case, blank, extra, action, remove in (
+                ("blank", "", "", "", True),
+                ("dark mark", "0 g 4 4 2 2 re f", "", "", False),
+                ("colour mark", "1 .99 1 rg 4 4 .2 .2 re f", "", "", False),
+                ("annotation on blank page", "", "/Annots[10 0 R]", "", False),
+                ("link on retained page", "", "", "/Annots[10 0 R]", False),
+                ("destination to blank page", "", "", "/OpenAction[4 0 R/Fit]", False),
+                ("wrong continuation", "", "", "", False),
+                ("later unrelated blank", "", "", "", False),
+                ("blank belongs to continuation", "", "", "", False),
+                ("first page proof changed", "", "", "", False),
+                ("proof timed out", "", "", "", False),
+            ):
+                with self.subTest(case=case):
+                    page = "<</Type/Page/Parent 2 0 R/Contents {} 0 R{}>>"
+                    page_action = action if action.startswith("/Annots") else ""
+                    catalog_action = action if action.startswith("/OpenAction") else ""
+                    heading = "Other text" if case == "wrong continuation" else "Continuation body"
+                    first_text = "BT /F1 12 Tf 25 100 Td (Quotation body) Tj ET"
+                    final_text = f"BT /F1 12 Tf 25 100 Td ({heading}) Tj ET"
+                    if case == "later unrelated blank":
+                        blank, final_text = final_text, ""
+                    objects = [
+                        f"<</Type/Catalog/Pages 2 0 R{catalog_action}>>",
+                        "<</Type/Pages/Count 3/Kids[3 0 R 4 0 R 5 0 R]/MediaBox[0 0 200 200]"
+                        "/Resources<</Font<</F1 9 0 R>>>>>>",
+                        page.format(6, page_action), page.format(7, extra), page.format(8, ""),
+                        stream(first_text), stream(blank), stream(final_text),
+                        "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+                        "<</Type/Annot/Subtype/Link/Rect[0 0 12 12]/Dest[4 0 R/Fit]>>",
+                    ]
+                    original = synthetic_pdf(objects)
+                    pdf.write_bytes(original)
+
+                    def export_first_section(source, output):
+                        with zipfile.ZipFile(source) as archive:
+                            limited = archive.read("xl/workbook.xml")
+                            self.assertEqual(limited, b"<definedName>Quotation!$A$1:$I$55</definedName>")
+                        if case == "proof timed out":
+                            raise subprocess.TimeoutExpired("native-export", 120)
+                        page_tree = "Count 1/Kids[3 0 R]" if case == "blank belongs to continuation" else "Count 2/Kids[3 0 R 4 0 R]"
+                        objects[1] = objects[1].replace("Count 3/Kids[3 0 R 4 0 R 5 0 R]", page_tree)
+                        if case == "first page proof changed":
+                            objects[5] = stream(first_text.replace("25 100", "28 100"))
+                        output.write_bytes(synthetic_pdf(objects))
+                        return "excel_exported"
+
+                    quote.remove_blank_pdf_overflow(workbook, pdf, boundary, export_first_section)
+                    self.assertEqual(workbook.read_bytes(), master)
+                    if not remove:
+                        self.assertEqual(pdf.read_bytes(), original)
+                    else:
+                        import pypdfium2 as pdfium
+
+                        with pdfium.PdfDocument(pdf) as document:
+                            self.assertEqual(len(document), 2)
+
+    def test_native_pdf_keeps_quotation_and_signature_without_blank_padding_page(self):
+        renderer = "libreoffice_exported" if quote.libreoffice_candidates() else "excel_exported"
+        if renderer == "excel_exported" and os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+            self.fail("LibreOffice is required for the native PDF pagination regression in CI.")
+        if renderer == "excel_exported" and not (
+            os.name == "nt" and shutil.which("powershell")
+            and any((Path(os.environ.get(root, "")) / "Microsoft Office/root/Office16/EXCEL.EXE").is_file()
+                    for root in ("ProgramFiles", "ProgramFiles(x86)"))
+        ):
+            self.skipTest("A native workbook PDF renderer is required.")
+
+        import pypdfium2 as pdfium
+
+        brief = commercial_test_brief({
+            "payment_terms": ["Example deposit is due upon acceptance.", "Balance is due after the exhibition."],
+            "standard_notes": [
+                "Example venue access is subject to the approved event schedule.",
+                "The quotation covers only the work listed in the document above.",
+            ],
+        })
+        lines = [
+            quote.QuoteLine(section, qty, unit, label, "", display, None, amount, "manual", [])
+            for section, qty, unit, label, display, amount in (
+                ("Flooring", 24, "sqm", "Example floor covering", "", 346.80),
+                ("Lighting", 4, "nos", "Example spotlight", "", 57.20),
+                ("Lighting", 1, "nos", "Example water feature", "Price to be discussed", None),
+                ("Lighting", 1, "nos", "Example marshal service", "Included", 0),
+            )
+        ]
+        break_counts = {
+            "empty column breaks": ("0", "0"),
+            "padded zero column breaks": ("00", "00"),
+            "signed zero column breaks": (" +00 ", "-000"),
+            "column break": ("1", "1"),
+        }
+
+        def with_print_style(template, variant):
+            if variant not in {"centred", "gridlines", "row fill", "case-equivalent sheet"} and variant not in break_counts:
+                return KONCEPT_LAYOUT
+            with zipfile.ZipFile(KONCEPT_LAYOUT) as source:
+                parts = {name: source.read(name) for name in source.namelist()}
+            sheet_name = "xl/worksheets/sheet1.xml"
+            sheet = ET.fromstring(parts[sheet_name])
+            if variant == "row fill":
+                styles = ET.fromstring(parts["xl/styles.xml"])
+                fills = styles.find(f"{NS_MAIN}fills")
+                fill_id = str(len(fills))
+                fill = ET.SubElement(fills, f"{NS_MAIN}fill")
+                pattern = ET.SubElement(fill, f"{NS_MAIN}patternFill", patternType="solid")
+                ET.SubElement(pattern, f"{NS_MAIN}fgColor", rgb="FFFF00FF")
+                ET.SubElement(pattern, f"{NS_MAIN}bgColor", indexed="64")
+                fills.set("count", str(len(fills)))
+                xfs = styles.find(f"{NS_MAIN}cellXfs")
+                row = sheet.find(f'{NS_MAIN}sheetData/{NS_MAIN}row[@r="50"]')
+                row.attrib.update(s=str(len(xfs)), customFormat="1")
+                ET.SubElement(xfs, f"{NS_MAIN}xf", {**xfs[0].attrib, "fillId": fill_id, "applyFill": "1"})
+                xfs.set("count", str(len(xfs)))
+                parts["xl/styles.xml"] = quote.serialize_excel_styles(styles)
+            elif variant == "case-equivalent sheet":
+                parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(b'name="Quotation"', b'name="QUOTATION"')
+            elif variant in break_counts:
+                count, manual_count = break_counts[variant]
+                breaks = quote.ensure_worksheet_child(sheet, "colBreaks")
+                breaks.attrib.update(count=count, manualBreakCount=manual_count)
+                if variant == "column break":
+                    ET.SubElement(breaks, f"{NS_MAIN}brk", id="4", min="0", max="1048575", man="1")
+            else:
+                option = "verticalCentered" if variant == "centred" else "gridLines"
+                quote.ensure_worksheet_child(sheet, "printOptions").set(option, "1")
+            parts[sheet_name] = quote.serialize_excel_worksheet(sheet)
+            with zipfile.ZipFile(template, "w", zipfile.ZIP_DEFLATED) as dest:
+                for name, data in parts.items():
+                    dest.writestr(name, data)
+            return template
+
+        def render(data):
+            signatures = []
+            with pdfium.PdfDocument(data) as document:
+                for page in document:
+                    try:
+                        text = page.get_textpage()
+                        bitmap = page.render(scale=1.25, force_bitmap_format=pdfium.raw.FPDFBitmap_BGRA)
+                        try:
+                            pixels = bytes(bitmap.buffer)
+                            signatures.append((
+                                text.get_text_range(), page.get_size(), page.get_bbox(),
+                                hashlib.sha256(pixels).digest(), pixels.count(255) != len(pixels),
+                            ))
+                        finally:
+                            bitmap.close()
+                            text.close()
+                    finally:
+                        page.close()
+            return signatures
+
+        native_name = "libreoffice_pdf_export" if renderer == "libreoffice_exported" else "powershell_pdf_export"
+        native_export = getattr(quote, native_name)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corrected = (
+                "baseline", "row fill", "centred", "empty column breaks", "padded zero column breaks",
+                "signed zero column breaks", "case-equivalent sheet", "repeated text",
+            )
+            for variant in (*corrected, "column break", "gridlines", "long static", "single page"):
+                with self.subTest(variant=variant):
+                    work = root / variant
+                    work.mkdir()
+                    workbook = work / "quotation.xlsx"
+                    pdf = workbook.with_suffix(".pdf")
+                    template = with_print_style(work / "layout.xlsx", variant)
+                    selected_brief, selected_lines = brief, lines
+                    if variant == "repeated text":
+                        selected_brief = commercial_test_brief({
+                            "payment_terms": ["_____________________________", "_____________________________________"],
+                            "standard_notes": brief["standard_notes"],
+                            "terms_heading": "Date:",
+                            "company": {"name": "Saved Client", "header_lines": ["Saved Client", "1 Saved Road"], "logo_data_url": logo_data_url()},
+                            "acceptance": {
+                                "company_name": "Saved Client", "text": "Example spotlight",
+                                "person_label": "Saved Client", "stamp_label": "Example marshal service", "date_label": "Date:",
+                            },
+                            "signature": {"company_signatory": "Saved Contact", "company_title": "Director", "company_date_label": "Date:"},
+                        })
+                    elif variant == "long static":
+                        selected_lines = [
+                            quote.QuoteLine("Flooring", 1, "nos", f"Review item {index:03d} leaf", "", "", None, 27.35, "manual", [])
+                            for index in range(1, 91)
+                        ]
+                    elif variant == "single page":
+                        template = REPO_DEFAULT_LAYOUT
+                        selected_brief = commercial_test_brief({"payment_terms": [], "standard_notes": []})
+                        selected_lines = lines[:1]
+                    quote.write_quote_layout_xlsx(template, workbook, selected_brief, selected_lines)
+                    master = workbook.read_bytes()
+                    if variant in break_counts:
+                        with zipfile.ZipFile(workbook) as archive:
+                            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+                        breaks = sheet.find(f"{NS_MAIN}colBreaks")
+                        self.assertEqual((breaks.get("count"), breaks.get("manualBreakCount")), break_counts[variant])
+                    rendered = []
+
+                    def capture(source, output, **kwargs):
+                        status = native_export(source, output, **kwargs)
+                        if status and output == pdf:
+                            rendered.append(output.read_bytes())
+                        return status
+
+                    with mock.patch.object(quote, native_name, side_effect=capture):
+                        self.assertEqual(quote.export_layout_pdf(workbook, pdf), renderer)
+
+                    self.assertEqual(workbook.read_bytes(), master)
+                    self.assertEqual(len(rendered), 1)
+                    native = render(rendered[0])
+                    exported = render(pdf.read_bytes())
+                    if variant in corrected:
+                        self.assertEqual(len(exported), 2)
+                        if renderer == "excel_exported":
+                            self.assertEqual(len(native), 3)
+                        if len(native) == 3:
+                            self.assertFalse(native[1][0] or native[1][4])
+                            self.assertEqual(exported, [native[0], native[2]])
+                        else:
+                            self.assertEqual(pdf.read_bytes(), rendered[0])
+                        self.assertIn("Example floor covering", exported[0][0])
+                        if variant == "repeated text":
+                            self.assertIn("Example spotlight", exported[0][0])
+                            self.assertIn("Example spotlight", exported[1][0])
+                            self.assertIn("Example marshal service", exported[0][0])
+                            self.assertIn("Example marshal service", exported[1][0])
+                        else:
+                            self.assertIn("Saved Signatory", exported[1][0])
+                    else:
+                        self.assertEqual(pdf.read_bytes(), rendered[0])
+                        if variant == "gridlines" and renderer == "excel_exported":
+                            self.assertEqual(len(exported), 3)
+                            self.assertTrue(exported[1][4])
+                        elif variant == "column break" and renderer == "excel_exported":
+                            self.assertGreater(len(exported), 2)
+                        elif variant == "long static":
+                            full_text = "\n".join(page[0] for page in exported)
+                            for index in range(1, 91):
+                                self.assertEqual(full_text.count(f"Review item {index:03d} leaf"), 1)
+                            self.assertEqual(full_text.count("Saved Signatory"), 1)
+                        elif variant == "single page":
+                            self.assertEqual(len(exported), 1)
+
     def test_pdf_conversion_resolves_drawing_theme_fonts_without_changing_master(self):
         drawing = (
             f'<xdr:wsDr xmlns:xdr="{NS_DRAWING[1:-1]}" xmlns:a="{NS_A[1:-1]}" '
@@ -5119,7 +5441,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
         self.assertIn("CorruptLoad", script)
         self.assertIn("$workbook.SaveAs($repairedWorkbookPath, 51)", script)
-        self.assertIn("Move-Item -LiteralPath $repairedWorkbookPath -Destination $xlsxPath -Force", script)
+        self.assertNotIn("Move-Item", script)
 
     def test_brief_text_is_written_as_literal_xlsx_text_not_formulas(self):
         brief = {
