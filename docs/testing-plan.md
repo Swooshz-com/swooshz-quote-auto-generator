@@ -122,6 +122,14 @@ the generator fixture uses its synthetic Git history.
   the pinned worker's parent, child and sweep-history validators offline. For
   a compatibility check against private snapshots, keep all data in the
   local evidence store and report only document and result counts.
+- **Replacement pull requests**. Run programme-graph-state and the focused
+  toolkit-programme-custody checks. Exercise closed unmerged to newer merged
+  and unfinished merged to newer open replacements. Verify that bare mentions,
+  older pull requests, multiple eligible open pull requests and retired tasks
+  leave the tracked pull request in place. Verify that a finished task moves
+  only from closed unmerged to newer merged, and that incomplete discovery or
+  a changed replacement state leaves the decision for another pass. Confirm
+  that review and gate acceptance depend on evidence at the replacement head.
 - **Board order**. Run programme-parent-layout and toolkit-programme-state.
   Check Waiting on and In progress with an unblocked assigned or active
   builder and pending owner UAT on an earlier merged pull request. The
@@ -136,11 +144,16 @@ The offline suites use a synthetic GitHub transport. After an approved merge,
 the controller records the current graph revision and hash, then observes a
 real App-backed sweep on `main`. Record the run and attempt, repository commit,
 Toolkit pin, both App token step outcomes, and the footer cleanup counts or skip
-reason. Independently read the landed private store commit. Verify that the
-board graph revision advances and that the rendered graph revision and hash
-match the saved state. Confirm the order above on a real task with a builder
-at work and an earlier owner test still owed. If no such task exists during
-the sweep, keep this verification pending until a qualifying run.
+reason. Independently read the landed private store commit. For the replacement
+case, confirm that the saved child follows the expected live claiming pull
+request at its observed head and state. Verify that the saved graph revision
+advances and that the published board shows the same pull request, graph
+revision and hash. Record a queued run or a held run without a verified save
+as pending, even if the workflow is green. A hold with a partial save still
+requires that same child and board read-back. Confirm the order above on a
+real task with a builder at work and an earlier owner test still owed. If no
+such task exists during the sweep, keep the board-order check pending until a
+qualifying run.
 
 ## Required Impact Pass
 
