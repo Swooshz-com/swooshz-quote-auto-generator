@@ -43651,6 +43651,8 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
 
             brief = webapp.payload_to_brief(request)
             self.assertEqual([row["source_basis_line_id"] for row in brief["line_items"]], expected)
+            self.assertTrue(all("category_order" not in row and "item_order" not in row
+                                for row in brief["line_items"]))
             job = Path(self._test_data_root) / "wide-order-xlsx"
             job.mkdir(parents=True)
             pricing_file = webapp.pricing_catalog_path_for_payload({**request, "_pricing_reference_snapshot": snapshot}, job)

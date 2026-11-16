@@ -20628,7 +20628,10 @@ def payload_to_brief(
         "currency": quote_currency_from_payload(payload, auth_session=auth_session),
         "exchange_rate": quote_exchange_rate_from_payload(payload),
         "tax": quote_tax_from_payload(payload, auth_session=auth_session),
-        "line_items": normalize_line_items_for_final_brief(payload, auth_session=auth_session),
+        "line_items": [
+            canonicalize_primary_order_fields(row)
+            for row in normalize_line_items_for_final_brief(payload, auth_session=auth_session)
+        ],
         "payment_terms": multiline_list(quote_text.get("payment_terms") or payload.get("payment_terms")),
         "terms_heading": clean_text(quote_text.get("terms_heading")),
         "cheque_payee": clean_text(quote_text.get("cheque_payee")),
