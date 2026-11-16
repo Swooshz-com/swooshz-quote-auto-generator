@@ -112,7 +112,7 @@ from webapp.quote_ai_spend import (
 )
 from webapp.ai_gateway import (AiGateway, GatewayConfiguration, GatewayError,
     safe_draft_error_param, draft_provider_error_diagnostics, SUPPORTED_REASONING_EFFORTS)
-from webapp.ai_response_contracts import BASIS_TAGS, DRAFT_SYNTHESIS, ContractViolation, ResponseContract
+from webapp.ai_response_contracts import BASIS_TAGS, DRAFT_SYNTHESIS, ContractViolation, ResponseContract, integer_digit_limit
 from webapp.pricing_response_contracts import PRICING_IMPORT, PRICING_METADATA
 from webapp.internal_password_auth import (
     INTERNAL_AUTH_MODE, INTERNAL_SESSION_TTL_SECONDS, LOGIN_NONCE_TTL_SECONDS,
@@ -6560,12 +6560,30 @@ def pricing_reference_order_from_raw(raw: dict[str, Any], keys: tuple[str, ...])
     return None
 
 
+def pricing_reference_order_limit() -> int:
+    return 10 ** integer_digit_limit() - 1
+
+
+def pricing_reference_order_tie(item: dict[str, Any], field: str, order: int | None) -> int:
+    rank = item.get(f"{field}_tie")
+    if type(rank) is not int or not 1 <= rank <= PRIMARY_ORDER_MAX or order is None:
+        return 0
+    # A saved tie can come from a lower configured digit limit.
+    digits = str(order)
+    return rank if len(digits) >= sys.int_info.str_digits_check_threshold and not digits.strip("9") else 0
+
+
 def ensure_pricing_reference_order_fields(
     items: list[dict[str, Any]], *, exact_order: bool = True,
 ) -> list[dict[str, Any]]:
     parse_order = catalogue_order_number if exact_order else pricing_reference_order_number
-    section_orders: dict[str, int] = {}
+    section_orders: dict[str, tuple[int, int]] = {}
     next_category_order = 1
+    ceiling = pricing_reference_order_limit()
+    next_category_tie = 1 + max((
+        pricing_reference_order_tie(item, "category_order", parse_order(item.get("category_order")))
+        for item in items
+    ), default=0) if exact_order and any("category_order_tie" in item for item in items) else 1
     for index, item in enumerate(items, start=1):
         item_order = parse_order(item.get("item_order")) or index
         item["item_order"] = item_order
@@ -6574,26 +6592,35 @@ def ensure_pricing_reference_order_fields(
         explicit_category_order = parse_order(item.get("category_order"))
         if section_key not in section_orders:
             if explicit_category_order is not None:
-                section_orders[section_key] = explicit_category_order
+                category_tie = pricing_reference_order_tie(item, "category_order", explicit_category_order) if exact_order else 0
+                section_orders[section_key] = (explicit_category_order, category_tie)
                 next_category_order = max(next_category_order, explicit_category_order + 1)
             else:
-                while next_category_order in section_orders.values():
-                    next_category_order += 1
-                section_orders[section_key] = next_category_order
+                if exact_order and next_category_order > ceiling:
+                    section_orders[section_key] = (ceiling, next_category_tie)
+                    next_category_tie += 1
+                else:
+                    section_orders[section_key] = (next_category_order, 0)
                 next_category_order += 1
-        item["category_order"] = section_orders[section_key]
+        item["category_order"], category_tie = section_orders[section_key]
+        if category_tie:
+            item["category_order_tie"] = category_tie
+        elif exact_order:
+            item.pop("category_order_tie", None)
     return items
 
 
 def pricing_reference_sort_order(
     item: dict[str, Any], *, exact_order: bool = True,
-) -> tuple[int, int, str, str, str]:
+) -> tuple[int, int, int, int, str, str, str]:
     parse_order = catalogue_order_number if exact_order else pricing_reference_order_number
     category_order = parse_order(item.get("category_order")) or 999999
     item_order = parse_order(item.get("item_order")) or 999999
     return (
         category_order,
+        pricing_reference_order_tie(item, "category_order", category_order) if exact_order else 0,
         item_order,
+        pricing_reference_order_tie(item, "item_order", item_order) if exact_order else 0,
         clean_text(item.get("section")).casefold(),
         clean_text(item.get("description")).casefold(),
         clean_text(item.get("id")).casefold(),
@@ -8792,6 +8819,10 @@ def normalize_pricing_reference_payload(payload: dict[str, Any]) -> dict[str, An
         sanitized = sanitize_pricing_reference_item({**raw, "description": sanitize_formula_text(raw.get("description"))}, index)
         if sanitized:
             sanitized["item_order"] = catalogue_order_number(sanitized.get("item_order")) or index + 1
+            for field in ("category_order", "item_order"):
+                tie = pricing_reference_order_tie(raw, field, sanitized.get(field))
+                if tie:
+                    sanitized[f"{field}_tie"] = tie
             items.append(sanitized)
     if not items:
         raise ValueError("At least one valid pricing row is required.")
@@ -8872,6 +8903,7 @@ def pricing_reference_authority_items(
 ) -> list[dict[str, Any]]:
     """Return the minimum trusted catalog projection needed for browser authority proof."""
     catalog = pricing_reference_catalog_payload(reference, exact_order=exact_order)
+    sort_orders = pricing_reference_appended_sort_orders(catalog["items"])
     authority_items: list[dict[str, Any]] = []
     for item in catalog.get("items", []):
         if not isinstance(item, dict):
@@ -8889,6 +8921,7 @@ def pricing_reference_authority_items(
             "description": description,
             "unit_hint": unit_hint,
             "sale_unit_price": sale_unit_price,
+            **({"sort_order": [str(value) for value in sort_orders[item_id]]} if item_id in sort_orders else {}),
         })
     return authority_items
 
@@ -9536,13 +9569,20 @@ def sorted_pricing_reference_items(
 
 
 def pricing_reference_section_names(reference_id: str | None = None, source: str = "") -> list[str]:
-    payload = load_pricing_reference_pack(reference_id, source=source).catalog()
+    catalogue = load_pricing_reference_pack(reference_id, source=source).catalog()
+    return pricing_reference_section_names_from_items(catalogue.get("items") or [])
+
+
+def pricing_reference_section_names_from_items(
+    items: list[dict[str, Any]], *, use_reference_titles: bool = False,
+) -> list[str]:
     sections: list[str] = []
     seen: set[str] = set()
-    for item in payload.get("items") or []:
+    for item in items:
         if not isinstance(item, dict):
             continue
-        section = clean_basis_section_title(item.get("section"))
+        title = item.get("reference_section") if use_reference_titles else None
+        section = clean_basis_section_title(title or item.get("section"))
         key = section.casefold()
         if section and key not in seen:
             sections.append(section)
@@ -9554,21 +9594,25 @@ def pricing_reference_section_names_for_payload(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
 ) -> list[str]:
+    return pricing_reference_sections_and_catalogue_for_payload(payload, auth_session)[0]
+
+
+def pricing_reference_sections_and_catalogue_for_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None,
+) -> tuple[list[str], list[dict[str, Any]]]:
     runtime_reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     if runtime_reference:
-        sections: list[str] = []
-        seen: set[str] = set()
-        for item in local_pricing_reference_items(payload, limit=None, auth_session=auth_session):
-            section = clean_basis_section_title(item.get("reference_section") or item.get("section"))
-            key = section.casefold()
-            if section and key not in seen:
-                sections.append(section)
-                seen.add(key)
-        return sections
+        priced_items = local_pricing_reference_items(payload, limit=None, auth_session=auth_session, reference=runtime_reference)
+        return pricing_reference_section_names_from_items(
+            priced_items, use_reference_titles=True,
+        ), runtime_reference.get("items") or []
     selection = explicit_pricing_reference_selection(payload)
     if not selection["ok"]:
-        return []
-    return pricing_reference_section_names(selection["id"], source=selection["source"])
+        return [], []
+    catalogue = load_pricing_reference_pack(selection["id"], source=selection["source"]).catalog()
+    items = catalogue.get("items") or []
+    return pricing_reference_section_names_from_items(items), items
 
 
 def pricing_reference_pack_for_payload(payload: dict[str, Any]) -> PricingReferencePack:
@@ -9581,20 +9625,18 @@ def pricing_reference_pack_for_payload(payload: dict[str, Any]) -> PricingRefere
         return pack
 
 
-def pricing_reference_section_order_map_for_payload(
+def pricing_reference_quote_order_maps(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, tuple[int, int, int, int, int]]]:
+    sections, items = pricing_reference_sections_and_catalogue_for_payload(payload, auth_session)
     order: dict[str, int] = {}
-    for index, section in enumerate(
-        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
-        start=1,
-    ):
+    for index, section in enumerate(sections, start=1):
         for value in (section, normalize_catalog_section(section)):
             key = safe_section_id(value, "")
             if key and key not in order:
                 order[key] = index
-    return order
+    return order, pricing_reference_appended_sort_orders(items)
 
 
 def pricing_reference_section_order_value(section: Any, section_order: dict[str, int]) -> int | None:
@@ -9609,7 +9651,8 @@ def line_item_pricing_reference_order(
     item: dict[str, Any],
     section_order: dict[str, int],
     fallback_index: int,
-) -> tuple[int, int, int, str, str]:
+    appended_orders: dict[str, tuple[int, int, int, int, int]],
+) -> tuple[int, int, int, int, int, int, str, str]:
     category_order = (
         catalogue_order_number(item.get("category_order"))
         or pricing_reference_section_order_value(item.get("section") or item.get("reference_section"), section_order)
@@ -9617,8 +9660,7 @@ def line_item_pricing_reference_order(
     )
     item_order = catalogue_order_number(item.get("item_order")) or 999999
     return (
-        category_order,
-        item_order,
+        *pricing_reference_quote_row_order(item, appended_orders, (category_order, 0, item_order, 0, 0)),
         fallback_index,
         clean_text(item.get("section")).casefold(),
         clean_text(item.get("description")).casefold(),
@@ -9630,12 +9672,12 @@ def sort_line_items_by_pricing_reference_order(
     line_items: list[dict[str, Any]],
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    section_order = pricing_reference_section_order_map_for_payload(payload, auth_session=auth_session)
+    section_order, appended_orders = pricing_reference_quote_order_maps(payload, auth_session)
     return [
         item
         for _index, item in sorted(
             enumerate(line_items),
-            key=lambda entry: line_item_pricing_reference_order(entry[1], section_order, entry[0]),
+            key=lambda entry: line_item_pricing_reference_order(entry[1], section_order, entry[0], appended_orders),
         )
     ]
 
@@ -9645,29 +9687,39 @@ def quote_basis_line_order(
     section_title: Any,
     section_order: dict[str, int],
     fallback_index: int,
-) -> tuple[int, int, int, str]:
+    appended_orders: dict[str, tuple[int, int, int, int, int]],
+) -> tuple[int, int, int, int, int, int, str]:
     category_order = (
         catalogue_order_number(line.get("category_order"))
         or pricing_reference_section_order_value(section_title, section_order)
         or 999999
     )
     item_order = catalogue_order_number(line.get("item_order")) or 999999
-    return (category_order, item_order, fallback_index, clean_text(line.get("text")).casefold())
+    return (
+        *pricing_reference_quote_row_order(line, appended_orders, (category_order, 0, item_order, 0, 0)),
+        fallback_index,
+        clean_text(line.get("text")).casefold(),
+    )
 
 
 def quote_basis_section_order(
     section: dict[str, Any],
     section_order: dict[str, int],
     fallback_index: int,
-) -> tuple[int, int, str]:
+    appended_orders: dict[str, tuple[int, int, int, int, int]],
+) -> tuple[int, int, int, str]:
     title = clean_basis_section_title(section.get("title"))
-    line_category_orders = [
-        order for line in section.get("lines") or []
-        if isinstance(line, dict) and (order := catalogue_order_number(line.get("category_order"))) is not None
-    ]
-    category_order = min(line_category_orders) if line_category_orders else None
-    category_order = category_order or pricing_reference_section_order_value(title, section_order) or 999999
-    return (category_order, fallback_index, title.casefold())
+    line_category_orders = []
+    for line in section.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        order = pricing_reference_quote_row_order(
+            line, appended_orders, (catalogue_order_number(line.get("category_order")) or 0, 0, 0, 0, 0),
+        )
+        if order[0]:
+            line_category_orders.append(order[:2])
+    default_category = pricing_reference_section_order_value(title, section_order) or 999999
+    return (*min(line_category_orders, default=(default_category, 0)), fallback_index, title.casefold())
 
 
 def sort_quote_basis_sections_by_pricing_reference_order(
@@ -9675,7 +9727,7 @@ def sort_quote_basis_sections_by_pricing_reference_order(
     sections: list[dict[str, Any]],
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    section_order = pricing_reference_section_order_map_for_payload(payload, auth_session=auth_session)
+    section_order, appended_orders = pricing_reference_quote_order_maps(payload, auth_session)
     sorted_sections: list[dict[str, Any]] = []
     for section in sections:
         next_section = {**section}
@@ -9684,7 +9736,7 @@ def sort_quote_basis_sections_by_pricing_reference_order(
             line
             for _index, line in sorted(
                 [(index, line) for index, line in enumerate(lines) if isinstance(line, dict)],
-                key=lambda entry: quote_basis_line_order(entry[1], section.get("title"), section_order, entry[0]),
+                key=lambda entry: quote_basis_line_order(entry[1], section.get("title"), section_order, entry[0], appended_orders),
             )
         ]
         sorted_sections.append(next_section)
@@ -9692,9 +9744,37 @@ def sort_quote_basis_sections_by_pricing_reference_order(
         section
         for _index, section in sorted(
             enumerate(sorted_sections),
-            key=lambda entry: quote_basis_section_order(entry[1], section_order, entry[0]),
+            key=lambda entry: quote_basis_section_order(entry[1], section_order, entry[0], appended_orders),
         )
     ]
+
+
+def pricing_reference_appended_sort_orders(items: list[dict[str, Any]]) -> dict[str, tuple[int, int, int, int, int]]:
+    """Project exact sort keys for categories affected by an append at the limit."""
+    appended_categories = {
+        catalogue_order_number(item.get("category_order")) for item in items if isinstance(item, dict)
+        and any(pricing_reference_order_tie(item, field, catalogue_order_number(item.get(field)))
+                for field in ("category_order", "item_order"))
+    }
+    if not appended_categories:
+        return {}
+    affected = [
+        item for item in items
+        if isinstance(item, dict) and catalogue_order_number(item.get("category_order")) in appended_categories
+    ]
+    return {
+        item_id: (*pricing_reference_sort_order(item)[:4], position)
+        for position, item in enumerate(sorted_pricing_reference_items(affected), start=1)
+        if (item_id := clean_text(item.get("id")))
+    }
+
+
+def pricing_reference_quote_row_order(
+    row: dict[str, Any], appended_orders: dict[str, tuple[int, int, int, int, int]], default: tuple[int, int, int, int, int],
+) -> tuple[int, int, int, int, int]:
+    authority = row.get("pricing_authority")
+    item_id = authority.get("catalog_item_id") if isinstance(authority, dict) else None
+    return appended_orders.get(clean_text(item_id or row.get("pricing_keyword") or row.get("keyword")), default)
 
 
 def build_pricing_catalog_import_prompt(source_name: str, content: Any, tax: dict[str, Any]) -> str:
@@ -18931,6 +19011,8 @@ def pricing_reference_visible_item_signature(item: dict[str, Any]) -> dict[str, 
         "remarks": pricing_reference_visible_remarks_signature(item.get("remarks") or item.get("remark")),
         "category_order": catalogue_order_number(item.get("category_order")),
         "item_order": catalogue_order_number(item.get("item_order")),
+        "category_order_tie": pricing_reference_order_tie(item, "category_order", catalogue_order_number(item.get("category_order"))),
+        "item_order_tie": pricing_reference_order_tie(item, "item_order", catalogue_order_number(item.get("item_order"))),
     }
 
 
@@ -21158,8 +21240,10 @@ def local_pricing_reference_items(
     auth_session: dict[str, Any] | None = None,
     *,
     include_unpriced: bool = False,
+    reference: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
+    if reference is None:
+        reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     if not reference:
         return []
     visual_base_dir = runtime_pricing_reference_visual_base_dir(payload, auth_session=auth_session)
@@ -33729,6 +33813,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "profiles": available_profiles,
                 "company_profiles": company_profiles,
                 "pricing_references": storage.list_pricing_references(),
+                "pricing_reference_order_digit_limit": integer_digit_limit(),
                 "default_profile_id": default_profile_id,
                 "default_pricing_reference_id": workspace_pricing_reference_id(workspace),
                 "company_id": workspace["company"]["id"],

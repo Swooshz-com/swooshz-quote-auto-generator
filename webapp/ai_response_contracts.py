@@ -31,13 +31,13 @@ class ContractViolation(ValueError):
         self.missing_path = missing_path
 
 
-def _integer_digit_limit() -> int:
+def integer_digit_limit() -> int:
     # Reuse the JSON integer I/O limit so admitted orders remain serialisable.
     return sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits
 
 
 def _bounded_json_integer(token: str) -> int:
-    if len(token.lstrip("-")) > _integer_digit_limit():
+    if len(token.lstrip("-")) > integer_digit_limit():
         raise ContractViolation("schema_json")
     return int(token)
 
@@ -50,7 +50,7 @@ def _bounded_json_decimal(token: str) -> Decimal:
     whole, _, fraction = mantissa.removeprefix("-").partition(".")
     digits = (whole + fraction).lstrip("0")
     coefficient = digits.rstrip("0")
-    if len(coefficient) > _integer_digit_limit():
+    if len(coefficient) > integer_digit_limit():
         raise ContractViolation("schema_json")
     # Let Decimal bound the exponent without converting its text to a large int.
     scale = Decimal("1e" + exponent).as_tuple().exponent if exponent else 0
@@ -114,7 +114,7 @@ class Field:
                  "string": lambda: isinstance(value, str),
                  "integer": lambda: type(value) is int or (
                      self.decimal_wire and isinstance(value, Decimal) and value.is_finite()
-                     and value.adjusted() < _integer_digit_limit()
+                     and value.adjusted() < integer_digit_limit()
                      and value == value.to_integral_value()
                  ),
                  "number": lambda: finite_number(

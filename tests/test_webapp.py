@@ -25707,12 +25707,13 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
 
         script = r"""
 function applyPricingAuthorityProjection(row){return row;}
+function currentPricingReference(){return state.pricingReferences[0];}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
 
 function extractFunction(name) {
-  const marker = `function ${name}`;
+  const marker = `function ${name}(`;
   const start = source.indexOf(marker);
   if (start < 0) throw new Error(`Missing function ${name}`);
   const bodyStart = source.indexOf(") {", start) + 2;
@@ -30249,6 +30250,8 @@ const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
 const PRICING_REFERENCE_PREVIEW_FIELDS = ["section", "description", "unit_hint", "internal_cost", "markup_multiplier", "remarks"];
+const PRICING_REFERENCE_ORDER_FIELDS = new Set(["category_order", "item_order"]);
+const state = {};
 
 function extractFunction(name) {
   const marker = `function ${name}`;
@@ -30284,6 +30287,10 @@ eval([
   "pricingReferenceOrderValue",
   "comparePricingReferenceOrder",
   "nextPricingReferenceOrder",
+  "pricingReferenceOrderTie",
+  "pricingReferenceOrderTies",
+  "pricingReferenceOrderCeiling",
+  "pricingReferencePreviewSectionKey",
   "sortPricingReferencePreviewItems",
   "pricingReferenceRowStatus",
   "pricingReferenceDuplicateRowKey",
@@ -30788,6 +30795,7 @@ function pricingReferenceOperationBusy() { return Boolean(state.pricingReference
 function pricingReferenceHasPendingChanges() { return true; }
 function pricingReferenceImportNameConflictMessage() { return ""; }
 function customCurrencyInputIsValid() { return /^[A-Z]{3}$/.test(String(elements.pricingReferenceCurrencyCustom.value || "").trim().toUpperCase()); }
+const PRICING_REFERENCE_ORDER_FIELDS = new Set(["category_order", "item_order"]);
 
 eval([
   "safeId",
@@ -30805,6 +30813,10 @@ eval([
   "pricingReferenceOrderValue",
   "comparePricingReferenceOrder",
   "nextPricingReferenceOrder",
+  "pricingReferenceOrderTie",
+  "pricingReferenceOrderTies",
+  "pricingReferenceOrderCeiling",
+  "pricingReferencePreviewSectionKey",
   "sortPricingReferencePreviewItems",
   "normalizePricingReferencePreviewItem",
   "pricingReferenceDuplicateRowKey",
@@ -41608,6 +41620,131 @@ main().catch((error) => {
         self.assertIn("local-collision-row", lookup)
 
 
+    def test_pricing_reference_add_row_at_order_limit_in_manage(self):
+        node = require_node(self)
+        if not (ROOT / "node_modules" / "playwright" / "package.json").exists():
+            message = "Playwright is required for the rendered pricing append regression."
+            if os.environ.get("CI"):
+                self.fail(message)
+            self.skipTest(message)
+        ceiling = 10 ** (sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits) - 1
+        reference = webapp.normalize_pricing_reference_payload({
+            "id": "synthetic-editor-append",
+            "label": "Synthetic pricing append",
+            "items": [with_required_pricing_metadata({
+                "id": item_id, "section": section, "description": description, "unit_hint": "nos",
+                "internal_cost": 12, "markup_multiplier": 2, "category_order": ceiling, "item_order": order,
+            }) for item_id, section, description, order in (
+                ("first", "Furniture", "Synthetic first chair", ceiling - 1),
+                ("last", "Lighting", "Synthetic Z lamp", ceiling),
+                ("previous", "Lighting", "Synthetic Y lamp", ceiling),
+            )],
+        })
+        browser = """
+const assert = require('node:assert/strict');
+const { chromium } = require('playwright');
+const base = process.argv[2];
+const endpoint = base + '/api/settings/pricing-references';
+const limit = Number(process.argv[3]);
+const ceiling = BigInt('9'.repeat(limit));
+const expected = ['Synthetic first chair', 'Synthetic Y lamp', 'Synthetic Z lamp', 'Synthetic A lamp',
+  'Synthetic B lamp', 'Synthetic A rail', 'Synthetic B rail'];
+const sortFields = ['category_order', 'item_order'];
+function exact(text) {
+  return JSON.parse(text, (key, value, context) => {
+    if (!sortFields.includes(key)) return value;
+    assert.equal(typeof value, 'number');
+    return BigInt(context.source);
+  });
+}
+async function run() {
+  const browser = await chromium.launch({ channel: process.env.SQAG_TEST_PLAYWRIGHT_CHANNEL || undefined });
+  try {
+    const context = await browser.newContext({ serviceWorkers: 'block' });
+    await context.route('**/*', route => new URL(route.request().url()).origin === base ? route.continue() : route.abort());
+    const page = await context.newPage();
+    await page.goto(base, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => !state.isBooting && canManagePricingReferences());
+    async function openManage() {
+      await page.evaluate(async () => {
+        openPricingReferenceModal({ preserveMode: true });
+        const reference = state.pricingReferences.find(item => item.id === 'synthetic-editor-append');
+        selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference));
+        await editSelectedPricingReference({ openTable: true });
+      });
+    }
+    const field = name => page.locator(`#pricingReferenceTableBody [data-preview-field="${name}"]`);
+    const descriptions = () => field('description').evaluateAll(rows => rows.map(row => row.value));
+    async function add(description, section) {
+      await page.locator('#pricingReferenceAddRowButton').click();
+      assert.equal((await descriptions()).at(-1), '');
+      const orders = await page.evaluate(() => state.pendingPricingReference.items.map(row => String(row.item_order)));
+      assert(orders.every(order => BigInt(order) <= ceiling), 'Add Row must stay within the numeric limit');
+      if (section) await field('section').last().fill(section);
+      await field('description').last().fill(description);
+      await field('internal_cost').last().fill('18');
+    }
+    await openManage();
+    assert.deepEqual(await descriptions(), expected.slice(0, 3));
+    await add(expected[3]);
+    await add('Synthetic undo lamp');
+    await page.locator('#pricingReferenceUndoButton').click(); // Cost edit.
+    await page.locator('#pricingReferenceUndoButton').click(); // Description edit.
+    await page.locator('#pricingReferenceUndoButton').click(); // Add Row.
+    assert.deepEqual(await descriptions(), expected.slice(0, 4));
+    await add(expected[4]);
+    await add(expected[5], 'Structures');
+    await add(expected[6]);
+    assert.deepEqual(await descriptions(), expected);
+    await page.locator('#pricingReferenceTableCloseButton').click();
+    const save = page.waitForResponse(response => response.url() === endpoint && response.request().method() === 'POST');
+    await page.locator('#pricingReferenceSaveButton').click();
+    const response = await save;
+    assert.equal(response.status(), 200, await response.text());
+    const posted = exact(response.request().postData()).items;
+    const detail = await context.request.get(endpoint + '/synthetic-editor-append?source=local');
+    assert.equal(detail.status(), 200);
+    const saved = exact(await detail.text()).pricing_reference.items;
+    for (const items of [posted, saved]) {
+      assert.deepEqual(items.map(row => row.description), expected);
+      assert.deepEqual(items.map(row => row.item_order), [ceiling - 1n, ...Array(6).fill(ceiling)]);
+      assert.deepEqual(items.map(row => row.category_order), Array(7).fill(ceiling));
+      assert.deepEqual(items.map(row => row.item_order_tie || 0), [0, 0, 0, 1, 2, 3, 4]);
+      assert.deepEqual(items.map(row => row.category_order_tie || 0), [0, 0, 0, 0, 0, 1, 1]);
+    }
+    await page.waitForFunction(() => !state.pricingReferenceSaveBusy);
+    await openManage();
+    assert.deepEqual(await descriptions(), expected);
+    assert.equal(await page.evaluate(() => pricingReferenceHasPendingChanges()), false);
+    const outputOrder = await page.evaluate(() => {
+      const reference = state.pricingReferences.find(item => item.id === 'synthetic-editor-append');
+      state.pricingReferenceId = reference.id;
+      state.pricingReferenceSource = reference.source;
+      state.outputSortMode = 'pricing_reference';
+      return sortOutputRows(reference.items.slice().reverse().map(item => ({
+        section: item.section, description: item.description, pricing_keyword: item.id,
+      }))).map(row => row.description);
+    });
+    assert.deepEqual(outputOrder, expected);
+  } finally {
+    await browser.close();
+  }
+}
+run().catch(error => { console.error(error.stack); process.exitCode = 1; });
+"""
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local"}),
+            mock.patch.object(webapp, "pricing_reference_ai_metadata_enrichment_configured", return_value=False),
+            mock.patch.object(webapp, "write_local_log"),
+            LocalRunnerServer() as runner,
+        ):
+            webapp.save_pricing_reference_pack(reference)
+            completed = subprocess.run(
+                [node, "-", runner.base_url, str(len(str(ceiling)))], cwd=ROOT, input=browser, text=True,
+                encoding="utf-8", capture_output=True, timeout=60,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-4000:])
+
     def test_pricing_reference_exact_orders_round_trip_in_rendered_editor(self):
         node = require_node(self)
         if not (ROOT / "node_modules" / "playwright" / "package.json").exists():
@@ -43576,22 +43713,42 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
             self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "letters-row"))
 
     def test_exact_catalogue_order_survives_quote_seal_and_workbook_generation(self):
+        self._assert_catalogue_order_survives_quote_seal_and_workbook_generation(at_limit=False)
+
+    def test_appended_catalogue_order_survives_quote_seal_and_workbook_generation(self):
+        self._assert_catalogue_order_survives_quote_seal_and_workbook_generation(at_limit=True)
+
+    def _assert_catalogue_order_survives_quote_seal_and_workbook_generation(self, *, at_limit):
         import generate_quote as quote
         from tests.test_generate_quote import find_cell_ref
 
         exponent = (sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits) - 1
         boundary = 10 ** exponent
+        ceiling = 10 * boundary - 1
         reference_id = "synthetic-quote-order"
         source_rows = [
             ("first-section", "Furniture", "Synthetic high-back chair", boundary, boundary, 18),
             ("first-item", "Lighting", "Synthetic spotlight arm", boundary + 1, boundary, 24),
             ("second-item", "Lighting", "Synthetic pendant fixture", boundary + 1, boundary + 1, 40),
         ]
+        ties = {}
+        if at_limit:
+            source_rows = [
+                source_rows[0],
+                ("first-item", "Lighting", "Synthetic spotlight arm", ceiling, boundary, 24),
+                ("previous-item", "Lighting", "Synthetic globe fixture", ceiling, ceiling, 42),
+                ("second-item", "Lighting", "Synthetic pendant fixture", ceiling, ceiling, 40),
+                ("appended-item", "Lighting", "Synthetic accent lamp", ceiling, ceiling, 36),
+                ("new-category", "Structures", "Synthetic upright rail", ceiling, boundary, 30),
+            ]
+            ties = {"appended-item": {"item_order_tie": 1}, "new-category": {"category_order_tie": 1}}
         items = [with_required_pricing_metadata({
             "id": item_id, "section": section, "description": description,
             "unit_hint": "nos", "internal_cost": cost, "markup_multiplier": 1.5,
             "category_order": category_order, "item_order": item_order,
-            "visual_references": [{"source": f"xl/media/{item_id}.png", "data_url": synthetic_image(size=(index, 1))}],
+            **ties.get(item_id, {}),
+            **({"visual_references": [{"source": f"xl/media/{item_id}.png", "data_url": synthetic_image(size=(index, 1))}]}
+               if not at_limit else {}),
         }) for index, (item_id, section, description, category_order, item_order, cost)
                  in enumerate(reversed(source_rows), start=1)]
         selection = {"pricing_reference_id": reference_id, "pricing_reference_source": "local",
@@ -43609,8 +43766,9 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
             expected = [row[0] for row in source_rows]
             prompts = webapp.pricing_catalog_prompt_rows_from_reference(snapshot.detail())
             self.assertEqual([row["id"] for row in prompts], expected)
-            images = webapp.catalog_visual_image_entries_for_payload({**selection, "_pricing_reference_snapshot": snapshot})
-            self.assertEqual([image["id"] for image in images], expected)
+            if not at_limit:
+                images = webapp.catalog_visual_image_entries_for_payload({**selection, "_pricing_reference_snapshot": snapshot})
+                self.assertEqual([image["id"] for image in images], expected)
             lookup = webapp.pricing_catalog_runtime_lookup_for_payload(selection)
             local = webapp.local_pricing_reference_items({**selection, "_pricing_reference_snapshot": snapshot})
             self.assertEqual([row["id"] for row in local], expected)
@@ -43624,8 +43782,13 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
                 for item_id, section, description, *_ in reversed(source_rows)
             ], session_id="quote-wide-catalogue", payload={**valid_payload(), **selection})
             self.assertEqual([row["source_basis_line_id"] for row in draft["line_items"]], expected)
+            expected_groups = [["first-section"], ["first-item", "second-item"]]
+            if at_limit:
+                expected_groups[1].insert(1, "previous-item")
+                expected_groups[1].append("appended-item")
+                expected_groups.append(["new-category"])
             self.assertEqual([[line["id"] for line in section["lines"]] for section in draft["quote_basis_sections"]],
-                             [["first-section"], ["first-item", "second-item"]])
+                             expected_groups)
             identity = {"id": reference_id, "source": "local", "currency": "SGD", "digest": saved["digest_sha256"]}
             state = request["quote_session"]["draft_state"]
             state["quoteDetails"]["commercial_snapshot"]["pricing_basis"] = identity
@@ -43647,7 +43810,8 @@ run().catch(error => { console.error(error.stack); process.exitCode = 1; });
                                 for item_id in expected))
             rows = self._ledger_normalize(runner, headers, request)
             self.assertEqual([row["source_basis_line_id"] for row in rows], expected)
-            self.assertEqual([self._ledger_price(rows, item_id) for item_id in expected], [27, 36, 60])
+            self.assertEqual([self._ledger_price(rows, item_id) for item_id in expected],
+                             [source_row[-1] * 1.5 for source_row in source_rows])
 
             brief = webapp.payload_to_brief(request)
             self.assertEqual([row["source_basis_line_id"] for row in brief["line_items"]], expected)

@@ -6946,6 +6946,7 @@ function pricingReferenceSnapshotItem(item = {}) {
     remarks: String(item.remarks || ""),
     category_order: pricingReferenceOrderValue(item.category_order) ?? "",
     item_order: pricingReferenceOrderValue(item.item_order) ?? "",
+    ...pricingReferenceOrderTies(item),
   };
 }
 
@@ -7765,6 +7766,41 @@ function nextPricingReferenceOrder(value) {
   return pricingReferenceOrderValue(String(BigInt(value) + 1n));
 }
 
+function pricingReferenceOrderTie(item, field) {
+  const rank = item?.[`${field}_tie`];
+  return Number.isSafeInteger(rank) && rank > 0 ? rank : 0;
+}
+
+function pricingReferenceOrderTies(item) {
+  return Object.fromEntries([...PRICING_REFERENCE_ORDER_FIELDS].flatMap((field) => {
+    const rank = pricingReferenceOrderTie(item, field);
+    return rank ? [[`${field}_tie`, rank]] : [];
+  }));
+}
+
+function pricingReferenceOrderCeiling() {
+  const digits = state.pricingReferenceOrderDigitLimit;
+  return Number.isInteger(digits) && digits > 0 ? "9".repeat(digits) : "";
+}
+
+function nextPricingReferencePosition(items, field) {
+  let max = 0;
+  let tie = 0;
+  for (const item of items) {
+    const order = pricingReferenceOrderValue(item[field]) ?? 0;
+    const comparison = comparePricingReferenceOrder(order, max);
+    if (comparison > 0) {
+      max = order;
+      tie = pricingReferenceOrderTie(item, field);
+    } else if (!comparison) {
+      tie = Math.max(tie, pricingReferenceOrderTie(item, field));
+    }
+  }
+  return String(max) === pricingReferenceOrderCeiling()
+    ? { [field]: max, [`${field}_tie`]: tie + 1 }
+    : { [field]: nextPricingReferenceOrder(max) };
+}
+
 function parsePricingReferenceJson(text) {
   // Match whole JSON strings first so descriptions and other string values are
   // untouched. Server pricing rows emit whole order numbers as decimal digits.
@@ -7807,32 +7843,47 @@ function stringifyPricingReferenceJson(payload, editor = false) {
   return encodeRecord(payload, (key, value) => key === "payload" ? encodeQuote(value) : JSON.stringify(value));
 }
 
-function sortPricingReferencePreviewItems(items = []) {
+function pricingReferencePreviewSectionKey(section, index) {
+  return safeId(normalizeCategoryTitle(section || ""), `section-${index + 1}`);
+}
+
+function sortPricingReferencePreviewItems(items = [], { preserveOrder = false } = {}) {
   const sectionOrders = new Map();
+  const ceiling = pricingReferenceOrderCeiling();
+  let nextCategoryTie = 1 + items.reduce((max, item) => Math.max(max, pricingReferenceOrderTie(item, "category_order")), 0);
   let nextCategoryOrder = 1;
   const ordered = [...items].map((item, index) => {
-    const sectionKey = safeId(normalizeCategoryTitle(item?.section || ""), `section-${index + 1}`);
+    const sectionKey = pricingReferencePreviewSectionKey(item?.section, index);
     const explicitCategoryOrder = pricingReferenceOrderValue(item?.category_order);
     if (!sectionOrders.has(sectionKey)) {
-      const categoryOrder = explicitCategoryOrder || nextCategoryOrder;
-      sectionOrders.set(sectionKey, categoryOrder);
+      const overflow = !explicitCategoryOrder && ceiling && comparePricingReferenceOrder(nextCategoryOrder, ceiling) > 0;
+      const categoryOrder = explicitCategoryOrder || (overflow ? ceiling : nextCategoryOrder);
+      const categoryTie = overflow ? nextCategoryTie++ : pricingReferenceOrderTie(item, "category_order");
+      sectionOrders.set(sectionKey, { categoryOrder, categoryTie });
       const maxOrder = comparePricingReferenceOrder(nextCategoryOrder, categoryOrder) < 0 ? categoryOrder : nextCategoryOrder;
       nextCategoryOrder = nextPricingReferenceOrder(maxOrder);
     }
+    const { categoryOrder, categoryTie } = sectionOrders.get(sectionKey);
+    const { category_order_tie, ...row } = item || {};
     return {
       item: {
-        ...item,
-        category_order: sectionOrders.get(sectionKey),
+        ...row,
+        category_order: categoryOrder,
+        ...(categoryTie ? { category_order_tie: categoryTie } : {}),
         item_order: pricingReferenceOrderValue(item?.item_order) || index + 1,
       },
       index,
     };
   });
-  ordered.sort((a, b) => {
+  if (!preserveOrder) ordered.sort((a, b) => {
     const categoryCompare = comparePricingReferenceOrder(a.item.category_order, b.item.category_order);
     if (categoryCompare) return categoryCompare;
+    const categoryTie = pricingReferenceOrderTie(a.item, "category_order") - pricingReferenceOrderTie(b.item, "category_order");
+    if (categoryTie) return categoryTie;
     const itemOrderCompare = comparePricingReferenceOrder(a.item.item_order, b.item.item_order);
     if (itemOrderCompare) return itemOrderCompare;
+    const itemTie = pricingReferenceOrderTie(a.item, "item_order") - pricingReferenceOrderTie(b.item, "item_order");
+    if (itemTie) return itemTie;
     const sectionCompare = String(a.item?.section || "").toLowerCase().localeCompare(String(b.item?.section || "").toLowerCase());
     if (sectionCompare) return sectionCompare;
     const descriptionCompare = String(a.item?.description || "").toLowerCase().localeCompare(String(b.item?.description || "").toLowerCase());
@@ -8040,6 +8091,7 @@ function normalizePricingReferencePreviewItem(item = {}, index = 0) {
     markup_multiplier: item.markup_multiplier ?? "",
     category_order: pricingReferenceOrderValue(item.category_order) ?? "",
     item_order: pricingReferenceOrderValue(item.item_order) ?? index + 1,
+    ...pricingReferenceOrderTies(item),
     remarks: listFieldText(item.remarks),
     aliases: listFieldText(item.aliases),
     match_terms: listFieldText(item.match_terms),
@@ -8049,9 +8101,9 @@ function normalizePricingReferencePreviewItem(item = {}, index = 0) {
   };
 }
 
-function refreshPricingReferencePreviewValidity(result = state.pendingPricingReference) {
+function refreshPricingReferencePreviewValidity(result = state.pendingPricingReference, options = {}) {
   if (!result) return false;
-  result.items = sortPricingReferencePreviewItems((result.items || []).map(normalizePricingReferencePreviewItem));
+  result.items = sortPricingReferencePreviewItems((result.items || []).map(normalizePricingReferencePreviewItem), options);
   if (result.items.length && Array.isArray(result.errors)) {
     result.errors = result.errors.filter((message) => !/(at least one|no editable pricing rows|no pricing rows)/i.test(String(message || "")));
   }
@@ -8075,11 +8127,6 @@ function refreshPricingReferencePreviewValidity(result = state.pendingPricingRef
 function blankPricingReferencePreviewItem(index = 0) {
   const existingItems = Array.isArray(state.pendingPricingReference?.items) ? state.pendingPricingReference.items : [];
   const previous = existingItems[existingItems.length - 1] || {};
-  const maxOrder = existingItems.reduce((max, item) => {
-    const order = pricingReferenceOrderValue(item.item_order) ?? 0;
-    return comparePricingReferenceOrder(max, order) < 0 ? order : max;
-  }, 0);
-  const nextOrder = nextPricingReferenceOrder(maxOrder);
   return normalizePricingReferencePreviewItem({
     id: `new-pricing-row-${Date.now().toString(36)}-${index + 1}`,
     section: previous.section || "",
@@ -8089,7 +8136,8 @@ function blankPricingReferencePreviewItem(index = 0) {
     markup_multiplier: previous.markup_multiplier || "",
     remarks: "",
     category_order: pricingReferenceOrderValue(previous.category_order) ?? "",
-    item_order: nextOrder,
+    category_order_tie: previous.category_order_tie,
+    ...nextPricingReferencePosition(existingItems, "item_order"),
   }, index);
 }
 
@@ -8337,13 +8385,38 @@ function handlePricingReferencePreviewInput(event) {
     pushPricingReferenceUndoSnapshot(state.pricingReferenceEditPendingUndoSnapshot);
     state.pricingReferenceEditPendingUndoSnapshot = "";
   }
-  state.pendingPricingReference.items[rowIndex][field] = input.value;
+  const items = state.pendingPricingReference.items;
+  const item = items[rowIndex];
+  const ceiling = pricingReferenceOrderCeiling();
+  const hasSaturatedOrder = ceiling && items.some((row) =>
+    String(row.category_order) === ceiling || String(row.item_order) === ceiling
+      || row.category_order_tie || row.item_order_tie
+  );
+  if (field === "section" && hasSaturatedOrder) {
+    const previousSection = pricingReferencePreviewSectionKey(item.section, rowIndex);
+    const nextSection = pricingReferencePreviewSectionKey(input.value, rowIndex);
+    if (previousSection !== nextSection) {
+      const peers = items.filter((_, index) => index !== rowIndex);
+      const target = items.find((peer, index) => index !== rowIndex
+        && pricingReferencePreviewSectionKey(peer.section, index) === nextSection);
+      if (target) {
+        item.category_order = target.category_order;
+        item.category_order_tie = target.category_order_tie;
+      } else if (String(item.category_order) === ceiling && items.some((peer, index) => (
+        index !== rowIndex && pricingReferencePreviewSectionKey(peer.section, index) === previousSection
+      ))) {
+        Object.assign(item, nextPricingReferencePosition(peers, "category_order"));
+      }
+    }
+  }
+  item[field] = input.value;
   if (PRICING_REFERENCE_METADATA_STALE_FIELDS.has(field)) {
     state.pendingPricingReference.items[rowIndex].match_terms = "";
     state.pendingPricingReference.items[rowIndex].object_families = "";
   }
   state.pricingReferenceSavedNotice = "";
-  refreshPricingReferencePreviewValidity(state.pendingPricingReference);
+  // Keep input indexes stable when moving a row between categories at the limit.
+  refreshPricingReferencePreviewValidity(state.pendingPricingReference, { preserveOrder: hasSaturatedOrder });
   const row = input.closest("tr");
   const status = row?.querySelector(".pricing-preview-status");
   if (status) {
@@ -9004,6 +9077,7 @@ async function loadProfiles() {
     : null;
   if (!hydrated || !authorityProfileRequestIsFresh(refreshedContext)) return false;
   state.profiles = hydrated.profiles;
+  state.pricingReferenceOrderDigitLimit = data.pricing_reference_order_digit_limit;
   state.companyProfiles = hydrated.companyProfiles;
   state.workspace = workspace;
   state.defaultProfileId = defaultProfileId;
@@ -9333,6 +9407,10 @@ function buildPayload(options = {}) {
     pricing_reference_id: pricingReferenceId,
     pricing_reference: pricingReference ? {
       ...pricingReference,
+      // Output ordering is resolved from the selected catalogue on the server.
+      ...(pricingReference.authority_items?.some((item) => item.sort_order)
+        ? { authority_items: pricingReference.authority_items.map(({ sort_order, ...item }) => item) }
+        : {}),
       source: pricingReference.source,
       tax: pricingReference.tax || selectedPricingReferenceTax(),
       currency: selectedPricingReferenceCurrency(),
@@ -10348,10 +10426,18 @@ function categoryOrderValue(row = {}) {
   return orderNumber(row.category_order) || 999999;
 }
 
-function pricingReferenceOrder(row = {}, fallbackIndex = 0) {
+function pricingReferenceOrder(row, fallbackIndex, appendedOrders) {
+  if (appendedOrders.size) {
+    const itemId = canonicalPricingAuthorityText(row.pricing_authority?.catalog_item_id || row.pricing_keyword);
+    const appended = appendedOrders.get(itemId);
+    if (appended) return [...appended, fallbackIndex];
+  }
   return [
     categoryOrderValue(row),
+    0,
     orderNumber(row.item_order) || 999999,
+    0,
+    0,
     fallbackIndex,
   ];
 }
@@ -10359,14 +10445,25 @@ function pricingReferenceOrder(row = {}, fallbackIndex = 0) {
 function compareOrderValues(left = [], right = []) {
   const length = Math.max(left.length, right.length);
   for (let index = 0; index < length; index += 1) {
-    const difference = (left[index] || 0) - (right[index] || 0);
-    if (difference) return difference;
+    const a = left[index] || 0;
+    const b = right[index] || 0;
+    if (a < b) return -1;
+    if (a > b) return 1;
   }
   return 0;
 }
 
 function sortOutputRows(rows = state.outputRows) {
   const copy = rows.map((row, index) => ({ row, index }));
+  const appendedOrders = new Map();
+  if (state.outputSortMode === "pricing_reference") {
+    for (const item of currentPricingReference()?.authority_items || []) {
+      if (Array.isArray(item.sort_order) && item.sort_order.length === 5
+        && item.sort_order.every((value) => typeof value === "string" && /^[0-9]+$/.test(value))) {
+        appendedOrders.set(canonicalPricingAuthorityText(item.id), item.sort_order.map(BigInt));
+      }
+    }
+  }
   const compareText = (value) => String(value || "").toLowerCase();
   copy.sort((a, b) => {
     const sectionCompare = compareText(a.row.section).localeCompare(compareText(b.row.section));
@@ -10377,20 +10474,16 @@ function sortOutputRows(rows = state.outputRows) {
       if (aBasisOrder !== null || bBasisOrder !== null) {
         return compareOrderValues([
           aBasisOrder ?? 999999,
-          categoryOrderValue(a.row),
-          orderNumber(a.row.item_order) || 999999,
-          a.index,
+          ...pricingReferenceOrder(a.row, a.index, appendedOrders),
         ], [
           bBasisOrder ?? 999999,
-          categoryOrderValue(b.row),
-          orderNumber(b.row.item_order) || 999999,
-          b.index,
+          ...pricingReferenceOrder(b.row, b.index, appendedOrders),
         ])
           || sectionCompare
           || descriptionCompare
           || a.index - b.index;
       }
-      return compareOrderValues(pricingReferenceOrder(a.row, a.index), pricingReferenceOrder(b.row, b.index))
+      return compareOrderValues(pricingReferenceOrder(a.row, a.index, appendedOrders), pricingReferenceOrder(b.row, b.index, appendedOrders))
         || sectionCompare
         || descriptionCompare
         || a.index - b.index;
