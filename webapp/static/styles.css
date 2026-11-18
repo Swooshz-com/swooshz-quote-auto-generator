@@ -3836,6 +3836,10 @@ h3 {
   color: var(--green);
 }
 
+.image-intake .known-details-control {
+  margin: 14px 17px 0;
+}
+
 .image-upload-status {
   min-height: 20px;
   margin: 10px 17px 0;

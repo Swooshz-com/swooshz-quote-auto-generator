@@ -154,6 +154,7 @@ const DEFAULT_QUOTE_COMPANY_RICH_TEXT = {
   companyDateLabel: "<div>Date:</div>",
   dateLabel: "<div>Date:</div>",
 };
+const KNOWN_DETAILS_MAX_CHARS = 2000;
 const DEFAULT_BOOTH_DIMENSIONS = {
   booth_width: "6",
   booth_depth: "6",
@@ -430,6 +431,7 @@ const elements = {
   imageInput: qs("#imageInput"),
   imageUploadStatus: qs("#imageUploadStatus"),
   fileList: qs("#fileList"),
+  knownDetails: qs("#knownDetails"),
   quoteDashboardPanel: qs("#quoteDashboardPanel"),
   quoteFlowPanel: qs("#panel-analysis"),
   topbarBrandButton: qs("#topbarBrandButton"),
@@ -3819,7 +3821,29 @@ function normalizeBoothDimensions(project = {}) {
       dimension_source: project.dimension_source || "analysis",
     };
   }
+  // An area-only size (Known details "93 sqm", or a brief that gives only an area).
+  const area = Number(project.booth_area_sqm);
+  if (project.booth_area_sqm !== "" && project.booth_area_sqm != null && Number.isFinite(area) && area > 0) {
+    return {
+      booth_width: "",
+      booth_depth: "",
+      booth_size: project.booth_size || `${area} sqm`,
+      booth_area_sqm: String(area),
+      dimension_source: project.dimension_source || "analysis",
+    };
+  }
   return { ...DEFAULT_BOOTH_DIMENSIONS };
+}
+
+function knownDetailsValue() {
+  return String(elements.knownDetails?.value || "").slice(0, KNOWN_DETAILS_MAX_CHARS);
+}
+
+function handleKnownDetailsChange() {
+  // Staff edit the box and run analysis again; editing never clears the draft.
+  if (quoteSessionDraftStateCanSave()) {
+    queueQuoteSessionDraftStateSave({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
+  }
 }
 
 function collectQuoteDetails() {
@@ -3836,6 +3860,7 @@ function collectQuoteDetails() {
     project: {
       title: elements.projectTitle.value.trim(),
       show_name: elements.showName?.value.trim() || "",
+      known_details: knownDetailsValue(),
     },
     company: {
       name: elements.quoteCompanyName.value.trim(),
@@ -3910,6 +3935,7 @@ function applyQuoteDetails(details = {}, options = {}) {
   if (shouldApply(client, "address", partial)) setInputValue(elements.clientAddress, client.address);
   if (shouldApply(project, "title", partial)) setInputValue(elements.projectTitle, project.title);
   if (shouldApply(project, "show_name", partial)) setInputValue(elements.showName, project.show_name);
+  if (shouldApply(project, "known_details", partial)) setInputValue(elements.knownDetails, project.known_details);
   if (!partial || shouldApply(project, "booth_width", true) || shouldApply(project, "booth_depth", true)) {
     state.boothDimensions = normalizeBoothDimensions(project);
   }
@@ -9395,12 +9421,14 @@ function buildPayload(options = {}) {
   const project = {
     title: elements.projectTitle.value.trim(),
     show_name: elements.showName?.value.trim() || "",
+    known_details: knownDetailsValue(),
   };
   if (includeBoothDimensions) {
     project.booth_width = state.boothDimensions.booth_width;
     project.booth_depth = state.boothDimensions.booth_depth;
     project.booth_size = state.boothDimensions.booth_size;
     project.dimension_source = state.boothDimensions.dimension_source;
+    if (state.boothDimensions.booth_area_sqm) project.booth_area_sqm = state.boothDimensions.booth_area_sqm;
   }
   return {
     profile_id: profileId,
@@ -12083,15 +12111,22 @@ function renderBasisTagLegend() {
 function detectedBoothSizeText(dimensionLines = []) {
   const dimensions = state.boothDimensions || {};
   if (!dimensions.dimension_source || dimensions.dimension_source === "default") return "";
+  const fromKnownDetails = dimensions.dimension_source === "staff";
+  const suffix = fromKnownDetails ? " (from Known details)" : "";
+  const format = (value) => value.toLocaleString(undefined, { maximumFractionDigits: 2 });
   const width = Number(dimensions.booth_width);
   const depth = Number(dimensions.booth_depth);
-  if (!(Number.isFinite(width) && width > 0 && Number.isFinite(depth) && depth > 0)) return "";
+  if (!(dimensions.booth_width !== "" && dimensions.booth_depth !== "" && Number.isFinite(width) && width > 0 && Number.isFinite(depth) && depth > 0)) {
+    const area = Number(dimensions.booth_area_sqm);
+    if (!(dimensions.booth_area_sqm && Number.isFinite(area) && area > 0)) return "";
+    return `Booth size ${format(area)} sqm${suffix}`;
+  }
   // The AI's own dimension line already states this footprint, so do not repeat it.
-  const restated = dimensionLines.some((line) => [...String(line).matchAll(/(\d+(?:\.\d+)?)\s*m?\s*[x\u00d7]\s*(\d+(?:\.\d+)?)/gi)]
+  // A Known details size is always shown, so staff can see their size won.
+  const restated = !fromKnownDetails && dimensionLines.some((line) => [...String(line).matchAll(/(\d+(?:\.\d+)?)\s*m?\s*[x\u00d7]\s*(\d+(?:\.\d+)?)/gi)]
     .some((match) => Number(match[1]) === width && Number(match[2]) === depth));
   if (restated) return "";
-  const format = (value) => value.toLocaleString(undefined, { maximumFractionDigits: 2 });
-  return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)`;
+  return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)${suffix}`;
 }
 
 function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
@@ -18933,6 +18968,7 @@ function wireEvents() {
     exportCurrentPreset(event);
   });
   elements.clearCustomerButton.addEventListener("click", clearCustomerDetails);
+  elements.knownDetails?.addEventListener("input", handleKnownDetailsChange);
   elements.clearQuoteCompanyButton.addEventListener("click", clearQuoteCompanyDetails);
   [
     elements.clientName,
