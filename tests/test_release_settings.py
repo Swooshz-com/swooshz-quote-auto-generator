@@ -55,12 +55,12 @@ class ReleaseSettingsFileTests(unittest.TestCase):
         return path
 
     def test_secret_like_shared_value_is_refused_without_echo(self) -> None:
-        secret = "sk-or-v1-" + "a1b2c3d4" * 6
+        planted = "sk-or-v1-" + "a1b2c3d4" * 6
         with tempfile.TemporaryDirectory() as tmp:
-            path = self.write_settings(Path(tmp), lambda d: d["shared"].__setitem__("OPENROUTER_DRAFT_MODEL", secret))
+            path = self.write_settings(Path(tmp), lambda d: d["shared"].__setitem__("OPENROUTER_DRAFT_MODEL", planted))
             code, out = run_checker("--settings", str(path), "--template", str(TEMPLATE))
         self.assertEqual(code, 1)
-        self.assertNotIn(secret, out)
+        self.assertNotIn(planted, out)
 
     def test_name_in_two_groups_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,29 +75,6 @@ class ReleaseSettingsFileTests(unittest.TestCase):
             code, out = run_checker("--settings", str(path), "--template", str(TEMPLATE))
         self.assertEqual(code, 1)
         self.assertIn("APP_MODE", out)
-
-    def test_print_shared_env_refuses_while_pending(self) -> None:
-        data = json.loads(SETTINGS.read_text(encoding="utf-8"))
-        if not checker.pending_names(data):
-            self.skipTest("no pending values")
-        code, out = run_checker("--print-shared-env")
-        self.assertEqual(code, 1)
-        self.assertNotIn("APP_MODE=deploy", out)
-
-    def test_print_shared_env_prints_only_shared_names_when_complete(self) -> None:
-        def fill(d):
-            for name, value in d["shared"].items():
-                if value is None:
-                    d["shared"][name] = "" if name in d["optional"] else "reviewed-value"
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self.write_settings(Path(tmp), fill)
-            code, out = run_checker("--settings", str(path), "--template", str(TEMPLATE), "--print-shared-env")
-        self.assertEqual(code, 0, out)
-        names = {line.split("=", 1)[0] for line in out.splitlines()}
-        data = json.loads(SETTINGS.read_text(encoding="utf-8"))
-        self.assertEqual(names, set(data["shared"]))
-        self.assertFalse(names & set(data["secrets"]))
 
 
 class EnvNamesComparisonTests(unittest.TestCase):
@@ -134,12 +111,12 @@ class EnvNamesComparisonTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
 
     def test_value_line_is_refused_without_echo(self) -> None:
-        secret_value = "hunter2-very-private-value"
-        names = self.all_names + [f"SESSION_SECRET={secret_value}"]
+        planted = "hunter2-very-private-value"
+        names = self.all_names + [f"SESSION_SECRET={planted}"]
         code, out = run_checker("--env-names", str(self.names_file(names)))
         self.assertEqual(code, 1)
         self.assertIn("contains '='", out)
-        self.assertNotIn(secret_value, out)
+        self.assertNotIn(planted, out)
 
     def test_unexpected_and_must_be_unset_names_fail(self) -> None:
         names = self.all_names + ["SOMETHING_NEW", "OIDC_CLIENT_ID", "OPENROUTER_DRAFT_SCHEMA_ENABLED"]

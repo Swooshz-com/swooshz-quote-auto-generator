@@ -187,11 +187,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="File with env names baked into the image (names only); they are not reported as unexpected.",
     )
-    parser.add_argument(
-        "--print-shared-env",
-        action="store_true",
-        help="Print NAME=value lines for the shared non-secret settings. Refuses while any value is pending.",
-    )
     return parser
 
 
@@ -232,14 +227,6 @@ def main(argv: list[str] | None = None) -> int:
                 report["errors"].append(
                     "env names that must stay unset: " + ", ".join(comparison["must_be_unset_present"])
                 )
-
-    if args.print_shared_env:
-        if report["errors"] or report["pending"]:
-            report["errors"].append("refusing --print-shared-env while the file has errors or pending values")
-        else:
-            for name, value in data["shared"].items():
-                print(f"{name}={value}")
-            return 0
 
     if report["errors"]:
         report["status"] = "fail"

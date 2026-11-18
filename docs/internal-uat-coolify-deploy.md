@@ -130,9 +130,9 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    - In Coolify, create the Docker Compose service `quote-rehearsal` on the
      same server and project as live and paste `deploy/rehearsal/compose.yaml`.
      Set each variable from the source the map gives it: shared settings from
-     `python scripts\check_release_settings.py --print-shared-env`, generated
-     secrets, the branch's runtime URL, the `sqag-rehearsal` key and the run
-     values. Set `REHEARSAL_IMAGE_ID` to the image live runs now. Give it the
+     the `shared` values in `deploy/internal/release-settings.json`, generated
+     secrets, the branch's runtime URL, the credential-store entries the map
+     names (the R2 token, the R2 endpoint and the AI key) and the run values. Set `REHEARSAL_IMAGE_ID` to the image live runs now. Give it the
      host `quote-rehearsal.<server-ip>.sslip.io` with Traefik basic auth.
    - Start the app and wait for health. Then check the bucket is empty from
      inside the rehearsal container with the map's `clear_command`, using

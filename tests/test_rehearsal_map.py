@@ -56,11 +56,11 @@ class RehearsalMapTests(unittest.TestCase):
 
     def test_value_in_a_secret_source_fails_without_echo(self) -> None:
         data = copy.deepcopy(self.data)
-        secret = "sk-or-v1-" + "9f8e7d6c" * 6
-        data["env_sources"]["credential_store"]["OPENROUTER_API_KEY"] = secret
+        planted = "sk-or-v1-" + "9f8e7d6c" * 6
+        data["env_sources"]["credential_store"]["OPENROUTER_API_KEY"] = planted
         errors = self.check_with(data)
         self.assertTrue(errors)
-        self.assertFalse(any(secret in e for e in errors))
+        self.assertFalse(any(planted in e for e in errors))
 
     def test_random_token_anywhere_fails(self) -> None:
         data = copy.deepcopy(self.data)
