@@ -11929,9 +11929,10 @@ function basisQuantityUnitText(line = {}) {
 
 function basisFreeQuantityHtml(section, line, index) {
   const unit = basisQuantityUnitText(line);
-  const placeholder = unit ? "Qty" : "Qty unit";
+  // With no unit yet the box takes "6 sqm", so the phone keyboard must allow letters.
+  const placeholder = unit ? "Qty" : "6 sqm";
   const label = unit ? `Quantity in ${unit}` : "Quantity and unit, for example 6 sqm";
-  return `<input class="basis-quantity-input basis-quantity-required" type="text" required inputmode="decimal" placeholder="${escapeHtml(placeholder)}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-free="1" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${unit ? ` ${escapeHtml(unit)}` : ""}`;
+  return `<input class="basis-quantity-input basis-quantity-required" type="text" required inputmode="${unit ? "decimal" : "text"}" placeholder="${escapeHtml(placeholder)}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-free="1" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${unit ? ` ${escapeHtml(unit)}` : ""}`;
 }
 
 function parseBasisFreeQuantity(value, lineUnit = "") {
