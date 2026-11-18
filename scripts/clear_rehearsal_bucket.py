@@ -63,8 +63,16 @@ def guard(env: Mapping[str, str], expect_bucket: str, map_path: Path) -> None:
         raise Refusal("storage endpoint must be https")
 
 
+# Same retry policy as webapp.object_storage.S3_CLIENT_RETRIES (botocore 1.44
+# changed the default from "legacy" to "standard"). Kept inline because this
+# script runs from a standalone tools folder without the webapp package; a test
+# keeps the two equal.
+S3_CLIENT_RETRIES: Mapping[str, str] = {"mode": "legacy"}
+
+
 def make_client(env: Mapping[str, str]) -> Any:
     import boto3  # imported here so tests can run without network or credentials
+    from botocore.config import Config
 
     return boto3.client(
         "s3",
@@ -72,6 +80,7 @@ def make_client(env: Mapping[str, str]) -> Any:
         region_name=env["SQAG_OBJECT_STORAGE_REGION"],
         aws_access_key_id=env["SQAG_OBJECT_STORAGE_ACCESS_KEY_ID"],
         aws_secret_access_key=env["SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY"],
+        config=Config(retries=dict(S3_CLIENT_RETRIES)),
     )
 
 
