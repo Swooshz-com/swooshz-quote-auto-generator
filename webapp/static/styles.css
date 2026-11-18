@@ -8633,8 +8633,16 @@ body.privacy-page {
 
   .basis-line-meta {
     grid-row: 1;
+    display: flex;
+    flex-wrap: wrap;
     width: auto;
     max-width: 100%;
+  }
+
+  /* On narrow cards the quantity (or its catalogue quantity box) wraps under the pills instead of being clipped. */
+  .basis-line-meta .basis-quantity-text {
+    width: auto;
+    justify-content: flex-start;
   }
 
   .basis-line-text {
