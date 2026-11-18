@@ -5193,13 +5193,14 @@ def format_dimension(value: float) -> str:
 BOOTH_SIZE_NUMBER = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
 BOOTH_SIZE_LENGTH_UNIT = r"(mm|millimet(?:re|er)s?|cm|centimet(?:re|er)s?|m(?![a-z0-9²])|met(?:re|er)s?)"
 BOOTH_SIZE_PAIR_RE = re.compile(
-    rf"(?<![\d.]){BOOTH_SIZE_NUMBER}\s*{BOOTH_SIZE_LENGTH_UNIT}?\s*(?:x|×|\*|by)\s*"
-    rf"{BOOTH_SIZE_NUMBER}\s*{BOOTH_SIZE_LENGTH_UNIT}?"
+    # Each unit owns the spaces before it, so no two whitespace runs can trade
+    # characters (keeps matching linear on long runs of spaces).
+    rf"(?<![\d.]){BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?\s*(?:x|×|\*|by)\s*"
+    rf"{BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?"
     # An optional third (height) value: W x D x H keeps W x D.
-    rf"(?:\s*(?:x|×|\*|by)\s*{BOOTH_SIZE_NUMBER}\s*{BOOTH_SIZE_LENGTH_UNIT}?)?(?!\d|\.\d)",
+    rf"(?:\s*(?:x|×|\*|by)\s*{BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?)?(?!\d|\.\d)",
     flags=re.IGNORECASE,
 )
-BOOTH_SIZE_PAIR_PREFIX_RE = re.compile(r"(?:\d\s*(?:x|×|\*|by)\s*|[\d.])$", flags=re.IGNORECASE)
 BOOTH_SIZE_COUNTED_NOUN_RE = re.compile(r"\s*[a-z]", flags=re.IGNORECASE)
 BOOTH_SIZE_AREA_RE = re.compile(
     rf"(?<![\d.]){BOOTH_SIZE_NUMBER}\s*"
@@ -5219,6 +5220,21 @@ def booth_length_in_metres(value: str, unit: str) -> float | None:
     if unit.startswith("cm") or unit.startswith("centi"):
         return round(number / 100, 4)
     return number
+
+
+def booth_size_pair_continues_earlier(text: str, start: int) -> bool:
+    # True when the match starts inside a longer number or after "<digit> x", so
+    # "3x3x2.5m" is read once from its first value. Plain string checks, no regex.
+    before = text[max(0, start - 40):start]
+    if before[-1:].isdigit() or before.endswith("."):
+        return True
+    before = before.rstrip()
+    lowered = before.lower()
+    for separator in ("x", "×", "*", "by"):
+        if lowered.endswith(separator):
+            head = before[: len(before) - len(separator)].rstrip()
+            return head[-1:].isdigit()
+    return False
 
 
 def booth_size_candidate_context(text: str, start: int) -> bool:
@@ -5241,7 +5257,7 @@ def booth_size_reading(value: Any) -> dict[str, Any]:
     pairs: list[tuple[int, bool, float, float]] = []
     pair_spans: list[tuple[int, int]] = []
     for match in BOOTH_SIZE_PAIR_RE.finditer(text):
-        if BOOTH_SIZE_PAIR_PREFIX_RE.search(text[:match.start()]):
+        if booth_size_pair_continues_earlier(text, match.start()):
             continue
         # "height 4m x 2 panels": outside booth wording, a bare second number that
         # counts a noun is not a depth.

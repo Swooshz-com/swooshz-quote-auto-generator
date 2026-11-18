@@ -90,6 +90,21 @@ class BoothSizeReaderTest(unittest.TestCase):
     def test_reader_is_bounded_to_the_box_limit(self):
         self.assertIsNone(size("x" * webapp.KNOWN_DETAILS_MAX_CHARS + " booth 9m x 9m"))
 
+    def test_long_whitespace_runs_stay_fast(self):
+        # Ambiguous whitespace runs made pattern matching slow; a full box of
+        # hostile spacing must still read in well under a second.
+        import time
+
+        hostile = [
+            "1" + " " * 1999,
+            ("1 x" + " " * 30) * 60,
+            ("1m" + " " * 20) * 90,
+        ]
+        for text in hostile:
+            started = time.monotonic()
+            webapp.booth_size_reading(text)
+            self.assertLess(time.monotonic() - started, 0.5, text[:12])
+
 
 class BoothPrecedenceTest(unittest.TestCase):
     def dims(self, project):

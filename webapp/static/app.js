@@ -12118,7 +12118,7 @@ function detectedBoothSizeText(dimensionLines = []) {
   }
   // The AI's own dimension line already states this footprint, so do not repeat it.
   // A Known details size is always shown, so staff can see their size won.
-  const restated = !fromKnownDetails && dimensionLines.some((line) => [...String(line).matchAll(/(\d+(?:\.\d+)?)\s*m?\s*[x\u00d7]\s*(\d+(?:\.\d+)?)/gi)]
+  const restated = !fromKnownDetails && dimensionLines.some((line) => [...String(line).matchAll(/(\d+(?:\.\d+)?)(?:\s*m)?\s*[x\u00d7]\s*(\d+(?:\.\d+)?)/gi)]
     .some((match) => Number(match[1]) === width && Number(match[2]) === depth));
   if (restated) return "";
   return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)${suffix}`;
