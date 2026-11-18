@@ -5,6 +5,7 @@
 //   node scripts/rehearsal-check.mjs --profile seed|verify|reopen|live-readonly
 //        --base-url https://<host> --result <file.json>
 //        [--seed-file <seed result.json>] [--asset-out <app.js file>] [--no-ai]
+//        [--allow-loopback-http [--file-storage]]
 //
 // Credentials come from the environment only, never arguments:
 //   SQAG_REHEARSAL_LOGIN_EMAIL, SQAG_REHEARSAL_LOGIN_PASSWORD: the rehearsal app's
@@ -19,6 +20,10 @@
 // browser's sign-in form POST), and anything else is refused and recorded.
 // A loopback host skips the "must say rehearsal" rule and needs
 // --allow-loopback-http, so never tunnel a live app to localhost.
+// Rehearsal and live run database storage, where generation needs a saved
+// company profile, so seed saves one and every new quote selects it.
+// --file-storage (loopback test servers only) is for a file-storage server,
+// which cannot save company profile layouts and does not need one.
 // The result file holds metadata only: step status, timings, opaque ids and hashes.
 import { signIn } from "./internal-password-browser-test.mjs";
 import { pdfFontNames, unexpectedPdfFonts, validatePdf, validateXlsx } from "./lib/artifact-checks.mjs";
@@ -30,10 +35,11 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fixtureDir = path.join(root, "tests", "fixtures", "quote-generator", "pricing-references", "synthetic-exhibition-fixture-pricing");
+const layoutFixture = path.join(root, "tests", "fixtures", "quote-generator", "profiles", "synthetic-exhibition-fixture-template", "quotation-layout.xlsx");
 const RESULT_SCHEMA = "sqag-rehearsal-check/v1";
 const PROFILES = ["seed", "verify", "reopen", "live-readonly"];
 const VALUE_FLAGS = new Set(["--profile", "--base-url", "--result", "--seed-file", "--asset-out"]);
-const BOOLEAN_FLAGS = new Set(["--no-ai", "--allow-loopback-http"]);
+const BOOLEAN_FLAGS = new Map([["--no-ai", "noAi"], ["--allow-loopback-http", "allowLoopbackHttp"], ["--file-storage", "fileStorage"]]);
 const REHEARSAL_LOGIN_ENV = { email: "SQAG_REHEARSAL_LOGIN_EMAIL", password: "SQAG_REHEARSAL_LOGIN_PASSWORD" };
 const LIVE_LOGIN_ENV = { email: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL", password: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD" };
 const CREDENTIAL_ENV = [...Object.values(REHEARSAL_LOGIN_ENV), ...Object.values(LIVE_LOGIN_ENV)];
@@ -42,6 +48,13 @@ const WRITE_HELPERS = ["post", "put", "patch", "delete"];
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 const PACK_ID = "rehearsal-synthetic-pricing";
 const PACK_LABEL = "Rehearsal Synthetic Pricing";
+// Database storage mode refuses generation without a saved company profile that
+// carries a quotation layout, so the seed saves one and every new quote selects it.
+// The server assigns a new profile its id, so the seed finds it again by label.
+const COMPANY_PROFILE_ID = "rehearsal-synthetic-company"; // requested id; database mode assigns its own
+const COMPANY_PROFILE_LABEL = "Rehearsal Synthetic Company";
+const COMPANY_PROFILE_PREFIX = "company:";
+const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const CUSTOMER = "Rehearsal Synthetic Customer";
 const PROJECT = "Rehearsal Synthetic Exhibition";
 const COMPANY = "Rehearsal Synthetic Fabrication";
@@ -49,6 +62,10 @@ const SIGNATORY = "Rehearsal Signatory";
 const TERMINAL = ["completed", "degraded", "needs_review", "blocked", "failed"];
 const AI_DRAFT_TIMEOUT_MS = 240000;
 const GENERATION_TIMEOUT_MS = 120000;
+const SAVE_TIMEOUT_MS = 30000;
+// The pricing-reference save runs AI enrichment on a real server (about 36 s
+// on the d07c910 rehearsal), so it gets a longer limit than other saves.
+const PRICING_SAVE_TIMEOUT_MS = 120000;
 
 export class UsageError extends Error {}
 export class ReadOnlyViolation extends Error {}
@@ -69,7 +86,7 @@ export function scrub(value) {
 
 export function parseArgs(argv, env = process.env) {
   const credentialValues = CREDENTIAL_ENV.map((name) => env[name]).filter((value) => typeof value === "string" && value.length >= 4);
-  const options = { noAi: false, allowLoopbackHttp: false };
+  const options = { noAi: false, allowLoopbackHttp: false, fileStorage: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = String(argv[index]);
     if (credentialValues.some((value) => arg.includes(value))) {
@@ -78,7 +95,7 @@ export function parseArgs(argv, env = process.env) {
     const equals = arg.startsWith("--") ? arg.indexOf("=") : -1;
     const flag = equals > 0 ? arg.slice(0, equals) : arg;
     if (BOOLEAN_FLAGS.has(flag) && equals < 0) {
-      options[flag === "--no-ai" ? "noAi" : "allowLoopbackHttp"] = true;
+      options[BOOLEAN_FLAGS.get(flag)] = true;
     } else if (VALUE_FLAGS.has(flag)) {
       const value = equals > 0 ? arg.slice(equals + 1) : argv[++index];
       if (typeof value !== "string" || !value || value.startsWith("--")) throw new UsageError(`${flag} needs a value`);
@@ -96,6 +113,7 @@ export function parseArgs(argv, env = process.env) {
   if (!options.baseUrl) throw new UsageError("--base-url is required");
   if (!options.result) throw new UsageError("--result is required");
   if (["verify", "reopen"].includes(options.profile) && !options.seedFile) throw new UsageError(`--seed-file is required for ${options.profile}`);
+  if (options.fileStorage && !options.allowLoopbackHttp) throw new UsageError("--file-storage is only for a loopback test server");
   options.baseUrl = checkBaseUrl(options.baseUrl, options.profile, options.allowLoopbackHttp, env);
   options.credentials = readCredentials(env, options.profile === "live-readonly" ? LIVE_LOGIN_ENV : REHEARSAL_LOGIN_ENV);
   return options;
@@ -314,8 +332,8 @@ async function csrfFor(run) {
   return { [session.csrf_header]: session.csrf_token, Origin: run.baseUrl };
 }
 
-async function postJson(run, route, data, label) {
-  const response = await run.api.post(`${run.baseUrl}${route}`, { data, headers: await csrfFor(run) });
+async function postJson(run, route, data, label, timeout = SAVE_TIMEOUT_MS) {
+  const response = await run.api.post(`${run.baseUrl}${route}`, { data, headers: await csrfFor(run), timeout });
   const body = await response.json().catch(() => ({}));
   assert(response.ok(), `${label} returned HTTP ${response.status()} (${scrub(body.errors?.[0] || body.status || "rejected")}).`);
   return body;
@@ -377,9 +395,35 @@ async function seedPricingPack(run, fixture) {
     description: "Synthetic rehearsal-only pricing reference.",
     tax: fixture.reference.tax, currency: fixture.reference.currency,
     items: fixture.catalog.items, update_existing: false, editing_reference_id: "",
-  }, "Pricing reference save");
+  }, "Pricing reference save", PRICING_SAVE_TIMEOUT_MS);
   assert(body.pricing_reference?.id, "Pricing reference save returned no id.");
   return { pricing_reference_id: body.pricing_reference.id, reused: false };
+}
+
+// The profiles list's company entries, never a text search of the whole response.
+function companyProfileEntry(profiles, match) {
+  return (profiles.company_profiles || []).find((item) => item?.source === "company" && item.id && match(item));
+}
+
+async function seedCompanyProfile(run) {
+  const profiles = await getJson(run.api, `${run.baseUrl}/api/profiles`, "Profiles");
+  const existing = companyProfileEntry(profiles, (item) => item.label === COMPANY_PROFILE_LABEL);
+  if (existing) {
+    run.companyProfileId = existing.id;
+    return { company_profile_id: existing.id, reused: true };
+  }
+  const layout = await fs.readFile(layoutFixture);
+  const body = await postJson(run, "/api/settings/profiles", {
+    operation: "create", id: COMPANY_PROFILE_ID, label: COMPANY_PROFILE_LABEL,
+    description: "Synthetic rehearsal-only company profile.", defaults: {},
+    pack: { quotation_layout: { filename: "quotation-layout.xlsx", data_url: `data:${XLSX_MIME};base64,${layout.toString("base64")}` } },
+  }, "Company profile save");
+  const savedId = body.profile?.id;
+  assert(savedId, "Company profile save returned no id.");
+  const after = await getJson(run.api, `${run.baseUrl}/api/profiles`, "Profiles");
+  assert(companyProfileEntry(after, (item) => item.id === savedId && item.label === COMPANY_PROFILE_LABEL), "The saved company profile is not in the profiles list.");
+  run.companyProfileId = savedId;
+  return { company_profile_id: savedId, reused: false };
 }
 
 async function openDashboard(run) {
@@ -407,6 +451,15 @@ async function createQuoteDraft(run, images, projectNumber) {
   await page.locator("#quoteDate").fill(new Date().toISOString().slice(0, 10));
   await page.locator("#sideNextButton").click();
   await page.locator("#quoteCompanyPanel").waitFor({ state: "visible", timeout: 15000 });
+  const companyOption = run.options.fileStorage ? "" : `${COMPANY_PROFILE_PREFIX}${run.companyProfileId}`;
+  if (companyOption) {
+    assert(run.companyProfileId, "No seeded company profile to select.");
+    const option = page.locator(`#presetSelect option[value="${companyOption}"]`);
+    await option.waitFor({ state: "attached", timeout: 15000 }).catch(() => {
+      throw new Error("The seeded company profile is not offered on Quote Company.");
+    });
+    await page.locator("#presetSelect").selectOption(companyOption);
+  }
   await page.locator("#headerLogoInput").setInputFiles({ name: "rehearsal-logo.png", mimeType: "image/png", buffer: images.logo });
   for (const [selector, value] of [
     ["#headerDetailsEditor", "Rehearsal Synthetic | Singapore"], ["#quoteCompanyNameEditor", COMPANY],
@@ -420,7 +473,8 @@ async function createQuoteDraft(run, images, projectNumber) {
   const saved = await waitUntil(() => [...run.trace.saves].reverse().find((item) => item.sequence > before && item.status === 200
     && item.body?.quote_session?.session_id
     && item.payload?.draft_state?.quoteDetails?.company?.name === COMPANY
-    && item.payload?.draft_state?.quoteDetails?.signature?.company_signatory === SIGNATORY), "the new quote's saved details", 30000);
+    && item.payload?.draft_state?.quoteDetails?.signature?.company_signatory === SIGNATORY
+    && (!companyOption || item.payload?.quote_company_profile?.id === companyOption)), "the new quote's saved details and company profile", 30000);
   const sessionId = saved.body.quote_session.session_id;
   const readback = await quoteSession(run, sessionId);
   assert(readback.customer_summary?.customer_name === CUSTOMER, "The new quote lost its customer details.");
@@ -554,7 +608,7 @@ async function readSeed(file) {
     throw new UsageError("--seed-file is unreadable");
   }
   const ids = seed?.seed;
-  if (seed?.schema !== RESULT_SCHEMA || seed.profile !== "seed" || seed.result !== "pass" || !ids?.published_session_id || !ids?.draft_session_id || !ids?.pricing_reference_id) {
+  if (seed?.schema !== RESULT_SCHEMA || seed.profile !== "seed" || seed.result !== "pass" || !ids?.published_session_id || !ids?.draft_session_id || !ids?.pricing_reference_id || !("company_profile_id" in ids)) {
     throw new UsageError("--seed-file is not a passed seed result");
   }
   return ids;
@@ -565,6 +619,16 @@ async function reopenSeed(run, seed) {
     const profiles = await getJson(run.api, `${run.baseUrl}/api/profiles`, "Profiles");
     assert((profiles.pricing_references || []).some((item) => item.id === seed.pricing_reference_id), "The seeded pricing reference is missing.");
   });
+  if (run.options.fileStorage) {
+    run.skip("company profile present", "--file-storage: the server has no database company profiles.");
+  } else {
+    await run.step("company profile present", async () => {
+      const profiles = await getJson(run.api, `${run.baseUrl}/api/profiles`, "Profiles");
+      const entry = companyProfileEntry(profiles, (item) => item.id === seed.company_profile_id);
+      assert(entry && entry.label === COMPANY_PROFILE_LABEL, "The seeded company profile is missing.");
+      run.companyProfileId = entry.id;
+    });
+  }
   await run.step("published quote reopens", async () => {
     const readback = await quoteSession(run, seed.published_session_id);
     assert(readback.customer_summary?.customer_name === CUSTOMER, "The published quote lost its customer details.");
@@ -665,11 +729,15 @@ export async function runChecks(options, playwright) {
       if (options.profile === "seed") {
         const images = await syntheticImages(run.context);
         const pack = await run.step("pricing reference", () => seedPricingPack(run, fixture));
+        let company = { company_profile_id: null };
+        if (options.fileStorage) run.skip("company profile", "--file-storage: the server has no database company profiles.");
+        else company = await run.step("company profile", () => seedCompanyProfile(run));
         const published = await newGeneratedQuote(run, images, fixture, "published quote");
         const draftId = await run.step("draft quote", () => createQuoteDraft(run, images, `REH-DRAFT-${Date.now().toString(36).toUpperCase()}`));
         run.skip("damaged pricing reference", "No app route creates a damaged pack; the fail-closed message stays covered by the unit tests.");
         run.result.seed = {
           pricing_reference_id: pack.pricing_reference_id,
+          company_profile_id: company.company_profile_id,
           published_session_id: published.sessionId,
           draft_session_id: draftId,
           published_exports: { xlsx_sha256: published.artifacts.xlsx_sha256, pdf_sha256: published.artifacts.pdf_sha256 },

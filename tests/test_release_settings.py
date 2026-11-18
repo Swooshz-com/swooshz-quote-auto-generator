@@ -133,6 +133,14 @@ class EnvNamesComparisonTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
 
 
+    def test_coolify_predefined_names_are_platform_names(self) -> None:
+        # Coolify sets SOURCE_COMMIT (the deployed commit) and HOST (0.0.0.0
+        # when unset) on every app; the d07c910 live check flagged both.
+        names = self.all_names + ["HOST", "SOURCE_COMMIT"]
+        code, out = run_checker("--env-names", str(self.names_file(names)))
+        self.assertEqual(code, 0, out)
+
+
 class AppNeverReadsSettingsTests(unittest.TestCase):
     def test_webapp_source_never_names_the_settings_file(self) -> None:
         for path in (ROOT / "webapp").rglob("*"):

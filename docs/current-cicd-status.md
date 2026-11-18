@@ -238,7 +238,12 @@ or deployment behaviour changes accompany this test.
   needs-review, blocked, failed and interrupted polling without reload. `npm run playwright:rehearsal-check` runs
   `scripts/rehearsal-check.mjs` (seed, verify without AI, reopen, live-readonly) against a loopback
   synthetic server behind a logging proxy, checks at the server that live-readonly sends no write, and checks
-  its argument, base-URL and read-only refusals. All seven browser steps remain gated by the successful
+  its argument, base-URL and read-only refusals. It runs every profile twice: once on a file-storage server,
+  and once on a database-storage server in live's modes (`SQAG_STORAGE_MODE=database`,
+  `SQAG_ARTIFACT_STORAGE_MODE=object`) built by `tests/disposable_database_mode.py`: a uniquely named
+  database on the job's disposable PostgreSQL 17 service, migrations through 011 as on live, the runtime
+  contract's grants, and an in-memory object store. The harness drops the database (and any roles it
+  created) when it stops. Under `CI=true` a missing PostgreSQL service fails this run instead of skipping it. All seven browser steps remain gated by the successful
   `runtime_prerequisites` privilege-contract validation, including after a
   Python test failure.
 - The default app smoke covers reload, saved reopen and generation recovery,
@@ -304,8 +309,8 @@ or deployment behaviour changes accompany this test.
   bucket clear script and the build script's dry run and fake-docker build are
   covered by the existing `python -m unittest discover -s tests` step. Its
   remote check, `scripts/rehearsal-check.mjs`, is tested by the browser job's
-  `npm run playwright:rehearsal-check` step against a loopback synthetic server only; CI
-  never reaches the rehearsal or live app. No trigger, secret or required
+  `npm run playwright:rehearsal-check` step against loopback synthetic servers only (file
+  storage and database storage); CI never reaches the rehearsal or live app. No trigger, secret or required
   check changes.
 - All six maintained inference operations require `OPENROUTER_API_KEY` and
   explicit `OPENROUTER_<SUFFIX>_MODEL`,

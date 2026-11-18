@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""Loopback-only synthetic password login harness; never loads host dotenv values."""
+"""Loopback-only synthetic password login harness; never loads host dotenv values.
+
+Usage: internal_password_browser_harness.py <repo root> [data output tmp logs pricing]
+       [--storage file|database]
+
+--storage database runs the app in live's storage modes (database metadata on a
+disposable PostgreSQL database, object artifacts on an in-memory object store);
+see tests/disposable_database_mode.py. The default is file storage.
+"""
 from __future__ import annotations
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -40,17 +49,72 @@ class HarnessHandler(webapp.QuoteRunnerHandler):
     pass
 
 
-def main():
-    configure_auth_env()
-    if len(sys.argv)>6:
-        os.environ.update({"QUOTE_DATA_ROOT":sys.argv[2], "QUOTE_OUTPUT_ROOT":sys.argv[3], "QUOTE_TMP_ROOT":sys.argv[4], "QUOTE_LOG_ROOT":sys.argv[5], "SQAG_LOCAL_PRICING_REFERENCES_ROOT":sys.argv[6]})
-    # SYNTHETIC_WORKSPACE_SETUP
-    server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), HarnessHandler)
-    print("http://127.0.0.1:"+str(server.server_port), flush=True)
+def parse_storage(argv):
+    args = list(argv)
+    storage = "file"
+    if "--storage" in args:
+        index = args.index("--storage")
+        if index + 1 >= len(args) or args[index + 1] not in {"file", "database"}:
+            raise SystemExit("--storage must be file or database")
+        storage = args[index + 1]
+        del args[index:index + 2]
+    return storage, args
+
+
+def configure_database_storage(settings):
+    """Point the app at a disposable database and an in-memory object store."""
+    from tests.disposable_database_mode import DisposableDatabase
+
+    database = DisposableDatabase(settings)
     try:
-        server.serve_forever()
+        database.create()
+    except BaseException:
+        database.drop()
+        raise
+    # Synthetic object-store names: the app checks they are set, and the
+    # in-memory backend below replaces the S3 client, so nothing leaves the host.
+    os.environ.update({
+        "SQAG_STORAGE_MODE":"database", "SQAG_ARTIFACT_STORAGE_MODE":"object",
+        "SQAG_DATABASE_URL":database.runtime_url,
+        "SQAG_OBJECT_STORAGE_PROVIDER":"s3_compatible",
+        "SQAG_OBJECT_STORAGE_ENDPOINT_URL":"https://object-store.example.test",
+        "SQAG_OBJECT_STORAGE_BUCKET":"synthetic-ci-artifacts",
+        "SQAG_OBJECT_STORAGE_REGION":"ap-southeast-1",
+        "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID":"SYNTHETIC_CI_ACCESS_KEY_ID",
+        "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY":"synthetic-ci-secret-access-key",
+    })
+    backend = webapp.InMemoryObjectStorageBackend()
+    webapp.configured_object_storage_backend = lambda: backend
+    return database
+
+
+def main():
+    storage, argv = parse_storage(sys.argv)
+    settings = None
+    if storage == "database":
+        from tests.disposable_database_mode import bootstrap_settings
+
+        # Read before configure_auth_env clears every SQAG_* name.
+        settings = bootstrap_settings()
+    configure_auth_env()
+    if len(argv)>6:
+        os.environ.update({"QUOTE_DATA_ROOT":argv[2], "QUOTE_OUTPUT_ROOT":argv[3], "QUOTE_TMP_ROOT":argv[4], "QUOTE_LOG_ROOT":argv[5], "SQAG_LOCAL_PRICING_REFERENCES_ROOT":argv[6]})
+    # SYNTHETIC_WORKSPACE_SETUP
+    database = None
+    if storage == "database":
+        # A stop signal unwinds through the finally blocks so the database is dropped.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        database = configure_database_storage(settings)
+    try:
+        server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), HarnessHandler)
+        print("http://127.0.0.1:"+str(server.server_port), flush=True)
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
     finally:
-        server.server_close()
+        if database is not None:
+            database.drop()
     return 0
 
 if __name__ == "__main__":
