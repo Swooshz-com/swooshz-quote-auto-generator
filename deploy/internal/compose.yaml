@@ -1,8 +1,8 @@
-# Application image source: 9f67167244c6f15db3665d6391341d4fcfd3c235
+# Application image source: d07c910a5180cc918a17010cccbd800776f0b06a
 # Coolify supplies the runtime environment file and proxy routing.
 services:
   quote-internal:
-    image: "sha256:4ce7edd4a15bcea1c4fbe530e4f590f0510c7cdd9aab041b08361f272adba0a6"
+    image: "sha256:c0d25407252d79ad53d3fb86324766c3e3759c443f5385cf2c192d62c28d7c27"
     pull_policy: never
     platform: linux/amd64
     restart: unless-stopped
