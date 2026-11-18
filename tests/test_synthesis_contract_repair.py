@@ -159,6 +159,34 @@ class SynthesisContractRepairTest(unittest.TestCase):
         repaired["input"][0]["content"][0]["text"] = original_text
         self.assertEqual(repaired, original)
 
+    def test_quantity_reask_shares_the_single_repair_send_and_settles_every_attempt(self):
+        # Owner decision 18 Nov 2026: a physical line without a size gets one re-ask, then the booth-size rule.
+        for second, outcome, rule in ((draft(), "quantity_success", False), ("not json", "quantity_failed", True)):
+            with self.subTest(outcome=outcome):
+                self.logs.clear()
+                transport = SynthesisTransport([draft(measured=False), second])
+                result = self.analyse(transport)
+                self.assert_sends(transport, 12, 2)
+                self.assertEqual(self.usage()["synthesis_repair_count"], 1)
+                self.assertEqual(self.usage()["synthesis_repair_outcome"], outcome)
+                note = transport.calls[-1]["input"][0]["content"][0]["text"]
+                self.assertIn("Quantity repair. These physical lines have no usable quantity: floor, rail, chair.", note)
+                lines = [line for section in result["quote_basis_sections"] for line in section["lines"]]
+                self.assertTrue(all(line.get("quantity") not in (None, "") for line in lines if line["id"] != "concept"))
+                self.assertEqual(any(finding["id"] == "booth-size-rule" for finding in result["analysis_findings"]), rule)
+                statuses = [record["status"] for event, record in self.logs
+                            if event == "ai_call_attempt" and record.get("attempt_number", 0) > 0]
+                self.assertEqual(statuses.count("failed"), 1 if rule else 0)
+
+    def test_contract_repair_leaves_no_quantity_reask_and_the_rule_fills_sizes(self):
+        unmeasured = draft(measured=False)
+        unmeasured["quote_basis_sections"][0]["lines"][0].pop("confidence_pct")
+        transport = SynthesisTransport([unmeasured, draft(measured=False)])
+        result = self.analyse(transport)
+        self.assert_sends(transport, 12, 2)
+        self.assertEqual(self.usage()["synthesis_repair_outcome"], "success")
+        self.assertEqual(result["analysis_findings"][0]["id"], "booth-size-rule")
+
     def test_second_contract_failure_uses_normal_error_reference_and_settles_both_sends(self):
         transport = SynthesisTransport([missing_confidence(), missing_confidence()])
         result = self.analyse(transport, terminal=True)

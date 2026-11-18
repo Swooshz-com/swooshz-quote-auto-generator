@@ -11935,13 +11935,28 @@ function basisFreeQuantityHtml(section, line, index) {
   return `<input class="basis-quantity-input basis-quantity-required" type="text" required inputmode="${unit ? "decimal" : "text"}" placeholder="${escapeHtml(placeholder)}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-free="1" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${unit ? ` ${escapeHtml(unit)}` : ""}`;
 }
 
+const BASIS_FREE_QUANTITY_UNITS = new Set(["sqm", "m", "m run", "m length", "nos", "lot", "sets"]);
+
 function parseBasisFreeQuantity(value, lineUnit = "") {
   const match = String(value ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([A-Za-z][A-Za-z .]*)?$/);
   if (!match) return null;
   const quantity = Number(match[1]);
-  const unit = normalizeUnit((match[2] || "").trim() || lineUnit || "");
-  if (!(Number.isFinite(quantity) && quantity > 0) || !unit) return null;
+  const knownUnit = normalizeUnit(lineUnit || "");
+  const typedUnit = normalizeUnit((match[2] || "").trim());
+  // A line that already has a unit keeps it; a new unit must be one the quote can price in.
+  if (knownUnit && typedUnit && typedUnit !== knownUnit) return null;
+  const unit = knownUnit || typedUnit;
+  if (!(Number.isFinite(quantity) && quantity > 0) || !BASIS_FREE_QUANTITY_UNITS.has(unit)) return null;
   return { quantity, unit };
+}
+
+function basisFreeQuantityRefusal(line = {}) {
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  if (state.lineItems.filter((row) => ids.has(row?.source_basis_line_id)).length > 1) {
+    return "This line has more than one output row. Use Re to set its quantity.";
+  }
+  const unit = basisQuantityUnitText(line);
+  return unit ? `Enter a quantity above 0 in ${unit}.` : "Enter a quantity above 0 with its unit: sqm, m, nos, lot or sets.";
 }
 
 function applyBasisFreeQuantity(sectionId, lineIndex, value) {
@@ -12054,7 +12069,8 @@ function handleQuoteBasisQuantity(event) {
   if (input.dataset.basisQuantityFree) {
     const appliedFree = applyBasisFreeQuantity(input.dataset.basisSection || "", Number(input.dataset.basisLineIndex), input.value);
     if (!appliedFree && String(input.value).trim() && typeof input.reportValidity === "function") {
-      input.setCustomValidity("Enter a quantity above 0 with its unit, for example 6 sqm.");
+      const freeSection = basisSections(state.quoteBasisSections).find((entry) => entry.id === input.dataset.basisSection);
+      input.setCustomValidity(basisFreeQuantityRefusal(freeSection?.lines?.[Number(input.dataset.basisLineIndex)] || {}));
       input.reportValidity();
       input.setCustomValidity("");
     }

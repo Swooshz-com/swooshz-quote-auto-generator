@@ -6128,6 +6128,35 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         ):
             self.assertNotIn(private_value, serialized)
 
+    def test_sizing_guarantee_turns_one_lot_on_an_area_catalogue_item_into_a_priced_area(self):
+        # Owner decision 18 Nov 2026: every physical line ends with a size. G2 (#392) found "1 lot" on a
+        # per-sqm catalogue item left unpriced; the booth-size rule sizes it before the seal is issued.
+        payload = {
+            "profile_id": "synthetic-exhibition-fixture-template",
+            "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
+            "pricing_reference_source": "local",
+            "project": {"booth_width": 8, "booth_depth": 9},
+        }
+        keyword = "synthetic-floors-synthetic-carpet-tile"
+        parsed = {
+            "quote_basis_sections": [{"id": "floors", "title": "Synthetic Floors", "lines": [
+                {"id": "carpet", "tag": "Confirm", "text": "Synthetic carpet tile across the booth",
+                 "confidence_pct": 82, "quantity": 1, "unit": "lot", "pricing_keyword": keyword}]}],
+            "line_items": [{"source_basis_line_id": "carpet", "section": "Synthetic Floors",
+                            "description": "Synthetic carpet tile across the booth", "quantity": 1, "unit": "lot",
+                            "pricing_keyword": keyword}],
+            "project": {"booth_width": 8, "booth_depth": 9},
+        }
+        self.assertEqual(webapp.raw_draft_catalog_units(payload, None).get(keyword), "sqm")
+        draft = webapp.normalize_ai_draft(webapp.complete_predicted_quantities(parsed, payload, None), payload,
+                                          require_confidence=True)
+        line = draft["quote_basis_sections"][0]["lines"][0]
+        row = draft["line_items"][0]
+        self.assertEqual((float(line["quantity"]), line["unit"]), (72, "sqm"))
+        self.assertEqual((float(row["quantity"]), row["unit"], row["pricing_keyword"]), (72, "sqm", keyword))
+        self.assertLessEqual(line["confidence"], webapp.PREDICTED_QUANTITY_RULE_CONFIDENCE)
+        self.assertEqual(draft["analysis_findings"][0]["id"], "booth-size-rule")
+
     def test_normalize_ai_draft_appends_missing_catalog_backed_basis_lines(self):
         parsed = {
             "quote_basis_sections": [

@@ -162,6 +162,7 @@ class ResponseContract:
     name: str
     root: Field
     exact_decimals: bool = False
+    measurement_rule: str = "never invent measurements"
 
     def text_format(self):
         return {"format": {"type": "json_schema", "name": self.name, "strict": True,
@@ -169,7 +170,7 @@ class ResponseContract:
 
     def field_instructions(self):
         return ("Fresh response contract " + self.name + ". " + self.root.instructions()
-                + ". Use [] for empty arrays. Null means genuinely absent optional data; never invent measurements.")
+                + ". Use [] for empty arrays. Null means genuinely absent optional data; " + self.measurement_rule + ".")
 
     def matches_text_format(self, value):
         try:
@@ -245,4 +246,6 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
         id=Field("string", nullable=True),
         confidence_pct=Field("integer", nullable=True, minimum=0, maximum=100),
     )),
-))
+# Owner rule (18 Nov 2026): a quote is a prediction, so physical lines always carry a predicted quantity.
+), measurement_rule="null quantity and unit are only for purely informational lines; every physical line "
+   "has a positive quantity and unit, predicted from the booth size, drawing scale and typical sizes when not stated")

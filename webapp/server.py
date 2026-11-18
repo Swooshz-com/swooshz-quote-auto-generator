@@ -625,6 +625,7 @@ ALLOWED_LOG_EVENTS = {
     "draft_failed",
     "draft_worker_failed",
     "draft_batch_usage",
+    "draft_quantity_completion",
     "feedback_context_failed",
     "feedback_submission_failed",
     "forensic_persistence_failed",
@@ -26228,6 +26229,152 @@ def send_draft_request(gateway, operation, configuration, content, budget):
         raise type(exc)(str(exc), diagnostics={**exc.diagnostics, "request_shape_sha256": fingerprint}) from None
 
 
+# Owner decision (18 Nov 2026): sizing is guaranteed. A physical line the AI leaves without a size gets one
+# AI re-ask (sharing the single repair send), then a booth-size rule; both run before normalisation so the
+# pricing analysis seal covers the final quantities.
+PREDICTED_QUANTITY_RULE_CONFIDENCE = 30
+PREDICTED_QUANTITY_FALLBACK_UNIT = "lot"
+LENGTH_OR_AREA_CATALOG_UNITS = {"m", "m length", "m run", "sqm"}
+FLOOR_AREA_LINE_RE = re.compile(
+    r"(?i)\b(?:floor(?:ing)?|carpet(?:ing)?|underlay|platform|raised\s+floor|vinyl|laminate|decking|floor\s+tiles?)\b"
+)
+
+
+def raw_draft_catalog_units(payload: Any, auth_session: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    try:
+        lookup = pricing_catalog_runtime_lookup_for_payload(payload, profile_id_from_payload(payload), auth_session=auth_session)
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    return {item_id: catalog_item_unit_hint(item) for item_id, item in lookup.items() if isinstance(item, dict)}
+
+
+def raw_draft_line_items_by_basis_line(parsed: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    linked: dict[str, list[dict[str, Any]]] = {}
+    for item in parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []:
+        if isinstance(item, dict) and clean_text(item.get("source_basis_line_id")):
+            linked.setdefault(clean_text(item.get("source_basis_line_id")), []).append(item)
+    return linked
+
+
+def raw_draft_physical_lines(parsed: dict[str, Any]):
+    for section in parsed.get("quote_basis_sections") if isinstance(parsed.get("quote_basis_sections"), list) else []:
+        for line in section.get("lines") if isinstance(section, dict) and isinstance(section.get("lines"), list) else []:
+            if (isinstance(line, dict) and not is_informational_dimension_basis_line(line)
+                    and normalize_basis_tag(line.get("tag")) != "Exclude"):
+                yield line
+
+
+def raw_draft_line_catalog_unit(line: dict[str, Any], items: list[dict[str, Any]], catalog_units: dict[str, str]) -> str:
+    for keyword in [clean_text(line.get("pricing_keyword")), *(clean_text(item.get("pricing_keyword")) for item in items)]:
+        if catalog_units.get(keyword):
+            return normalize_pricing_unit(catalog_units[keyword])
+    return ""
+
+
+def raw_draft_line_needs_quantity(line: dict[str, Any], items: list[dict[str, Any]], catalog_units: dict[str, str]) -> bool:
+    measured = [(line.get("quantity"), line.get("unit")), *((item.get("quantity"), item.get("unit")) for item in items)]
+    positive = [(parse_float_or_none(quantity), normalize_pricing_unit(unit)) for quantity, unit in measured
+                if (parse_float_or_none(quantity) or 0) > 0]
+    if not positive:
+        return True
+    # "1 lot" against a per-sqm or per-metre catalogue item is later cleared as unmeasured; size it instead.
+    catalog_unit = raw_draft_line_catalog_unit(line, items, catalog_units)
+    return catalog_unit in LENGTH_OR_AREA_CATALOG_UNITS and all(
+        unit == "lot" and abs(quantity - 1) <= 0.001 for quantity, unit in positive)
+
+
+def raw_draft_lines_missing_quantity(parsed: dict[str, Any], catalog_units: dict[str, str]) -> list[dict[str, Any]]:
+    linked = raw_draft_line_items_by_basis_line(parsed)
+    return [line for line in raw_draft_physical_lines(parsed)
+            if raw_draft_line_needs_quantity(line, linked.get(clean_text(line.get("id")), []), catalog_units)]
+
+
+def booth_size_rule_quantity(line: dict[str, Any], catalog_unit: str, booth_area_sqm: float) -> tuple[float, str]:
+    text = clean_text(line.get("text") or line.get("description"))
+    line_unit = normalize_pricing_unit(line.get("unit"))
+    unit = catalog_unit or (line_unit if line_unit and line_unit != "lot" else "")
+    if FLOOR_AREA_LINE_RE.search(text) and unit in {"", "sqm"} and booth_area_sqm > 0:
+        return booth_area_sqm, "sqm"
+    return 1, unit or PREDICTED_QUANTITY_FALLBACK_UNIT
+
+
+def apply_booth_size_quantity_rule(parsed: dict[str, Any], payload: Any, catalog_units: dict[str, str]) -> int:
+    """Last resort: give every physical line still missing a size a rule-based size at low confidence."""
+    missing = raw_draft_lines_missing_quantity(parsed, catalog_units)
+    if not missing:
+        return 0
+    raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
+    dimension_source = {"project": raw_project} if raw_project else (payload if isinstance(payload, dict) else {})
+    booth_area = parse_float_or_none(booth_dimensions_from_payload(dimension_source).get("booth_area_sqm")) or 0
+    linked = raw_draft_line_items_by_basis_line(parsed)
+    labels = []
+    for line in missing:
+        items = linked.get(clean_text(line.get("id")), [])
+        quantity, unit = booth_size_rule_quantity(line, raw_draft_line_catalog_unit(line, items, catalog_units), booth_area)
+        for row in (line, *items):
+            row["quantity"] = quantity
+            row["unit"] = unit
+        for key in ("confidence_pct", "confidence"):
+            if key in line:
+                current = normalize_confidence_percent(line.get(key))
+                line[key] = min(current, PREDICTED_QUANTITY_RULE_CONFIDENCE) if current is not None else PREDICTED_QUANTITY_RULE_CONFIDENCE
+        if "confidence_pct" not in line and "confidence" not in line:
+            line["confidence_pct"] = PREDICTED_QUANTITY_RULE_CONFIDENCE
+        labels.append(f"{clean_text(line.get('text') or line.get('description'))[:60]} = {format_dimension(quantity)} {unit}")
+    findings = parsed.get("analysis_findings") if isinstance(parsed.get("analysis_findings"), list) else []
+    parsed["analysis_findings"] = [{
+        "id": "booth-size-rule",
+        "text": "Rough sizes set by the booth-size rule because the AI gave none; check them: " + "; ".join(labels),
+    }, *findings]
+    return len(missing)
+
+
+def predicted_quantity_repair_text(line_ids: list[str]) -> str:
+    return (
+        "\\nQuantity repair. These physical lines have no usable quantity: " + ", ".join(line_ids) + ". "
+        "Return the complete JSON object again, unchanged except that each of these lines and its linked line_items "
+        "row has a positive predicted quantity and unit in the catalog unit. " + PREDICTED_QUANTITY_RULE
+        + "Keep all original evidence and output rules."
+    )
+
+
+def record_pending_draft_attempt(*, failed_details: dict[str, Any] | None = None) -> None:
+    """Record the owner's sent attempt before the quantity re-ask starts another operation."""
+    owner = current_ai_transport_owner()
+    if owner is None or owner.pending is None:
+        return
+    details = {key: value for key, value in owner.pending["details"].items()
+               if key not in {"usage", "retry_pending", "attempt_number"}}
+    log_ai_call_attempt(
+        feature="draft_quote_basis", provider=AI_PROVIDER_OPENROUTER, model=owner.operation["model"],
+        status="failed" if failed_details is not None else owner.pending["status"],
+        duration_ms=owner.pending["duration_ms"], **owner.attempt_metadata, **details, **(failed_details or {}),
+    )
+
+
+def complete_predicted_quantities(parsed, payload, auth_session, quantity_repair=None, *, precheck=None):
+    """Sizing guarantee: one AI re-ask when a physical line lacks a size, then the booth-size rule."""
+    catalog_units = raw_draft_catalog_units(payload, auth_session)
+    missing = raw_draft_lines_missing_quantity(parsed, catalog_units)
+    outcome = {"missing_lines": len(missing), "ai_repair": "not_needed" if not missing else "not_attempted"}
+    if missing and quantity_repair is not None:
+        if precheck is not None:
+            precheck(parsed)
+        line_ids = [safe_resource_id(line.get("id"), "") for line in missing]
+        repaired = quantity_repair([line_id for line_id in line_ids if line_id])
+        if isinstance(repaired, dict):
+            parsed = repaired
+            outcome["ai_repair"] = "success"
+        else:
+            outcome["ai_repair"] = "unavailable"
+    if missing:
+        outcome["rule_filled_lines"] = apply_booth_size_quantity_rule(parsed, payload, catalog_units)
+        write_local_log("draft_quantity_completion", outcome)
+    return parsed
+
+
 ENABLE_SYNTHESIS_CONTRACT_REPAIR = True
 
 
@@ -26299,6 +26446,48 @@ class OpenAIDraftRequest:
     def send_single(self, media, budget):
         content = [{"type": "input_text", "text": self.prompt}, *media, *self.catalog_parts]
         return send_draft_request(self.gateway, self.operation, self.configuration, content, budget)
+
+    def normalize_single(self, data, fingerprint, media, budget):
+        content = [{"type": "input_text", "text": self.prompt}, *media, *self.catalog_parts]
+        body = draft_request_body(self.configuration, content, final_draft=True)
+        return self.normalize_response(data, fingerprint, quantity_repair=self.quantity_repair(body, budget, synthesis=False))
+
+    def quantity_repair(self, body, budget, *, synthesis):
+        """One re-ask for missing sizes, sharing the draft's single repair send; None when unavailable."""
+        configuration = self.configuration
+
+        def repair(line_ids):
+            if not line_ids:
+                return None
+            try:
+                budget.next_stage(synthesis_repair=True)
+            except DraftBatchError:
+                return None
+            record_pending_draft_attempt()
+            begin_ai_transport_operation("draft_quote_basis", AI_PROVIDER_OPENROUTER, configuration.model)
+            repair_body = copy.deepcopy(body)
+            repair_body["input"][0]["content"][0]["text"] += predicted_quantity_repair_text(line_ids)
+            budget.repair_outcome = "quantity_failed"
+            try:
+                draft_request_fingerprint(repair_body, configuration, synthesis=synthesis, final_draft=True)
+                data = gateway_request(self.gateway, self.operation, repair_body, send_budget=budget,
+                                       response_contract=configuration.response_contract)
+                parsed = parse_draft_output(data, configuration.response_contract)
+                if not isinstance(parsed, dict):
+                    raise AIModelOutputError("AI quantity repair returned no draft object.",
+                                             diagnostics={"failure_boundary": "model_output_json"})
+                budget.repair_outcome = "quantity_success"
+                return parsed
+            except (OpenAIAnalysisError, DraftBatchError, ContractViolation) as exc:
+                diagnostics = safe_ai_output_diagnostics(getattr(exc, "diagnostics", {}) or {})
+                record_pending_draft_attempt(failed_details={
+                    "failure_boundary": diagnostics.get("failure_boundary") or "model_output_contract",
+                })
+                # The draft continues from the first answer, so start a clean operation for its final record.
+                begin_ai_transport_operation("draft_quote_basis", AI_PROVIDER_OPENROUTER, configuration.model)
+                return None
+
+        return repair
 
     def prepare_batches(self, batches):
         configuration = self.configuration
@@ -26389,7 +26578,8 @@ class OpenAIDraftRequest:
                 if exc.diagnostics.get("failure_boundary") == "provider_response_schema":
                     raise
                 raise DraftBatchError("synthesis_provider_failure") from exc
-            return self.normalize_response(data, fingerprint)
+            return self.normalize_response(data, fingerprint, quantity_repair=self.quantity_repair(
+                body, budget, synthesis=True))
 
         budget.next_stage(synthesis=True)
         try:
@@ -26397,10 +26587,10 @@ class OpenAIDraftRequest:
         except AIModelOutputError as exc:
             return repair_draft_synthesis(exc, body, send_synthesis, budget)
 
-    def normalize_response(self, data, fingerprint):
+    def normalize_response(self, data, fingerprint, *, quantity_repair=None):
         return normalize_draft_response(
             data, fingerprint, self.payload, self.auth_session,
-            response_contract=self.configuration.response_contract,
+            response_contract=self.configuration.response_contract, quantity_repair=quantity_repair,
         )
 
     def record_usage(self, budget):
@@ -26446,7 +26636,13 @@ def request_openai_quote_basis(
     return QuoteDraftRunner(draft_request).run(prepared)
 
 
-def normalize_draft_response(data, shape_fingerprint, payload, auth_session, *, response_contract=None):
+def parse_draft_output(data, response_contract=None):
+    output_text = response_output_text(data)
+    parsed = response_contract.parse_json(output_text) if response_contract else parse_json_object(output_text)
+    return response_contract.admit(parsed) if response_contract else parsed
+
+
+def normalize_draft_response(data, shape_fingerprint, payload, auth_session, *, response_contract=None, quantity_repair=None):
     response_diagnostics = openai_response_failure_diagnostics(data)
     for key in ("provider_error_class", "provider_error_code"):
         response_diagnostics.pop(key, None)
@@ -26491,6 +26687,12 @@ def normalize_draft_response(data, shape_fingerprint, payload, auth_session, *, 
             diagnostics={**response_diagnostics, "failure_boundary": "model_output_json"},
         ) from exc
     try:
+        if isinstance(parsed, dict):
+            # Contract faults in the first answer keep their own repair; sizing only follows an admissible answer.
+            parsed = complete_predicted_quantities(
+                parsed, payload, auth_session, quantity_repair,
+                precheck=lambda value: admit_provider_quote_draft(copy.deepcopy(value), require_confidence=True),
+            )
         return normalize_ai_draft(
             parsed,
             payload,

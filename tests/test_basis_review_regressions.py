@@ -37,6 +37,8 @@ class BasisReviewRegressionsTest(unittest.TestCase):
         self.assertEqual(evidence['blankQuantityPriced']['unit'], 'sqm')
         # Quantity is mandatory: a line with no catalogue match takes a typed quantity and unit.
         self.assertEqual(evidence['freeQuantityLine'], {'quantity': 6, 'unit': 'sqm', 'needsQuantity': False})
+        self.assertEqual((evidence['keywordQuantityOutput']['quantity'], evidence['keywordQuantityOutput']['unit']), (5, 'sqm'))
+        self.assertEqual((evidence['freeQuantityOutput']['quantity'], evidence['freeQuantityOutput']['unit']), (6, 'sqm'))
 
 
 if __name__ == '__main__':

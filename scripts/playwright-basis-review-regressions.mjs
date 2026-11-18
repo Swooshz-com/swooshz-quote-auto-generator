@@ -24,7 +24,8 @@ replaceOnce('const cases = [', `const cases = [
   { id: "g-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },
   { id: "g-review", kind: "review", section: "Lighting and Electrical", text: "Bespoke neon signage with custom lettering", quantity: 1, unit: "lot", rawUnit: "" },
   { id: "q-blank-graphic", kind: "blank", section: "Graphics and Printing", text: "[ sqm Printed Wall Graphic ] - Printed graphic on rear feature wall, size pending approval", quantity: null, unit: "" },
-  { id: "q-blank-unknown", kind: "blank", section: "Graphics and Printing", text: "[ sqm Holographic Wall Wrap ] - Side wall wrap, size pending approval", quantity: null, unit: "" },`);
+  { id: "q-blank-unknown", kind: "blank", section: "Graphics and Printing", text: "[ sqm Holographic Wall Wrap ] - Side wall wrap, size pending approval", quantity: null, unit: "" },
+  { id: "q-blank-kw", kind: "confirm", section: "Graphics and Printing", text: "Printed Fabric Banner", quantity: null, unit: "", claim: "Printed Fabric Banner" },`);
 // The AI names a catalogue item but measures nothing, so it emits no line item for those lines.
 replaceOnce('const scenarioPath = path.join(runRoot, "scenario.json");', `lineItems.splice(0, lineItems.length, ...lineItems.filter((item) => !String(item.source_basis_line_id || "").startsWith("q-blank")));
 const scenarioPath = path.join(runRoot, "scenario.json");`);
@@ -196,6 +197,18 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       "typed quantity and unit were not kept on the line", freeEntered);
     assert(await (await rowFor("q-blank-unknown")).locator("input[data-basis-quantity-free]").count() === 0, "quantity box stayed after a valid quantity");
     result.freeQuantityLine = freeEntered;
+    // 7. A line already naming its catalogue item but saved without a quantity (only quotes analysed before
+    // the server sizing guarantee) takes its size in the box and reaches Output with it. Its price stays in
+    // review: the pricing analysis seal recorded no measured unit for it, and that seal is never rewritten.
+    const keywordRow = await rowFor("q-blank-kw");
+    const keywordInput = keywordRow.locator("input[data-basis-quantity-free]");
+    assert(await keywordInput.count() === 1, "catalogue line missing a quantity has no quantity box");
+    await keywordInput.fill("5 sqm");
+    await keywordInput.press("Enter");
+    assert((await lineById("q-blank-kw")).quantity === 5, "typed quantity was not kept on the catalogue line");
+    await (await rowFor("q-blank-kw")).locator('[data-basis-tag="Include"]').click();
+    // The free-box line goes to Output too, so its typed size is carried into the quote.
+    await (await rowFor("q-blank-unknown")).locator('[data-basis-tag="Include"]').click();
     await quantityInput.fill("0");
     await quantityInput.press("Enter");
     assert(await page.evaluate(() => !state.quoteBasisSections.flatMap((section) => section.lines).find((line) => line.id === "q-blank-graphic").pricing_keyword),
@@ -232,6 +245,18 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     assert(priced?.variant === "catalog" && priced.price === graphic.sale_unit_price && Number(priced.quantity) === 12.5 && priced.unit === "sqm"
       && priced.keyword === graphic.id, "entered catalogue quantity was not priced by the server admission", priced);
     result.blankQuantityPriced = priced;
+    const outputOf = (id) => page.evaluate((lineId) => {
+      const row = state.outputRows.find((entry) => entry.source_basis_line_id === lineId);
+      const authority = row ? outputPriceAuthority(row) : null;
+      return row ? { variant: authority?.variant || "", price: pricingAuthorityPrice(authority), quantity: Number(row.quantity), unit: normalizeUnit(row.unit), keyword: row.pricing_keyword || "" } : null;
+    }, id);
+    const keywordOutput = await outputOf("q-blank-kw");
+    assert(keywordOutput?.quantity === 5 && keywordOutput.unit === "sqm" && keywordOutput.price === null,
+      "catalogue line typed quantity did not reach Output, or was priced without seal evidence", keywordOutput);
+    const freeOutput = await outputOf("q-blank-unknown");
+    assert(freeOutput?.quantity === 6 && freeOutput.unit === "sqm", "typed free quantity did not reach Output", freeOutput);
+    result.keywordQuantityOutput = keywordOutput;
+    result.freeQuantityOutput = freeOutput;
   }
   assert(pageErrors.length === 0, "page errors", pageErrors);
   result.status = "PASS";
