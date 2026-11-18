@@ -47,7 +47,7 @@ import urllib.request
 import unicodedata
 import warnings
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -112,7 +112,8 @@ from webapp.quote_ai_spend import (
 )
 from webapp.ai_gateway import (AiGateway, GatewayConfiguration, GatewayError,
     safe_draft_error_param, draft_provider_error_diagnostics, SUPPORTED_REASONING_EFFORTS)
-from webapp.ai_response_contracts import BASIS_TAGS, DRAFT_SYNTHESIS, ContractViolation
+from webapp.ai_response_contracts import BASIS_TAGS, DRAFT_SYNTHESIS, ContractViolation, ResponseContract, integer_digit_limit
+from webapp.pricing_response_contracts import PRICING_IMPORT, PRICING_METADATA
 from webapp.internal_password_auth import (
     INTERNAL_AUTH_MODE, INTERNAL_SESSION_TTL_SECONDS, LOGIN_NONCE_TTL_SECONDS,
     InternalAuthConfigError, InternalAuthPolicy, InternalAuthState,
@@ -149,6 +150,7 @@ from webapp.quote_engine import (
     normalize_pricing_unit,
     parse_float_or_none,
     parse_pricing_number,
+    catalogue_order_number,
     pricing_catalog_runtime_lookup,
     pricing_reference_order_number,
     pricing_reference_sale_unit_price,
@@ -1106,8 +1108,7 @@ def ai_failure_metadata(
     elif json_error or boundary == "provider_response_json" or "invalid json" in combined_text:
         failure_kind = "invalid_json"
     elif (
-        "omitted pricing rows" in combined_text
-        or "failed validation" in combined_text
+        "failed validation" in combined_text
         or "mandatory confidence" in combined_text
     ):
         failure_kind = "schema_validation_failed"
@@ -6553,40 +6554,73 @@ def pricing_reference_order_from_raw(raw: dict[str, Any], keys: tuple[str, ...])
     for key in keys:
         if key not in raw:
             continue
-        order = pricing_reference_order_number(raw.get(key))
+        order = catalogue_order_number(raw.get(key))
         if order is not None:
             return order
     return None
 
 
-def ensure_pricing_reference_order_fields(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    section_orders: dict[str, int] = {}
+def pricing_reference_order_limit() -> int:
+    return 10 ** integer_digit_limit() - 1
+
+
+def pricing_reference_order_tie(item: dict[str, Any], field: str, order: int | None) -> int:
+    rank = item.get(f"{field}_tie")
+    if type(rank) is not int or not 1 <= rank <= PRIMARY_ORDER_MAX or order is None:
+        return 0
+    # A saved tie can come from a lower configured digit limit.
+    digits = str(order)
+    return rank if len(digits) >= sys.int_info.str_digits_check_threshold and not digits.strip("9") else 0
+
+
+def ensure_pricing_reference_order_fields(
+    items: list[dict[str, Any]], *, exact_order: bool = True,
+) -> list[dict[str, Any]]:
+    parse_order = catalogue_order_number if exact_order else pricing_reference_order_number
+    section_orders: dict[str, tuple[int, int]] = {}
     next_category_order = 1
+    ceiling = pricing_reference_order_limit()
+    next_category_tie = 1 + max((
+        pricing_reference_order_tie(item, "category_order", parse_order(item.get("category_order")))
+        for item in items
+    ), default=0) if exact_order and any("category_order_tie" in item for item in items) else 1
     for index, item in enumerate(items, start=1):
-        item_order = pricing_reference_order_number(item.get("item_order")) or index
+        item_order = parse_order(item.get("item_order")) or index
         item["item_order"] = item_order
         section = clean_text(item.get("section")) or clean_text(item.get("reference_section"))
         section_key = safe_section_id(normalize_catalog_section(section) or section, f"section-{index}")
-        explicit_category_order = pricing_reference_order_number(item.get("category_order"))
+        explicit_category_order = parse_order(item.get("category_order"))
         if section_key not in section_orders:
             if explicit_category_order is not None:
-                section_orders[section_key] = explicit_category_order
+                category_tie = pricing_reference_order_tie(item, "category_order", explicit_category_order) if exact_order else 0
+                section_orders[section_key] = (explicit_category_order, category_tie)
                 next_category_order = max(next_category_order, explicit_category_order + 1)
             else:
-                while next_category_order in section_orders.values():
-                    next_category_order += 1
-                section_orders[section_key] = next_category_order
+                if exact_order and next_category_order > ceiling:
+                    section_orders[section_key] = (ceiling, next_category_tie)
+                    next_category_tie += 1
+                else:
+                    section_orders[section_key] = (next_category_order, 0)
                 next_category_order += 1
-        item["category_order"] = section_orders[section_key]
+        item["category_order"], category_tie = section_orders[section_key]
+        if category_tie:
+            item["category_order_tie"] = category_tie
+        elif exact_order:
+            item.pop("category_order_tie", None)
     return items
 
 
-def pricing_reference_sort_order(item: dict[str, Any]) -> tuple[int, int, str, str, str]:
-    category_order = pricing_reference_order_number(item.get("category_order")) or 999999
-    item_order = pricing_reference_order_number(item.get("item_order")) or 999999
+def pricing_reference_sort_order(
+    item: dict[str, Any], *, exact_order: bool = True,
+) -> tuple[int, int, int, int, str, str, str]:
+    parse_order = catalogue_order_number if exact_order else pricing_reference_order_number
+    category_order = parse_order(item.get("category_order")) or 999999
+    item_order = parse_order(item.get("item_order")) or 999999
     return (
         category_order,
+        pricing_reference_order_tie(item, "category_order", category_order) if exact_order else 0,
         item_order,
+        pricing_reference_order_tie(item, "item_order", item_order) if exact_order else 0,
         clean_text(item.get("section")).casefold(),
         clean_text(item.get("description")).casefold(),
         clean_text(item.get("id")).casefold(),
@@ -7079,7 +7113,7 @@ def validate_pricing_reference_rows(
                 suffix += 1
             seen_ids.add(candidate_id)
             item["id"] = candidate_id
-            item["item_order"] = pricing_reference_order_number(item.get("item_order")) or pricing_reference_order_from_raw(raw, PRICING_REFERENCE_ITEM_ORDER_KEYS) or index + 1
+            item["item_order"] = catalogue_order_number(item.get("item_order")) or pricing_reference_order_from_raw(raw, PRICING_REFERENCE_ITEM_ORDER_KEYS) or index + 1
             items.append(item)
         else:
             skipped += 1
@@ -7949,10 +7983,13 @@ def xlsx_drawing_rels_xml(media: list[dict[str, Any]]) -> str:
     )
 
 
-def generated_pricing_reference_export_xlsx_bytes(detail: dict[str, Any], pack: PricingReferencePack) -> bytes:
+def generated_pricing_reference_export_xlsx_bytes(
+    detail: dict[str, Any], pack: PricingReferencePack, *, media: list[dict[str, Any]] | None = None,
+) -> bytes:
     raw_items = detail.get("items") if isinstance(detail.get("items"), list) else []
     items = [item for item in raw_items if isinstance(item, dict)]
-    media = pricing_reference_export_media(items, pack)
+    if media is None:
+        media = pricing_reference_export_media(items, pack)
     sheets = [
         ("Pricing Reference", pricing_reference_export_rows(items, detail)),
         ("Reference Info", pricing_reference_export_reference_rows(detail)),
@@ -8036,12 +8073,13 @@ def pricing_reference_export_xlsx(reference_id: str, source: str = "") -> tuple[
     safe_id = safe_resource_id(reference_id, "")
     if not safe_id:
         raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
-    detail = pricing_reference_pack_detail(safe_id, source=source)
-    if not detail:
-        return None
-    pack = load_pricing_reference_pack(safe_id, source=source)
+    with PricingReferencePack.read_scope(safe_id, source) as pack:
+        if pack.id != safe_id or not pack.config:
+            return None
+        detail = pack.public_detail()
+        media = pricing_reference_export_media(detail["items"], pack)
     filename_base = safe_segment(clean_text(detail.get("label")) or safe_id, safe_id)
-    return f"{filename_base}-pricing-reference.xlsx", generated_pricing_reference_export_xlsx_bytes(detail, pack)
+    return f"{filename_base}-pricing-reference.xlsx", generated_pricing_reference_export_xlsx_bytes(detail, pack, media=media)
 
 
 def static_asset_version(relative_path: str) -> str:
@@ -8780,7 +8818,11 @@ def normalize_pricing_reference_payload(payload: dict[str, Any]) -> dict[str, An
             continue
         sanitized = sanitize_pricing_reference_item({**raw, "description": sanitize_formula_text(raw.get("description"))}, index)
         if sanitized:
-            sanitized["item_order"] = pricing_reference_order_number(sanitized.get("item_order")) or index + 1
+            sanitized["item_order"] = catalogue_order_number(sanitized.get("item_order")) or index + 1
+            for field in ("category_order", "item_order"):
+                tie = pricing_reference_order_tie(raw, field, sanitized.get(field))
+                if tie:
+                    sanitized[f"{field}_tie"] = tie
             items.append(sanitized)
     if not items:
         raise ValueError("At least one valid pricing row is required.")
@@ -8807,37 +8849,7 @@ def normalize_pricing_reference_payload(payload: dict[str, Any]) -> dict[str, An
     }
 
 
-def pricing_reference_pack_dir(reference_id: str) -> Path:
-    safe_id = safe_resource_id(reference_id, "")
-    if not safe_id:
-        raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
-    root = pricing_references_root()
-    reference_dir = root / safe_id
-    try:
-        resolved_root = root.resolve()
-        resolved_dir = reference_dir.resolve()
-        resolved_dir.relative_to(resolved_root)
-    except ValueError as exc:
-        raise ValueError("Pricing reference id is not safe.") from exc
-    return resolved_dir
-
-
-def bundled_pricing_reference_pack_dir(reference_id: str) -> Path:
-    safe_id = safe_resource_id(reference_id, "")
-    if not safe_id:
-        raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
-    root = bundled_pricing_references_root()
-    reference_dir = root / safe_id
-    try:
-        resolved_root = root.resolve()
-        resolved_dir = reference_dir.resolve()
-        resolved_dir.relative_to(resolved_root)
-    except ValueError as exc:
-        raise ValueError("Pricing reference id is not safe.") from exc
-    return resolved_dir
-
-
-def pricing_reference_catalog_payload(reference: dict[str, Any]) -> dict[str, Any]:
+def project_pricing_reference_catalog(reference: dict[str, Any], *, exact_order: bool) -> dict[str, Any]:
     raw_items = reference.get("items") if isinstance(reference.get("items"), list) else []
     items: list[dict[str, Any]] = []
     for item in raw_items:
@@ -8849,8 +8861,8 @@ def pricing_reference_catalog_payload(reference: dict[str, Any]) -> dict[str, An
             next_item["sale_unit_price"] = sale_unit_price
         pricing_reference_enrichment.enrich_pricing_reference_item(next_item)
         items.append(next_item)
-    ensure_pricing_reference_order_fields(items)
-    items = sorted_pricing_reference_items(items)
+    ensure_pricing_reference_order_fields(items, exact_order=exact_order)
+    items = sorted_pricing_reference_items(items, exact_order=exact_order)
     return {
         "schema_version": int(parse_pricing_number(reference.get("schema_version")) or 1),
         "currency": normalize_currency_label(reference.get("currency")),
@@ -8858,19 +8870,40 @@ def pricing_reference_catalog_payload(reference: dict[str, Any]) -> dict[str, An
     }
 
 
-def pricing_reference_catalog_digest(reference: dict[str, Any]) -> str:
-    if not isinstance(reference, dict):
-        return ""
-    catalog = pricing_reference_catalog_payload(reference)
-    if not catalog.get("items"):
+def projected_catalog_digest(catalog: dict[str, Any]) -> str:
+    if not catalog["items"]:
         return ""
     raw = json.dumps(catalog, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
-def pricing_reference_authority_items(reference: dict[str, Any]) -> list[dict[str, Any]]:
+def pricing_reference_catalog_payload(
+    reference: dict[str, Any], *, exact_order: bool | None = None,
+) -> dict[str, Any]:
+    if exact_order is None:
+        exact_order = pricing_reference_has_exact_order(reference)
+        # Public details and quote snapshots carry the catalogue digest. Verify
+        # that identity against the exact projection without exposing the stamp.
+        digest = reference.get("digest_sha256")
+        if not exact_order and isinstance(digest, str) and digest:
+            exact = project_pricing_reference_catalog(reference, exact_order=True)
+            if projected_catalog_digest(exact) == digest:
+                return exact
+    return project_pricing_reference_catalog(reference, exact_order=exact_order)
+
+
+def pricing_reference_catalog_digest(reference: dict[str, Any], *, exact_order: bool | None = None) -> str:
+    if not isinstance(reference, dict):
+        return ""
+    return projected_catalog_digest(pricing_reference_catalog_payload(reference, exact_order=exact_order))
+
+
+def pricing_reference_authority_items(
+    reference: dict[str, Any], *, exact_order: bool | None = None,
+) -> list[dict[str, Any]]:
     """Return the minimum trusted catalog projection needed for browser authority proof."""
-    catalog = pricing_reference_catalog_payload(reference)
+    catalog = pricing_reference_catalog_payload(reference, exact_order=exact_order)
+    sort_orders = pricing_reference_appended_sort_orders(catalog["items"])
     authority_items: list[dict[str, Any]] = []
     for item in catalog.get("items", []):
         if not isinstance(item, dict):
@@ -8888,6 +8921,7 @@ def pricing_reference_authority_items(reference: dict[str, Any]) -> list[dict[st
             "description": description,
             "unit_hint": unit_hint,
             "sale_unit_price": sale_unit_price,
+            **({"sort_order": [str(value) for value in sort_orders[item_id]]} if item_id in sort_orders else {}),
         })
     return authority_items
 
@@ -8966,20 +9000,261 @@ def pricing_reference_pack_config(reference: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def save_pricing_reference_pack(reference: dict[str, Any]) -> dict[str, Any]:
+PRICING_REFERENCE_SAVE_REVISION_KEY = "_save_revision"
+EXACT_PRICING_ORDER_REVISION_PREFIX = "exact-order:"
+
+
+def pricing_reference_has_exact_order(reference: dict[str, Any]) -> bool:
+    return clean_text(reference.get(PRICING_REFERENCE_SAVE_REVISION_KEY)).startswith(EXACT_PRICING_ORDER_REVISION_PREFIX)
+
+
+def pricing_reference_new_revision(reference: dict[str, Any]) -> str:
+    exact = project_pricing_reference_catalog(reference, exact_order=True)
+    legacy = project_pricing_reference_catalog(reference, exact_order=False)
+    revision = secrets.token_hex(16)
+    return EXACT_PRICING_ORDER_REVISION_PREFIX + revision if exact != legacy else revision
+
+
+def read_stored_pricing_reference(raw: str | bytes, reference_id: str) -> dict[str, Any]:
+    try:
+        reference = json.loads(raw)
+        if not isinstance(reference, dict) or not isinstance(reference.get("items"), list):
+            raise ValueError
+        if reference.get("id", reference_id) != reference_id:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+    return reference
+
+
+@dataclass(frozen=True)
+class PricingReferenceSaveSnapshot:
+    selected: dict[str, Any] | None
+    destination_revision: str | None
+
+    def require_current(self, revision: str | None) -> None:
+        if revision != self.destination_revision:
+            raise pricing_reference_revision_conflict()
+
+
+def pricing_reference_revision_conflict() -> SqagStorageAccessError:
+    return SqagStorageAccessError(
+        "This pricing reference changed. Reload it before saving again.",
+        status=409,
+        reason="pricing_reference_revision_conflict",
+    )
+
+
+class LocalPricingReferenceStore:
+    """Own publication and recovery for one local pack under its stable lock."""
+
+    transaction_directory_name = ".pricing-reference-transactions"
+
+    def __init__(self, reference_id: str):
+        if not PROFILE_ID_RE.fullmatch(reference_id):
+            raise ValueError("Pricing reference id is not safe.")
+        self.id = reference_id
+        try:
+            self.root = pricing_references_root().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PricingReferencePathError("Pricing reference files are unavailable.") from exc
+        self.directory = self.root / reference_id
+        self.transactions = self.root / self.transaction_directory_name
+        self.transaction = self.transactions / reference_id
+        self.owner_marker = self.transaction / ".owned-v1"
+        self.stage = self.transaction / "stage"
+        self.previous = self.transaction / "previous"
+
+    @staticmethod
+    def _path_info(path: Path) -> os.stat_result | None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or (
+            getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise PricingReferencePathError("Pricing reference files are unavailable.")
+        return info
+
+    @classmethod
+    def _directory_exists(cls, path: Path) -> bool:
+        info = cls._path_info(path)
+        if info is None:
+            return False
+        if not stat.S_ISDIR(info.st_mode):
+            raise PricingReferencePathError("Pricing reference files are unavailable.")
+        return True
+
+    @classmethod
+    def _check_copy_tree(cls, path: Path) -> None:
+        pending = [path]
+        while pending:
+            for child in pending.pop().iterdir():
+                info = cls._path_info(child)
+                if info is None:
+                    raise FileNotFoundError
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(child)
+                elif not stat.S_ISREG(info.st_mode):
+                    raise PricingReferencePathError("Pricing reference files are unavailable.")
+
+    @contextlib.contextmanager
+    def locked(self, *, create: bool = True):
+        lock_dir = self.root / ".locks"
+        try:
+            if not create and not self._directory_exists(self.directory) and not (
+                self._directory_exists(self.transactions) and self._directory_exists(self.transaction)
+            ):
+                # A writer creates its transaction before promotion and keeps its
+                # identity directory, including throughout a replacement gap.
+                yield None
+                return
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            self._directory_exists(lock_dir)
+            lock_path = lock_dir / ("_" + self.id)
+            info = self._path_info(lock_path)
+            if info is not None and not stat.S_ISREG(info.st_mode):
+                raise PricingReferencePathError("Pricing reference files are unavailable.")
+            # Closing the handle releases the cross-process lock, including on exit.
+            with lock_path.open("a+b") as lock:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    self.recover()
+                except PricingReferencePathError as exc:
+                    raise SqagStorageAccessError("Saved pricing reference recovery is unavailable.") from exc
+                yield self
+        except OSError as exc:
+            raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+
+    def read(self, *, directory: Path | None = None) -> tuple[PricingReferencePack | None, str | None]:
+        path = self.directory if directory is None else directory
+        if not self._directory_exists(path):
+            return None, None
+        raw_config = PricingReferencePack._contained_path(self.root, path, "reference.json").read_bytes()
+        try:
+            config = json.loads(raw_config)
+        except ValueError as exc:
+            raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+        if not isinstance(config, dict) or not config or config.get("id", self.id) != self.id:
+            raise SqagStorageAccessError("Saved pricing reference is unavailable.")
+        pack = PricingReferencePack(self.id, path, config, "local")
+        raw_catalog = pack.pricing_catalog_path.read_bytes()
+        read_stored_pricing_reference(raw_catalog, self.id)
+        revision = clean_text(config.get(PRICING_REFERENCE_SAVE_REVISION_KEY))
+        if not revision:
+            revision = "legacy:" + hashlib.sha256(raw_config + b"\0" + raw_catalog).hexdigest()
+        return replace(pack, catalog_bytes=raw_catalog), revision
+
+    def _discard(self, path: Path) -> None:
+        try:
+            if self._directory_exists(path):
+                self._check_copy_tree(path)
+                shutil.rmtree(path)
+        except (OSError, PricingReferencePathError):
+            write_local_log("error_pricing_reference_transaction_cleanup", {
+                "reason": "pricing_reference_transaction_cleanup_pending",
+                "slot": path.name,
+            })
+
+    def recover(self) -> None:
+        if not self._directory_exists(self.transactions) or not self._directory_exists(self.transaction):
+            return
+        current = self._directory_exists(self.directory)
+        staged = self._directory_exists(self.stage)
+        previous = self._directory_exists(self.previous)
+        if staged or previous:
+            if not self._directory_exists(self.owner_marker) or (current and staged and previous):
+                raise SqagStorageAccessError("Saved pricing reference recovery is unavailable.")
+        if previous:
+            if current:
+                self._validate_prepared_pack(self.directory)
+                self._discard(self.previous)
+            else:
+                self.read(directory=self.previous)
+                os.replace(self.previous, self.directory)
+        if staged:
+            self._discard(self.stage)
+
+    def save(
+        self, reference: dict[str, Any], before_save: PricingReferenceSaveSnapshot | None,
+    ) -> dict[str, Any]:
+        with self.locked():
+            pack, revision = self.read()
+            if before_save is not None:
+                before_save.require_current(revision)
+            self.transaction.mkdir(parents=True, exist_ok=True)
+            # A read may serve known-good data while a scratch cleanup is pending.
+            # A writer must wait for both slots before creating another transaction.
+            if self._directory_exists(self.stage) or self._directory_exists(self.previous):
+                raise SqagStorageAccessError("Saved pricing reference recovery is unavailable.")
+            self.owner_marker.mkdir(exist_ok=True)
+            self._directory_exists(self.owner_marker)
+            try:
+                if pack is None:
+                    self.stage.mkdir()
+                else:
+                    self._check_copy_tree(self.directory)
+                    shutil.copytree(self.directory, self.stage)
+                summary = write_local_pricing_reference_pack(self.id, self.stage, reference)
+                self._validate_prepared_pack(self.stage)
+                if pack is not None:
+                    os.replace(self.directory, self.previous)
+                os.replace(self.stage, self.directory)
+            except (OSError, SqagStorageAccessError, PricingReferencePathError):
+                self.recover()
+                raise
+            self._discard(self.previous)
+            return summary
+
+    def _validate_prepared_pack(self, directory: Path) -> None:
+        pack, _ = self.read(directory=directory)
+        if pack is None or not pack.pricing_reference_path.is_file():
+            raise SqagStorageAccessError("Prepared pricing reference is unavailable.")
+        for item in pack.catalog().get("items", []):
+            if not isinstance(item, dict):
+                continue
+            for ref in sanitize_visual_references(item.get("visual_references")):
+                path = clean_text(ref.get("path"))
+                if path:
+                    pack._contained_path(self.root, directory, path)
+
+    @classmethod
+    def transaction_ids(cls, root: Path) -> set[str]:
+        transactions = root / cls.transaction_directory_name
+        if not cls._directory_exists(transactions):
+            return set()
+        return {path.name for path in transactions.iterdir() if PROFILE_ID_RE.fullmatch(path.name)}
+
+
+def save_pricing_reference_pack(
+    reference: dict[str, Any], *, before_save: PricingReferenceSaveSnapshot | None = None,
+) -> dict[str, Any]:
     reference_id = safe_resource_id(reference.get("id") or reference.get("label"), "")
-    reference_dir = pricing_reference_pack_dir(reference_id)
+    try:
+        return LocalPricingReferenceStore(reference_id).save(reference, before_save)
+    except PricingReferencePathError as exc:
+        raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+
+
+def write_local_pricing_reference_pack(
+    reference_id: str, reference_dir: Path, reference: dict[str, Any],
+) -> dict[str, Any]:
     stored = persist_pricing_reference_visuals_to_directory(
         reference,
         reference_dir / "pricing-catalog-images",
         "pricing-catalog-images",
     )
     reference_dir.mkdir(parents=True, exist_ok=True)
-    catalog_payload = pricing_reference_catalog_payload(stored)
-    (reference_dir / "reference.json").write_text(
-        json.dumps(pricing_reference_pack_config(stored), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    catalog_payload = pricing_reference_catalog_payload(stored, exact_order=True)
     (reference_dir / "pricing-catalog.json").write_text(
         json.dumps(catalog_payload, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -8988,7 +9263,10 @@ def save_pricing_reference_pack(reference: dict[str, Any]) -> dict[str, Any]:
         pricing_reference_catalog_ai_markdown(catalog_payload, "pricing-catalog.json"),
         encoding="utf-8",
     )
-    summary = load_pricing_reference_pack(reference_id, source="local").public_summary()
+    config = pricing_reference_pack_config(stored)
+    config[PRICING_REFERENCE_SAVE_REVISION_KEY] = pricing_reference_new_revision(catalog_payload)
+    atomic_write_text(reference_dir / "reference.json", json.dumps(config, indent=2, sort_keys=True))
+    summary = PricingReferencePack(reference_id, reference_dir, config, "local").public_summary(catalog_payload)
     summary["item_count"] = len(stored.get("items") if isinstance(stored.get("items"), list) else [])
     return summary
 
@@ -9051,60 +9329,6 @@ def pricing_reference_with_ai_metadata_before_save(reference: dict[str, Any]) ->
     return enriched_reference, "completed"
 
 
-def apply_saved_pricing_reference_ai_metadata_enrichment(reference_id: str) -> bool:
-    safe_id = safe_resource_id(reference_id, "")
-    if not safe_id:
-        raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
-    detail = pricing_reference_pack_detail(safe_id)
-    if not detail:
-        return False
-    initial_saved_at = clean_text(detail.get("saved_at"))
-    items = [dict(item) for item in (detail.get("items") if isinstance(detail.get("items"), list) else []) if isinstance(item, dict)]
-    if not items:
-        return False
-    enriched_items, errors = ai_pricing_reference_metadata_enrichment(
-        clean_text(detail.get("label")) or safe_id,
-        items,
-        reference_id=safe_id,
-    )
-    if errors or not enriched_items:
-        write_local_log(
-            "server_error",
-            {
-                "source": "pricing_reference_metadata_enrichment",
-                "reference_id": safe_id,
-                "errors": safe_error_messages(errors or ["AI pricing metadata enrichment returned no rows."]),
-            },
-        )
-        return False
-    pricing_reference_enrichment.enrich_pricing_reference_items(enriched_items)
-    metadata_errors = pricing_reference_metadata_quality_errors(enriched_items)
-    if metadata_errors:
-        write_local_log(
-            "server_error",
-            {
-                "source": "pricing_reference_metadata_enrichment",
-                "reference_id": safe_id,
-                "errors": safe_error_messages(metadata_errors),
-            },
-        )
-        return False
-    latest_detail = pricing_reference_pack_detail(safe_id)
-    if not latest_detail or clean_text(latest_detail.get("saved_at")) != initial_saved_at:
-        return False
-    save_pricing_reference_pack({
-        "id": safe_id,
-        "label": clean_text(detail.get("label")) or safe_id,
-        "description": clean_text(detail.get("description")),
-        "tax": normalized_tax_config(detail.get("tax")),
-        "currency": normalize_currency_label(detail.get("currency")),
-        "schema_version": int(parse_pricing_number(detail.get("schema_version")) or 1),
-        "items": enriched_items,
-        "saved_at": utc_timestamp(),
-    })
-    return True
-
-
 def pricing_reference_is_profile_default(reference_id: str) -> bool:
     safe_id = safe_resource_id(reference_id, "")
     if not safe_id:
@@ -9123,11 +9347,24 @@ def delete_pricing_reference_pack(reference_id: str, source: str = "local") -> b
         raise ValueError("Only local pricing reference packs can be deleted here.")
     if safe_id == DEFAULT_PRICING_REFERENCE_ID or pricing_reference_is_profile_default(safe_id):
         raise ValueError("Default pricing references cannot be deleted.")
-    reference_dir = pricing_reference_pack_dir(safe_id)
-    if not reference_dir.exists() or not (reference_dir / "reference.json").is_file():
-        return False
-    shutil.rmtree(reference_dir)
-    return True
+    try:
+        store = LocalPricingReferenceStore(safe_id)
+        with store.locked():
+            if not store._directory_exists(store.directory) or not (
+                PricingReferencePack._contained_path(store.root, store.directory, "reference.json").is_file()
+            ):
+                return False
+            # Do not allow an old copy to be restored after a successful delete.
+            if store._directory_exists(store.previous) or store._directory_exists(store.stage):
+                raise SqagStorageAccessError("Saved pricing reference recovery is unavailable.")
+            shutil.rmtree(store.directory)
+            # No stage or previous copy remains, so the identity directory has
+            # nothing left to recover. The next save recreates it before renaming.
+            # The lock file stays: another waiter may already hold its handle.
+            store._discard(store.transaction)
+            return True
+    except PricingReferencePathError as exc:
+        raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
 
 
 def profile_payload_from_export(payload: dict[str, Any]) -> dict[str, Any]:
@@ -9295,9 +9532,7 @@ def repair_ai_pricing_import_source_placement(raw_items: list[Any], content: Any
             repaired.append(raw_item)
             continue
         item = dict(raw_item)
-        source_index = parse_basis_chat_line_index(
-            item.get("source_row_index") or item.get("row_index") or item.get("source_index")
-        )
+        source_index = parse_basis_chat_line_index(item.get("source_row_index"))
         source_row = source_rows[source_index - 1] if 1 <= source_index <= len(source_rows) else (
             source_rows[index] if index < len(source_rows) else {}
         )
@@ -9331,21 +9566,27 @@ def repair_ai_pricing_import_source_placement(raw_items: list[Any], content: Any
     return repaired
 
 
-def sorted_pricing_reference_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(items, key=pricing_reference_sort_order)
+def sorted_pricing_reference_items(
+    items: list[dict[str, Any]], *, exact_order: bool = True,
+) -> list[dict[str, Any]]:
+    return sorted(items, key=lambda item: pricing_reference_sort_order(item, exact_order=exact_order))
 
 
 def pricing_reference_section_names(reference_id: str | None = None, source: str = "") -> list[str]:
-    try:
-        payload = json.loads(load_pricing_reference_pack(reference_id, source=source).pricing_catalog_path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
-        return []
+    catalogue = load_pricing_reference_pack(reference_id, source=source).catalog()
+    return pricing_reference_section_names_from_items(catalogue.get("items") or [])
+
+
+def pricing_reference_section_names_from_items(
+    items: list[dict[str, Any]], *, use_reference_titles: bool = False,
+) -> list[str]:
     sections: list[str] = []
     seen: set[str] = set()
-    for item in payload.get("items") or []:
+    for item in items:
         if not isinstance(item, dict):
             continue
-        section = clean_basis_section_title(item.get("section"))
+        title = item.get("reference_section") if use_reference_titles else None
+        section = clean_basis_section_title(title or item.get("section"))
         key = section.casefold()
         if section and key not in seen:
             sections.append(section)
@@ -9357,47 +9598,49 @@ def pricing_reference_section_names_for_payload(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
 ) -> list[str]:
+    return pricing_reference_sections_and_catalogue_for_payload(payload, auth_session)[0]
+
+
+def pricing_reference_sections_and_catalogue_for_payload(
+    payload: dict[str, Any],
+    auth_session: dict[str, Any] | None,
+) -> tuple[list[str], list[dict[str, Any]]]:
     runtime_reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     if runtime_reference:
-        sections: list[str] = []
-        seen: set[str] = set()
-        for item in local_pricing_reference_items(payload, limit=None, auth_session=auth_session):
-            section = clean_basis_section_title(item.get("reference_section") or item.get("section"))
-            key = section.casefold()
-            if section and key not in seen:
-                sections.append(section)
-                seen.add(key)
-        return sections
+        priced_items = local_pricing_reference_items(payload, limit=None, auth_session=auth_session, reference=runtime_reference)
+        return pricing_reference_section_names_from_items(
+            priced_items, use_reference_titles=True,
+        ), runtime_reference.get("items") or []
     selection = explicit_pricing_reference_selection(payload)
     if not selection["ok"]:
-        return []
-    return pricing_reference_section_names(selection["id"], source=selection["source"])
+        return [], []
+    catalogue = load_pricing_reference_pack(selection["id"], source=selection["source"]).catalog()
+    items = catalogue.get("items") or []
+    return pricing_reference_section_names_from_items(items), items
 
 
 def pricing_reference_pack_for_payload(payload: dict[str, Any]) -> PricingReferencePack:
     selection = explicit_pricing_reference_selection(payload)
     if not selection["ok"] or selection["source"] not in {"local", "bundled"}:
         raise ValueError("Selected pricing reference is not available.")
-    pack = PricingReferencePack.resolve_exact(selection["id"], selection["source"])
-    if pack is None:
-        raise ValueError("Selected pricing reference is not available.")
-    return pack
+    with PricingReferencePack.read_scope(selection["id"], selection["source"], exact=True) as pack:
+        if pack is None:
+            raise ValueError("Selected pricing reference is not available.")
+        return pack
 
 
-def pricing_reference_section_order_map_for_payload(
+def pricing_reference_quote_order_maps(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, tuple[int, int, int, int, int]]]:
+    sections, items = pricing_reference_sections_and_catalogue_for_payload(payload, auth_session)
     order: dict[str, int] = {}
-    for index, section in enumerate(
-        pricing_reference_section_names_for_payload(payload, auth_session=auth_session),
-        start=1,
-    ):
+    for index, section in enumerate(sections, start=1):
         for value in (section, normalize_catalog_section(section)):
             key = safe_section_id(value, "")
             if key and key not in order:
                 order[key] = index
-    return order
+    return order, pricing_reference_appended_sort_orders(items)
 
 
 def pricing_reference_section_order_value(section: Any, section_order: dict[str, int]) -> int | None:
@@ -9412,16 +9655,16 @@ def line_item_pricing_reference_order(
     item: dict[str, Any],
     section_order: dict[str, int],
     fallback_index: int,
-) -> tuple[int, int, int, str, str]:
+    appended_orders: dict[str, tuple[int, int, int, int, int]],
+) -> tuple[int, int, int, int, int, int, str, str]:
     category_order = (
-        pricing_reference_order_number(item.get("category_order"))
+        catalogue_order_number(item.get("category_order"))
         or pricing_reference_section_order_value(item.get("section") or item.get("reference_section"), section_order)
         or 999999
     )
-    item_order = pricing_reference_order_number(item.get("item_order")) or 999999
+    item_order = catalogue_order_number(item.get("item_order")) or 999999
     return (
-        category_order,
-        item_order,
+        *pricing_reference_quote_row_order(item, appended_orders, (category_order, 0, item_order, 0, 0)),
         fallback_index,
         clean_text(item.get("section")).casefold(),
         clean_text(item.get("description")).casefold(),
@@ -9433,12 +9676,12 @@ def sort_line_items_by_pricing_reference_order(
     line_items: list[dict[str, Any]],
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    section_order = pricing_reference_section_order_map_for_payload(payload, auth_session=auth_session)
+    section_order, appended_orders = pricing_reference_quote_order_maps(payload, auth_session)
     return [
         item
         for _index, item in sorted(
             enumerate(line_items),
-            key=lambda entry: line_item_pricing_reference_order(entry[1], section_order, entry[0]),
+            key=lambda entry: line_item_pricing_reference_order(entry[1], section_order, entry[0], appended_orders),
         )
     ]
 
@@ -9448,30 +9691,39 @@ def quote_basis_line_order(
     section_title: Any,
     section_order: dict[str, int],
     fallback_index: int,
-) -> tuple[int, int, int, str]:
+    appended_orders: dict[str, tuple[int, int, int, int, int]],
+) -> tuple[int, int, int, int, int, int, str]:
     category_order = (
-        pricing_reference_order_number(line.get("category_order"))
+        catalogue_order_number(line.get("category_order"))
         or pricing_reference_section_order_value(section_title, section_order)
         or 999999
     )
-    item_order = pricing_reference_order_number(line.get("item_order")) or 999999
-    return (category_order, item_order, fallback_index, clean_text(line.get("text")).casefold())
+    item_order = catalogue_order_number(line.get("item_order")) or 999999
+    return (
+        *pricing_reference_quote_row_order(line, appended_orders, (category_order, 0, item_order, 0, 0)),
+        fallback_index,
+        clean_text(line.get("text")).casefold(),
+    )
 
 
 def quote_basis_section_order(
     section: dict[str, Any],
     section_order: dict[str, int],
     fallback_index: int,
-) -> tuple[int, int, str]:
+    appended_orders: dict[str, tuple[int, int, int, int, int]],
+) -> tuple[int, int, int, str]:
     title = clean_basis_section_title(section.get("title"))
-    line_category_orders = [
-        pricing_reference_order_number(line.get("category_order"))
-        for line in section.get("lines") or []
-        if isinstance(line, dict) and pricing_reference_order_number(line.get("category_order")) is not None
-    ]
-    category_order = min(line_category_orders) if line_category_orders else None
-    category_order = category_order or pricing_reference_section_order_value(title, section_order) or 999999
-    return (category_order, fallback_index, title.casefold())
+    line_category_orders = []
+    for line in section.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        order = pricing_reference_quote_row_order(
+            line, appended_orders, (catalogue_order_number(line.get("category_order")) or 0, 0, 0, 0, 0),
+        )
+        if order[0]:
+            line_category_orders.append(order[:2])
+    default_category = pricing_reference_section_order_value(title, section_order) or 999999
+    return (*min(line_category_orders, default=(default_category, 0)), fallback_index, title.casefold())
 
 
 def sort_quote_basis_sections_by_pricing_reference_order(
@@ -9479,7 +9731,7 @@ def sort_quote_basis_sections_by_pricing_reference_order(
     sections: list[dict[str, Any]],
     auth_session: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    section_order = pricing_reference_section_order_map_for_payload(payload, auth_session=auth_session)
+    section_order, appended_orders = pricing_reference_quote_order_maps(payload, auth_session)
     sorted_sections: list[dict[str, Any]] = []
     for section in sections:
         next_section = {**section}
@@ -9488,7 +9740,7 @@ def sort_quote_basis_sections_by_pricing_reference_order(
             line
             for _index, line in sorted(
                 [(index, line) for index, line in enumerate(lines) if isinstance(line, dict)],
-                key=lambda entry: quote_basis_line_order(entry[1], section.get("title"), section_order, entry[0]),
+                key=lambda entry: quote_basis_line_order(entry[1], section.get("title"), section_order, entry[0], appended_orders),
             )
         ]
         sorted_sections.append(next_section)
@@ -9496,16 +9748,45 @@ def sort_quote_basis_sections_by_pricing_reference_order(
         section
         for _index, section in sorted(
             enumerate(sorted_sections),
-            key=lambda entry: quote_basis_section_order(entry[1], section_order, entry[0]),
+            key=lambda entry: quote_basis_section_order(entry[1], section_order, entry[0], appended_orders),
         )
     ]
+
+
+def pricing_reference_appended_sort_orders(items: list[dict[str, Any]]) -> dict[str, tuple[int, int, int, int, int]]:
+    """Project exact sort keys for categories affected by an append at the limit."""
+    appended_categories = {
+        catalogue_order_number(item.get("category_order")) for item in items if isinstance(item, dict)
+        and any(pricing_reference_order_tie(item, field, catalogue_order_number(item.get(field)))
+                for field in ("category_order", "item_order"))
+    }
+    if not appended_categories:
+        return {}
+    affected = [
+        item for item in items
+        if isinstance(item, dict) and catalogue_order_number(item.get("category_order")) in appended_categories
+    ]
+    return {
+        item_id: (*pricing_reference_sort_order(item)[:4], position)
+        for position, item in enumerate(sorted_pricing_reference_items(affected), start=1)
+        if (item_id := clean_text(item.get("id")))
+    }
+
+
+def pricing_reference_quote_row_order(
+    row: dict[str, Any], appended_orders: dict[str, tuple[int, int, int, int, int]], default: tuple[int, int, int, int, int],
+) -> tuple[int, int, int, int, int]:
+    authority = row.get("pricing_authority")
+    item_id = authority.get("catalog_item_id") if isinstance(authority, dict) else None
+    return appended_orders.get(clean_text(item_id or row.get("pricing_keyword") or row.get("keyword")), default)
 
 
 def build_pricing_catalog_import_prompt(source_name: str, content: Any, tax: dict[str, Any]) -> str:
     sections = pricing_reference_section_names()
     return (
-        "Normalize an uploaded pricing catalog into Swooshz pricing reference rows. Return only JSON with currency and an items array. "
-        "Each item must include section, description, unit_hint, internal_cost, markup_multiplier, remarks, aliases, and warning/status when useful. "
+        "Normalize an uploaded pricing catalog into Swooshz pricing reference rows. Return only JSON matching the response schema. "
+        "Use JSON numbers for internal_cost and markup_multiplier, and arrays of strings for remarks and aliases, with [] when empty. "
+        "Use null for missing nullable values, including currency, warning and status. Do not invent missing costs or markups. "
         "Identify continuation rows and stitch them into the previous item; do not drop continuation description or remarks. "
         "Do not merge independent priced rows. Preserve short technical rows such as nos. rigging point for Overhead Structure or Aluminium Box Truss. "
         "Preserve source placement: if a bullet or commercial note appears inside the item/description cell or column, keep it in description; "
@@ -9517,7 +9798,8 @@ def build_pricing_catalog_import_prompt(source_name: str, content: Any, tax: dic
         "Do not invent a fixed taxonomy and do not copy terms from unrelated examples. "
         "Use these pricing reference sections first and match each priced row to the closest provided section. "
         "Only create a new section when none of the provided pricing reference sections fits the row. "
-        "Preserve the source category order and source row order. When no category order exists, assign category_order by first-seen section in the source rows and item_order by source row order. "
+        "Preserve the source category and item order as positive integers. When no category order exists, assign category_order by first-seen section in the source rows and item_order by source row order. "
+        "For source_row_index, give the one-based position of the first contributing entry in the bounded rows array, or null if it cannot be located. Do not use the workbook row number. "
         f"Pricing reference sections JSON: {json.dumps(sections, ensure_ascii=True)}. "
         f"Source name: {source_name}. Tax: {json.dumps(tax, ensure_ascii=True)}. Bounded extracted content JSON: {json.dumps(content, ensure_ascii=True)}"
     )
@@ -9525,14 +9807,9 @@ def build_pricing_catalog_import_prompt(source_name: str, content: Any, tax: dic
 
 def pricing_catalog_metadata_prompt_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for item in items[:MAX_PRICING_REFERENCE_ROWS]:
-        if not isinstance(item, dict):
-            continue
-        item_id = clean_text(item.get("id"))
-        if not item_id:
-            continue
+    for item in items:
         rows.append({
-            "id": item_id,
+            "id": item["id"],
             "section": clean_text(item.get("reference_section") or item.get("section")),
             "description": clean_text(item.get("description")),
             "unit_hint": clean_text(item.get("unit_hint")),
@@ -9544,8 +9821,9 @@ def pricing_catalog_metadata_prompt_rows(items: list[dict[str, Any]]) -> list[di
 
 def build_pricing_catalog_metadata_prompt(source_name: str, items: list[dict[str, Any]]) -> str:
     return (
-        "Enrich pricing reference rows with source-backed matching metadata. Return only JSON with an items array. "
-        "For each input id, return id, match_terms, and object_families. Do not change descriptions, prices, units, ids, sections, or remarks. "
+        "Enrich pricing reference rows with source-backed matching metadata. Return only JSON matching the response schema. "
+        "Return exactly one item for every input row, copying its id verbatim. Do not omit, repeat or add ids. "
+        "Return only id, match_terms and object_families in each item. Use arrays of strings and use [] when there are no supported terms or families. "
         "Derive match_terms and object_families only from the row's own wording, nearby technical context implied by that row, section, unit, aliases, remarks, and common industry names for the exact same object/service. "
         "Use metadata to help future quote matching decide whether a proposed thing can be this catalog row. Include useful synonyms only when they are genuinely equivalent for that row; do not use generic overlap alone. "
         "Equivalent-name terms are allowed only when they name the exact same object/service described by that row; narrower rows must not receive broader terms that would make them catch unrelated products. "
@@ -9564,23 +9842,61 @@ def build_pricing_catalog_metadata_prompt(source_name: str, items: list[dict[str
 
 
 
+def _parse_pricing_response(data: dict[str, Any], contract: ResponseContract) -> dict[str, Any]:
+    """Decode the admitted envelope and adapt nullable fields for pricing."""
+    try:
+        return contract.parse(response_output_text(data))
+    except ContractViolation as exc:
+        raise AIModelOutputError("AI pricing response was not accepted.", diagnostics={
+            "failure_boundary": "model_output_json" if exc.reason == "schema_json" else "model_output_contract",
+            "response_contract_name": contract.name,
+            "response_contract_reason": exc.reason,
+        }) from None
+
+
+def _pricing_metadata_rows_by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item_id = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(item_id, str) or not item_id.strip() or item_id in by_id:
+            return None
+        by_id[item_id] = row
+    return by_id
+
+
 @scoped_ai_transport_operation("pricing_reference_import")
 def request_openai_pricing_catalog_import(source_name: str, content: Any, tax: dict[str, Any], api_key: str = "", *, gateway: AiGateway | None = None) -> dict[str, Any]:
     gateway = gateway if gateway is not None else configured_ai_gateway("pricing_reference_import", operation_owner=current_ai_transport_owner())
     route = gateway.configuration.route("pricing_import")
     begin_ai_transport_operation("pricing_reference_import", AI_PROVIDER_OPENROUTER, route.model)
     data = gateway_request(gateway, "pricing_import", {"model":route.model, "input":[{"role":"user", "content":[{"type":"input_text", "text":build_pricing_catalog_import_prompt(source_name, content, tax)}]}], "reasoning":{"effort":route.effort}, "max_output_tokens":4000})
-    return parse_json_object(response_output_text(data))
+    return _parse_pricing_response(data, PRICING_IMPORT)
 
 
 
 @scoped_ai_transport_operation("pricing_reference_metadata_enrichment")
 def request_openai_pricing_catalog_metadata(source_name: str, items: list[dict[str, Any]], api_key: str = "", *, gateway: AiGateway | None = None) -> dict[str, Any]:
+    requested = _pricing_metadata_rows_by_id(items)
+    if requested is None or len(requested) > MAX_PRICING_REFERENCE_ROWS:
+        raise AIModelOutputError("AI matching metadata was not accepted.", diagnostics={
+            "failure_boundary": "request_validation",
+            "attempt_number": 0,
+            "response_contract_name": PRICING_METADATA.name,
+            "response_contract_reason": "metadata_request_identity",
+        })
     gateway = gateway if gateway is not None else configured_ai_gateway("pricing_reference_metadata_enrichment", operation_owner=current_ai_transport_owner())
     route = gateway.configuration.route("pricing_metadata")
     begin_ai_transport_operation("pricing_reference_metadata_enrichment", AI_PROVIDER_OPENROUTER, route.model)
     data = gateway_request(gateway, "pricing_metadata", {"model":route.model, "input":[{"role":"user", "content":[{"type":"input_text", "text":build_pricing_catalog_metadata_prompt(source_name, items)}]}], "reasoning":{"effort":route.effort}, "max_output_tokens":12000})
-    return parse_json_object(response_output_text(data))
+    parsed = _parse_pricing_response(data, PRICING_METADATA)
+    returned = _pricing_metadata_rows_by_id(parsed["items"])
+    if returned is None or returned.keys() != requested.keys():
+        raise AIModelOutputError("AI matching metadata was not accepted.", diagnostics={
+            "failure_boundary": "model_output_contract",
+            "response_contract_name": PRICING_METADATA.name,
+            "response_contract_reason": "metadata_response_identity",
+        })
+    return parsed
 
 
 
@@ -9601,24 +9917,15 @@ def merge_pricing_reference_ai_metadata(
     items: list[dict[str, Any]],
     raw_metadata_items: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    source_ids = [clean_text(item.get("id")) for item in items if clean_text(item.get("id"))]
-    metadata_by_id: dict[str, dict[str, Any]] = {}
-    for raw in raw_metadata_items:
-        if not isinstance(raw, dict):
-            continue
-        item_id = clean_text(raw.get("id"))
-        if item_id and item_id in source_ids:
-            metadata_by_id[item_id] = raw
-    missing_ids = [item_id for item_id in source_ids if item_id not in metadata_by_id]
-    if missing_ids:
-        preview = ", ".join(missing_ids[:5])
-        suffix = f" and {len(missing_ids) - 5} more" if len(missing_ids) > 5 else ""
-        return items, [f"AI metadata enrichment omitted pricing rows: {preview}{suffix}."]
+    source = _pricing_metadata_rows_by_id(items)
+    metadata_by_id = _pricing_metadata_rows_by_id(raw_metadata_items)
+    if source is None or metadata_by_id is None or metadata_by_id.keys() != source.keys():
+        return items, ["AI matching metadata did not match the requested pricing rows."]
 
     enriched: list[dict[str, Any]] = []
     for item in items:
         next_item = copy.deepcopy(item)
-        metadata = metadata_by_id.get(clean_text(item.get("id")), {})
+        metadata = metadata_by_id[item["id"]]
         ai_match_terms = sanitize_pricing_reference_terms(metadata.get("match_terms"))
         next_item["match_terms"] = unique_clean_list(ai_match_terms)[:36]
         ai_families = sanitize_pricing_reference_families(metadata.get("object_families"))
@@ -9652,9 +9959,6 @@ def ai_pricing_reference_metadata_enrichment(filename: str, items: list[dict[str
             batch_started = time.perf_counter()
             try:
                 parsed = request_openai_pricing_catalog_metadata(batch_name, batch, gateway=gateway)
-                rows = parsed.get("items")
-                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                    raise AIModelOutputError("AI matching metadata was not accepted.")
             except OpenAIAnalysisError as exc:
                 failure = ai_failure_metadata(exc, provider=AI_PROVIDER_OPENROUTER)
                 log_ai_call_attempt(feature="pricing_reference_metadata_enrichment", provider=AI_PROVIDER_OPENROUTER,
@@ -9662,7 +9966,7 @@ def ai_pricing_reference_metadata_enrichment(filename: str, items: list[dict[str
                                     **metadata, **failure)
                 attempts.append({"status":"failed", "batch_index":index, **failure})
                 raise
-            raw_metadata.extend(rows)
+            raw_metadata.extend(parsed["items"])
             log_ai_call_attempt(feature="pricing_reference_metadata_enrichment", provider=AI_PROVIDER_OPENROUTER,
                                 model=route.model, status="success", duration_ms=elapsed_milliseconds(batch_started), **metadata)
             attempts.append({"status":"success", "batch_index":index})
@@ -11555,6 +11859,13 @@ def safe_auth_session_for_async(session: dict[str, Any] | None) -> dict[str, Any
 def storage_access_error_payload(exc: SqagStorageAccessError) -> dict[str, Any]:
     error_reference = new_error_reference()
     write_local_log("server_error", {"error_reference": error_reference, "reason": exc.reason, "status": exc.status, "errors": safe_error_messages([str(exc)])})
+    if exc.reason in {"pricing_reference_revision_conflict", "pricing_reference_missing"}:
+        return {
+            "status": "blocked",
+            "errors": generic_referenced_errors(error_reference),
+            "reason": exc.reason,
+            "error_reference": error_reference,
+        }
     message = (
         QUOTE_SESSION_RETIRED_MESSAGE
         if exc.reason == "quote_session_retired"
@@ -11723,8 +12034,24 @@ class LocalSqagStorage:
     def list_pricing_references(self) -> list[dict[str, Any]]:
         return list_pricing_references(self.company_id())
 
-    def save_pricing_reference(self, reference: dict[str, Any]) -> dict[str, Any]:
-        return save_pricing_reference_pack(reference)
+    def pricing_reference_save_snapshot(self, reference_id: str, source: str) -> PricingReferenceSaveSnapshot:
+        try:
+            with LocalPricingReferenceStore(reference_id).locked(create=False) as store:
+                local, revision = store.read() if store is not None else (None, None)
+                requested_source = clean_text(source).lower()
+                selected = None
+                if local is not None and requested_source in {"", "local"}:
+                    selected = local.public_detail()
+                elif requested_source != "local":
+                    selected = pricing_reference_pack_detail(reference_id, source="bundled")
+                return PricingReferenceSaveSnapshot(selected, revision)
+        except PricingReferencePathError as exc:
+            raise SqagStorageAccessError("Saved pricing reference is unavailable.") from exc
+
+    def save_pricing_reference(
+        self, reference: dict[str, Any], *, before_save: PricingReferenceSaveSnapshot | None = None,
+    ) -> dict[str, Any]:
+        return save_pricing_reference_pack(reference, before_save=before_save)
 
     def delete_pricing_reference(self, reference_id: str, source: str = "local") -> bool:
         return delete_pricing_reference_pack(reference_id, source=source)
@@ -12917,26 +13244,79 @@ class DatabaseSqagStorage:
         return payload
 
     def list_pricing_references(self) -> list[dict[str, Any]]:
-        company_references = [public_company_pricing_reference(reference) for reference in self._read_payloads("sqag_pricing_references", "reference_id")]
+        with self.connection() as connection:
+            rows = connection.execute(
+                "select reference_id, payload_json from sqag_pricing_references where workspace_id = ?",
+                (self.workspace_id,),
+            ).fetchall()
+        company_references = []
+        for row in rows:
+            try:
+                stored = read_stored_pricing_reference(row["payload_json"], row["reference_id"])
+            except SqagStorageAccessError as exc:
+                log_unavailable_listed_pricing_reference(row["reference_id"], "company", exc)
+                continue
+            company_references.append(public_company_pricing_reference({**stored, "id": row["reference_id"]}))
         return sorted(company_references, key=lambda item: (clean_text(item.get("label") or item.get("id")).casefold(), clean_text(item.get("source")).casefold(), clean_text(item.get("id")).casefold()))
 
-    def save_pricing_reference(self, reference: dict[str, Any]) -> dict[str, Any]:
+    def _read_pricing_reference_for_save(
+        self, connection: Any, reference_id: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        row = connection.execute(
+            "select payload_json from sqag_pricing_references where workspace_id = ? and reference_id = ?",
+            (self.workspace_id, reference_id),
+        ).fetchone()
+        if row is None:
+            return None, None
+        raw = row["payload_json"]
+        reference = read_stored_pricing_reference(raw, reference_id)
+        reference.setdefault("id", reference_id)
+        revision = clean_text(reference.get(PRICING_REFERENCE_SAVE_REVISION_KEY))
+        return reference, revision or ("legacy:" + hashlib.sha256(raw.encode("utf-8")).hexdigest())
+
+    def pricing_reference_save_snapshot(self, reference_id: str, source: str) -> PricingReferenceSaveSnapshot:
+        if not reference_id:
+            raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
+        reference, revision = self._pricing_reference_record(reference_id)
+        selected = (
+            self._company_pricing_reference_detail(reference)
+            if reference is not None and clean_text(source).lower() in {"", "company"}
+            else None
+        )
+        return PricingReferenceSaveSnapshot(selected, revision)
+
+    def _pricing_reference_record(self, reference_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            with self.connection() as connection:
+                return self._read_pricing_reference_for_save(connection, reference_id)
+        except SqagStorageAccessError:
+            raise
+        except Exception as exc:
+            if not self._expected_storage_failure(exc):
+                raise
+            raise self._storage_unavailable_error(exc) from exc
+
+    def save_pricing_reference(
+        self, reference: dict[str, Any], *, before_save: PricingReferenceSaveSnapshot | None = None,
+    ) -> dict[str, Any]:
         reference_id = safe_resource_id(reference.get("id") or reference.get("label"), "")
         if not reference_id:
             raise ValueError("Pricing reference id is required and may only contain letters, numbers, dashes, or underscores.")
         stored = copy.deepcopy(reference)
         stored["id"] = reference_id
+        stored[PRICING_REFERENCE_SAVE_REVISION_KEY] = pricing_reference_new_revision(stored)
         artifact_mode = configured_artifact_storage_mode()
-        if artifact_mode not in {"database", "object"}:
-            self._upsert_payload("sqag_pricing_references", "reference_id", reference_id, stored)
-            return public_company_pricing_reference(stored)
 
-        stored, items, retained_kinds = self._prepare_pricing_visual_artifacts(
-            reference_id,
-            stored,
-        )
+        def require_current(connection: Any) -> None:
+            _, revision = self._read_pricing_reference_for_save(connection, reference_id)
+            if before_save is not None:
+                before_save.require_current(revision)
+
+        if artifact_mode in {"database", "object"}:
+            stored, items, retained_kinds = self._prepare_pricing_visual_artifacts(reference_id, stored)
         if artifact_mode == 'object':
             def prepare_object_pricing(connection: Any):
+                require_current(connection)
                 managed_kinds = set(retained_kinds)
                 managed_kinds.update(
                     clean_text(row['artifact_kind'])
@@ -12990,6 +13370,8 @@ class DatabaseSqagStorage:
                     prepare_object_pricing,
                     persist_object_pricing,
                 )
+            except SqagStorageAccessError:
+                raise
             except Exception as exc:
                 if not self._expected_storage_failure(exc):
                     raise
@@ -12999,21 +13381,20 @@ class DatabaseSqagStorage:
             return public_company_pricing_reference(stored)
 
         def persist_pricing(connection: Any) -> None:
-            self._execute_delete_database_pricing_visuals_except(
-                connection,
-                reference_id,
-                retained_kinds,
-            )
-            for item in items:
-                self._execute_upsert_file_artifact(
-                    connection,
-                    "pricing_reference",
-                    reference_id,
-                    item.artifact_kind,
-                    item.filename,
-                    item.content_type,
-                    item.content,
-                )
+            self._begin_object_lifecycle_transaction(connection, "pricing_reference", reference_id)
+            require_current(connection)
+            if artifact_mode == "database":
+                self._execute_delete_database_pricing_visuals_except(connection, reference_id, retained_kinds)
+                for item in items:
+                    self._execute_upsert_file_artifact(
+                        connection,
+                        "pricing_reference",
+                        reference_id,
+                        item.artifact_kind,
+                        item.filename,
+                        item.content_type,
+                        item.content,
+                    )
             self._execute_upsert_payload(
                 connection,
                 "sqag_pricing_references",
@@ -13024,6 +13405,8 @@ class DatabaseSqagStorage:
 
         try:
             self._run_storage_transaction(persist_pricing)
+        except SqagStorageAccessError:
+            raise
         except Exception as exc:
             if not self._expected_storage_failure(exc):
                 raise
@@ -13057,6 +13440,7 @@ class DatabaseSqagStorage:
                 raise self._storage_unavailable_error(exc) from exc
 
         def delete_pricing_owner(connection: Any) -> bool:
+            self._begin_object_lifecycle_transaction(connection, "pricing_reference", safe_id)
             if artifact_mode == "database":
                 connection.execute(
                     "delete from sqag_file_artifacts where workspace_id = ? and owner_type = ? and owner_id = ?",
@@ -13082,13 +13466,16 @@ class DatabaseSqagStorage:
         requested_source = clean_text(source).lower()
         if requested_source not in {"", "company"}:
             return None
-        reference = self._read_payload("sqag_pricing_references", "reference_id", safe_id)
-        if reference is None:
-            return None
+        reference, _ = self._pricing_reference_record(safe_id)
+        return self._company_pricing_reference_detail(reference) if reference is not None else None
+
+    @staticmethod
+    def _company_pricing_reference_detail(reference: dict[str, Any]) -> dict[str, Any]:
         detail = public_company_pricing_reference(reference)
         items = [dict(item) for item in (reference.get("items") if isinstance(reference.get("items"), list) else []) if isinstance(item, dict)]
-        ensure_pricing_reference_order_fields(items)
-        detail.update({"schema_version": int(parse_pricing_number(reference.get("schema_version")) or 1), "items": sorted_pricing_reference_items(items), "item_count": len(items)})
+        exact_order = pricing_reference_has_exact_order(reference)
+        ensure_pricing_reference_order_fields(items, exact_order=exact_order)
+        detail.update({"schema_version": int(parse_pricing_number(reference.get("schema_version")) or 1), "items": sorted_pricing_reference_items(items, exact_order=exact_order), "item_count": len(items)})
         return detail
 
     def pricing_reference_export_xlsx(self, reference_id: str, source: str = "") -> tuple[str, bytes] | None:
@@ -17463,31 +17850,44 @@ def capture_pricing_reference_snapshot(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
 ) -> PricingReferenceSnapshot | None:
-    authority = exact_pricing_reference_authority(
-        payload,
-        auth_session=auth_session,
-        use_snapshot=False,
-        authoritative_reload=True,
-    )
-    detail = authority.get("detail") if authority.get("ok") and isinstance(authority.get("detail"), dict) else None
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"]:
+        return None
+    visual_images: list[dict[str, Any]] = []
+    if configured_storage_mode() != "database" and selection["source"] in {"local", "bundled"}:
+        try:
+            with PricingReferencePack.read_scope(selection["id"], selection["source"], exact=True) as pack:
+                if pack is None:
+                    return None
+                detail = pack.public_detail()
+                visual_images = catalog_visual_image_entries_for_items(detail["items"], pack.directory)
+        except PricingReferencePathError:
+            return None
+    else:
+        authority = exact_pricing_reference_authority(
+            payload,
+            auth_session=auth_session,
+            use_snapshot=False,
+            authoritative_reload=True,
+        )
+        detail = authority.get("detail") if authority.get("ok") else None
     items = detail.get("items") if isinstance(detail, dict) else None
     digest = clean_text(detail.get("digest_sha256")) if isinstance(detail, dict) else ""
     currency = normalize_currency_label(detail.get("currency")) if isinstance(detail, dict) else ""
     if (
         not isinstance(detail, dict)
         or not isinstance(items, list)
-        or detail.get("id") != authority.get("id")
-        or detail.get("source") != authority.get("source")
+        or detail.get("id") != selection["id"]
+        or detail.get("source") != selection["source"]
         or not digest
         or not currency
     ):
         return None
-    visual_images = catalog_visual_image_entries_for_snapshot_detail(detail, authority["source"], authority["id"])
     detail_json = json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     visual_images_json = json.dumps(visual_images, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return PricingReferenceSnapshot(
-        source=authority["source"],
-        reference_id=authority["id"],
+        source=selection["source"],
+        reference_id=selection["id"],
         digest=digest,
         currency=currency,
         detail_json=detail_json,
@@ -17646,8 +18046,11 @@ def exact_pricing_reference_detail_for_payload(
             detail["source"] = selection["source"]
             detail["digest_sha256"] = pricing_reference_catalog_digest(detail)
             return detail if detail.get("digest_sha256") else None
-        pack = PricingReferencePack.resolve_exact(selection["id"], selection["source"])
-        return pack.public_detail() if pack is not None else None
+        try:
+            with PricingReferencePack.read_scope(selection["id"], selection["source"], exact=True) as pack:
+                return pack.public_detail() if pack is not None else None
+        except PricingReferencePathError:
+            return None
     company_id = pricing_reference_company_id_from_payload(payload)
     for candidate in company_config_store().list_pricing_references(company_id):
         if candidate.get("id") == selection["id"]:
@@ -18036,7 +18439,11 @@ def pricing_catalog_path_for_payload(payload: dict[str, Any], job_tmp: Path, aut
         return catalog_path
     runtime_catalog = runtime_pricing_catalog_payload_for_payload(payload, auth_session=auth_session)
     if runtime_catalog is None:
-        return pricing_reference_pack_for_payload(payload).pricing_catalog_path
+        runtime_catalog = (
+            pricing_reference_catalog_payload(authority["detail"])
+            if authority["source"] == "local"
+            else pricing_reference_pack_for_payload(payload).catalog()
+        )
     catalog_path = job_tmp / "pricing-catalog.json"
     catalog_path.write_text(json.dumps(runtime_catalog, indent=2), encoding="utf-8")
     return catalog_path
@@ -18249,6 +18656,7 @@ class PricingReferencePack:
     directory: Path
     config: dict[str, Any]
     source: str = "bundled"
+    catalog_bytes: bytes | None = field(default=None, repr=False, compare=False)
 
     @staticmethod
     def _contained_path(root: Path, directory: Path, filename: str) -> Path:
@@ -18281,48 +18689,67 @@ class PricingReferencePack:
         return config, catalog_path
 
     @classmethod
-    def resolve(cls, reference_id: str | None = None, source: str = "") -> "PricingReferencePack":
+    @contextlib.contextmanager
+    def read_scope(cls, reference_id: str | None = None, source: str = "", *, exact: bool = False):
+        if exact and (
+            not isinstance(reference_id, str) or not PROFILE_ID_RE.fullmatch(reference_id)
+            or not isinstance(source, str) or source not in {"local", "bundled"}
+        ):
+            yield None
+            return
         resolved_id = safe_resource_id(reference_id, DEFAULT_PRICING_REFERENCE_ID)
         requested_source = clean_text(source).lower()
-
+        if not resolved_id:
+            if requested_source == "local":
+                yield cls("", pricing_references_root(), {}, "local", b"{}")
+            else:
+                yield cls("", bundled_pricing_references_root(), {}, "bundled", b"{}")
+            return
         if requested_source in {"", "local"}:
-            local_root = pricing_references_root()
-            local_dir = local_root / resolved_id
-            local_config, _ = cls._read_config(local_root, local_dir)
-            if local_config or requested_source == "local":
-                reference_id_from_config = safe_resource_id(local_config.get("id"), resolved_id)
-                return cls(reference_id_from_config, local_dir, dict(local_config), "local")
+            store = LocalPricingReferenceStore(resolved_id)
+            with store.locked(create=False) as locked_store:
+                pack, _ = locked_store.read() if locked_store is not None else (None, None)
+                if exact:
+                    if pack is None or pack.config.get("id") != resolved_id or not pack.catalog()["items"]:
+                        yield None
+                    else:
+                        yield pack
+                    return
+                if pack is not None or requested_source == "local":
+                    yield pack or cls(resolved_id, store.directory, {}, "local", b"{}")
+                    return
 
-        bundled_root = bundled_pricing_references_root()
-        reference_dir = bundled_root / resolved_id
-        config, _ = cls._read_config(bundled_root, reference_dir)
-        if not config and resolved_id != DEFAULT_PRICING_REFERENCE_ID and requested_source != "local":
-            return cls.resolve(DEFAULT_PRICING_REFERENCE_ID, source=requested_source)
-        reference_id_from_config = safe_resource_id(config.get("id"), resolved_id)
-        return cls(reference_id_from_config, reference_dir, dict(config))
+        root = bundled_pricing_references_root()
+        directory = root / resolved_id
+        config, catalog_path = cls._read_config(root, directory)
+        if exact:
+            catalog = load_json_file(catalog_path) if config.get("id") == resolved_id else {}
+            if not isinstance(catalog.get("items"), list) or not catalog["items"]:
+                yield None
+                return
+        elif not config and resolved_id != DEFAULT_PRICING_REFERENCE_ID:
+            with cls.read_scope(DEFAULT_PRICING_REFERENCE_ID, source=requested_source) as pack:
+                yield pack
+            return
+        yield cls(safe_resource_id(config.get("id"), resolved_id), directory, config)
+
+    @classmethod
+    def resolve(cls, reference_id: str | None = None, source: str = "") -> "PricingReferencePack":
+        with cls.read_scope(reference_id, source) as pack:
+            return pack
 
     @classmethod
     def resolve_exact(cls, reference_id: Any, source: Any) -> "PricingReferencePack" | None:
-        if not isinstance(reference_id, str) or not PROFILE_ID_RE.fullmatch(reference_id):
-            return None
-        if not isinstance(source, str) or source not in {"local", "bundled"}:
-            return None
-        root = pricing_references_root() if source == "local" else bundled_pricing_references_root()
-        reference_dir = root / reference_id
         try:
-            config, catalog_path = cls._read_config(root, reference_dir)
-        except PricingReferencePathError:
+            with cls.read_scope(reference_id, source, exact=True) as pack:
+                return pack
+        except (PricingReferencePathError, SqagStorageAccessError):
             return None
-        if (
-            not isinstance(config, dict)
-            or not isinstance(config.get("id"), str)
-            or config.get("id") != reference_id
-        ):
-            return None
-        catalog = load_json_file(catalog_path)
-        if not isinstance(catalog, dict) or not isinstance(catalog.get("items"), list) or not catalog.get("items"):
-            return None
-        return cls(reference_id, reference_dir, dict(config), source)
+
+    def catalog(self) -> dict[str, Any]:
+        if self.catalog_bytes is not None:
+            return json.loads(self.catalog_bytes)
+        return load_json_file(self.pricing_catalog_path)
 
     def asset_path(self, key: str, fallback_filename: str) -> Path:
         filename = clean_text(self.config.get(key)) or fallback_filename
@@ -18338,7 +18765,7 @@ class PricingReferencePack:
 
     def public_summary(self, catalog: dict[str, Any] | None = None) -> dict[str, Any]:
         if catalog is None:
-            catalog = load_json_file(self.pricing_catalog_path)
+            catalog = self.catalog()
         items = catalog.get("items") if isinstance(catalog.get("items"), list) else []
         return {
             "id": self.id or DEFAULT_PRICING_REFERENCE_ID,
@@ -18348,19 +18775,21 @@ class PricingReferencePack:
             "currency": normalize_currency_label(self.config.get("currency")),
             "item_count": len(items),
             "source": self.source,
-            "digest_sha256": pricing_reference_catalog_digest(catalog),
-            "authority_items": pricing_reference_authority_items(catalog),
+            "digest_sha256": pricing_reference_catalog_digest(catalog, exact_order=pricing_reference_has_exact_order(self.config)),
+            "authority_items": pricing_reference_authority_items(catalog, exact_order=pricing_reference_has_exact_order(self.config)),
         }
 
-    def public_detail(self) -> dict[str, Any]:
-        catalog = load_json_file(self.pricing_catalog_path)
+    def public_detail(self, catalog: dict[str, Any] | None = None) -> dict[str, Any]:
+        if catalog is None:
+            catalog = self.catalog()
         raw_items = catalog.get("items") if isinstance(catalog.get("items"), list) else []
         items = [dict(item) for item in raw_items if isinstance(item, dict)]
-        ensure_pricing_reference_order_fields(items)
+        exact_order = pricing_reference_has_exact_order(self.config)
+        ensure_pricing_reference_order_fields(items, exact_order=exact_order)
         detail = self.public_summary(catalog)
         detail.update({
             "schema_version": int(parse_pricing_number(catalog.get("schema_version")) or 1),
-            "items": sorted_pricing_reference_items(items),
+            "items": sorted_pricing_reference_items(items, exact_order=exact_order),
             "item_count": len(items),
         })
         return detail
@@ -18403,13 +18832,6 @@ def load_pricing_reference_pack(reference_id: str | None = None, source: str = "
 def pricing_reference_tax(reference_id: str | None = None) -> dict[str, Any]:
     resolved_id = safe_resource_id(reference_id, DEFAULT_PRICING_REFERENCE_ID)
     return normalized_tax_config(load_pricing_reference_pack(resolved_id).config.get("tax"))
-
-
-def profile_pricing_catalog_path(profile_id: str | None = None) -> Path:
-    if profile_id is None:
-        return load_pricing_reference_pack(workspace_pricing_reference_id()).pricing_catalog_path
-    profile = load_profile_pack(profile_id)
-    return load_pricing_reference_pack(profile.default_pricing_reference_id()).pricing_catalog_path
 
 
 def profile_quotation_layout_path(profile_id: str | None = None) -> Path:
@@ -18469,29 +18891,46 @@ def list_profiles() -> list[dict[str, Any]]:
 
 
 def list_local_pricing_references() -> list[dict[str, Any]]:
-    root = pricing_references_root()
-    references: list[dict[str, Any]] = []
-    if root.exists():
-        for path in sorted(root.iterdir()):
-            if not path.is_dir() or not PROFILE_ID_RE.fullmatch(path.name):
-                continue
-            if not (path / "reference.json").is_file():
-                continue
-            try:
-                reference = load_pricing_reference_pack(path.name, source="local")
-                if reference.config:
-                    references.append(reference.public_summary())
-            except PricingReferencePathError:
-                continue
-    if references:
-        return sorted(
-            references,
-            key=lambda item: (
-                clean_text(item.get("label") or item.get("id")).casefold(),
-                clean_text(item.get("id")).casefold(),
-            ),
-        )
-    return []
+    try:
+        root = pricing_references_root().resolve()
+        candidates = {
+            path.name for path in root.iterdir()
+            if PROFILE_ID_RE.fullmatch(path.name) and path.is_dir()
+        } if root.exists() else set()
+        # The identity directory is created before the first rename and retained
+        # after cleanup. An edit in the rename gap is therefore still discoverable.
+        candidates.update(LocalPricingReferenceStore.transaction_ids(root))
+    except (OSError, PricingReferencePathError) as exc:
+        raise SqagStorageAccessError("Saved pricing references are unavailable.") from exc
+    references = []
+    for reference_id in sorted(candidates):
+        try:
+            # Listing never creates a lock for an id that has no pack or identity.
+            with LocalPricingReferenceStore(reference_id).locked(create=False) as store:
+                if store is None or not (store.directory / "reference.json").is_file():
+                    continue
+                pack, _ = store.read()
+                if pack is not None:
+                    references.append(pack.public_summary())
+        except PricingReferencePathError:
+            continue
+        except (OSError, SqagStorageAccessError) as exc:
+            log_unavailable_listed_pricing_reference(reference_id, "local", exc)
+    return sorted(references, key=lambda item: (item["label"].casefold(), item["id"].casefold()))
+
+
+def log_unavailable_listed_pricing_reference(reference_id: str, source: str, exc: Exception) -> str:
+    """Keep one damaged pack out of a listing without hiding it from support."""
+    error_reference = new_error_reference()
+    write_local_log("server_error", {
+        "source": "pricing_reference_listing",
+        "error_reference": error_reference,
+        "reference_id": reference_id,
+        "pricing_reference_source": source,
+        "reason": getattr(exc, "reason", "storage_unavailable"),
+        "errors": safe_error_messages([str(exc)]),
+    })
+    return error_reference
 
 
 def list_bundled_pricing_references() -> list[dict[str, Any]]:
@@ -18592,8 +19031,10 @@ def pricing_reference_visible_item_signature(item: dict[str, Any]) -> dict[str, 
         "internal_cost": parse_pricing_number(item.get("internal_cost") or item.get("cost")),
         "markup_multiplier": parse_pricing_number(item.get("markup_multiplier") or item.get("markup")),
         "remarks": pricing_reference_visible_remarks_signature(item.get("remarks") or item.get("remark")),
-        "category_order": pricing_reference_order_number(item.get("category_order")),
-        "item_order": pricing_reference_order_number(item.get("item_order")),
+        "category_order": catalogue_order_number(item.get("category_order")),
+        "item_order": catalogue_order_number(item.get("item_order")),
+        "category_order_tie": pricing_reference_order_tie(item, "category_order", catalogue_order_number(item.get("category_order"))),
+        "item_order_tie": pricing_reference_order_tie(item, "item_order", catalogue_order_number(item.get("item_order"))),
     }
 
 
@@ -18616,12 +19057,6 @@ def pricing_reference_payload_matches_existing_pack(payload: dict[str, Any], exi
     payload_signature = pricing_reference_visible_signature(payload)
     existing_signature = pricing_reference_visible_signature(existing)
     return payload_signature == existing_signature
-
-
-def pricing_reference_unchanged_save_summary(storage: SqagStorage, reference_id: str, source: str, existing: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(storage, DatabaseSqagStorage):
-        return public_company_pricing_reference(existing)
-    return load_pricing_reference_pack(reference_id, source=source).public_summary()
 
 
 def pricing_reference_payload_updates_existing_pack(payload: dict[str, Any], reference_id: str) -> bool:
@@ -19510,6 +19945,13 @@ def normalize_owned_line_item(
         item["status"] = "unmatched"
     trusted_price = pricing_authority_price(authority)
     authority_variant = clean_text(authority.get("variant")).lower()
+    if authority_variant == "catalog" and catalog_item:
+        # A validated catalogue match can restore orders that the quote draft
+        # wire format cannot carry. Keep that format's limit on caller values.
+        for order_key in ("category_order", "item_order"):
+            order = catalogue_order_number(catalog_item.get(order_key))
+            if order is not None and order > PRIMARY_ORDER_MAX:
+                item[order_key] = order
     authority_is_untrusted = raw_authority_present and authority_variant not in PRICING_AUTHORITY_TRUSTED_VARIANTS
     if authority_is_untrusted:
         for stale_key in (
@@ -19883,7 +20325,7 @@ def normalize_line_items(
             "source_basis_line_id": safe_resource_id(raw.get("source_basis_line_id"), ""),
         }
         for order_key in ("category_order", "item_order"):
-            order_value = pricing_reference_order_number((catalog_item or {}).get(order_key)) or raw.get(order_key)
+            order_value = catalogue_order_number((catalog_item or {}).get(order_key)) or raw.get(order_key)
             if order_value is not None:
                 item[order_key] = order_value
         if raw.get("basis_order") is not None:
@@ -20290,7 +20732,10 @@ def payload_to_brief(
         "currency": quote_currency_from_payload(payload, auth_session=auth_session),
         "exchange_rate": quote_exchange_rate_from_payload(payload),
         "tax": quote_tax_from_payload(payload, auth_session=auth_session),
-        "line_items": normalize_line_items_for_final_brief(payload, auth_session=auth_session),
+        "line_items": [
+            canonicalize_primary_order_fields(row)
+            for row in normalize_line_items_for_final_brief(payload, auth_session=auth_session)
+        ],
         "payment_terms": multiline_list(quote_text.get("payment_terms") or payload.get("payment_terms")),
         "terms_heading": clean_text(quote_text.get("terms_heading")),
         "cheque_payee": clean_text(quote_text.get("cheque_payee")),
@@ -20757,12 +21202,8 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 def pricing_catalog_prompt_rows(reference_id: str | None = None, source: str = "") -> list[dict[str, Any]]:
-    try:
-        pack = load_pricing_reference_pack(reference_id, source=source)
-        payload = json.loads(pack.pricing_catalog_path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    return pricing_catalog_prompt_rows_from_reference(payload)
+    pack = load_pricing_reference_pack(reference_id, source=source)
+    return pricing_catalog_prompt_rows_from_reference(pack.catalog())
 
 
 def pricing_catalog_prompt_rows_from_reference(reference: dict[str, Any]) -> list[dict[str, Any]]:
@@ -20779,8 +21220,8 @@ def pricing_catalog_prompt_rows_from_reference(reference: dict[str, Any]) -> lis
         row = {
             "id": clean_text(item.get("id")),
             "section": clean_text(item.get("section")),
-            "category_order": pricing_reference_order_number(item.get("category_order")),
-            "item_order": pricing_reference_order_number(item.get("item_order")),
+            "category_order": catalogue_order_number(item.get("category_order")),
+            "item_order": catalogue_order_number(item.get("item_order")),
             "unit_hint": clean_text(item.get("unit_hint")),
             "description": clean_customer_quote_line_text(item.get("description"))[:MAX_PROMPT_CATALOG_DESCRIPTION_CHARS],
             "remarks": [
@@ -20821,8 +21262,10 @@ def local_pricing_reference_items(
     auth_session: dict[str, Any] | None = None,
     *,
     include_unpriced: bool = False,
+    reference: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
+    if reference is None:
+        reference = runtime_pricing_reference_from_payload(payload, auth_session=auth_session)
     if not reference:
         return []
     visual_base_dir = runtime_pricing_reference_visual_base_dir(payload, auth_session=auth_session)
@@ -20849,8 +21292,8 @@ def local_pricing_reference_items(
             "id": clean_text(raw.get("id")) or f"local-item-{len(items) + 1}",
             "section": clean_text(raw.get("section")),
             "reference_section": clean_basis_section_title(raw.get("reference_section") or raw.get("section")),
-            "category_order": pricing_reference_order_number(raw.get("category_order")),
-            "item_order": pricing_reference_order_number(raw.get("item_order")),
+            "category_order": catalogue_order_number(raw.get("category_order")),
+            "item_order": catalogue_order_number(raw.get("item_order")),
             "unit_hint": clean_text(raw.get("unit_hint")),
             "description": clean_customer_quote_line_text(description),
             "internal_cost": cost,
@@ -20930,44 +21373,19 @@ def catalog_visual_image_entries_for_payload(
     snapshot = pricing_reference_snapshot_for_payload(payload)
     if snapshot is not None:
         return snapshot.visual_images()[:limit]
-    if pricing_reference_authority_error(payload, auth_session=auth_session):
-        return []
     if runtime_pricing_reference_from_payload(payload, auth_session=auth_session):
         return []
-    try:
-        pack = pricing_reference_pack_for_payload(payload)
-        data = json.loads(pack.pricing_catalog_path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
-        source_items = []
-        visual_base_dir = None
-    else:
-        source_items = [item for item in data.get("items") or [] if isinstance(item, dict)]
-        visual_base_dir = pack.directory
-    return catalog_visual_image_entries_for_items(source_items, visual_base_dir, limit=limit)
-
-
-def catalog_visual_image_entries_for_snapshot_detail(
-    detail: dict[str, Any],
-    source: str,
-    reference_id: str,
-    limit: int = MAX_PROMPT_CATALOG_VISUAL_IMAGES,
-) -> list[dict[str, Any]]:
-    if source not in {"local", "bundled"}:
+    selection = explicit_pricing_reference_selection(payload)
+    if not selection["ok"] or selection["source"] not in {"local", "bundled"} or configured_storage_mode() == "database":
         return []
     try:
-        visual_base_dir = (
-            pricing_reference_pack_dir(reference_id)
-            if source == "local"
-            else bundled_pricing_reference_pack_dir(reference_id)
-        )
-    except ValueError:
+        with PricingReferencePack.read_scope(selection["id"], selection["source"], exact=True) as pack:
+            if pack is None:
+                return []
+            items = [item for item in pack.catalog()["items"] if isinstance(item, dict)]
+            return catalog_visual_image_entries_for_items(items, pack.directory, limit=limit)
+    except PricingReferencePathError:
         return []
-    items = detail.get("items") if isinstance(detail.get("items"), list) else []
-    return catalog_visual_image_entries_for_items(
-        [item for item in items if isinstance(item, dict)],
-        visual_base_dir,
-        limit=limit,
-    )
 
 
 def catalog_visual_image_entries_for_items(
@@ -20982,8 +21400,8 @@ def catalog_visual_image_entries_for_items(
         if not refs:
             continue
         label = clean_text(f"{item.get('id')}: {item.get('description')}")
-        category_order = pricing_reference_order_number(item.get("category_order")) or 10**9
-        item_order = pricing_reference_order_number(item.get("item_order")) or 10**9
+        category_order = catalogue_order_number(item.get("category_order")) or 10**9
+        item_order = catalogue_order_number(item.get("item_order")) or 10**9
         for ref in refs:
             data_url = clean_text(ref.get("data_url"))
             if not data_url:
@@ -21038,7 +21456,7 @@ def pricing_catalog_runtime_lookup_for_payload(
     payload_json = runtime_pricing_catalog_payload_for_payload(payload, auth_session=auth_session)
     if payload_json is None:
         try:
-            payload_json = json.loads(pricing_reference_pack_for_payload(payload).pricing_catalog_path.read_text(encoding="utf-8-sig"))
+            payload_json = pricing_reference_pack_for_payload(payload).catalog()
         except (OSError, json.JSONDecodeError):
             return {}
     return pricing_catalog_runtime_lookup(payload_json)
@@ -22244,7 +22662,7 @@ def quote_basis_sections_with_catalog_exact_lines(
         if catalog_unit_price is not None:
             line["catalog_unit_price"] = catalog_unit_price
         for order_key in ("category_order", "item_order"):
-            order_value = pricing_reference_order_number(item.get(order_key))
+            order_value = catalogue_order_number(item.get(order_key))
             if order_value is not None:
                 line[order_key] = order_value
         display_detail_source = display_detail_source_for_catalog_line(line, catalog_description, item.get("description"))
@@ -22748,9 +23166,9 @@ def line_items_with_resolved_basis_catalog(
             next_item["catalog_unit_price"] = catalog_unit_price
         for order_key in ("category_order", "item_order"):
             order_value = (
-                pricing_reference_order_number(basis_line.get(order_key))
-                or pricing_reference_order_number(catalog_item.get(order_key))
-                or pricing_reference_order_number(item.get(order_key))
+                catalogue_order_number(basis_line.get(order_key))
+                or catalogue_order_number(catalog_item.get(order_key))
+                or catalogue_order_number(item.get(order_key))
             )
             if order_value is not None:
                 next_item[order_key] = order_value
@@ -23102,9 +23520,9 @@ def line_items_aligned_to_quote_basis(
                     next_item["pricing_authority"] = build_pricing_authority("none", next_item)
             for order_key in ("category_order", "item_order"):
                 order_value = (
-                    pricing_reference_order_number(line.get(order_key))
-                    or pricing_reference_order_number((catalog_item or {}).get(order_key))
-                    or pricing_reference_order_number(existing.get(order_key))
+                    catalogue_order_number(line.get(order_key))
+                    or catalogue_order_number((catalog_item or {}).get(order_key))
+                    or catalogue_order_number(existing.get(order_key))
                 )
                 if order_value is not None:
                     next_item[order_key] = order_value
@@ -23875,7 +24293,7 @@ def line_items_with_confirmed_basis_selections(
             next_item["pricing_basis_amount"], quote_exchange_rate_from_payload(payload) or 1,
         )
         for key in ("category_order", "item_order"):
-            value = pricing_reference_order_number(catalog_item.get(key))
+            value = catalogue_order_number(catalog_item.get(key))
             if value is not None:
                 next_item[key] = value
         result.append(next_item)
@@ -24357,7 +24775,7 @@ def apply_pricing_selections(
             # Same contract as /api/line-items/normalize, plus each selection's outcome.
             "status": "normalized",
             "selections": outcomes,
-            "line_items": line_items,
+            "line_items": [canonicalize_primary_order_fields(row) for row in line_items],
             "quote_session": {**saved, "pricing_ledger": public_pricing_ledger(persisted)},
         }
 
@@ -26414,6 +26832,15 @@ def completed_draft_with_pricing_reference_snapshot(
             {**payload, "quote_basis_sections": completed.get("quote_basis_sections", [])},
             completed["line_items"], auth_session, offer=True, source_measurements=measurements,
         )
+    # Exact catalogue values have already served as sort keys. The quote wire
+    # format still admits only JavaScript-safe primary orders.
+    if isinstance(completed.get("line_items"), list):
+        completed["line_items"] = [canonicalize_primary_order_fields(row) for row in completed["line_items"]]
+    if isinstance(completed.get("quote_basis_sections"), list):
+        completed["quote_basis_sections"] = [
+            {**section, "lines": [canonicalize_primary_order_fields(line) for line in section["lines"]]}
+            for section in completed["quote_basis_sections"]
+        ]
     return completed
 
 
@@ -32703,11 +33130,17 @@ def _run_quote_job(
         publication_patch = quote_session_patch_payload(payload)
         publication_draft_state = quote_session_draft_state(publication_patch)
     if quote_session_strict_revision_number(publication_draft_state.get("outputRevision"), -1) >= 0:
+        # Local and company job catalogues already carry the selected projection.
+        # Applying the legacy numeric conversion again would round exact orders.
+        pricing_digest = pricing_reference_catalog_digest(
+            pricing_snapshot_for_publication,
+            exact_order=True if selected_pricing.get("source") in {"local", "company"} else None,
+        )
         result["_publication_authority"] = {
             "pricing_reference": {
                 "id": selected_pricing.get("id") if selected_pricing.get("ok") else "",
                 "source": selected_pricing.get("source") if selected_pricing.get("ok") else "",
-                "digest": pricing_reference_catalog_digest(pricing_snapshot_for_publication),
+                "digest": pricing_digest,
             },
             "profile": {
                 "id": profile_identity_value(selected_profile_id, selected_profile_source),
@@ -33375,33 +33808,39 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_app_storage()
             if storage is None:
                 return
-            workspace = storage.workspace()
-            company_profiles = []
-            if self.current_permissions().get("canGenerateQuote"):
-                company_profiles = [
-                    public_database_profile_summary(profile)
-                    for profile in storage.list_company_profiles()
-                    if isinstance(profile, dict)
-                    and safe_resource_id(profile.get("id") or profile.get("label"), "")
-                ]
-                company_profiles.sort(
-                    key=lambda item: (
-                        clean_text(item.get("label") or item.get("id")).casefold(),
-                        clean_text(item.get("id")).casefold(),
+            try:
+                workspace = storage.workspace()
+                company_profiles = []
+                if self.current_permissions().get("canGenerateQuote"):
+                    company_profiles = [
+                        public_database_profile_summary(profile)
+                        for profile in storage.list_company_profiles()
+                        if isinstance(profile, dict)
+                        and safe_resource_id(profile.get("id") or profile.get("label"), "")
+                    ]
+                    company_profiles.sort(
+                        key=lambda item: (
+                            clean_text(item.get("label") or item.get("id")).casefold(),
+                            clean_text(item.get("id")).casefold(),
+                        )
                     )
-                )
-            available_profiles = storage.list_profiles()
-            default_profile_id = workspace_profile_pack_id(workspace)
-            if isinstance(storage, DatabaseSqagStorage) and not any(
-                item["id"] == default_profile_id for item in available_profiles
-            ):
-                default_profile_id = ""
-                workspace = copy.deepcopy(workspace)
-                workspace.get("defaults", {}).pop("profile_id", None)
+                available_profiles = storage.list_profiles()
+                default_profile_id = workspace_profile_pack_id(workspace)
+                if isinstance(storage, DatabaseSqagStorage) and not any(
+                    item["id"] == default_profile_id for item in available_profiles
+                ):
+                    default_profile_id = ""
+                    workspace = copy.deepcopy(workspace)
+                    workspace.get("defaults", {}).pop("profile_id", None)
+                pricing_references = storage.list_pricing_references()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             self.send_json({
                 "profiles": available_profiles,
                 "company_profiles": company_profiles,
-                "pricing_references": storage.list_pricing_references(),
+                "pricing_references": pricing_references,
+                "pricing_reference_order_digit_limit": integer_digit_limit(),
                 "default_profile_id": default_profile_id,
                 "default_pricing_reference_id": workspace_pricing_reference_id(workspace),
                 "company_id": workspace["company"]["id"],
@@ -33416,14 +33855,20 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_app_storage()
             if storage is None:
                 return
-            workspace = storage.workspace()
+            try:
+                workspace = storage.workspace()
+                pricing_references = storage.list_pricing_references()
+                profiles = storage.list_profiles()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             self.send_json({
                 "status": "ok",
                 "company_id": workspace["company"]["id"],
                 "workspace": workspace,
                 "permissions": self.current_permissions(),
-                "pricing_references": storage.list_pricing_references(),
-                "profiles": storage.list_profiles(),
+                "pricing_references": pricing_references,
+                "profiles": profiles,
             })
             return
         if path == "/api/settings/pricing-references":
@@ -33434,7 +33879,12 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             storage = self.current_app_storage()
             if storage is None:
                 return
-            self.send_json({"pricing_references": storage.list_pricing_references()})
+            try:
+                pricing_references = storage.list_pricing_references()
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
+            self.send_json({"pricing_references": pricing_references})
             return
         pricing_reference_export_match = re.fullmatch(r"/api/settings/pricing-references/([A-Za-z0-9_-]+)/export\.xlsx", path)
         if pricing_reference_export_match:
@@ -33449,6 +33899,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if storage is None:
                     return
                 export = storage.pricing_reference_export_xlsx(pricing_reference_export_match.group(1), source=source)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             except ValueError as exc:
                 self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
                 return
@@ -33471,6 +33924,9 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 if storage is None:
                     return
                 detail = storage.pricing_reference_detail(pricing_reference_detail_match.group(1), source=source)
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             except ValueError as exc:
                 self.send_json({"status": "blocked", "errors": safe_error_messages([str(exc)])}, status=400)
                 return
@@ -33631,21 +34087,32 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 storage = self.current_app_storage()
                 if storage is None:
                     return
-                existing = storage.pricing_reference_detail(reference_id, source=source) if reference_id else None
+                before_save = storage.pricing_reference_save_snapshot(reference_id, source)
+                existing = before_save.selected
+                updates_existing = pricing_reference_payload_updates_existing_pack(payload, reference_id)
+                if payload.get("update_existing") is True:
+                    if not updates_existing:
+                        raise ValueError("The selected pricing reference does not match the requested edit.")
+                    if existing is None:
+                        raise SqagStorageAccessError(
+                            "The selected pricing reference is unavailable.",
+                            status=404, reason="pricing_reference_missing",
+                        )
                 if existing and pricing_reference_payload_matches_existing_pack(payload, existing):
-                    pricing_reference_summary = pricing_reference_unchanged_save_summary(storage, reference_id, source, existing)
-                    self.send_json({
-                        "status": "unchanged",
-                        "pricing_reference": pricing_reference_summary,
-                        "unchanged": True,
-                    })
+                    summary = (
+                        public_company_pricing_reference(existing) if existing["source"] == "company"
+                        else {key: value for key, value in existing.items() if key not in {"items", "schema_version"}}
+                    )
+                    self.send_json({"status": "unchanged", "pricing_reference": summary, "unchanged": True})
                     return
-                if existing and not pricing_reference_payload_updates_existing_pack(payload, reference_id):
+                if existing and not updates_existing:
                     label = clean_text(existing.get("label")) or reference_id
                     raise ValueError(
                         f'A pricing reference named "{label}" already exists. '
                         "Choose a different pricing reference name, or switch to Manage to edit it."
                     )
+                if before_save.destination_revision is not None and (not existing or existing["source"] == "bundled"):
+                    raise pricing_reference_revision_conflict()
                 reference = normalize_pricing_reference_payload(payload)
                 if pricing_reference_payload_has_visual_artifacts(reference):
                     try:
@@ -33658,7 +34125,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     auth_session=auth_session,
                 ):
                     reference, metadata_enrichment_status = pricing_reference_with_ai_metadata_before_save(reference)
-                saved = storage.save_pricing_reference(reference)
+                saved = storage.save_pricing_reference(reference, before_save=before_save)
                 append_runtime_telemetry(
                     auth_session,
                     "pricing_change",
@@ -33804,43 +34271,44 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            commercial_review_block = quote_commercial_review_preflight(
-                payload,
-                auth_session=auth_session,
-            )
-            if commercial_review_block:
-                self.send_json(commercial_review_block, status=400)
-                return
-            pricing_reference_error = pricing_reference_authority_error(
-                payload,
-                auth_session=self.current_auth_session(),
-            )
-            if pricing_reference_error:
-                if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
-                    log_database_pricing_reference_resolution_block(payload)
-                self.send_json(
-                    pricing_reference_authority_blocked_result(
-                        payload,
-                        [pricing_reference_error],
-                        auth_session=self.current_auth_session(),
-                    ),
-                    status=400,
-                )
-                return
-            resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
-            if resolved_payload is None:
-                log_database_pricing_reference_resolution_block(payload)
-                self.send_json(
-                    pricing_reference_authority_blocked_result(
-                        payload,
-                        [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
-                        auth_session=self.current_auth_session(),
-                    ),
-                    status=400,
-                )
-                return
-            payload = resolved_payload
+            # A damaged selected pack fails closed with a support reference (#375).
             try:
+                commercial_review_block = quote_commercial_review_preflight(
+                    payload,
+                    auth_session=auth_session,
+                )
+                if commercial_review_block:
+                    self.send_json(commercial_review_block, status=400)
+                    return
+                pricing_reference_error = pricing_reference_authority_error(
+                    payload,
+                    auth_session=self.current_auth_session(),
+                )
+                if pricing_reference_error:
+                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                        log_database_pricing_reference_resolution_block(payload)
+                    self.send_json(
+                        pricing_reference_authority_blocked_result(
+                            payload,
+                            [pricing_reference_error],
+                            auth_session=self.current_auth_session(),
+                        ),
+                        status=400,
+                    )
+                    return
+                resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+                if resolved_payload is None:
+                    log_database_pricing_reference_resolution_block(payload)
+                    self.send_json(
+                        pricing_reference_authority_blocked_result(
+                            payload,
+                            [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+                            auth_session=self.current_auth_session(),
+                        ),
+                        status=400,
+                    )
+                    return
+                payload = resolved_payload
                 line_items = normalize_line_items_for_quote_basis_review(
                     payload,
                     auth_session=self.current_auth_session(),
@@ -33848,7 +34316,10 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             except SqagStorageAccessError as exc:
                 self.send_json(storage_access_error_payload(exc), status=exc.status)
                 return
-            self.send_json({"status": "normalized", "line_items": line_items})
+            self.send_json({
+                "status": "normalized",
+                "line_items": [canonicalize_primary_order_fields(row) for row in line_items],
+            })
             return
 
         if parsed.path == "/api/quote-sessions/pricing-selections":
@@ -33860,10 +34331,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            persistence_review = quote_commercial_persistence_preflight(
-                payload,
-                auth_session=auth_session,
-            )
+            try:
+                persistence_review = quote_commercial_persistence_preflight(
+                    payload,
+                    auth_session=auth_session,
+                )
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             if persistence_review:
                 self.send_json(
                     {
@@ -33906,10 +34381,15 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            commercial_review_block = quote_commercial_review_preflight(
-                payload,
-                auth_session=auth_session,
-            )
+            # A damaged selected pack fails closed with a support reference (#375).
+            try:
+                commercial_review_block = quote_commercial_review_preflight(
+                    payload,
+                    auth_session=auth_session,
+                )
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             if commercial_review_block:
                 self.send_json(commercial_review_block, status=400)
                 return
@@ -33928,60 +34408,64 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     write_local_log("draft_blocked", {"errors": errors})
                     self.send_json({"status": "blocked", "errors": errors}, status=400)
                     return
-                pricing_reference_error = pricing_reference_authority_error(
-                    payload,
-                    auth_session=self.current_auth_session(),
-                )
-                if pricing_reference_error:
-                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                try:
+                    pricing_reference_error = pricing_reference_authority_error(
+                        payload,
+                        auth_session=self.current_auth_session(),
+                    )
+                    if pricing_reference_error:
+                        if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                            log_database_pricing_reference_resolution_block(payload)
+                        errors = safe_error_messages([pricing_reference_error])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json(
+                            pricing_reference_authority_blocked_result(
+                                payload,
+                                errors,
+                                auth_session=self.current_auth_session(),
+                            ),
+                            status=400,
+                        )
+                        return
+                    missing_details = quote_detail_missing_fields(payload)
+                    if missing_details:
+                        errors = safe_error_messages([f"Fill quote details before AI analysis: {', '.join(missing_details)}."])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json({"status": "blocked", "errors": errors}, status=400)
+                        return
+                    pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
+                    if pricing_reference_error:
+                        if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                            log_database_pricing_reference_resolution_block(payload)
+                        errors = safe_error_messages([pricing_reference_error])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json(
+                            pricing_reference_authority_blocked_result(
+                                payload,
+                                errors,
+                                auth_session=self.current_auth_session(),
+                            ),
+                            status=400,
+                        )
+                        return
+                    resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+                    if resolved_payload is None:
                         log_database_pricing_reference_resolution_block(payload)
-                    errors = safe_error_messages([pricing_reference_error])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json(
-                        pricing_reference_authority_blocked_result(
-                            payload,
-                            errors,
-                            auth_session=self.current_auth_session(),
-                        ),
-                        status=400,
-                    )
+                        errors = safe_error_messages([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json(
+                            pricing_reference_authority_blocked_result(
+                                payload,
+                                errors,
+                                auth_session=self.current_auth_session(),
+                            ),
+                            status=400,
+                        )
+                        return
+                    payload = resolved_payload
+                except SqagStorageAccessError as exc:
+                    self.send_json(storage_access_error_payload(exc), status=exc.status)
                     return
-                missing_details = quote_detail_missing_fields(payload)
-                if missing_details:
-                    errors = safe_error_messages([f"Fill quote details before AI analysis: {', '.join(missing_details)}."])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json({"status": "blocked", "errors": errors}, status=400)
-                    return
-                pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
-                if pricing_reference_error:
-                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
-                        log_database_pricing_reference_resolution_block(payload)
-                    errors = safe_error_messages([pricing_reference_error])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json(
-                        pricing_reference_authority_blocked_result(
-                            payload,
-                            errors,
-                            auth_session=self.current_auth_session(),
-                        ),
-                        status=400,
-                    )
-                    return
-                resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
-                if resolved_payload is None:
-                    log_database_pricing_reference_resolution_block(payload)
-                    errors = safe_error_messages([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json(
-                        pricing_reference_authority_blocked_result(
-                            payload,
-                            errors,
-                            auth_session=self.current_auth_session(),
-                        ),
-                        status=400,
-                    )
-                    return
-                payload = resolved_payload
                 try:
                     binding = bind_quote_spend(payload, auth_session, "draft")
                     requested_job_id = clean_text(self.headers.get("Idempotency-Key"))
@@ -34323,24 +34807,29 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "blocked", "reason_code": "pricing_selection_invalid",
                             "errors": ["Pricing selection request is invalid."]}, status=400)
             return
-        commercial_review_block = quote_commercial_review_preflight(payload, auth_session=auth_session)
-        if commercial_review_block:
-            self.send_json(commercial_review_block, status=400)
-            return
-        pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
-        if pricing_reference_error:
-            if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+        # A damaged selected pack fails closed with a support reference (#375).
+        try:
+            commercial_review_block = quote_commercial_review_preflight(payload, auth_session=auth_session)
+            if commercial_review_block:
+                self.send_json(commercial_review_block, status=400)
+                return
+            pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
+            if pricing_reference_error:
+                if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                    log_database_pricing_reference_resolution_block(payload)
+                self.send_json(pricing_reference_authority_blocked_result(
+                    payload, [pricing_reference_error], auth_session=self.current_auth_session(),
+                ), status=400)
+                return
+            resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+            if resolved_payload is None:
                 log_database_pricing_reference_resolution_block(payload)
-            self.send_json(pricing_reference_authority_blocked_result(
-                payload, [pricing_reference_error], auth_session=self.current_auth_session(),
-            ), status=400)
-            return
-        resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
-        if resolved_payload is None:
-            log_database_pricing_reference_resolution_block(payload)
-            self.send_json(pricing_reference_authority_blocked_result(
-                payload, [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], auth_session=self.current_auth_session(),
-            ), status=400)
+                self.send_json(pricing_reference_authority_blocked_result(
+                    payload, [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], auth_session=self.current_auth_session(),
+                ), status=400)
+                return
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
             return
         storage = self.current_quote_session_storage()
         if storage is None:

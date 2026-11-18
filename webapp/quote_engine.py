@@ -265,6 +265,20 @@ def pricing_reference_order_number(value: Any) -> int | None:
     return int(number)
 
 
+def catalogue_order_number(value: Any) -> int | None:
+    """Preserve exact catalogue orders and the historical input coercions."""
+    if type(value) is int:
+        return value if value > 0 else None
+    if isinstance(value, str):
+        digits = value.replace(",", "").strip()
+        if digits.isascii() and digits.isdigit():
+            try:
+                return int(digits) or None
+            except ValueError:
+                return None
+    return pricing_reference_order_number(value)
+
+
 def pricing_reference_sale_unit_price(item: dict[str, Any]) -> float | None:
     explicit = parse_pricing_number(item.get("sale_unit_price"))
     if explicit is not None and explicit >= 0:
@@ -1025,8 +1039,8 @@ def pricing_catalog_runtime_lookup(payload_json: dict[str, Any]) -> dict[str, di
             "id": item_id,
             "section": normalize_catalog_section(item.get("section")),
             "reference_section": reference_section or normalize_catalog_section(item.get("section")),
-            "category_order": pricing_reference_order_number(item.get("category_order")),
-            "item_order": pricing_reference_order_number(item.get("item_order")),
+            "category_order": catalogue_order_number(item.get("category_order")),
+            "item_order": catalogue_order_number(item.get("item_order")),
             "unit_hint": clean_text(item.get("unit_hint")),
             "description": clean_customer_quote_line_text(raw_description),
             "pricing_reference_description": raw_description,

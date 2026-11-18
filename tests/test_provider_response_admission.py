@@ -35,6 +35,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         self.enterContext(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(socket, "create_connection", side_effect=AssertionError("NETWORK_DENIED")))
         self.enterContext(mock.patch.object(s.urllib.request, "urlopen", side_effect=AssertionError("NETWORK_DENIED")))
+        self.pricing_root = self.enterContext(existing.local_pricing_fixture_root())
 
     def admit(self, value):
         return s.admit_provider_quote_draft(value, require_confidence=True)
@@ -43,7 +44,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
-             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"):
+             mock.patch.object(s, "pricing_references_root", return_value=self.pricing_root):
             prompt = s.build_quote_draft_prompt(existing.valid_payload())
         for text in ("one unique stable id", "same id in its linked line_items source_basis_line_id",
                      "linked to exactly one physical basis line", "positive JSON numbers",
@@ -60,7 +61,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
-             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
+             mock.patch.object(s, "pricing_references_root", return_value=self.pricing_root), \
              mock.patch.object(s, "catalog_visual_image_entries_for_payload", return_value=[]), \
              mock.patch.object(s, "normalize_ai_draft", return_value={"ok": True}), \
              mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
@@ -84,7 +85,7 @@ class ProviderAdmissionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, existing.isolated_env(OPENROUTER_API_KEY="synthetic-key"), clear=True), \
              mock.patch.object(s, "read_dotenv_value", side_effect=existing.env_only_dotenv_value), \
              mock.patch.object(s, "profiles_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"), \
-             mock.patch.object(s, "pricing_references_root", return_value=existing.QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"), \
+             mock.patch.object(s, "pricing_references_root", return_value=self.pricing_root), \
              mock.patch.object(s, "catalog_visual_image_entries_for_payload", return_value=[]), \
              mock.patch.object(s.urllib.request, "urlopen", return_value=response) as send:
             try:
@@ -413,6 +414,8 @@ class ProviderAdapterContractTest(unittest.TestCase):
         for route,suffix in cases:
             for mode in ("completed","incomplete","refusal"):
                 parsed={"items":[]} if route in {"import","metadata"} else draft()
+                if route == "import":
+                    parsed["currency"] = None
                 payload={"images":[{"name":"synthetic.png","data_url":synthetic_image()}],
                     "pricing_reference_id":self.detail["id"],"pricing_reference_source":"local",
                     "pricing_reference":self.detail,"_pricing_reference_snapshot":self.snapshot}
@@ -462,17 +465,17 @@ class ProviderAdapterContractTest(unittest.TestCase):
         for operation,suffix in (("basis_line","BASIS_LINE"),("basis_answer","BASIS_ANSWER"),("pricing_import","PRICING_IMPORT"),("pricing_metadata","PRICING_METADATA")):
             for status in ("completed","incomplete"):
                 model=configs["OPENROUTER_"+suffix+"_MODEL"]
-                envelope=responses_envelope(model,json.dumps({"items":[]}),status=status)
+                fixture = {"currency": None, "items": []} if operation == "pricing_import" else {"items": []}
+                envelope=responses_envelope(model,json.dumps(fixture),status=status)
                 response=FixtureHttpResponse(envelope)
-                gateway=s.configured_ai_gateway()
-                route=gateway.configuration.route(operation)
-                with self.subTest(operation=operation,status=status),mock.patch.object(s.urllib.request,"urlopen",return_value=response) as send:
-                    # Recreate the gateway while the exact opener is injected.
+                with (self.subTest(operation=operation,status=status), s.ai_log_tracking_scope({}),
+                      mock.patch.object(s.urllib.request,"urlopen",return_value=response) as send):
                     gateway=s.configured_ai_gateway()
+                    route=gateway.configuration.route(operation)
                     body={"model":route.model,"reasoning":{"effort":route.effort},"input":[{"role":"user","content":[{"type":"input_text","text":"Synthetic request"}]}]}
                     if status=="completed":
                         result=s.gateway_request(gateway,operation,body)
-                        self.assertEqual(s.parse_json_object(s.response_output_text(result)),{"items":[]})
+                        self.assertEqual(s.parse_json_object(s.response_output_text(result)), fixture)
                     else:
                         with self.assertRaises(s.OpenAIAnalysisError):s.gateway_request(gateway,operation,body)
                     self.assertEqual(send.call_count,1)

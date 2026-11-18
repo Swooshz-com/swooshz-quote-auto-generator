@@ -6,8 +6,10 @@ Business identity, measurement, catalogue and pricing guards remain in server.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import json
 import math
+import sys
 
 
 BASIS_TAGS = frozenset({"Include", "Confirm", "Custom", "Exclude"})
@@ -29,6 +31,33 @@ class ContractViolation(ValueError):
         self.missing_path = missing_path
 
 
+def integer_digit_limit() -> int:
+    # Reuse the JSON integer I/O limit so admitted orders remain serialisable.
+    return sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits
+
+
+def _bounded_json_integer(token: str) -> int:
+    if len(token.lstrip("-")) > integer_digit_limit():
+        raise ContractViolation("schema_json")
+    return int(token)
+
+
+def _bounded_json_decimal(token: str) -> Decimal:
+    # The JSON decoder has already recognised the number syntax. Remove
+    # insignificant zeros before constructing a bounded Decimal coefficient.
+    mantissa, _, exponent = token.lower().partition("e")
+    sign = "-" if mantissa.startswith("-") else ""
+    whole, _, fraction = mantissa.removeprefix("-").partition(".")
+    digits = (whole + fraction).lstrip("0")
+    coefficient = digits.rstrip("0")
+    if len(coefficient) > integer_digit_limit():
+        raise ContractViolation("schema_json")
+    # Let Decimal bound the exponent without converting its text to a large int.
+    scale = Decimal("1e" + exponent).as_tuple().exponent if exponent else 0
+    scale += len(digits) - len(coefficient) - len(fraction)
+    return Decimal(f"{sign}{coefficient or '0'}e{scale}")
+
+
 @dataclass(frozen=True)
 class Field:
     kind: str
@@ -42,6 +71,7 @@ class Field:
     maximum: int | None = None
     nonblank: bool = False
     positive: bool = False
+    decimal_wire: bool = False
 
     def schema(self):
         result = {"type": [self.kind, "null"] if self.nullable else self.kind}
@@ -82,8 +112,14 @@ class Field:
         valid = {"object": lambda: isinstance(value, dict),
                  "array": lambda: isinstance(value, list),
                  "string": lambda: isinstance(value, str),
-                 "integer": lambda: type(value) is int,
-                 "number": lambda: finite_number(value)}[self.kind]()
+                 "integer": lambda: type(value) is int or (
+                     self.decimal_wire and isinstance(value, Decimal) and value.is_finite()
+                     and value.adjusted() < integer_digit_limit()
+                     and value == value.to_integral_value()
+                 ),
+                 "number": lambda: finite_number(
+                     float(value) if self.decimal_wire and isinstance(value, Decimal) else value
+                 )}[self.kind]()
         if not valid or (self.enum and value not in self.enum):
             raise ContractViolation()
         if ((self.minimum is not None and value < self.minimum)
@@ -112,6 +148,8 @@ class Field:
                     if key in value and not (field.nullable and value[key] is None)}
         if self.kind == "array":
             return [self.item.adapt(entry) for entry in value]
+        if self.decimal_wire and isinstance(value, Decimal):
+            return int(value) if self.kind == "integer" else float(value)
         return value
 
 
@@ -123,6 +161,7 @@ def obj(**fields):
 class ResponseContract:
     name: str
     root: Field
+    exact_decimals: bool = False
 
     def text_format(self):
         return {"format": {"type": "json_schema", "name": self.name, "strict": True,
@@ -169,9 +208,12 @@ class ResponseContract:
             return value
 
         try:
-            value = json.loads(text, object_pairs_hook=unique, parse_constant=invalid, parse_float=number)
-            return value
-        except (ValueError, TypeError, RecursionError, OverflowError) as exc:
+            return json.loads(
+                text, object_pairs_hook=unique, parse_constant=invalid,
+                parse_int=_bounded_json_integer if self.exact_decimals else int,
+                parse_float=_bounded_json_decimal if self.exact_decimals else number,
+            )
+        except (ValueError, TypeError, RecursionError, OverflowError, InvalidOperation) as exc:
             if isinstance(exc, ContractViolation):
                 raise
             raise ContractViolation("schema_json") from None

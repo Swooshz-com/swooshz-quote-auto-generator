@@ -65,11 +65,11 @@ class CodeqlBoundaryTest(unittest.TestCase):
                     self.assertEqual(resolved.pricing_catalog_path, catalogue.resolve())
                     self.assertEqual(resolved.public_detail()['items'][0]['id'], 'synthetic-row')
                     manifest.write_text(json.dumps({'id': 'synthetic-pack', 'pricing_catalog': '../synthetic-pack-extra/catalogue.json'}), encoding='utf-8')
-                    original_read = Path.read_text
+                    original_open = Path.open
                     def read_inside_selected(path, *args, **kwargs):
                         self.assertNotEqual(path.resolve(), outside.resolve(), 'Prefix sibling was read')
-                        return original_read(path, *args, **kwargs)
-                    with mock.patch.object(Path, 'read_text', read_inside_selected):
+                        return original_open(path, *args, **kwargs)
+                    with mock.patch.object(Path, 'open', read_inside_selected):
                         self.assertIsNone(webapp.PricingReferencePack.resolve_exact('synthetic-pack', source))
                         with self.assertRaises(webapp.PricingReferencePathError):
                             webapp.PricingReferencePack.resolve('synthetic-pack', source)
@@ -102,7 +102,8 @@ class CodeqlBoundaryTest(unittest.TestCase):
                             '../outside.json' if target == 'catalogue' else 'pricing-catalog.json'}), encoding='utf-8')
                         catalog.write_text('{"items":[{"id":"synthetic-default"}]}', encoding='utf-8')
                         outside.write_text('{"id":"synthetic-pack","label":"Synthetic outside sentinel","items":[]}', encoding='utf-8')
-                        original_resolve, original_read = Path.resolve, Path.read_text
+                        original_resolve, original_open = Path.resolve, Path.open
+                        pack_lock = root / '.locks' / '_synthetic-pack'
                         reads = []
 
                         def resolved(path, *args, **kwargs):
@@ -112,16 +113,17 @@ class CodeqlBoundaryTest(unittest.TestCase):
 
                         def contained_read(path, *args, **kwargs):
                             actual = path.resolve()
-                            self.assertTrue(actual.is_relative_to(original_resolve(pack_dir)), 'Pack read escaped its selected directory')
-                            reads.append(actual)
-                            return original_read(path, *args, **kwargs)
+                            if actual != original_resolve(pack_lock):
+                                self.assertTrue(actual.is_relative_to(original_resolve(pack_dir)), 'Pack read escaped its selected directory')
+                                reads.append(actual)
+                            return original_open(path, *args, **kwargs)
 
                         with mock.patch.object(webapp, 'pricing_references_root', return_value=root), \
                              mock.patch.object(webapp, 'bundled_pricing_references_root', return_value=root), \
                              mock.patch.object(webapp, 'DEFAULT_PRICING_REFERENCE_ID', 'synthetic-pack'), \
                              mock.patch.object(webapp, 'BUNDLED_DEFAULT_PRICING_REFERENCE_ID', 'synthetic-pack'), \
                              mock.patch.object(Path, 'resolve', resolved), \
-                             mock.patch.object(Path, 'read_text', contained_read):
+                             mock.patch.object(Path, 'open', contained_read):
                             if route == 'list':
                                 listing = webapp.list_local_pricing_references if source == 'local' else webapp.list_bundled_pricing_references
                                 self.assertEqual(listing(), [])
@@ -176,7 +178,8 @@ class CodeqlBoundaryTest(unittest.TestCase):
                 outside.write_text(json.dumps({'id': 'synthetic-pack'}), encoding='utf-8')
                 (pack / 'pricing-catalog.json').write_text('{"items":[{"id":"synthetic-row"}]}', encoding='utf-8')
                 original_resolve = Path.resolve
-                original_read = Path.read_text
+                original_open = Path.open
+                pack_lock = root / '.locks' / '_synthetic-pack'
                 reads = []
 
                 def resolved(path, *args, **kwargs):
@@ -185,15 +188,16 @@ class CodeqlBoundaryTest(unittest.TestCase):
 
                 def contained_read(path, *args, **kwargs):
                     resolved_path = path.resolve()
-                    self.assertTrue(resolved_path.is_relative_to(original_resolve(pack)),
-                                    'Exact pack reader attempted an escaped manifest read')
-                    reads.append(resolved_path)
-                    return original_read(path, *args, **kwargs)
+                    if resolved_path != original_resolve(pack_lock):
+                        self.assertTrue(resolved_path.is_relative_to(original_resolve(pack)),
+                                        'Exact pack reader attempted an escaped manifest read')
+                        reads.append(resolved_path)
+                    return original_open(path, *args, **kwargs)
 
                 with mock.patch.object(webapp, 'pricing_references_root', return_value=root), \
                      mock.patch.object(webapp, 'bundled_pricing_references_root', return_value=root), \
                      mock.patch.object(Path, 'resolve', resolved), \
-                     mock.patch.object(Path, 'read_text', contained_read):
+                     mock.patch.object(Path, 'open', contained_read):
                     self.assertIsNone(webapp.PricingReferencePack.resolve_exact('synthetic-pack', source))
                 self.assertEqual(reads, [])
 
@@ -201,7 +205,7 @@ class CodeqlBoundaryTest(unittest.TestCase):
         for failure in (OSError('Synthetic resolution failure'), RuntimeError('Synthetic link loop')):
             with self.subTest(failure=type(failure).__name__), \
                  mock.patch.object(Path, 'resolve', side_effect=failure), \
-                 mock.patch.object(Path, 'read_text') as reader:
+                 mock.patch.object(Path, 'open') as reader:
                 self.assertIsNone(webapp.PricingReferencePack.resolve_exact('synthetic-pack', 'local'))
                 with self.assertRaises(webapp.PricingReferencePathError):
                     webapp.PricingReferencePack.resolve('synthetic-pack', 'local')
@@ -221,6 +225,27 @@ class CodeqlBoundaryTest(unittest.TestCase):
                      mock.patch.object(webapp, 'bundled_pricing_references_root', return_value=root):
                     listing = webapp.list_local_pricing_references if source == 'local' else webapp.list_bundled_pricing_references
                     self.assertEqual([item['id'] for item in listing()], ['safe-pack'])
-                    with mock.patch.object(webapp, 'load_pricing_reference_pack', side_effect=RuntimeError('Synthetic unrelated error')):
+                    owner, reader = (
+                        (webapp.LocalPricingReferenceStore, 'read') if source == 'local'
+                        else (webapp, 'load_pricing_reference_pack')
+                    )
+                    with mock.patch.object(owner, reader, side_effect=RuntimeError('Synthetic unrelated error')):
                         with self.assertRaises(RuntimeError):
                             listing()
+
+    def test_missing_pricing_selection_does_not_create_local_storage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "local"
+            bundled = Path(tmp) / "bundled"
+            with mock.patch.object(webapp, "pricing_references_root", return_value=local), \
+                 mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled), \
+                 mock.patch.object(webapp, "DEFAULT_PRICING_REFERENCE_ID", ""):
+                self.assertEqual(webapp.pricing_reference_section_names(), [])
+                self.assertEqual(webapp.pricing_reference_section_names("missing-pack"), [])
+                self.assertIsNone(webapp.PricingReferencePack.resolve_exact("missing-pack", "local"))
+                self.assertIsNone(webapp.PricingReferencePack.resolve_exact("missing-pack", []))
+                self.assertIsNone(webapp.PricingReferencePack.resolve_exact("", "local"))
+                self.assertFalse(local.exists())
+                local.mkdir()
+                self.assertIsNone(webapp.pricing_reference_pack_detail("missing-pack", "local"))
+                self.assertEqual(list(local.iterdir()), [])

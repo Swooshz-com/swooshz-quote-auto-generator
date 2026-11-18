@@ -6944,8 +6944,9 @@ function pricingReferenceSnapshotItem(item = {}) {
     internal_cost: numberOrNull(item.internal_cost ?? item.cost),
     markup_multiplier: numberOrNull(item.markup_multiplier ?? item.markup),
     remarks: String(item.remarks || ""),
-    category_order: orderNumber(item.category_order) ?? "",
-    item_order: orderNumber(item.item_order) ?? "",
+    category_order: pricingReferenceOrderValue(item.category_order) ?? "",
+    item_order: pricingReferenceOrderValue(item.item_order) ?? "",
+    ...pricingReferenceOrderTies(item),
   };
 }
 
@@ -6977,7 +6978,7 @@ function pricingReferenceHasPendingChanges(result = state.pendingPricingReferenc
 
 function pricingReferenceDraftUndoSnapshot(result = state.pendingPricingReference) {
   return JSON.stringify({
-    items: Array.isArray(result?.items) ? result.items.map(pricingReferenceSnapshotItem) : [],
+    items: Array.isArray(result?.items) ? result.items : [],
   });
 }
 
@@ -7040,7 +7041,8 @@ function pricingReferenceItemChangeCount(beforeSnapshot = "", result = state.pen
   const maxLength = Math.max(beforeItems.length, afterItems.length);
   let count = 0;
   for (let index = 0; index < maxLength; index += 1) {
-    if (JSON.stringify(beforeItems[index] || null) !== JSON.stringify(afterItems[index] || null)) count += 1;
+    const beforeItem = beforeItems[index] ? pricingReferenceSnapshotItem(beforeItems[index]) : null;
+    if (JSON.stringify(beforeItem) !== JSON.stringify(afterItems[index] || null)) count += 1;
   }
   return count;
 }
@@ -7159,7 +7161,9 @@ async function fetchPricingReferenceDetail(reference = {}) {
   if (!referenceId) return null;
   const source = String(reference.source || "").trim();
   const query = source ? `?source=${encodeURIComponent(source)}` : "";
-  const { ok, data } = await getJson(`/api/settings/pricing-references/${encodeURIComponent(referenceId)}${query}`);
+  const { ok, data } = await getJson(`/api/settings/pricing-references/${encodeURIComponent(referenceId)}${query}`, {
+    pricingReferenceOrders: true,
+  });
   if (!ok || !data || typeof data.pricing_reference !== "object") {
     return null;
   }
@@ -7742,31 +7746,144 @@ function pricingReferenceValidationResult(items, headers, skipped, sourceName = 
   };
 }
 
-function sortPricingReferencePreviewItems(items = []) {
+const PRICING_REFERENCE_ORDER_FIELDS = new Set(["category_order", "item_order"]);
+
+function pricingReferenceOrderValue(value) {
+  if (typeof value === "string" && /^[1-9][0-9]*$/.test(value)) {
+    const number = Number(value);
+    return Number.isSafeInteger(number) ? number : value;
+  }
+  return orderNumber(value);
+}
+
+function comparePricingReferenceOrder(left, right) {
+  const a = BigInt(left);
+  const b = BigInt(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function nextPricingReferenceOrder(value) {
+  return pricingReferenceOrderValue(String(BigInt(value) + 1n));
+}
+
+function pricingReferenceOrderTie(item, field) {
+  const rank = item?.[`${field}_tie`];
+  return Number.isSafeInteger(rank) && rank > 0 ? rank : 0;
+}
+
+function pricingReferenceOrderTies(item) {
+  return Object.fromEntries([...PRICING_REFERENCE_ORDER_FIELDS].flatMap((field) => {
+    const rank = pricingReferenceOrderTie(item, field);
+    return rank ? [[`${field}_tie`, rank]] : [];
+  }));
+}
+
+function pricingReferenceOrderCeiling() {
+  const digits = state.pricingReferenceOrderDigitLimit;
+  return Number.isInteger(digits) && digits > 0 ? "9".repeat(digits) : "";
+}
+
+function nextPricingReferencePosition(items, field) {
+  let max = 0;
+  let tie = 0;
+  for (const item of items) {
+    const order = pricingReferenceOrderValue(item[field]) ?? 0;
+    const comparison = comparePricingReferenceOrder(order, max);
+    if (comparison > 0) {
+      max = order;
+      tie = pricingReferenceOrderTie(item, field);
+    } else if (!comparison) {
+      tie = Math.max(tie, pricingReferenceOrderTie(item, field));
+    }
+  }
+  return String(max) === pricingReferenceOrderCeiling()
+    ? { [field]: max, [`${field}_tie`]: tie + 1 }
+    : { [field]: nextPricingReferenceOrder(max) };
+}
+
+function parsePricingReferenceJson(text) {
+  // Match whole JSON strings first so descriptions and other string values are
+  // untouched. Server pricing rows emit whole order numbers as decimal digits.
+  const tokens = /("[^"\\]*(?:\\[\s\S][^"\\]*)*")(?:(\s*:\s*)([1-9][0-9]{15,})(?=\s*[,}]))?/g;
+  return JSON.parse(text.replace(tokens, (match, key, colon, digits) => (
+    digits && PRICING_REFERENCE_ORDER_FIELDS.has(JSON.parse(key))
+      ? `${key}${colon}"${digits}"`
+      : match
+  )));
+}
+
+function stringifyPricingReferenceJson(payload, editor = false) {
+  const hasPricingItems = (value) => Array.isArray(value?.pricing_reference?.items);
+  if (!(editor && Array.isArray(payload?.items)) && !hasPricingItems(payload) && !hasPricingItems(payload?.payload)) {
+    return JSON.stringify(payload);
+  }
+  const encodeRecord = (record, encode) => {
+    const parts = Object.entries(record).map(([key, value]) => {
+      const json = encode(key, value);
+      return json === undefined ? null : `${JSON.stringify(key)}:${json}`;
+    });
+    return `{${parts.filter(Boolean).join(",")}}`;
+  };
+  const encodeRow = (row) => {
+    if (!isPlainObject(row)) return JSON.stringify(row) ?? "null";
+    return encodeRecord(row, (key, value) => (
+      PRICING_REFERENCE_ORDER_FIELDS.has(key) && typeof value === "string" && /^[1-9][0-9]*$/.test(value)
+        ? value
+        : JSON.stringify(value)
+    ));
+  };
+  const encodeReference = (reference) => encodeRecord(reference, (key, value) => (
+    key === "items" ? `[${Array.from(value, encodeRow).join(",")}]` : JSON.stringify(value)
+  ));
+  if (editor && Array.isArray(payload.items)) return encodeReference(payload);
+  const encodeQuote = (quote) => encodeRecord(quote, (key, value) => (
+    key === "pricing_reference" ? encodeReference(value) : JSON.stringify(value)
+  ));
+  if (hasPricingItems(payload)) return encodeQuote(payload);
+  return encodeRecord(payload, (key, value) => key === "payload" ? encodeQuote(value) : JSON.stringify(value));
+}
+
+function pricingReferencePreviewSectionKey(section, index) {
+  return safeId(normalizeCategoryTitle(section || ""), `section-${index + 1}`);
+}
+
+function sortPricingReferencePreviewItems(items = [], { preserveOrder = false } = {}) {
   const sectionOrders = new Map();
+  const ceiling = pricingReferenceOrderCeiling();
+  let nextCategoryTie = 1 + items.reduce((max, item) => Math.max(max, pricingReferenceOrderTie(item, "category_order")), 0);
   let nextCategoryOrder = 1;
   const ordered = [...items].map((item, index) => {
-    const sectionKey = safeId(normalizeCategoryTitle(item?.section || ""), `section-${index + 1}`);
-    const explicitCategoryOrder = orderNumber(item?.category_order);
+    const sectionKey = pricingReferencePreviewSectionKey(item?.section, index);
+    const explicitCategoryOrder = pricingReferenceOrderValue(item?.category_order);
     if (!sectionOrders.has(sectionKey)) {
-      const categoryOrder = explicitCategoryOrder || nextCategoryOrder;
-      sectionOrders.set(sectionKey, categoryOrder);
-      nextCategoryOrder = Math.max(nextCategoryOrder + 1, categoryOrder + 1);
+      const overflow = !explicitCategoryOrder && ceiling && comparePricingReferenceOrder(nextCategoryOrder, ceiling) > 0;
+      const categoryOrder = explicitCategoryOrder || (overflow ? ceiling : nextCategoryOrder);
+      const categoryTie = overflow ? nextCategoryTie++ : pricingReferenceOrderTie(item, "category_order");
+      sectionOrders.set(sectionKey, { categoryOrder, categoryTie });
+      const maxOrder = comparePricingReferenceOrder(nextCategoryOrder, categoryOrder) < 0 ? categoryOrder : nextCategoryOrder;
+      nextCategoryOrder = nextPricingReferenceOrder(maxOrder);
     }
+    const { categoryOrder, categoryTie } = sectionOrders.get(sectionKey);
+    const { category_order_tie, ...row } = item || {};
     return {
       item: {
-        ...item,
-        category_order: sectionOrders.get(sectionKey),
-        item_order: orderNumber(item?.item_order) || index + 1,
+        ...row,
+        category_order: categoryOrder,
+        ...(categoryTie ? { category_order_tie: categoryTie } : {}),
+        item_order: pricingReferenceOrderValue(item?.item_order) || index + 1,
       },
       index,
     };
   });
-  ordered.sort((a, b) => {
-    const categoryCompare = (orderNumber(a.item.category_order) || 999999) - (orderNumber(b.item.category_order) || 999999);
+  if (!preserveOrder) ordered.sort((a, b) => {
+    const categoryCompare = comparePricingReferenceOrder(a.item.category_order, b.item.category_order);
     if (categoryCompare) return categoryCompare;
-    const itemOrderCompare = (orderNumber(a.item.item_order) || 999999) - (orderNumber(b.item.item_order) || 999999);
+    const categoryTie = pricingReferenceOrderTie(a.item, "category_order") - pricingReferenceOrderTie(b.item, "category_order");
+    if (categoryTie) return categoryTie;
+    const itemOrderCompare = comparePricingReferenceOrder(a.item.item_order, b.item.item_order);
     if (itemOrderCompare) return itemOrderCompare;
+    const itemTie = pricingReferenceOrderTie(a.item, "item_order") - pricingReferenceOrderTie(b.item, "item_order");
+    if (itemTie) return itemTie;
     const sectionCompare = String(a.item?.section || "").toLowerCase().localeCompare(String(b.item?.section || "").toLowerCase());
     if (sectionCompare) return sectionCompare;
     const descriptionCompare = String(a.item?.description || "").toLowerCase().localeCompare(String(b.item?.description || "").toLowerCase());
@@ -7972,8 +8089,9 @@ function normalizePricingReferencePreviewItem(item = {}, index = 0) {
     unit_hint: normalizeUnit(neutralizeFormulaText(item.unit_hint || item.unit || "")),
     internal_cost: item.internal_cost ?? "",
     markup_multiplier: item.markup_multiplier ?? "",
-    category_order: orderNumber(item.category_order) ?? "",
-    item_order: orderNumber(item.item_order) ?? index + 1,
+    category_order: pricingReferenceOrderValue(item.category_order) ?? "",
+    item_order: pricingReferenceOrderValue(item.item_order) ?? index + 1,
+    ...pricingReferenceOrderTies(item),
     remarks: listFieldText(item.remarks),
     aliases: listFieldText(item.aliases),
     match_terms: listFieldText(item.match_terms),
@@ -7983,9 +8101,9 @@ function normalizePricingReferencePreviewItem(item = {}, index = 0) {
   };
 }
 
-function refreshPricingReferencePreviewValidity(result = state.pendingPricingReference) {
+function refreshPricingReferencePreviewValidity(result = state.pendingPricingReference, options = {}) {
   if (!result) return false;
-  result.items = sortPricingReferencePreviewItems((result.items || []).map(normalizePricingReferencePreviewItem));
+  result.items = sortPricingReferencePreviewItems((result.items || []).map(normalizePricingReferencePreviewItem), options);
   if (result.items.length && Array.isArray(result.errors)) {
     result.errors = result.errors.filter((message) => !/(at least one|no editable pricing rows|no pricing rows)/i.test(String(message || "")));
   }
@@ -8009,7 +8127,6 @@ function refreshPricingReferencePreviewValidity(result = state.pendingPricingRef
 function blankPricingReferencePreviewItem(index = 0) {
   const existingItems = Array.isArray(state.pendingPricingReference?.items) ? state.pendingPricingReference.items : [];
   const previous = existingItems[existingItems.length - 1] || {};
-  const nextOrder = Math.max(0, ...existingItems.map((item) => Number(item.item_order) || 0)) + 1;
   return normalizePricingReferencePreviewItem({
     id: `new-pricing-row-${Date.now().toString(36)}-${index + 1}`,
     section: previous.section || "",
@@ -8018,8 +8135,9 @@ function blankPricingReferencePreviewItem(index = 0) {
     internal_cost: "",
     markup_multiplier: previous.markup_multiplier || "",
     remarks: "",
-    category_order: orderNumber(previous.category_order) ?? "",
-    item_order: nextOrder,
+    category_order: pricingReferenceOrderValue(previous.category_order) ?? "",
+    category_order_tie: previous.category_order_tie,
+    ...nextPricingReferencePosition(existingItems, "item_order"),
   }, index);
 }
 
@@ -8267,13 +8385,38 @@ function handlePricingReferencePreviewInput(event) {
     pushPricingReferenceUndoSnapshot(state.pricingReferenceEditPendingUndoSnapshot);
     state.pricingReferenceEditPendingUndoSnapshot = "";
   }
-  state.pendingPricingReference.items[rowIndex][field] = input.value;
+  const items = state.pendingPricingReference.items;
+  const item = items[rowIndex];
+  const ceiling = pricingReferenceOrderCeiling();
+  const hasSaturatedOrder = ceiling && items.some((row) =>
+    String(row.category_order) === ceiling || String(row.item_order) === ceiling
+      || row.category_order_tie || row.item_order_tie
+  );
+  if (field === "section" && hasSaturatedOrder) {
+    const previousSection = pricingReferencePreviewSectionKey(item.section, rowIndex);
+    const nextSection = pricingReferencePreviewSectionKey(input.value, rowIndex);
+    if (previousSection !== nextSection) {
+      const peers = items.filter((_, index) => index !== rowIndex);
+      const target = items.find((peer, index) => index !== rowIndex
+        && pricingReferencePreviewSectionKey(peer.section, index) === nextSection);
+      if (target) {
+        item.category_order = target.category_order;
+        item.category_order_tie = target.category_order_tie;
+      } else if (String(item.category_order) === ceiling && items.some((peer, index) => (
+        index !== rowIndex && pricingReferencePreviewSectionKey(peer.section, index) === previousSection
+      ))) {
+        Object.assign(item, nextPricingReferencePosition(peers, "category_order"));
+      }
+    }
+  }
+  item[field] = input.value;
   if (PRICING_REFERENCE_METADATA_STALE_FIELDS.has(field)) {
     state.pendingPricingReference.items[rowIndex].match_terms = "";
     state.pendingPricingReference.items[rowIndex].object_families = "";
   }
   state.pricingReferenceSavedNotice = "";
-  refreshPricingReferencePreviewValidity(state.pendingPricingReference);
+  // Keep input indexes stable when moving a row between categories at the limit.
+  refreshPricingReferencePreviewValidity(state.pendingPricingReference, { preserveOrder: hasSaturatedOrder });
   const row = input.closest("tr");
   const status = row?.querySelector(".pricing-preview-status");
   if (status) {
@@ -8425,7 +8568,7 @@ async function validatePricingReferenceFile(file) {
     data_url: await fileToDataUrl(file),
     currency: pricingReferenceModalCurrency(),
     tax: pricingReferenceModalTax(),
-  });
+  }, { pricingReferenceOrders: true });
   if (ok) return data;
   return {
     ...pricingReferenceValidationResult([], [], 0, file.name),
@@ -8733,7 +8876,7 @@ async function savePricingReferenceFromModal(event) {
       items: result.items,
       update_existing: Boolean(state.editingPricingReferenceId),
       editing_reference_id: state.editingPricingReferenceId || "",
-    });
+    }, { pricingReferenceOrders: true });
     if (!ok) {
       state.pricingReferenceSaveBusy = false;
       stopElapsedTimer("pricingReferenceSaveElapsed");
@@ -8934,6 +9077,7 @@ async function loadProfiles() {
     : null;
   if (!hydrated || !authorityProfileRequestIsFresh(refreshedContext)) return false;
   state.profiles = hydrated.profiles;
+  state.pricingReferenceOrderDigitLimit = data.pricing_reference_order_digit_limit;
   state.companyProfiles = hydrated.companyProfiles;
   state.workspace = workspace;
   state.defaultProfileId = defaultProfileId;
@@ -9263,6 +9407,10 @@ function buildPayload(options = {}) {
     pricing_reference_id: pricingReferenceId,
     pricing_reference: pricingReference ? {
       ...pricingReference,
+      // Output ordering is resolved from the selected catalogue on the server.
+      ...(pricingReference.authority_items?.some((item) => item.sort_order)
+        ? { authority_items: pricingReference.authority_items.map(({ sort_order, ...item }) => item) }
+        : {}),
       source: pricingReference.source,
       tax: pricingReference.tax || selectedPricingReferenceTax(),
       currency: selectedPricingReferenceCurrency(),
@@ -10278,10 +10426,18 @@ function categoryOrderValue(row = {}) {
   return orderNumber(row.category_order) || 999999;
 }
 
-function pricingReferenceOrder(row = {}, fallbackIndex = 0) {
+function pricingReferenceOrder(row, fallbackIndex, appendedOrders) {
+  if (appendedOrders.size) {
+    const itemId = canonicalPricingAuthorityText(row.pricing_authority?.catalog_item_id || row.pricing_keyword);
+    const appended = appendedOrders.get(itemId);
+    if (appended) return [...appended, fallbackIndex];
+  }
   return [
     categoryOrderValue(row),
+    0,
     orderNumber(row.item_order) || 999999,
+    0,
+    0,
     fallbackIndex,
   ];
 }
@@ -10289,14 +10445,25 @@ function pricingReferenceOrder(row = {}, fallbackIndex = 0) {
 function compareOrderValues(left = [], right = []) {
   const length = Math.max(left.length, right.length);
   for (let index = 0; index < length; index += 1) {
-    const difference = (left[index] || 0) - (right[index] || 0);
-    if (difference) return difference;
+    const a = left[index] || 0;
+    const b = right[index] || 0;
+    if (a < b) return -1;
+    if (a > b) return 1;
   }
   return 0;
 }
 
 function sortOutputRows(rows = state.outputRows) {
   const copy = rows.map((row, index) => ({ row, index }));
+  const appendedOrders = new Map();
+  if (state.outputSortMode === "pricing_reference") {
+    for (const item of currentPricingReference()?.authority_items || []) {
+      if (Array.isArray(item.sort_order) && item.sort_order.length === 5
+        && item.sort_order.every((value) => typeof value === "string" && /^[0-9]+$/.test(value))) {
+        appendedOrders.set(canonicalPricingAuthorityText(item.id), item.sort_order.map(BigInt));
+      }
+    }
+  }
   const compareText = (value) => String(value || "").toLowerCase();
   copy.sort((a, b) => {
     const sectionCompare = compareText(a.row.section).localeCompare(compareText(b.row.section));
@@ -10307,20 +10474,16 @@ function sortOutputRows(rows = state.outputRows) {
       if (aBasisOrder !== null || bBasisOrder !== null) {
         return compareOrderValues([
           aBasisOrder ?? 999999,
-          categoryOrderValue(a.row),
-          orderNumber(a.row.item_order) || 999999,
-          a.index,
+          ...pricingReferenceOrder(a.row, a.index, appendedOrders),
         ], [
           bBasisOrder ?? 999999,
-          categoryOrderValue(b.row),
-          orderNumber(b.row.item_order) || 999999,
-          b.index,
+          ...pricingReferenceOrder(b.row, b.index, appendedOrders),
         ])
           || sectionCompare
           || descriptionCompare
           || a.index - b.index;
       }
-      return compareOrderValues(pricingReferenceOrder(a.row, a.index), pricingReferenceOrder(b.row, b.index))
+      return compareOrderValues(pricingReferenceOrder(a.row, a.index, appendedOrders), pricingReferenceOrder(b.row, b.index, appendedOrders))
         || sectionCompare
         || descriptionCompare
         || a.index - b.index;
@@ -13852,13 +14015,13 @@ function postJsonFetchFailure(url) {
   };
 }
 
-async function fetchPostJsonResponse(url, payload) {
+async function fetchPostJsonResponse(url, payload, options = {}) {
   const headers = { "Content-Type": "application/json" };
   if (state.csrfToken) headers[state.csrfHeaderName] = state.csrfToken;
   return fetch(url, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: stringifyPricingReferenceJson(payload, options.pricingReferenceOrders),
   });
 }
 
@@ -13999,7 +14162,7 @@ function hideFeedbackModal() {
 
 async function jsonFromResponse(response, options = {}) {
   try {
-    return await response.json();
+    return options.pricingReferenceOrders ? parsePricingReferenceJson(await response.text()) : await response.json();
   } catch (error) {
     if (options.persistSession === false) {
       const errorReference = newClientErrorReference();
@@ -14185,7 +14348,7 @@ async function postJson(url, payload, options = {}) {
   if (state.authenticationRecoveryRequested || state.isSigningOut || state.isRecoveryScopeTransitioning) return { ok: false, status: 401, data: { status: "auth_required" } };
   let response;
   try {
-    response = await fetchPostJsonResponse(url, payload);
+    response = await fetchPostJsonResponse(url, payload, options);
   } catch (error) {
     if (!requestIsCurrent()) return superseded();
     return postJsonFetchFailure(url, error);
@@ -14201,7 +14364,7 @@ async function postJson(url, payload, options = {}) {
     && !state.authenticationRecoveryRequested && !state.isSigningOut && !state.isPageUnloading) {
     if (!requestIsCurrent()) return superseded();
     try {
-      response = await fetchPostJsonResponse(url, payload);
+      response = await fetchPostJsonResponse(url, payload, options);
       if (!requestIsCurrent()) return superseded();
       data = await jsonFromResponse(response, options);
     } catch (error) {

@@ -61,12 +61,11 @@ capability, Responses schema subset, model accuracy or cost saving.
 
 When enabled, standard and High Quality final drafts, including batched synthesis,
 send `text.format` with `type=json_schema`, `name=draft_synthesis_v1`, `strict=true`
-and the generated schema. Page observations, basis chat, pricing import and
-matching metadata retain their own existing contracts. A trusted contract identity
-is checked separately from the operation and body. Missing, modified or unexpected
-schemas reject before credential access or transport. Both request validators and
-the synthesis size preflight include the schema. The shape fingerprint includes
-only the fixed public contract structure, never catalogue or prompt values.
+and the generated schema. A trusted contract identity is checked separately from
+the operation and body. Missing, modified or unexpected schemas reject before
+credential access or transport. Both request validators and the synthesis size
+preflight include the schema. The shape fingerprint includes only the fixed
+public contract structure, never catalogue or prompt values.
 
 `webapp/ai_response_contracts.py` owns the field tree that generates the schema,
 field instructions and local structural admission. Objects are recursively closed
@@ -75,14 +74,15 @@ Fresh basis confidence uses only integer `confidence_pct`. Unmeasured basis
 quantity/unit, optional basis pricing keyword, item price mode/Included label and
 finding identity/confidence can be null and adapt back to absence. Fresh output
 cannot supply amounts, pricing authority, legacy aliases or clarification arrays.
-Saved/history aliases and the other operations' parsers retain compatibility.
+Saved/history aliases retain compatibility.
 Exact-object JSON parsing, duplicate-key rejection and local shape checks precede
 the existing identity, quantity, coverage, catalogue and sealing guards. Ranges,
 positive values and nonblank text are checked locally; unsupported range/pattern
 schema keywords are not assumed to work at an unqualified endpoint.
 
-For schema-bearing calls, HTTP 400/404/405/415/422 or closed schema parameter/code
-errors terminate as `response_schema_rejected` at `provider_response_schema`.
+For strict draft synthesis, HTTP 400/404/405/415/422 and errors with recognised
+schema parameters or codes terminate as `response_schema_rejected` at
+`provider_response_schema`.
 This deliberately includes ambiguous request rejections without claiming their
 cause. A successful HTTP envelope carrying a machine schema rejection is terminal
 too. Provider prose never classifies errors. There is no retry, schema removal,
@@ -99,7 +99,37 @@ its captured route, schema and original evidence remain identical. Single-send
 drafts never repair. Supplied invalid fields, extra properties, malformed JSON,
 refusal and schema rejection do not qualify. Send reservation/settlement remains
 per attempt, including rejected responses and repairs; unknown usage/cost remains
-unknown. Other operations need their own schemas and separate rollout approval.
+unknown. Each operation's response schema requires separate rollout approval.
+
+## Pricing response contracts
+
+The gateway attaches the strict `pricing_import_v1` schema to AI pricing
+imports and `pricing_metadata_v1` to matching metadata requests. It validates
+the returned JSON against the corresponding schema before the application
+uses it. Objects require all declared fields and reject extra fields.
+Nullable fields use null, and empty lists use `[]`.
+Pricing import accepts equivalent whole-number JSON forms such as `1`, `1.0`
+and `1e0` for category order, item order and source row index. It checks those
+numbers exactly before converting them to integers. Fractions are rejected
+even when they would round to a whole number. The import preview, row editor,
+and save endpoint preserve these orders as exact integers on the wire. Source
+row indices outside the supplied rows use the existing positional fallback.
+Existing catalogue digests keep their original projection. A new save that
+needs exact order arithmetic records that choice in its internal revision
+while preserving the public numeric fields and catalogue filenames.
+
+Matching metadata must return exactly one item for each ID in the requested
+batch. The application applies enrichment only after every batch passes.
+If enrichment fails, an otherwise valid save can still write the reviewed
+catalogue. Each save checks the destination it saw when the request started
+under the same lock or transaction that writes the catalogue. If another
+request has changed that destination, the save returns a conflict and a support
+reference before changing catalogue files or images. Reload the reference before
+retrying.
+
+Each pricing call sends once. A provider schema rejection requires a
+recognised machine code or schema parameter. Qualify each configured pricing
+route on the installed build before rollout.
 
 ## PDF reference limits
 

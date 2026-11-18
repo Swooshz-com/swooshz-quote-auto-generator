@@ -3,6 +3,7 @@ import tempfile
 import threading
 import unittest
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import html
@@ -1259,6 +1260,14 @@ def write_generator_diagnostic_fixture(command):
     generator.write_match_csv(output / "pricing_matches.csv", lines)
 
 
+@contextlib.contextmanager
+def local_pricing_fixture_root():
+    with tempfile.TemporaryDirectory(prefix="fixture-pricing-", dir=test_temp_root()) as temp:
+        destination = Path(temp) / "pricing-references"
+        shutil.copytree(QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references", destination)
+        yield destination
+
+
 class WebappServerTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -1274,14 +1283,14 @@ class WebappServerTest(unittest.TestCase):
         self._empty_bundled_pricing_root = test_temp_root() / "empty-bundled-pricing"
         self._empty_bundled_pricing_root.mkdir(parents=True, exist_ok=True)
         fixture_profiles_root = QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"
-        fixture_pricing_root = QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"
+        self._fixture_pricing_root = self.enterContext(local_pricing_fixture_root())
         patchers = [
             mock.patch.object(webapp, "DEFAULT_PROFILE_ID", "synthetic-exhibition-fixture-template"),
             mock.patch.object(webapp, "DEFAULT_PRICING_REFERENCE_ID", "synthetic-exhibition-fixture-pricing"),
             mock.patch.object(webapp, "BUNDLED_DEFAULT_PROFILE_ID", "synthetic-exhibition-fixture-template"),
             mock.patch.object(webapp, "BUNDLED_DEFAULT_PRICING_REFERENCE_ID", "synthetic-exhibition-fixture-pricing"),
             mock.patch.object(webapp, "profiles_root", return_value=fixture_profiles_root),
-            mock.patch.object(webapp, "pricing_references_root", return_value=fixture_pricing_root),
+            mock.patch.object(webapp, "pricing_references_root", return_value=self._fixture_pricing_root),
             mock.patch.object(webapp, "bundled_pricing_references_root", return_value=self._empty_bundled_pricing_root),
         ]
         for patcher in patchers:
@@ -11118,6 +11127,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_pricing_reference_import_logs_timing_for_messy_ai_path(self):
         raw = "Item,Price\nWhite painted walling per sqm,50\n".encode("utf-8")
         parsed = {
+            "currency": None,
             "items": [{
                 "section": "Structures",
                 "description": "White painted walling",
@@ -11126,6 +11136,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                 "markup_multiplier": 1.7,
                 "remarks": ["painted wall"],
                 "aliases": ["white wall"],
+                "category_order": 1, "item_order": 1, "source_row_index": 1,
+                "warning": None, "status": None,
             }]
         }
         with mock.patch.object(webapp, "read_dotenv_value", side_effect={**SYNTHETIC_DRAFT_CONFIG, "OPENROUTER_API_KEY":"sk-test-redacted"}.get), \
@@ -11449,11 +11461,12 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertIn("Synthetic Floors", prompt)
         self.assertIn("Synthetic Rentals", prompt)
         self.assertIn("Only create a new section", prompt)
-        self.assertIn("Preserve the source category order and source row order.", prompt)
+        self.assertIn("Preserve the source category and item order as positive integers.", prompt)
         self.assertIn("assign category_order by first-seen section in the source rows and item_order by source row order", prompt)
         self.assertIn("Clean obvious spelling, OCR, spacing, and unit wording errors only when the workbook itself makes the correction unambiguous", prompt)
         self.assertIn("Do not paraphrase, market-polish, simplify, or rename technical catalog descriptions", prompt)
-        self.assertIn("Each item must include section, description, unit_hint, internal_cost, markup_multiplier, remarks, aliases", prompt)
+        self.assertIn("Use JSON numbers for internal_cost and markup_multiplier", prompt)
+        self.assertIn("one-based position of the first contributing entry in the bounded rows array", prompt)
         self.assertIn("Do not generate match_terms or object_families in this import step", prompt)
         self.assertIn("Do not invent a fixed taxonomy", prompt)
         self.assertIn("Preserve source placement", prompt)
@@ -12415,7 +12428,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_explicit_test_fixture_profile_and_pricing_roots_resolve_assets(self):
         fixture_profiles_root = QUOTE_GENERATOR_FIXTURE_ROOT / "profiles"
-        fixture_pricing_root = QUOTE_GENERATOR_FIXTURE_ROOT / "pricing-references"
+        fixture_pricing_root = self._fixture_pricing_root
         with (
             mock.patch.object(webapp, "profiles_root", return_value=fixture_profiles_root),
             mock.patch.object(webapp, "pricing_references_root", return_value=fixture_pricing_root),
@@ -12430,7 +12443,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual(profile_pack.quotation_layout_path, KONCEPT_LAYOUT)
         self.assertEqual(profile_pack.layout_rules_path, KONCEPT_LAYOUT_RULES)
         self.assertEqual(pricing_pack.source, "local")
-        self.assertEqual(pricing_pack.pricing_catalog_path, KONCEPT_CATALOG)
+        self.assertEqual(pricing_pack.pricing_catalog_path.read_bytes(), KONCEPT_CATALOG.read_bytes())
         self.assertEqual([item["id"] for item in pricing_references].count("synthetic-exhibition-fixture-pricing"), 1)
         self.assertEqual(pricing_references[0]["source"], "local")
         self.assertFalse((LEGACY_BUNDLED_PROFILE / "assets" / "koncept-header-logo.jpeg").exists())
@@ -13747,48 +13760,43 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
 
     def test_openai_request_resolves_bundled_catalog_visual_paths(self):
         response = FixtureHttpResponse(responses_envelope(SYNTHETIC_DRAFT_CONFIG["OPENROUTER_DRAFT_MODEL"], json.dumps({'quote_basis': {}, 'line_items': []})))
+        reference_id = "synthetic-bundled-visual"
+        image_url = synthetic_image(color="blue")
+        payload = valid_payload()
+        payload.update(
+            pricing_reference_id=reference_id,
+            pricing_reference_source="bundled",
+            pricing_reference={"id": reference_id, "source": "bundled"},
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            reference_dir = Path(tmp)
-            image_path = reference_dir / "pricing-catalog-images" / "chair.png"
-            image_path.parent.mkdir(parents=True)
-            image_path.write_bytes(base64.b64decode(synthetic_image().split(",")[1]))
-            catalog_path = reference_dir / "pricing-catalog.json"
-            catalog_path.write_text(json.dumps({
-                "schema_version": 1,
-                "items": [{
-                    "id": "furniture.white-chair",
-                    "section": "Furniture Rental",
-                    "description": "nos. White chair",
-                    "unit_hint": "nos",
-                    "internal_cost": 30,
-                    "markup_multiplier": 1.5,
-                    "visual_references": [{
-                        "source": "xl/media/image4.png",
-                        "path": "pricing-catalog-images/chair.png",
-                        "anchor_row": 20,
-                    }],
+            root = Path(tmp)
+            reference_dir = write_test_pricing_reference(root, reference_id, [{
+                "id": "furniture.white-chair",
+                "section": "Furniture Rental",
+                "description": "nos. White chair",
+                "unit_hint": "nos",
+                "internal_cost": 30,
+                "markup_multiplier": 1.5,
+                "visual_references": [{
+                    "source": "xl/media/image4.png",
+                    "path": "pricing-catalog-images/chair.png",
+                    "anchor_row": 20,
                 }],
-            }), encoding="utf-8")
+            }])
+            image_path = reference_dir / "pricing-catalog-images" / "chair.png"
+            image_path.parent.mkdir()
+            image_path.write_bytes(base64.b64decode(image_url.split(",", 1)[1]))
 
-            pack = mock.MagicMock()
-            pack.directory = reference_dir
-            pack.pricing_catalog_path = catalog_path
-            pack.public_detail.return_value = {
-                "id": "synthetic-exhibition-fixture-pricing",
-                "source": "local",
-                "currency": "SGD",
-                "items": [],
-            }
             with (
-                mock.patch.object(webapp, "load_pricing_reference_pack", return_value=pack),
-                mock.patch.object(webapp.PricingReferencePack, "resolve_exact", return_value=pack),
+                mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root),
+                mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen,
             ):
-                with mock.patch.object(webapp.urllib.request, "urlopen", return_value=response) as urlopen:
-                    webapp.request_openai_quote_basis(valid_payload(), "sk-test-redacted")
+                webapp.request_openai_quote_basis(payload, "sk-test-redacted")
 
+        urlopen.assert_called_once()
         content = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))["input"][0]["content"]
         self.assertIn("Internal catalog reference images follow", content[-2]["text"])
-        self.assertEqual(content[-1]["image_url"], synthetic_image())
+        self.assertEqual(content[-1]["image_url"], image_url)
 
     def test_openai_prompt_uses_compact_profile_context_without_logo_or_presets(self):
         prompt = webapp.build_quote_draft_prompt(valid_payload())
@@ -14653,7 +14661,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         return payload
 
     def _gateway_import_output(self):
-        return {"currency":"SGD", "items":[{"section":"Floor Design", "description":"sqm needle punch carpet in colour", "unit_hint":"sqm", "internal_cost":"0", "markup_multiplier":"1", "remarks":"", "aliases":[]}]}
+        return {"currency": "SGD", "items": [{
+            "section": "Floor Design", "description": "sqm needle punch carpet in colour", "unit_hint": "sqm",
+            "internal_cost": 0, "markup_multiplier": 1, "remarks": [], "aliases": [],
+            "category_order": 1, "item_order": 1, "source_row_index": None, "warning": None, "status": None,
+        }]}
 
     def test_gateway_answer_and_quote_edit_use_explicit_answer_route(self):
         for question in ("What does this mean?", "Include all lighting and electrical lines"):
@@ -14708,7 +14720,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             self.assertEqual(body["model"],model);self.assertEqual(body["reasoning"],{"effort":"high"})
             self.assertEqual(body["input"][0]["role"],"user")
             self.assertIn("JSON",body["input"][0]["content"][0]["text"])
-            self.assertEqual(result,parsed)
+            self.assertEqual(body["text"]["format"]["name"], suffix.lower() + "_v1")
+            self.assertIs(body["text"]["format"]["strict"], True)
+            expected = {**parsed, "items": [{key: value for key, value in row.items() if value is not None}
+                                             for row in parsed["items"]]}
+            self.assertEqual(result, expected)
 
     def test_gateway_pricing_timeout_is_explicit_and_failure_does_not_fallback(self):
         values=synthetic_configuration(credential="synthetic-key",overrides={"OPENROUTER_REQUEST_TIMEOUT_SECONDS":"17"})
@@ -25691,12 +25707,13 @@ assert.strictEqual(sanitizeRichTextHtml("<blink>Plain <em>x</em></blink>"), "Pla
 
         script = r"""
 function applyPricingAuthorityProjection(row){return row;}
+function currentPricingReference(){return state.pricingReferences[0];}
 const fs = require("fs");
 const assert = require("assert");
 const source = fs.readFileSync("webapp/static/app.js", "utf8");
 
 function extractFunction(name) {
-  const marker = `function ${name}`;
+  const marker = `function ${name}(`;
   const start = source.indexOf(marker);
   if (start < 0) throw new Error(`Missing function ${name}`);
   const bodyStart = source.indexOf(") {", start) + 2;
@@ -28670,6 +28687,7 @@ function extractFunction(name) {
 const constantNames = ["CSRF_HEADER_NAME", "GENERIC_FAILURE_MESSAGE", "PRICING_SELECTION_STALE_MESSAGE", "QUOTE_COMMERCIAL_REVIEW_SCHEMA",
   "QUOTE_COMMERCIAL_REVIEW_VERSION", "QUOTE_COMMERCIAL_REVIEW_STATUS", "QUOTE_COMMERCIAL_REVIEW_MESSAGE",
   "QUOTE_COMMERCIAL_REVIEW_REASONS", "PRICING_REFERENCE_ID_RE", "PRICING_REFERENCE_SOURCES",
+  "PRICING_REFERENCE_ORDER_FIELDS",
   "SERVER_JOB_TYPES", "ACTIVE_JOB_STARTING_MAX_AGE_MS", "ACTIVE_JOB_CLOCK_SKEW_MS",
   "ACTIVE_JOB_RUNNING_DRAFT_MAX_AGE_MS", "ACTIVE_JOB_RUNNING_BASIS_CHAT_MAX_AGE_MS",
   "ACTIVE_JOB_RUNNING_CONFIRM_BASIS_MAX_AGE_MS", "ACTIVE_JOB_RUNNING_GENERATION_MAX_AGE_MS"];
@@ -28933,7 +28951,7 @@ const scrollDashboardSessionIntoView = () => {};
 const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "quoteCommercialReviewIdentity",
   "normalizeQuoteCommercialReview", "quoteCommercialReviewRequired", "serverQuoteCommercialReviewFromResponse",
   "adoptServerQuoteCommercialReview", "errorReferenceFrom", "genericFailureMessage", "genericFailureMessages",
-  "newClientErrorReference", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
+  "newClientErrorReference", "stringifyPricingReferenceJson", "jsonFromResponse", "fetchPostJsonResponse", "postJsonFetchFailure",
   "refreshSessionToken", "postJson", "logClientEvent", "ensureClientQuoteSessionId", "mergeDashboardQuoteSession",
   "quoteAiSpendText", "renderQuoteAiSpend", "refreshQuoteAiSpend",
   "currentQuoteSessionPayload", "currentQuoteSessionDraftState", "quoteSessionDraftComparisonKey",
@@ -30232,6 +30250,8 @@ const DEFAULT_TAX_LABEL = "GST";
 const DEFAULT_TAX_RATE = 0.09;
 const DEFAULT_CURRENCY_LABEL = "SGD";
 const PRICING_REFERENCE_PREVIEW_FIELDS = ["section", "description", "unit_hint", "internal_cost", "markup_multiplier", "remarks"];
+const PRICING_REFERENCE_ORDER_FIELDS = new Set(["category_order", "item_order"]);
+const state = {};
 
 function extractFunction(name) {
   const marker = `function ${name}`;
@@ -30264,6 +30284,13 @@ eval([
   "normalizeCurrencyLabel",
   "orderNumber",
   "pricingReferenceSnapshotItem",
+  "pricingReferenceOrderValue",
+  "comparePricingReferenceOrder",
+  "nextPricingReferenceOrder",
+  "pricingReferenceOrderTie",
+  "pricingReferenceOrderTies",
+  "pricingReferenceOrderCeiling",
+  "pricingReferencePreviewSectionKey",
   "sortPricingReferencePreviewItems",
   "pricingReferenceRowStatus",
   "pricingReferenceDuplicateRowKey",
@@ -30768,6 +30795,7 @@ function pricingReferenceOperationBusy() { return Boolean(state.pricingReference
 function pricingReferenceHasPendingChanges() { return true; }
 function pricingReferenceImportNameConflictMessage() { return ""; }
 function customCurrencyInputIsValid() { return /^[A-Z]{3}$/.test(String(elements.pricingReferenceCurrencyCustom.value || "").trim().toUpperCase()); }
+const PRICING_REFERENCE_ORDER_FIELDS = new Set(["category_order", "item_order"]);
 
 eval([
   "safeId",
@@ -30782,6 +30810,13 @@ eval([
   "pricingReferenceNoAccessReason",
   "pricingReferenceRowStatus",
   "pricingReferenceSaveBlockReason",
+  "pricingReferenceOrderValue",
+  "comparePricingReferenceOrder",
+  "nextPricingReferenceOrder",
+  "pricingReferenceOrderTie",
+  "pricingReferenceOrderTies",
+  "pricingReferenceOrderCeiling",
+  "pricingReferencePreviewSectionKey",
   "sortPricingReferencePreviewItems",
   "normalizePricingReferencePreviewItem",
   "pricingReferenceDuplicateRowKey",
@@ -33160,27 +33195,38 @@ assert.strictEqual(formatOutputTotalValue(invalidOverrideStats), "SGD 0.00 + ???
     def test_run_quote_job_never_passes_payload_pdf_mode_to_generator(self):
         payload = valid_payload()
         payload["pdf_mode"] = "auto"
+        job_id = "job-xlsx-only"
+        expected_catalog = json.loads(KONCEPT_CATALOG.read_bytes())
+        observed_catalog = None
 
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_catalog = root / "tmp" / job_id / "pricing-catalog.json"
             completed = webapp.subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
                 stdout="Wrote quotation.xlsx\nPDF export status: skipped\n",
                 stderr="",
             )
-            with mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run:
+
+            def execute_generator(command, **_kwargs):
+                nonlocal observed_catalog
+                template = Path(command[command.index("--template") + 1])
+                observed_catalog = json.loads(template.read_bytes())
+                write_generator_diagnostic_fixture(command)
+                return completed
+
+            with mock.patch.object(webapp.subprocess, "run", side_effect=execute_generator) as run:
                 result = webapp.run_quote_job(
-                    payload,
-                    output_root=Path(tmp) / "out",
-                    tmp_root=Path(tmp) / "tmp",
+                    payload, output_root=root / "out", tmp_root=root / "tmp", job_id=job_id,
                 )
 
+        run.assert_called_once()
         command = run.call_args.args[0]
         self.assertEqual(result["status"], "completed")
-        self.assertIn("--template", command)
-        self.assertIn(str(KONCEPT_CATALOG), command)
-        self.assertIn("--layout-template", command)
-        self.assertIn(str(KONCEPT_LAYOUT), command)
+        self.assertEqual(Path(command[command.index("--template") + 1]), job_catalog)
+        self.assertEqual(observed_catalog, expected_catalog)
+        self.assertEqual(Path(command[command.index("--layout-template") + 1]), KONCEPT_LAYOUT)
         self.assertNotIn("--pdf-mode", command)
         self.assertNotIn("quotation.pdf", command)
 
@@ -40715,21 +40761,64 @@ main().catch((error) => {
                 stdout="Wrote quotation.xlsx\nPDF export status: skipped\n",
                 stderr="",
             )
-            expected_catalog_path = str((reference_dir / "pricing-catalog.json").resolve())
+            expected_catalog = json.loads(catalog_path.read_bytes())
+            job_catalog_path = root / "tmp" / "runtime-local" / "pricing-catalog.json"
             expected_layout_path = str((profile_dir / "quotation-layout.xlsx").resolve())
+            observed_catalog = None
+
+            def execute_generator(command, **_kwargs):
+                nonlocal observed_catalog
+                template = Path(command[command.index("--template") + 1])
+                observed_catalog = json.loads(template.read_bytes())
+                write_generator_diagnostic_fixture(command)
+                return completed
+
             with (
                 mock.patch.object(webapp, "profiles_root", return_value=profiles_root),
                 mock.patch.object(webapp, "pricing_references_root", return_value=pricing_root),
-                mock.patch.object(webapp.subprocess, "run", side_effect=lambda command, **kwargs: (write_generator_diagnostic_fixture(command), completed)[1]) as run,
+                mock.patch.object(webapp.subprocess, "run", side_effect=execute_generator) as run,
             ):
-                result = webapp.run_quote_job(payload, output_root=root / "out", tmp_root=root / "tmp")
+                result = webapp.run_quote_job(
+                    payload, output_root=root / "out", tmp_root=root / "tmp", job_id="runtime-local",
+                )
 
         command = run.call_args.args[0]
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(command[command.index("--template") + 1], expected_catalog_path)
+        self.assertEqual(command[command.index("--template") + 1], str(job_catalog_path))
+        self.assertEqual(observed_catalog, expected_catalog)
         self.assertEqual(command[command.index("--layout-template") + 1], expected_layout_path)
         self.assertNotIn(str(KONCEPT_CATALOG), command)
         self.assertNotIn(str(KONCEPT_LAYOUT), command)
+
+    def test_generated_publication_proof_preserves_exact_catalogue_digest(self):
+        from scripts import generate_quote as generator
+
+        payload = valid_payload()
+        reference_id = payload["pricing_reference_id"]
+        reference = webapp.pricing_reference_pack_detail(reference_id, source="local")
+        first, second = reference["items"][:2]
+        first["item_order"] = 9007199254740993
+        second["item_order"] = 9007199254740992
+        saved = webapp.save_pricing_reference_pack(reference)
+        payload["line_items"] = generation_diagnostic_manual_brief()["line_items"]
+        payload["quote_session"] = {
+            "session_id": "quote-exact-order-publication",
+            "draft_state": {"outputRevision": 0},
+        }
+        with tempfile.TemporaryDirectory(dir=test_temp_root()) as tmp:
+            root = Path(tmp)
+            result = webapp.run_quote_job(
+                payload, output_root=root / "out", tmp_root=root / "tmp", job_id="job-exact-order",
+            )
+            self.assertEqual(result["status"], "completed", result.get("errors"))
+            catalogue = json.loads((root / "tmp" / "job-exact-order" / "pricing-catalog.json").read_bytes())
+            metadata = webapp.read_quote_session_metadata(payload["quote_session"]["session_id"])
+            self.assertEqual(metadata["publication"]["proof"]["pricing_reference"]["digest"],
+                             saved["digest_sha256"].removeprefix("sha256:"))
+        orders = {item["id"]: item["item_order"] for item in catalogue["items"]}
+        self.assertEqual((orders[first["id"]], orders[second["id"]]), (9007199254740993, 9007199254740992))
+        self.assertEqual(generator.catalog_payload_digest(catalogue), saved["digest_sha256"])
+
     def test_exported_quote_company_profile_imports_to_default_company_store(self):
         exported_profile = {
             "schema": "swooshz.quote-company-profile.v1",
@@ -41311,7 +41400,8 @@ main().catch((error) => {
                 filename = {"relative": "../reserved-outside.json", "absolute-outside": str(outside.resolve()), "absolute-inside": str(default.resolve())}[kind]
                 (pack_dir / "reference.json").write_text(json.dumps({"id": "reserved-pack", "pricing_catalog": filename}), encoding="utf-8")
                 reads = []
-                original_read = Path.read_text
+                read_method = "read_bytes" if source == "local" else "read_text"
+                original_read = getattr(Path, read_method)
                 def read_selected_pack(path, *args, **kwargs):
                     self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Catalogue read escaped selected pack")
                     reads.append(path.resolve())
@@ -41319,7 +41409,7 @@ main().catch((error) => {
                 with (
                     mock.patch.object(webapp, "pricing_references_root", return_value=roots["local"]),
                     mock.patch.object(webapp, "bundled_pricing_references_root", return_value=roots["bundled"]),
-                    mock.patch.object(Path, "read_text", read_selected_pack),
+                    mock.patch.object(Path, read_method, read_selected_pack),
                 ):
                     self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", source))
                 self.assertNotIn(outside.resolve(), reads)
@@ -41344,7 +41434,8 @@ main().catch((error) => {
                     (pack_dir / linked_file).symlink_to(outside)
                     if linked_file != "reference.json":
                         (pack_dir / "reference.json").write_text('{"id":"reserved-pack","pricing_catalog":"linked.json"}', encoding="utf-8")
-                original_read = Path.read_text
+                read_method = "read_bytes" if source == "local" else "read_text"
+                original_read = getattr(Path, read_method)
                 def read_selected_pack(path, *args, **kwargs):
                     self.assertTrue(path.resolve().is_relative_to(pack_dir.resolve()), "Native symlink file escaped selected pack")
                     self.assertTrue(path.resolve().is_relative_to(root.resolve()), "Native symlink directory escaped pack root")
@@ -41354,7 +41445,7 @@ main().catch((error) => {
                     mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root),
                     mock.patch.object(webapp, "DEFAULT_PRICING_REFERENCE_ID", "reserved-pack"),
                     mock.patch.object(webapp, "BUNDLED_DEFAULT_PRICING_REFERENCE_ID", "reserved-pack"),
-                    mock.patch.object(Path, "read_text", read_selected_pack),
+                    mock.patch.object(Path, read_method, read_selected_pack),
                 ):
                     if route == "exact":
                         self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", source))
@@ -41376,7 +41467,7 @@ main().catch((error) => {
             outside = root / "reserved-outside.json"
             outside.write_text(json.dumps({"items": [{"id": "reserved-sentinel"}]}), encoding="utf-8")
             (pack_dir / "reference.json").write_text('{"id":"reserved-pack"}', encoding="utf-8")
-            original_resolve, original_read = Path.resolve, Path.read_text
+            original_resolve, original_read = Path.resolve, Path.read_bytes
             def resolved_path(path, *args, **kwargs):
                 # Filesystem-effect adapter only. The real native symlink check
                 # remains separately held where Windows lacks link privileges.
@@ -41387,7 +41478,7 @@ main().catch((error) => {
             with (
                 mock.patch.object(webapp, "pricing_references_root", return_value=root),
                 mock.patch.object(Path, "resolve", resolved_path),
-                mock.patch.object(Path, "read_text", read_selected_pack),
+                mock.patch.object(Path, "read_bytes", read_selected_pack),
             ):
                 self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", "local"))
 
@@ -41400,7 +41491,7 @@ main().catch((error) => {
             (pack_dir / "pricing-catalog.json").write_text('{"items":[{"id":"reserved-default"}]}', encoding="utf-8")
             config_path = pack_dir / "reference.json"
             config_path.write_text('{"id":"reserved-pack","pricing_catalog":"assets/loop.json"}', encoding="utf-8")
-            original_resolve, original_read = Path.resolve, Path.read_text
+            original_resolve, original_read = Path.resolve, Path.read_bytes
             reads = []
             def resolve_catalog_loop(path, *args, **kwargs):
                 if path == catalog_path:
@@ -41413,7 +41504,7 @@ main().catch((error) => {
             with (
                 mock.patch.object(webapp, "pricing_references_root", return_value=root),
                 mock.patch.object(Path, "resolve", resolve_catalog_loop),
-                mock.patch.object(Path, "read_text", observed_read),
+                mock.patch.object(Path, "read_bytes", observed_read),
             ):
                 self.assertIsNone(webapp.PricingReferencePack.resolve_exact("reserved-pack", "local"))
             self.assertEqual(reads, [config_path])
@@ -41431,14 +41522,14 @@ main().catch((error) => {
                     if case == "missing-catalog": config["pricing_catalog"] = "missing.json"
                     (pack_dir / "reference.json").write_text(json.dumps(config), encoding="utf-8")
                 reads = []
-                original_read = Path.read_text
+                original_read = Path.read_bytes
                 def observed_read(path, *args, **kwargs):
                     reads.append(path)
                     return original_read(path, *args, **kwargs)
                 with (
                     mock.patch.object(webapp, "pricing_references_root", return_value=local),
                     mock.patch.object(webapp, "bundled_pricing_references_root", return_value=bundled),
-                    mock.patch.object(Path, "read_text", observed_read),
+                    mock.patch.object(Path, "read_bytes", observed_read),
                 ):
                     source = "company" if case == "wrong-source" else "bundled" if case == "missing-bundled" else "local"
                     reference_id = "../reserved-pack" if case == "invalid-id" else "reserved-pack"
@@ -41528,6 +41619,278 @@ main().catch((error) => {
         self.assertEqual(prompt_rows[0]["description"], "Local collision graphics")
         self.assertIn("local-collision-row", lookup)
 
+
+    def test_pricing_reference_add_row_at_order_limit_in_manage(self):
+        node = require_node(self)
+        if not (ROOT / "node_modules" / "playwright" / "package.json").exists():
+            message = "Playwright is required for the rendered pricing append regression."
+            if os.environ.get("CI"):
+                self.fail(message)
+            self.skipTest(message)
+        ceiling = 10 ** (sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits) - 1
+        reference = webapp.normalize_pricing_reference_payload({
+            "id": "synthetic-editor-append",
+            "label": "Synthetic pricing append",
+            "items": [with_required_pricing_metadata({
+                "id": item_id, "section": section, "description": description, "unit_hint": "nos",
+                "internal_cost": 12, "markup_multiplier": 2, "category_order": ceiling, "item_order": order,
+            }) for item_id, section, description, order in (
+                ("first", "Furniture", "Synthetic first chair", ceiling - 1),
+                ("last", "Lighting", "Synthetic Z lamp", ceiling),
+                ("previous", "Lighting", "Synthetic Y lamp", ceiling),
+            )],
+        })
+        browser = """
+const assert = require('node:assert/strict');
+const { chromium } = require('playwright');
+const base = process.argv[2];
+const endpoint = base + '/api/settings/pricing-references';
+const limit = Number(process.argv[3]);
+const ceiling = BigInt('9'.repeat(limit));
+const expected = ['Synthetic first chair', 'Synthetic Y lamp', 'Synthetic Z lamp', 'Synthetic A lamp',
+  'Synthetic B lamp', 'Synthetic A rail', 'Synthetic B rail'];
+const sortFields = ['category_order', 'item_order'];
+function exact(text) {
+  return JSON.parse(text, (key, value, context) => {
+    if (!sortFields.includes(key)) return value;
+    assert.equal(typeof value, 'number');
+    return BigInt(context.source);
+  });
+}
+async function run() {
+  const browser = await chromium.launch({ channel: process.env.SQAG_TEST_PLAYWRIGHT_CHANNEL || undefined });
+  try {
+    const context = await browser.newContext({ serviceWorkers: 'block' });
+    await context.route('**/*', route => new URL(route.request().url()).origin === base ? route.continue() : route.abort());
+    const page = await context.newPage();
+    await page.goto(base, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => !state.isBooting && canManagePricingReferences());
+    async function openManage() {
+      await page.locator('#settingsButton').click();
+      const selection = page.locator('#deletePricingReferenceSelect');
+      const value = 'local::synthetic-editor-append';
+      if (await selection.inputValue() !== value) await selection.selectOption(value);
+      // Manage renders Review only after the selected reference's editable rows load.
+      await page.locator('#pricingReferenceManageStatus [data-pricing-reference-table-open]').click();
+    }
+    const field = name => page.locator(`#pricingReferenceTableBody [data-preview-field="${name}"]`);
+    const descriptions = () => field('description').evaluateAll(rows => rows.map(row => row.value));
+    async function add(description, section) {
+      await page.locator('#pricingReferenceAddRowButton').click();
+      assert.equal((await descriptions()).at(-1), '');
+      const orders = await page.evaluate(() => state.pendingPricingReference.items.map(row => String(row.item_order)));
+      assert(orders.every(order => BigInt(order) <= ceiling), 'Add Row must stay within the numeric limit');
+      if (section) await field('section').last().fill(section);
+      await field('description').last().fill(description);
+      await field('internal_cost').last().fill('18');
+    }
+    await openManage();
+    assert.deepEqual(await descriptions(), expected.slice(0, 3));
+    await add(expected[3]);
+    await add('Synthetic undo lamp');
+    await page.locator('#pricingReferenceUndoButton').click(); // Cost edit.
+    await page.locator('#pricingReferenceUndoButton').click(); // Description edit.
+    await page.locator('#pricingReferenceUndoButton').click(); // Add Row.
+    assert.deepEqual(await descriptions(), expected.slice(0, 4));
+    await add(expected[4]);
+    await add(expected[5], 'Structures');
+    await add(expected[6]);
+    assert.deepEqual(await descriptions(), expected);
+    await page.locator('#pricingReferenceTableCloseButton').click();
+    const save = page.waitForResponse(response => response.url() === endpoint && response.request().method() === 'POST');
+    await page.locator('#pricingReferenceSaveButton').click();
+    const response = await save;
+    assert.equal(response.status(), 200, await response.text());
+    const posted = exact(response.request().postData()).items;
+    const detail = await context.request.get(endpoint + '/synthetic-editor-append?source=local');
+    assert.equal(detail.status(), 200);
+    const saved = exact(await detail.text()).pricing_reference.items;
+    for (const items of [posted, saved]) {
+      assert.deepEqual(items.map(row => row.description), expected);
+      assert.deepEqual(items.map(row => row.item_order), [ceiling - 1n, ...Array(6).fill(ceiling)]);
+      assert.deepEqual(items.map(row => row.category_order), Array(7).fill(ceiling));
+      assert.deepEqual(items.map(row => row.item_order_tie || 0), [0, 0, 0, 1, 2, 3, 4]);
+      assert.deepEqual(items.map(row => row.category_order_tie || 0), [0, 0, 0, 0, 0, 1, 1]);
+    }
+    await page.waitForFunction(() => !state.pricingReferenceSaveBusy);
+    await page.locator('#pricingReferenceCloseButton').click();
+    await openManage();
+    assert.deepEqual(await descriptions(), expected);
+    assert.equal(await page.evaluate(() => pricingReferenceHasPendingChanges()), false);
+    const outputOrder = await page.evaluate(() => {
+      const reference = state.pricingReferences.find(item => item.id === 'synthetic-editor-append');
+      state.pricingReferenceId = reference.id;
+      state.pricingReferenceSource = reference.source;
+      state.outputSortMode = 'pricing_reference';
+      return sortOutputRows(reference.items.slice().reverse().map(item => ({
+        section: item.section, description: item.description, pricing_keyword: item.id,
+      }))).map(row => row.description);
+    });
+    assert.deepEqual(outputOrder, expected);
+  } finally {
+    await browser.close();
+  }
+}
+run().catch(error => { console.error(error.stack); process.exitCode = 1; });
+"""
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local"}),
+            mock.patch.object(webapp, "pricing_reference_ai_metadata_enrichment_configured", return_value=False),
+            mock.patch.object(webapp, "write_local_log"),
+            LocalRunnerServer() as runner,
+        ):
+            webapp.save_pricing_reference_pack(reference)
+            completed = subprocess.run(
+                [node, "-", runner.base_url, str(len(str(ceiling)))], cwd=ROOT, input=browser, text=True,
+                encoding="utf-8", capture_output=True, timeout=60,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-4000:])
+
+    def test_pricing_reference_exact_orders_round_trip_in_rendered_editor(self):
+        node = require_node(self)
+        if not (ROOT / "node_modules" / "playwright" / "package.json").exists():
+            message = "Playwright is required for the rendered exact pricing order regression."
+            if os.environ.get("CI"):
+                self.fail(message)
+            self.skipTest(message)
+        raw = json.dumps({"currency": "MYR", "items": [
+            {
+                "section": "Structures", "description": description, "unit_hint": "sqm",
+                "internal_cost": cost, "markup_multiplier": 1.5, "remarks": [], "aliases": [],
+                "category_order": "__CATEGORY__", "item_order": order, "source_row_index": index,
+                "warning": None, "status": None,
+            }
+            for description, cost, order, index in (
+                ("Synthetic panel", 24, "__HIGH__", 1), ("Synthetic rail", 40, "__LOW__", "__OUTSIDE__"),
+            )
+        ]})
+        exponent = (sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits) - 1
+        boundary = 10 ** exponent
+        for key, token in {
+            "__CATEGORY__": str(boundary + 1), "__HIGH__": f"{boundary + 1}.0",
+            "__LOW__": f"1e{exponent}", "__OUTSIDE__": f"1e{exponent}",
+        }.items():
+            raw = raw.replace(json.dumps(key), token)
+        model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
+        fixture_root = Path(self._test_data_root) / "exact-pricing"
+        browser = """
+const assert = require('node:assert/strict');
+const { chromium } = require('playwright');
+const base = process.argv[2];
+const endpoint = base + '/api/settings/pricing-references';
+const boundary = 10n ** BigInt(process.argv[3]);
+const orders = [String(boundary), String(boundary + 1n)];
+const category = orders[1];
+function exact(raw) {
+  return JSON.parse(raw, (key, value, context) => {
+    if (!['item_order', 'category_order'].includes(key)) return value;
+    assert.equal(typeof value, 'number', 'order token must remain numeric on the wire');
+    return context.source;
+  });
+}
+async function run() {
+  const browser = await chromium.launch({ channel: process.env.SQAG_TEST_PLAYWRIGHT_CHANNEL || undefined });
+  try {
+    const context = await browser.newContext({ serviceWorkers: 'block' });
+    await context.route('**/*', route => new URL(route.request().url()).origin === base ? route.continue() : route.abort());
+    // Test application transport with the newer JSON raw-token APIs absent.
+    await context.addInitScript(() => {
+      JSON.rawJSON = undefined;
+      const parse = JSON.parse;
+      JSON.parse = (text, reviver) => parse(text, reviver && function (key, value) {
+        return reviver.call(this, key, value);
+      });
+    });
+    const page = await context.newPage();
+    await page.goto(base, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => !state.isBooting && canManagePricingReferences());
+    const helpers = await page.evaluate(() => {
+      const description = 'x'.repeat(512000) + '"item_order":9007199254740993';
+      const raw = '{"description":' + JSON.stringify(description) + ',"item_order":9007199254740993}';
+      const row = parsePricingReferenceJson(raw);
+      return [row.description === description, row.item_order, nextPricingReferenceOrder('9999999999999999')];
+    });
+    assert.deepEqual(helpers, [true, '9007199254740993', '10000000000000000']);
+    await page.evaluate(() => openPricingReferenceModal({ preserveMode: true }));
+    const previewResponse = page.waitForResponse(response => response.url() === endpoint + '/import-preview');
+    await page.locator('#pricingReferenceFile').setInputFiles({
+      name: 'fixture.csv', mimeType: 'text/csv', buffer: Buffer.from('Item,Price\\nSynthetic panel,24\\nSynthetic rail,40\\n'),
+    });
+    const preview = await previewResponse;
+    assert.equal(preview.status(), 200);
+    assert.deepEqual(exact(await preview.text()).items.map(item => item.item_order), orders);
+    await page.waitForFunction(() => state.pendingPricingReference?.canSave && !state.pricingReferenceImportBusy);
+    const browserOrders = () => page.evaluate(() => state.pendingPricingReference.items.map(item => String(item.item_order)));
+    assert.deepEqual(await browserOrders(), orders);
+    await page.evaluate(() => openPricingReferenceTableOverlay());
+    assert.deepEqual(await page.locator('#pricingReferenceTableBody [data-preview-field="description"]').evaluateAll(rows => rows.map(row => row.value)), ['Synthetic rail', 'Synthetic panel']);
+    await page.locator('#pricingReferenceAddRowButton').click();
+    assert.deepEqual(await browserOrders(), [...orders, String(boundary + 2n)]);
+    await page.locator('#pricingReferenceUndoButton').click();
+    assert.deepEqual(await browserOrders(), orders);
+    await page.locator('#pricingReferenceTableCloseButton').click();
+    await page.locator('#pricingReferenceName').fill('Synthetic Exact Ordering');
+    const saveResponse = page.waitForResponse(response => response.url() === endpoint && response.request().method() === 'POST');
+    await page.evaluate(() => savePricingReferenceFromModal({ preventDefault() {} }));
+    const saved = await saveResponse;
+    assert.equal(saved.status(), 200, await saved.text());
+    const posted = exact(saved.request().postData());
+    assert.deepEqual(posted.items.map(item => item.item_order), orders);
+    assert.deepEqual(posted.items.map(item => item.category_order), [category, category]);
+    const readback = await context.request.get(endpoint + '/synthetic-exact-ordering?source=local');
+    assert.equal(readback.status(), 200);
+    assert.deepEqual(exact(await readback.text()).pricing_reference.items.map(item => item.item_order), orders);
+    await page.evaluate(async () => {
+      await loadProfiles();
+      openPricingReferenceModal({ preserveMode: true });
+      const reference = state.pricingReferences.find(item => item.id === 'synthetic-exact-ordering');
+      if (!reference) throw Error('Expected catalogue in Manage');
+      selectPricingReferenceOptionValue(pricingReferenceSelectValue(reference));
+      await editSelectedPricingReference();
+    });
+    assert.deepEqual(await browserOrders(), orders);
+    assert.equal(await page.evaluate(() => pricingReferenceHasPendingChanges()), false);
+    const quoteRequest = await page.evaluate(() => stringifyPricingReferenceJson({ type: 'draft', payload: buildPayload() }));
+    assert.deepEqual(exact(quoteRequest).payload.pricing_reference.items.map(item => item.item_order), orders);
+    const unchanged = await page.evaluate(async (posted) => postJson('/api/settings/pricing-references', {
+      ...posted,
+      items: state.pendingPricingReference.items,
+      source: 'local',
+      update_existing: true,
+      editing_reference_id: posted.id,
+    }, { pricingReferenceOrders: true }), posted);
+    assert.equal(unchanged.status, 200);
+    assert.equal(unchanged.data.status, 'unchanged');
+    await page.evaluate(() => openPricingReferenceTableOverlay());
+    await page.locator('#pricingReferenceTableBody [data-preview-field="internal_cost"]').first().fill('41');
+    await page.locator('#pricingReferenceTableCloseButton').click();
+    const editResponse = page.waitForResponse(response => response.url() === endpoint && response.request().method() === 'POST');
+    await page.evaluate(() => savePricingReferenceFromModal({ preventDefault() {} }));
+    const edited = await editResponse;
+    assert.equal(edited.status(), 200, await edited.text());
+    const editedBody = exact(edited.request().postData());
+    assert.equal(editedBody.update_existing, true);
+    assert.equal(editedBody.id, posted.id);
+    assert.deepEqual(editedBody.items.map(item => item.item_order), orders);
+    assert.equal(Number(editedBody.items[0].internal_cost), 41);
+  } finally { await browser.close(); }
+}
+run().catch(error => { console.error(error.stack); process.exitCode = 1; });
+"""
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local"}),
+            mock.patch.object(webapp, "pricing_references_root", return_value=fixture_root),
+            mock.patch.object(webapp, "pricing_reference_ai_metadata_enrichment_configured", return_value=False),
+            mock.patch.object(webapp, "write_local_log"),
+            mock.patch.object(webapp.urllib.request, "urlopen", return_value=FixtureHttpResponse(responses_envelope(model, raw))),
+            LocalRunnerServer() as runner,
+        ):
+            completed = subprocess.run(
+                [node, "-", runner.base_url, str(exponent)], cwd=ROOT, input=browser, text=True, encoding="utf-8",
+                capture_output=True, timeout=60,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-4000:])
+
     def test_pricing_reference_save_endpoint_writes_local_pack(self):
         payload = {
             "id": "endpoint-ref",
@@ -41574,47 +41937,474 @@ main().catch((error) => {
         self.assertIn("ai metadata row-1", catalog["items"][0]["match_terms"])
         self.assertIn("ai_family", catalog["items"][0]["object_families"])
 
-    def test_apply_saved_pricing_reference_ai_metadata_enrichment_updates_pack(self):
-        with mock_pricing_metadata_enrichment():
-            reference = webapp.normalize_pricing_reference_payload({
-                "id": "async-ref",
-                "label": "Async Ref",
-                "tax": {"label": "GST", "rate": 0.09},
-                "currency": "SGD",
+    def test_pricing_reference_http_failures_before_promotion_keep_previous_bytes(self):
+        from tests.test_pricing_reference_storage import pricing_reference
+
+        endpoint = "/api/settings/pricing-references"
+        root = Path(self._test_data_root) / "failed-stage"
+        original_bytes, original_text, original_replace = Path.write_bytes, Path.write_text, os.replace
+
+        def files(path):
+            return {file.relative_to(path): file.read_bytes() for file in path.rglob("*") if file.is_file()}
+
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local"}),
+            mock.patch.object(webapp, "pricing_references_root", return_value=root),
+            mock.patch.object(webapp, "pricing_reference_ai_metadata_enrichment_configured", return_value=False),
+            mock.patch.object(webapp, "write_local_log") as logs,
+            mock.patch.object(webapp, "append_runtime_telemetry") as telemetry,
+            LocalRunnerServer() as runner,
+        ):
+            with urllib.request.urlopen(runner.base_url + "/api/session", timeout=5) as response:
+                session = json.load(response)
+            for editing, point in itertools.product((False, True), ("visual", "catalogue", "markdown", "config", "promote")):
+                with self.subTest(editing=editing, point=point):
+                    self.reset_rate_limit_state()
+                    reference_id = f"synthetic-fault-{int(editing)}-{point}"
+                    store = webapp.LocalPricingReferenceStore(reference_id)
+                    if editing:
+                        webapp.save_pricing_reference_pack({**pricing_reference(10), "id": reference_id})
+                        (store.directory / "unmentioned.bin").write_bytes(b"fixture keep")
+                    old = files(store.directory)
+
+                    def write_bytes(path, data):
+                        result = original_bytes(path, data)
+                        if point == "visual" and path.is_relative_to(store.stage):
+                            raise OSError("synthetic staged visual write fault")
+                        return result
+
+                    def write_text(path, text, *args, **kwargs):
+                        result = original_text(path, text, *args, **kwargs)
+                        failures = {"catalogue": "pricing-catalog.json", "markdown": "pricing-catalog.ai-reference.md"}
+                        if path.is_relative_to(store.stage) and path.name == failures.get(point):
+                            raise OSError("synthetic staged text write fault")
+                        return result
+
+                    def rename(source, destination):
+                        if (point == "config" and destination == store.stage / "reference.json"
+                                or point == "promote" and source == store.stage):
+                            raise OSError("synthetic staged rename fault")
+                        original_replace(source, destination)
+
+                    telemetry.reset_mock()
+                    request = urllib.request.Request(
+                        runner.base_url + endpoint,
+                        data=json.dumps({
+                            **pricing_reference(30, width=3), "id": reference_id, "source": "local",
+                            "update_existing": editing, "editing_reference_id": reference_id if editing else "",
+                        }).encode("utf-8"),
+                        headers={"Content-Type": "application/json", session["csrf_header"]: session["csrf_token"]},
+                        method="POST",
+                    )
+                    with (
+                        mock.patch.object(Path, "write_bytes", write_bytes),
+                        mock.patch.object(Path, "write_text", write_text),
+                        mock.patch.object(os, "replace", rename),
+                        self.assertRaises(urllib.error.HTTPError) as failed,
+                    ):
+                        urllib.request.urlopen(request, timeout=10)
+                    with failed.exception as response:
+                        self.assertEqual(response.code, 503)
+                        body = json.load(response)
+                    reference = body["error_reference"]
+                    self.assertTrue(reference.startswith("ERR-"))
+                    self.assertTrue(any(call.args[0] == "server_error" and call.args[1].get("error_reference") == reference
+                                        for call in logs.call_args_list))
+                    telemetry.assert_not_called()
+                    self.assertEqual(files(store.directory), old)
+                    self.assertEqual(store.directory.exists(), editing)
+                    self.assertFalse(store.stage.exists())
+                    self.assertFalse(store.previous.exists())
+
+    def test_pricing_reference_save_rejects_concurrent_destination_changes(self):
+        root = Path(self._test_data_root) / "pricing-save-races"
+        model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_METADATA_MODEL"]
+        endpoint = "/api/settings/pricing-references"
+        cases = (
+            ("winner-valid", "save", True, False, "local"),
+            ("winner-rejected", "save", True, True, "local"),
+            ("concurrent-create", "save", False, False, "local"),
+            ("concurrent-delete", "delete", True, False, "local"),
+            ("identical-recreate", "recreate", True, False, "local"),
+            ("bundled-shadow", "save", True, False, "bundled"),
+        )
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+
+        def payload(reference_id, cost, *, update=False, source="local", image_width=2):
+            return {
+                "id": reference_id, "label": reference_id, "currency": "MYR", "source": source,
+                "update_existing": update, "editing_reference_id": reference_id if update else "",
                 "items": [with_required_pricing_metadata({
-                    "id": "graphics-lightbox",
-                    "section": "Graphics",
-                    "description": "Lightbox graphics",
-                    "unit_hint": "sqm",
-                    "internal_cost": 40,
-                    "markup_multiplier": 1.5,
-                    "match_terms": ["deterministic lightbox"],
-                    "object_families": ["deterministic_family"],
+                    "id": "panel", "section": "Structures", "description": "Synthetic panel",
+                    "unit_hint": "sqm", "internal_cost": cost, "markup_multiplier": 1.5,
+                    "category_order": 1, "item_order": 1,
+                    "visual_references": [{
+                        "source": "xl/media/panel.png", "data_url": "data:image/png;base64,"
+                        + base64.b64encode(highly_compressible_rgb_png(image_width, 2)).decode("ascii"),
+                    }],
                 })],
-            })
-
-        ai_items = [
-            {
-                **reference["items"][0],
-                "match_terms": ["lightbox graphics", "illuminated fabric graphic"],
-                "object_families": ["illuminated_graphics"],
             }
+
+        def files(directory):
+            return {path.relative_to(directory): path.read_bytes()
+                    for path in directory.rglob("*") if path.is_file()}
+
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local"}),
+            mock.patch.object(webapp, "pricing_references_root", return_value=root / "local"),
+            mock.patch.object(webapp, "bundled_pricing_references_root", return_value=root / "bundled"),
+            mock.patch.object(webapp, "write_local_log") as logs,
+            mock.patch.object(webapp, "append_runtime_telemetry") as telemetry,
+            LocalRunnerServer() as runner,
+        ):
+            with urllib.request.urlopen(runner.base_url + "/api/session", timeout=5) as response:
+                session = json.load(response)
+            host, port = runner.server.server_address
+
+            def request(method, suffix="", body=None):
+                connection = http.client.HTTPConnection(host, port, timeout=12)
+                try:
+                    connection.request(method, endpoint + suffix, None if body is None else json.dumps(body), {
+                        "Content-Type": "application/json", "Origin": runner.base_url,
+                        session["csrf_header"]: session["csrf_token"],
+                    })
+                    response = connection.getresponse()
+                    return response.status, json.load(response)
+                finally:
+                    connection.close()
+
+            for reference_id, change, update, reject, source in cases:
+                with self.subTest(reference_id=reference_id):
+                    initial = payload(reference_id, 10)
+                    local_directory = root / "local" / reference_id
+                    bundled_directory = root / "bundled" / reference_id
+                    initial_reference = webapp.normalize_pricing_reference_payload(initial)
+                    if update:
+                        webapp.save_pricing_reference_pack(initial_reference)
+                        if source == "bundled":
+                            bundled_directory.parent.mkdir(exist_ok=True)
+                            local_directory.rename(bundled_directory)
+                    bundled_before = files(bundled_directory)
+                    if reference_id == "winner-valid":
+                        # Exercise the legacy config before the first stamped save.
+                        config_path = local_directory / "reference.json"
+                        config = json.loads(config_path.read_bytes())
+                        del config["_save_revision"]
+                        config_path.write_text(json.dumps(config), encoding="utf-8")
+                    started, release = threading.Event(), threading.Event()
+
+                    def provider_reply(*args, **kwargs):
+                        first = not started.is_set()
+                        if first:
+                            started.set()
+                            self.assertTrue(release.wait(10), "First pricing save never resumed")
+                        return json_response(model, {"items": [{
+                            "id": "unknown" if first and reject else "panel",
+                            "match_terms": ["synthetic panel"], "object_families": ["synthetic_panel"],
+                        }]})
+
+                    older_payload = payload(reference_id, 20, update=update, source=source)
+                    with (
+                        mock.patch.object(webapp.urllib.request, "urlopen", side_effect=provider_reply) as send,
+                        ThreadPoolExecutor(max_workers=1) as pool,
+                    ):
+                        older = pool.submit(request, "POST", "", older_payload)
+                        try:
+                            self.assertTrue(started.wait(5), "First pricing save never reached enrichment")
+                            if change in {"delete", "recreate"}:
+                                status, result = request("DELETE", f"/{reference_id}?source=local")
+                                self.assertEqual(status, 200, result)
+                            if change == "recreate":
+                                webapp.save_pricing_reference_pack(initial_reference)
+                            if change == "save":
+                                winner = payload(reference_id, 30, update=update and source == "local",
+                                                 image_width=3)
+                                status, result = request("POST", "", winner)
+                                self.assertEqual(status, 200, result)
+                                self.assertEqual(result["status"], "saved")
+                            winner_files = files(local_directory)
+                            if change != "delete":
+                                self.assertIn(Path("reference.json"), winner_files)
+                                self.assertIn(Path("pricing-catalog.json"), winner_files)
+                                self.assertIn(Path("pricing-catalog.ai-reference.md"), winner_files)
+                                self.assertTrue(any(path.parent.name == "pricing-catalog-images" for path in winner_files))
+                            else:
+                                self.assertFalse(local_directory.exists())
+                            telemetry.reset_mock()
+                            logs.reset_mock()
+                        finally:
+                            release.set()
+                        status, result = older.result(timeout=10)
+                        self.assertEqual(send.call_count, 2 if change == "save" else 1)
+                    self.assertEqual(status, 409, result)
+                    self.assertEqual(result["reason"], "pricing_reference_revision_conflict")
+                    self.assertTrue(any(
+                        call.args[1].get("error_reference") == result["error_reference"]
+                        for call in logs.call_args_list if call.args[0] == "server_error"
+                    ))
+                    telemetry.assert_not_called()
+                    self.assertEqual(files(local_directory), winner_files)
+                    self.assertEqual(files(bundled_directory), bundled_before)
+
+            with mock.patch.object(webapp.urllib.request, "urlopen") as send:
+                status, result = request("POST", "", payload("missing-edit", 20, update=True))
+                self.assertEqual(status, 404, result)
+                self.assertEqual(result["reason"], "pricing_reference_missing")
+                send.assert_not_called()
+            self.assertFalse((root / "local" / "missing-edit").exists())
+
+            bundled_id = "bundled-copy"
+            seed = webapp.normalize_pricing_reference_payload(payload(bundled_id, 10))
+            webapp.save_pricing_reference_pack(seed)
+            local_copy = root / "local" / bundled_id
+            bundled_copy = root / "bundled" / bundled_id
+            local_copy.rename(bundled_copy)
+            bundled_before = files(bundled_copy)
+            reply = {"items": [{
+                "id": "panel", "match_terms": ["synthetic panel"], "object_families": ["synthetic_panel"],
+            }]}
+            with mock.patch.object(webapp.urllib.request, "urlopen", return_value=json_response(model, reply)) as send:
+                status, result = request("POST", "", payload(bundled_id, 30, update=True, source="bundled"))
+                self.assertEqual(status, 200, result)
+                self.assertEqual(result["pricing_reference"]["source"], "local")
+                self.assertEqual(files(bundled_copy), bundled_before)
+                self.assertTrue(local_copy.is_dir())
+                send.assert_called_once()
+
+            with mock.patch.object(webapp.urllib.request, "urlopen") as send:
+                bundled_directory = root / "bundled" / "bundled-shadow"
+                bundled_before = files(bundled_directory)
+                status, result = request("POST", "", payload("bundled-shadow", 50, update=True, source="bundled"))
+                self.assertEqual(status, 409, result)
+                status, result = request("POST", "", payload("bundled-shadow", 10, update=True, source="bundled"))
+                self.assertEqual(status, 200, result)
+                self.assertEqual(result["status"], "unchanged")
+                self.assertEqual(result["pricing_reference"]["source"], "bundled")
+                send.assert_not_called()
+                self.assertEqual(files(bundled_directory), bundled_before)
+
+                unreadable = root / "local" / "unreadable-pack"
+                unreadable.mkdir()
+                (unreadable / "reference.json").write_text("{", encoding="utf-8")
+                before = files(unreadable)
+                status, result = request("POST", "", payload("unreadable-pack", 20))
+                self.assertEqual(status, 503, result)
+                send.assert_not_called()
+                self.assertEqual(files(unreadable), before)
+
+    def test_pricing_import_wire_order_has_exact_numeric_form_parity(self):
+        model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
+        catalogue = Path(self._test_data_root) / "wire-pricing"
+        source = base64.b64encode(b"Item,Price\nSynthetic rail,40\n").decode("ascii")
+        upload = {"filename": "synthetic-rail.csv", "currency": "MYR",
+                  "data_url": "data:text/csv;base64," + source}
+        row = {"section": "Structures", "description": "Synthetic rail", "unit_hint": "sqm",
+               "internal_cost": 40, "markup_multiplier": 1.5, "remarks": [], "aliases": [],
+               "category_order": 1, "item_order": 1, "source_row_index": 1,
+               "warning": None, "status": None}
+        limit = sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits
+        boundary = "9" * limit
+        expanded = "1" + "0" * (limit - 1)
+        order_fields = ("category_order", "item_order", "source_row_index")
+
+        def wire(token, fields=order_fields):
+            return json.dumps({"currency": None, "items": [
+                {**row, **dict.fromkeys(fields, "WIRE_NUMBER")},
+            ]}).replace('"WIRE_NUMBER"', token)
+
+        cases = [
+            ("plain", wire(boundary), int(boundary)),
+            ("decimal", wire(boundary + ".00"), int(boundary)),
+            ("negative-exponent", wire(boundary + "0e-1"), int(boundary)),
+            ("expanded-plain", wire(expanded), int(expanded)),
+            ("expanded-decimal", wire("0.01e" + str(limit + 1)), int(expanded)),
+            ("expanded-exponent", wire(f"1e{limit - 1}"), int(expanded)),
+            ("over-limit-integer", wire("1" + "0" * limit), None),
+            ("over-limit-expansion", wire(f"1e{limit}"), None),
+            ("over-limit-precision", wire("1." + boundary), None),
+            ("extreme-exponent", wire("1e999999999999999999"), None),
+            ("integer-shaped-fraction", wire("1.00000000000000000001"), None),
+            ("underflowing-fraction", wire("1e-9999"), None),
+            ("negative-integer", wire("-1e0"), None),
+            ("bad-leading-zero", wire("01e0"), None),
+            ("missing-exponent", wire("1e+"), None),
+            ("duplicate-order", wire('1,"category_order":2', ("category_order",)), None),
+            ("nonfinite-constant", wire("NaN"), None),
+            ("nonfinite-cost", wire("1e309", ("internal_cost",)), None),
+            ("nonfinite-markup", wire("1e309", ("markup_multiplier",)), None),
         ]
+        self.addCleanup(self.reset_rate_limit_state)
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin", "SQAG_STORAGE_MODE": "local"}),
+            mock.patch.object(webapp, "pricing_references_root", return_value=catalogue),
+            mock.patch.object(webapp, "write_local_log"),
+            mock.patch.object(webapp, "repair_ai_pricing_import_source_placement",
+                              wraps=webapp.repair_ai_pricing_import_source_placement) as placement,
+            LocalRunnerServer() as runner,
+        ):
+            with urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3) as response:
+                session = json.load(response)
+            for case, text, expected in cases:
+                self.reset_rate_limit_state()
+                placement.reset_mock()
+                with self.subTest(case=case), mock.patch.object(
+                    webapp.urllib.request, "urlopen",
+                    return_value=FixtureHttpResponse(responses_envelope(model, text)),
+                ) as send:
+                    connection = http.client.HTTPConnection(*runner.server.server_address, timeout=5)
+                    try:
+                        connection.request("POST", "/api/settings/pricing-references/import-preview", json.dumps(upload), {
+                            "Content-Type": "application/json", "Origin": runner.base_url,
+                            session["csrf_header"]: session["csrf_token"],
+                        })
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, 200)
+                        preview = json.load(response)
+                    finally:
+                        connection.close()
+                    send.assert_called_once()
+                    self.assertFalse(preview["saved"])
+                    self.assertFalse(catalogue.exists())
+                    self.assertEqual(preview["canSave"], expected is not None)
+                    if expected is None:
+                        placement.assert_not_called()
+                        self.assertEqual(preview["items"], [])
+                        self.assertEqual(preview["errors"], webapp.generic_referenced_errors(preview["error_reference"]))
+                    else:
+                        placement.assert_called_once()
+                        self.assertTrue(placement.call_args.args[0][0]["source_row_index"] == expected)
+                        for field in ("category_order", "item_order"):
+                            self.assertTrue(preview["items"][0][field] == expected)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(webapp, "pricing_references_root", return_value=Path(tmp)):
-                webapp.save_pricing_reference_pack(reference)
-                with mock.patch.object(webapp, "ai_pricing_reference_metadata_enrichment", return_value=(ai_items, [])) as enrichment:
-                    updated = webapp.apply_saved_pricing_reference_ai_metadata_enrichment("async-ref")
-                catalog = json.loads((Path(tmp) / "async-ref" / "pricing-catalog.json").read_text(encoding="utf-8"))
-                metadata = json.loads((Path(tmp) / "async-ref" / "reference.json").read_text(encoding="utf-8"))
+    def test_strict_pricing_import_and_metadata_through_upload_and_save_endpoints(self):
+        import_model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_IMPORT_MODEL"]
+        metadata_model = SYNTHETIC_DRAFT_CONFIG["OPENROUTER_PRICING_METADATA_MODEL"]
+        catalogue = Path(self._test_data_root) / "strict-pricing"
+        source = b'Item,Price\n"Synthetic panel; Prices are not inclusive of trim",24\nSynthetic rail,40\n'
+        upload = {"filename": "synthetic-pricing.csv", "currency": "MYR",
+                  "data_url": "data:text/csv;base64," + base64.b64encode(source).decode("ascii")}
+        panel = {"section": "Structures", "description": "Synthetic panel", "unit_hint": "sqm",
+                 "internal_cost": 24, "markup_multiplier": 1.5, "remarks": ["Prices are not inclusive of trim"],
+                 "aliases": [], "category_order": 1, "item_order": 1, "source_row_index": 1,
+                 "warning": None, "status": None}
+        rail = {**panel, "description": "Synthetic rail", "unit_hint": "m", "internal_cost": 40,
+                "remarks": [], "item_order": 2, "source_row_index": 2}
+        valid_import = {"currency": "USD", "items": [rail, panel]}
+        cases = {
+            "malformed": '{"items":[',
+            "extra": json.dumps({"currency": "USD", "items": [{**panel, "match_terms": ["synthetic"]}]}),
+            "missing": json.dumps({"currency": "USD", "items": [{k: v for k, v in panel.items() if k != "internal_cost"}]}),
+            "duplicate": '{"currency":null,"items":[],"items":[]}',
+            "fraction-rounds-to-integer": json.dumps(valid_import).replace(
+                '"category_order": 1', '"category_order": 1.0000000000000000001'),
+            "valid-integral-forms": json.dumps(valid_import).replace(
+                '"category_order": 1', '"category_order": 1.0').replace(
+                '"source_row_index": 2', '"source_row_index": 2e0').replace(
+                '"item_order": 1', '"item_order": 1.0'),
+            "valid": json.dumps(valid_import),
+        }
+        self.reset_rate_limit_state()
+        self.addCleanup(self.reset_rate_limit_state)
+        with (
+            mock.patch.dict(os.environ, {"APP_MODE": "local", "USER_TYPE": "admin"}, clear=False),
+            mock.patch.object(webapp, "pricing_references_root", return_value=catalogue),
+            mock.patch.object(webapp, "MAX_PRICING_METADATA_BATCH_ITEMS", 1),
+            mock.patch.object(webapp, "write_local_log") as logs,
+            LocalRunnerServer() as runner,
+        ):
+            with urllib.request.urlopen(f"{runner.base_url}/api/session", timeout=3) as response:
+                session = json.load(response)
+            endpoint = "/api/settings/pricing-references"
 
-        self.assertTrue(updated)
-        enrichment.assert_called_once()
-        self.assertEqual(metadata["label"], "Async Ref")
-        self.assertIn("lightbox graphics", catalog["items"][0]["match_terms"])
-        self.assertIn("illuminated fabric graphic", catalog["items"][0]["match_terms"])
-        self.assertIn("illuminated_graphics", catalog["items"][0]["object_families"])
+            def post(path, payload):
+                target = urllib.parse.urlsplit(runner.base_url)
+                connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+                try:
+                    connection.request("POST", endpoint + path, json.dumps(payload), {
+                        "Content-Type": "application/json", "Origin": runner.base_url,
+                        session["csrf_header"]: session["csrf_token"],
+                    })
+                    response = connection.getresponse()
+                    result = json.load(response)
+                    self.assertEqual(response.status, 200, result)
+                    return result
+                finally:
+                    connection.close()
+
+            def provider_reply(model, text):
+                return FixtureHttpResponse(responses_envelope(model, text))
+
+            for case, text in cases.items():
+                with self.subTest(operation="import", case=case), mock.patch.object(
+                    webapp.urllib.request, "urlopen", return_value=provider_reply(import_model, text),
+                ) as send:
+                    preview = post("/import-preview", upload)
+                    send.assert_called_once()
+                    request = send.call_args.args[0]
+                    self.assertEqual(request.full_url, OPENROUTER_RESPONSES_URL)
+                    self.assertEqual(json.loads(request.data)["text"]["format"]["name"], "pricing_import_v1")
+                    self.assertFalse(preview["saved"])
+                    if not case.startswith("valid"):
+                        self.assertFalse(preview["canSave"])
+                        self.assertEqual(preview["items"], [])
+                        self.assertEqual(preview["errors"], webapp.generic_referenced_errors(preview["error_reference"]))
+                    else:
+                        self.assertTrue(preview["canSave"], preview)
+                        self.assertEqual(preview["currency"], "MYR")
+                        self.assertEqual([row["description"] for row in preview["items"]],
+                                         ["Synthetic panel; Prices are not inclusive of trim", "Synthetic rail"])
+                        self.assertEqual(preview["items"][0]["remarks"], [])
+            self.assertFalse(catalogue.exists())
+
+            preview_rows = preview["items"]
+            first_id, second_id = (row["id"] for row in preview_rows)
+            first = {"id": first_id, "match_terms": ["synthetic panel review term"], "object_families": ["review_panel"]}
+            second = {"id": second_id, "match_terms": ["synthetic rail review term"], "object_families": ["review_rail"]}
+            second_batch = {
+                "valid": json.dumps({"items": [second]}),
+                "malformed": '{"items":[',
+                "extra": json.dumps({"items": [second, {**second, "id": "synthetic-unrequested"}]}),
+                "missing": '{"items":[]}',
+                "duplicate": json.dumps({"items": [second, second]}),
+                "wrong-batch": json.dumps({"items": [first]}),
+                "swapped-batches": json.dumps({"items": [first]}),
+            }
+            authoritative_fields = ("id", "section", "description", "unit_hint", "internal_cost",
+                                    "markup_multiplier", "sale_unit_price", "category_order", "item_order")
+            for case, text in second_batch.items():
+                logs.reset_mock()
+                ref_id = "strict-pricing-" + case
+                swapped = case == "swapped-batches"
+                replies = [provider_reply(metadata_model, json.dumps({"items": [second if swapped else first]})),
+                           provider_reply(metadata_model, text)]
+                payload = {"id": ref_id, "label": ref_id, "currency": preview["currency"], "items": preview_rows}
+                with self.subTest(operation="metadata", case=case), mock.patch.object(
+                    webapp.urllib.request, "urlopen", side_effect=replies,
+                ) as send:
+                    result = post("", payload)
+                    self.assertEqual(send.call_count, 1 if swapped else 2)
+                    for call, expected_id in zip(send.call_args_list, (first_id, second_id)):
+                        body = json.loads(call.args[0].data)
+                        self.assertEqual(body["text"]["format"]["name"], "pricing_metadata_v1")
+                        prompt = body["input"][0]["content"][0]["text"]
+                        self.assertEqual([row["id"] for row in json.loads(prompt.split("Pricing rows JSON: ")[1])], [expected_id])
+                    self.assertEqual(result["status"], "saved")
+                    self.assertEqual(result["metadata_enrichment_status"], "completed" if case == "valid" else "failed")
+                    saved = json.loads((catalogue / ref_id / "pricing-catalog.json").read_text(encoding="utf-8"))
+                    self.assertEqual(saved["currency"], "MYR")
+                    self.assertEqual([[row[key] for key in authoritative_fields] for row in saved["items"]],
+                                     [[row[key] for key in authoritative_fields] for row in preview_rows])
+                    self.assertEqual(["review_panel" in row.get("object_families", []) for row in saved["items"]],
+                                     [case == "valid", False])
+                    self.assertEqual("review_rail" in saved["items"][1].get("object_families", []), case == "valid")
+                    attempts = [entry.args[1] for entry in logs.call_args_list if entry.args[0] == "ai_call_attempt"]
+                    expected_attempts = [] if swapped else ["success"]
+                    self.assertEqual([entry["status"] for entry in attempts],
+                                     expected_attempts + ["success" if case == "valid" else "failed"])
+                    self.assertNotIn("synthetic-unrequested", json.dumps(attempts))
+                    if case not in {"valid", "malformed"}:
+                        self.assertEqual(attempts[-1]["response_contract_reason"], "metadata_response_identity")
 
     def test_ai_pricing_metadata_enrichment_logs_rollup_with_reference_id(self):
         items = [
@@ -41886,40 +42676,6 @@ main().catch((error) => {
         self.assertEqual(body["status"], "deleted")
         self.assertFalse(reference_dir_exists)
         self.assertNotIn("delete-me-ref", {item["id"] for item in body["pricing_references"]})
-
-    def test_pricing_reference_ai_metadata_enrichment_does_not_recreate_deleted_pack(self):
-        with mock_pricing_metadata_enrichment():
-            reference = webapp.normalize_pricing_reference_payload({
-                "id": "delete-race-ref",
-                "label": "Delete Race Ref",
-                "tax": {"label": "GST", "rate": 0.09},
-                "items": [with_required_pricing_metadata({
-                    "id": "row-1",
-                    "section": "Graphics",
-                    "description": "Printed graphics",
-                    "unit_hint": "sqm",
-                    "internal_cost": 10,
-                    "markup_multiplier": 2,
-                })],
-            })
-
-        def delete_during_ai_call(label, items, **kwargs):
-            webapp.delete_pricing_reference_pack(kwargs["reference_id"])
-            return [dict(item) for item in items], []
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(webapp, "pricing_references_root", return_value=Path(tmp)):
-                webapp.save_pricing_reference_pack(reference)
-                with mock.patch.object(
-                    webapp,
-                    "ai_pricing_reference_metadata_enrichment",
-                    side_effect=delete_during_ai_call,
-                ):
-                    applied = webapp.apply_saved_pricing_reference_ai_metadata_enrichment("delete-race-ref")
-                reference_dir_exists = (Path(tmp) / "delete-race-ref").exists()
-
-        self.assertFalse(applied)
-        self.assertFalse(reference_dir_exists)
 
     def test_pricing_reference_delete_blocks_default_pack(self):
         with self.assertRaisesRegex(ValueError, "Default pricing references cannot be deleted"):
@@ -42956,6 +43712,127 @@ main().catch((error) => {
             self.assertIsNone(self._ledger_price(rows, "letters-row"))
             self.assertEqual(self._ledger_price(rows, "carpet-row"), koncept_catalog_sale_unit_price(self.LEDGER_CARPET))
             self.assertIsNone(self._ledger_price(self._ledger_brief_rows(request), "letters-row"))
+
+    def test_exact_catalogue_order_survives_quote_seal_and_workbook_generation(self):
+        self._assert_catalogue_order_survives_quote_seal_and_workbook_generation(at_limit=False)
+
+    def test_appended_catalogue_order_survives_quote_seal_and_workbook_generation(self):
+        self._assert_catalogue_order_survives_quote_seal_and_workbook_generation(at_limit=True)
+
+    def _assert_catalogue_order_survives_quote_seal_and_workbook_generation(self, *, at_limit):
+        import generate_quote as quote
+        from tests.test_generate_quote import find_cell_ref
+
+        exponent = (sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits) - 1
+        boundary = 10 ** exponent
+        ceiling = 10 * boundary - 1
+        reference_id = "synthetic-quote-order"
+        source_rows = [
+            ("first-section", "Furniture", "Synthetic high-back chair", boundary, boundary, 18),
+            ("first-item", "Lighting", "Synthetic spotlight arm", boundary + 1, boundary, 24),
+            ("second-item", "Lighting", "Synthetic pendant fixture", boundary + 1, boundary + 1, 40),
+        ]
+        ties = {}
+        if at_limit:
+            source_rows = [
+                source_rows[0],
+                ("first-item", "Lighting", "Synthetic spotlight arm", ceiling, boundary, 24),
+                ("previous-item", "Lighting", "Synthetic globe fixture", ceiling, ceiling, 42),
+                ("second-item", "Lighting", "Synthetic pendant fixture", ceiling, ceiling, 40),
+                ("appended-item", "Lighting", "Synthetic accent lamp", ceiling, ceiling, 36),
+                ("new-category", "Structures", "Synthetic upright rail", ceiling, boundary, 30),
+            ]
+            ties = {"appended-item": {"item_order_tie": 1}, "new-category": {"category_order_tie": 1}}
+        items = [with_required_pricing_metadata({
+            "id": item_id, "section": section, "description": description,
+            "unit_hint": "nos", "internal_cost": cost, "markup_multiplier": 1.5,
+            "category_order": category_order, "item_order": item_order,
+            **ties.get(item_id, {}),
+            **({"visual_references": [{"source": f"xl/media/{item_id}.png", "data_url": synthetic_image(size=(index, 1))}]}
+               if not at_limit else {}),
+        }) for index, (item_id, section, description, category_order, item_order, cost)
+                 in enumerate(reversed(source_rows), start=1)]
+        selection = {"pricing_reference_id": reference_id, "pricing_reference_source": "local",
+                     "pricing_reference": {"id": reference_id, "source": "local", "currency": "SGD"}}
+        self.addCleanup(self.reset_rate_limit_state)
+        with (
+            mock.patch.dict(os.environ, self._ledger_env()),
+            mock.patch.object(webapp, "write_local_log"),
+            LocalRunnerServer() as runner,
+        ):
+            saved = webapp.save_pricing_reference_pack(webapp.normalize_pricing_reference_payload({
+                "id": reference_id, "label": "Synthetic quote order", "currency": "SGD", "items": items,
+            }))
+            snapshot = webapp.capture_pricing_reference_snapshot(selection)
+            expected = [row[0] for row in source_rows]
+            prompts = webapp.pricing_catalog_prompt_rows_from_reference(snapshot.detail())
+            self.assertEqual([row["id"] for row in prompts], expected)
+            if not at_limit:
+                images = webapp.catalog_visual_image_entries_for_payload({**selection, "_pricing_reference_snapshot": snapshot})
+                self.assertEqual([image["id"] for image in images], expected)
+            lookup = webapp.pricing_catalog_runtime_lookup_for_payload(selection)
+            local = webapp.local_pricing_reference_items({**selection, "_pricing_reference_snapshot": snapshot})
+            self.assertEqual([row["id"] for row in local], expected)
+            for actual in (prompts, [lookup[item_id] for item_id in expected], local):
+                for row, (_, _, _, category_order, item_order, _) in zip(actual, source_rows, strict=True):
+                    self.assertTrue(row["category_order"] == category_order)
+                    self.assertTrue(row["item_order"] == item_order)
+
+            request, draft = self._ledger_analysis([
+                (item_id, section, description, 2, "nos", item_id)
+                for item_id, section, description, *_ in reversed(source_rows)
+            ], session_id="quote-wide-catalogue", payload={**valid_payload(), **selection})
+            self.assertEqual([row["source_basis_line_id"] for row in draft["line_items"]], expected)
+            expected_groups = [["first-section"], ["first-item", "second-item"]]
+            if at_limit:
+                expected_groups[1].insert(1, "previous-item")
+                expected_groups[1].append("appended-item")
+                expected_groups.append(["new-category"])
+            self.assertEqual([[line["id"] for line in section["lines"]] for section in draft["quote_basis_sections"]],
+                             expected_groups)
+            identity = {"id": reference_id, "source": "local", "currency": "SGD", "digest": saved["digest_sha256"]}
+            state = request["quote_session"]["draft_state"]
+            state["quoteDetails"]["commercial_snapshot"]["pricing_basis"] = identity
+            completed = webapp.completed_draft_with_pricing_reference_snapshot(
+                {**request, "_pricing_reference_snapshot": snapshot}, {**draft, "source": "openai"},
+            )
+            self.assertEqual(completed["pricing_analysis_seal"], draft["pricing_analysis_seal"])
+            request["quote_basis_sections"] = completed["quote_basis_sections"]
+            request["line_items"] = list(reversed(completed["line_items"]))
+            for row in request["line_items"]:
+                self.assertNotIn("category_order", row)
+                self.assertNotIn("item_order", row)
+            self._ledger_sync(request)
+            headers = self._ledger_runner_headers(runner)
+            unsealed = copy.deepcopy(request)
+            unsealed.pop("pricing_analysis_seal")
+            unsealed["quote_session"]["draft_state"]["originalAnalysisSnapshot"].pop("pricing_analysis_seal")
+            self.assertTrue(all(self._ledger_price(self._ledger_brief_rows(unsealed), item_id) is None
+                                for item_id in expected))
+            rows = self._ledger_normalize(runner, headers, request)
+            self.assertEqual([row["source_basis_line_id"] for row in rows], expected)
+            self.assertEqual([self._ledger_price(rows, item_id) for item_id in expected],
+                             [source_row[-1] * 1.5 for source_row in source_rows])
+
+            brief = webapp.payload_to_brief(request)
+            self.assertEqual([row["source_basis_line_id"] for row in brief["line_items"]], expected)
+            self.assertTrue(all("category_order" not in row and "item_order" not in row
+                                for row in brief["line_items"]))
+            job = Path(self._test_data_root) / "wide-order-xlsx"
+            job.mkdir(parents=True)
+            pricing_file = webapp.pricing_catalog_path_for_payload({**request, "_pricing_reference_snapshot": snapshot}, job)
+            self.assertEqual(quote.catalog_payload_digest(json.loads(pricing_file.read_bytes())), identity["digest"])
+            lines = quote.prepare_lines(brief, quote.extract_price_rows(pricing_file), allow_ambiguous=False,
+                                        authority_required=True, trusted_pricing_reference=identity)
+            self.assertEqual([line.match_status for line in lines], ["matched"] * len(expected))
+            output = job / "quotation.xlsx"
+            quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, output, brief, lines)
+            with zipfile.ZipFile(output) as archive:
+                sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+            cells = [find_cell_ref(sheet, row[2]) for row in source_rows]
+            self.assertTrue(all(cells))
+            worksheet_rows = [quote.parse_cell_ref(cell)[0] for cell in cells]
+            self.assertEqual(worksheet_rows, sorted(set(worksheet_rows)))
 
     def test_ledger_analysis_matches_price_through_the_server_seal_only(self):
         price = koncept_catalog_sale_unit_price(self.LEDGER_CARPET)
