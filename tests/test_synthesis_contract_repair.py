@@ -252,10 +252,12 @@ class SynthesisContractRepairTest(unittest.TestCase):
         text = transport.calls[-1]["input"][0]["content"][0]["text"]
         instructions = text[:text.index('[{"source":')]
         tail = instructions[instructions.index("Required fields:"):]
-        self.assertIn("Leave quantity and unit absent for genuinely unmeasured or purely informational lines.", instructions)
-        self.assertIn("Keep unmeasured physical lines in the basis for review.", instructions)
+        self.assertIn("Leave quantity and unit absent only for purely informational lines.", instructions)
+        self.assertIn(server.PREDICTED_QUANTITY_RULE, instructions)
+        self.assertIn("Emit a linked line_items row for every physical line.", instructions)
+        self.assertNotIn("unmeasured physical lines in the basis for review", instructions)
         self.assertIn("Do not emit line_items for informational lines.", instructions)
-        for required in ("id, tag, text and confidence_pct (or confidence)", "Measured physical lines also have quantity and unit",
+        for required in ("id, tag, text, confidence_pct (or confidence), quantity and unit",
                          "JSON integer from 0 to 100", "supplied aliases must agree",
                          "Pure informational notes may omit quantity and unit", "source_basis_line_id"):
             self.assertIn(required, tail)

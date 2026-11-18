@@ -31160,8 +31160,8 @@ const state = {
       id: "platform",
       title: "Platform / Flooring",
       lines: [
-        { tag: "Include", text: "Raised platform." },
-        { tag: "Confirm", text: "Finish colour." },
+        { tag: "Include", text: "Raised platform.", quantity: 36, unit: "sqm" },
+        { tag: "Confirm", text: "Finish colour.", quantity: 1, unit: "lot" },
       ],
     },
     {
@@ -31289,6 +31289,9 @@ eval([
             "catalogueItemsByReferenceKey",
             "basisCatalogueQuantityItem",
             "basisCatalogueQuantityHtml",
+            "basisLineNeedsQuantity",
+            "basisQuantityUnitText",
+            "basisFreeQuantityHtml",
             "renderBasisLine",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
@@ -31490,8 +31493,8 @@ state.quoteBasisSections = [
     id: "platform",
     title: "Platform / Flooring",
     lines: [
-      { tag: "Include", text: "Raised platform." },
-      { tag: "Include", text: "Finish colour." },
+      { tag: "Include", text: "Raised platform.", quantity: 36, unit: "sqm" },
+      { tag: "Include", text: "Finish colour.", quantity: 1, unit: "lot" },
     ],
   },
   {
@@ -31537,6 +31540,18 @@ assert.ok(bracketedCatalogLineHtml.includes("Grey carpet finish across 9m x 10.5
 state.quoteBasisSections[0].lines[1].tag = "Include";
 assert.deepStrictEqual(unresolvedConfirmLines(state.quoteBasisSections), []);
 assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
+// Every physical line needs a quantity: no "Not measured" state, and Confirm waits for one.
+const savedQuantity = state.quoteBasisSections[0].lines[0].quantity;
+state.quoteBasisSections[0].lines[0].quantity = "";
+assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "Enter a quantity for every line before confirming quotation basis.");
+const blankQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
+assert.ok(!blankQuantityHtml.includes("Not measured"), "A blank quantity still shows Not measured");
+assert.ok(blankQuantityHtml.includes('data-basis-quantity-free="1"'), "A blank quantity lost its required input");
+assert.ok(blankQuantityHtml.includes(" required "), "The quantity input is not marked required");
+state.quoteBasisSections[0].lines[0].tag = "Exclude";
+assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
+state.quoteBasisSections[0].lines[0].tag = "Include";
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
 assert.strictEqual(renderBasisConfirmSummary(state.quoteBasisSections), "");
 
 let rendered = 0;
@@ -31813,8 +31828,8 @@ assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "nos" }), "2 n
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 1, unit: "lot" }), "1 lot");
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "" }), "2 (unit needed)");
 assert.strictEqual(basisQuantityLabel({ quantity: "m", unit: "length" }), "");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "Not measured");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "Not measured");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "");
 assert.strictEqual(
   basisChatLineContext({ tag: "Include", text: "100mm raised platform", quantity: 36, unit: "sqm" }),
   "Include: 100mm raised platform"

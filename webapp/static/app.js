@@ -11534,8 +11534,9 @@ function basisConfirmBlockReason(sections = state.quoteBasisSections) {
   if ((state.blockingClarificationQuestions || []).some((question) => question.status !== "answered" && !String(question.answer || "").trim())) {
     return "Answer all clarification questions before confirming quotation basis.";
   }
-  return unresolvedConfirmLines(sections).length
-    ? "Resolve all review lines before confirming quotation basis."
+  if (unresolvedConfirmLines(sections).length) return "Resolve all review lines before confirming quotation basis.";
+  return basisSections(sections).some((section) => (section.lines || []).some((line) => basisLineNeedsQuantity(line)))
+    ? "Enter a quantity for every line before confirming quotation basis."
     : "";
 }
 
@@ -11614,7 +11615,8 @@ function basisQuantityLabel(line = {}) {
 
 function basisQuantityDisplayLabel(line = {}) {
   const quantityText = basisQuantityText(line.quantity);
-  if (!quantityText) return "Not measured";
+  // Every physical line carries a quantity; a missing one is asked for in the row, never labelled.
+  if (!quantityText) return "";
   let unit = normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
   if (/^nos?\.?$/i.test(unit)) unit = "nos.";
   return `${quantityText}${unit ? ` ${unit}` : " (unit needed)"}`;
@@ -11914,6 +11916,64 @@ function basisCatalogueQuantityItem(line = {}) {
   return { id, unit, price, description };
 }
 
+// A physical line still missing a quantity (an older quote, or an AI reply without one).
+function basisLineNeedsQuantity(line = {}) {
+  if (!line || basisLineIsInformationalDimension(line)) return false;
+  if (normalizeBasisTag(line.tag) === "Exclude") return false;
+  return !basisQuantityText(line.quantity);
+}
+
+function basisQuantityUnitText(line = {}) {
+  return normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
+}
+
+function basisFreeQuantityHtml(section, line, index) {
+  const unit = basisQuantityUnitText(line);
+  const placeholder = unit ? "Qty" : "Qty unit";
+  const label = unit ? `Quantity in ${unit}` : "Quantity and unit, for example 6 sqm";
+  return `<input class="basis-quantity-input basis-quantity-required" type="text" required inputmode="decimal" placeholder="${escapeHtml(placeholder)}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-free="1" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${unit ? ` ${escapeHtml(unit)}` : ""}`;
+}
+
+function parseBasisFreeQuantity(value, lineUnit = "") {
+  const match = String(value ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([A-Za-z][A-Za-z .]*)?$/);
+  if (!match) return null;
+  const quantity = Number(match[1]);
+  const unit = normalizeUnit((match[2] || "").trim() || lineUnit || "");
+  if (!(Number.isFinite(quantity) && quantity > 0) || !unit) return null;
+  return { quantity, unit };
+}
+
+function applyBasisFreeQuantity(sectionId, lineIndex, value) {
+  if (appIsBusy()) return false;
+  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
+  const section = sections.find((entry) => entry.id === sectionId);
+  const lineNumber = Number(lineIndex);
+  const currentLine = Number.isInteger(lineNumber) ? section?.lines?.[lineNumber] : null;
+  if (!currentLine || !basisLineNeedsQuantity(currentLine) || basisCatalogueQuantityItem(currentLine)) return false;
+  const parsed = parseBasisFreeQuantity(value, currentLine.unit);
+  if (!parsed) return false;
+  section.lines[lineNumber] = { ...currentLine, quantity: parsed.quantity, unit: parsed.unit };
+  const ids = new Set([currentLine.id, currentLine.source_line_item_id].filter(Boolean));
+  const linked = state.lineItems.filter((row) => ids.has(row?.source_basis_line_id));
+  if (linked.length > 1) return false;
+  if (linked.length) {
+    // The quantity changes the row's price basis, so any earlier price grant no longer applies.
+    const { pricing_authority, ...previousRow } = linked[0];
+    const nextRow = normalizeLineItem({ ...previousRow, quantity: parsed.quantity, unit: parsed.unit });
+    state.lineItems = state.lineItems.map((row) => (row === linked[0] ? nextRow : row));
+  }
+  state.quoteBasisSections = sections;
+  state.quoteBasis = quoteBasisFromSections(sections);
+  state.basisConfirmed = false;
+  state.outputRows = [];
+  state.originalOutputRows = [];
+  setDownloadFiles([]);
+  markOutputRowsDirty();
+  updateQuoteBasisCard("edited");
+  syncControlStates();
+  return true;
+}
+
 function basisCatalogueQuantityHtml(section, line, index, item) {
   return `<input class="basis-quantity-input" type="number" min="0" step="any" inputmode="decimal" placeholder="Qty" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-item="${escapeHtml(item.id)}" aria-label="Quantity in ${escapeHtml(item.unit)} for ${escapeHtml(item.description)}"> ${escapeHtml(item.unit)}`;
 }
@@ -11984,11 +12044,20 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
 }
 
 function handleQuoteBasisQuantity(event) {
-  const input = event.target.closest?.("[data-basis-quantity-item]");
+  const input = event.target.closest?.("[data-basis-quantity-item], [data-basis-quantity-free]");
   if (!input) return;
   if (event.type === "keydown") {
     if (event.key !== "Enter") return;
     event.preventDefault();
+  }
+  if (input.dataset.basisQuantityFree) {
+    const appliedFree = applyBasisFreeQuantity(input.dataset.basisSection || "", Number(input.dataset.basisLineIndex), input.value);
+    if (!appliedFree && String(input.value).trim() && typeof input.reportValidity === "function") {
+      input.setCustomValidity("Enter a quantity above 0 with its unit, for example 6 sqm.");
+      input.reportValidity();
+      input.setCustomValidity("");
+    }
+    return;
   }
   const applied = applyBasisCatalogueQuantity(
     input.dataset.basisSection || "",
@@ -12035,7 +12104,7 @@ function renderBasisLine(section, line, index) {
       <span class="basis-line-meta">
         <span class="basis-line-pill"${pillTitleAttribute}>${escapeHtml(pillLabel)}</span>
         <span class="basis-confidence-pill" title="AI confidence">${escapeHtml(confidenceLabel)}</span>
-        <span class="basis-quantity-text">${catalogueQuantityItem ? basisCatalogueQuantityHtml(section, line, index, catalogueQuantityItem) : escapeHtml(quantityLabel)}</span>
+        <span class="basis-quantity-text">${catalogueQuantityItem ? basisCatalogueQuantityHtml(section, line, index, catalogueQuantityItem) : basisLineNeedsQuantity(line) ? basisFreeQuantityHtml(section, line, index) : escapeHtml(quantityLabel)}</span>
       </span>
       <span class="basis-line-text"${lineTitleAttribute}>
         ${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}

@@ -128,15 +128,23 @@ class BasisQuantityRetentionTest(unittest.TestCase):
         self.assertIn("Analyze the uploaded reference images", synthesis)
         self.assertIn("Carry supported quantities and units", synthesis)
         self.assertIn("linked line_items", synthesis)
-        self.assertIn("Do not replace missing measurements with 1 lot", synthesis)
+        self.assertIn("Do not replace a missing measurement with 1 lot", synthesis)
         self.assertIn("Area or length quantities derived from stated booth or object dimensions", synthesis)
         self.assertIn("including floor area from booth size", synthesis)
         self.assertIn("except for services genuinely priced per lot in the catalog", synthesis)
-        self.assertIn("Do not invent quantities or units", synthesis)
+        self.assertIn(server.PREDICTED_QUANTITY_RULE, synthesis)
+        self.assertIn("predict the quantity in the catalog unit instead", synthesis)
+        self.assertNotIn("Do not invent quantities or units", synthesis)
         observations = json.loads(synthesis[synthesis.index('[{"source":'):])
         self.assertEqual([row["source"] for row in observations],
                          [f"Reference 1, PDF page {page}" for page in range(1, 14)])
         self.assertTrue(all(row["observation"] == MEASURED_NOTE for row in observations))
+
+    def test_booth_area_is_the_shared_base_for_predicted_quantities(self):
+        # One key carries the booth area, so later sources (#385 known details) fill it in one place.
+        self.assertEqual(server.booth_dimensions_from_payload({"project": {"booth_width": 8, "booth_depth": 9}})["booth_area_sqm"], 72)
+        self.assertEqual(server.booth_dimensions_from_payload({"project": {"booth_size": "9m x 10.5m"}})["booth_area_sqm"], 94.5)
+        self.assertGreater(server.booth_dimensions_from_payload({})["booth_area_sqm"], 0)
 
     def test_page_note_budget_tracks_result_limit_and_actual_batch_size(self):
         for limit in (server.MAX_DRAFT_BATCH_RESULT_CHARS, server.MAX_DRAFT_BATCH_RESULT_CHARS // 2):

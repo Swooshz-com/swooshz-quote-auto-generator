@@ -171,6 +171,31 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       return offered;
     }, graphic.id);
     assert(ambiguous === null, "ambiguous catalogue reference was offered a catalogue price", ambiguous);
+    // 6. Quantity is mandatory (owner rule 18 Nov 2026): a line without a catalogue match asks for its own
+    // quantity and unit, is never labelled "Not measured", and blocks Confirm until it is filled.
+    const lineById = (id) => page.evaluate((lineId) => {
+      const line = state.quoteBasisSections.flatMap((section) => section.lines).find((entry) => entry.id === lineId);
+      return { quantity: line.quantity, unit: normalizeUnit(line.unit), needsQuantity: basisLineNeedsQuantity(line) };
+    }, id);
+    assert(!/not measured/i.test(await surface.innerText()), "a basis line is still labelled Not measured");
+    const freeInput = unknownRow.locator("input[data-basis-quantity-free]");
+    assert(await freeInput.count() === 1 && await freeInput.evaluate((input) => input.required), "line without a quantity has no required quantity box");
+    assert((await lineById("q-blank-unknown")).needsQuantity, "blank quantity line is not flagged as needing a quantity");
+    assert(await page.evaluate(() => {
+      const saved = state.quoteBasisSections;
+      state.quoteBasisSections = [{ id: "probe", title: "Probe", lines: [{ id: "probe-line", tag: "Include", text: "Probe wall", quantity: null, unit: "" }] }];
+      try { return basisConfirmBlockReason(state.quoteBasisSections); } finally { state.quoteBasisSections = saved; }
+    }) === "Enter a quantity for every line before confirming quotation basis.", "a blank quantity did not block Confirm");
+    await freeInput.fill("lots");
+    await freeInput.press("Enter");
+    assert((await lineById("q-blank-unknown")).needsQuantity, "an invalid quantity was accepted");
+    await freeInput.fill("6 sqm");
+    await freeInput.press("Enter");
+    const freeEntered = await lineById("q-blank-unknown");
+    assert(Number(freeEntered.quantity) === 6 && freeEntered.unit === "sqm" && !freeEntered.needsQuantity,
+      "typed quantity and unit were not kept on the line", freeEntered);
+    assert(await (await rowFor("q-blank-unknown")).locator("input[data-basis-quantity-free]").count() === 0, "quantity box stayed after a valid quantity");
+    result.freeQuantityLine = freeEntered;
     await quantityInput.fill("0");
     await quantityInput.press("Enter");
     assert(await page.evaluate(() => !state.quoteBasisSections.flatMap((section) => section.lines).find((line) => line.id === "q-blank-graphic").pricing_keyword),
