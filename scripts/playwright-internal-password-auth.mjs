@@ -109,11 +109,22 @@ try {
   const pdfLimit = 48 * 1024 * 1024;
   await fileInput.setInputFiles({ name: "synthetic-large.pdf", mimeType: "application/pdf",
     buffer: Buffer.alloc(pdfLimit + 1) });
-  await page.getByText("Choose images up to 12 MiB and PDFs up to 48 MiB each.", { exact: true }).waitFor({ state: "attached" });
+  await page.getByText("Choose files up to 48 MiB each.", { exact: true }).waitFor({ state: "attached" });
   assert.equal(await page.evaluate(() => state.images.length), 0);
   await fileInput.setInputFiles({ name: "synthetic-boundary.pdf", mimeType: "application/pdf",
     buffer: Buffer.alloc(pdfLimit) });
   await page.waitForFunction(size => state.images.length === 1 && state.images[0].size === size, pdfLimit);
+  await page.evaluate(() => removeImageAt(0));
+  // Images share the 48 MiB per-file limit (#384).
+  const imageLimit = 48 * 1024 * 1024;
+  await page.evaluate(() => setImageUploadStatus(""));
+  await fileInput.setInputFiles({ name: "synthetic-large.jpg", mimeType: "image/jpeg",
+    buffer: Buffer.alloc(imageLimit + 1) });
+  await page.getByText("Choose files up to 48 MiB each.", { exact: true }).waitFor({ state: "attached" });
+  assert.equal(await page.evaluate(() => state.images.length), 0);
+  await fileInput.setInputFiles({ name: "synthetic-boundary.jpg", mimeType: "image/jpeg",
+    buffer: Buffer.alloc(imageLimit) });
+  await page.waitForFunction(size => state.images.length === 1 && state.images[0].size === size, imageLimit);
   await page.evaluate(() => removeImageAt(0));
   const cards = page.locator(".dashboard-session-card");
   await cards.nth(1).waitFor();

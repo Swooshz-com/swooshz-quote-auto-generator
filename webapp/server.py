@@ -254,8 +254,11 @@ DEFAULT_TAX_RATE = 0.09
 DEFAULT_CURRENCY_LABEL = "SGD"
 MISSING_IMAGES_MESSAGE = "Please upload reference images first so I can analyze the design and prepare the quote."
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
-MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PDF_BYTES = 48 * 1024 * 1024
+# Uploaded reference images share the PDF ceiling; the AI only ever receives a
+# bounded copy (MAX_AI_IMAGE_BYTES / AI_IMAGE_LONG_EDGE_PX) and the original is
+# stored unchanged.
+MAX_IMAGE_BYTES = MAX_PDF_BYTES
 MAX_SINGLE_SEND_PDF_BYTES = 16 * 1024 * 1024
 MAX_DRAFT_PDF_PAGES = 96
 MAX_DRAFT_BATCH_MEDIA = 6
@@ -271,12 +274,17 @@ MAX_RENDERED_PDF_PAGE_BYTES = 1024 * 1024
 # base64 transport overhead.
 MAX_DRAFT_INPUT_FILE_TOTAL_BYTES = 50_000_000
 PDF_RENDER_TARGET_LONG_EDGE_PX = 1600
-# 4K-axis inputs and fewer than 9 million pixels cover DCI 4K quote/reference
-# images while bounding decoded RGB/RGBA buffers to about 26/35 MiB, well below
-# Pillow's library-wide decompression-bomb threshold.
-MAX_PROMPT_IMAGE_WIDTH = 4096
-MAX_PROMPT_IMAGE_HEIGHT = 4096
-MAX_PROMPT_IMAGE_PIXELS = 9_000_000 - 1
+# One pair of limits for every image the AI receives at high detail: rendered
+# PDF pages and the normalised copy of each uploaded reference image.
+MAX_AI_IMAGE_BYTES = MAX_RENDERED_PDF_PAGE_BYTES
+AI_IMAGE_LONG_EDGE_PX = PDF_RENDER_TARGET_LONG_EDGE_PX
+# Decompression-bomb guards on uploaded images, checked from the header before
+# any pixel decode. JPEG is draft-decoded near the AI size, so it keeps Pillow's
+# default MAX_IMAGE_PIXELS ceiling (pinned here so a library change cannot move
+# it). PNG and WebP always decode at full size, so they stop at 40 megapixels
+# (8K renders are 33.2 MP) to bound one decoded RGBA image to about 160 MiB.
+MAX_SOURCE_JPEG_PIXELS = 89_478_485
+MAX_SOURCE_LOSSLESS_PIXELS = 40_000_000
 PROMPT_IMAGE_PIL_FORMATS = ("JPEG", "PNG", "WEBP")
 PROMPT_IMAGE_PIL_FORMAT_BY_MIME = {
     "image/jpeg": "JPEG",
@@ -829,15 +837,27 @@ def request_body_limit(path: str) -> int:
     return MAX_REQUEST_BYTES
 
 
-def pdf_request_fits_standard_budget(path: str, payload: dict[str, Any], length: int) -> bool:
-    """Allow only admitted PDF bytes to extend the standard JSON limit."""
+REFERENCE_MEDIA_DATA_URL_PREFIXES = (
+    "data:application/pdf;base64,",
+    "data:image/jpeg;base64,",
+    "data:image/png;base64,",
+    "data:image/webp;base64,",
+)
+
+
+def reference_media_request_fits_budget(path: str, payload: dict[str, Any], length: int) -> bool:
+    """Allow only admitted reference PDF and image bytes to extend the standard JSON limit.
+
+    Images get the cheap header check here; their single full decode happens
+    when the draft validates them.
+    """
     checkpoint = path == "/api/quote-sessions"
     entries = payload.get("draft_files" if checkpoint else "images")
     if not isinstance(entries, list):
         return False
     seen_keys: set[str] = set()
     source_bytes = 0
-    pdf_wire_bytes = 0
+    media_wire_bytes = 0
     for entry in entries[:MAX_REFERENCE_IMAGES + int(checkpoint)]:
         if not isinstance(entry, dict):
             continue
@@ -851,17 +871,19 @@ def pdf_request_fits_standard_budget(path: str, payload: dict[str, Any], length:
         elif not isinstance(entry.get("name"), str) or not entry["name"].strip():
             continue
         url = entry.get("data_url")
-        if not isinstance(url, str) or not url.startswith("data:application/pdf;base64,"):
+        if not isinstance(url, str):
+            continue
+        prefix = next((item for item in REFERENCE_MEDIA_DATA_URL_PREFIXES if url.startswith(item)), "")
+        if not prefix:
             continue
         try:
-            validate_draft_media(url)
+            validate_draft_media(url, header_only=prefix != "data:application/pdf;base64,")
         except OpenAIAnalysisError:
             return False
-        offset = len("data:application/pdf;base64,")
-        encoded_length = len(url) - offset
+        encoded_length = len(url) - len(prefix)
         source_bytes += encoded_length // 4 * 3 - (2 if url.endswith("==") else int(url.endswith("=")))
-        pdf_wire_bytes += encoded_length
-    return source_bytes <= MAX_DRAFT_SOURCE_BYTES and length - pdf_wire_bytes <= MAX_REQUEST_BYTES
+        media_wire_bytes += encoded_length
+    return source_bytes <= MAX_DRAFT_SOURCE_BYTES and length - media_wire_bytes <= MAX_REQUEST_BYTES
 
 
 def safe_stderr(message: str) -> None:
@@ -1135,7 +1157,7 @@ def ai_failure_metadata(
     metadata: dict[str, Any] = {
         "failure_kind": failure_kind,
         "error_type": type(chain[-1]).__name__ if chain else type(exception).__name__,
-        "safe_error_summary": draft_limit_message(diagnostics.get("batch_failure_reason", "")) or summaries[failure_kind],
+        "safe_error_summary": draft_failure_message(diagnostics) or summaries[failure_kind],
     }
     if diagnostics:
         metadata.update(diagnostics)
@@ -19518,7 +19540,8 @@ def image_mime_type_from_bytes(raw: bytes) -> str:
     return ""
 
 
-def prompt_image_dimensions_are_allowed(size: Any) -> bool:
+def prompt_image_dimensions_are_allowed(size: Any, image_format: str = "PNG") -> bool:
+    """Header-only decompression-bomb guard: JPEG up to MAX_SOURCE_JPEG_PIXELS, PNG/WebP up to MAX_SOURCE_LOSSLESS_PIXELS."""
     try:
         width, height = size
     except (TypeError, ValueError):
@@ -19530,19 +19553,38 @@ def prompt_image_dimensions_are_allowed(size: Any) -> bool:
         or isinstance(height, bool)
         or width <= 0
         or height <= 0
-        or width > MAX_PROMPT_IMAGE_WIDTH
-        or height > MAX_PROMPT_IMAGE_HEIGHT
     ):
         return False
-    return width <= MAX_PROMPT_IMAGE_PIXELS // height
+    limit = MAX_SOURCE_JPEG_PIXELS if image_format == "JPEG" else MAX_SOURCE_LOSSLESS_PIXELS
+    return width <= limit // height
 
 
-def image_data_url_from_bytes(raw: bytes, mime_type: str) -> str:
-    if not raw or mime_type not in {"image/jpeg", "image/png", "image/webp"}:
-        return ""
-    if len(raw) > MAX_RENDERED_PDF_PAGE_BYTES:
-        return ""
-    return f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}"
+class ReferenceImageError(ValueError):
+    """Closed-vocabulary reason for an uploaded image the AI copy cannot be made from."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+EXIF_ORIENTATION_TAG = 0x0112
+
+
+def image_exif_orientation(image: Any) -> int:
+    try:
+        value = image.getexif().get(EXIF_ORIENTATION_TAG)
+    except Exception:
+        return 1
+    return value if type(value) is int and 1 <= value <= 8 else 1
+
+
+def ai_image_target_size(size: tuple[int, int], max_edge: int) -> tuple[int, int]:
+    width, height = size
+    long_edge = max(width, height)
+    if long_edge <= max_edge:
+        return width, height
+    scale = max_edge / long_edge
+    return (min(max_edge, max(1, round(width * scale))), min(max_edge, max(1, round(height * scale))))
 
 
 def looks_like_complete_pdf(raw: bytes) -> bool:
@@ -19550,58 +19592,133 @@ def looks_like_complete_pdf(raw: bytes) -> bool:
     return stripped.startswith(b"%PDF-") and b"%%EOF" in raw[-4096:]
 
 
-def prompt_image_data_url_from_pil(image: Any) -> str:
+def prompt_image_data_url_from_pil(image: Any, orientation: int = 1) -> str:
+    """Encode a decoded image as the AI copy: long edge at most AI_IMAGE_LONG_EDGE_PX, at most MAX_AI_IMAGE_BYTES.
+
+    Shrink first, then flatten alpha onto white and apply the EXIF orientation,
+    so no full-size RGBA or rotated copy of a large upload is ever made.
+    """
     try:
         from PIL import Image
     except Exception:
         return ""
 
     try:
-        if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        if image.mode not in {"RGB", "RGBA", "L", "LA"}:
+            transparent = image.mode in {"PA", "RGBa", "La"} or (image.mode == "P" and "transparency" in image.info)
+            image = image.convert("RGBA" if transparent else "RGB")
+        target = ai_image_target_size(image.size, AI_IMAGE_LONG_EDGE_PX)
+        if target != image.size:
+            image = image.resize(target, Image.Resampling.BICUBIC, reducing_gap=2.0)
+        if image.mode in {"RGBA", "LA"}:
             background = Image.new("RGB", image.size, (255, 255, 255))
-            background.paste(image.convert("RGBA"), mask=image.convert("RGBA").split()[-1])
+            rgba = image.convert("RGBA")
+            background.paste(rgba, mask=rgba.getchannel("A"))
             image = background
         elif image.mode != "RGB":
             image = image.convert("RGB")
+        transpose = {
+            2: Image.Transpose.FLIP_LEFT_RIGHT,
+            3: Image.Transpose.ROTATE_180,
+            4: Image.Transpose.FLIP_TOP_BOTTOM,
+            5: Image.Transpose.TRANSPOSE,
+            6: Image.Transpose.ROTATE_270,
+            7: Image.Transpose.TRANSVERSE,
+            8: Image.Transpose.ROTATE_90,
+        }.get(orientation)
+        if transpose is not None:
+            image = image.transpose(transpose)
 
-        for max_edge in (PDF_RENDER_TARGET_LONG_EDGE_PX, 1280, 1024, 768):
-            candidate = image.copy()
-            if max(candidate.size) > max_edge:
-                candidate.thumbnail((max_edge, max_edge))
+        for max_edge in (AI_IMAGE_LONG_EDGE_PX, 1280, 1024, 768):
+            size = ai_image_target_size(image.size, max_edge)
+            candidate = image if size == image.size else image.resize(size, Image.Resampling.BICUBIC, reducing_gap=2.0)
             for quality in (82, 74, 66, 58):
                 output = io.BytesIO()
                 candidate.save(output, format="JPEG", quality=quality, optimize=True)
                 data = output.getvalue()
-                if len(data) <= MAX_RENDERED_PDF_PAGE_BYTES:
-                    return image_data_url_from_bytes(data, "image/jpeg")
+                if len(data) <= MAX_AI_IMAGE_BYTES:
+                    return f"data:image/jpeg;base64,{base64.b64encode(data).decode('ascii')}"
     except Exception:
         return ""
     return ""
 
 
-def compressed_prompt_image_data_url(raw: bytes) -> str:
+def ai_image_data_url_from_bytes(raw: bytes, *, verify: bool = True) -> str:
+    """Make the copy of an uploaded image that the AI receives; the original is never sent.
+
+    The header is checked against the pixel guards before any decode. A file of
+    at most MAX_AI_IMAGE_BYTES, AI_IMAGE_LONG_EDGE_PX and no EXIF rotation passes
+    through unchanged; anything else is decoded once (JPEG in draft mode near the
+    target size) and re-encoded as JPEG, which also drops EXIF metadata.
+    verify=False skips Pillow's structural check (kept off for PDF-embedded
+    images, as before). Raises ReferenceImageError with a closed reason; never
+    returns an empty copy.
+    """
     mime_type = image_mime_type_from_bytes(raw)
     expected_format = PROMPT_IMAGE_PIL_FORMAT_BY_MIME.get(mime_type)
     if not expected_format:
-        return ""
-
-    try:
-        from PIL import Image
-    except Exception:
-        return ""
+        raise ReferenceImageError("invalid_media_format")
+    from PIL import Image
 
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
                 if clean_text(getattr(image, "format", "")).upper() != expected_format:
-                    return ""
-                if not prompt_image_dimensions_are_allowed(getattr(image, "size", None)):
-                    return ""
+                    raise ReferenceImageError("invalid_media_format")
+                size = getattr(image, "size", None)
+                if not prompt_image_dimensions_are_allowed(size, expected_format):
+                    raise ReferenceImageError("media_dimension_limit")
+                if verify:
+                    image.verify()
+            with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
+                if image.format != expected_format or image.size != size:
+                    raise ReferenceImageError("invalid_media_format")
+                orientation = image_exif_orientation(image)
+                if len(raw) <= MAX_AI_IMAGE_BYTES and max(size) <= AI_IMAGE_LONG_EDGE_PX and orientation == 1:
+                    image.load()
+                    return f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}"
+                if expected_format == "JPEG":
+                    image.draft(None, ai_image_target_size(size, AI_IMAGE_LONG_EDGE_PX))
                 image.load()
-                if len(raw) <= MAX_RENDERED_PDF_PAGE_BYTES:
-                    return image_data_url_from_bytes(raw, mime_type)
-                return prompt_image_data_url_from_pil(image)
+                data_url = prompt_image_data_url_from_pil(image, orientation)
+    except ReferenceImageError:
+        raise
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError):
+        raise ReferenceImageError("media_dimension_limit") from None
+    except Exception:
+        # Parser exceptions may contain supplied content; keep only the reason.
+        raise ReferenceImageError("media_decode_failed") from None
+    if not data_url:
+        raise ReferenceImageError("media_decode_failed")
+    return data_url
+
+
+_AI_IMAGE_COPIES: dict[str, str] = {}
+_AI_IMAGE_COPIES_LOCK = threading.Lock()
+
+
+def ai_image_copy_for_upload(raw: bytes) -> str:
+    """Normalise each distinct upload once per request; content-addressed so validation and sending share it."""
+    digest = hashlib.sha256(raw).hexdigest()
+    with _AI_IMAGE_COPIES_LOCK:
+        cached = _AI_IMAGE_COPIES.pop(digest, None)
+        if cached is not None:
+            _AI_IMAGE_COPIES[digest] = cached
+            return cached
+    data_url = ai_image_data_url_from_bytes(raw)
+    with _AI_IMAGE_COPIES_LOCK:
+        _AI_IMAGE_COPIES.pop(digest, None)
+        _AI_IMAGE_COPIES[digest] = data_url
+        while len(_AI_IMAGE_COPIES) > 2 * MAX_REFERENCE_IMAGES:
+            _AI_IMAGE_COPIES.pop(next(iter(_AI_IMAGE_COPIES)))
+    return data_url
+
+
+def compressed_prompt_image_data_url(raw: bytes) -> str:
+    """Best-effort AI copy for PDF-embedded images: empty on any rejection."""
+    try:
+        return ai_image_data_url_from_bytes(raw, verify=False)
     except Exception:
         return ""
 
@@ -25668,8 +25785,14 @@ def draft_request_invalid(stage: str = "request_envelope", reason: str = "invali
 
 def validate_draft_media(
     data_url: Any, max_bytes: int | None = None, *, stage: str = "reference_media",
+    max_long_edge: int | None = None, upload: bool = False, header_only: bool = False,
 ) -> str:
-    """Validate in memory; never normalize or retain supplied media or parser errors."""
+    """Validate in memory; never retain supplied media or parser errors.
+
+    upload=True is for uploaded reference images: the full decode happens once,
+    in the normaliser that makes the AI copy (cached by content hash).
+    header_only=True stops after the format and pixel-guard header checks.
+    """
     if not isinstance(data_url, str):
         draft_request_invalid(stage, "invalid_media_format")
     prefix, separator, encoded = data_url.partition(",")
@@ -25727,16 +25850,30 @@ def validate_draft_media(
                 draft_request_invalid(stage, "invalid_media_format")
             from PIL import Image
 
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
-                    if image.format != PROMPT_IMAGE_PIL_FORMAT_BY_MIME[mime]:
-                        draft_request_invalid(stage, "invalid_media_format")
-                    if not prompt_image_dimensions_are_allowed(image.size):
-                        draft_request_invalid(stage, "media_dimension_limit")
-                    image.verify()
-                with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
-                    image.load()
+            if upload and not header_only:
+                try:
+                    ai_image_copy_for_upload(raw)
+                except ReferenceImageError as exc:
+                    draft_request_invalid(stage, exc.reason)
+                return mime
+            image_format = PROMPT_IMAGE_PIL_FORMAT_BY_MIME[mime]
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
+                        if image.format != image_format:
+                            draft_request_invalid(stage, "invalid_media_format")
+                        if not prompt_image_dimensions_are_allowed(image.size, image_format):
+                            draft_request_invalid(stage, "media_dimension_limit")
+                        if max_long_edge is not None and max(image.size) > max_long_edge:
+                            draft_request_invalid(stage, "media_dimension_limit")
+                        if header_only:
+                            return mime
+                        image.verify()
+                    with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
+                        image.load()
+            except (Image.DecompressionBombWarning, Image.DecompressionBombError):
+                draft_request_invalid(stage, "media_dimension_limit")
     except OpenAIAnalysisError:
         raise
     except Exception:
@@ -25756,7 +25893,7 @@ def validate_draft_references(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"].strip():
             draft_request_invalid("reference_media")
         try:
-            validate_draft_media(entry.get("data_url"))
+            validate_draft_media(entry.get("data_url"), upload=True)
         except OpenAIAnalysisError as exc:
             if exc.diagnostics.get("batch_failure_reason") in {"pdf_page_limit", "pdf_byte_limit"}:
                 diagnostics = {**exc.diagnostics, **draft_pdf_limit_diagnostics(entries), "source_number": source}
@@ -25823,7 +25960,11 @@ def validate_draft_responses_envelope(
         elif kind == "input_image":
             if set(part) != {"type", "image_url", "detail"} or part["detail"] not in ("high", "low"):
                 draft_request_invalid()
-            mime = validate_draft_media(part["image_url"], MAX_PRICING_REFERENCE_VISUAL_BYTES if part["detail"] == "low" else MAX_IMAGE_BYTES)
+            # High detail is only ever an AI copy (rendered PDF page or normalised
+            # upload), never an original: fail closed before the provider call.
+            mime = (validate_draft_media(part["image_url"], MAX_PRICING_REFERENCE_VISUAL_BYTES)
+                    if part["detail"] == "low" else
+                    validate_draft_media(part["image_url"], MAX_AI_IMAGE_BYTES, max_long_edge=AI_IMAGE_LONG_EDGE_PX))
             if not mime.startswith("image/"):
                 draft_request_invalid()
             high_images += part["detail"] == "high"
@@ -25874,6 +26015,23 @@ def draft_limit_message(reason: str) -> str:
         "pdf_byte_limit": f"PDF references can be up to {MAX_PDF_BYTES // (1024 * 1024)} MiB each.",
         "source_byte_limit": f"Reference files can be up to {MAX_DRAFT_SOURCE_BYTES // (1024 * 1024)} MiB in total.",
     }.get(reason, "")
+
+
+REFERENCE_IMAGE_DIMENSION_MESSAGE = (
+    "This image is too large to read (over 89 megapixels for JPG, or 40 megapixels for PNG and WebP). "
+    "Export a smaller copy and try again."
+)
+
+
+def draft_failure_message(diagnostics: dict[str, Any]) -> str:
+    """Staff-safe message for a known reference limit; empty for anything else."""
+    message = draft_limit_message(diagnostics.get("batch_failure_reason", ""))
+    if message:
+        return message
+    if (diagnostics.get("request_validation_stage") == "reference_media"
+            and diagnostics.get("request_validation_reason") == "media_dimension_limit"):
+        return REFERENCE_IMAGE_DIMENSION_MESSAGE
+    return ""
 
 
 def draft_pdf_limit_diagnostics(references) -> dict[str, int]:
@@ -26128,7 +26286,12 @@ def prepare_draft_media(references):
     for source, reference in enumerate(references, 1):
         url = reference["data_url"]
         if reference_file_mime_type(reference) != "application/pdf":
-            image = {"type": "input_image", "image_url": url, "detail": "high"}
+            # The AI gets the bounded copy; the uploaded original stays in the session.
+            try:
+                ai_url = ai_image_copy_for_upload(decode_reference_data_url_bytes(reference, MAX_IMAGE_BYTES))
+            except Exception:
+                raise DraftBatchError("image_normalise", source=source) from None
+            image = {"type": "input_image", "image_url": ai_url, "detail": "high"}
             single_send.append(image)
             media.append((f"Reference {source}, uploaded image", image))
             continue
@@ -30636,7 +30799,7 @@ def generic_referenced_errors(error_reference: str = "") -> list[str]:
 
 def failed_result_payload(error_reference: str, *, exception: BaseException | None = None) -> dict[str, Any]:
     diagnostics = safe_ai_output_diagnostics(getattr(exception, "diagnostics", {}))
-    message = draft_limit_message(diagnostics.get("batch_failure_reason", ""))
+    message = draft_failure_message(diagnostics)
     return {
         "status": "failed",
         "errors": ([f"{message} Reference: {clean_text(error_reference)}."] if message
@@ -35532,16 +35695,16 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if length > request_body_limit(self.path):
             raise RequestBodyError(too_large, status=413)
         path = urlparse(self.path).path
-        needs_pdf_budget = length > MAX_REQUEST_BYTES and path in {"/api/draft", "/api/quote-sessions"}
+        needs_media_budget = length > MAX_REQUEST_BYTES and path in {"/api/draft", "/api/quote-sessions"}
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            if needs_pdf_budget:
+            if needs_media_budget:
                 raise RequestBodyError(too_large, status=413) from None
             raise RequestBodyError("Request body must be valid JSON.") from exc
-        if needs_pdf_budget and (
-            not isinstance(payload, dict) or not pdf_request_fits_standard_budget(path, payload, length)
+        if needs_media_budget and (
+            not isinstance(payload, dict) or not reference_media_request_fits_budget(path, payload, length)
         ):
             raise RequestBodyError(too_large, status=413)
         if not isinstance(payload, dict):

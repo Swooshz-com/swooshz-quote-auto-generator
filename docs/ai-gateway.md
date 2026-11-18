@@ -133,10 +133,12 @@ route on the installed build before rollout.
 
 ## PDF reference limits
 
-Analysis accepts PDFs up to 48 MiB each, 96 pages in total across PDFs and
+Analysis accepts PDFs and images up to 48 MiB each, 96 pages in total across PDFs and
 128 MiB across all reference files. Up to eight reference files remain allowed.
 The draft and checkpoint JSON body ceiling remains about 173 MiB, including
-base64 and metadata; non-PDF fields retain the 24 MiB standard budget.
+base64 and metadata; fields other than reference PDFs and images retain the 24 MiB
+standard budget. Each uploaded image reaches the AI as a copy of at most 1600 px
+and 1 MiB (EXIF rotation applied); the original is stored unchanged.
 Stored reference artifacts and database artifacts admit up to 48 MiB each.
 The object adapter adds no smaller application byte ceiling; installed object
 storage and ingress limits still require verification before rollout.

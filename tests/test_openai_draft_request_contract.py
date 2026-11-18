@@ -31,6 +31,21 @@ def synthetic_image(format="PNG", size=(2, 2), color="white"):
     return "data:image/" + format.lower() + ";base64," + base64.b64encode(stream.getvalue()).decode("ascii")
 
 
+@functools.lru_cache(maxsize=8)
+def header_only_png(width, height):
+    """A valid PNG signature and IHDR claiming width x height; pixel data is never reached."""
+    import struct
+    import zlib
+
+    stream = io.BytesIO()
+    Image.new("RGB", (1, 1), "white").save(stream, format="PNG")
+    raw = bytearray(stream.getvalue())
+    ihdr = raw.index(b"IHDR")
+    raw[ihdr + 4:ihdr + 12] = struct.pack(">II", width, height)
+    raw[ihdr + 17:ihdr + 21] = struct.pack(">I", zlib.crc32(bytes(raw[ihdr:ihdr + 17])) & 0xFFFFFFFF)
+    return "data:image/png;base64," + base64.b64encode(bytes(raw)).decode("ascii")
+
+
 @functools.lru_cache(maxsize=16)
 def synthetic_pdf(pages=1):
     stream = io.BytesIO()
@@ -366,7 +381,7 @@ class DraftRequestContractTest(unittest.TestCase):
     def test_draft_pre_send_media_diagnostics_disambiguate_without_sending(self):
         corrupt = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\ncorrupt").decode("ascii")
         cases = (
-            ("reference_media", "media_dimension_limit", synthetic_image(size=(4097, 1)), []),
+            ("reference_media", "media_dimension_limit", header_only_png(8000, 5001), []),
             ("reference_media", "media_decode_failed", corrupt, []),
             ("catalog_media", "media_decode_failed", self.image, [{"data_url": corrupt}]),
         )
@@ -460,7 +475,7 @@ class DraftRequestContractTest(unittest.TestCase):
                 self.assertEqual(self.send.call_count, 2)
                 self.assertNotIn("input_file", [part["type"] for call in self.send.call_args_list
                     for part in json.loads(call.args[0].data)["input"][0]["content"]])
-        self.assertEqual(server.MAX_IMAGE_BYTES, 12 * 1024 * 1024)
+        self.assertEqual(server.MAX_IMAGE_BYTES, 48 * 1024 * 1024)
         self.assertEqual(server.MAX_DRAFT_INPUT_FILE_TOTAL_BYTES, 50_000_000)
 
     def test_input_file_aggregate_bytes_boundaries_and_five_pdf_reproducer(self):
@@ -1023,26 +1038,24 @@ class DraftRequestContractTest(unittest.TestCase):
                 decode.assert_not_called()
 
     def test_dimension_and_pixel_boundaries(self):
-        for width in (4095, 4096, 4097):
-            url = synthetic_image(size=(width, 1))
-            if width > 4096:
-                self.assert_rejected(self.payload(url))
-            else:
-                self.capture(self.payload(url))
-        for height in (4095, 4096, 4097):
-            url = synthetic_image(size=(1, height))
-            if height > 4096:
-                self.assert_rejected(self.payload(url))
-            else:
-                self.capture(self.payload(url))
-        # Scale only the pixel ceiling for exact N-1/N/N+1 decoded images.
-        with mock.patch.object(server, "MAX_PROMPT_IMAGE_PIXELS", 100):
-            for pixels in (99, 100, 101):
-                url = synthetic_image(size=(pixels, 1))
-                if pixels > 100:
-                    self.assert_rejected(self.payload(url))
-                else:
-                    self.capture(self.payload(url))
+        # Wide and tall uploads are no longer rejected: the AI gets a copy
+        # with the long edge at most 1600 px.
+        for size in ((4097, 1), (1, 4097), (1601, 2)):
+            with self.subTest(size=size):
+                sent = self.capture(self.payload(synthetic_image(size=size)))["input"][0]["content"][1]["image_url"]
+                with Image.open(io.BytesIO(base64.b64decode(sent.partition(",")[2]))) as image:
+                    self.assertEqual(max(image.size), server.AI_IMAGE_LONG_EDGE_PX)
+        # Scale only the per-format pixel guard for exact N-1/N/N+1 decoded images.
+        for format, constant in (("PNG", "MAX_SOURCE_LOSSLESS_PIXELS"), ("WEBP", "MAX_SOURCE_LOSSLESS_PIXELS"),
+                                 ("JPEG", "MAX_SOURCE_JPEG_PIXELS")):
+            with mock.patch.object(server, constant, 100):
+                for pixels in (99, 100, 101):
+                    with self.subTest(format=format, pixels=pixels):
+                        url = synthetic_image(format, size=(pixels, 1))
+                        if pixels > 100:
+                            self.assert_rejected(self.payload(url))
+                        else:
+                            self.capture(self.payload(url))
 
     def test_outbound_json_boundaries(self):
         body = self.capture()
@@ -1070,16 +1083,24 @@ class DraftRequestContractTest(unittest.TestCase):
                     else:
                         self.assertEqual(handler.read_json(), {})
 
-    def test_direct_draft_extended_limit_rejects_non_pdf_json(self):
+    def test_direct_draft_extended_limit_rejects_non_media_json(self):
         body = json.dumps(self.payload() | {"_pricing_reference_snapshot": None}).encode()
-        handler = object.__new__(server.QuoteRunnerHandler)
-        handler.path = "/api/draft"
-        handler.headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
-        handler.rfile = io.BytesIO(body)
-        with mock.patch.object(server, "MAX_REQUEST_BYTES", len(body) - 1):
-            with self.assertRaises(server.RequestBodyError) as caught:
-                handler.read_json()
-        self.assertEqual(caught.exception.status, 413)
+        # Reference image bytes use the extended allowance; everything else
+        # must still fit the standard budget.
+        non_media = len(body) - len(self.image.partition(",")[2])
+        for limit in (non_media - 1, non_media):
+            with self.subTest(limit=limit):
+                handler = object.__new__(server.QuoteRunnerHandler)
+                handler.path = "/api/draft"
+                handler.headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+                handler.rfile = io.BytesIO(body)
+                with mock.patch.object(server, "MAX_REQUEST_BYTES", limit):
+                    if limit < non_media:
+                        with self.assertRaises(server.RequestBodyError) as caught:
+                            handler.read_json()
+                        self.assertEqual(caught.exception.status, 413)
+                    else:
+                        self.assertEqual(handler.read_json()["images"][0]["data_url"], self.image)
 
     def test_page_budget_and_derived_media_byte_boundaries(self):
         for count in (server.MAX_RENDERED_PDF_PAGES - 1, server.MAX_RENDERED_PDF_PAGES):
@@ -1167,6 +1188,7 @@ class DraftRequestContractTest(unittest.TestCase):
         references = self.payload(synthetic_pdf(48), *([large_image] * 7))["images"]
         rendered = [{"page": number, "data_url": page} for number in range(1, 49)]
         with (mock.patch.object(server, "render_pdf_pages_with_pdfium", return_value=rendered),
+              mock.patch.object(server, "ai_image_copy_for_upload", return_value=large_image),
               mock.patch.object(server, "MAX_DRAFT_BATCH_MEDIA_CHARS", len(large_image))):
             prepared = server.prepare_draft_media(references)
         self.assertEqual([len(batch) for batch in prepared.batches], [6] * 8 + [1] * 7)

@@ -508,8 +508,11 @@ An error inside a failed job uses the same safe error detail as an HTTP failure.
 
 ## Limits and sandbox quotas
 
-Preserve 8 files, 12 MiB per image, 48 MiB per PDF, 96 PDF pages across the entire
-request and 128 MiB aggregate decoded source bytes. MiB means 1,048,576 bytes.
+Preserve 8 files, 48 MiB per image, 48 MiB per PDF, 96 PDF pages across the entire
+request and 128 MiB aggregate decoded source bytes. Images are rejected from the
+header, before decode, above 89,478,485 pixels for JPEG or 40,000,000 pixels for
+PNG and WebP. Images sent to the AI are at most 1600 px on the long edge and
+1 MiB (EXIF rotation applied); the uploaded original is stored unchanged. MiB means 1,048,576 bytes.
 Check encoded-body caps before decode and MIME/signature, base64, dimensions,
 decompression and page limits before analysis. Remote URLs are rejected.
 Notes are at most 16 KiB UTF-8 (the schema character limit is only a preliminary
