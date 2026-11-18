@@ -235,7 +235,10 @@ or deployment behaviour changes accompany this test.
 - Runs `npm run playwright:internal-auth`.
 - Runs `npm run playwright:smoke` and `npm run playwright:alpha-smoke`, plus `npm run playwright:smoke -- --recovery-only` in a separate
   process with fresh quote state. The isolated `npm run playwright:smoke -- --terminal-only` step checks live
-  needs-review, blocked, failed and interrupted polling without reload. All six browser steps remain gated by the successful
+  needs-review, blocked, failed and interrupted polling without reload. `npm run playwright:rehearsal-check` runs
+  `scripts/rehearsal-check.mjs` (seed, verify without AI, reopen, live-readonly) against a loopback
+  synthetic server behind a logging proxy, checks at the server that live-readonly sends no write, and checks
+  its argument, base-URL and read-only refusals. All seven browser steps remain gated by the successful
   `runtime_prerequisites` privilege-contract validation, including after a
   Python test failure.
 - The default app smoke covers reload, saved reopen and generation recovery,
@@ -299,8 +302,11 @@ or deployment behaviour changes accompany this test.
   (`docs/internal-uat-coolify-deploy.md`). Its offline checkers
   (`scripts/check_release_settings.py`, `scripts/check_rehearsal_map.py`), the
   bucket clear script and the build script's dry run and fake-docker build are
-  covered by the existing `python -m unittest discover -s tests` step. No CI
-  job, trigger, secret or required check changes.
+  covered by the existing `python -m unittest discover -s tests` step. Its
+  remote check, `scripts/rehearsal-check.mjs`, is tested by the browser job's
+  `npm run playwright:rehearsal-check` step against a loopback synthetic server only; CI
+  never reaches the rehearsal or live app. No trigger, secret or required
+  check changes.
 - All six maintained inference operations require `OPENROUTER_API_KEY` and
   explicit `OPENROUTER_<SUFFIX>_MODEL`,
   `OPENROUTER_<SUFFIX>_REASONING_EFFORT` and

@@ -27,7 +27,7 @@
       "kind": "coolify_service",
       "name": "quote-rehearsal",
       "lifetime": "per_run",
-      "created_by": "Operator on the laptop, in Coolify: a Docker Compose service on the same server and project as live, compose pasted from deploy/rehearsal/compose.yaml.",
+      "created_by": "Operator on the laptop, in Coolify: a Docker Compose service on the same server and project as live, compose pasted from deploy/rehearsal/compose.yaml. Every compose, variable or image change is applied with POST /api/v1/deploy?uuid=<service uuid>; a restart does not re-render the compose.",
       "delete": "Clear the bucket first (storage.clear_setup, then storage.clear_command), then delete the quote-rehearsal service in Coolify with its containers."
     },
     {
@@ -44,7 +44,7 @@
       "kind": "https_host",
       "name": "quote-rehearsal.<server-ip>.sslip.io",
       "lifetime": "per_run",
-      "created_by": "Operator in Coolify: the service domain, with Traefik basic auth using the generated basic-auth user and password.",
+      "created_by": "Operator in Coolify: the service domain. Coolify services have no basic auth, so access control is the app's own sign-in with the run's test-only logins.",
       "delete": "Removed with the Coolify service."
     },
     {
@@ -85,6 +85,18 @@
       "lifetime": "kept",
       "created_by": "Owner decision: the rehearsal reuses live's OpenRouter key, already in the laptop credential store (toolkit-env) under this name. It is set on the rehearsal app for one run only and leaves with the app. --no-ai keeps reruns free.",
       "delete": "Not deleted per run; it is live's key. It leaves the rehearsal when the app is deleted."
+    },
+    {
+      "id": "live-readonly-login",
+      "kind": "credential_store_entry",
+      "name": "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN",
+      "entries": [
+        "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL",
+        "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD"
+      ],
+      "lifetime": "kept",
+      "created_by": "Owner, once: the operator's own live sign-in, stored in the laptop credential store (toolkit-env) under the entry names listed here. Only the live read-only check uses it, through toolkit env run, so agents never see the values.",
+      "delete": "Not deleted per run. The owner removes it with toolkit env when it is no longer wanted."
     },
     {
       "id": "neon-access",
@@ -176,8 +188,7 @@
     "SESSION_SECRET": "At least 48 random characters.",
     "SQAG_TRACKING_HMAC_KEY": "At least 48 random characters.",
     "SQAG_INTERNAL_LOGIN_PASSWORD": "24 random characters, different from the admin password.",
-    "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "24 random characters, different from the staff password.",
-    "basic-auth": "One user and a 24-character random password for the Traefik basic auth on the rehearsal host."
+    "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "24 random characters, different from the staff password."
   },
   "image_retention": "Keep the current live image, the previous live image and the candidate. Removing any other image or old container is a separate owner-approved server action.",
   "workspace_id": "sqag-rehearsal"

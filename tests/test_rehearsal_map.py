@@ -176,6 +176,13 @@ class RehearsalMapTests(unittest.TestCase):
             errors = self.check_with(data)
             self.assertTrue(any("neon-branch created_by" in e for e in errors), needle)
 
+    def test_service_changes_go_through_the_deploy_api(self) -> None:
+        data = copy.deepcopy(self.data)
+        for resource in data["resources"]:
+            if resource["kind"] == "coolify_service":
+                resource["created_by"] = "Operator in Coolify; restart the service after each change."
+        self.assertTrue(any("POST /api/v1/deploy" in e for e in self.check_with(data)))
+
     def test_proxy_cidr_is_derived_from_the_service_network(self) -> None:
         for value in (
             "10.0.10.0/24",

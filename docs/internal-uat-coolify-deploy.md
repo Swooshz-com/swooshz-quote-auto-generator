@@ -41,8 +41,6 @@ create, test, delete, with no new decisions per run.
   (offline checks), `scripts/clear_rehearsal_bucket.py` (empties the
   rehearsal bucket), `scripts/rehearsal-check.mjs` (checks against the
   rehearsal or live URL) and `scripts/verify_release_identity.py` (identity).
-  Until `scripts/rehearsal-check.mjs` is added, run each of its steps below by
-  hand in a browser against the rehearsal URL and record the results.
 
 ### One-time rehearsal setup
 
@@ -63,6 +61,15 @@ by each run.
 5. The release settings file with no pending values. A null value is filled
    from the owner's approved record of the live value, never by an agent
    reading live.
+6. The laptop's tools for `scripts/rehearsal-check.mjs`: `npm ci`,
+   `npx playwright install chromium` and the Python packages in
+   `requirements.txt` (it validates the downloaded PDF with them).
+7. The operator's own live sign-in in the laptop credential store under
+   `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL` and
+   `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD`. The owner adds them once with
+   `toolkit env edit`. Only the live read-only check reads them, through
+   `toolkit env run`, so the values never pass through a chat or a command
+   line, and the rehearsal's synthetic logins never reach live.
 
 The owner's standing scope confirmation for this flow lets each run create and
 delete the resources the map names as rehearsal, and copy live's migration
@@ -100,6 +107,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    scp.exe -o BatchMode=yes "_tmp\deploy-$short-out\sqag-$short.tar" "swooshz-vps:/root/sqag-build-$short.tar"
    scp.exe -o BatchMode=yes "_tmp\deploy-$short\scripts\build_internal_image.sh" "swooshz-vps:/root/sqag-build-$short.sh"
    $tarSha = "<tar_sha256 from the archive record>"
+   ssh.exe swooshz-vps "rm -f /root/sqag-build-$short.exit"
    ssh.exe swooshz-vps "nohup bash -c 'bash /root/sqag-build-$short.sh build --commit $sha --tar /root/sqag-build-$short.tar --tar-sha256 $tarSha > /root/sqag-build-$short.json 2> /root/sqag-build-$short.log; echo `$? > /root/sqag-build-$short.exit' < /dev/null > /dev/null 2>&1 &"
    ssh.exe swooshz-vps "until [ -e /root/sqag-build-$short.exit ]; do sleep 15; done; cat /root/sqag-build-$short.exit"
    ```
@@ -145,7 +153,13 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      secrets, the branch's runtime URL, the credential-store entries the map
      names (the R2 token, the R2 endpoint and the AI key) and the run values. Set
      `REHEARSAL_IMAGE_ID` to the image live runs now. Give it the host
-     `quote-rehearsal.<server-ip>.sslip.io` with Traefik basic auth.
+     `quote-rehearsal.<server-ip>.sslip.io`. Coolify services have no basic
+     auth, so access control is the app's own sign-in with the run's test-only
+     logins.
+   - Apply every compose or variable change, and every image swap, with
+     Coolify's deploy API for the service: `POST /api/v1/deploy?uuid=<service
+     uuid>`. A service restart does not re-render the compose, so it keeps the
+     old image and values. "Redeploy" below always means this call.
    - Derive `SQAG_TRUSTED_PROXY_CIDRS` from the rehearsal service's own
      network, never a fixed value. The proxy joins that network, so a
      request reaches the app from there and not from the shared `coolify`
@@ -170,24 +184,48 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      any bucket or workspace that is not the rehearsal's, so it cannot touch
      live.
 
-4. **Seed on the current image.** Run `rehearsal-check --profile seed`. It
-   creates the fixed synthetic set and saves the seed ids for later steps.
+4. **Seed on the current image.** `scripts/rehearsal-check.mjs` reads its
+   credentials from the environment only and refuses them as arguments. For
+   the rehearsal, sign in as the compose file's synthetic admin alias with the
+   run's generated admin password. Set them in the same PowerShell session from the run's generated values, never by
+   typing them into the command. Writing profiles refuse any host that does
+   not say rehearsal and any host in `SQAG_REHEARSAL_LIVE_HOSTS`.
+
+   ```powershell
+   $env:SQAG_REHEARSAL_LOGIN_EMAIL = "rehearsal-admin@example.com"
+   $env:SQAG_REHEARSAL_LOGIN_PASSWORD = <the run's generated admin password>
+   $env:SQAG_REHEARSAL_LIVE_HOSTS = "<live host>"
+   $rehearsal = "https://quote-rehearsal.<server-ip>.sslip.io"
+   $out = "_tmp\deploy-$short-out"
+   node scripts\rehearsal-check.mjs --profile seed --base-url $rehearsal --result "$out\seed.json"
+   ```
+
+   It saves the synthetic pricing reference, makes a quote to XLSX and PDF
+   and a saved draft, and records their ids and file hashes in `seed.json`.
+   Saving the pricing reference makes one small AI call when the app has an
+   AI key. A damaged pricing reference has no app route, so its fail-closed
+   message stays covered by the unit tests only. Each later profile writes its
+   own result file; a failed step holds promotion.
 
 5. **Migrate the rehearsal database** if the candidate has pending migrations:
    pre-apply check, one apply, post-apply check, all on the branch with its
-   migrator URL. Then run `rehearsal-check --profile reopen` on the current
-   image to prove it still serves the seed on the new schema.
+   migrator URL. Then run the reopen profile on the current image to prove it
+   still serves the seed on the new schema:
+   `node scripts\rehearsal-check.mjs --profile reopen --base-url $rehearsal --seed-file "$out\seed.json" --result "$out\reopen-migrated.json"`.
 
 6. **Upgrade.** Set `REHEARSAL_IMAGE_ID` to the candidate image id, redeploy
-   and run `rehearsal-check --profile verify`. It signs in, reopens every seed
-   item, makes a new quote from test images with image analysis, downloads and
-   validates the XLSX and PDF, checks the PDF fonts and captures the served
-   `app.js` hash. `--no-ai` skips the paid calls on a rerun.
+   and run
+   `node scripts\rehearsal-check.mjs --profile verify --base-url $rehearsal --seed-file "$out\seed.json" --result "$out\verify.json" --asset-out "$out\rehearsal-app.js"`.
+   It signs in, reopens every seed item and checks their files are unchanged,
+   makes a new quote to XLSX and PDF, validates both, checks the PDF uses only
+   the release fonts (Carlito and Liberation Sans), runs AI image analysis on
+   a test image and captures the served `app.js`. `--no-ai` skips the paid
+   call on a rerun.
 
 7. **Rollback drill.** Set `REHEARSAL_IMAGE_ID` back to the current image,
-   redeploy and run `rehearsal-check --profile reopen`. Then switch forward to
-   the candidate again and run `--profile reopen` once more. Any failed check
-   holds promotion.
+   redeploy and run the reopen profile (result `reopen-rollback.json`). Then
+   switch forward to the candidate again and run it once more (result
+   `reopen-forward.json`). Any failed check holds promotion.
 
 8. **Promote after the owner approves the tested image id.**
    - Live migrations first, if any, in the runbook order and with their own
@@ -206,10 +244,25 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      env change.
    - Commit the one-line image pin and its source comment on the
      `deployment/internal` branch and deploy in Coolify.
-   - Run `rehearsal-check --profile live-readonly` against live. It signs in,
-     loads the quote list and captures the served `app.js`, and creates
-     nothing. Then run `scripts/verify_release_identity.py` with the expected
-     source commit, image id and the hash the rehearsal captured.
+   - Run the live read-only check. It reads the live sign-in from
+     `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL` and
+     `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD` only, never the rehearsal
+     names, and `toolkit env run` feeds them from the credential store to
+     this one command. Clear the rehearsal values from the session first:
+
+     ```powershell
+     Remove-Item Env:SQAG_REHEARSAL_LOGIN_EMAIL, Env:SQAG_REHEARSAL_LOGIN_PASSWORD -ErrorAction SilentlyContinue
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL,SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD -- node scripts\rehearsal-check.mjs --profile live-readonly --base-url https://<live host> --result "$out\live-readonly.json" --asset-out "$out\live-app.js"
+     ```
+
+     It signs in, loads the quote list and captures the served `app.js`.
+     Every channel it opens is read-only: the browser and its own API
+     requests send only reads and the sign-in form, refuse anything else
+     before it is sent, and list both in the result, so it creates nothing.
+     Then run
+     `scripts/verify_release_identity.py` with the expected source commit and
+     image id and `--served-asset "$out\live-app.js"`; its hash must equal
+     the rehearsal's `rehearsal-app.js`.
    - If any live check fails, pin the previous image id and deploy again.
 
 9. **Delete and record.**

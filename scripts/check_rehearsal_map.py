@@ -273,6 +273,9 @@ def check_create_steps(data: dict[str, Any]) -> list[str]:
         for needle, step in BRANCH_CREATE_STEPS:
             if needle not in created:
                 errors.append(f"resource {branch.get('id')} created_by must {step}")
+    for service in (r for r in data.get("resources") or [] if isinstance(r, dict) and r.get("kind") == "coolify_service"):
+        if "POST /api/v1/deploy?uuid=" not in str(service.get("created_by") or ""):
+            errors.append(f"resource {service.get('id')} created_by must apply changes with POST /api/v1/deploy?uuid=, not a restart")
     run_values = data.get("run_values") if isinstance(data.get("run_values"), dict) else {}
     proxy = str(run_values.get("SQAG_TRUSTED_PROXY_CIDRS") or "")
     if (

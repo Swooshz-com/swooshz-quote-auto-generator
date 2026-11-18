@@ -246,6 +246,7 @@ wrappers or failure suppression in these steps are rejected by the contract.
 | Run isolated app recovery smoke | `npm run playwright:smoke -- --recovery-only` | none | prerequisites |
 | Run isolated live generation terminal smoke | `npm run playwright:smoke -- --terminal-only` | none | prerequisites |
 | Run minimum internal alpha browser smoke | `npm run playwright:alpha-smoke` | none | prerequisites |
+| Run redeploy rehearsal check against a local synthetic server | `npm run playwright:rehearsal-check` | none | prerequisites |
 <!-- coverage-ci:end -->
 
 ### Browser suite inventory
@@ -271,6 +272,7 @@ Do not remove old failing fixtures or narrow their assertions to pass.
 | internal-auth | playwright:internal-auth | `node scripts/playwright-internal-password-auth.mjs` | `npm run playwright:internal-auth` | Synthetic local staff admission and denial. |
 | screenshots | playwright:screenshot | `node scripts/playwright-smoke.mjs --screenshots` | absent | Manual broad-run visual tool using Playwright Chromium; skips the isolated G3 tail. Default full-smoke CI still runs G3. |
 | alpha-full | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | `npm run playwright:alpha-smoke` | Native saved edits, reopen, workbook/PDF and protected download checks; renderer dependencies required. |
+| rehearsal-check | playwright:rehearsal-check | `node --test tests/test_rehearsal_check.mjs` | `npm run playwright:rehearsal-check` | `scripts/rehearsal-check.mjs` seed, verify (no AI), reopen and live-readonly against a loopback synthetic server behind a logging proxy (live-readonly must send no write the server sees), plus its base-URL, credential-argument and read-only API refusals. The real runs target the rehearsal and live apps from the laptop. |
 | owner-uat | playwright:owner-uat-basis | `node scripts/playwright-owner-uat-basis-repair.mjs --lines=24 --latency-ms=800` | absent | Operator tool; bounded rendered variants also run indirectly in focused Python tests. |
 <!-- coverage-browser:end -->
 

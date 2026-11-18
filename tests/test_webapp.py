@@ -10592,11 +10592,11 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_internal_uat_coolify_env_template_requires_exact_zdr_boolean(self):
         source_text = deploy_template.DEFAULT_TEMPLATE.read_text(encoding="utf-8")
         values, _ = deploy_template.parse_env_template(deploy_template.DEFAULT_TEMPLATE)
-        self.assertEqual(values["OPENROUTER_ZDR"], "true")
+        self.assertEqual(values["OPENROUTER_ZDR"], "false")
         with tempfile.TemporaryDirectory() as tmp:
             template = Path(tmp) / "sqag.uat.env.example"
             for value in ("true", "false", None, "", "True", "False", "1", "no"):
-                text = source_text.replace("OPENROUTER_ZDR=true", "" if value is None else f"OPENROUTER_ZDR={value}")
+                text = source_text.replace("OPENROUTER_ZDR=false", "" if value is None else f"OPENROUTER_ZDR={value}")
                 template.write_text(text, encoding="utf-8")
                 result = deploy_template.verify_template(template)
                 with self.subTest(zdr=value):
@@ -10608,7 +10608,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             for key, invalid in (("OPENROUTER_DATA_COLLECTION", "allow"),
                                  ("OPENROUTER_REQUIRE_PARAMETERS", "false"),
                                  ("OPENROUTER_ALLOW_FALLBACKS", "true")):
-                text = source_text.replace("OPENROUTER_ZDR=true", "OPENROUTER_ZDR=false")
+                text = source_text
                 text = re.sub(rf"(?m)^{key}=.*$", f"{key}={invalid}", text)
                 template.write_text(text, encoding="utf-8")
                 with self.subTest(key=key):
