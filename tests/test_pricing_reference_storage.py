@@ -1,5 +1,6 @@
 """Pricing save preconditions on disposable databases and synthetic objects."""
 import base64
+import contextlib
 import http.client
 import io
 import json
@@ -600,6 +601,75 @@ class DamagedPricingReferenceHttpTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(body["pricing_reference"]["id"], "healthy-pack")
 
+    def post(self, runner, path, body, cookie=None):
+        host, port = runner.server.server_address
+        status, session = self.get(runner, "/api/session", cookie)
+        self.assertEqual(status, 200, session)
+        headers = {"Accept": "application/json", "Content-Type": "application/json",
+                   "Origin": runner.base_url, session["csrf_header"]: session["csrf_token"]}
+        if cookie:
+            headers["Cookie"] = cookie
+        connection = http.client.HTTPConnection(host, port, timeout=20)
+        try:
+            connection.request("POST", path, json.dumps(body).encode("utf-8"), headers)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read() or b"{}")
+        finally:
+            connection.close()
+
+    def quote_use_requests(self, reference_id, source):
+        """Every quote action that resolves the selected pack, with and without a saved basis."""
+        selected = self.webapp_tests.valid_payload()
+        saved = self.webapp_tests.recovered_convergence_payload()
+        saved["quote_session"]["draft_state"]["quoteDetails"]["commercial_snapshot"]["pricing_basis"].update(
+            {"id": reference_id, "source": source})
+        requests = []
+        for basis, payload in (("selected", selected), ("saved-basis", saved)):
+            payload["pricing_reference_id"] = reference_id
+            payload["pricing_reference_source"] = source
+            payload["pricing_reference"] = {"id": reference_id, "source": source, "currency": "SGD"}
+            selection = {
+                **payload,
+                "quote_session": payload.get("quote_session") or {"session_id": "quote-damagedpack0001"},
+                "pricing_selections": [{"source_basis_line_id": "row-1", "catalog_item_id": "workspace-row", "expected_revision": 0}],
+            }
+            requests += [
+                (basis, "normalize", "/api/line-items/normalize", payload),
+                (basis, "draft", "/api/draft", payload),
+                (basis, "pricing-selections", "/api/quote-sessions/pricing-selections", selection),
+            ]
+        if source == "company":
+            # Only a signed-in save re-checks the saved basis against the pack before writing.
+            requests.append(("saved-basis", "quote-sessions", "/api/quote-sessions", saved))
+        return requests
+
+    def assert_quote_use_fails_closed(self, runner, source, cookie=None):
+        downstream_names = ("draft_quote_basis", "apply_pricing_selections", "normalize_line_items_for_quote_basis_review")
+        with contextlib.ExitStack() as stack:
+            downstream = {
+                name: stack.enter_context(mock.patch.object(server, name, side_effect=AssertionError(name + " ran")))
+                for name in downstream_names
+            }
+            for basis, label, path, body in self.quote_use_requests("damaged-pack", source):
+                with self.subTest(basis=basis, route=label):
+                    self.logs.reset_mock()
+                    status, reply = self.post(runner, path, body, cookie)
+                    self.assertEqual(status, 503, reply)
+                    self.assertEqual(reply["status"], "failed")
+                    self.assertTrue(reply["error_reference"])
+                    self.assertTrue(any(
+                        call.args[1].get("error_reference") == reply["error_reference"]
+                        for call in self.logs.call_args_list if call.args[0] == "server_error"
+                    ))
+            for name, patched in downstream.items():
+                with self.subTest(downstream=name):
+                    patched.assert_not_called()
+        # The healthy pack still goes through the same handler.
+        status, reply = self.post(runner, "/api/line-items/normalize",
+                                  self.quote_use_requests("healthy-pack", source)[0][3], cookie)
+        self.assertEqual(status, 200, reply)
+        self.assertEqual(reply["status"], "normalized")
+
     def test_local_damaged_pack_is_left_out_and_reads_fail_closed(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="pricing-damaged-", dir=test_temp_root())))
         self.enterContext(mock.patch.dict(os.environ, {
@@ -620,6 +690,7 @@ class DamagedPricingReferenceHttpTest(unittest.TestCase):
         with self.webapp_tests.LocalRunnerServer() as runner:
             self.assert_lists_survive(runner)
             self.assert_damaged_reads_fail_closed(runner, "local")
+            self.assert_quote_use_fails_closed(runner, "local")
 
         self.assertEqual(catalogue.read_bytes(), damaged_bytes)
         # Listing never creates a lock file for an id that has no pack.
@@ -650,6 +721,7 @@ class DamagedPricingReferenceHttpTest(unittest.TestCase):
         with self.webapp_tests.LocalRunnerServer() as runner:
             self.assert_lists_survive(runner, cookie)
             self.assert_damaged_reads_fail_closed(runner, "company", cookie)
+            self.assert_quote_use_fails_closed(runner, "company", cookie)
 
         with storage.connection() as connection:
             row = connection.execute(

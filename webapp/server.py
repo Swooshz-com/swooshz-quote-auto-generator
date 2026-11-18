@@ -34271,43 +34271,44 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            commercial_review_block = quote_commercial_review_preflight(
-                payload,
-                auth_session=auth_session,
-            )
-            if commercial_review_block:
-                self.send_json(commercial_review_block, status=400)
-                return
-            pricing_reference_error = pricing_reference_authority_error(
-                payload,
-                auth_session=self.current_auth_session(),
-            )
-            if pricing_reference_error:
-                if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
-                    log_database_pricing_reference_resolution_block(payload)
-                self.send_json(
-                    pricing_reference_authority_blocked_result(
-                        payload,
-                        [pricing_reference_error],
-                        auth_session=self.current_auth_session(),
-                    ),
-                    status=400,
-                )
-                return
-            resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
-            if resolved_payload is None:
-                log_database_pricing_reference_resolution_block(payload)
-                self.send_json(
-                    pricing_reference_authority_blocked_result(
-                        payload,
-                        [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
-                        auth_session=self.current_auth_session(),
-                    ),
-                    status=400,
-                )
-                return
-            payload = resolved_payload
+            # A damaged selected pack fails closed with a support reference (#375).
             try:
+                commercial_review_block = quote_commercial_review_preflight(
+                    payload,
+                    auth_session=auth_session,
+                )
+                if commercial_review_block:
+                    self.send_json(commercial_review_block, status=400)
+                    return
+                pricing_reference_error = pricing_reference_authority_error(
+                    payload,
+                    auth_session=self.current_auth_session(),
+                )
+                if pricing_reference_error:
+                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                        log_database_pricing_reference_resolution_block(payload)
+                    self.send_json(
+                        pricing_reference_authority_blocked_result(
+                            payload,
+                            [pricing_reference_error],
+                            auth_session=self.current_auth_session(),
+                        ),
+                        status=400,
+                    )
+                    return
+                resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+                if resolved_payload is None:
+                    log_database_pricing_reference_resolution_block(payload)
+                    self.send_json(
+                        pricing_reference_authority_blocked_result(
+                            payload,
+                            [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE],
+                            auth_session=self.current_auth_session(),
+                        ),
+                        status=400,
+                    )
+                    return
+                payload = resolved_payload
                 line_items = normalize_line_items_for_quote_basis_review(
                     payload,
                     auth_session=self.current_auth_session(),
@@ -34330,10 +34331,14 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            persistence_review = quote_commercial_persistence_preflight(
-                payload,
-                auth_session=auth_session,
-            )
+            try:
+                persistence_review = quote_commercial_persistence_preflight(
+                    payload,
+                    auth_session=auth_session,
+                )
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             if persistence_review:
                 self.send_json(
                     {
@@ -34376,10 +34381,15 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             if not allowed:
                 self.send_json(error, status=403)
                 return
-            commercial_review_block = quote_commercial_review_preflight(
-                payload,
-                auth_session=auth_session,
-            )
+            # A damaged selected pack fails closed with a support reference (#375).
+            try:
+                commercial_review_block = quote_commercial_review_preflight(
+                    payload,
+                    auth_session=auth_session,
+                )
+            except SqagStorageAccessError as exc:
+                self.send_json(storage_access_error_payload(exc), status=exc.status)
+                return
             if commercial_review_block:
                 self.send_json(commercial_review_block, status=400)
                 return
@@ -34398,60 +34408,64 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                     write_local_log("draft_blocked", {"errors": errors})
                     self.send_json({"status": "blocked", "errors": errors}, status=400)
                     return
-                pricing_reference_error = pricing_reference_authority_error(
-                    payload,
-                    auth_session=self.current_auth_session(),
-                )
-                if pricing_reference_error:
-                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                try:
+                    pricing_reference_error = pricing_reference_authority_error(
+                        payload,
+                        auth_session=self.current_auth_session(),
+                    )
+                    if pricing_reference_error:
+                        if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                            log_database_pricing_reference_resolution_block(payload)
+                        errors = safe_error_messages([pricing_reference_error])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json(
+                            pricing_reference_authority_blocked_result(
+                                payload,
+                                errors,
+                                auth_session=self.current_auth_session(),
+                            ),
+                            status=400,
+                        )
+                        return
+                    missing_details = quote_detail_missing_fields(payload)
+                    if missing_details:
+                        errors = safe_error_messages([f"Fill quote details before AI analysis: {', '.join(missing_details)}."])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json({"status": "blocked", "errors": errors}, status=400)
+                        return
+                    pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
+                    if pricing_reference_error:
+                        if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                            log_database_pricing_reference_resolution_block(payload)
+                        errors = safe_error_messages([pricing_reference_error])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json(
+                            pricing_reference_authority_blocked_result(
+                                payload,
+                                errors,
+                                auth_session=self.current_auth_session(),
+                            ),
+                            status=400,
+                        )
+                        return
+                    resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+                    if resolved_payload is None:
                         log_database_pricing_reference_resolution_block(payload)
-                    errors = safe_error_messages([pricing_reference_error])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json(
-                        pricing_reference_authority_blocked_result(
-                            payload,
-                            errors,
-                            auth_session=self.current_auth_session(),
-                        ),
-                        status=400,
-                    )
+                        errors = safe_error_messages([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE])
+                        write_local_log("draft_blocked", {"errors": errors})
+                        self.send_json(
+                            pricing_reference_authority_blocked_result(
+                                payload,
+                                errors,
+                                auth_session=self.current_auth_session(),
+                            ),
+                            status=400,
+                        )
+                        return
+                    payload = resolved_payload
+                except SqagStorageAccessError as exc:
+                    self.send_json(storage_access_error_payload(exc), status=exc.status)
                     return
-                missing_details = quote_detail_missing_fields(payload)
-                if missing_details:
-                    errors = safe_error_messages([f"Fill quote details before AI analysis: {', '.join(missing_details)}."])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json({"status": "blocked", "errors": errors}, status=400)
-                    return
-                pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
-                if pricing_reference_error:
-                    if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
-                        log_database_pricing_reference_resolution_block(payload)
-                    errors = safe_error_messages([pricing_reference_error])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json(
-                        pricing_reference_authority_blocked_result(
-                            payload,
-                            errors,
-                            auth_session=self.current_auth_session(),
-                        ),
-                        status=400,
-                    )
-                    return
-                resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
-                if resolved_payload is None:
-                    log_database_pricing_reference_resolution_block(payload)
-                    errors = safe_error_messages([PRICING_REFERENCE_SELECTION_ERROR_MESSAGE])
-                    write_local_log("draft_blocked", {"errors": errors})
-                    self.send_json(
-                        pricing_reference_authority_blocked_result(
-                            payload,
-                            errors,
-                            auth_session=self.current_auth_session(),
-                        ),
-                        status=400,
-                    )
-                    return
-                payload = resolved_payload
                 try:
                     binding = bind_quote_spend(payload, auth_session, "draft")
                     requested_job_id = clean_text(self.headers.get("Idempotency-Key"))
@@ -34793,24 +34807,29 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "blocked", "reason_code": "pricing_selection_invalid",
                             "errors": ["Pricing selection request is invalid."]}, status=400)
             return
-        commercial_review_block = quote_commercial_review_preflight(payload, auth_session=auth_session)
-        if commercial_review_block:
-            self.send_json(commercial_review_block, status=400)
-            return
-        pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
-        if pricing_reference_error:
-            if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+        # A damaged selected pack fails closed with a support reference (#375).
+        try:
+            commercial_review_block = quote_commercial_review_preflight(payload, auth_session=auth_session)
+            if commercial_review_block:
+                self.send_json(commercial_review_block, status=400)
+                return
+            pricing_reference_error = pricing_reference_authority_error(payload, auth_session=self.current_auth_session())
+            if pricing_reference_error:
+                if pricing_reference_error != QUOTE_COMMERCIAL_REVIEW_MESSAGE:
+                    log_database_pricing_reference_resolution_block(payload)
+                self.send_json(pricing_reference_authority_blocked_result(
+                    payload, [pricing_reference_error], auth_session=self.current_auth_session(),
+                ), status=400)
+                return
+            resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
+            if resolved_payload is None:
                 log_database_pricing_reference_resolution_block(payload)
-            self.send_json(pricing_reference_authority_blocked_result(
-                payload, [pricing_reference_error], auth_session=self.current_auth_session(),
-            ), status=400)
-            return
-        resolved_payload = payload_with_database_pricing_reference_detail(payload, auth_session=self.current_auth_session())
-        if resolved_payload is None:
-            log_database_pricing_reference_resolution_block(payload)
-            self.send_json(pricing_reference_authority_blocked_result(
-                payload, [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], auth_session=self.current_auth_session(),
-            ), status=400)
+                self.send_json(pricing_reference_authority_blocked_result(
+                    payload, [PRICING_REFERENCE_SELECTION_ERROR_MESSAGE], auth_session=self.current_auth_session(),
+                ), status=400)
+                return
+        except SqagStorageAccessError as exc:
+            self.send_json(storage_access_error_payload(exc), status=exc.status)
             return
         storage = self.current_quote_session_storage()
         if storage is None:
