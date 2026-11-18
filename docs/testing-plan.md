@@ -201,7 +201,7 @@ npm run playwright:smoke
   padding to keep icons and text inside their buttons. At 640 px and below all
   targets are 44 px high and review controls are 44 px wide. Check 640 px and
   641 px boundaries.
-- Follow-ups (#338): Quote Basis section check/X match the row buttons (size,
+- Button standard follow-ups: Quote Basis section check/X match the row buttons (size,
   8 px gap, same columns) at every width; the PDF ready buttons sit flush right
   from 500 px to 880 px too; below 380 px the profile actions stack in one
   column and review actions use the full row width, wrapping at 320 px.
