@@ -5201,7 +5201,6 @@ BOOTH_SIZE_PAIR_RE = re.compile(
     rf"(?:\s*(?:x|×|\*|by)\s*{BOOTH_SIZE_NUMBER}(?:\s*{BOOTH_SIZE_LENGTH_UNIT})?)?(?!\d|\.\d)",
     flags=re.IGNORECASE,
 )
-BOOTH_SIZE_COUNTED_NOUN_RE = re.compile(r"\s*[a-z]", flags=re.IGNORECASE)
 BOOTH_SIZE_AREA_RE = re.compile(
     rf"(?<![\d.]){BOOTH_SIZE_NUMBER}\s*"
     r"(?:sq\.?\s*m(?:et(?:re|er)s?)?\b\.?|sqm\b|m\s*(?:2|²)(?![\d])|square\s+met(?:re|er)s?\b)",
@@ -5220,6 +5219,16 @@ def booth_length_in_metres(value: str, unit: str) -> float | None:
     if unit.startswith("cm") or unit.startswith("centi"):
         return round(number / 100, 4)
     return number
+
+
+def booth_size_next_word_is_a_noun(text: str, end: int) -> bool:
+    # True when a word (not booth wording) follows the match, as in "4m x 2 panels".
+    # Plain string checks, no regex on the open-ended rest of the text.
+    rest = text[end:].lstrip()
+    first = rest[:1]
+    if not (first.isascii() and first.isalpha()):
+        return False
+    return not BOOTH_SIZE_CONTEXT_RE.match(rest)
 
 
 def booth_size_pair_continues_earlier(text: str, start: int) -> bool:
@@ -5263,8 +5272,7 @@ def booth_size_reading(value: Any) -> dict[str, Any]:
         # counts a noun is not a depth.
         if (
             not match.group(4) and not match.group(5)
-            and BOOTH_SIZE_COUNTED_NOUN_RE.match(text, match.end())
-            and not BOOTH_SIZE_CONTEXT_RE.match(text[match.end():].lstrip())
+            and booth_size_next_word_is_a_noun(text, match.end())
             and not booth_size_candidate_context(text, match.start())
         ):
             continue
