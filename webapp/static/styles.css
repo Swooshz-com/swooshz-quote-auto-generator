@@ -5348,6 +5348,27 @@ select:focus {
   white-space: nowrap;
 }
 
+/* Quantities read as plain text; a click turns one into a small box (owner, 18 Nov 2026). */
+.basis-quantity-edit {
+  padding: 0;
+  border: 0;
+  border-bottom: 1px dotted transparent;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: text;
+}
+
+.basis-quantity-edit:hover,
+.basis-quantity-edit:focus-visible {
+  border-bottom-color: currentColor;
+  outline: none;
+}
+
+.basis-quantity-edit.is-missing {
+  opacity: 0.6;
+}
+
 .basis-quantity-input {
   width: 4.5em;
   min-height: 22px;

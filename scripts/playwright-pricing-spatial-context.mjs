@@ -58,7 +58,7 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   assert(!await sculptureStatus.isVisible() && await page.evaluate(() => state.lineItems.some((row) =>
     row.source_basis_line_id === "u1-unmatched" && Boolean(row.unmatched_pricing_offer) && !row.deferred_pricing)),
     "untouched unmatched row already carries a deferral");
-  assert(await sculpture.locator('button').count() === 3, "unmatched row has an extra action");
+  assert(await sculpture.locator('button:not([data-basis-quantity-edit])').count() === 3, "unmatched row has an extra action");
   await tickAll.click();
   await assertBasisRow(spotlight, "Matched", "include");
   assert(!await sculptureStatus.isVisible(), "Matched block tick acted on the Unmatched block");

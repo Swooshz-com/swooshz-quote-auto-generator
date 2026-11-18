@@ -11927,12 +11927,24 @@ function basisQuantityUnitText(line = {}) {
   return normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
 }
 
-function basisFreeQuantityHtml(section, line, index) {
-  const unit = basisQuantityUnitText(line);
+// Owner (18 Nov 2026): every quantity can be changed in place without Re, but reads as plain text until clicked.
+function basisLineQuantityEditable(line = {}) {
+  return Boolean(line) && !basisLineIsInformationalDimension(line);
+}
+
+function basisQuantityEditButtonHtml(section, line, index, label) {
+  const shown = label || "Add qty";
+  const title = label ? `Quantity ${String(label).replace(/\.+$/, "")}. Click to change.` : "No quantity yet. Click to add one.";
+  return `<button class="basis-quantity-edit${label ? "" : " is-missing"}" type="button" data-basis-quantity-edit="1" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" aria-label="${escapeHtml(title)}" title="${escapeHtml(title)}">${escapeHtml(shown)}</button>`;
+}
+
+function basisQuantityEditorHtml(section, line, index) {
+  const item = basisCatalogueQuantityItem(line);
+  const unit = item ? item.unit : basisQuantityUnitText(line);
   // With no unit yet the box takes "6 sqm", so the phone keyboard must allow letters.
-  const placeholder = unit ? "Qty" : "6 sqm";
   const label = unit ? `Quantity in ${unit}` : "Quantity and unit, for example 6 sqm";
-  return `<input class="basis-quantity-input basis-quantity-required" type="text" required inputmode="${unit ? "decimal" : "text"}" placeholder="${escapeHtml(placeholder)}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-free="1" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${unit ? ` ${escapeHtml(unit)}` : ""}`;
+  const target = item ? `data-basis-quantity-item="${escapeHtml(item.id)}"` : `data-basis-quantity-free="1"`;
+  return `<input class="basis-quantity-input" type="text" inputmode="${unit ? "decimal" : "text"}" value="${escapeHtml(basisQuantityText(line.quantity))}" placeholder="${unit ? "Qty" : "6 sqm"}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" ${target} required aria-label="${escapeHtml(label)}" title="Enter to save, Esc to cancel">${unit ? ` ${escapeHtml(unit)}` : ""}`;
 }
 
 const BASIS_FREE_QUANTITY_UNITS = new Set(["sqm", "m", "m run", "m length", "nos", "lot", "sets"]);
@@ -11953,7 +11965,7 @@ function parseBasisFreeQuantity(value, lineUnit = "") {
 function basisFreeQuantityRefusal(line = {}) {
   const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
   if (state.lineItems.filter((row) => ids.has(row?.source_basis_line_id)).length > 1) {
-    return "This line has more than one output row. Use Re to set its quantity.";
+    return "This line has more than one output row. Use Re to change its quantity.";
   }
   const unit = basisQuantityUnitText(line);
   return unit ? `Enter a quantity above 0 in ${unit}.` : "Enter a quantity above 0 with its unit: sqm, m, nos, lot or sets.";
@@ -11965,18 +11977,20 @@ function applyBasisFreeQuantity(sectionId, lineIndex, value) {
   const section = sections.find((entry) => entry.id === sectionId);
   const lineNumber = Number(lineIndex);
   const currentLine = Number.isInteger(lineNumber) ? section?.lines?.[lineNumber] : null;
-  if (!currentLine || !basisLineNeedsQuantity(currentLine) || basisCatalogueQuantityItem(currentLine)) return false;
+  if (!currentLine || !basisLineQuantityEditable(currentLine) || basisCatalogueQuantityItem(currentLine)) return false;
   const parsed = parseBasisFreeQuantity(value, currentLine.unit);
   if (!parsed) return false;
-  section.lines[lineNumber] = { ...currentLine, quantity: parsed.quantity, unit: parsed.unit };
   const ids = new Set([currentLine.id, currentLine.source_line_item_id].filter(Boolean));
   const linked = state.lineItems.filter((row) => ids.has(row?.source_basis_line_id));
   if (linked.length > 1) return false;
+  section.lines[lineNumber] = { ...currentLine, quantity: parsed.quantity, unit: parsed.unit };
   if (linked.length) {
-    // The quantity changes the row's price basis, so any earlier price grant no longer applies.
-    const { pricing_authority, ...previousRow } = linked[0];
-    const nextRow = normalizeLineItem({ ...previousRow, quantity: parsed.quantity, unit: parsed.unit });
-    state.lineItems = state.lineItems.map((row) => (row === linked[0] ? nextRow : row));
+    // Like a quantity edit in Output: the row keeps its unit and price grant, and only the count changes.
+    const previous = linked[0];
+    const unitChanged = normalizeUnit(previous.unit || "") !== parsed.unit;
+    const { pricing_authority, ...rest } = previous;
+    const nextRow = normalizeLineItem({ ...(unitChanged ? rest : previous), quantity: parsed.quantity, unit: parsed.unit });
+    state.lineItems = state.lineItems.map((row) => (row === previous ? nextRow : row));
   }
   state.quoteBasisSections = sections;
   state.quoteBasis = quoteBasisFromSections(sections);
@@ -11988,10 +12002,6 @@ function applyBasisFreeQuantity(sectionId, lineIndex, value) {
   updateQuoteBasisCard("edited");
   syncControlStates();
   return true;
-}
-
-function basisCatalogueQuantityHtml(section, line, index, item) {
-  return `<input class="basis-quantity-input" type="number" min="0" step="any" inputmode="decimal" placeholder="Qty" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-item="${escapeHtml(item.id)}" aria-label="Quantity in ${escapeHtml(item.unit)} for ${escapeHtml(item.description)}"> ${escapeHtml(item.unit)}`;
 }
 
 function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
@@ -12059,34 +12069,71 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
   return true;
 }
 
-function handleQuoteBasisQuantity(event) {
-  const input = event.target.closest?.("[data-basis-quantity-item], [data-basis-quantity-free]");
-  if (!input) return;
-  if (event.type === "keydown") {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
+function basisQuantityEditTarget(element) {
+  const section = basisSections(state.quoteBasisSections).find((entry) => entry.id === element.dataset.basisSection);
+  const index = Number(element.dataset.basisLineIndex);
+  const line = Number.isInteger(index) ? section?.lines?.[index] : null;
+  return section && line ? { section, index, line } : null;
+}
+
+function openBasisQuantityEditor(button) {
+  const target = basisQuantityEditTarget(button);
+  const holder = button.closest(".basis-quantity-text");
+  if (!target || !holder || appIsBusy() || !basisLineQuantityEditable(target.line)) return;
+  holder.innerHTML = basisQuantityEditorHtml(target.section, target.line, target.index);
+  const input = holder.querySelector("input");
+  input?.focus();
+  input?.select();
+}
+
+function closeBasisQuantityEditor(input) {
+  const target = basisQuantityEditTarget(input);
+  const holder = input.closest(".basis-quantity-text");
+  input.dataset.basisQuantityDone = "1";
+  if (target && holder) {
+    holder.innerHTML = basisQuantityEditButtonHtml(target.section, target.line, target.index, basisQuantityDisplayLabel(target.line));
   }
-  if (input.dataset.basisQuantityFree) {
-    const appliedFree = applyBasisFreeQuantity(input.dataset.basisSection || "", Number(input.dataset.basisLineIndex), input.value);
-    if (!appliedFree && String(input.value).trim() && typeof input.reportValidity === "function") {
-      const freeSection = basisSections(state.quoteBasisSections).find((entry) => entry.id === input.dataset.basisSection);
-      input.setCustomValidity(basisFreeQuantityRefusal(freeSection?.lines?.[Number(input.dataset.basisLineIndex)] || {}));
-      input.reportValidity();
-      input.setCustomValidity("");
-    }
+}
+
+function commitBasisQuantityEditor(input, { report = true } = {}) {
+  if (input.dataset.basisQuantityDone) return;
+  const target = basisQuantityEditTarget(input);
+  const text = String(input.value ?? "").trim();
+  if (!target || text === basisQuantityText(target.line.quantity)) {
+    closeBasisQuantityEditor(input);
     return;
   }
-  const applied = applyBasisCatalogueQuantity(
-    input.dataset.basisSection || "",
-    Number(input.dataset.basisLineIndex),
-    input.dataset.basisQuantityItem || "",
-    input.value,
-  );
-  if (!applied && String(input.value).trim() && typeof input.reportValidity === "function") {
-    input.setCustomValidity("Enter a quantity above 0.");
+  // Mark first: the redraw removes this box, and a focusout from that must not apply the edit twice.
+  input.dataset.basisQuantityDone = "1";
+  const applied = input.dataset.basisQuantityFree
+    ? applyBasisFreeQuantity(input.dataset.basisSection || "", Number(input.dataset.basisLineIndex), text)
+    : applyBasisCatalogueQuantity(input.dataset.basisSection || "", Number(input.dataset.basisLineIndex), input.dataset.basisQuantityItem || "", text);
+  if (applied) return;
+  delete input.dataset.basisQuantityDone;
+  if (report && typeof input.reportValidity === "function") {
+    input.setCustomValidity(input.dataset.basisQuantityFree ? basisFreeQuantityRefusal(target.line) : "Enter a quantity above 0.");
     input.reportValidity();
     input.setCustomValidity("");
   }
+}
+
+function handleQuoteBasisQuantity(event) {
+  const input = event.target.closest?.("[data-basis-quantity-item], [data-basis-quantity-free]");
+  if (!input) return;
+  if (event.type === "focusout") {
+    // Leaving the box saves a changed value; an invalid value is put back rather than kept half-typed.
+    commitBasisQuantityEditor(input, { report: false });
+    if (!input.dataset.basisQuantityDone && input.isConnected) closeBasisQuantityEditor(input);
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeBasisQuantityEditor(input);
+    return;
+  }
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  commitBasisQuantityEditor(input);
 }
 
 function renderBasisLine(section, line, index) {
@@ -12121,12 +12168,12 @@ function renderBasisLine(section, line, index) {
       <span class="basis-line-meta">
         <span class="basis-line-pill"${pillTitleAttribute}>${escapeHtml(pillLabel)}</span>
         <span class="basis-confidence-pill" title="AI confidence">${escapeHtml(confidenceLabel)}</span>
-        <span class="basis-quantity-text">${catalogueQuantityItem ? basisCatalogueQuantityHtml(section, line, index, catalogueQuantityItem) : basisLineNeedsQuantity(line) ? basisFreeQuantityHtml(section, line, index) : escapeHtml(quantityLabel)}</span>
+        <span class="basis-quantity-text">${basisLineQuantityEditable(line) ? basisQuantityEditButtonHtml(section, line, index, quantityLabel) : escapeHtml(quantityLabel)}</span>
       </span>
       <span class="basis-line-text"${lineTitleAttribute}>
         ${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}
         ${deferredPricing ? "<small>Price to be discussed</small>" : ""}
-        ${catalogueQuantityItem ? `<small>Catalogue price ${escapeHtml(formatAmount(catalogueQuantityItem.price))} ${escapeHtml(selectedPricingReferenceCurrency())} per ${escapeHtml(catalogueQuantityItem.unit)}. Enter the quantity to price it.</small>` : ""}
+        ${catalogueQuantityItem ? `<small>Catalogue price ${escapeHtml(formatAmount(catalogueQuantityItem.price))} ${escapeHtml(selectedPricingReferenceCurrency())} per ${escapeHtml(catalogueQuantityItem.unit)}. Add the quantity to price it.</small>` : ""}
       </span>
       <span class="basis-line-actions">
         ${primaryAction}
@@ -18501,6 +18548,11 @@ async function goToNextSidePanel(options = {}) {
 }
 
 function handleQuoteBasisClick(event) {
+  const quantityEdit = event.target.closest("[data-basis-quantity-edit]");
+  if (quantityEdit) {
+    openBasisQuantityEditor(quantityEdit);
+    return;
+  }
   const sectionAction = event.target.closest("[data-basis-section-action]");
   if (sectionAction) {
     retagBasisSectionConfirmLines(
@@ -19076,7 +19128,7 @@ function wireEvents() {
     }
   });
   elements.basisReviewSurface.addEventListener("click", handleQuoteBasisClick);
-  elements.basisReviewSurface.addEventListener("change", handleQuoteBasisQuantity);
+  elements.basisReviewSurface.addEventListener("focusout", handleQuoteBasisQuantity);
   elements.basisReviewSurface.addEventListener("keydown", handleQuoteBasisQuantity);
   elements.pricingMatchesBody.addEventListener("input", handleOutputRowEdit);
   elements.pricingMatchesBody.addEventListener("change", handleOutputRowEdit);

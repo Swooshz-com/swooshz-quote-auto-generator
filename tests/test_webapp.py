@@ -6147,7 +6147,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                             "pricing_keyword": keyword}],
             "project": {"booth_width": 8, "booth_depth": 9},
         }
-        self.assertEqual(webapp.raw_draft_catalog_units(payload, None).get(keyword), "sqm")
+        entry = webapp.raw_draft_catalog_entries(payload, None).get(keyword)
+        self.assertEqual(entry["unit"], "sqm")
+        self.assertRegex(entry["section"], webapp.FLOOR_SECTION_RE)
         draft = webapp.normalize_ai_draft(webapp.complete_predicted_quantities(parsed, payload, None), payload,
                                           require_confidence=True)
         line = draft["quote_basis_sections"][0]["lines"][0]
@@ -31317,10 +31319,10 @@ eval([
             "comparableCatalogueReferenceKey",
             "catalogueItemsByReferenceKey",
             "basisCatalogueQuantityItem",
-            "basisCatalogueQuantityHtml",
             "basisLineNeedsQuantity",
             "basisQuantityUnitText",
-            "basisFreeQuantityHtml",
+            "basisLineQuantityEditable",
+            "basisQuantityEditButtonHtml",
             "renderBasisLine",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
@@ -31539,7 +31541,7 @@ const lineHtml = renderBasisLine(
 );
 assert.ok(lineHtml.includes(">Confirm</span>"));
 assert.ok(lineHtml.includes(">92%</span>"));
-assert.ok(lineHtml.includes(">36 sqm</span>"));
+assert.ok(lineHtml.includes(">36 sqm</button></span>"));
 assert.ok(lineHtml.includes("sqm 100mm raised platform with aluminum edging"));
 assert.ok(lineHtml.includes("basis-confidence-pill"));
 assert.ok(lineHtml.includes("basis-quantity-text"));
@@ -31575,8 +31577,13 @@ state.quoteBasisSections[0].lines[0].quantity = "";
 assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "Enter a quantity for every line before confirming quotation basis.");
 const blankQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
 assert.ok(!blankQuantityHtml.includes("Not measured"), "A blank quantity still shows Not measured");
-assert.ok(blankQuantityHtml.includes('data-basis-quantity-free="1"'), "A blank quantity lost its required input");
-assert.ok(blankQuantityHtml.includes(" required "), "The quantity input is not marked required");
+assert.ok(blankQuantityHtml.includes('data-basis-quantity-edit="1"') && blankQuantityHtml.includes(">Add qty<"), "A blank quantity has no way to add one");
+assert.ok(!blankQuantityHtml.includes("<input"), "The quantity should read as text until clicked");
+// Every measured quantity is also a click-to-edit text control, never a box by default.
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
+const measuredQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
+assert.ok(measuredQuantityHtml.includes('data-basis-quantity-edit="1"') && !measuredQuantityHtml.includes("<input"), "A measured quantity is not editable in place");
+state.quoteBasisSections[0].lines[0].quantity = "";
 state.quoteBasisSections[0].lines[0].tag = "Exclude";
 assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
 state.quoteBasisSections[0].lines[0].tag = "Include";

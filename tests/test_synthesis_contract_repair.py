@@ -161,7 +161,9 @@ class SynthesisContractRepairTest(unittest.TestCase):
 
     def test_quantity_reask_shares_the_single_repair_send_and_settles_every_attempt(self):
         # Owner decision 18 Nov 2026: a physical line without a size gets one re-ask, then the booth-size rule.
-        for second, outcome, rule in ((draft(), "quantity_success", False), ("not json", "quantity_failed", True)):
+        sizes = {"quantities": [{"id": "floor", "quantity": 36, "unit": "sqm"}, {"id": "rail", "quantity": 6, "unit": "m"},
+                                {"id": "chair", "quantity": 4, "unit": "nos"}]}
+        for second, outcome, rule in ((sizes, "quantity_success", False), ("not json", "quantity_failed", True)):
             with self.subTest(outcome=outcome):
                 self.logs.clear()
                 transport = SynthesisTransport([draft(measured=False), second])
@@ -169,8 +171,12 @@ class SynthesisContractRepairTest(unittest.TestCase):
                 self.assert_sends(transport, 12, 2)
                 self.assertEqual(self.usage()["synthesis_repair_count"], 1)
                 self.assertEqual(self.usage()["synthesis_repair_outcome"], outcome)
-                note = transport.calls[-1]["input"][0]["content"][0]["text"]
-                self.assertIn("Quantity repair. These physical lines have no usable quantity: floor, rail, chair.", note)
+                reask = transport.calls[-1]["input"][0]["content"]
+                self.assertEqual([part["type"] for part in reask], ["input_text"])
+                self.assertTrue(reask[0]["text"].startswith("Quantity prediction for an exhibition booth quote."))
+                self.assertNotIn("text", transport.calls[-1])
+                context = json.loads(reask[0]["text"].split("Context JSON: ", 1)[1])
+                self.assertEqual([line["id"] for line in context["lines"]], ["floor", "rail", "chair"])
                 lines = [line for section in result["quote_basis_sections"] for line in section["lines"]]
                 self.assertTrue(all(line.get("quantity") not in (None, "") for line in lines if line["id"] != "concept"))
                 self.assertEqual(any(finding["id"] == "booth-size-rule" for finding in result["analysis_findings"]), rule)
