@@ -29,7 +29,7 @@ SECRET_LIKE_RE = re.compile(
 )
 LIST_FIELDS = (
     "per_app",
-    "secrets",
+    "never_in_git",
     "optional",
     "must_be_unset",
     "must_be_unset_prefixes",
@@ -65,7 +65,7 @@ def load_settings(path: Path) -> dict[str, Any]:
 
 def settings_names(data: dict[str, Any]) -> set[str]:
     shared = data.get("shared") if isinstance(data.get("shared"), dict) else {}
-    return set(shared) | set(data.get("per_app") or []) | set(data.get("secrets") or [])
+    return set(shared) | set(data.get("per_app") or []) | set(data.get("never_in_git") or [])
 
 
 def validate_settings(data: dict[str, Any], template: dict[str, str]) -> list[str]:
@@ -84,7 +84,7 @@ def validate_settings(data: dict[str, Any], template: dict[str, str]) -> list[st
         elif len(set(value)) != len(value):
             errors.append(f"{field} has duplicate entries")
 
-    groups = {"shared": set(shared), "per_app": set(data["per_app"]), "secrets": set(data["secrets"])}
+    groups = {"shared": set(shared), "per_app": set(data["per_app"]), "never_in_git": set(data["never_in_git"])}
     every_name = set().union(*groups.values()) | set(data["must_be_unset"]) | set(data["platform_names"])
     for name in sorted(every_name):
         if not NAME_RE.match(name):
@@ -101,7 +101,7 @@ def validate_settings(data: dict[str, Any], template: dict[str, str]) -> list[st
 
     union = settings_names(data)
     for name in sorted(set(data["optional"]) - union):
-        errors.append(f"optional name {name} is not in shared, per_app or secrets")
+        errors.append(f"optional name {name} is not in shared, per_app or never_in_git")
     for name in sorted(union & set(data["must_be_unset"])):
         errors.append(f"{name} is both a release setting and must_be_unset")
     for name in sorted(set(template) - union):

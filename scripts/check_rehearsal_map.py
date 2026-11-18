@@ -279,8 +279,8 @@ def check_env_sources(data: dict[str, Any], settings: dict[str, Any], app_env: d
             errors.append(f"credential store name for {name} is not a kept resource in the map")
 
     shared = set((settings.get("shared") or {}).keys())
-    secrets = set(settings.get("secrets") or [])
-    every = shared | set(settings.get("per_app") or []) | secrets
+    host_only = set(settings.get("never_in_git") or [])
+    every = shared | set(settings.get("per_app") or []) | host_only
     optional = set(settings.get("optional") or [])
 
     for name in sorted(every - set(source_of)):
@@ -290,7 +290,7 @@ def check_env_sources(data: dict[str, Any], settings: dict[str, Any], app_env: d
     for name in sorted(shared):
         if source_of.get(name) not in {"settings", "not_used"}:
             errors.append(f"shared setting {name} must come from the settings file")
-    for name in sorted(secrets):
+    for name in sorted(host_only):
         kind = source_of.get(name)
         if kind in {"compose", "settings", "run_value"}:
             errors.append(f"secret {name} must not have source {kind}")

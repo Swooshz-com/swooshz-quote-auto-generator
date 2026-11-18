@@ -1,6 +1,6 @@
 {
   "schema": "sqag-release-settings/v1",
-  "purpose": "Deployment record of the non-secret settings the internal release runs with, and every secret by name only. The app never reads this file. Operators copy the shared values into each app's host environment (an env change that keeps its own approval), and scripts/check_release_settings.py compares an app's env names with it.",
+  "purpose": "Deployment record of the non-secret settings the internal release runs with, and every name whose value never goes in git (never_in_git), by name only. The app never reads this file. Operators copy the shared values into each app's host environment (an env change that keeps its own approval), and scripts/check_release_settings.py compares an app's env names with it.",
   "template": "deploy/internal-uat/coolify/sqag.uat.env.example",
   "pending_note": "A null shared value is not recorded yet. Fill it from the owner-approved record of the live value, never from an agent reading live. A release run uses --require-complete, which fails while any value is null.",
   "shared": {
@@ -50,7 +50,7 @@
     "QUOTE_LOG_ROOT",
     "PORT"
   ],
-  "secrets": [
+  "never_in_git": [
     "SESSION_SECRET",
     "SQAG_TRACKING_HMAC_KEY",
     "SQAG_DATABASE_URL",
