@@ -37,7 +37,9 @@ def draft(measured=True):
 
 class EvidenceTransport:
     """A deterministic channel probe, not a simulation of model compliance."""
-    def __init__(self, retain=True, repair_measures=False, single_measured=True, repair_answer=None, repair_failure=""):
+    def __init__(self, retain=True, repair_measures=False, single_measured=True, repair_answer=None, repair_failure="",
+                 estimated=None):
+        self.estimated = estimated or {}
         self.repair_failure = repair_failure
         self.retain = retain
         self.repair_measures = repair_measures
@@ -75,6 +77,13 @@ class EvidenceTransport:
         else:
             observations = json.loads(text[text.index('[{"source":'):])
             result = draft(any(MEASURED_NOTE in row["observation"] for row in observations))
+        if isinstance(result, dict) and "quote_basis_sections" in result:
+            for line in result["quote_basis_sections"][0]["lines"]:
+                flag = self.estimated.get(line["id"])
+                if flag == "forged":
+                    line["quantity_estimate"] = {"quantity": 4, "unit": "nos"}
+                elif flag is not None:
+                    line["quantity_estimated"] = flag
         return responses_envelope(body["model"], result if isinstance(result, str) else json.dumps(result))
 
 
@@ -186,6 +195,20 @@ class BasisQuantityRetentionTest(unittest.TestCase):
             context = json.loads(text.split("Context JSON: ", 1)[1])
             self.assertEqual([line["id"] for line in context["lines"]], ["floor", "rail", "chair"])
             self.assertEqual(context["booth"]["booth_area_sqm"], 36)
+
+    def test_the_ai_flags_its_own_predicted_sizes_for_the_est_tag(self):
+        # Owner card 17:39Z (18 Nov): sizes the AI predicts in its first answer get "Est." too. The AI says which
+        # with quantity_estimated; only the server sets the mark, so a mark the AI writes itself is dropped.
+        flags = {"floor": True, "rail": False, "chair": "forged", "concept": True}
+        for pages in (12, 13):
+            with self.subTest(pages=pages):
+                result, calls = self.analyse(pages, estimated=flags)
+                lines = {line["id"]: line for section in result["quote_basis_sections"] for line in section["lines"]}
+                self.assertEqual(lines["floor"]["quantity_estimate"], {"quantity": 36, "unit": "sqm"})
+                for identity in ("rail", "chair", "concept"):
+                    self.assertNotIn("quantity_estimate", lines[identity])
+                self.assertFalse(any("quantity_estimated" in line for line in lines.values()))
+                self.assertIn(server.QUANTITY_ESTIMATED_RULE, calls[-1]["input"][0]["content"][0]["text"])
 
     def test_the_reask_can_only_size_the_listed_lines(self):
         # G2 (#392): the re-ask answer must not replace the first answer. Extra ids, a second entry for the same

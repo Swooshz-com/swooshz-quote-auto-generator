@@ -112,6 +112,7 @@ class Field:
         valid = {"object": lambda: isinstance(value, dict),
                  "array": lambda: isinstance(value, list),
                  "string": lambda: isinstance(value, str),
+                 "boolean": lambda: type(value) is bool,
                  "integer": lambda: type(value) is int or (
                      self.decimal_wire and isinstance(value, Decimal) and value.is_finite()
                      and value.adjusted() < integer_digit_limit()
@@ -230,6 +231,9 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
             confidence_pct=Field("integer", instruction="integer from 0 to 100",
                                  missing_reason="confidence_missing", minimum=0, maximum=100),
             quantity=Field("number", nullable=True, positive=True), unit=Field("string", nullable=True, nonblank=True),
+            # Owner (18 Nov 2026): the Quote Basis shows "Est." on a quantity the AI predicted rather than read.
+            quantity_estimated=Field("boolean", nullable=True,
+                                     instruction="true when quantity was predicted rather than stated or counted"),
             pricing_keyword=Field("string", nullable=True),
         )),
     )),

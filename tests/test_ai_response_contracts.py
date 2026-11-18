@@ -30,6 +30,7 @@ def canonical_draft():
             line.setdefault('quantity', None)
             line.setdefault('unit', None)
             line['pricing_keyword'] = None
+            line.setdefault('quantity_estimated', None)
     for item in value['line_items']:
         item.update(price_mode=None, display_price=None)
     return value
@@ -47,7 +48,8 @@ class ContractDefinitionTest(unittest.TestCase):
         root = fmt['schema']
         self.assertEqual(set(root['required']), {'project', 'quote_basis_sections', 'line_items', 'analysis_findings'})
         line = root['properties']['quote_basis_sections']['items']['properties']['lines']['items']
-        self.assertEqual(set(line['required']), {'id', 'tag', 'text', 'confidence_pct', 'quantity', 'unit', 'pricing_keyword'})
+        self.assertEqual(set(line['required']), {'id', 'tag', 'text', 'confidence_pct', 'quantity', 'unit', 'quantity_estimated', 'pricing_keyword'})
+        self.assertEqual(line['properties']['quantity_estimated']['type'], ['boolean', 'null'])
         self.assertEqual(line['properties']['confidence_pct']['type'], 'integer')
         self.assertEqual(line['properties']['quantity']['type'], ['number', 'null'])
         self.assertEqual(set(line['properties']['tag']['enum']), {'Include', 'Confirm', 'Custom', 'Exclude'})
@@ -78,6 +80,9 @@ class ContractDefinitionTest(unittest.TestCase):
         value = canonical_draft()
         admitted = contracts.DRAFT_SYNTHESIS.parse(json.dumps(value))
         note = admitted['quote_basis_sections'][0]['lines'][-1]
+        self.assertNotIn('quantity_estimated', note)
+        flagged = canonical_draft(); flagged['quote_basis_sections'][0]['lines'][0]['quantity_estimated'] = True
+        self.assertIs(contracts.DRAFT_SYNTHESIS.parse(json.dumps(flagged))['quote_basis_sections'][0]['lines'][0]['quantity_estimated'], True)
         self.assertNotIn('quantity', note)
         self.assertNotIn('unit', note)
         self.assertNotIn('price_mode', admitted['line_items'][0])
@@ -89,6 +94,9 @@ class ContractDefinitionTest(unittest.TestCase):
                 lambda v: v['quote_basis_sections'][0]['lines'][0].update(confidence=90),
                 lambda v: v['quote_basis_sections'][0]['lines'][0].update(confidence_pct=True),
                 lambda v: v['quote_basis_sections'][0]['lines'][0].update(confidence_pct=101),
+                lambda v: v['quote_basis_sections'][0]['lines'][0].update(quantity_estimated='yes'),
+                lambda v: v['quote_basis_sections'][0]['lines'][0].update(quantity_estimated=1),
+                lambda v: v['quote_basis_sections'][0]['lines'][0].update(quantity_estimate={'quantity': 1, 'unit': 'lot'}),
                 lambda v: v['line_items'][0].update(quantity='3'),
                 lambda v: v['line_items'][0].update(quantity=10**1000),
                 lambda v: v['line_items'][0].update(unit_price_override=2),

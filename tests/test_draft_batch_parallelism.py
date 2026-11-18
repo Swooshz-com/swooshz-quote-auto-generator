@@ -389,7 +389,7 @@ class DraftBatchParallelismTest(unittest.TestCase):
                 "Keep counts, areas and lengths attached to their object when merging repeated views; do not add counts for repeated views. "
                 "When measurements conflict, use the most likely value, lower confidence_pct and flag the conflict in analysis_findings. "
                 "Leave quantity and unit absent only for purely informational lines. "
-                + server.PREDICTED_QUANTITY_RULE +
+                + server.PREDICTED_QUANTITY_RULE + server.QUANTITY_ESTIMATED_RULE +
                 "Emit a linked line_items row for every physical line. Do not emit line_items for informational lines. "
                 "Area or length quantities derived from stated booth or object dimensions remain supported, "
                 "including floor area from booth size. Do not replace a missing measurement with 1 lot, "

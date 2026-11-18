@@ -6499,6 +6499,12 @@ PREDICTED_QUANTITY_RULE = (
     "Never leave a physical line without a quantity and never mark it as unmeasured. "
     "Use a lower confidence_pct for a predicted quantity and say how it was predicted in analysis_findings. "
 )
+# Owner (18 Nov 2026): the Quote Basis shows "Est." beside a quantity the AI predicted, so the AI says which ones.
+QUANTITY_ESTIMATED_RULE = (
+    "Set quantity_estimated to true on each physical quote_basis_sections line whose quantity you predicted "
+    "(from the booth size, drawing scale or grid, or typical sizes) rather than read from a stated dimension, "
+    "quantity or visible count, and to false when the evidence gives it. "
+)
 LINEAR_TAKEOFF_UNITS = {"m", "m length", "m run"}
 PIECE_DIMENSION_DESCRIPTION_RE = re.compile(
     r"(?i)^(?:nos\.?\s+of\s+1m\s+length\s+x|m\.?\s*length\s*x)\b"
@@ -21611,7 +21617,7 @@ def build_quote_draft_prompt(
         "Use the pricing_catalog choices in Quote context JSON. When a catalog item applies, set "
         "pricing_keyword exactly to that catalog id from pricing_catalog, not an invented keyword. "
         "Do not include pricing amounts or internal costs. If no catalog item fits and the item should be customer-visible, keep pricing_keyword empty and let the Custom basis line flag it for manual pricing. "
-        + PREDICTED_QUANTITY_RULE +
+        + PREDICTED_QUANTITY_RULE + QUANTITY_ESTIMATED_RULE +
         f"Quote context JSON: {json.dumps(brief_context, ensure_ascii=True)}"
     )
 
@@ -26446,8 +26452,28 @@ def record_pending_draft_attempt(*, failed_details: dict[str, Any] | None = None
     )
 
 
+def mark_ai_estimated_quantities(parsed: dict[str, Any]) -> None:
+    """Turn the AI's quantity_estimated flag into the server's Est. mark; the AI cannot set the mark itself."""
+    linked = raw_draft_line_items_by_basis_line(parsed)
+    for section in parsed.get("quote_basis_sections") if isinstance(parsed.get("quote_basis_sections"), list) else []:
+        for line in section.get("lines") if isinstance(section, dict) and isinstance(section.get("lines"), list) else []:
+            if isinstance(line, dict):
+                line.pop("quantity_estimate", None)
+    for _section, line in raw_draft_physical_lines(parsed):
+        if line.pop("quantity_estimated", None) is not True:
+            continue
+        sizes = [(line.get("quantity"), line.get("unit")),
+                 *((item.get("quantity"), item.get("unit")) for item in linked.get(clean_text(line.get("id")), []))]
+        for quantity, unit in sizes:
+            number = parse_float_or_none(quantity) if not isinstance(quantity, bool) else None
+            if number is not None and number > 0 and clean_text(unit):
+                line["quantity_estimate"] = {"quantity": quantity, "unit": unit}
+                break
+
+
 def complete_predicted_quantities(parsed, payload, auth_session, quantity_repair=None, *, precheck=None):
     """Sizing guarantee: one AI re-ask for the missing sizes only, then the booth-size rule."""
+    mark_ai_estimated_quantities(parsed)
     catalog = raw_draft_catalog_entries(payload, auth_session)
     missing = raw_draft_lines_missing_quantity(parsed, catalog)
     outcome = {"missing_lines": len(missing), "ai_repair": "not_needed" if not missing else "not_attempted"}
@@ -26596,7 +26622,7 @@ class OpenAIDraftRequest:
             "When measurements conflict, use the most likely value, lower confidence_pct and flag the conflict in analysis_findings. "
             + ("Use null quantity and unit only for purely informational lines. " if configuration.response_contract else
              "Leave quantity and unit absent only for purely informational lines. ") +
-            PREDICTED_QUANTITY_RULE +
+            PREDICTED_QUANTITY_RULE + QUANTITY_ESTIMATED_RULE +
             "Emit a linked line_items row for every physical line. Do not emit line_items for informational lines. "
             "Area or length quantities derived from stated booth or object dimensions remain supported, "
             "including floor area from booth size. Do not replace a missing measurement with 1 lot, "
