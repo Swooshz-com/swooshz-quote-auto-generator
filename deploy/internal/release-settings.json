@@ -83,7 +83,9 @@
     "AUTH_ALLOWED_"
   ],
   "platform_names": [
-    "HOSTNAME"
+    "HOST",
+    "HOSTNAME",
+    "SOURCE_COMMIT"
   ],
   "platform_prefixes": [
     "COOLIFY_",
