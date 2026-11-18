@@ -6162,6 +6162,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertEqual((float(row["quantity"]), row["unit"], row["pricing_keyword"]), (72, "sqm", keyword))
         self.assertLessEqual(line["confidence"], webapp.PREDICTED_QUANTITY_RULE_CONFIDENCE)
         self.assertEqual(draft["analysis_findings"][0]["id"], "booth-size-rule")
+        # Owner 17:18Z: the predicted size reaches the Quote Basis marked as an estimate ("Est.").
+        self.assertEqual(line["quantity_estimate"], {"quantity": 72, "unit": "sqm"})
 
     def test_normalize_ai_draft_appends_missing_catalog_backed_basis_lines(self):
         parsed = {
@@ -25850,6 +25852,7 @@ eval([
   "normalizeConfidence",
   "normalizePossiblePricingMatches",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "parseBasisLine",
   "pythonWhitespaceText",
@@ -31277,6 +31280,7 @@ eval([
   "normalizeConfidence",
   "normalizePossiblePricingMatches",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "parseBasisLine",
   "pythonWhitespaceText",
@@ -31335,6 +31339,7 @@ eval([
             "basisPredictedQuantityLabel",
             "basisQuantityUnitText",
             "basisLineQuantityEditable",
+            "basisQuantityIsEstimate",
             "basisQuantityEditButtonHtml",
             "renderBasisLine",
             "renderQuoteBasisMessage",
@@ -31600,6 +31605,19 @@ assert.ok(!blankQuantityHtml.includes("<input"), "The quantity should read as te
 state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
 const measuredQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
 assert.ok(measuredQuantityHtml.includes('data-basis-quantity-edit="1"') && !measuredQuantityHtml.includes("<input"), "A measured quantity is not editable in place");
+assert.ok(!measuredQuantityHtml.includes("Est."), "A measured quantity is tagged as an estimate");
+// Owner 17:18Z: a size the server predicted shows a small "Est." while the line still holds that size.
+state.quoteBasisSections[0].lines[0].quantity_estimate = { quantity: savedQuantity, unit: "sqm" };
+const estimatedQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
+assert.ok(estimatedQuantityHtml.includes('data-basis-quantity-est="1"') && estimatedQuantityHtml.includes(">Est.</span>"), "A predicted size has no Est. tag");
+assert.ok(estimatedQuantityHtml.includes('aria-label="Estimated quantity '), "The Est. tag is not announced");
+assert.deepStrictEqual(normalizeBasisLines(state.quoteBasisSections[0].lines[0])[0].quantity_estimate, { quantity: savedQuantity, unit: "sqm" });
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity + 1;
+assert.ok(!renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0).includes("Est."), "A changed size still shows Est.");
+state.quoteBasisSections[0].lines[0].quantity = "";
+assert.ok(!renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0).includes("Est."), "A blank line shows Est.");
+delete state.quoteBasisSections[0].lines[0].quantity_estimate;
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
 state.quoteBasisSections[0].lines[0].quantity = "";
 state.quoteBasisSections[0].lines[0].tag = "Exclude";
 assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
@@ -32062,6 +32080,7 @@ eval([
   "numberOrNull",
   "orderNumber",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "normalizeQuoteBasisTitle",
   "pythonWhitespaceText",
@@ -32270,6 +32289,7 @@ eval([
   "numberOrNull",
   "orderNumber",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "parseBasisLine",
   "normalizeQuoteBasisTitle",
@@ -32433,6 +32453,7 @@ eval([
   "numberOrNull",
   "orderNumber",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "pythonWhitespaceText",
   "normalizeQuoteBasisSections",

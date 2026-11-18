@@ -20,7 +20,7 @@ replaceOnce('import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthe
   `import { SyntheticBrowserBoundary, freshBrowserRun } from ${local('synthetic-browser-boundary.mjs')};`);
 // One section (Lighting and Electrical) lands in all three pricing groups, plus blank-quantity catalogue picks.
 replaceOnce('const cases = [', `const cases = [
-  { id: "g-matched", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light" },
+  { id: "g-matched", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light", estimate: { quantity: 3, unit: "nos" } },
   { id: "g-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },
   { id: "g-review", kind: "review", section: "Lighting and Electrical", text: "Bespoke neon signage with custom lettering", quantity: 1, unit: "lot", rawUnit: "" },
   { id: "q-blank-graphic", kind: "blank", section: "Graphics and Printing", text: "[ sqm Printed Wall Graphic ] - Printed graphic on rear feature wall, size pending approval", quantity: null, unit: "" },
@@ -30,6 +30,8 @@ replaceOnce('const cases = [', `const cases = [
 // The AI names a catalogue item but measures nothing, so it emits no line item for those lines.
 replaceOnce('const scenarioPath = path.join(runRoot, "scenario.json");', `lineItems.splice(0, lineItems.length, ...lineItems.filter((item) => !String(item.source_basis_line_id || "").startsWith("q-blank")));
 const scenarioPath = path.join(runRoot, "scenario.json");`);
+// A size the server predicted carries quantity_estimate, which the Quote Basis shows as "Est." (owner 17:18Z, 18 Nov).
+replaceOnce('confidence_pct: 82 };', 'confidence_pct: 82, ...(entry.estimate ? { quantity_estimate: entry.estimate } : {}) };');
 replaceOnce('line_items: lineItems } }', 'line_items: lineItems, project: { booth_width: 9, booth_depth: 10.5 } } }');
 replaceOnce('try {\n  server = startServer();', 'carrier: try {\n  server = startServer();');
 replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = draftLines.length;
@@ -164,6 +166,12 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     assert(await surface.locator("input.basis-quantity-input").count() === 0, "a quantity box is open before any click");
     const measuredButton = (await rowFor("g-matched")).locator("[data-basis-quantity-edit]");
     assert(await measuredButton.count() === 1 && (await measuredButton.innerText()).trim().startsWith("3 nos"), "measured quantity is not shown as plain clickable text", await measuredButton.innerText());
+    // The predicted size shows "Est." beside it; sizes with no estimate show none.
+    assert(await (await rowFor("g-matched")).locator("[data-basis-quantity-est]").innerText() === "Est.", "a predicted size has no Est. tag");
+    assert(await surface.locator("[data-basis-quantity-est]").count() === 1, "Est. shows on sizes nobody predicted");
+    if (process.env.SQAG_BASIS_SCREENSHOT_DIR) {
+      await (await rowFor("g-matched")).locator("xpath=ancestor::*[contains(@class,'basis-review-item')][1]").screenshot({ path: process.env.SQAG_BASIS_SCREENSHOT_DIR + "/est-tag.png" });
+    }
     const blankRow = await rowFor("q-blank-graphic");
     const unknownRow = await rowFor("q-blank-unknown");
     // Owner (18 Nov 2026): no "Add qty". A blank line (only quotes saved before the server sizing guarantee)
@@ -251,6 +259,7 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     await matchedInput.fill("5");
     await matchedInput.press("Enter");
     assert(Number((await lineById("g-matched")).quantity) === 5, "measured quantity edit was not kept");
+    assert(await (await rowFor("g-matched")).locator("[data-basis-quantity-est]").count() === 0, "a typed size still shows Est.");
     quantityInput = await openQuantity("q-blank-graphic");
     await quantityInput.fill("0");
     await quantityInput.press("Enter");

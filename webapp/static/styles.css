@@ -5365,6 +5365,18 @@ select:focus {
   outline: none;
 }
 
+/* A size the server predicted, until someone changes it (owner, 18 Nov 2026). */
+.basis-quantity-est {
+  margin-left: 2px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #eef2f7;
+  color: #5b6b80;
+  font-size: 0.78em;
+  font-weight: 700;
+  vertical-align: 1px;
+}
+
 .basis-quantity-input {
   width: 4.5em;
   min-height: 22px;

@@ -5661,6 +5661,17 @@ def split_basis_decision_text(text: Any, default_tag: Any = "Confirm") -> list[d
     return lines
 
 
+def normalized_quantity_estimate(value: Any) -> dict[str, Any] | None:
+    """The size the server predicted for a line ({quantity, unit}); the UI tags it "Est." while it still applies."""
+    if not isinstance(value, dict) or isinstance(value.get("quantity"), bool):
+        return None
+    quantity = parse_float_or_none(value.get("quantity"))
+    unit = clean_text(value.get("unit"))
+    if quantity is None or not 0 < quantity <= 100000 or not unit:
+        return None
+    return {"quantity": int(quantity) if quantity.is_integer() else quantity, "unit": unit[:40]}
+
+
 def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         value = canonicalize_primary_order_fields(value)
@@ -5692,6 +5703,9 @@ def normalize_basis_lines(value: Any) -> list[dict[str, Any]]:
             source_line_item_id = safe_resource_id(value.get("source_line_item_id"), "")
             if source_line_item_id:
                 line["source_line_item_id"] = source_line_item_id
+            estimate = normalized_quantity_estimate(value.get("quantity_estimate"))
+            if estimate and "quantity" in line:
+                line["quantity_estimate"] = estimate
             pricing_keyword = clean_text(value.get("pricing_keyword"))
             if pricing_keyword:
                 line["pricing_keyword"] = pricing_keyword
@@ -26313,6 +26327,9 @@ def set_raw_draft_line_quantity(parsed, section, line, quantity, unit, catalog, 
     for target in (line, *linked):
         target["quantity"] = quantity
         target["unit"] = unit
+    # Owner (18 Nov 2026): the Quote Basis shows "Est." beside a size the server predicted, while the line
+    # still holds that size; a typed or Re change to the quantity drops the tag on its own.
+    line["quantity_estimate"] = {"quantity": quantity, "unit": unit}
     keys = [key for key in ("confidence_pct", "confidence") if key in line] or ["confidence_pct"]
     for key in keys:
         current = normalize_confidence_percent(line.get(key))

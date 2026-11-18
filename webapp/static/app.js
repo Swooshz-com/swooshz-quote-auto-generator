@@ -7251,6 +7251,23 @@ function splitBasisDecisionText(text = "", defaultTag = "Confirm") {
   return lines;
 }
 
+// The size the server predicted for a line (owner, 18 Nov 2026): shown as "Est." while the line still holds it.
+function normalizedQuantityEstimate(value) {
+  if (!value || typeof value !== "object" || typeof value.quantity === "boolean") return null;
+  const quantity = Number(value.quantity);
+  const unit = String(value.unit ?? "").trim();
+  if (!(Number.isFinite(quantity) && quantity > 0 && quantity <= 100000) || !unit) return null;
+  return { quantity, unit: unit.slice(0, 40) };
+}
+
+function basisQuantityIsEstimate(line = {}) {
+  const estimate = normalizedQuantityEstimate(line.quantity_estimate);
+  const quantity = Number(line.quantity);
+  return Boolean(estimate) && basisQuantityText(line.quantity) !== "" && Number.isFinite(quantity)
+    && Math.abs(quantity - estimate.quantity) < 0.0005
+    && normalizeUnit(line.unit || "") === normalizeUnit(estimate.unit);
+}
+
 function normalizeBasisLines(line = "") {
   if (line && typeof line === "object" && !Array.isArray(line) && typeof canonicalizePrimaryOrderFields === "function") line = canonicalizePrimaryOrderFields(line);
   if (line && typeof line === "object") {
@@ -7275,6 +7292,8 @@ function normalizeBasisLines(line = "") {
       if (orderNumber(line.item_order) !== null) next.item_order = orderNumber(line.item_order);
       if (quantityParts.quantity !== undefined && quantityParts.quantity !== null && String(quantityParts.quantity).trim() !== "") next.quantity = quantityParts.quantity;
       if (quantityParts.unit) next.unit = quantityParts.unit;
+      const estimate = normalizedQuantityEstimate(line.quantity_estimate);
+      if (estimate && next.quantity !== undefined) next.quantity_estimate = estimate;
       if (confidence !== null) next.confidence = confidence;
       if (hasCustomPricing || normalizeBasisTag(parsed.tag) === "Custom") next.custom_pricing = true;
       if (line.custom_confirmed) next.custom_confirmed = true;
@@ -11984,8 +12003,10 @@ function basisLineQuantityEditable(line = {}) {
 
 function basisQuantityEditButtonHtml(section, line, index, label) {
   const shown = label || basisPredictedQuantityLabel(line) || "1 lot";
-  const title = `Quantity ${String(shown).replace(/\.+$/, "")}. Click to change.`;
-  return `<button class="basis-quantity-edit" type="button" data-basis-quantity-edit="1" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" aria-label="${escapeHtml(title)}" title="${escapeHtml(title)}">${escapeHtml(shown)}</button>`;
+  const estimated = Boolean(label) && basisQuantityIsEstimate(line);
+  const title = `${estimated ? "Estimated quantity" : "Quantity"} ${String(shown).replace(/\.+$/, "")}. Click to change.`;
+  const tag = estimated ? ` <span class="basis-quantity-est" data-basis-quantity-est="1" title="Estimated size. Check it.">Est.</span>` : "";
+  return `<button class="basis-quantity-edit" type="button" data-basis-quantity-edit="1" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" aria-label="${escapeHtml(title)}" title="${escapeHtml(title)}">${escapeHtml(shown)}</button>${tag}`;
 }
 
 function basisQuantityEditorHtml(section, line, index) {
@@ -12036,7 +12057,9 @@ function applyBasisFreeQuantity(sectionId, lineIndex, value) {
   const ids = new Set([currentLine.id, currentLine.source_line_item_id].filter(Boolean));
   const linked = state.lineItems.filter((row) => ids.has(row?.source_basis_line_id));
   if (linked.length > 1) return false;
-  section.lines[lineNumber] = { ...currentLine, quantity: parsed.quantity, unit: parsed.unit };
+  // A typed size is the user's own, so it is no longer an estimate.
+  const { quantity_estimate, ...typedLine } = currentLine;
+  section.lines[lineNumber] = { ...typedLine, quantity: parsed.quantity, unit: parsed.unit };
   if (linked.length) {
     // Like a quantity edit in Output: the row keeps its unit and price grant, and only the count changes.
     const previous = linked[0];
@@ -12086,6 +12109,7 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
   delete nextLine.pricing_status;
   delete nextLine.possible_pricing_matches;
   delete nextLine.possible_catalog_matches;
+  delete nextLine.quantity_estimate;
   section.lines[lineNumber] = nextLine;
   // The AI emitted no physical row for an unmeasured line. Add the unpriced row the selection
   // needs; it carries no price authority until the server admits the selection on Confirm.

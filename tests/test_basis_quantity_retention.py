@@ -119,6 +119,8 @@ class BasisQuantityRetentionTest(unittest.TestCase):
                 for identity, _, quantity, unit in MEASUREMENTS:
                     self.assertEqual(float(lines[identity]["quantity"]), quantity)
                     self.assertEqual(lines[identity]["unit"], unit)
+                    # Measured sizes are not estimates, so the Quote Basis shows no "Est." for them.
+                    self.assertNotIn("quantity_estimate", lines[identity])
                 self.assertNotIn("quantity", lines["concept"])
                 self.assertNotIn("unit", lines["concept"])
                 self.assertEqual(len(result["line_items"]), 3)
@@ -141,7 +143,10 @@ class BasisQuantityRetentionTest(unittest.TestCase):
                 for identity in ("floor", "rail", "chair"):
                     self.assertEqual((float(lines[identity]["quantity"]), lines[identity]["unit"]), (1, "lot"))
                     self.assertLessEqual(lines[identity]["confidence"], server.PREDICTED_QUANTITY_RULE_CONFIDENCE)
+                    # Owner 17:18Z: a rule size survives normalisation marked as an estimate ("Est." in the UI).
+                    self.assertEqual(lines[identity]["quantity_estimate"], {"quantity": 1, "unit": "lot"})
                 self.assertNotIn("quantity", lines["concept"])
+                self.assertNotIn("quantity_estimate", lines["concept"])
                 self.assertEqual(sorted(row["source_basis_line_id"] for row in batched["line_items"]), ["chair", "floor", "rail"])
                 self.assertEqual(batched["analysis_findings"][0]["id"], "booth-size-rule")
                 self.assertIn("Floor panel = 1 lot", batched["analysis_findings"][0]["text"])
@@ -167,6 +172,8 @@ class BasisQuantityRetentionTest(unittest.TestCase):
             for identity, _, quantity, unit in MEASUREMENTS:
                 self.assertEqual((float(lines[identity]["quantity"]), lines[identity]["unit"]), (quantity, unit))
                 self.assertLessEqual(lines[identity]["confidence"], server.PREDICTED_QUANTITY_AI_CONFIDENCE)
+                estimate = lines[identity]["quantity_estimate"]
+                self.assertEqual((float(estimate["quantity"]), estimate["unit"]), (quantity, unit))
             self.assertFalse(any(finding["id"] == "booth-size-rule" for finding in result["analysis_findings"]))
             self.assertEqual(result["analysis_findings"][0]["id"], "predicted-sizes")
             self.assertEqual(len(result["line_items"]), 3)
