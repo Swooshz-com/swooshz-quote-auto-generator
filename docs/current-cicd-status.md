@@ -295,6 +295,12 @@ or deployment behaviour changes accompany this test.
   ceiling and zero retries; no CI job, trigger or required check changes.
 
 - CI still performs no deployment.
+- The internal redeployment flow is a manual, rehearsed operator procedure
+  (`docs/internal-uat-coolify-deploy.md`). Its offline checkers
+  (`scripts/check_release_settings.py`, `scripts/check_rehearsal_map.py`), the
+  bucket clear script and the build script's dry run and fake-docker build are
+  covered by the existing `python -m unittest discover -s tests` step. No CI
+  job, trigger, secret or required check changes.
 - All six maintained inference operations require `OPENROUTER_API_KEY` and
   explicit `OPENROUTER_<SUFFIX>_MODEL`,
   `OPENROUTER_<SUFFIX>_REASONING_EFFORT` and

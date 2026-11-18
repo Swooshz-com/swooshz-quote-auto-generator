@@ -1,0 +1,92 @@
+# SQAG redeploy rehearsal: created, tested and deleted on every release run.
+# Map of every resource, secret source and delete step: deploy/rehearsal/resources.json
+# Run order: docs/internal-uat-coolify-deploy.md, "Internal redeployment flow".
+# Check offline with: python scripts/check_rehearsal_map.py
+#
+# Same app shape as the live internal compose file: a pinned local image that
+# is never pulled. Storage is the rehearsal-only Cloudflare R2 bucket named in
+# the map, reached over HTTPS with a token scoped to that bucket; each run
+# clears it. No third-party image, no host ports, no host paths, no env file,
+# and nothing here refers to live.
+#
+# Every ${NAME} is set in the rehearsal service's environment for one run only.
+# REHEARSAL_IMAGE_ID is the local image id (sha256:...) under test; changing
+# it and redeploying is how the run upgrades and rolls back.
+services:
+  quote-rehearsal:
+    image: "${REHEARSAL_IMAGE_ID:?}"
+    pull_policy: never
+    platform: linux/amd64
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 2g
+    memswap_limit: 2g
+    mem_reservation: 1g
+    expose:
+      - "8765"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -s -X 'GET' -f 'http://localhost:8765/api/health' > /dev/null || wget -q -O- 'http://localhost:8765/api/health' > /dev/null || exit 1"
+      interval: 10s
+      timeout: 5s
+      start_period: 90s
+      retries: 12
+    environment:
+      # Shared release settings: values from deploy/internal/release-settings.json.
+      APP_MODE: "${APP_MODE}"
+      AUTH_REQUIRED: "${AUTH_REQUIRED}"
+      SQAG_AUTH_MODE: "${SQAG_AUTH_MODE}"
+      SQAG_STORAGE_MODE: "${SQAG_STORAGE_MODE}"
+      SQAG_ARTIFACT_STORAGE_MODE: "${SQAG_ARTIFACT_STORAGE_MODE}"
+      SQAG_PLATFORM_LAUNCH_MODE: "${SQAG_PLATFORM_LAUNCH_MODE}"
+      OPENROUTER_DRAFT_MODEL: "${OPENROUTER_DRAFT_MODEL}"
+      OPENROUTER_DRAFT_REASONING_EFFORT: "${OPENROUTER_DRAFT_REASONING_EFFORT}"
+      OPENROUTER_DRAFT_BATCH_REASONING_EFFORT: "${OPENROUTER_DRAFT_BATCH_REASONING_EFFORT}"
+      OPENROUTER_DRAFT_PROVIDER_ONLY: "${OPENROUTER_DRAFT_PROVIDER_ONLY}"
+      OPENROUTER_DRAFT_HIGH_QUALITY_MODEL: "${OPENROUTER_DRAFT_HIGH_QUALITY_MODEL}"
+      OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT: "${OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT}"
+      OPENROUTER_DRAFT_HIGH_QUALITY_PROVIDER_ONLY: "${OPENROUTER_DRAFT_HIGH_QUALITY_PROVIDER_ONLY}"
+      OPENROUTER_BASIS_LINE_MODEL: "${OPENROUTER_BASIS_LINE_MODEL}"
+      OPENROUTER_BASIS_LINE_REASONING_EFFORT: "${OPENROUTER_BASIS_LINE_REASONING_EFFORT}"
+      OPENROUTER_BASIS_LINE_PROVIDER_ONLY: "${OPENROUTER_BASIS_LINE_PROVIDER_ONLY}"
+      OPENROUTER_BASIS_ANSWER_MODEL: "${OPENROUTER_BASIS_ANSWER_MODEL}"
+      OPENROUTER_BASIS_ANSWER_REASONING_EFFORT: "${OPENROUTER_BASIS_ANSWER_REASONING_EFFORT}"
+      OPENROUTER_BASIS_ANSWER_PROVIDER_ONLY: "${OPENROUTER_BASIS_ANSWER_PROVIDER_ONLY}"
+      OPENROUTER_PRICING_IMPORT_MODEL: "${OPENROUTER_PRICING_IMPORT_MODEL}"
+      OPENROUTER_PRICING_IMPORT_REASONING_EFFORT: "${OPENROUTER_PRICING_IMPORT_REASONING_EFFORT}"
+      OPENROUTER_PRICING_IMPORT_PROVIDER_ONLY: "${OPENROUTER_PRICING_IMPORT_PROVIDER_ONLY}"
+      OPENROUTER_PRICING_METADATA_MODEL: "${OPENROUTER_PRICING_METADATA_MODEL}"
+      OPENROUTER_PRICING_METADATA_REASONING_EFFORT: "${OPENROUTER_PRICING_METADATA_REASONING_EFFORT}"
+      OPENROUTER_PRICING_METADATA_PROVIDER_ONLY: "${OPENROUTER_PRICING_METADATA_PROVIDER_ONLY}"
+      OPENROUTER_REQUEST_TIMEOUT_SECONDS: "${OPENROUTER_REQUEST_TIMEOUT_SECONDS}"
+      OPENROUTER_REQUIRE_PARAMETERS: "${OPENROUTER_REQUIRE_PARAMETERS}"
+      OPENROUTER_ALLOW_FALLBACKS: "${OPENROUTER_ALLOW_FALLBACKS}"
+      OPENROUTER_DATA_COLLECTION: "${OPENROUTER_DATA_COLLECTION}"
+      OPENROUTER_ZDR: "${OPENROUTER_ZDR}"
+      # Rehearsal-only fixed values (synthetic, non-secret).
+      SQAG_TRACKING_HMAC_KEY_VERSION: "rehearsal-v1"
+      SQAG_INTERNAL_WORKSPACE_ID: "sqag-rehearsal"
+      SQAG_OBJECT_STORAGE_PROVIDER: "s3_compatible"
+      SQAG_OBJECT_STORAGE_BUCKET: "sqag-rehearsal"
+      SQAG_OBJECT_STORAGE_REGION: "auto"
+      SQAG_INTERNAL_ALLOWED_EMAILS: "rehearsal-staff@example.com"
+      SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN: "rehearsal-admin@example.com"
+      QUOTE_DATA_ROOT: "/tmp/sqag-rehearsal/data"
+      QUOTE_OUTPUT_ROOT: "/tmp/sqag-rehearsal/output"
+      QUOTE_TMP_ROOT: "/tmp/sqag-rehearsal/tmp"
+      QUOTE_LOG_ROOT: "/tmp/sqag-rehearsal/logs"
+      PORT: "8765"
+      # Set per run (see the map for each source).
+      SQAG_PUBLIC_BASE_URL: "${SQAG_PUBLIC_BASE_URL}"
+      SQAG_TRUSTED_PROXY_CIDRS: "${SQAG_TRUSTED_PROXY_CIDRS}"
+      SESSION_SECRET: "${SESSION_SECRET}"
+      SQAG_TRACKING_HMAC_KEY: "${SQAG_TRACKING_HMAC_KEY}"
+      SQAG_DATABASE_URL: "${SQAG_DATABASE_URL}"
+      SQAG_OBJECT_STORAGE_ENDPOINT_URL: "${SQAG_OBJECT_STORAGE_ENDPOINT_URL}"
+      SQAG_OBJECT_STORAGE_ACCESS_KEY_ID: "${SQAG_OBJECT_STORAGE_ACCESS_KEY_ID}"
+      SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY: "${SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY}"
+      SQAG_INTERNAL_LOGIN_PASSWORD: "${SQAG_INTERNAL_LOGIN_PASSWORD}"
+      SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD: "${SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+

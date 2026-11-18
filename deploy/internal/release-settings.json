@@ -1,0 +1,92 @@
+{
+  "schema": "sqag-release-settings/v1",
+  "purpose": "Deployment record of the non-secret settings the internal release runs with, and every name whose value never goes in git (never_in_git), by name only. The app never reads this file. Operators copy the shared values into each app's host environment (an env change that keeps its own approval), and scripts/check_release_settings.py compares an app's env names with it.",
+  "template": "deploy/internal-uat/coolify/sqag.uat.env.example",
+  "pending_note": "A null shared value is not recorded yet. Fill it from the owner-approved record of the live value, never from an agent reading live. A release run uses --require-complete, which fails while any value is null.",
+  "shared": {
+    "APP_MODE": "deploy",
+    "AUTH_REQUIRED": "true",
+    "SQAG_AUTH_MODE": "internal_password",
+    "SQAG_STORAGE_MODE": "database",
+    "SQAG_ARTIFACT_STORAGE_MODE": "object",
+    "SQAG_PLATFORM_LAUNCH_MODE": "disabled",
+    "OPENROUTER_DRAFT_MODEL": null,
+    "OPENROUTER_DRAFT_REASONING_EFFORT": null,
+    "OPENROUTER_DRAFT_BATCH_REASONING_EFFORT": null,
+    "OPENROUTER_DRAFT_PROVIDER_ONLY": null,
+    "OPENROUTER_DRAFT_HIGH_QUALITY_MODEL": null,
+    "OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT": null,
+    "OPENROUTER_DRAFT_HIGH_QUALITY_PROVIDER_ONLY": null,
+    "OPENROUTER_BASIS_LINE_MODEL": null,
+    "OPENROUTER_BASIS_LINE_REASONING_EFFORT": null,
+    "OPENROUTER_BASIS_LINE_PROVIDER_ONLY": null,
+    "OPENROUTER_BASIS_ANSWER_MODEL": null,
+    "OPENROUTER_BASIS_ANSWER_REASONING_EFFORT": null,
+    "OPENROUTER_BASIS_ANSWER_PROVIDER_ONLY": null,
+    "OPENROUTER_PRICING_IMPORT_MODEL": null,
+    "OPENROUTER_PRICING_IMPORT_REASONING_EFFORT": null,
+    "OPENROUTER_PRICING_IMPORT_PROVIDER_ONLY": null,
+    "OPENROUTER_PRICING_METADATA_MODEL": null,
+    "OPENROUTER_PRICING_METADATA_REASONING_EFFORT": null,
+    "OPENROUTER_PRICING_METADATA_PROVIDER_ONLY": null,
+    "OPENROUTER_REQUEST_TIMEOUT_SECONDS": null,
+    "OPENROUTER_REQUIRE_PARAMETERS": "true",
+    "OPENROUTER_ALLOW_FALLBACKS": "false",
+    "OPENROUTER_DATA_COLLECTION": "deny",
+    "OPENROUTER_ZDR": "true"
+  },
+  "per_app": [
+    "SQAG_TRACKING_HMAC_KEY_VERSION",
+    "SQAG_PUBLIC_BASE_URL",
+    "SQAG_INTERNAL_WORKSPACE_ID",
+    "SQAG_TRUSTED_PROXY_CIDRS",
+    "SQAG_OBJECT_STORAGE_PROVIDER",
+    "SQAG_OBJECT_STORAGE_ENDPOINT_URL",
+    "SQAG_OBJECT_STORAGE_BUCKET",
+    "SQAG_OBJECT_STORAGE_REGION",
+    "QUOTE_DATA_ROOT",
+    "QUOTE_OUTPUT_ROOT",
+    "QUOTE_TMP_ROOT",
+    "QUOTE_LOG_ROOT",
+    "PORT"
+  ],
+  "never_in_git": [
+    "SESSION_SECRET",
+    "SQAG_TRACKING_HMAC_KEY",
+    "SQAG_DATABASE_URL",
+    "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID",
+    "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY",
+    "SQAG_INTERNAL_ALLOWED_EMAILS",
+    "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN",
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON",
+    "SQAG_INTERNAL_LOGIN_PASSWORD",
+    "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD",
+    "OPENROUTER_API_KEY"
+  ],
+  "optional": [
+    "OPENROUTER_DRAFT_BATCH_REASONING_EFFORT",
+    "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON"
+  ],
+  "must_be_unset": [
+    "OPENROUTER_DRAFT_SCHEMA_ENABLED",
+    "OPENROUTER_DRAFT_IMAGE_SCHEMA_ENABLED",
+    "SQAG_PLATFORM_BASE_URL",
+    "SQAG_PLATFORM_SERVICE_SECRET",
+    "SQAG_INTERNAL_GOOGLE_IDENTITIES_JSON",
+    "SQAG_INTERNAL_ADMIN_EMAILS",
+    "SQAG_INTERNAL_OPERATOR_EMAILS",
+    "AUTH_ALLOW_ANY_AUTHENTICATED_USER",
+    "AUTH_APPROVED_TESTER_ROLE"
+  ],
+  "must_be_unset_prefixes": [
+    "OIDC_",
+    "AUTH_ALLOWED_"
+  ],
+  "platform_names": [
+    "HOSTNAME"
+  ],
+  "platform_prefixes": [
+    "COOLIFY_",
+    "SERVICE_"
+  ]
+}

@@ -22,30 +22,208 @@ Koncept pack until an authorized import or seed action targets that workspace.
 
 ## Internal redeployment flow
 
-Promote releases to `quote-internal` manually after testing the upgrade in a
-fresh container. Before the first rehearsal, verify that Git pushes, CI and
-deployment webhooks cannot deploy to `quote-internal` without approval.
+Every release is rehearsed on a throwaway copy of the app before live gets the
+same image. The one-time setup is mapped in the repository, so each run is
+create, test, delete, with no new decisions per run.
 
-1. Record the image digest currently serving `quote-internal`, the candidate
-   source commit and its built image digest. Keep the current image available
-   for rollback.
-2. Start a fresh test container on the current release image. Reuse the test
-   app definition and mirror the release runtime settings, proxy behaviour and
-   feature flags. Use a separate test workspace, database, artifact storage
-   and credentials with synthetic data. Use an access-controlled temporary
-   HTTPS URL for browser testing.
-3. Seed a synthetic quote on the current image, then upgrade the test container
-   to the candidate digest. Verify sign-in, reopen the seeded quote, generate a
-   new quote from test images and download its XLSX and PDF. Check image
-   analysis with the feature settings intended for the release. Record the
-   digest and results. A failed check holds promotion.
-4. After approval, manually deploy the same tested digest to `quote-internal`
-   with the intended release settings. Verify the running digest, health and
-   a protected browser smoke check. If verification fails, use the previous
-   release image and its recorded settings to roll back.
-5. After release verification, remove the test container and retain the test
-   app definition and validation record for the next rehearsal. Clean up test
-   database and object data under their own reset and retention policy.
+- **Map:** `deploy/rehearsal/resources.json` lists every rehearsal resource,
+  who creates it, where each secret comes from and how it is deleted. It holds
+  names and sources only, never a secret value.
+- **Rehearsal app:** `deploy/rehearsal/compose.yaml` has the same shape as the
+  live internal compose file: one pinned local image, never pulled. It runs no
+  storage or other third-party container. Its files go to a rehearsal-only
+  Cloudflare R2 bucket that each run empties.
+- **Release settings:** `deploy/internal/release-settings.json` records the
+  non-secret settings both apps share (modes and AI model, effort and provider
+  settings) and every secret by name only. The app never reads this file.
+- **Scripts:** `scripts/build_internal_image.sh` (archive and image build),
+  `scripts/check_rehearsal_map.py` and `scripts/check_release_settings.py`
+  (offline checks), `scripts/clear_rehearsal_bucket.py` (empties the
+  rehearsal bucket), `scripts/rehearsal-check.mjs` (checks against the
+  rehearsal or live URL) and `scripts/verify_release_identity.py` (identity).
+  Until `scripts/rehearsal-check.mjs` is added, run each of its steps below by
+  hand in a browser against the rehearsal URL and record the results.
+
+### One-time rehearsal setup
+
+Only these outlive a run. Everything else in the map is created and deleted
+by each run.
+
+1. Live's OpenRouter key in the laptop credential store under the name the map
+   lists. The owner chose to reuse it rather than keep a separate test key, so
+   rehearsal AI calls count against live's key. It sits on the rehearsal app
+   for one run only, and `--no-ai` keeps reruns free.
+2. The R2 bucket `sqag-rehearsal`, used by nothing else, and an R2 token with
+   object read and write on that bucket only. The token and the account's R2
+   S3 endpoint sit in the laptop credential store under the entry names the
+   map lists.
+3. The laptop's Neon access to the `swooshz-sqag` project.
+4. The laptop's SSH host alias `swooshz-vps` (Windows OpenSSH) and Coolify
+   access to the server and project that host live.
+5. The release settings file with no pending values. A null value is filled
+   from the owner's approved record of the live value, never by an agent
+   reading live.
+
+The owner's standing scope confirmation for this flow lets each run create and
+delete the resources the map names as rehearsal, and copy live's migration
+ledger rows into the rehearsal branch, without asking again. It never covers
+live resources, live env changes, live migrations, new keys or image pruning.
+Those keep their own approvals.
+
+### Per-release order
+
+Run the PowerShell blocks on the laptop from the repository folder. Replace
+`<candidate commit>` with the full 40-character commit.
+
+1. **Preflight.**
+   - CI is green on the exact candidate commit.
+   - Record the image id live runs now (the pin on the `deployment/internal`
+     branch) and the previous image id. Keep both images on the server.
+   - Record that Coolify auto-deploy and preview deployments are off for live.
+   - The offline checks pass on the candidate:
+
+     ```powershell
+     python scripts\check_rehearsal_map.py
+     python scripts\check_release_settings.py --require-complete
+     ```
+
+2. **Build.** Make the archive from a clean worktree, never the primary
+   checkout, then build on the server. The archive keeps LF line endings and
+   records the commit in its header, which the build checks.
+
+   ```powershell
+   $sha = "<candidate commit>"
+   $short = $sha.Substring(0, 7)
+   git fetch origin main
+   git worktree add --detach "_tmp\deploy-$short" $sha
+   & "$env:ProgramFiles\Git\bin\bash.exe" -c "cd _tmp/deploy-$short && bash scripts/build_internal_image.sh archive --commit $sha --out ../deploy-$short-out"
+   scp.exe -o BatchMode=yes "_tmp\deploy-$short-out\sqag-$short.tar" "swooshz-vps:/root/sqag-build-$short.tar"
+   scp.exe -o BatchMode=yes "_tmp\deploy-$short\scripts\build_internal_image.sh" "swooshz-vps:/root/sqag-build-$short.sh"
+   $tarSha = "<tar_sha256 from the archive record>"
+   ssh.exe swooshz-vps "nohup bash -c 'bash /root/sqag-build-$short.sh build --commit $sha --tar /root/sqag-build-$short.tar --tar-sha256 $tarSha > /root/sqag-build-$short.json 2> /root/sqag-build-$short.log; echo `$? > /root/sqag-build-$short.exit' < /dev/null > /dev/null 2>&1 &"
+   ssh.exe swooshz-vps "until [ -e /root/sqag-build-$short.exit ]; do sleep 15; done; cat /root/sqag-build-$short.exit"
+   ```
+
+   The build takes about five minutes. The wait prints the build's exit code
+   once the record is complete; require `0`. Then read the record and require
+   `"result":"pass"`. It holds the image id, the four font checks, the Python
+   version, the server import and the image's env names.
+
+   ```powershell
+   ssh.exe swooshz-vps "cat /root/sqag-build-$short.json" | Set-Content -Encoding utf8 "_tmp\deploy-$short-out\build-record.json"
+   $build = Get-Content "_tmp\deploy-$short-out\build-record.json" -Raw | ConvertFrom-Json
+   $build.result
+   $build.image_env_names | Set-Content -Encoding ascii "_tmp\deploy-$short-out\image-env-names.txt"
+   ```
+
+3. **Create the rehearsal from the map.**
+   - Create the Neon schema-only branch `rehearsal-<short>` of live's default
+     branch in `swooshz-sqag`. A schema-only branch copies tables but no rows,
+     so its migration ledger is empty and the migration preflight would refuse
+     it. Right after creating it, read live's
+     `public.sqag_schema_migrations` rows (`sequence_no`, `migration_id`,
+     `checksum_sha256`, `applied_at`; nothing else) and insert the same rows
+     into the branch's table.
+   - A schema-only branch also leaves every `sqag_` table and function owned
+     by `neondb_owner` instead of `sqag_migrator`, and readiness refuses that.
+     On the branch only, run `GRANT sqag_migrator TO neondb_owner`, then
+     `ALTER TABLE ... OWNER TO sqag_migrator` for each `sqag_` table and
+     `ALTER FUNCTION ... OWNER TO sqag_migrator` for each `sqag_` function,
+     then `REVOKE sqag_migrator FROM neondb_owner`. Other grants already match
+     live.
+   - Reset the passwords of the roles on the `rehearsal-<short>` branch,
+     named by its branch id, so no live password is used. Never reset a
+     password on the default branch.
+   - Run the read-only preflight on the branch with the branch's migrator URL
+     (see [the migration runbook](postgres-migration-runbook.md)). It must
+     report ready, with live's applied IDs and only the candidate's new
+     migrations pending.
+   - In Coolify, create the Docker Compose service `quote-rehearsal` on the
+     same server and project as live and paste `deploy/rehearsal/compose.yaml`.
+     Set each variable from the source the map gives it: shared settings from
+     the `shared` values in `deploy/internal/release-settings.json`, generated
+     secrets, the branch's runtime URL, the credential-store entries the map
+     names (the R2 token, the R2 endpoint and the AI key) and the run values. Set
+     `REHEARSAL_IMAGE_ID` to the image live runs now. Give it the host
+     `quote-rehearsal.<server-ip>.sslip.io` with Traefik basic auth.
+   - Derive `SQAG_TRUSTED_PROXY_CIDRS` from the rehearsal service's own
+     network, never a fixed value. The proxy joins that network, so a
+     request reaches the app from there and not from the shared `coolify`
+     network. Deploy once so the network exists (the app reports not ready
+     until the value is set), list the container's networks, read the subnet
+     of the service's own network, set it as the value and redeploy. It must
+     be one exact subnet, never a trust-all range.
+
+     ```powershell
+     ssh.exe swooshz-vps 'docker inspect --format ''{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}'' <rehearsal app container>'
+     ssh.exe swooshz-vps 'docker network inspect --format ''{{range .IPAM.Config}}{{println .Subnet}}{{end}}'' <rehearsal service network>'
+     ```
+
+   - Wait for health. Then check the bucket is empty from inside the
+     rehearsal container. The image under test may predate the clear script,
+     so first run the map's `clear_setup` on the server: it copies the
+     reviewed script and map from the candidate's build folder into the
+     container's `/tmp/rehearsal-tools`. Then run the map's `clear_command`
+     with `--mode check`. If a failed run left files, run it with
+     `--mode clear` first. A redeploy replaces the container, so run
+     `clear_setup` again before any later check or clear. The script refuses
+     any bucket or workspace that is not the rehearsal's, so it cannot touch
+     live.
+
+4. **Seed on the current image.** Run `rehearsal-check --profile seed`. It
+   creates the fixed synthetic set and saves the seed ids for later steps.
+
+5. **Migrate the rehearsal database** if the candidate has pending migrations:
+   pre-apply check, one apply, post-apply check, all on the branch with its
+   migrator URL. Then run `rehearsal-check --profile reopen` on the current
+   image to prove it still serves the seed on the new schema.
+
+6. **Upgrade.** Set `REHEARSAL_IMAGE_ID` to the candidate image id, redeploy
+   and run `rehearsal-check --profile verify`. It signs in, reopens every seed
+   item, makes a new quote from test images with image analysis, downloads and
+   validates the XLSX and PDF, checks the PDF fonts and captures the served
+   `app.js` hash. `--no-ai` skips the paid calls on a rerun.
+
+7. **Rollback drill.** Set `REHEARSAL_IMAGE_ID` back to the current image,
+   redeploy and run `rehearsal-check --profile reopen`. Then switch forward to
+   the candidate again and run `--profile reopen` once more. Any failed check
+   holds promotion.
+
+8. **Promote after the owner approves the tested image id.**
+   - Live migrations first, if any, in the runbook order and with their own
+     approval.
+   - Compare live's env names with the settings file without reading values.
+     On the server, list the names only and drop the values before they leave
+     the server, then check them with the image's names (from the build
+     record) ignored:
+
+     ```powershell
+     ssh.exe swooshz-vps 'docker inspect --format ''{{range .Config.Env}}{{index (split . `=`) 0}}{{println}}{{end}}'' <live container>' | Set-Content -Encoding ascii "_tmp\deploy-$short-out\live-env-names.txt"
+     python scripts\check_release_settings.py --env-names "_tmp\deploy-$short-out\live-env-names.txt" --ignore-names "_tmp\deploy-$short-out\image-env-names.txt"
+     ```
+
+     Fix a missing or unexpected name only with the owner's approval for that
+     env change.
+   - Commit the one-line image pin and its source comment on the
+     `deployment/internal` branch and deploy in Coolify.
+   - Run `rehearsal-check --profile live-readonly` against live. It signs in,
+     loads the quote list and captures the served `app.js`, and creates
+     nothing. Then run `scripts/verify_release_identity.py` with the expected
+     source commit, image id and the hash the rehearsal captured.
+   - If any live check fails, pin the previous image id and deploy again.
+
+9. **Delete and record.**
+   - Empty the rehearsal bucket: run the map's `clear_setup`, then its
+     `clear_command` (`--mode clear`, which reports zero remaining). Then
+     delete the `quote-rehearsal`
+     service in Coolify and the `rehearsal-<short>` Neon branch. The bucket
+     itself stays. Never delete anything whose name does not say rehearsal.
+   - Drop the run's generated secrets.
+   - Store the build record, the preflight outputs and every check result in
+     the evidence store, then remove the worktree with `git worktree remove`.
+   - Image retention: keep the current, previous and candidate images. Removing
+     any other image or old container is a separate owner-approved server
+     action.
 
 ## Hosted Object Artifact Posture
 
