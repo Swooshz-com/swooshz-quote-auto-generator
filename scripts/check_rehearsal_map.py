@@ -248,6 +248,42 @@ def check_resources(data: dict[str, Any]) -> list[str]:
     for name in (data.get("app_service"),):
         if not name or "rehearsal" not in str(name) or str(name).lower() in live_names:
             errors.append(f"service name {name!r} must say rehearsal and differ from live names")
+    errors += check_create_steps(data)
+    return errors
+
+
+BRANCH_CREATE_STEPS = (
+    ("public.sqag_schema_migrations", "copy live's migration ledger rows into the branch"),
+    ("GRANT sqag_migrator TO neondb_owner", "grant sqag_migrator to neondb_owner on the branch"),
+    ("OWNER TO sqag_migrator", "reassign each sqag_ table and function to sqag_migrator"),
+    ("REVOKE sqag_migrator FROM neondb_owner", "revoke the grant afterwards"),
+    ("rehearsal-<run id> branch", "reset passwords on the rehearsal branch only"),
+    ("Never reset a password on the default branch", "never reset a password on the default branch"),
+)
+
+
+def check_create_steps(data: dict[str, Any]) -> list[str]:
+    """Create steps a schema-only branch and a Coolify service network need."""
+    errors = []
+    branches = [
+        r for r in data.get("resources") or [] if isinstance(r, dict) and r.get("kind") == "neon_branch"
+    ]
+    for branch in branches:
+        created = str(branch.get("created_by") or "")
+        for needle, step in BRANCH_CREATE_STEPS:
+            if needle not in created:
+                errors.append(f"resource {branch.get('id')} created_by must {step}")
+    run_values = data.get("run_values") if isinstance(data.get("run_values"), dict) else {}
+    proxy = str(run_values.get("SQAG_TRUSTED_PROXY_CIDRS") or "")
+    if (
+        "rehearsal service's own network" not in proxy
+        or "never a fixed value" not in proxy
+        or re.search(r"\d+\.\d+\.\d+\.\d+", proxy)
+    ):
+        errors.append(
+            "run_values.SQAG_TRUSTED_PROXY_CIDRS must be derived from the rehearsal service's own network "
+            "at create time, never a fixed value or CIDR"
+        )
     return errors
 
 
@@ -365,8 +401,19 @@ def check_compose(data: dict[str, Any], compose: dict[str, Any], compose_text: s
     if [r.get("name") for r in buckets] != [bucket]:
         errors.append("the map must list exactly one r2_bucket resource named like storage.bucket")
     clear = str(storage.get("clear_command") or "")
+    setup = str(storage.get("clear_setup") or "")
+    tools = str(storage.get("tools_dir") or "")
     if f"--expect-bucket {bucket}" not in clear or "clear_rehearsal_bucket.py" not in clear:
         errors.append("storage.clear_command must run clear_rehearsal_bucket.py with --expect-bucket for the mapped bucket")
+    if not tools.startswith("/tmp/") or f"{tools}/scripts/clear_rehearsal_bucket.py" not in clear or "/app" in clear:
+        errors.append("storage.clear_command must run the copied script under storage.tools_dir, never the image's /app copy")
+    for needed in (
+        f"docker cp /root/sqag-build-<run id>/scripts/clear_rehearsal_bucket.py <rehearsal app container>:{tools}/scripts/",
+        f"docker cp /root/sqag-build-<run id>/deploy/rehearsal/resources.json <rehearsal app container>:{tools}/deploy/rehearsal/",
+    ):
+        if needed not in setup:
+            errors.append("storage.clear_setup must copy the reviewed script and map from the candidate build folder into storage.tools_dir")
+            break
     if app_env.get("SQAG_INTERNAL_WORKSPACE_ID") != data.get("workspace_id"):
         errors.append("app workspace id must equal the map's workspace_id")
     if "rehearsal" not in str(data.get("workspace_id") or ""):

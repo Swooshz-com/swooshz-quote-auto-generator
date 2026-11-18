@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -87,6 +88,49 @@ class ClearRehearsalBucketTests(unittest.TestCase):
             self.assertEqual(code, 2, (args, report))
             self.assertEqual(fake.calls, [])
             self.assertEqual(len(fake.keys), 5)
+
+    def refusal(self, args: list[str], env: dict[str, str]) -> str:
+        fake = FakeS3(5)
+        code, report = clear_script.run(args + ["--mode", "clear"], env, client_factory=lambda _env: fake)
+        self.assertEqual((code, fake.calls, len(fake.keys)), (2, [], 5), report)
+        return report["error"]
+
+    def test_each_bucket_guard_refuses_on_its_own(self) -> None:
+        # --expect-bucket alone differs; the env bucket is the map's.
+        self.assertIn("--expect-bucket", self.refusal(["--expect-bucket", "other-rehearsal"], rehearsal_env()))
+        # A map that names a non-rehearsal bucket, with the env and flag agreeing with it.
+        with tempfile.TemporaryDirectory() as tmp:
+            live_like = "example-production-artifacts"
+            data = json.loads(json.dumps(MAP))
+            data["storage"]["bucket"] = live_like
+            map_path = Path(tmp) / "resources.json"
+            map_path.write_text(json.dumps(data), encoding="utf-8")
+            error = self.refusal(
+                ["--expect-bucket", live_like, "--map", str(map_path)],
+                rehearsal_env(SQAG_OBJECT_STORAGE_BUCKET=live_like),
+            )
+        self.assertIn("does not say rehearsal", error)
+        # Says rehearsal and matches the flag, but is not the map's bucket.
+        error = self.refusal(
+            ["--expect-bucket", "prod-rehearsal-copy"], rehearsal_env(SQAG_OBJECT_STORAGE_BUCKET="prod-rehearsal-copy")
+        )
+        self.assertIn("map's bucket", error)
+
+    def test_clear_fails_on_delete_errors_or_leftovers(self) -> None:
+        class Failing(FakeS3):
+            def delete_objects(self, Bucket: str, Delete):
+                self.calls.append(f"delete:{Bucket}")
+                return {"Errors": [{"Key": item["Key"]} for item in Delete["Objects"][:1]]}
+
+        class Stubborn(FakeS3):
+            def delete_objects(self, Bucket: str, Delete):
+                self.calls.append(f"delete:{Bucket}")
+                return {}
+
+        for fake_class in (Failing, Stubborn):
+            code, report = self.run_with(["--expect-bucket", BUCKET, "--mode", "clear"], rehearsal_env(), fake_class(3))
+            self.assertEqual((code, report["status"]), (1, "fail"), fake_class.__name__)
+            self.assertEqual(report["remaining"], 3)
 
     def test_provider_error_reports_type_only(self) -> None:
         class Boom(FakeS3):

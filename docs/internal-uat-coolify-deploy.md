@@ -100,10 +100,12 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    scp.exe -o BatchMode=yes "_tmp\deploy-$short-out\sqag-$short.tar" "swooshz-vps:/root/sqag-build-$short.tar"
    scp.exe -o BatchMode=yes "_tmp\deploy-$short\scripts\build_internal_image.sh" "swooshz-vps:/root/sqag-build-$short.sh"
    $tarSha = "<tar_sha256 from the archive record>"
-   ssh.exe swooshz-vps "nohup bash /root/sqag-build-$short.sh build --commit $sha --tar /root/sqag-build-$short.tar --tar-sha256 $tarSha > /root/sqag-build-$short.json 2> /root/sqag-build-$short.log &"
+   ssh.exe swooshz-vps "nohup bash -c 'bash /root/sqag-build-$short.sh build --commit $sha --tar /root/sqag-build-$short.tar --tar-sha256 $tarSha > /root/sqag-build-$short.json 2> /root/sqag-build-$short.log; echo `$? > /root/sqag-build-$short.exit' < /dev/null > /dev/null 2>&1 &"
+   ssh.exe swooshz-vps "until [ -e /root/sqag-build-$short.exit ]; do sleep 15; done; cat /root/sqag-build-$short.exit"
    ```
 
-   The build takes about five minutes. Then read the record and require
+   The build takes about five minutes. The wait prints the build's exit code
+   once the record is complete; require `0`. Then read the record and require
    `"result":"pass"`. It holds the image id, the four font checks, the Python
    version, the server import and the image's env names.
 
@@ -121,8 +123,17 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      it. Right after creating it, read live's
      `public.sqag_schema_migrations` rows (`sequence_no`, `migration_id`,
      `checksum_sha256`, `applied_at`; nothing else) and insert the same rows
-     into the branch's table. Then reset the branch roles' passwords so no
-     live password is used.
+     into the branch's table.
+   - A schema-only branch also leaves every `sqag_` table and function owned
+     by `neondb_owner` instead of `sqag_migrator`, and readiness refuses that.
+     On the branch only, run `GRANT sqag_migrator TO neondb_owner`, then
+     `ALTER TABLE ... OWNER TO sqag_migrator` for each `sqag_` table and
+     `ALTER FUNCTION ... OWNER TO sqag_migrator` for each `sqag_` function,
+     then `REVOKE sqag_migrator FROM neondb_owner`. Other grants already match
+     live.
+   - Reset the passwords of the roles on the `rehearsal-<short>` branch,
+     named by its branch id, so no live password is used. Never reset a
+     password on the default branch.
    - Run the read-only preflight on the branch with the branch's migrator URL
      (see [the migration runbook](postgres-migration-runbook.md)). It must
      report ready, with live's applied IDs and only the candidate's new
@@ -132,13 +143,32 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      Set each variable from the source the map gives it: shared settings from
      the `shared` values in `deploy/internal/release-settings.json`, generated
      secrets, the branch's runtime URL, the credential-store entries the map
-     names (the R2 token, the R2 endpoint and the AI key) and the run values. Set `REHEARSAL_IMAGE_ID` to the image live runs now. Give it the
-     host `quote-rehearsal.<server-ip>.sslip.io` with Traefik basic auth.
-   - Start the app and wait for health. Then check the bucket is empty from
-     inside the rehearsal container with the map's `clear_command`, using
-     `--mode check`. If a failed run left files, run it with `--mode clear`
-     first. The script refuses any bucket or workspace that is not the
-     rehearsal's, so it cannot touch live.
+     names (the R2 token, the R2 endpoint and the AI key) and the run values. Set
+     `REHEARSAL_IMAGE_ID` to the image live runs now. Give it the host
+     `quote-rehearsal.<server-ip>.sslip.io` with Traefik basic auth.
+   - Derive `SQAG_TRUSTED_PROXY_CIDRS` from the rehearsal service's own
+     network, never a fixed value. The proxy joins that network, so a
+     request reaches the app from there and not from the shared `coolify`
+     network. Deploy once so the network exists (the app reports not ready
+     until the value is set), list the container's networks, read the subnet
+     of the service's own network, set it as the value and redeploy. It must
+     be one exact subnet, never a trust-all range.
+
+     ```powershell
+     ssh.exe swooshz-vps 'docker inspect --format ''{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}'' <rehearsal app container>'
+     ssh.exe swooshz-vps 'docker network inspect --format ''{{range .IPAM.Config}}{{println .Subnet}}{{end}}'' <rehearsal service network>'
+     ```
+
+   - Wait for health. Then check the bucket is empty from inside the
+     rehearsal container. The image under test may predate the clear script,
+     so first run the map's `clear_setup` on the server: it copies the
+     reviewed script and map from the candidate's build folder into the
+     container's `/tmp/rehearsal-tools`. Then run the map's `clear_command`
+     with `--mode check`. If a failed run left files, run it with
+     `--mode clear` first. A redeploy replaces the container, so run
+     `clear_setup` again before any later check or clear. The script refuses
+     any bucket or workspace that is not the rehearsal's, so it cannot touch
+     live.
 
 4. **Seed on the current image.** Run `rehearsal-check --profile seed`. It
    creates the fixed synthetic set and saves the seed ids for later steps.
@@ -168,7 +198,7 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      record) ignored:
 
      ```powershell
-     ssh.exe swooshz-vps "docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' <live container> | cut -d= -f1" | Set-Content -Encoding ascii "_tmp\deploy-$short-out\live-env-names.txt"
+     ssh.exe swooshz-vps 'docker inspect --format ''{{range .Config.Env}}{{index (split . `=`) 0}}{{println}}{{end}}'' <live container>' | Set-Content -Encoding ascii "_tmp\deploy-$short-out\live-env-names.txt"
      python scripts\check_release_settings.py --env-names "_tmp\deploy-$short-out\live-env-names.txt" --ignore-names "_tmp\deploy-$short-out\image-env-names.txt"
      ```
 
@@ -183,8 +213,9 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
    - If any live check fails, pin the previous image id and deploy again.
 
 9. **Delete and record.**
-   - Empty the rehearsal bucket with the map's `clear_command` (`--mode
-     clear`, which reports zero remaining), then delete the `quote-rehearsal`
+   - Empty the rehearsal bucket: run the map's `clear_setup`, then its
+     `clear_command` (`--mode clear`, which reports zero remaining). Then
+     delete the `quote-rehearsal`
      service in Coolify and the `rehearsal-<short>` Neon branch. The bucket
      itself stays. Never delete anything whose name does not say rehearsal.
    - Drop the run's generated secrets.

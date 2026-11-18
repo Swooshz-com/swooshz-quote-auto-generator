@@ -149,6 +149,44 @@ class RehearsalMapTests(unittest.TestCase):
         )
         self.assertTrue(any("clear_command" in e for e in self.check_with(data)))
 
+    def test_clear_runs_the_copied_script_not_the_image_copy(self) -> None:
+        storage = self.data["storage"]
+        self.assertIn(f"{storage['tools_dir']}/scripts/clear_rehearsal_bucket.py", storage["clear_command"])
+        self.assertNotIn("/app", storage["clear_command"])
+        data = copy.deepcopy(self.data)
+        data["storage"]["clear_command"] = (
+            "docker exec <rehearsal app container> bash -lc "
+            "'cd /app && python scripts/clear_rehearsal_bucket.py --expect-bucket sqag-rehearsal --mode clear'"
+        )
+        self.assertTrue(any("storage.tools_dir" in e for e in self.check_with(data)))
+
+    def test_clear_setup_copies_script_and_map_from_the_build_folder(self) -> None:
+        for dropped in ("scripts/clear_rehearsal_bucket.py", "deploy/rehearsal/resources.json"):
+            data = copy.deepcopy(self.data)
+            setup = data["storage"]["clear_setup"]
+            data["storage"]["clear_setup"] = setup.replace(f"/root/sqag-build-<run id>/{dropped}", "/root/other")
+            self.assertTrue(any("clear_setup" in e for e in self.check_with(data)), dropped)
+
+    def test_branch_create_reassigns_owners_and_pins_the_password_reset(self) -> None:
+        for needle, _step in checker.BRANCH_CREATE_STEPS:
+            data = copy.deepcopy(self.data)
+            for resource in data["resources"]:
+                if resource["kind"] == "neon_branch":
+                    resource["created_by"] = resource["created_by"].replace(needle, "")
+            errors = self.check_with(data)
+            self.assertTrue(any("neon-branch created_by" in e for e in errors), needle)
+
+    def test_proxy_cidr_is_derived_from_the_service_network(self) -> None:
+        for value in (
+            "10.0.10.0/24",
+            "The subnet of the server's Coolify proxy network, read on the server with docker network inspect.",
+            "Derived from the rehearsal service's own network, never a fixed value, e.g. 10.0.10.0/24.",
+        ):
+            data = copy.deepcopy(self.data)
+            data["run_values"]["SQAG_TRUSTED_PROXY_CIDRS"] = value
+            errors = self.check_with(data)
+            self.assertTrue(any("SQAG_TRUSTED_PROXY_CIDRS" in e for e in errors), value)
+
     def test_mini_yaml_matches_pyyaml_when_available(self) -> None:
         try:
             import yaml  # type: ignore

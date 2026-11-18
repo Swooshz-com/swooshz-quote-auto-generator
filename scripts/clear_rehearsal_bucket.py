@@ -52,7 +52,9 @@ def guard(env: Mapping[str, str], expect_bucket: str, map_path: Path) -> None:
     bucket = str(env.get("SQAG_OBJECT_STORAGE_BUCKET") or "").strip()
     if not expect_bucket or bucket != expect_bucket:
         raise Refusal("configured bucket does not equal --expect-bucket")
-    if "rehearsal" not in bucket or bucket != mapped_bucket:
+    if "rehearsal" not in bucket:
+        raise Refusal("configured bucket name does not say rehearsal")
+    if bucket != mapped_bucket:
         raise Refusal("configured bucket is not the rehearsal map's bucket")
     workspace = str(env.get("SQAG_INTERNAL_WORKSPACE_ID") or "").strip()
     if not workspace or workspace != rehearsal_map.get("workspace_id"):

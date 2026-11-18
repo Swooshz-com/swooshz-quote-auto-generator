@@ -16,7 +16,9 @@
     "bucket": "sqag-rehearsal",
     "region": "auto",
     "token_scope": "Object Read and Write on the sqag-rehearsal bucket only. The deploy run confirms the final scope and region when it creates the token.",
-    "clear_command": "docker exec <rehearsal app container> bash -lc 'cd /app && python scripts/clear_rehearsal_bucket.py --expect-bucket sqag-rehearsal --mode clear'",
+    "tools_dir": "/tmp/rehearsal-tools",
+    "clear_setup": "Run on the server before each check or clear, because a redeploy replaces the container. It copies the reviewed script and map from the candidate's build folder, so it works even when the image under test predates the script: docker exec <rehearsal app container> mkdir -p /tmp/rehearsal-tools/scripts /tmp/rehearsal-tools/deploy/rehearsal && docker cp /root/sqag-build-<run id>/scripts/clear_rehearsal_bucket.py <rehearsal app container>:/tmp/rehearsal-tools/scripts/ && docker cp /root/sqag-build-<run id>/deploy/rehearsal/resources.json <rehearsal app container>:/tmp/rehearsal-tools/deploy/rehearsal/",
+    "clear_command": "docker exec <rehearsal app container> bash -lc 'python /tmp/rehearsal-tools/scripts/clear_rehearsal_bucket.py --expect-bucket sqag-rehearsal --mode clear'",
     "rule": "The bucket is kept between runs and holds rehearsal files only. Each run checks it is empty before seeding and clears it before the app is deleted. No storage container or third-party storage image is used."
   },
   "resources": [
@@ -26,7 +28,7 @@
       "name": "quote-rehearsal",
       "lifetime": "per_run",
       "created_by": "Operator on the laptop, in Coolify: a Docker Compose service on the same server and project as live, compose pasted from deploy/rehearsal/compose.yaml.",
-      "delete": "Clear the bucket first (storage.clear_command), then delete the quote-rehearsal service in Coolify with its containers."
+      "delete": "Clear the bucket first (storage.clear_setup, then storage.clear_command), then delete the quote-rehearsal service in Coolify with its containers."
     },
     {
       "id": "r2-bucket",
@@ -34,7 +36,7 @@
       "name": "sqag-rehearsal",
       "lifetime": "kept",
       "created_by": "Owner-approved one-time setup: a Cloudflare R2 bucket used only by the rehearsal.",
-      "clear": "Each run: --mode check before seeding (clear first if a failed run left files), --mode clear before deleting the app.",
+      "clear": "Each run: storage.clear_setup, then storage.clear_command with --mode check before seeding (clear first if a failed run left files), and with --mode clear before deleting the app.",
       "delete": "Not deleted per run; its files are cleared. The owner removes the bucket when the rehearsal flow is retired."
     },
     {
@@ -52,7 +54,7 @@
       "project": "swooshz-sqag",
       "branch_type": "schema-only, parent is live's default branch",
       "lifetime": "per_run",
-      "created_by": "Operator on the laptop with Neon access. Right after creating it, copy live's public.sqag_schema_migrations rows (sequence_no, migration_id, checksum_sha256, applied_at only) into the branch, then reset the branch roles' passwords so no live password is used.",
+      "created_by": "Operator on the laptop with Neon access. Right after creating it, copy live's public.sqag_schema_migrations rows (sequence_no, migration_id, checksum_sha256, applied_at only) into the branch. A schema-only branch leaves the sqag_ tables and functions owned by neondb_owner, so on the branch only run GRANT sqag_migrator TO neondb_owner, ALTER ... OWNER TO sqag_migrator on each sqag_ table and function, then REVOKE sqag_migrator FROM neondb_owner. Then reset the passwords of the roles on the rehearsal-<run id> branch, named by its branch id, so no live password is used. Never reset a password on the default branch.",
       "delete": "Delete the rehearsal-<run id> branch in the swooshz-sqag project. Never delete a branch whose name does not start with rehearsal-."
     },
     {
@@ -167,7 +169,7 @@
   },
   "run_values": {
     "SQAG_PUBLIC_BASE_URL": "https://quote-rehearsal.<server-ip>.sslip.io (the rehearsal host)",
-    "SQAG_TRUSTED_PROXY_CIDRS": "The subnet of the server's Coolify proxy network, read on the server with docker network inspect.",
+    "SQAG_TRUSTED_PROXY_CIDRS": "Derived at create time from the rehearsal service's own network, never a fixed value: after the first deploy, read the subnet of the service's own network (not the shared coolify network) with docker network inspect, set it and redeploy. One exact subnet, never a trust-all range.",
     "REHEARSAL_IMAGE_ID": "The image id from the build record: the current live image first, then the candidate."
   },
   "generated_rules": {

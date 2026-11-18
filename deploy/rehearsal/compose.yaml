@@ -14,7 +14,7 @@
 # it and redeploying is how the run upgrades and rolls back.
 services:
   quote-rehearsal:
-    image: "${REHEARSAL_IMAGE_ID:?set REHEARSAL_IMAGE_ID to the local image id under test}"
+    image: "${REHEARSAL_IMAGE_ID:?}"
     pull_policy: never
     platform: linux/amd64
     restart: unless-stopped
