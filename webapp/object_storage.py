@@ -177,6 +177,19 @@ def _configured_provider(env: Mapping[str, str] | None) -> str:
     return "unsupported"
 
 
+# botocore 1.44.0 changed the SDK's default retry mode from "legacy" (5 attempts,
+# seconds-scale backoff) to "standard" (3 attempts, 50 ms base backoff). Every S3
+# client is built with this pinned policy so a dependency bump or an AWS_* env
+# value cannot silently change how hard artifact saves and reads retry.
+S3_CLIENT_RETRIES: Mapping[str, str] = {"mode": "legacy"}
+
+
+def s3_client_config() -> object:
+    """Return the botocore Config every SQAG S3 client is built with."""
+    botocore_config = importlib.import_module("botocore.config")
+    return botocore_config.Config(retries=dict(S3_CLIENT_RETRIES))
+
+
 def _optional_s3_sdk_available() -> bool:
     return importlib.util.find_spec("boto3") is not None
 

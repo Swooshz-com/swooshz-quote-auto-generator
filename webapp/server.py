@@ -104,6 +104,7 @@ from webapp.object_storage import (
     artifact_checksum,
     object_artifact_key,
     object_storage_provider_status,
+    s3_client_config,
 )
 from webapp.postgres_migrations import EXPECTED_TRIGGER_ROUTINE_LINKS
 from webapp.quote_ai_spend import (
@@ -1993,6 +1994,7 @@ def configured_object_storage_backend() -> ObjectStorageBackend:
             region_name=read_dotenv_value(OBJECT_STORAGE_REGION_ENV_NAME),
             aws_access_key_id=read_dotenv_value(OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME),
             aws_secret_access_key=read_dotenv_value(OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME),
+            config=s3_client_config(),
         )
         return S3CompatibleObjectStorageBackend(
             bucket=read_dotenv_value(OBJECT_STORAGE_BUCKET_ENV_NAME),
