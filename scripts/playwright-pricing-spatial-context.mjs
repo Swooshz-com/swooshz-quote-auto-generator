@@ -37,8 +37,16 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   const sculptureTick = () => basisControl(page, "u1-unmatched", '[data-basis-tag]:not([data-basis-tag="Exclude"])');
   const sculptureCross = await basisControl(page, "u1-unmatched", '[data-basis-tag="Exclude"]');
   const sectionActions = page.locator('#basisReviewSurface [data-basis-section="' + sectionId + '"][data-basis-section-action]');
-  const tickAll = sectionActions.and(page.locator('[data-basis-section-action="Include"]')).first();
-  const crossAll = sectionActions.and(page.locator('[data-basis-section-action="Exclude"]')).first();
+  // Each pricing-group block has its own controls; no .first() shortcut hides a missing set.
+  const blockAction = (group, action) => page.locator('#basisReviewSurface .basis-review-grid[aria-label="' + group + '"] [data-basis-section="'
+    + sectionId + '"][data-basis-section-action="' + action + '"]');
+  const tickAll = blockAction("Matched", "Include");
+  const crossAll = blockAction("Matched", "Exclude");
+  const unmatchedTickAll = blockAction("Unmatched", "Include");
+  const unmatchedCrossAll = blockAction("Unmatched", "Exclude");
+  for (const control of [tickAll, crossAll, unmatchedTickAll, unmatchedCrossAll]) {
+    assert(await control.count() === 1, "a section block lacks its own bulk control");
+  }
   async function assertBasisRow(row, group, tag) {
     assert(await row.isVisible(), group + " row disappeared after a basis action");
     assert(await row.evaluate((element, expected) =>
@@ -53,13 +61,20 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   assert(await sculpture.locator('button').count() === 3, "unmatched row has an extra action");
   await tickAll.click();
   await assertBasisRow(spotlight, "Matched", "include");
+  assert(!await sculptureStatus.isVisible(), "Matched block tick acted on the Unmatched block");
+  await unmatchedTickAll.click();
+  await assertBasisRow(spotlight, "Matched", "include");
   await assertBasisRow(sculpture, "Unmatched", "custom");
   assert(await sculptureStatus.isVisible(), "section tick did not defer eligible unmatched row");
   await crossAll.click();
   await assertBasisRow(spotlight, "Matched", "exclude");
+  await assertBasisRow(sculpture, "Unmatched", "custom");
+  assert(await sculptureStatus.isVisible(), "Matched block X acted on the Unmatched block");
+  await unmatchedCrossAll.click();
   await assertBasisRow(sculpture, "Unmatched", "exclude");
   assert(!await sculptureStatus.isVisible(), "excluded row still shows a deferral");
   await tickAll.click();
+  await unmatchedTickAll.click();
   await assertBasisRow(spotlight, "Matched", "include");
   await assertBasisRow(sculpture, "Unmatched", "custom");
   assert(await sculptureStatus.isVisible(), "section tick did not defer after bulk exclusion");
@@ -68,12 +83,20 @@ replaceOnce('  // Resolve any remaining server-added review line', `
   assert(await sculpture.evaluate((row) => !row.classList.contains("basis-line-exclude")), "single X excluded a different row");
   await spotlightTick.click();
   await assertBasisRow(spotlight, "Matched", "include");
-  assert(await sectionActions.count() === 2, "one section rendered duplicate bulk controls across groups");
+  const blockControls = await page.locator("#basisReviewSurface .basis-review-item").evaluateAll((items) => items.map((item) => {
+    const group = item.closest(".basis-review-grid").getAttribute("aria-label");
+    const controls = [...item.querySelectorAll(".basis-section-heading [data-basis-section-action]")];
+    return controls.length === 2 && controls[0].dataset.basisSectionAction === "Include" && controls[1].dataset.basisSectionAction === "Exclude"
+      && controls.every((control) => control.dataset.basisSectionGroup === group);
+  }));
+  assert(blockControls.length > 1 && blockControls.every(Boolean), "a section block lacks its own scoped bulk controls", blockControls);
+  assert(await sectionActions.count() === 4, "the two-block section did not get one control pair per block");
   assert(await tickAll.getAttribute("title") === "Accept all review lines"
     && await crossAll.getAttribute("title") === "Exclude all review lines", "original bulk tooltips missing");
   const sectionTitle = await tickAll.locator('xpath=ancestor::div[contains(@class, "basis-section-heading")]/h4').innerText();
-  assert(await tickAll.getAttribute("aria-label") === "Accept all review lines in " + sectionTitle
-    && await crossAll.getAttribute("aria-label") === "Exclude all review lines in " + sectionTitle, "bulk labels do not describe section-wide scope");
+  assert(await tickAll.getAttribute("aria-label") === "Accept all Matched lines in " + sectionTitle
+    && await crossAll.getAttribute("aria-label") === "Exclude all Matched lines in " + sectionTitle
+    && await unmatchedTickAll.getAttribute("aria-label") === "Accept all Unmatched lines in " + sectionTitle, "bulk labels do not name their section and group");
   assert(await tickAll.innerText() === await spotlightTick.innerText() && await crossAll.innerText() === await spotlightCross.innerText(),
     "bulk controls do not use the original row glyphs");
   assert(await tickAll.locator('xpath=..').locator('.basis-section-action-spacer').count() === 1,
@@ -86,7 +109,8 @@ replaceOnce('  // Resolve any remaining server-added review line', `
     .filter({ hasText: "Custom reception desk" });
   assert(await manualReview.isVisible() && !await manualReview.getByText("Price to be discussed").isVisible(),
     "ticking a Review row granted a pricing deferral");
-  assert(await page.locator('#basisReviewSurface').getByText("Detected booth", { exact: true }).isVisible(), "Detected booth header missing");
+  const boothBox = page.locator("#basisReviewSurface .basis-visual-display");
+  assert(await boothBox.count() === 0 || (await boothBox.innerText()).replace("Detected booth", "").trim(), "empty Detected booth box rendered");
   const floodCross = await basisControl(page, "u1-excluded-match", '[data-basis-tag="Exclude"]');
   const flood = floodCross.locator("xpath=ancestor::li[1]");
   await sculptureCross.click();

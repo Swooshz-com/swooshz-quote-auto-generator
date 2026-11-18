@@ -11639,13 +11639,69 @@ function basisLinePillLabel(line = {}, pricingRow = basisPricingRow(line)) {
   return basisTagLabel(tag);
 }
 
+// One render or bulk action reads every basis line's pricing rows. Index them once per pass
+// by source id instead of scanning every row list for every line (O(lines x rows)).
+let basisPricingIndex = null;
+
+function basisRowsBySourceId(rows) {
+  const index = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const id = row?.source_basis_line_id;
+    if (!id) return;
+    const list = index.get(id);
+    if (list) list.push(row);
+    else index.set(id, [row]);
+  });
+  return index;
+}
+
+function basisLinesBySourceId(sections) {
+  const index = new Map();
+  (Array.isArray(sections) ? sections : []).forEach((entry) => (Array.isArray(entry?.lines) ? entry.lines : [])
+    .forEach((candidate) => {
+      const linked = { section: entry, line: candidate };
+      new Set([candidate?.id, candidate?.source_line_item_id].filter(Boolean)).forEach((id) => {
+        const list = index.get(id);
+        if (list) list.push(linked);
+        else index.set(id, [linked]);
+      });
+    }));
+  return index;
+}
+
+function withBasisPricingIndex(callback) {
+  if (basisPricingIndex) return callback();
+  basisPricingIndex = {
+    outputRows: basisRowsBySourceId(state.outputRows),
+    lineItems: basisRowsBySourceId(state.lineItems),
+    snapshotRows: basisRowsBySourceId(state.originalAnalysisSnapshot?.line_items),
+    currentLines: basisLinesBySourceId(state.quoteBasisSections),
+    originalLines: basisLinesBySourceId(state.originalAnalysisSnapshot?.quote_basis_sections),
+    referenceIsCurrent: basisAnalysisReferenceIsCurrent(),
+  };
+  try {
+    return callback();
+  } finally {
+    basisPricingIndex = null;
+  }
+}
+
+function indexedBasisEntries(index, ids) {
+  const found = new Set();
+  ids.forEach((id) => (index.get(id) || []).forEach((entry) => found.add(entry)));
+  return [...found];
+}
+
 function originalBasisLineForPricing(line, section, ids) {
   const linked = (sections) => (Array.isArray(sections) ? sections : []).flatMap((entry) =>
     (Array.isArray(entry?.lines) ? entry.lines : [])
     .filter((candidate) => ids.has(candidate?.id) || ids.has(candidate?.source_line_item_id))
     .map((candidate) => ({ section: entry, line: candidate })));
-  const current = linked(state.quoteBasisSections);
-  const original = linked(state.originalAnalysisSnapshot?.quote_basis_sections);
+  const linkedBy = (indexName, sections) => (basisPricingIndex
+    ? indexedBasisEntries(basisPricingIndex[indexName], ids)
+    : linked(sections));
+  const current = linkedBy("currentLines", state.quoteBasisSections);
+  const original = linkedBy("originalLines", state.originalAnalysisSnapshot?.quote_basis_sections);
   if (current.length !== 1 || original.length !== 1) return null;
   const saved = original[0];
   if (saved.section.id !== section.id || saved.section.title !== section.title
@@ -11656,15 +11712,17 @@ function originalBasisLineForPricing(line, section, ids) {
 function basisPricingRow(line, section) {
   const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
   if (!ids.size) return null;
-  const matches = (rows) => (rows || []).filter((row) => ids.has(row?.source_basis_line_id));
-  for (const rows of [state.outputRows, state.lineItems]) {
-    const active = matches(rows);
+  const matches = (rows, indexName) => (basisPricingIndex
+    ? indexedBasisEntries(basisPricingIndex[indexName], ids)
+    : (rows || []).filter((row) => ids.has(row?.source_basis_line_id)));
+  for (const [rows, indexName] of [[state.outputRows, "outputRows"], [state.lineItems, "lineItems"]]) {
+    const active = matches(rows, indexName);
     if (active.length) return active.length === 1 ? active[0] : null;
   }
   const snapshot = state.originalAnalysisSnapshot;
-  if (!section || !Array.isArray(snapshot?.line_items) || !basisAnalysisReferenceIsCurrent()) return null;
+  if (!section || !Array.isArray(snapshot?.line_items) || !basisAnalysisReferenceIsCurrentForPass()) return null;
   const original = originalBasisLineForPricing(line, section, ids);
-  const rows = matches(snapshot.line_items);
+  const rows = matches(snapshot.line_items, "snapshotRows");
   if (!original || rows.length !== 1
     || original.text !== line.text || (original.pricing_keyword || "") !== (line.pricing_keyword || "")
     || numberOrNull(original.quantity) !== numberOrNull(line.quantity)
@@ -11688,9 +11746,13 @@ function basisAnalysisReferenceIsCurrent() {
   );
 }
 
+function basisAnalysisReferenceIsCurrentForPass() {
+  return basisPricingIndex ? basisPricingIndex.referenceIsCurrent : basisAnalysisReferenceIsCurrent();
+}
+
 function basisUnmatchedOffer(line, row, section) {
   if (!row || row.pricing_authority?.variant !== "none" || line.pricing_keyword
-    || line.possible_pricing_matches?.length || !basisAnalysisReferenceIsCurrent()) return "";
+    || line.possible_pricing_matches?.length || !basisAnalysisReferenceIsCurrentForPass()) return "";
   const quantity = numberOrNull(line.quantity);
   const unit = normalizeUnit(line.unit);
   if (!(quantity > 0) || !unit) return "";
@@ -11802,6 +11864,145 @@ function basisPossibleMatchesHtml(section, line, index) {
   `;
 }
 
+function comparableCatalogueReferenceKey(value = "") {
+  const tokens = (cleanCustomerQuoteLineText(value).toLowerCase().match(/[a-z0-9]+/g) || [])
+    .filter((token) => token !== "inch" && token !== "inches");
+  return tokens.join(" ").replace(/^(?:m2|sqm|m length|m run|m|nos|no|lot|sets?)\s+/, "").trim();
+}
+
+// Index each loaded catalogue once (keyed by its items array) so every render stays O(lines).
+const catalogueReferenceKeyIndexes = new WeakMap();
+
+function catalogueItemsByReferenceKey(items) {
+  const cached = catalogueReferenceKeyIndexes.get(items);
+  if (cached && cached.length === items.length) return cached.index;
+  const index = new Map();
+  items.forEach((item) => {
+    if (!item || typeof item !== "object") return;
+    new Set([item.description, item.catalog_description, item.pricing_reference_description]
+      .filter(Boolean).map((value) => comparableCatalogueReferenceKey(value)).filter(Boolean))
+      .forEach((key) => {
+        const list = index.get(key);
+        if (list) list.push(item);
+        else index.set(key, [item]);
+      });
+  });
+  catalogueReferenceKeyIndexes.set(items, { length: items.length, index });
+  return index;
+}
+
+// The AI named one exact catalogue item of the selected reference but measured nothing.
+// Show that item and its catalogue price and ask only for the quantity. This is display
+// only: an entered quantity goes through the normal server pricing admission.
+function basisCatalogueQuantityItem(line = {}) {
+  if (!line || normalizeBasisTag(line.tag) === "Exclude" || line.pricing_keyword) return null;
+  if (basisQuantityText(line.quantity) || !(line.id || line.source_line_item_id)) return null;
+  const bracketed = bracketedCatalogReferenceParts(line.text || "");
+  const key = bracketed ? comparableCatalogueReferenceKey(bracketed.reference) : "";
+  const reference = currentPricingReference();
+  const items = Array.isArray(reference?.authority_items) ? reference.authority_items : reference?.items;
+  if (!key || !Array.isArray(items)) return null;
+  const matches = catalogueItemsByReferenceKey(items).get(key) || [];
+  if (matches.length !== 1) return null;
+  const item = matches[0];
+  const id = String(item.id || item.pricing_keyword || "").trim();
+  const unit = normalizeUnit(item.unit || item.unit_hint || "");
+  const lineUnit = normalizeUnit(line.unit || "");
+  const price = pricingAuthorityNumber(item.sale_unit_price ?? item.catalog_unit_price ?? item.unit_price);
+  const description = pricingReferenceLineText(item.description || item.catalog_description || item.pricing_reference_description || "");
+  if (!id || !unit || price === null || !description || (lineUnit && lineUnit !== unit)) return null;
+  return { id, unit, price, description };
+}
+
+function basisCatalogueQuantityHtml(section, line, index, item) {
+  return `<input class="basis-quantity-input" type="number" min="0" step="any" inputmode="decimal" placeholder="Qty" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-item="${escapeHtml(item.id)}" aria-label="Quantity in ${escapeHtml(item.unit)} for ${escapeHtml(item.description)}"> ${escapeHtml(item.unit)}`;
+}
+
+function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
+  if (appIsBusy()) return false;
+  const text = String(value ?? "").trim();
+  const quantity = /^\d+(?:\.\d+)?$/.test(text) ? Number(text) : NaN;
+  if (!(Number.isFinite(quantity) && quantity > 0)) return false;
+  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
+  const section = sections.find((entry) => entry.id === sectionId);
+  const lineNumber = Number(lineIndex);
+  const currentLine = Number.isInteger(lineNumber) ? section?.lines?.[lineNumber] : null;
+  const item = currentLine ? basisCatalogueQuantityItem(currentLine) : null;
+  if (!item || item.id !== itemId) return false;
+  const nextLine = {
+    ...currentLine,
+    tag: "Include",
+    quantity: text,
+    unit: item.unit,
+    pricing_keyword: item.id,
+    catalog_description: item.description,
+    pricing_reference_description: item.description,
+    catalog_unit_price: item.price,
+  };
+  delete nextLine.custom_pricing;
+  delete nextLine.custom_confirmed;
+  delete nextLine.custom;
+  delete nextLine.manual_pricing;
+  delete nextLine.pricing_tag;
+  delete nextLine.pricing_status;
+  delete nextLine.possible_pricing_matches;
+  delete nextLine.possible_catalog_matches;
+  section.lines[lineNumber] = nextLine;
+  // The AI emitted no physical row for an unmeasured line. Add the unpriced row the selection
+  // needs; it carries no price authority until the server admits the selection on Confirm.
+  const rowId = String(currentLine.id || currentLine.source_line_item_id);
+  const ids = new Set([currentLine.id, currentLine.source_line_item_id].filter(Boolean));
+  const existing = state.lineItems.filter((row) => ids.has(row?.source_basis_line_id));
+  if (existing.length > 1) return false;
+  const { pricing_authority, deferred_pricing, unmatched_pricing_offer, ...previousRow } = existing[0] || {};
+  const nextRow = normalizeLineItem({
+    ...previousRow,
+    section: previousRow.section || section.title,
+    description: outputCatalogDescription(nextLine),
+    quantity: text,
+    unit: item.unit,
+    price_mode: "Priced",
+    pricing_keyword: item.id,
+    catalog_description: item.description,
+    pricing_reference_description: item.description,
+    source_basis_line_id: existing[0]?.source_basis_line_id || rowId,
+  });
+  state.lineItems = existing.length
+    ? state.lineItems.map((row) => (row === existing[0] ? nextRow : row))
+    : [...state.lineItems, nextRow];
+  state.quoteBasisSections = sections;
+  state.quoteBasis = quoteBasisFromSections(sections);
+  state.basisConfirmed = false;
+  // Same as choosing a possible match: the server admits the selection on Confirm.
+  state.outputRows = [];
+  state.originalOutputRows = [];
+  setDownloadFiles([]);
+  markOutputRowsDirty();
+  updateQuoteBasisCard("edited");
+  syncControlStates();
+  return true;
+}
+
+function handleQuoteBasisQuantity(event) {
+  const input = event.target.closest?.("[data-basis-quantity-item]");
+  if (!input) return;
+  if (event.type === "keydown") {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+  }
+  const applied = applyBasisCatalogueQuantity(
+    input.dataset.basisSection || "",
+    Number(input.dataset.basisLineIndex),
+    input.dataset.basisQuantityItem || "",
+    input.value,
+  );
+  if (!applied && String(input.value).trim() && typeof input.reportValidity === "function") {
+    input.setCustomValidity("Enter a quantity above 0.");
+    input.reportValidity();
+    input.setCustomValidity("");
+  }
+}
+
 function renderBasisLine(section, line, index) {
   const tag = normalizeBasisTag(line.tag);
   const customPricing = isCustomPricingBasisLine(line);
@@ -11810,6 +12011,7 @@ function renderBasisLine(section, line, index) {
   const pillLabel = basisLinePillLabel(line, pricingRow);
   const acceptsAsAiProposal = basisLineAcceptsAsAiProposal(line);
   const quantityLabel = basisQuantityDisplayLabel(line);
+  const catalogueQuantityItem = basisCatalogueQuantityItem(line);
   const confidenceLabel = basisConfidenceLabel(line);
   const pillTitle = basisPillTitle(line, tag);
   const lineTitle = basisLineTitle(line);
@@ -11828,16 +12030,17 @@ function renderBasisLine(section, line, index) {
     ? `<button class="basis-line-tag-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-tag="Custom" aria-label="Accept this AI proposal" title="Accept AI proposal">&#x2713;</button>`
     : `<button class="basis-line-tag-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-tag="Include" aria-label="Mark this line as included" title="Mark included">&#x2713;</button>`;
   return `
-    <li class="${escapeHtml(rowClasses)}">
+    <li class="${escapeHtml(rowClasses)}" data-basis-key="${escapeHtml(line.id || line.source_line_item_id || `${section.id}:${index}`)}">
       <span class="basis-line-icon" aria-hidden="true"></span>
       <span class="basis-line-meta">
         <span class="basis-line-pill"${pillTitleAttribute}>${escapeHtml(pillLabel)}</span>
         <span class="basis-confidence-pill" title="AI confidence">${escapeHtml(confidenceLabel)}</span>
-        <span class="basis-quantity-text">${escapeHtml(quantityLabel)}</span>
+        <span class="basis-quantity-text">${catalogueQuantityItem ? basisCatalogueQuantityHtml(section, line, index, catalogueQuantityItem) : escapeHtml(quantityLabel)}</span>
       </span>
       <span class="basis-line-text"${lineTitleAttribute}>
         ${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}
         ${deferredPricing ? "<small>Price to be discussed</small>" : ""}
+        ${catalogueQuantityItem ? `<small>Catalogue price ${escapeHtml(formatAmount(catalogueQuantityItem.price))} ${escapeHtml(selectedPricingReferenceCurrency())} per ${escapeHtml(catalogueQuantityItem.unit)}. Enter the quantity to price it.</small>` : ""}
       </span>
       <span class="basis-line-actions">
         ${primaryAction}
@@ -11877,7 +12080,22 @@ function renderBasisTagLegend() {
   `;
 }
 
+function detectedBoothSizeText(dimensionLines = []) {
+  const dimensions = state.boothDimensions || {};
+  if (!dimensions.dimension_source || dimensions.dimension_source === "default") return "";
+  const width = Number(dimensions.booth_width);
+  const depth = Number(dimensions.booth_depth);
+  if (!(Number.isFinite(width) && width > 0 && Number.isFinite(depth) && depth > 0)) return "";
+  // The AI's own dimension line already states this footprint, so do not repeat it.
+  const restated = dimensionLines.some((line) => [...String(line).matchAll(/(\d+(?:\.\d+)?)\s*m?\s*[x\u00d7]\s*(\d+(?:\.\d+)?)/gi)]
+    .some((match) => Number(match[1]) === width && Number(match[2]) === depth));
+  if (restated) return "";
+  const format = (value) => value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)`;
+}
+
 function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
+  if (!basisPricingIndex) return withBasisPricingIndex(() => renderQuoteBasisMessage(basis, source));
   const aiFailed = source === "local" && state.aiFailed;
   if (aiFailed) {
     return `
@@ -11902,10 +12120,12 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
     }))
     .map((section) => ({ ...section, lines: section.reviewLineEntries.map((entry) => entry.line) }))
     .filter((section) => section.reviewLineEntries.length);
-  const dimensionLines = sections.flatMap((section) => (section.lines || [])
+  const aiDimensionLines = sections.flatMap((section) => (section.lines || [])
     .filter((line) => basisLineIsInformationalDimension(line))
     .map((line) => cleanCustomerQuoteLineText(line.text || line.description || "")))
     .filter(Boolean);
+  // Structured analysis dimensions come first; the box is omitted when nothing is known.
+  const dimensionLines = [detectedBoothSizeText(aiDimensionLines), ...aiDimensionLines].filter(Boolean);
   const dimensionDisplay = dimensionLines.length
     ? `
       <div class="basis-visual-display" aria-label="Booth display details">
@@ -11915,10 +12135,9 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
         </ul>
       </div>
     `
-    : '<div class="basis-visual-display"><strong>Detected booth</strong></div>';
+    : "";
   const reviewLineCount = basisTotalLineCount(reviewSections);
   const outputLineCount = basisOutputLineCount(sections);
-  const sectionsWithActions = new Set();
   return `
     <div class="assistant-card quote-basis-card ${aiFailed ? "quote-basis-card-failed" : ""}">
       <div class="quote-basis-header">
@@ -11952,27 +12171,21 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
           ${reviewSections.map((section) => ({
             ...section,
             reviewLineEntries: section.reviewLineEntries.filter((entry) => entry.group === group),
-          })).filter((section) => section.reviewLineEntries.length).map((section) => {
-            const showActions = !sectionsWithActions.has(section.id);
-            sectionsWithActions.add(section.id);
-            return `
-          <div class="basis-review-item">
+          })).filter((section) => section.reviewLineEntries.length).map((section) => `
+          <div class="basis-review-item" data-basis-key="${escapeHtml(group)}:${escapeHtml(section.id)}">
             <div class="basis-section-heading">
               <h4>${escapeHtml(section.title)}</h4>
-              ${showActions ? `
               <span class="basis-section-actions">
-                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-action="Include" aria-label="Accept all review lines in ${escapeHtml(section.title)}" title="Accept all review lines">&#x2713;</button>
-                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-action="Exclude" aria-label="Exclude all review lines in ${escapeHtml(section.title)}" title="Exclude all review lines">X</button>
+                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-group="${group}" data-basis-section-action="Include" aria-label="Accept all ${group} lines in ${escapeHtml(section.title)}" title="Accept all review lines">&#x2713;</button>
+                <button class="basis-section-action-button" type="button" data-basis-section="${escapeHtml(section.id)}" data-basis-section-group="${group}" data-basis-section-action="Exclude" aria-label="Exclude all ${group} lines in ${escapeHtml(section.title)}" title="Exclude all review lines">X</button>
                 <span class="basis-section-action-spacer" aria-hidden="true"></span>
               </span>
-              ` : ""}
             </div>
             <ul class="basis-line-list">
               ${section.reviewLineEntries.map((entry) => renderBasisLine(section, entry.line, entry.index)).join("")}
             </ul>
           </div>
-          `;
-          }).join("")}
+          `).join("")}
         </div>
         `).join("")}
       ` : ""}
@@ -11998,23 +12211,64 @@ function replaceChangedMarkup(container, html) {
   replaceChangedChildNodes(container, template.content);
 }
 
+function sameElementShell(existing, node) {
+  return existing.nodeType === Node.ELEMENT_NODE
+    && node.nodeType === Node.ELEMENT_NODE
+    && existing.tagName === node.tagName
+    && existing.attributes.length === node.attributes.length
+    && [...node.attributes].every((attribute) => existing.getAttribute(attribute.name) === attribute.value);
+}
+
+function basisNodeKey(node) {
+  return node.nodeType === Node.ELEMENT_NODE ? node.getAttribute("data-basis-key") : null;
+}
+
 function replaceChangedChildNodes(target, source) {
   const current = [...target.childNodes];
   const next = [...source.childNodes];
   if (current.length !== next.length) {
-    target.replaceChildren(...next);
+    replaceKeyedChildNodes(target, current, next);
     return;
   }
   next.forEach((node, index) => {
     const existing = current[index];
     if (existing.isEqualNode(node)) return;
-    const sameElementShell = existing.nodeType === Node.ELEMENT_NODE
-      && node.nodeType === Node.ELEMENT_NODE
-      && existing.tagName === node.tagName
-      && existing.attributes.length === node.attributes.length
-      && [...node.attributes].every((attribute) => existing.getAttribute(attribute.name) === attribute.value);
-    if (sameElementShell) replaceChangedChildNodes(existing, node);
+    if (sameElementShell(existing, node)) replaceChangedChildNodes(existing, node);
     else existing.replaceWith(node);
+  });
+}
+
+// A line or section block moved between Matched / Review / Unmatched, so the child count changed.
+// Keep every keyed block and line that still exists (patched in place) instead of rebuilding the list.
+function replaceKeyedChildNodes(target, current, next) {
+  const keyed = new Map();
+  current.forEach((node) => {
+    const key = basisNodeKey(node);
+    if (key && !keyed.has(key)) keyed.set(key, node);
+  });
+  if (!keyed.size) {
+    target.replaceChildren(...next);
+    return;
+  }
+  const kept = new Set();
+  const result = next.map((node) => {
+    const existing = keyed.get(basisNodeKey(node));
+    if (!existing || kept.has(existing)) return node;
+    if (existing.isEqualNode(node)) {
+      kept.add(existing);
+      return existing;
+    }
+    if (!sameElementShell(existing, node)) return node;
+    kept.add(existing);
+    replaceChangedChildNodes(existing, node);
+    return existing;
+  });
+  current.forEach((node) => {
+    if (!kept.has(node)) node.remove();
+  });
+  result.forEach((node, index) => {
+    const at = target.childNodes[index] || null;
+    if (at !== node) target.insertBefore(node, at);
   });
 }
 
@@ -12110,21 +12364,47 @@ function retagBasisLine(sectionId, lineIndex, nextTag) {
   applyBasisTag(sectionId, requestedTag, Number(lineIndex));
 }
 
-function retagBasisSectionConfirmLines(sectionId, nextTag) {
+function retagBasisSectionConfirmLines(sectionId, nextTag, group = "") {
   if (!sectionId || !["Include", "Exclude"].includes(nextTag)) return;
-  applyBasisTag(sectionId, nextTag);
+  // A section can appear once per pricing group; each block's controls act only on its own lines.
+  if (group && !["Matched", "Review", "Unmatched"].includes(group)) return;
+  applyBasisTag(sectionId, nextTag, null, group || null);
 }
 
-function applyBasisTag(sectionId, nextTag, lineIndex = null) {
+function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   if (appIsBusy()) return;
+  // Read every row through one index, then release it before state changes and the re-render.
+  const plan = withBasisPricingIndex(() => planBasisTagChanges(sectionId, nextTag, lineIndex, group));
+  if (!plan) return;
+  const { sections, deferralChanged, pricingChanges } = plan;
+  if (pricingChanges.size) {
+    state.lineItems = [...state.lineItems.filter((row) => !pricingChanges.has(row.source_basis_line_id)), ...pricingChanges.values()];
+  }
+  if (deferralChanged) {
+    state.outputRows = [];
+    state.originalOutputRows = [];
+  }
+  state.quoteBasisSections = sections;
+  state.quoteBasis = quoteBasisFromSections(sections);
+  state.basisConfirmed = false;
+  markOutputRowsDirty();
+  updateQuoteBasisCard("edited");
+  syncControlStates();
+  if (deferralChanged && !state.lineItems.some((row) => row.reincluded_catalog_selection)) {
+    queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+  }
+}
+
+function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null) {
   const sections = cloneQuoteBasisSections(state.quoteBasisSections);
   const section = sections.find((item) => item.id === sectionId);
-  if (!section) return;
+  if (!section) return null;
   let changed = false;
   let deferralChanged = false;
   const pricingChanges = new Map();
   section.lines = (section.lines || []).map((line, index) => {
     if (lineIndex !== null && lineIndex !== index) return line;
+    if (group && (basisLineIsInformationalDimension(line) || basisPricingGroup(line, section) !== group)) return line;
     const row = basisPricingRow(line, section);
     const offer = nextTag === "Exclude" ? "" : basisUnmatchedOffer(line, row, section);
     if (offer && row.deferred_pricing !== offer) {
@@ -12154,23 +12434,8 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null) {
       ...(customPricing ? { custom_pricing: true, custom_confirmed: customConfirmed } : { custom_confirmed: false }),
     };
   });
-  if (!changed && !pricingChanges.size) return;
-  if (pricingChanges.size) {
-    state.lineItems = [...state.lineItems.filter((row) => !pricingChanges.has(row.source_basis_line_id)), ...pricingChanges.values()];
-  }
-  if (deferralChanged) {
-    state.outputRows = [];
-    state.originalOutputRows = [];
-  }
-  state.quoteBasisSections = sections;
-  state.quoteBasis = quoteBasisFromSections(sections);
-  state.basisConfirmed = false;
-  markOutputRowsDirty();
-  updateQuoteBasisCard("edited");
-  syncControlStates();
-  if (deferralChanged && !state.lineItems.some((row) => row.reincluded_catalog_selection)) {
-    queueQuoteSessionDraftStateSave({ quoteGenerated: false });
-  }
+  if (!changed && !pricingChanges.size) return null;
+  return { sections, deferralChanged, pricingChanges };
 }
 
 function basisChatIntroMessage() {
@@ -18154,7 +18419,8 @@ function handleQuoteBasisClick(event) {
   if (sectionAction) {
     retagBasisSectionConfirmLines(
       sectionAction.dataset.basisSection || "",
-      sectionAction.dataset.basisSectionAction || ""
+      sectionAction.dataset.basisSectionAction || "",
+      sectionAction.dataset.basisSectionGroup || ""
     );
     return;
   }
@@ -18724,6 +18990,8 @@ function wireEvents() {
     }
   });
   elements.basisReviewSurface.addEventListener("click", handleQuoteBasisClick);
+  elements.basisReviewSurface.addEventListener("change", handleQuoteBasisQuantity);
+  elements.basisReviewSurface.addEventListener("keydown", handleQuoteBasisQuantity);
   elements.pricingMatchesBody.addEventListener("input", handleOutputRowEdit);
   elements.pricingMatchesBody.addEventListener("change", handleOutputRowEdit);
 }
