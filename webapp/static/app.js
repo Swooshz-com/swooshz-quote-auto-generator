@@ -154,7 +154,6 @@ const DEFAULT_QUOTE_COMPANY_RICH_TEXT = {
   companyDateLabel: "<div>Date:</div>",
   dateLabel: "<div>Date:</div>",
 };
-const KNOWN_DETAILS_MAX_CHARS = 2000;
 const DEFAULT_BOOTH_DIMENSIONS = {
   booth_width: "6",
   booth_depth: "6",
@@ -3835,10 +3834,6 @@ function normalizeBoothDimensions(project = {}) {
   return { ...DEFAULT_BOOTH_DIMENSIONS };
 }
 
-function knownDetailsValue() {
-  return String(elements.knownDetails?.value || "").slice(0, KNOWN_DETAILS_MAX_CHARS);
-}
-
 function handleKnownDetailsChange() {
   // Staff edit the box and run analysis again; editing never clears the draft.
   if (quoteSessionDraftStateCanSave()) {
@@ -3860,7 +3855,7 @@ function collectQuoteDetails() {
     project: {
       title: elements.projectTitle.value.trim(),
       show_name: elements.showName?.value.trim() || "",
-      known_details: knownDetailsValue(),
+      known_details: String(elements.knownDetails?.value || "").slice(0, 2000),
     },
     company: {
       name: elements.quoteCompanyName.value.trim(),
@@ -9421,7 +9416,7 @@ function buildPayload(options = {}) {
   const project = {
     title: elements.projectTitle.value.trim(),
     show_name: elements.showName?.value.trim() || "",
-    known_details: knownDetailsValue(),
+    known_details: String(elements.knownDetails?.value || "").slice(0, 2000),
   };
   if (includeBoothDimensions) {
     project.booth_width = state.boothDimensions.booth_width;
