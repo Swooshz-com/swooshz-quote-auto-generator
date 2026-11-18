@@ -132,6 +132,15 @@ class ClearRehearsalBucketTests(unittest.TestCase):
             self.assertEqual((code, report["status"]), (1, "fail"), fake_class.__name__)
             self.assertEqual(report["remaining"], 3)
 
+        class ErrorsButEmpty(FakeS3):
+            def delete_objects(self, Bucket: str, Delete):
+                super().delete_objects(Bucket, Delete)
+                return {"Errors": [{"Key": Delete["Objects"][0]["Key"]}]}
+
+        code, report = self.run_with(["--expect-bucket", BUCKET, "--mode", "clear"], rehearsal_env(), ErrorsButEmpty(3))
+        self.assertEqual((code, report["status"], report["remaining"]), (1, "fail", 0))
+        self.assertEqual(report["delete_errors"], 1)
+
     def test_provider_error_reports_type_only(self) -> None:
         class Boom(FakeS3):
             def list_objects_v2(self, **kwargs):

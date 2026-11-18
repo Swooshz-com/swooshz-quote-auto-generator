@@ -203,6 +203,8 @@ jobs:
           node --check scripts/playwright-ai-basis-chat-stress.mjs
           node --check scripts/playwright-internal-password-auth.mjs
           node --check scripts/playwright-alpha-smoke.mjs
+          node --check scripts/lib/artifact-checks.mjs
+          node --check scripts/rehearsal-check.mjs
 
       - name: Check Python syntax
         run: |
@@ -247,3 +249,7 @@ jobs:
       - name: Run minimum internal alpha browser smoke
         if: always() && steps.runtime_prerequisites.outcome == 'success'
         run: npm run playwright:alpha-smoke
+
+      - name: Run redeploy rehearsal check against a local synthetic server
+        if: always() && steps.runtime_prerequisites.outcome == 'success'
+        run: npm run playwright:rehearsal-check
