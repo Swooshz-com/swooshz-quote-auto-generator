@@ -535,9 +535,11 @@ async function main() {
 
     const customGraphicsText = "Printed graphics pending manual pricing.";
     await retagBasisLineAndWait(page, customGraphicsText, "Exclude");
-    await page.locator(".basis-review-item", { hasText: "Graphics" }).locator('[data-basis-section-action="Include"]').click();
+    // Each pricing-group block has its own controls; use the block that holds this line.
+    const customGraphicsBlock = () => basisLineRow(page, customGraphicsText).locator("xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' basis-review-item ')][1]");
+    await customGraphicsBlock().locator('[data-basis-section-action="Include"]').click();
     await basisLineRow(page, customGraphicsText).locator(".basis-line-pill", { hasText: "AI Proposal" }).waitFor({ timeout: 15000 });
-    await page.locator(".basis-review-item", { hasText: "Graphics" }).locator('[data-basis-section-action="Exclude"]').click();
+    await customGraphicsBlock().locator('[data-basis-section-action="Exclude"]').click();
     await basisLineRow(page, customGraphicsText).locator(".basis-line-pill", { hasText: "Exclude" }).waitFor({ timeout: 15000 });
     await retagBasisLineAndWait(page, customGraphicsText, "Custom", "AI Proposal");
 

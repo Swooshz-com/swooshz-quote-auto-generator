@@ -31061,15 +31061,23 @@ function renderBasisLine(section, line) { return `<li>${escapeHtml(line.text)}</
 function normalizeQuoteBasisSections() { return state.quoteBasisSections; }
 function basisLineIsInformationalDimension() { return false; }
 
+let basisPricingIndex = null;
+function basisAnalysisReferenceIsCurrent() { return false; }
 eval([
   "normalizeAnalysisMode",
   "normalizeBasisTag",
   "normalizeUnit",
   "numberOrNull",
   "cleanCustomerQuoteLineText",
+  "basisRowsBySourceId",
+  "basisLinesBySourceId",
+  "withBasisPricingIndex",
+  "indexedBasisEntries",
+  "basisAnalysisReferenceIsCurrentForPass",
   "basisPricingRow",
   "basisUnmatchedOffer",
   "basisPricingGroup",
+  "detectedBoothSizeText",
   "renderQuoteBasisMessage",
 ].map(extractFunction).join("\n"));
 
@@ -31193,6 +31201,8 @@ function quoteCommercialContextPillsHtml() { return '<span class="pricing-refere
 function renderAnalysisFindings() { return ""; }
 function setDownloadFiles() { state.downloadFile = null; }
 function markOutputRowsDirty() { state.downloadFile = null; }
+let basisPricingIndex = null;
+const catalogueReferenceKeyIndexes = new WeakMap();
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
 eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
@@ -31255,6 +31265,12 @@ eval([
   "originalBasisLineForPricing",
   "basisUnmatchedOffer",
   "basisPricingGroup",
+  "basisRowsBySourceId",
+  "basisLinesBySourceId",
+  "withBasisPricingIndex",
+  "indexedBasisEntries",
+  "basisAnalysisReferenceIsCurrentForPass",
+  "detectedBoothSizeText",
             "basisLinePillLabel",
             "basisQuantityText",
             "basisQuantityDisplayLabel",
@@ -31269,6 +31285,10 @@ eval([
             "catalogBackedBasisDisplayParts",
             "basisLineTextHtml",
             "basisPossibleMatchesHtml",
+            "comparableCatalogueReferenceKey",
+            "catalogueItemsByReferenceKey",
+            "basisCatalogueQuantityItem",
+            "basisCatalogueQuantityHtml",
             "renderBasisLine",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
@@ -31289,6 +31309,7 @@ eval([
   "retagBasisLine",
   "retagBasisSectionConfirmLines",
   "applyBasisTag",
+  "planBasisTagChanges",
 ].map(extractFunction).join("\n"));
 
 assert.deepStrictEqual(unresolvedConfirmLines(state.quoteBasisSections), ["Floor Coverings: Finish colour."]);

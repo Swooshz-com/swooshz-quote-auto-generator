@@ -5348,6 +5348,18 @@ select:focus {
   white-space: nowrap;
 }
 
+.basis-quantity-input {
+  width: 4.5em;
+  min-height: 22px;
+  margin-right: 4px;
+  padding: 1px 4px;
+  border: 1px solid #9fb3cf;
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  text-align: right;
+}
+
 .basis-line-meta {
   display: grid;
   grid-template-columns: var(--basis-status-pill-width) var(--basis-confidence-pill-width) var(--basis-quantity-pill-width);
