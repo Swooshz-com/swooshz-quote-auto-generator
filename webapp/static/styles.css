@@ -5365,10 +5365,6 @@ select:focus {
   outline: none;
 }
 
-.basis-quantity-edit.is-missing {
-  opacity: 0.6;
-}
-
 .basis-quantity-input {
   width: 4.5em;
   min-height: 22px;

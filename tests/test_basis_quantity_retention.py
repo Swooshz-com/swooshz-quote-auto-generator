@@ -37,7 +37,8 @@ def draft(measured=True):
 
 class EvidenceTransport:
     """A deterministic channel probe, not a simulation of model compliance."""
-    def __init__(self, retain=True, repair_measures=False, single_measured=True, repair_answer=None):
+    def __init__(self, retain=True, repair_measures=False, single_measured=True, repair_answer=None, repair_failure=""):
+        self.repair_failure = repair_failure
         self.retain = retain
         self.repair_measures = repair_measures
         self.repair_answer = repair_answer
@@ -51,6 +52,15 @@ class EvidenceTransport:
             self.calls.append(body)
         parts = body["input"][0]["content"]
         text = parts[0]["text"]
+        if text.startswith(REASK_PREFIX) and self.repair_failure:
+            if self.repair_failure == "connection":
+                raise ai_gateway.GatewayError("connection_failed", boundary="provider_transport", retryable=True)
+            envelope = responses_envelope(body["model"], "", status=self.repair_failure if self.repair_failure != "refusal" else "completed")
+            if self.repair_failure == "refusal":
+                envelope["output"][0]["content"] = [{"type": "refusal", "refusal": "synthetic refusal"}]
+            if self.repair_failure == "incomplete":
+                envelope["incomplete_details"] = {"reason": "max_output_tokens"}
+            return envelope
         if text.startswith(REASK_PREFIX):
             wanted = [line["id"] for line in json.loads(text.split("Context JSON: ", 1)[1])["lines"]]
             sizes = {identity: (quantity, unit) for identity, _, quantity, unit in MEASUREMENTS}
@@ -135,6 +145,18 @@ class BasisQuantityRetentionTest(unittest.TestCase):
                 self.assertEqual(sorted(row["source_basis_line_id"] for row in batched["line_items"]), ["chair", "floor", "rail"])
                 self.assertEqual(batched["analysis_findings"][0]["id"], "booth-size-rule")
                 self.assertIn("Floor panel = 1 lot", batched["analysis_findings"][0]["text"])
+
+    def test_a_provider_failure_on_the_reask_falls_back_to_the_rule(self):
+        # G2 (#392) round 2: a provider-level failure on the re-ask must not fail the whole analysis.
+        for failure in ("connection", "failed", "incomplete", "refusal"):
+            for pages, options in ((13, {"retain": False}), (12, {"single_measured": False})):
+                with self.subTest(failure=failure, pages=pages):
+                    result, calls = self.analyse(pages, repair_failure=failure, **options)
+                    self.assertTrue(calls[-1]["input"][0]["content"][0]["text"].startswith(REASK_PREFIX))
+                    lines = {line["id"]: line for section in result["quote_basis_sections"] for line in section["lines"]}
+                    for identity in ("floor", "rail", "chair"):
+                        self.assertEqual((float(lines[identity]["quantity"]), lines[identity]["unit"]), (1, "lot"))
+                    self.assertEqual(result["analysis_findings"][0]["id"], "booth-size-rule")
 
     def test_one_ai_reask_supplies_missing_sizes_on_both_paths(self):
         batched, calls = self.analyse(13, retain=False, repair_measures=True)

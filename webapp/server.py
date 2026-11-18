@@ -26418,10 +26418,14 @@ def record_pending_draft_attempt(*, failed_details: dict[str, Any] | None = None
         return
     details = {key: value for key, value in owner.pending["details"].items()
                if key not in {"usage", "retry_pending", "attempt_number"}}
+    # Like the owner's own exit: a provider failure keeps the gateway's boundary; only a sent answer the
+    # application then rejected takes the given one. One merged dict, so no keyword is passed twice.
+    if failed_details is not None and owner.pending["status"] == "success":
+        details.update(failed_details)
     log_ai_call_attempt(
         feature="draft_quote_basis", provider=AI_PROVIDER_OPENROUTER, model=owner.operation["model"],
         status="failed" if failed_details is not None else owner.pending["status"],
-        duration_ms=owner.pending["duration_ms"], **owner.attempt_metadata, **details, **(failed_details or {}),
+        duration_ms=owner.pending["duration_ms"], **{**owner.attempt_metadata, **details},
     )
 
 

@@ -11535,7 +11535,8 @@ function basisConfirmBlockReason(sections = state.quoteBasisSections) {
     return "Answer all clarification questions before confirming quotation basis.";
   }
   if (unresolvedConfirmLines(sections).length) return "Resolve all review lines before confirming quotation basis.";
-  return basisSections(sections).some((section) => (section.lines || []).some((line) => basisLineNeedsQuantity(line)))
+  // Confirm fills a blank line with its shown rule size; only a line it cannot fill (more than one output row) blocks.
+  return basisSections(sections).some((section) => (section.lines || []).some((line) => basisLineNeedsQuantity(line) && !basisLineQuantityFillable(line)))
     ? "Enter a quantity for every line before confirming quotation basis."
     : "";
 }
@@ -11913,7 +11914,56 @@ function basisCatalogueQuantityItem(line = {}) {
   const price = pricingAuthorityNumber(item.sale_unit_price ?? item.catalog_unit_price ?? item.unit_price);
   const description = pricingReferenceLineText(item.description || item.catalog_description || item.pricing_reference_description || "");
   if (!id || !unit || price === null || !description || (lineUnit && lineUnit !== unit)) return null;
-  return { id, unit, price, description };
+  const section = String(item.reference_section || item.section || "").trim();
+  return { id, unit, price, description, section };
+}
+
+// Owner (18 Nov 2026): no line is ever shown without a size, and there is no "Add qty". The server sizes every
+// new analysis; a line still blank (only quotes saved before that) shows the same booth-size rule the server
+// uses, and Confirm writes it: a per-sqm item in a floor section of the catalogue takes the booth area, anything
+// else 1 in the catalogue unit, its own unit, or lot.
+const BASIS_FLOOR_SECTION_RE = /\bfloor(?:s|ing)?\b/i;
+
+function basisPredictedQuantity(line = {}) {
+  if (!basisLineNeedsQuantity(line)) return null;
+  const item = basisCatalogueQuantityItem(line);
+  const ownUnit = normalizeUnit(line.unit || "");
+  // A bracketed catalogue reference such as "[ sqm Wall Wrap ]" names its unit even when no item matches it.
+  const referenceUnit = normalizeUnit((bracketedCatalogReferenceParts(line.text || "")?.reference || "").split(/\s+/)[0] || "");
+  const unit = item?.unit || (ownUnit && ownUnit !== "lot" ? ownUnit : "")
+    || (BASIS_FREE_QUANTITY_UNITS.has(referenceUnit) ? referenceUnit : "lot");
+  const area = Number(state.boothDimensions?.booth_width) * Number(state.boothDimensions?.booth_depth);
+  const quantity = item && unit === "sqm" && BASIS_FLOOR_SECTION_RE.test(item.section || "") && Number.isFinite(area) && area > 0
+    ? Math.round(area * 100) / 100 : 1;
+  return { quantity, unit, item };
+}
+
+function basisLineQuantityFillable(line = {}) {
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  return state.lineItems.filter((row) => ids.has(row?.source_basis_line_id)).length <= 1;
+}
+
+function basisPredictedQuantityLabel(line = {}) {
+  const predicted = basisPredictedQuantity(line);
+  return predicted ? basisQuantityDisplayLabel({ quantity: predicted.quantity, unit: predicted.unit }) : "";
+}
+
+// Confirm writes the shown rule size into every line still blank, through the same paths as a typed edit.
+function fillPredictedBasisQuantities() {
+  const tried = new Set();
+  for (;;) {
+    let target = null;
+    for (const section of basisSections(state.quoteBasisSections)) {
+      const index = (section.lines || []).findIndex((line, lineIndex) => !tried.has(section.id + ":" + lineIndex) && basisLineNeedsQuantity(line));
+      if (index >= 0) { target = { section, index, line: section.lines[index] }; break; }
+    }
+    if (!target) return;
+    tried.add(target.section.id + ":" + target.index);
+    const predicted = basisPredictedQuantity(target.line);
+    if (!predicted) continue;
+    if (predicted.item) applyBasisCatalogueQuantity(target.section.id, target.index, predicted.item.id, String(predicted.quantity));
+    else applyBasisFreeQuantity(target.section.id, target.index, predicted.quantity + " " + predicted.unit);
+  }
 }
 
 // A physical line still missing a quantity (an older quote, or an AI reply without one).
@@ -11933,9 +11983,9 @@ function basisLineQuantityEditable(line = {}) {
 }
 
 function basisQuantityEditButtonHtml(section, line, index, label) {
-  const shown = label || "Add qty";
-  const title = label ? `Quantity ${String(label).replace(/\.+$/, "")}. Click to change.` : "No quantity yet. Click to add one.";
-  return `<button class="basis-quantity-edit${label ? "" : " is-missing"}" type="button" data-basis-quantity-edit="1" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" aria-label="${escapeHtml(title)}" title="${escapeHtml(title)}">${escapeHtml(shown)}</button>`;
+  const shown = label || basisPredictedQuantityLabel(line) || "1 lot";
+  const title = `Quantity ${String(shown).replace(/\.+$/, "")}. Click to change.`;
+  return `<button class="basis-quantity-edit" type="button" data-basis-quantity-edit="1" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" aria-label="${escapeHtml(title)}" title="${escapeHtml(title)}">${escapeHtml(shown)}</button>`;
 }
 
 function basisQuantityEditorHtml(section, line, index) {
@@ -11944,7 +11994,9 @@ function basisQuantityEditorHtml(section, line, index) {
   // With no unit yet the box takes "6 sqm", so the phone keyboard must allow letters.
   const label = unit ? `Quantity in ${unit}` : "Quantity and unit, for example 6 sqm";
   const target = item ? `data-basis-quantity-item="${escapeHtml(item.id)}"` : `data-basis-quantity-free="1"`;
-  return `<input class="basis-quantity-input" type="text" inputmode="${unit ? "decimal" : "text"}" value="${escapeHtml(basisQuantityText(line.quantity))}" placeholder="${unit ? "Qty" : "6 sqm"}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" ${target} required aria-label="${escapeHtml(label)}" title="Enter to save, Esc to cancel">${unit ? ` ${escapeHtml(unit)}` : ""}`;
+  const predicted = basisPredictedQuantity(line);
+  const value = basisQuantityText(line.quantity) || (predicted ? (unit ? String(predicted.quantity) : predicted.quantity + " " + predicted.unit) : "");
+  return `<input class="basis-quantity-input" type="text" inputmode="${unit ? "decimal" : "text"}" value="${escapeHtml(value)}" placeholder="${unit ? "Qty" : "6 sqm"}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" ${target} required aria-label="${escapeHtml(label)}" title="Enter to save, Esc to cancel">${unit ? ` ${escapeHtml(unit)}` : ""}`;
 }
 
 const BASIS_FREE_QUANTITY_UNITS = new Set(["sqm", "m", "m run", "m length", "nos", "lot", "sets"]);
@@ -11958,7 +12010,8 @@ function parseBasisFreeQuantity(value, lineUnit = "") {
   // A line that already has a unit keeps it; a new unit must be one the quote can price in.
   if (knownUnit && typedUnit && typedUnit !== knownUnit) return null;
   const unit = knownUnit || typedUnit;
-  if (!(Number.isFinite(quantity) && quantity > 0) || !BASIS_FREE_QUANTITY_UNITS.has(unit)) return null;
+  // The line's own unit (for example "day") is always kept; only a newly typed unit must be one of the list.
+  if (!(Number.isFinite(quantity) && quantity > 0) || !(knownUnit || BASIS_FREE_QUANTITY_UNITS.has(unit))) return null;
   return { quantity, unit };
 }
 
@@ -12173,7 +12226,7 @@ function renderBasisLine(section, line, index) {
       <span class="basis-line-text"${lineTitleAttribute}>
         ${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}
         ${deferredPricing ? "<small>Price to be discussed</small>" : ""}
-        ${catalogueQuantityItem ? `<small>Catalogue price ${escapeHtml(formatAmount(catalogueQuantityItem.price))} ${escapeHtml(selectedPricingReferenceCurrency())} per ${escapeHtml(catalogueQuantityItem.unit)}. Add the quantity to price it.</small>` : ""}
+        ${catalogueQuantityItem ? `<small>Catalogue price ${escapeHtml(formatAmount(catalogueQuantityItem.price))} ${escapeHtml(selectedPricingReferenceCurrency())} per ${escapeHtml(catalogueQuantityItem.unit)}.</small>` : ""}
       </span>
       <span class="basis-line-actions">
         ${primaryAction}
@@ -17509,6 +17562,7 @@ async function confirmBasis(options = {}) {
     phase: "running",
     startedAt: new Date().toISOString(),
   });
+  if (!restoredOperation) fillPredictedBasisQuantities();
   const confirmBlockReason = basisConfirmBlockReason();
   if (confirmBlockReason) {
     setWorkflowStage("basis_review");

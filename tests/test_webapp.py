@@ -5893,6 +5893,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "tag": "Confirm",
                     "text": "Synthetic nested raw response line",
                     "confidence_pct": 95,
+                    # Physical lines carry a predicted quantity (owner rule 18 Nov 2026).
+                    "quantity": 2,
+                    "unit": "nos",
                 }],
             }],
             "line_items": [],
@@ -5926,7 +5929,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("failure_boundary", diagnostics)
         self.assertEqual(result["status"], "drafted")
         self.assertEqual(result["source"], "openai")
-        self.assertEqual(result["quote_basis"]["surfaces"], "Confirm: Synthetic nested raw response line")
+        # A sized line with no catalogue match is normalised to Custom, as for any measured unmatched line.
+        self.assertEqual(result["quote_basis"]["surfaces"], "Custom: Synthetic nested raw response line")
         normalized_lines = [
             line["text"]
             for section in result["quote_basis_sections"]
@@ -31235,6 +31239,12 @@ function markOutputRowsDirty() { state.downloadFile = null; }
 let basisPricingIndex = null;
 const catalogueReferenceKeyIndexes = new WeakMap();
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
+// The shown rule size uses the same unit list and floor pattern as the app.
+for (const name of ["BASIS_FREE_QUANTITY_UNITS", "BASIS_FLOOR_SECTION_RE"]) {
+  const declaration = source.match(new RegExp("const " + name + " = [^\\n]+"));
+  if (!declaration) throw new Error("Missing constant " + name);
+  eval.call(globalThis, declaration[0].replace(/^const /, "var "));
+}
 eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
   "normalizeAnalysisMode",
@@ -31320,6 +31330,9 @@ eval([
             "catalogueItemsByReferenceKey",
             "basisCatalogueQuantityItem",
             "basisLineNeedsQuantity",
+            "basisPredictedQuantity",
+            "basisLineQuantityFillable",
+            "basisPredictedQuantityLabel",
             "basisQuantityUnitText",
             "basisLineQuantityEditable",
             "basisQuantityEditButtonHtml",
@@ -31571,13 +31584,17 @@ assert.ok(bracketedCatalogLineHtml.includes("Grey carpet finish across 9m x 10.5
 state.quoteBasisSections[0].lines[1].tag = "Include";
 assert.deepStrictEqual(unresolvedConfirmLines(state.quoteBasisSections), []);
 assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
-// Every physical line needs a quantity: no "Not measured" state, and Confirm waits for one.
+// Every physical line shows a size (owner 18 Nov 2026): no "Not measured" and no "Add qty". A line still blank
+// (only quotes saved before the server sizing guarantee) shows the booth-size rule size, which Confirm writes.
 const savedQuantity = state.quoteBasisSections[0].lines[0].quantity;
 state.quoteBasisSections[0].lines[0].quantity = "";
-assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "Enter a quantity for every line before confirming quotation basis.");
+assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
 const blankQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
+const predictedLabel = basisPredictedQuantityLabel(state.quoteBasisSections[0].lines[0]);
+assert.ok(/^1 /.test(predictedLabel), "A blank line has no rule size: " + predictedLabel);
 assert.ok(!blankQuantityHtml.includes("Not measured"), "A blank quantity still shows Not measured");
-assert.ok(blankQuantityHtml.includes('data-basis-quantity-edit="1"') && blankQuantityHtml.includes(">Add qty<"), "A blank quantity has no way to add one");
+assert.ok(!blankQuantityHtml.includes("Add qty"), "A blank quantity still asks to Add qty");
+assert.ok(blankQuantityHtml.includes('data-basis-quantity-edit="1"') && blankQuantityHtml.includes(">" + escapeHtml(predictedLabel) + "</button>"), "A blank quantity does not show its rule size");
 assert.ok(!blankQuantityHtml.includes("<input"), "The quantity should read as text until clicked");
 // Every measured quantity is also a click-to-edit text control, never a box by default.
 state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
