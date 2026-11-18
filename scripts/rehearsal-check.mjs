@@ -7,9 +7,18 @@
 //        [--seed-file <seed result.json>] [--asset-out <app.js file>] [--no-ai]
 //
 // Credentials come from the environment only, never arguments:
-//   SQAG_REHEARSAL_LOGIN_EMAIL, SQAG_REHEARSAL_LOGIN_PASSWORD (app sign-in; the
-//   rehearsal host has no proxy auth, so the app's sign-in is its access control)
+//   SQAG_REHEARSAL_LOGIN_EMAIL, SQAG_REHEARSAL_LOGIN_PASSWORD: the rehearsal app's
+//     sign-in for seed, verify and reopen (the rehearsal host has no proxy auth,
+//     so the app's sign-in is its access control)
+//   SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL, SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD:
+//     the operator's live sign-in for live-readonly, fed from the laptop credential
+//     store with `toolkit env run`, so rehearsal logins never reach live
 //   SQAG_REHEARSAL_LIVE_HOSTS (comma-separated hosts that writing profiles refuse)
+// live-readonly is read-only on every channel the script opens: the browser
+// context and every API request context allow only GET and HEAD (plus the
+// browser's sign-in form POST), and anything else is refused and recorded.
+// A loopback host skips the "must say rehearsal" rule and needs
+// --allow-loopback-http, so never tunnel a live app to localhost.
 // The result file holds metadata only: step status, timings, opaque ids and hashes.
 import { signIn } from "./internal-password-browser-test.mjs";
 import { pdfFontNames, unexpectedPdfFonts, validatePdf, validateXlsx } from "./lib/artifact-checks.mjs";
@@ -25,7 +34,11 @@ const RESULT_SCHEMA = "sqag-rehearsal-check/v1";
 const PROFILES = ["seed", "verify", "reopen", "live-readonly"];
 const VALUE_FLAGS = new Set(["--profile", "--base-url", "--result", "--seed-file", "--asset-out"]);
 const BOOLEAN_FLAGS = new Set(["--no-ai", "--allow-loopback-http"]);
-const CREDENTIAL_ENV = ["SQAG_REHEARSAL_LOGIN_EMAIL", "SQAG_REHEARSAL_LOGIN_PASSWORD"];
+const REHEARSAL_LOGIN_ENV = { email: "SQAG_REHEARSAL_LOGIN_EMAIL", password: "SQAG_REHEARSAL_LOGIN_PASSWORD" };
+const LIVE_LOGIN_ENV = { email: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL", password: "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD" };
+const CREDENTIAL_ENV = [...Object.values(REHEARSAL_LOGIN_ENV), ...Object.values(LIVE_LOGIN_ENV)];
+const READ_METHODS = new Set(["GET", "HEAD"]);
+const WRITE_HELPERS = ["post", "put", "patch", "delete"];
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 const PACK_ID = "rehearsal-synthetic-pricing";
 const PACK_LABEL = "Rehearsal Synthetic Pricing";
@@ -38,6 +51,7 @@ const AI_DRAFT_TIMEOUT_MS = 240000;
 const GENERATION_TIMEOUT_MS = 120000;
 
 export class UsageError extends Error {}
+export class ReadOnlyViolation extends Error {}
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -83,7 +97,7 @@ export function parseArgs(argv, env = process.env) {
   if (!options.result) throw new UsageError("--result is required");
   if (["verify", "reopen"].includes(options.profile) && !options.seedFile) throw new UsageError(`--seed-file is required for ${options.profile}`);
   options.baseUrl = checkBaseUrl(options.baseUrl, options.profile, options.allowLoopbackHttp, env);
-  options.credentials = readCredentials(env);
+  options.credentials = readCredentials(env, options.profile === "live-readonly" ? LIVE_LOGIN_ENV : REHEARSAL_LOGIN_ENV);
   return options;
 }
 
@@ -105,6 +119,9 @@ export function checkBaseUrl(raw, profile, allowLoopbackHttp, env = process.env)
     throw new UsageError("--base-url must use https");
   }
   if (profile !== "live-readonly") {
+    if (loopback && !allowLoopbackHttp) {
+      throw new UsageError(`profile ${profile} writes data, so a loopback host needs --allow-loopback-http (local test servers only)`);
+    }
     const denied = String(env.SQAG_REHEARSAL_LIVE_HOSTS || "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
     if (denied.includes(host)) throw new UsageError(`profile ${profile} writes data and refuses a live host`);
     if (!loopback && !host.includes("rehearsal")) {
@@ -114,11 +131,73 @@ export function checkBaseUrl(raw, profile, allowLoopbackHttp, env = process.env)
   return url.origin;
 }
 
-function readCredentials(env) {
-  const email = String(env.SQAG_REHEARSAL_LOGIN_EMAIL || "");
-  const password = String(env.SQAG_REHEARSAL_LOGIN_PASSWORD || "");
-  if (!email || !password) throw new UsageError("set SQAG_REHEARSAL_LOGIN_EMAIL and SQAG_REHEARSAL_LOGIN_PASSWORD");
+function readCredentials(env, names) {
+  const email = String(env[names.email] || "");
+  const password = String(env[names.password] || "");
+  if (!email || !password) throw new UsageError(`set ${names.email} and ${names.password}`);
   return { email, password };
+}
+
+function blockedPath(raw, baseUrl) {
+  try {
+    const url = new URL(String(raw), baseUrl);
+    return url.origin === baseUrl ? url.pathname.replace(/[A-Za-z0-9_-]{16,}/g, "<id>") : "<other origin>";
+  } catch {
+    return "<unparsed>";
+  }
+}
+
+function requestTarget(urlOrRequest) {
+  if (typeof urlOrRequest === "string") return { url: urlOrRequest, method: "" };
+  return { url: urlOrRequest?.url?.() ?? "", method: String(urlOrRequest?.method?.() ?? "") };
+}
+
+// Wraps a Playwright API request context so only GET and HEAD reach the server.
+// Every other method throws ReadOnlyViolation before any request is sent and is
+// recorded in `blocked` (method and scrubbed path only).
+export function readOnlyRequestContext(api, blocked, baseUrl) {
+  const refuse = (method, raw) => {
+    blocked.push({ channel: "api", method, path: blockedPath(raw, baseUrl) });
+    throw new ReadOnlyViolation(`live-readonly refused a ${method} request`);
+  };
+  return new Proxy(api, {
+    get(target, property) {
+      if (WRITE_HELPERS.includes(property)) {
+        return async (url) => refuse(property.toUpperCase(), url);
+      }
+      if (property === "get" || property === "head") {
+        const expected = property.toUpperCase();
+        return async (url, options = {}) => {
+          const method = String(options?.method || expected).toUpperCase();
+          if (method !== expected) return refuse(method, url);
+          return target[property](url, options);
+        };
+      }
+      if (property === "fetch") {
+        return async (urlOrRequest, options = {}) => {
+          const requested = requestTarget(urlOrRequest);
+          const method = String(options?.method || requested.method || "GET").toUpperCase();
+          if (!READ_METHODS.has(method)) return refuse(method, requested.url);
+          return target.fetch(urlOrRequest, options);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+// In live-readonly every request context the run opens comes through here.
+function guardedPlaywright(playwright, run) {
+  const request = {
+    newContext: async (options) => readOnlyRequestContext(await playwright.request.newContext(options), run.readOnly.blocked, run.baseUrl),
+  };
+  return new Proxy(playwright, {
+    get(target, property) {
+      if (property === "request") return request;
+      return Reflect.get(target, property, target);
+    },
+  });
 }
 
 function sha256(bytes) {
@@ -144,6 +223,13 @@ class Run {
       no_ai: options.noAi, started_at: new Date().toISOString(), steps: [],
     };
     this.trace = { jobs: [], saves: [], normalizations: [], pending: [], sequence: 0 };
+    this.readOnly = null;
+    if (options.profile === "live-readonly") {
+      // Attached before the first step so a failed run still shows what was tried.
+      this.readOnly = { writes: [], blocked: [] };
+      this.result.write_requests = this.readOnly.writes;
+      this.result.blocked_requests = this.readOnly.blocked;
+    }
   }
 
   async step(name, action) {
@@ -527,8 +613,7 @@ async function aiAnalysis(run, images) {
 }
 
 async function liveReadonly(run) {
-  const writes = [];
-  const blocked = [];
+  const { writes, blocked } = run.readOnly;
   await run.context.route("**/*", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -537,7 +622,7 @@ async function liveReadonly(run) {
       if (method === "POST") writes.push({ method, path: url.pathname });
       return route.continue();
     }
-    blocked.push({ method, path: url.origin === run.baseUrl ? url.pathname.replace(/[A-Za-z0-9_-]{16,}/g, "<id>") : "<other origin>" });
+    blocked.push({ channel: "browser", method, path: blockedPath(url.toString(), run.baseUrl) });
     return route.abort();
   });
   await run.step("sign in", () => signInBrowser(run));
@@ -552,18 +637,16 @@ async function liveReadonly(run) {
     return { quotes: list.length };
   });
   await run.step("served app.js", () => capturedAppJs(run));
-  run.result.write_requests = writes;
-  run.result.blocked_requests = blocked;
 }
 
 export async function runChecks(options, playwright) {
   const run = new Run(options);
-  run.playwright = playwright;
+  run.playwright = run.readOnly ? guardedPlaywright(playwright, run) : playwright;
   run.workDir = await fs.mkdtemp(path.join(os.tmpdir(), "sqag-rehearsal-"));
   let browser;
   try {
     await run.step("health", async () => {
-      const api = await playwright.request.newContext();
+      const api = await run.playwright.request.newContext();
       try {
         const health = await getJson(api, `${run.baseUrl}/api/health`, "Health");
         assert(health.status === "ok", "Health did not report ok.");
@@ -571,7 +654,7 @@ export async function runChecks(options, playwright) {
         await api.dispose();
       }
     });
-    browser = await playwright.chromium.launch({ headless: true });
+    browser = await run.playwright.chromium.launch({ headless: true });
     run.browser = browser;
     run.context = await browser.newContext({ acceptDownloads: true });
     if (options.profile === "live-readonly") {

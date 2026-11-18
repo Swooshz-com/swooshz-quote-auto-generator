@@ -237,7 +237,8 @@ or deployment behaviour changes accompany this test.
   process with fresh quote state. The isolated `npm run playwright:smoke -- --terminal-only` step checks live
   needs-review, blocked, failed and interrupted polling without reload. `npm run playwright:rehearsal-check` runs
   `scripts/rehearsal-check.mjs` (seed, verify without AI, reopen, live-readonly) against a loopback
-  synthetic server and checks its argument and base-URL refusals. All seven browser steps remain gated by the successful
+  synthetic server behind a logging proxy, checks at the server that live-readonly sends no write, and checks
+  its argument, base-URL and read-only refusals. All seven browser steps remain gated by the successful
   `runtime_prerequisites` privilege-contract validation, including after a
   Python test failure.
 - The default app smoke covers reload, saved reopen and generation recovery,

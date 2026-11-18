@@ -87,6 +87,18 @@
       "delete": "Not deleted per run; it is live's key. It leaves the rehearsal when the app is deleted."
     },
     {
+      "id": "live-readonly-login",
+      "kind": "credential_store_entry",
+      "name": "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN",
+      "entries": [
+        "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL",
+        "SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD"
+      ],
+      "lifetime": "kept",
+      "created_by": "Owner, once: the operator's own live sign-in, stored in the laptop credential store (toolkit-env) under the entry names listed here. Only the live read-only check uses it, through toolkit env run, so agents never see the values.",
+      "delete": "Not deleted per run. The owner removes it with toolkit env when it is no longer wanted."
+    },
+    {
       "id": "neon-access",
       "kind": "credential_store_entry",
       "name": "neon",

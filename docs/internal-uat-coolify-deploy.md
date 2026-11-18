@@ -64,6 +64,12 @@ by each run.
 6. The laptop's tools for `scripts/rehearsal-check.mjs`: `npm ci`,
    `npx playwright install chromium` and the Python packages in
    `requirements.txt` (it validates the downloaded PDF with them).
+7. The operator's own live sign-in in the laptop credential store under
+   `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL` and
+   `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD`. The owner adds them once with
+   `toolkit env edit`. Only the live read-only check reads them, through
+   `toolkit env run`, so the values never pass through a chat or a command
+   line, and the rehearsal's synthetic logins never reach live.
 
 The owner's standing scope confirmation for this flow lets each run create and
 delete the resources the map names as rehearsal, and copy live's migration
@@ -238,13 +244,22 @@ Run the PowerShell blocks on the laptop from the repository folder. Replace
      env change.
    - Commit the one-line image pin and its source comment on the
      `deployment/internal` branch and deploy in Coolify.
-   - Run the live read-only check with the operator's own live sign-in from
-     the laptop credential store in `SQAG_REHEARSAL_LOGIN_EMAIL` and
-     `SQAG_REHEARSAL_LOGIN_PASSWORD`:
-     `node scripts\rehearsal-check.mjs --profile live-readonly --base-url https://<live host> --result "$out\live-readonly.json" --asset-out "$out\live-app.js"`.
-     It signs in, loads the quote list and captures the served `app.js`. It
-     blocks every request except reads and the sign-in form, and lists them in
-     the result, so it creates nothing. Then run
+   - Run the live read-only check. It reads the live sign-in from
+     `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL` and
+     `SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD` only, never the rehearsal
+     names, and `toolkit env run` feeds them from the credential store to
+     this one command. Clear the rehearsal values from the session first:
+
+     ```powershell
+     Remove-Item Env:SQAG_REHEARSAL_LOGIN_EMAIL, Env:SQAG_REHEARSAL_LOGIN_PASSWORD -ErrorAction SilentlyContinue
+     node "<home folder>/.ai-agent-toolkit/source/ai-agent-toolkit/repo/scripts/toolkit-env.cjs" run --names SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_EMAIL,SWOOSHZ_SQAG_LIVE_READONLY_LOGIN_PASSWORD -- node scripts\rehearsal-check.mjs --profile live-readonly --base-url https://<live host> --result "$out\live-readonly.json" --asset-out "$out\live-app.js"
+     ```
+
+     It signs in, loads the quote list and captures the served `app.js`.
+     Every channel it opens is read-only: the browser and its own API
+     requests send only reads and the sign-in form, refuse anything else
+     before it is sent, and list both in the result, so it creates nothing.
+     Then run
      `scripts/verify_release_identity.py` with the expected source commit and
      image id and `--served-asset "$out\live-app.js"`; its hash must equal
      the rehearsal's `rehearsal-app.js`.
