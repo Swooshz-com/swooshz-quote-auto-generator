@@ -1,0 +1,182 @@
+{
+  "schema": "sqag-rehearsal-map/v1",
+  "purpose": "One-time rehearsal setup, mapped so every release run knows what to create, where each secret comes from, what to clear and how everything is deleted. Names and sources only: this file never holds a secret value.",
+  "compose": "deploy/rehearsal/compose.yaml",
+  "settings": "deploy/internal/release-settings.json",
+  "doc": "docs/internal-uat-coolify-deploy.md",
+  "app_service": "quote-rehearsal",
+  "run_id_rule": "First 7 characters of the candidate source commit, for example 9f67167.",
+  "live_names": [
+    "quote-internal",
+    "deployment/internal",
+    "deploy/internal/compose.yaml"
+  ],
+  "storage": {
+    "provider": "cloudflare_r2",
+    "bucket": "sqag-rehearsal",
+    "region": "auto",
+    "token_scope": "Object Read and Write on the sqag-rehearsal bucket only. The deploy run confirms the final scope and region when it creates the token.",
+    "clear_command": "docker exec <rehearsal app container> bash -lc 'cd /app && python scripts/clear_rehearsal_bucket.py --expect-bucket sqag-rehearsal --mode clear'",
+    "rule": "The bucket is kept between runs and holds rehearsal files only. Each run checks it is empty before seeding and clears it before the app is deleted. No storage container or third-party storage image is used."
+  },
+  "resources": [
+    {
+      "id": "coolify-service",
+      "kind": "coolify_service",
+      "name": "quote-rehearsal",
+      "lifetime": "per_run",
+      "created_by": "Operator on the laptop, in Coolify: a Docker Compose service on the same server and project as live, compose pasted from deploy/rehearsal/compose.yaml.",
+      "delete": "Clear the bucket first (storage.clear_command), then delete the quote-rehearsal service in Coolify with its containers."
+    },
+    {
+      "id": "r2-bucket",
+      "kind": "r2_bucket",
+      "name": "sqag-rehearsal",
+      "lifetime": "kept",
+      "created_by": "Owner-approved one-time setup: a Cloudflare R2 bucket used only by the rehearsal.",
+      "clear": "Each run: --mode check before seeding (clear first if a failed run left files), --mode clear before deleting the app.",
+      "delete": "Not deleted per run; its files are cleared. The owner removes the bucket when the rehearsal flow is retired."
+    },
+    {
+      "id": "rehearsal-host",
+      "kind": "https_host",
+      "name": "quote-rehearsal.<server-ip>.sslip.io",
+      "lifetime": "per_run",
+      "created_by": "Operator in Coolify: the service domain, with Traefik basic auth using the generated basic-auth user and password.",
+      "delete": "Removed with the Coolify service."
+    },
+    {
+      "id": "neon-branch",
+      "kind": "neon_branch",
+      "name": "rehearsal-<run id>",
+      "project": "swooshz-sqag",
+      "branch_type": "schema-only, parent is live's default branch",
+      "lifetime": "per_run",
+      "created_by": "Operator on the laptop with Neon access. Right after creating it, copy live's public.sqag_schema_migrations rows (sequence_no, migration_id, checksum_sha256, applied_at only) into the branch, then reset the branch roles' passwords so no live password is used.",
+      "delete": "Delete the rehearsal-<run id> branch in the swooshz-sqag project. Never delete a branch whose name does not start with rehearsal-."
+    },
+    {
+      "id": "run-secrets",
+      "kind": "generated_secrets",
+      "name": "rehearsal-run-secrets",
+      "lifetime": "per_run",
+      "created_by": "Generated on the laptop for one run and typed only into the rehearsal service's environment.",
+      "delete": "Removed with the Coolify service. The laptop copy lives only in the run's session and is dropped at the end."
+    },
+    {
+      "id": "r2-token",
+      "kind": "credential_store_entry",
+      "name": "SWOOSHZ_SQAG_REHEARSAL_R2",
+      "entries": [
+        "SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL",
+        "SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID",
+        "SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY"
+      ],
+      "lifetime": "kept",
+      "created_by": "Owner-approved one-time setup: an R2 API token scoped to the sqag-rehearsal bucket, stored in the laptop credential store (toolkit-env) under the entry names listed here, with the account's R2 S3 endpoint URL.",
+      "delete": "Not deleted per run. The owner revokes the token when it is no longer wanted."
+    },
+    {
+      "id": "openrouter-key",
+      "kind": "credential_store_entry",
+      "name": "OPENROUTER_SWOOSHZ_SQAG_API_KEY",
+      "lifetime": "kept",
+      "created_by": "Owner decision: the rehearsal reuses live's OpenRouter key, already in the laptop credential store (toolkit-env) under this name. It is set on the rehearsal app for one run only and leaves with the app. --no-ai keeps reruns free.",
+      "delete": "Not deleted per run; it is live's key. It leaves the rehearsal when the app is deleted."
+    },
+    {
+      "id": "neon-access",
+      "kind": "credential_store_entry",
+      "name": "neon",
+      "lifetime": "kept",
+      "created_by": "Owner, once: the laptop's existing Neon access.",
+      "delete": "Not deleted per run."
+    }
+  ],
+  "env_sources": {
+    "settings": [
+      "APP_MODE",
+      "AUTH_REQUIRED",
+      "SQAG_AUTH_MODE",
+      "SQAG_STORAGE_MODE",
+      "SQAG_ARTIFACT_STORAGE_MODE",
+      "SQAG_PLATFORM_LAUNCH_MODE",
+      "OPENROUTER_DRAFT_MODEL",
+      "OPENROUTER_DRAFT_REASONING_EFFORT",
+      "OPENROUTER_DRAFT_BATCH_REASONING_EFFORT",
+      "OPENROUTER_DRAFT_PROVIDER_ONLY",
+      "OPENROUTER_DRAFT_HIGH_QUALITY_MODEL",
+      "OPENROUTER_DRAFT_HIGH_QUALITY_REASONING_EFFORT",
+      "OPENROUTER_DRAFT_HIGH_QUALITY_PROVIDER_ONLY",
+      "OPENROUTER_BASIS_LINE_MODEL",
+      "OPENROUTER_BASIS_LINE_REASONING_EFFORT",
+      "OPENROUTER_BASIS_LINE_PROVIDER_ONLY",
+      "OPENROUTER_BASIS_ANSWER_MODEL",
+      "OPENROUTER_BASIS_ANSWER_REASONING_EFFORT",
+      "OPENROUTER_BASIS_ANSWER_PROVIDER_ONLY",
+      "OPENROUTER_PRICING_IMPORT_MODEL",
+      "OPENROUTER_PRICING_IMPORT_REASONING_EFFORT",
+      "OPENROUTER_PRICING_IMPORT_PROVIDER_ONLY",
+      "OPENROUTER_PRICING_METADATA_MODEL",
+      "OPENROUTER_PRICING_METADATA_REASONING_EFFORT",
+      "OPENROUTER_PRICING_METADATA_PROVIDER_ONLY",
+      "OPENROUTER_REQUEST_TIMEOUT_SECONDS",
+      "OPENROUTER_REQUIRE_PARAMETERS",
+      "OPENROUTER_ALLOW_FALLBACKS",
+      "OPENROUTER_DATA_COLLECTION",
+      "OPENROUTER_ZDR"
+    ],
+    "compose": [
+      "SQAG_TRACKING_HMAC_KEY_VERSION",
+      "SQAG_INTERNAL_WORKSPACE_ID",
+      "SQAG_OBJECT_STORAGE_PROVIDER",
+      "SQAG_OBJECT_STORAGE_BUCKET",
+      "SQAG_OBJECT_STORAGE_REGION",
+      "QUOTE_DATA_ROOT",
+      "QUOTE_OUTPUT_ROOT",
+      "QUOTE_TMP_ROOT",
+      "QUOTE_LOG_ROOT",
+      "PORT"
+    ],
+    "compose_synthetic": [
+      "SQAG_INTERNAL_ALLOWED_EMAILS",
+      "SQAG_INTERNAL_ALLOWED_EMAILS_ADMIN"
+    ],
+    "run_value": [
+      "SQAG_PUBLIC_BASE_URL",
+      "SQAG_TRUSTED_PROXY_CIDRS"
+    ],
+    "generated": [
+      "SESSION_SECRET",
+      "SQAG_TRACKING_HMAC_KEY",
+      "SQAG_INTERNAL_LOGIN_PASSWORD",
+      "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD"
+    ],
+    "neon_branch": [
+      "SQAG_DATABASE_URL"
+    ],
+    "credential_store": {
+      "SQAG_OBJECT_STORAGE_ENDPOINT_URL": "SWOOSHZ_SQAG_REHEARSAL_R2_ENDPOINT_URL",
+      "SQAG_OBJECT_STORAGE_ACCESS_KEY_ID": "SWOOSHZ_SQAG_REHEARSAL_R2_ACCESS_KEY_ID",
+      "SQAG_OBJECT_STORAGE_SECRET_ACCESS_KEY": "SWOOSHZ_SQAG_REHEARSAL_R2_SECRET_ACCESS_KEY",
+      "OPENROUTER_API_KEY": "OPENROUTER_SWOOSHZ_SQAG_API_KEY"
+    },
+    "not_used": [
+      "SQAG_INTERNAL_IDENTITY_BINDINGS_JSON"
+    ]
+  },
+  "run_values": {
+    "SQAG_PUBLIC_BASE_URL": "https://quote-rehearsal.<server-ip>.sslip.io (the rehearsal host)",
+    "SQAG_TRUSTED_PROXY_CIDRS": "The subnet of the server's Coolify proxy network, read on the server with docker network inspect.",
+    "REHEARSAL_IMAGE_ID": "The image id from the build record: the current live image first, then the candidate."
+  },
+  "generated_rules": {
+    "SESSION_SECRET": "At least 48 random characters.",
+    "SQAG_TRACKING_HMAC_KEY": "At least 48 random characters.",
+    "SQAG_INTERNAL_LOGIN_PASSWORD": "24 random characters, different from the admin password.",
+    "SQAG_INTERNAL_ADMIN_LOGIN_PASSWORD": "24 random characters, different from the staff password.",
+    "basic-auth": "One user and a 24-character random password for the Traefik basic auth on the rehearsal host."
+  },
+  "image_retention": "Keep the current live image, the previous live image and the candidate. Removing any other image or old container is a separate owner-approved server action.",
+  "workspace_id": "sqag-rehearsal"
+}
