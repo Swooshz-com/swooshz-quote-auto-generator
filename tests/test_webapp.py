@@ -27814,6 +27814,7 @@ function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
+function normalizeKnownDetailsSize(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
 function renderFiles() {}
@@ -28097,6 +28098,7 @@ function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
+function normalizeKnownDetailsSize(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
 function renderFiles() {}
@@ -28361,6 +28363,7 @@ function normalizeQuoteBasisSections(value = []) { return value; }
 function normalizeLineItem(value) { return value; }
 function normalizeOutputRow(value) { return value; }
 function normalizeBoothDimensions(value = {}) { return value; }
+function normalizeKnownDetailsSize(value = {}) { return value; }
 function normalizeAnalysisMode(value = "") { return value; }
 function normalizeActiveJob() { return null; }
 function renderFiles() {}
@@ -28969,6 +28972,7 @@ const normalizeLineItem = value => structuredClone(value);
 const normalizeOutputRow = value => structuredClone(value);
 const outputRowFromLineItem = value => normalizeOutputRow(value);
 const normalizeBoothDimensions = value => structuredClone(value);
+const normalizeKnownDetailsSize = value => structuredClone(value);
 const syntheticRevisionNumber = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 const renderFiles = () => {};
 const renderPricingMatches = () => {};
@@ -31120,6 +31124,7 @@ eval([
   "basisUnmatchedOffer",
   "basisPricingGroup",
   "detectedBoothSizeText",
+  "knownDetailsSizeProposalHtml",
   "quoteBasisHeaderHtml",
   "renderQuoteBasisMessage",
 ].map(extractFunction).join("\n"));
@@ -31321,6 +31326,7 @@ eval([
   "indexedBasisEntries",
   "basisAnalysisReferenceIsCurrentForPass",
   "detectedBoothSizeText",
+  "knownDetailsSizeProposalHtml",
             "basisLinePillLabel",
             "basisQuantityText",
             "basisQuantityDisplayLabel",

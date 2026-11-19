@@ -308,6 +308,8 @@ const state = {
   analysisFindings: [],
   blockingClarificationQuestions: [],
   boothDimensions: { ...DEFAULT_BOOTH_DIMENSIONS },
+  // Known details booth size the AI read: a proposal staff Apply or Discard, and their last decision.
+  knownDetailsSize: { proposal: null, decision: null },
   originalAnalysisSnapshot: null,
   standardServiceRows: newStandardServiceDecisions(),
   pricingLedgerRevisions: {},
@@ -443,6 +445,7 @@ const elements = {
   imageInput: qs("#imageInput"),
   imageUploadStatus: qs("#imageUploadStatus"),
   fileList: qs("#fileList"),
+  knownDetails: qs("#knownDetails"),
   quoteDashboardPanel: qs("#quoteDashboardPanel"),
   quoteFlowPanel: qs("#panel-analysis"),
   topbarBrandButton: qs("#topbarBrandButton"),
@@ -3832,7 +3835,25 @@ function normalizeBoothDimensions(project = {}) {
       dimension_source: project.dimension_source || "analysis",
     };
   }
+  // An area-only size (Known details "93 sqm", or a brief that gives only an area).
+  const area = Number(project.booth_area_sqm);
+  if (project.booth_area_sqm !== "" && project.booth_area_sqm != null && Number.isFinite(area) && area > 0) {
+    return {
+      booth_width: "",
+      booth_depth: "",
+      booth_size: project.booth_size || `${area} sqm`,
+      booth_area_sqm: String(area),
+      dimension_source: project.dimension_source || "analysis",
+    };
+  }
   return { ...DEFAULT_BOOTH_DIMENSIONS };
+}
+
+function handleKnownDetailsChange() {
+  // Staff edit the box and run analysis again; editing never clears the draft.
+  if (quoteSessionDraftStateCanSave()) {
+    queueQuoteSessionDraftStateSave({ quoteGenerated: Boolean(state.basisConfirmed || state.outputRows.length) });
+  }
 }
 
 function collectQuoteDetails() {
@@ -3849,6 +3870,7 @@ function collectQuoteDetails() {
     project: {
       title: elements.projectTitle.value.trim(),
       show_name: elements.showName?.value.trim() || "",
+      known_details: String(elements.knownDetails?.value || "").slice(0, 2000),
     },
     company: {
       name: elements.quoteCompanyName.value.trim(),
@@ -3923,6 +3945,7 @@ function applyQuoteDetails(details = {}, options = {}) {
   if (shouldApply(client, "address", partial)) setInputValue(elements.clientAddress, client.address);
   if (shouldApply(project, "title", partial)) setInputValue(elements.projectTitle, project.title);
   if (shouldApply(project, "show_name", partial)) setInputValue(elements.showName, project.show_name);
+  if (shouldApply(project, "known_details", partial)) setInputValue(elements.knownDetails, project.known_details);
   if (!partial || shouldApply(project, "booth_width", true) || shouldApply(project, "booth_depth", true)) {
     state.boothDimensions = normalizeBoothDimensions(project);
   }
@@ -4453,6 +4476,7 @@ function buildSessionSnapshot() {
     analysisFindings: state.analysisFindings,
     blockingClarificationQuestions: state.blockingClarificationQuestions,
     boothDimensions: state.boothDimensions,
+    knownDetailsSize: state.knownDetailsSize,
     originalAnalysisSnapshot: state.originalAnalysisSnapshot,
     // Only quotes started from #363 carry this record; older drafts keep their saved shape.
     ...standardServiceDecisionsForSave(),
@@ -5057,6 +5081,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.analysisFindings = Array.isArray(restoredState.analysisFindings) ? restoredState.analysisFindings : [];
   state.blockingClarificationQuestions = Array.isArray(restoredState.blockingClarificationQuestions) ? restoredState.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
+  state.knownDetailsSize = normalizeKnownDetailsSize(restoredState.knownDetailsSize);
   state.originalAnalysisSnapshot = restoredState.originalAnalysisSnapshot || null;
   state.standardServiceRows = normalizeStandardServiceDecisions(restoredState.standardServiceRows);
   const recoveredVersion = isOwnedBrowserSnapshot ? savedState.pricingDraftVersion : options.serverDraftVersion;
@@ -6055,6 +6080,7 @@ function clearCustomerDetails() {
   setInputValue(elements.projectTitle, "");
   setInputValue(elements.showName, "");
   state.boothDimensions = { ...DEFAULT_BOOTH_DIMENSIONS };
+  state.knownDetailsSize = { proposal: null, decision: null };
   setInputValue(elements.quoteDate, todayDateInputValue());
   applyQuoteDateFormatFromHtml("");
   setInputValue(elements.projectNumber, "");
@@ -6144,6 +6170,7 @@ function resetCurrentQuoteDraftState() {
   state.feedbackContextLoadPromise = null;
   state.feedbackContext = null;
   state.boothDimensions = { ...DEFAULT_BOOTH_DIMENSIONS };
+  state.knownDetailsSize = { proposal: null, decision: null };
   state.pendingFeedback = "";
   state.downloadFile = null;
   state.pdfFile = null;
@@ -9554,13 +9581,16 @@ function buildPayload(options = {}) {
   const project = {
     title: elements.projectTitle.value.trim(),
     show_name: elements.showName?.value.trim() || "",
+    known_details: String(elements.knownDetails?.value || "").slice(0, 2000),
   };
   if (includeBoothDimensions) {
     project.booth_width = state.boothDimensions.booth_width;
     project.booth_depth = state.boothDimensions.booth_depth;
     project.booth_size = state.boothDimensions.booth_size;
     project.dimension_source = state.boothDimensions.dimension_source;
+    if (state.boothDimensions.booth_area_sqm) project.booth_area_sqm = state.boothDimensions.booth_area_sqm;
   }
+  if (state.knownDetailsSize?.decision) project.known_details_size_decision = { ...state.knownDetailsSize.decision };
   return {
     profile_id: profileId,
     pricing_reference_id: pricingReferenceId,
@@ -12438,15 +12468,210 @@ function renderBasisTagLegend() {
 function detectedBoothSizeText(dimensionLines = []) {
   const dimensions = state.boothDimensions || {};
   if (!dimensions.dimension_source || dimensions.dimension_source === "default") return "";
+  const fromKnownDetails = dimensions.dimension_source === "staff";
+  const suffix = fromKnownDetails ? " (from Known details)" : "";
+  const format = (value) => value.toLocaleString(undefined, { maximumFractionDigits: 2 });
   const width = Number(dimensions.booth_width);
   const depth = Number(dimensions.booth_depth);
-  if (!(Number.isFinite(width) && width > 0 && Number.isFinite(depth) && depth > 0)) return "";
+  if (!(dimensions.booth_width !== "" && dimensions.booth_depth !== "" && Number.isFinite(width) && width > 0 && Number.isFinite(depth) && depth > 0)) {
+    const area = Number(dimensions.booth_area_sqm);
+    if (!(dimensions.booth_area_sqm && Number.isFinite(area) && area > 0)) return "";
+    return `Booth size ${format(area)} sqm${suffix}`;
+  }
   // The AI's own dimension line already states this footprint, so do not repeat it.
-  const restated = dimensionLines.some((line) => [...String(line).matchAll(/(\d+(?:\.\d+)?)\s*m?\s*[x\u00d7]\s*(\d+(?:\.\d+)?)/gi)]
+  // A Known details size is always shown, so staff can see their size won.
+  const restated = !fromKnownDetails && dimensionLines.some((line) => [...String(line).matchAll(/(\d+(?:\.\d+)?)(?:\s*m)?\s*[x\u00d7]\s*(\d+(?:\.\d+)?)/gi)]
     .some((match) => Number(match[1]) === width && Number(match[2]) === depth));
   if (restated) return "";
-  const format = (value) => value.toLocaleString(undefined, { maximumFractionDigits: 2 });
-  return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)`;
+  return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)${suffix}`;
+}
+
+// Owner decision INT-SQAG-202611190008: the booth size the AI read from Known details is offered
+// with the Re ("Revise basis line") proposal markup and its Discard/Apply controls. Nothing from it
+// applies until staff press Apply; the server sends the draft as it would be with the size applied.
+function normalizeKnownDetailsSizeProposal(value) {
+  if (!isPlainObject(value) || !isPlainObject(value.applied)) return null;
+  const boothSize = String(value.booth_size || "").trim().slice(0, 40);
+  const applied = value.applied;
+  if (!boothSize || !Array.isArray(applied.quote_basis_sections) || !Array.isArray(applied.line_items)
+    || !isPlainObject(applied.project)) return null;
+  const size = (key) => (Number.isFinite(Number(value[key])) && Number(value[key]) > 0 ? Number(value[key]) : null);
+  return { booth_width: size("booth_width"), booth_depth: size("booth_depth"), booth_area_sqm: size("booth_area_sqm"), booth_size: boothSize, applied };
+}
+
+function normalizeKnownDetailsSize(value) {
+  const decision = isPlainObject(value?.decision) && ["applied", "discarded"].includes(value.decision.decision)
+    ? { booth_size: String(value.decision.booth_size || "").trim().slice(0, 40), decision: value.decision.decision }
+    : null;
+  return { proposal: normalizeKnownDetailsSizeProposal(value?.proposal), decision: decision?.booth_size ? decision : null };
+}
+
+function knownDetailsSizeProposalHtml() {
+  const proposal = state.knownDetailsSize?.proposal;
+  if (!proposal) return "";
+  const source = state.boothDimensions?.dimension_source;
+  const current = source === "default" ? "" : String(state.boothDimensions?.booth_size || "");
+  return `
+    <div class="basis-chat-proposal" data-known-details-size-proposal>
+      <div class="basis-chat-proposal-header">
+        <div>
+          <span>Proposed change</span>
+          <strong>Booth size update</strong>
+        </div>
+        <span class="basis-chat-proposal-status">Review</span>
+      </div>
+      <p class="basis-chat-proposal-summary">Booth size from Known details: ${escapeHtml(proposal.booth_size)}</p>
+      ${current ? `
+      <div class="basis-chat-compare">
+        <div class="basis-chat-compare-card">
+          <span>Current</span>
+          <p>${escapeHtml(current)} (from ${source === "staff" ? "Known details" : "the references"})</p>
+        </div>
+        <div class="basis-chat-compare-card is-proposed">
+          <span>Proposed</span>
+          <p>${escapeHtml(proposal.booth_size)} (from Known details)</p>
+        </div>
+      </div>` : ""}
+    </div>
+    <div class="basis-chat-proposal-actions">
+      <button class="secondary-button" type="button" data-known-details-size="discard">Discard</button>
+      <button class="primary-button" type="button" data-known-details-size="apply">Apply</button>
+    </div>
+  `;
+}
+
+// Apply merges the applied draft into the current basis (G2 round 3 B1/B2). The applied draft differs
+// from the analysis only where the Known details size changes it (resized area lines, size notes), so
+// those differences go in; staff ticks and edits stay, and lines staff or standard service rows added
+// are kept. A line the applied draft no longer has is a note about the old size and is removed.
+function knownDetailsLineKey(sectionId, line = {}) {
+  const id = String(line?.id || "").trim();
+  return id ? `id:${id}` : `note:${sectionId}:${String(line?.text || "")}`;
+}
+
+function knownDetailsRowKey(row = {}) {
+  const id = String(row?.source_basis_line_id || "").trim();
+  return id ? `id:${id}` : `row:${String(row?.section || "")}:${String(row?.description || "")}`;
+}
+
+// A key used twice maps to null, so an ambiguous line is left as it is.
+function knownDetailsEntriesByKey(entries, keyOf) {
+  const byKey = new Map();
+  entries.forEach((entry) => {
+    const key = keyOf(entry);
+    byKey.set(key, byKey.has(key) ? null : entry);
+  });
+  return byKey;
+}
+
+// Field by field: a field staff left as analysed takes the applied value; a field they changed stays.
+function knownDetailsMergedFields(current = {}, base = {}, applied = {}) {
+  const merged = { ...current };
+  new Set([...Object.keys(base), ...Object.keys(applied)]).forEach((field) => {
+    if (JSON.stringify(current[field]) !== JSON.stringify(base[field])) return;
+    if (applied[field] === undefined) delete merged[field];
+    else merged[field] = applied[field];
+  });
+  return merged;
+}
+
+function knownDetailsMergedSections(currentSections = [], baseSections = [], appliedSections = []) {
+  const flatten = (sections) => sections.flatMap((section) => (section.lines || []).map((line) => ({ section, line })));
+  const lineKey = ({ section, line }) => knownDetailsLineKey(section.id, line);
+  const base = knownDetailsEntriesByKey(flatten(baseSections), lineKey);
+  const applied = knownDetailsEntriesByKey(flatten(appliedSections), lineKey);
+  const kept = new Set();
+  const sections = currentSections.map((section) => ({
+    ...section,
+    lines: (section.lines || []).flatMap((line) => {
+      const key = knownDetailsLineKey(section.id, line);
+      kept.add(key);
+      const before = base.get(key);
+      if (!before) return [line];
+      const after = applied.get(key);
+      if (after === undefined) return [];
+      return after ? [knownDetailsMergedFields(line, before.line, after.line)] : [line];
+    }),
+  }));
+  // New applied lines (the resize note) go after the line that precedes them in the applied draft.
+  appliedSections.forEach((appliedSection) => {
+    let anchor = "";
+    (appliedSection.lines || []).forEach((line) => {
+      const key = knownDetailsLineKey(appliedSection.id, line);
+      if (!base.has(key) && !kept.has(key)) {
+        let target = sections.find((section) => section.id === appliedSection.id);
+        if (!target) {
+          target = { ...appliedSection, lines: [] };
+          sections.push(target);
+        }
+        const index = anchor ? target.lines.findIndex((entry) => knownDetailsLineKey(target.id, entry) === anchor) : -1;
+        target.lines.splice(index >= 0 ? index + 1 : (anchor ? target.lines.length : 0), 0, line);
+        kept.add(key);
+      }
+      anchor = key;
+    });
+  });
+  return sections.filter((section) => (section.lines || []).length);
+}
+
+function knownDetailsMergedRows(currentRows = [], baseRows = [], appliedRows = []) {
+  const base = knownDetailsEntriesByKey(baseRows, knownDetailsRowKey);
+  const applied = knownDetailsEntriesByKey(appliedRows, knownDetailsRowKey);
+  const kept = new Set();
+  const rows = currentRows.flatMap((row) => {
+    const key = knownDetailsRowKey(row);
+    kept.add(key);
+    const before = base.get(key);
+    if (!before) return [row];
+    const after = applied.get(key);
+    if (after === undefined) return JSON.stringify(row) === JSON.stringify(before) ? [] : [row];
+    return after ? [normalizeLineItem(knownDetailsMergedFields(row, before, after))] : [row];
+  });
+  appliedRows.forEach((row) => {
+    const key = knownDetailsRowKey(row);
+    if (!base.has(key) && !kept.has(key)) rows.push(row);
+  });
+  return rows;
+}
+
+function applyKnownDetailsSize(proposal) {
+  const snapshot = isPlainObject(state.originalAnalysisSnapshot) ? state.originalAnalysisSnapshot : null;
+  const applied = proposal.applied;
+  const standardDecisions = currentStandardServiceDecisions();
+  // The applied draft as the analysis itself would have shown it: Confirm tags and standard rows.
+  const appliedSections = confirmOnlyQuoteBasisSections(applied.quote_basis_sections);
+  const appliedRows = withStandardServiceRows(appliedSections, applied.line_items.map((item) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
+  )).map(normalizeLineItem), standardDecisions).lineItems.map(normalizeLineItem);
+  // Without an analysis snapshot there is nothing staff changed to keep.
+  const baseSections = snapshot ? confirmOnlyQuoteBasisSections(snapshot.quote_basis_sections || []) : state.quoteBasisSections;
+  const baseRows = snapshot && Array.isArray(snapshot.line_items) ? snapshot.line_items : state.lineItems;
+  const sections = canonicalQuoteBasisSections(knownDetailsMergedSections(state.quoteBasisSections, baseSections, appliedSections));
+  state.quoteBasisSections = sections;
+  state.quoteBasis = { ...state.quoteBasis, ...quoteBasisFromSections(sections) };
+  state.lineItems = knownDetailsMergedRows(state.lineItems, baseRows, appliedRows);
+  applyStandardServiceRows(standardDecisions);
+  state.boothDimensions = normalizeBoothDimensions(applied.project);
+  captureOriginalAnalysisSnapshot({
+    ...applied, source: snapshot?.source, analysis_mode: snapshot?.analysis_mode, warnings: snapshot?.warnings,
+  }, appliedRows);
+}
+
+async function decideKnownDetailsSize(action) {
+  const proposal = state.knownDetailsSize?.proposal;
+  if (!proposal || appIsBusy() || !["apply", "discard"].includes(action)) return;
+  if (action === "apply") {
+    applyKnownDetailsSize(proposal);
+    state.basisConfirmed = false;
+    state.outputRows = [];
+    state.originalOutputRows = [];
+    setDownloadFiles([]);
+    markOutputRowsDirty();
+  }
+  state.knownDetailsSize = { proposal: null, decision: { booth_size: proposal.booth_size, decision: action === "apply" ? "applied" : "discarded" } };
+  updateQuoteBasisCard(action === "apply" ? "edited" : state.draftSource);
+  syncControlStates();
+  await saveQuoteSessionDraftState({ quoteGenerated: false });
 }
 
 // The card header. Its line counts change with a tick, so a single-line redraw renders it too.
@@ -12524,6 +12749,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
       ${renderBasisConfirmSummary(sections)}
       ${renderBasisTagLegend()}
       ${dimensionDisplay}
+      ${knownDetailsSizeProposalHtml()}
       ${reviewSections.length ? `
         ${["Matched", "Review", "Unmatched"].map((group) => `
         <div class="basis-review-grid" aria-label="${group}">
@@ -14465,12 +14691,12 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
   return result;
 }
 
-function captureOriginalAnalysisSnapshot(data = {}) {
+function captureOriginalAnalysisSnapshot(data = {}, lineItems = state.lineItems) {
   const sections = canonicalQuoteBasisSections(data.quote_basis_sections || data.quote_basis || state.quoteBasisSections);
   state.originalAnalysisSnapshot = {
     quote_basis_sections: cloneQuoteBasisSections(sections),
     quote_basis: { ...state.quoteBasis, ...quoteBasisFromSections(sections) },
-    line_items: state.lineItems.map(normalizeLineItem),
+    line_items: lineItems.map(normalizeLineItem),
     boothDimensions: { ...state.boothDimensions },
     source: data.source || state.draftSource || "",
     analysis_mode: normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode),
@@ -14521,6 +14747,7 @@ function openBlockingClarifications(questions = [], findings = [], project = {})
   state.originalOutputRows = [];
   state.basisConfirmed = false;
   state.boothDimensions = normalizeBoothDimensions(project || state.boothDimensions);
+  state.knownDetailsSize = { proposal: null, decision: state.knownDetailsSize?.decision || null };
   setDownloadFiles([]);
   setWorkflowStage("basis_review");
   renderClarificationQuestions();
@@ -14633,6 +14860,7 @@ function clearAiFailedDraftState() {
 
 function showAiFailedDraftState(data = {}) {
   clearAiFailedDraftState();
+  state.knownDetailsSize = { proposal: null, decision: state.knownDetailsSize?.decision || null };
   state.aiFailed = true;
   state.draftSource = data.source || "local";
   state.lastAnalysisMode = normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode);
@@ -17782,6 +18010,7 @@ async function handleDraftBasis(options = {}) {
   applyDraftLineItems(data.line_items || []);
   applyStandardServiceRows();
   state.boothDimensions = normalizeBoothDimensions(data.project || state.boothDimensions);
+  state.knownDetailsSize = { proposal: normalizeKnownDetailsSizeProposal(data.known_details_size_proposal), decision: state.knownDetailsSize?.decision || null };
   state.draftSource = data.source || "";
   state.lastAnalysisMode = normalizeAnalysisMode(data.analysis_mode || analysisMode);
   captureOriginalAnalysisSnapshot(data);
@@ -18314,6 +18543,7 @@ async function resumeSavedJob() {
     applyDraftLineItems(data.line_items || []);
     applyStandardServiceRows();
     state.boothDimensions = normalizeBoothDimensions(data.project || state.boothDimensions);
+    state.knownDetailsSize = { proposal: normalizeKnownDetailsSizeProposal(data.known_details_size_proposal), decision: state.knownDetailsSize?.decision || null };
     state.draftSource = data.source || "";
     captureOriginalAnalysisSnapshot(data);
     state.aiFailed = false;
@@ -18848,6 +19078,11 @@ async function goToNextSidePanel(options = {}) {
 }
 
 function handleQuoteBasisClick(event) {
+  const knownDetailsSizeButton = event.target.closest("[data-known-details-size]");
+  if (knownDetailsSizeButton) {
+    decideKnownDetailsSize(knownDetailsSizeButton.dataset.knownDetailsSize || "");
+    return;
+  }
   const quantityEdit = event.target.closest("[data-basis-quantity-edit]");
   if (quantityEdit) {
     openBasisQuantityEditor(quantityEdit);
@@ -19371,6 +19606,7 @@ function wireEvents() {
     exportCurrentPreset(event);
   });
   elements.clearCustomerButton.addEventListener("click", clearCustomerDetails);
+  elements.knownDetails?.addEventListener("input", handleKnownDetailsChange);
   elements.clearQuoteCompanyButton.addEventListener("click", clearQuoteCompanyDetails);
   [
     elements.clientName,

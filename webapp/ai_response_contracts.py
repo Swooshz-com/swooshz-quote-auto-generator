@@ -72,6 +72,10 @@ class Field:
     nonblank: bool = False
     positive: bool = False
     decimal_wire: bool = False
+    # Object only: at least one key group must be fully present and non-null.
+    require_any: tuple[tuple[str, ...], ...] = ()
+    # Nullable only: a reply from before the field existed may leave it out.
+    optional: bool = False
 
     def schema(self):
         result = {"type": [self.kind, "null"] if self.nullable else self.kind}
@@ -90,6 +94,8 @@ class Field:
             line += "; allowed values " + ", ".join(self.enum)
         if self.kind == "object":
             line += "; requires " + ", ".join(key for key, _ in self.fields) + "; no other fields"
+            if self.require_any:
+                line += "; non-null " + ", or ".join(" and ".join(group) for group in self.require_any)
         if self.instruction:
             line += "; " + self.instruction
         if self.minimum is not None:
@@ -131,8 +137,13 @@ class Field:
         if self.kind == "object":
             if set(value) - {key for key, _ in self.fields}:
                 raise ContractViolation()
+            if self.require_any and not any(
+                    all(value.get(key) is not None for key in group) for group in self.require_any):
+                raise ContractViolation()
             for key, field in self.fields:
                 child = f"{path}.{key}" if path else key
+                if key not in value and field.optional and field.nullable:
+                    continue
                 if key not in value:
                     missing.append(ContractViolation(field.missing_reason or "schema_shape",
                         child if field.missing_reason else ""))
@@ -154,8 +165,8 @@ class Field:
         return value
 
 
-def obj(**fields):
-    return Field("object", fields=tuple(fields.items()))
+def obj(_require_any=(), **fields):
+    return Field("object", fields=tuple(fields.items()), require_any=tuple(tuple(group) for group in _require_any))
 
 
 @dataclass(frozen=True)
@@ -222,7 +233,21 @@ class ResponseContract:
 
 
 DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
-    project=obj(booth_width=Field("number", positive=True), booth_depth=Field("number", positive=True)),
+    # An area-only reply (#385) is allowed; a project with no size at all is not.
+    project=obj(
+        (("booth_width", "booth_depth"), ("booth_area_sqm",)),
+        booth_width=Field("number", nullable=True, positive=True),
+        booth_depth=Field("number", nullable=True, positive=True),
+        booth_area_sqm=Field("number", nullable=True, positive=True, optional=True,
+                             instruction="floor area in sqm when only an area is known"),
+        # Owner (19 Nov 2026): the booth size staff state in Known details, as the AI reads it.
+        staff_booth_size=Field("object", nullable=True, optional=True, fields=(
+            ("booth_width", Field("number", nullable=True, positive=True)),
+            ("booth_depth", Field("number", nullable=True, positive=True)),
+            ("booth_area_sqm", Field("number", nullable=True, positive=True)),
+            ("stated", Field("string", enum=("clear", "unclear", "none"))),
+        ), instruction="booth size stated in staff_confirmed_facts, numbers as written"),
+    ),
     quote_basis_sections=Field("array", item=obj(
         id=Field("string", nonblank=True), title=Field("string", nonblank=True),
         lines=Field("array", missing_reason="basis_rows_shape", item=obj(
