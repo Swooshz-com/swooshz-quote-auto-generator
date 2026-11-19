@@ -7632,15 +7632,16 @@ function standardServiceDecisionsForSave() {
 }
 
 // The words a standard row's section title and line share ("project management", "waste disposal").
-// A suggested line whose own words and section title contain all of them offers the same service.
+// A suggested line whose own words contain all of them offers the same service. The section title is not
+// used: every unrelated line under a title such as "Project Management" would match and lose its price.
 function standardServiceCoreTerms(row) {
   const lineTerms = new Set(sectionTitleKey(row.text).split(" ").filter(Boolean));
   return sectionTitleKey(row.title).split(" ").filter((term) => term && lineTerms.has(term));
 }
 
-function standardServiceDuplicate(sectionTitle, line = {}) {
+function standardServiceDuplicate(line = {}) {
   if (basisLineIsInformationalDimension(line)) return false;
-  const terms = new Set(`${sectionTitleKey(sectionTitle)} ${sectionTitleKey(line.text || "")}`.split(" ").filter(Boolean));
+  const terms = new Set(sectionTitleKey(line.text || "").split(" ").filter(Boolean));
   return STANDARD_SERVICE_ROWS.some((row) => {
     const core = standardServiceCoreTerms(row);
     return core.length > 0 && core.every((term) => terms.has(term));
@@ -7672,7 +7673,7 @@ function withStandardServiceRows(sections = [], lineItems = [], decisions = null
   const keptSections = (Array.isArray(sections) ? sections : []).flatMap((section) => {
     if (reservedIds.has(section?.id)) return [];
     const lines = (section?.lines || []).filter((line) => {
-      if (!reservedIds.has(line?.id) && !standardServiceDuplicate(section.title, line)) return true;
+      if (!reservedIds.has(line?.id) && !standardServiceDuplicate(line)) return true;
       [line?.id, line?.source_line_item_id].filter(Boolean).forEach((id) => removedIds.add(String(id)));
       return false;
     });

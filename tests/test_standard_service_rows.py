@@ -18,11 +18,14 @@ def line(line_id, text, *, tag="Include", quantity=1, unit="nos"):
     return {"id": line_id, "tag": tag, "text": text, "quantity": quantity, "unit": unit, "confidence": 80}
 
 
-def row(line_id, section, description, keyword):
-    return {
-        "section": section, "description": description, "quantity": 1, "unit": "nos",
+def row(line_id, section, description, keyword, *, quantity=1, unit="nos", price=None):
+    item = {
+        "section": section, "description": description, "quantity": quantity, "unit": unit,
         "source_basis_line_id": line_id, "pricing_keyword": keyword,
     }
+    if price is not None:
+        item["catalog_price"] = price  # the harness gives the row a catalogue pricing authority at this price
+    return item
 
 
 # An analysis result whose suggestions include the same two services in its own words, plus lines that only
@@ -50,6 +53,27 @@ SECOND_ANALYSIS = {
     ],
     "line_items": [row("wall-2", "Booth structure", "Back wall", "wall"), row("disposal", "Services", "Disposal", "waste")],
 }
+
+# Catalogue-priced lines that are not the standard services, in sections whose titles hold both core words.
+TITLED_SECTIONS = {
+    "quote_basis_sections": [
+        {"id": "pm", "title": "Project Management", "lines": [
+            line("supervisor", "On-site supervisor during build-up", quantity=2, unit="day"),
+        ]},
+        {"id": "cleaning", "title": "Waste disposal & cleaning", "lines": [
+            line("daily-clean", "Daily booth cleaning during show days", quantity=3, unit="day"),
+            line("skip", "Skip bin hire"),
+        ]},
+        {"id": "design", "title": "Design & project management", "lines": [line("renders", "3D design renders")]},
+    ],
+    "line_items": [
+        row("supervisor", "Project Management", "On-site supervisor", "supervisor", quantity=2, unit="day", price=150),
+        row("daily-clean", "Waste disposal & cleaning", "Daily booth cleaning", "cleaning", quantity=3, unit="day", price=80),
+        row("skip", "Waste disposal & cleaning", "Skip bin hire", "skip", price=200),
+        row("renders", "Design & project management", "3D design renders", "render", price=500),
+    ],
+}
+TITLED_SECTIONS_TOTAL = 2 * 150 + 3 * 80 + 200 + 500
 
 
 class StandardServiceRowsTest(unittest.TestCase):
@@ -101,6 +125,21 @@ class StandardServiceRowsTest(unittest.TestCase):
             )
             self.assertEqual(step["saved"], {"standardServiceRows": {PM: "Confirm", WASTE: "Confirm"}})
 
+    def test_unrelated_priced_lines_stay_whatever_their_section_title_says(self):
+        # Only a line's own words can make it the same service as a standard row. A section title such as
+        # "Project Management" says nothing about its other lines, which keep their price and the total.
+        result = self.run_steps([{"adopt": TITLED_SECTIONS}, {"tag": {"id": PM, "tag": "Include"}}, {"reset": True}])
+        priced = ["supervisor", "daily-clean", "skip", "renders"]
+        for step in result["steps"]:
+            self.assertEqual(self.line_ids(step), priced + [PM, WASTE])
+            kept = [item for item in step["line_items"] if item["source_basis_line_id"] in priced]
+            self.assertEqual(
+                [(item["source_basis_line_id"], item["variant"], item["price"]) for item in kept],
+                [("supervisor", "catalog", 150), ("daily-clean", "catalog", 80), ("skip", "catalog", 200), ("renders", "catalog", 500)],
+            )
+            # The standard rows add zero, so the total is the analysis's own.
+            self.assertEqual(step["priced_total"], TITLED_SECTIONS_TOTAL)
+
     def test_tick_and_x_survive_reanalyse_reset_and_reopen(self):
         result = self.run_steps([
             {"adopt": FIRST_ANALYSIS},
@@ -149,6 +188,29 @@ class StandardServiceRowsTest(unittest.TestCase):
             self.assertIsNone(step["decisions"])
             # Saving it adds no decisions record, so it stays an older draft.
             self.assertEqual(step["saved"], {})
+
+    def test_older_draft_reopened_through_the_page_restore_gets_no_rows_after_reset_or_reanalyse(self):
+        # A draft saved before this change has no standardServiceRows key. Reopened through the page's own
+        # restore (applyQuoteSessionSnapshot), it gets no rows and no record, through Reset and Re-Analyse too.
+        older_draft = {
+            "quoteBasisSections": FIRST_ANALYSIS["quote_basis_sections"],
+            "lineItems": FIRST_ANALYSIS["line_items"],
+        }
+        result = self.run_steps([{"reopen": older_draft}, {"reset": True}, {"adopt": SECOND_ANALYSIS}, {"reset": True}])
+        reopened, reset, reanalysed, reset_again = result["steps"]
+        for step in (reopened, reset):
+            self.assertEqual(self.line_ids(step), ["wall", "bin-graphic", "signage-pm", "pm-line", "cleanup"])
+        for step in (reanalysed, reset_again):
+            self.assertEqual(self.line_ids(step), ["wall-2", "disposal"])
+        for step in result["steps"]:
+            self.assertFalse({PM, WASTE} & set(self.line_ids(step)))
+            self.assertIsNone(step["decisions"])
+            self.assertEqual(step["saved"], {})
+
+        # The same restore reads a saved record, so a quote started after this change keeps its decisions.
+        newer_draft = {**older_draft, "standardServiceRows": {PM: "Include", WASTE: "Exclude"}}
+        reanalysed = self.run_steps([{"reopen": newer_draft}, {"adopt": SECOND_ANALYSIS}])["steps"][1]
+        self.assert_standard_rows(reanalysed, "Include", "Exclude")
 
     def test_saved_record_is_read_strictly(self):
         result = self.run_steps([
