@@ -54,7 +54,7 @@ async function check(mode) {
     restoreRestorableOverlay: () => calls.push(['overlay']),
   };
   vm.createContext(c);
-  vm.runInContext(readiness + boot, c);
+  vm.runInContext(readiness + extract('workspaceViewIsFromEarlierSignIn') + boot, c);
   const result = c.boot();
   if (mode === 'pending') {
     await new Promise(setImmediate);

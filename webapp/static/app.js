@@ -9917,11 +9917,14 @@ function showGeneratedExportReadyModal(viewPdf = false) {
   return true;
 }
 
-async function handleGeneratedExportReadyAction() {
+function handleGeneratedExportReadyAction() {
   if (commitActiveOutputEditor() === "blocked") return false;
   const action = elements.excelGeneratingActionButton?.dataset.exportAction || "";
-  const handled = action === "pdf" ? await viewCurrentPdfFile() : action === "excel" ? await downloadCurrentExcelFile() : false;
-  if (handled || authenticationRecoveryNavigating()) hideExcelGeneratingModal();
+  const handled = action === "pdf" ? viewCurrentPdfFile() : action === "excel" ? downloadCurrentExcelFile() : false;
+  if (handled === true) hideExcelGeneratingModal();
+  // Excel checks the session before it downloads; close the dialog once it
+  // downloaded or sign-in took over.
+  else if (handled) handled.then((done) => { if (done || authenticationRecoveryNavigating()) hideExcelGeneratingModal(); });
 }
 
 function generatedExportReadyModalIsOpen() {
@@ -10002,19 +10005,15 @@ async function downloadCurrentExcelFile(file = state.downloadFile) {
   return true;
 }
 
-async function viewCurrentPdfFile(file = state.pdfFile) {
+function viewCurrentPdfFile(file = state.pdfFile) {
   if (commitActiveOutputEditor() === "blocked") return false;
   if (!file?.url) return false;
-  // Open the tab inside the click so pop-up blocking is unchanged, then load
-  // the PDF only after the session check.
-  const opened = window.open("", "_blank");
-  if (!await sessionAllowsDownload()) {
-    if (opened && !opened.closed) opened.close();
-    return false;
-  }
-  if (opened && !opened.closed) {
-    opened.opener = null;
-    opened.location.replace(file.url);
+  const opened = window.open(file.url, "_blank");
+  if (opened) {
+    window.setTimeout(() => {
+      if (!opened.closed) opened.opener = null;
+    }, 0);
+    void closePdfTabIfSessionEnded(opened);
     return true;
   }
   const link = document.createElement("a");
@@ -10024,7 +10023,15 @@ async function viewCurrentPdfFile(file = state.pdfFile) {
   document.body.appendChild(link);
   link.click();
   link.remove();
+  void closePdfTabIfSessionEnded(null);
   return true;
+}
+
+// The PDF tab opens inside the click so pop-up blocking is unchanged. If the
+// session has ended, close it again; the check sends this page to sign-in.
+async function closePdfTabIfSessionEnded(opened) {
+  if (await sessionAllowsDownload()) return;
+  if (opened && !opened.closed) opened.close();
 }
 
 async function handleViewPdf(event) {
