@@ -34663,6 +34663,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/session":
             session = self.current_auth_session()
+            sign_in_id = internal_sign_in_id(session) if internal_password_mode_enabled() else ""
             self.send_json({
                 "csrf_header": configured_csrf_header_name(),
                 "csrf_token": csrf_token_for_cookie_header(self.headers.get("Cookie", ""), auth_state=self.server.internal_auth),
@@ -34671,7 +34672,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "permissions": self.current_permissions(),
                 "user": None if internal_password_mode_enabled() else (session.get("user") if session else None),
                 **({"staff_identity": self.current_staff_identity(session)} if internal_password_mode_enabled() else {}),
-                **({"sign_in_id": internal_sign_in_id(session)} if internal_password_mode_enabled() and internal_sign_in_id(session) else {}),
+                **({"sign_in_id": sign_in_id} if sign_in_id else {}),
                 "browser_recovery_scope": browser_recovery_scope(session),
             })
             return
@@ -36693,10 +36694,11 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
         if getattr(self, "_session_cookie_written", False) or getattr(self, "_session_cookie_renewal_done", False):
             return
         self._session_cookie_renewal_done = True
-        if urlparse(self.path).path in {"/login", "/logout"} or not internal_password_mode_enabled():
-            return
+        # Checked first: an error reply for an unparsable request line has no path.
         session = getattr(self, "_validated_auth_session", None)
         if not isinstance(session, dict) or session.get("auth_mode") != INTERNAL_AUTH_MODE:
+            return
+        if urlparse(self.path).path in {"/login", "/logout"} or not internal_password_mode_enabled():
             return
         raw = cookies_from_header(self.headers.get("Cookie", "")).get(SESSION_COOKIE_NAME, "")
         if not raw or not self.server.internal_auth.claim_cookie_renewal(session.get("session_id")):

@@ -241,7 +241,7 @@ try {
     await onDashboard(idlePage);
     const loginCookie = (await idle.cookies()).find(cookie => cookie.name === "swooshz_quote_session");
     assert.ok(loginCookie && loginCookie.httpOnly && loginCookie.sameSite === "Lax" && loginCookie.path === "/");
-    assert.ok(loginCookie.expires - Date.now() / 1000 > 4 * 24 * HOUR - 120, "Cookie lasts the 3-day idle limit plus one day");
+    assert.ok(loginCookie.expires - Date.now() / 1000 > 400 * 24 * HOUR - 120, "Cookie lasts 400 days, so the ended note can show after any absence");
     // E2: used every 48 h, the session never ends.
     for (const step of [1, 2]) {
       await advanceClock(48 * HOUR);
@@ -370,6 +370,59 @@ try {
       await idlePage.waitForURL(base + "/login").catch(async error => {
         throw new Error(label + " did not reach sign-in: " + JSON.stringify(await Promise.race([outcome, Promise.resolve("pending")])) + " " + error.message.split(String.fromCharCode(10))[0]);
       });
+      assert.deepEqual(failures, [], label + " showed a failure before sign-in");
+      assert.deepEqual(blocked, []);
+      await idle.close();
+    }
+  }
+  {
+    // E9: after the session really ended (server clock past 72 h), downloads,
+    // the PDF tab and feedback submit go to sign-in: no file, no tab left open.
+    const xlsxUrl = "/api/quote-sessions/quote-idle-fixture/exports/quotation.xlsx";
+    const actions = [
+      ["Excel download", null, page => page.evaluate(url => {
+        state.outputRevision = 1;
+        state.downloadFileRevision = 1;
+        return downloadCurrentExcelFile({ url, name: "quotation.xlsx" });
+      }, xlsxUrl)],
+      ["PDF tab", null, page => page.evaluate(() => viewCurrentPdfFile({ url: "/api/quote-sessions/quote-idle-fixture/view/pdf" }))],
+      ["pricing reference template", page => page.evaluate(() => canManagePricingReferences()),
+        page => page.evaluate(() => downloadPricingReferenceTemplate({ preventDefault() {} }))],
+      ["pricing reference export", page => page.evaluate(() => {
+        deletionPricingReference = () => ({ id: "reference-idle", source: "company", label: "Idle reference" });
+        return pricingReferenceExportBlockReason() === "";
+      }), page => page.evaluate(() => exportSelectedPricingReference({ preventDefault() {} }))],
+      ["feedback submit", page => page.evaluate(async () => {
+        // Opened while signed in (it loads its context), submitted after the end.
+        await showFeedbackModal();
+        elements.feedbackShortTitle.value = "Synthetic idle feedback";
+        elements.feedbackMessage.value = "Synthetic message after the session ended.";
+        return !elements.feedbackModal.hidden && elements.feedbackForm.checkValidity();
+      }), page => page.evaluate(() => submitFeedback({ preventDefault() {} }))],
+    ];
+    for (const [label, prepare, act] of actions) {
+      const { idle, idlePage, blocked } = await idleContext();
+      await idlePage.route("**/api/quote-sessions", route => route.request().method() === "GET"
+        ? route.fulfill({ json: { quote_sessions: idleQuotes } }) : route.fallback());
+      await signIn(idlePage, base);
+      await onDashboard(idlePage);
+      if (prepare) assert.equal(await prepare(idlePage), true, label + " was not ready to run");
+      await advanceClock(72 * HOUR + 1);
+      let downloads = 0;
+      const tabs = [];
+      idle.on("page", tab => tabs.push(tab));
+      idlePage.on("download", () => { downloads++; });
+      const failures = [];
+      await idlePage.exposeFunction("recordVisibleFailure", text => failures.push(text));
+      await idlePage.evaluate(() => new MutationObserver(() => {
+        const text = elements.messageList.textContent.trim();
+        if (text) window.recordVisibleFailure(text);
+      }).observe(elements.messageList, { childList: true, subtree: true }));
+      void act(idlePage).catch(() => {});
+      await endedSignInPage(idlePage);
+      assert.equal(downloads, 0, label + " downloaded a file after the session ended");
+      for (const tab of tabs) if (!tab.isClosed()) await tab.waitForEvent("close");
+      assert.equal(tabs.length, label === "PDF tab" ? 1 : 0, label + " opened an unexpected tab");
       assert.deepEqual(failures, [], label + " showed a failure before sign-in");
       assert.deepEqual(blocked, []);
       await idle.close();
