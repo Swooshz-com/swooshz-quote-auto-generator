@@ -9,6 +9,10 @@ const PRICING_REFERENCE_DIGEST_RE = eval(digestValidatorSource[1]);
 const whitespaceSource = source.match(/^const PRICING_AUTHORITY_WHITESPACE_RE = (.+);$/m);
 assert.ok(whitespaceSource, "Missing production canonical whitespace expression");
 const PRICING_AUTHORITY_WHITESPACE_RE = eval(whitespaceSource[1]);
+const addedFieldsSource = source.match(/^const CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS = (.+);$/m);
+assert.ok(addedFieldsSource, "Missing production Customer checkpoint added-field defaults");
+const CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS = eval(addedFieldsSource[1]);
+const knownDetailsField = 'known_details: String(elements.knownDetails?.value || "").slice(0, 2000),';
 function extract(name) {
   const match = new RegExp(`(?:async )?function ${name}\\(`).exec(source);
   assert.ok(match, `Missing production function ${name}`);
@@ -72,8 +76,10 @@ function collectQuoteDetails() {
   return {quote_date: elements.quoteDate.value, project_number: elements.projectNumber.value,
     client: {name: elements.clientName.value, attention: elements.clientAttention.value,
       title: elements.clientTitle.value, address: elements.clientAddress.value},
-    project: {title: elements.projectTitle.value, show_name: elements.showName.value}};
+    project: {title: elements.projectTitle.value, show_name: elements.showName.value,
+      known_details: String(elements.knownDetails?.value || "").slice(0, 2000)}};
 }
+assert.ok(extract("collectQuoteDetails").includes(knownDetailsField), "The Customer details stand-in no longer matches production Known details");
 function currentBrowserRecoveryScope() {return scope;}
 function currentGenerator() { return {label: "Synthetic", intakeSubtitle: "Synthetic", analyzeLabel: "Start Analysis"}; }
 function currentProfile() {return {label: "Synthetic Profile"};}
@@ -178,7 +184,8 @@ const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading",
   "validQuoteDraftVersion", "validPricingLedgerReceipt", "unchangedDraftLedgerMatches", "requireQuoteDraftReopen",
   "saveQuoteSessionDraftState", "quoteSessionDraftStateCanSave", "quoteSessionSaveFailureFrom",
   "markQuoteSessionDraftSaveStartedAfterCustomerStep", "quoteSessionDraftReachedCustomerStep",
-  "quoteCommercialStrictDataEqual", "customerStepCheckpointForCurrent", "customerStepCheckpointIsCurrent",
+  "quoteCommercialStrictDataEqual", "customerStepCheckpointForCurrent", "customerStepCheckpointWithAddedFieldDefaults",
+  "customerStepCheckpointIsCurrent",
   "customerNextBlockReason",
   "checkpointGatedSidePanel", "advanceCustomerStep", "sidePanelBlockReason", "setSidePanel",
   "activeSidePanelIndex", "updateSidePanelNav", "appIsBusy", "appBusyTitle", "quoteOutputProgressForNavigation",
@@ -204,6 +211,7 @@ function fresh() {
   elements.quoteDate.value = "2026-10-13";
   elements.quoteDependencyConfirmModal.hidden = true;
   elements.clientName.value = "Synthetic Customer";
+  elements.knownDetails.value = "";
   state.headerLogo = {data_url: "synthetic"};
   updateSidePanelNav();
 }
@@ -294,6 +302,38 @@ function control(name, action) {action(); controls.push(name);}
     fresh(); state.pricingReferenceId = "reference-b"; state.customerStepCheckpoint = clone(checkpoint); change();
     control(`${name} checkpoint cannot restore or rail-forward`, () => {
       state.outputRows = [{}];
+      assert.strictEqual(setSidePanel("quote_company"), false);
+      assert.strictEqual(restoredQuoteSessionSidePanel({activeSidePanel: "output"}), "customer");
+    });
+  }
+  // #385: quotes saved before the Known details box have no known_details in their checkpoint.
+  assert.strictEqual(checkpoint.customer.project.known_details, "", "the saved checkpoint carries the empty Known details box");
+  const olderCheckpoint = clone(checkpoint);
+  delete olderCheckpoint.customer.project.known_details;
+  fresh(); state.pricingReferenceId = "reference-b"; state.customerStepCheckpoint = clone(olderCheckpoint);
+  control("older checkpoint without Known details restores and rail-forwards", () => {
+    state.outputRows = [{}];
+    assert.strictEqual(customerStepCheckpointIsCurrent(), true);
+    assert.strictEqual(restoredQuoteSessionSidePanel({activeSidePanel: "output"}), "output");
+    assert.strictEqual(restoredQuoteSessionSidePanel({activeSidePanel: "customer", outputRows: [{}]}, {restoreFurthestPanel: true}), "output");
+    assert.strictEqual(setSidePanel("quote_company"), true);
+    assert.deepStrictEqual(state.customerStepCheckpoint, olderCheckpoint, "the saved record is read, never rewritten");
+  });
+  for (const [name, saved, change] of [
+    ["older checkpoint, Known details typed since", olderCheckpoint, () => {elements.knownDetails.value = "Booth is 93 sqm";}],
+    ["older checkpoint, changed Customer", olderCheckpoint, () => {elements.clientName.value = "Changed Synthetic Customer";}],
+    ["older checkpoint, changed show name", olderCheckpoint, () => {elements.showName.value = "Changed Synthetic Show";}],
+    ["saved Known details cleared since", {...checkpoint, customer: {...checkpoint.customer,
+      project: {...checkpoint.customer.project, known_details: "Booth is 93 sqm"}}}, () => {}],
+    ["saved empty Known details, typed since", checkpoint, () => {elements.knownDetails.value = "Booth is 93 sqm";}],
+    ["saved null Known details", {...checkpoint, customer: {...checkpoint.customer,
+      project: {...checkpoint.customer.project, known_details: null}}}, () => {}],
+    ["older checkpoint without project", {...checkpoint, customer: {...checkpoint.customer, project: undefined}}, () => {}],
+  ]) {
+    fresh(); state.pricingReferenceId = "reference-b"; state.customerStepCheckpoint = clone(saved); change();
+    control(`${name} reopens at Customer`, () => {
+      state.outputRows = [{}];
+      assert.strictEqual(customerStepCheckpointIsCurrent(), false);
       assert.strictEqual(setSidePanel("quote_company"), false);
       assert.strictEqual(restoredQuoteSessionSidePanel({activeSidePanel: "output"}), "customer");
     });

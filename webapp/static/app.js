@@ -44,6 +44,8 @@ const QUOTE_COMMERCIAL_PRESENCE_VALUES = new Set(["captured", "intentional_empty
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const PRICING_REFERENCE_ID_RE = /^[A-Za-z0-9_-]+$/;
 const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+// Customer-step checkpoint fields added after quotes were first saved, with the value a quote saved before then means.
+const CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS = Object.freeze([Object.freeze({ path: Object.freeze(["customer", "project", "known_details"]), value: "" })]);
 const PRICING_AUTHORITY_SCHEMA = "swooshz.pricing-authority.v1";
 const PRICING_AUTHORITY_VERSION = 1;
 const PRICING_AUTHORITY_VARIANTS = new Set(["none", "historical", "manual", "catalog", "included"]);
@@ -18749,8 +18751,28 @@ function customerStepCheckpointForCurrent() {
   };
 }
 
+// A quote saved before a Customer-step field existed has no value for it. Fill only those missing
+// fields with the value the older quote meant (an empty box); a saved field still compares exactly.
+function customerStepCheckpointWithAddedFieldDefaults(checkpoint) {
+  let upgraded = checkpoint;
+  for (const { path, value } of CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS) {
+    const parents = [upgraded];
+    for (const key of path.slice(0, -1)) {
+      const parent = parents[parents.length - 1];
+      parents.push(isPlainObject(parent) ? parent[key] : undefined);
+    }
+    const key = path[path.length - 1];
+    const owner = parents[parents.length - 1];
+    if (!isPlainObject(owner) || Object.prototype.hasOwnProperty.call(owner, key)) continue;
+    let filled = { ...owner, [key]: value };
+    for (let index = path.length - 2; index >= 0; index -= 1) filled = { ...parents[index], [path[index]]: filled };
+    upgraded = filled;
+  }
+  return upgraded;
+}
+
 function customerStepCheckpointIsCurrent() {
-  const checkpoint = state.customerStepCheckpoint;
+  const checkpoint = customerStepCheckpointWithAddedFieldDefaults(state.customerStepCheckpoint);
   const current = customerStepCheckpointForCurrent();
   return Boolean(!state.customerStepCheckpointSaveBusy
     && !pendingPricingReferenceSelectionChanged()
