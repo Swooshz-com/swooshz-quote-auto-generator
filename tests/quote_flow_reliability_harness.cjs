@@ -378,6 +378,7 @@ async function lifecycleCases() {
     c.normalizeActiveJob = value => value;
     c.newClientOperationId = () => "operation-test";
     c.basisConfirmBlockReason = () => "";
+    c.fillPredictedBasisQuantities = () => {};
     c.missingDetailFields = () => [];
     c.clearActiveJob = () => { state.activeJob = null; };
     c.showBlockedBasisAction = () => {};

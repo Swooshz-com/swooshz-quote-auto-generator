@@ -20,14 +20,18 @@ replaceOnce('import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthe
   `import { SyntheticBrowserBoundary, freshBrowserRun } from ${local('synthetic-browser-boundary.mjs')};`);
 // One section (Lighting and Electrical) lands in all three pricing groups, plus blank-quantity catalogue picks.
 replaceOnce('const cases = [', `const cases = [
-  { id: "g-matched", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light" },
+  { id: "g-matched", kind: "confirm", section: "Lighting and Electrical", text: "LED Flood Light", quantity: 3, unit: "nos", claim: "LED Flood Light", estimate: { quantity: 3, unit: "nos" } },
   { id: "g-unmatched", kind: "unmatched", section: "Lighting and Electrical", text: "Kinetic sculpture", quantity: 2, unit: "nos" },
   { id: "g-review", kind: "review", section: "Lighting and Electrical", text: "Bespoke neon signage with custom lettering", quantity: 1, unit: "lot", rawUnit: "" },
   { id: "q-blank-graphic", kind: "blank", section: "Graphics and Printing", text: "[ sqm Printed Wall Graphic ] - Printed graphic on rear feature wall, size pending approval", quantity: null, unit: "" },
-  { id: "q-blank-unknown", kind: "blank", section: "Graphics and Printing", text: "[ sqm Holographic Wall Wrap ] - Side wall wrap, size pending approval", quantity: null, unit: "" },`);
+  { id: "q-blank-unknown", kind: "blank", section: "Graphics and Printing", text: "[ sqm Holographic Wall Wrap ] - Side wall wrap, size pending approval", quantity: null, unit: "" },
+  { id: "q-blank-fill", kind: "blank", section: "Graphics and Printing", text: "Hanging banner over the counter", quantity: null, unit: "" },
+  { id: "q-blank-kw", kind: "confirm", section: "Graphics and Printing", text: "Printed Fabric Banner", quantity: null, unit: "", claim: "Printed Fabric Banner" },`);
 // The AI names a catalogue item but measures nothing, so it emits no line item for those lines.
 replaceOnce('const scenarioPath = path.join(runRoot, "scenario.json");', `lineItems.splice(0, lineItems.length, ...lineItems.filter((item) => !String(item.source_basis_line_id || "").startsWith("q-blank")));
 const scenarioPath = path.join(runRoot, "scenario.json");`);
+// A size the server predicted carries quantity_estimate, which the Quote Basis shows as "Est." (owner 17:18Z, 18 Nov).
+replaceOnce('confidence_pct: 82 };', 'confidence_pct: 82, ...(entry.estimate ? { quantity_estimate: entry.estimate } : {}) };');
 replaceOnce('line_items: lineItems } }', 'line_items: lineItems, project: { booth_width: 9, booth_depth: 10.5 } } }');
 replaceOnce('try {\n  server = startServer();', 'carrier: try {\n  server = startServer();');
 replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = draftLines.length;
@@ -149,13 +153,39 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     const slow = Object.entries(timing).filter(([, value]) => value.medianProcessingMs > 150);
     assert(!slow.length, "basis click handler exceeded its latency budget", timing);
     assert(reused === probes, "unchanged basis rows were rebuilt by a click", result.latency);
-    // 5. Blank-quantity catalogue picks keep the named item and its price and ask only for the quantity.
+    // 5. Quantities read as plain text; clicking one opens its box (owner 18 Nov 2026: editable inline,
+    // without Re, but not looking like a form by default). Blank-quantity catalogue picks keep the named
+    // item and its price and ask only for the quantity.
+    const openQuantity = async (id) => {
+      const row = await rowFor(id);
+      await row.locator("[data-basis-quantity-edit]").click();
+      const input = row.locator("input.basis-quantity-input");
+      await input.waitFor({ state: "visible", timeout: 5000 });
+      return input;
+    };
+    assert(await surface.locator("input.basis-quantity-input").count() === 0, "a quantity box is open before any click");
+    const measuredButton = (await rowFor("g-matched")).locator("[data-basis-quantity-edit]");
+    assert(await measuredButton.count() === 1 && (await measuredButton.innerText()).trim().startsWith("3 nos"), "measured quantity is not shown as plain clickable text", await measuredButton.innerText());
+    // The predicted size shows "Est." beside it; sizes with no estimate show none.
+    assert(await (await rowFor("g-matched")).locator("[data-basis-quantity-est]").innerText() === "Est.", "a predicted size has no Est. tag");
+    assert(await surface.locator("[data-basis-quantity-est]").count() === 1, "Est. shows on sizes nobody predicted");
+    if (process.env.SQAG_BASIS_SCREENSHOT_DIR) {
+      await (await rowFor("g-matched")).locator("xpath=ancestor::*[contains(@class,'basis-review-item')][1]").screenshot({ path: process.env.SQAG_BASIS_SCREENSHOT_DIR + "/est-tag.png" });
+    }
     const blankRow = await rowFor("q-blank-graphic");
     const unknownRow = await rowFor("q-blank-unknown");
+    // Owner (18 Nov 2026): no "Add qty". A blank line (only quotes saved before the server sizing guarantee)
+    // shows the booth-size rule size: 1 in its catalogue unit here, as Graphics is not a floor section.
+    assert(!/add qty/i.test(await surface.innerText()), "a basis line still asks to Add qty");
+    assert((await blankRow.locator("[data-basis-quantity-edit]").innerText()).trim() === "1 sqm", "blank catalogue line does not show its rule size");
+    assert((await (await rowFor("q-blank-fill")).locator("[data-basis-quantity-edit]").innerText()).trim() === "1 lot", "blank plain line does not show its rule size");
+    assert((await unknownRow.locator("[data-basis-quantity-edit]").innerText()).trim() === "1 sqm", "blank line does not take the unit its bracketed reference names");
     const graphic = byName("Printed Wall Graphic");
-    const quantityInput = blankRow.locator("input[data-basis-quantity-item]");
-    assert(await quantityInput.count() === 1 && await quantityInput.getAttribute("data-basis-quantity-item") === graphic.id,
-      "blank-quantity catalogue line has no quantity prompt for its catalogue item");
+    let quantityInput = await openQuantity("q-blank-graphic");
+    assert(await quantityInput.getAttribute("data-basis-quantity-item") === graphic.id && await quantityInput.inputValue() === "1",
+      "blank-quantity catalogue line has no quantity prompt for its catalogue item, prefilled with its rule size");
+    await quantityInput.press("Escape");
+    assert(await blankRow.locator("input.basis-quantity-input").count() === 0, "Escape did not close the quantity box");
     const blankText = await blankRow.innerText();
     assert(blankText.includes("sqm Printed Wall Graphic") && blankText.includes(Number(graphic.sale_unit_price).toFixed(2)),
       "blank-quantity line hides its catalogue item or price", blankText);
@@ -171,6 +201,66 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
       return offered;
     }, graphic.id);
     assert(ambiguous === null, "ambiguous catalogue reference was offered a catalogue price", ambiguous);
+    // 6. Quantity is mandatory (owner rule 18 Nov 2026): a line without a catalogue match takes its own
+    // quantity and unit, is never labelled "Not measured", and Confirm fills any still blank with its rule size.
+    const lineById = (id) => page.evaluate((lineId) => {
+      const line = state.quoteBasisSections.flatMap((section) => section.lines).find((entry) => entry.id === lineId);
+      return { quantity: line.quantity, unit: normalizeUnit(line.unit), needsQuantity: basisLineNeedsQuantity(line) };
+    }, id);
+    assert(!/not measured/i.test(await surface.innerText()), "a basis line is still labelled Not measured");
+    let freeInput = await openQuantity("q-blank-unknown");
+    assert(await freeInput.getAttribute("data-basis-quantity-free") !== null && await freeInput.evaluate((input) => input.required),
+      "line without a quantity has no required quantity box");
+    assert((await lineById("q-blank-unknown")).needsQuantity, "blank quantity line is not flagged as needing a quantity");
+    const probeBlocks = await page.evaluate(() => {
+      const saved = { sections: state.quoteBasisSections, rows: state.lineItems };
+      state.quoteBasisSections = [{ id: "probe", title: "Probe", lines: [{ id: "probe-line", tag: "Include", text: "Probe wall", quantity: null, unit: "" }] }];
+      try {
+        const fillable = basisConfirmBlockReason(state.quoteBasisSections);
+        // Confirm cannot fill a line with more than one output row, so that one still blocks.
+        state.lineItems = [{ source_basis_line_id: "probe-line" }, { source_basis_line_id: "probe-line" }];
+        return { fillable, multiRow: basisConfirmBlockReason(state.quoteBasisSections) };
+      } finally { state.quoteBasisSections = saved.sections; state.lineItems = saved.rows; }
+    });
+    assert(probeBlocks.fillable === "" && probeBlocks.multiRow === "Enter a quantity for every line before confirming quotation basis.",
+      "Confirm blocking for blank quantities is wrong", probeBlocks);
+    await freeInput.fill("lots");
+    await freeInput.press("Enter");
+    assert((await lineById("q-blank-unknown")).needsQuantity, "an invalid quantity was accepted");
+    // Leaving the box with an invalid value puts the old value back instead of keeping it half-typed.
+    await page.locator("body").click({ position: { x: 2, y: 2 } });
+    assert(await (await rowFor("q-blank-unknown")).locator("input.basis-quantity-input").count() === 0, "an invalid quantity box stayed open after leaving it");
+    freeInput = await openQuantity("q-blank-unknown");
+    await freeInput.fill("6 sqm");
+    await freeInput.press("Enter");
+    const freeEntered = await lineById("q-blank-unknown");
+    assert(Number(freeEntered.quantity) === 6 && freeEntered.unit === "sqm" && !freeEntered.needsQuantity,
+      "typed quantity and unit were not kept on the line", freeEntered);
+    assert(await (await rowFor("q-blank-unknown")).locator("input.basis-quantity-input").count() === 0, "quantity box stayed after a valid quantity");
+    assert((await (await rowFor("q-blank-unknown")).locator("[data-basis-quantity-edit]").innerText()).trim().startsWith("6 sqm"), "entered quantity is not shown as text");
+    result.freeQuantityLine = freeEntered;
+    // 7. A line already naming its catalogue item but saved without a quantity (only quotes analysed before
+    // the server sizing guarantee) takes its size in the box and reaches Output with it. Its price stays in
+    // review: the pricing analysis seal recorded no measured unit for it, and that seal is never rewritten.
+    const keywordInput = await openQuantity("q-blank-kw");
+    assert(await keywordInput.getAttribute("data-basis-quantity-free") !== null, "catalogue line missing a quantity has no quantity box");
+    await keywordInput.fill("5 sqm");
+    await keywordInput.press("Enter");
+    assert((await lineById("q-blank-kw")).quantity === 5, "typed quantity was not kept on the catalogue line");
+    await (await rowFor("q-blank-kw")).locator('[data-basis-tag="Include"]').click();
+    // The free-box line goes to Output too, so its typed size is carried into the quote.
+    await (await rowFor("q-blank-unknown")).locator('[data-basis-tag="Include"]').click();
+    // This one stays blank until Confirm, which writes its shown rule size.
+    await (await rowFor("q-blank-fill")).locator('[data-basis-tag="Include"]').click();
+    assert((await lineById("q-blank-fill")).needsQuantity, "the Confirm-fill probe line is no longer blank");
+    // A measured catalogue line is edited in place too (no Re) and keeps its catalogue price at the new size.
+    await (await rowFor("g-matched")).locator('[data-basis-tag="Include"]').click();
+    const matchedInput = await openQuantity("g-matched");
+    await matchedInput.fill("5");
+    await matchedInput.press("Enter");
+    assert(Number((await lineById("g-matched")).quantity) === 5, "measured quantity edit was not kept");
+    assert(await (await rowFor("g-matched")).locator("[data-basis-quantity-est]").count() === 0, "a typed size still shows Est.");
+    quantityInput = await openQuantity("q-blank-graphic");
     await quantityInput.fill("0");
     await quantityInput.press("Enter");
     assert(await page.evaluate(() => !state.quoteBasisSections.flatMap((section) => section.lines).find((line) => line.id === "q-blank-graphic").pricing_keyword),
@@ -207,6 +297,25 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     assert(priced?.variant === "catalog" && priced.price === graphic.sale_unit_price && Number(priced.quantity) === 12.5 && priced.unit === "sqm"
       && priced.keyword === graphic.id, "entered catalogue quantity was not priced by the server admission", priced);
     result.blankQuantityPriced = priced;
+    const outputOf = (id) => page.evaluate((lineId) => {
+      const row = state.outputRows.find((entry) => entry.source_basis_line_id === lineId);
+      const authority = row ? outputPriceAuthority(row) : null;
+      return row ? { variant: authority?.variant || "", price: pricingAuthorityPrice(authority), quantity: Number(row.quantity), unit: normalizeUnit(row.unit), keyword: row.pricing_keyword || "" } : null;
+    }, id);
+    const keywordOutput = await outputOf("q-blank-kw");
+    assert(keywordOutput?.quantity === 5 && keywordOutput.unit === "sqm" && keywordOutput.price === null,
+      "catalogue line typed quantity did not reach Output, or was priced without seal evidence", keywordOutput);
+    const freeOutput = await outputOf("q-blank-unknown");
+    assert(freeOutput?.quantity === 6 && freeOutput.unit === "sqm", "typed free quantity did not reach Output", freeOutput);
+    result.keywordQuantityOutput = keywordOutput;
+    const filledOutput = await outputOf("q-blank-fill");
+    assert(filledOutput?.quantity === 1 && filledOutput.unit === "lot", "Confirm did not write the shown rule size into a blank line", filledOutput);
+    result.confirmFilledOutput = filledOutput;
+    const matchedOutput = await outputOf("g-matched");
+    assert(matchedOutput?.quantity === 5 && matchedOutput.unit === "nos" && matchedOutput.variant === "catalog" && matchedOutput.price !== null,
+      "edited measured catalogue quantity was not priced at the new size", matchedOutput);
+    result.measuredQuantityOutput = matchedOutput;
+    result.freeQuantityOutput = freeOutput;
   }
   assert(pageErrors.length === 0, "page errors", pageErrors);
   result.status = "PASS";
