@@ -46,9 +46,8 @@ SANITIZED_LOGO_PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
 SANITIZED_LOGO_DATA_URL = "data:image/png;base64," + base64.b64encode(SANITIZED_LOGO_PNG_BYTES).decode("ascii")
-EXPECTED_PROMPT_IMAGE_MAX_WIDTH = 4096
-EXPECTED_PROMPT_IMAGE_MAX_HEIGHT = 4096
-EXPECTED_PROMPT_IMAGE_MAX_PIXELS = 9_000_000 - 1
+EXPECTED_SOURCE_JPEG_MAX_PIXELS = 89_478_485
+EXPECTED_SOURCE_LOSSLESS_MAX_PIXELS = 40_000_000
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -12589,7 +12588,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "data_url": "data:image/png;base64," + base64.b64encode(oversized).decode("ascii"),
         }
 
-        with self.assertRaisesRegex(ValueError, "larger than 12 MB"):
+        with self.assertRaisesRegex(ValueError, "larger than 48 MB"):
             webapp.decode_reference_data_url_bytes(entry, webapp.MAX_IMAGE_BYTES)
 
     def test_prompt_image_decoder_rejects_malformed_supported_format(self):
@@ -12628,10 +12627,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_prompt_image_decoder_rejects_real_below_pillow_limit_before_decode(self):
         from PIL import Image
 
-        raw = highly_compressible_rgb_png(4000, 4000)
+        raw = highly_compressible_rgb_png(8000, 5001)
         self.assertLessEqual(len(raw), webapp.MAX_IMAGE_BYTES)
-        self.assertGreater(4000 * 4000, EXPECTED_PROMPT_IMAGE_MAX_PIXELS)
-        self.assertLess(4000 * 4000, Image.MAX_IMAGE_PIXELS)
+        self.assertGreater(8000 * 5001, EXPECTED_SOURCE_LOSSLESS_MAX_PIXELS)
+        self.assertLess(8000 * 5001, Image.MAX_IMAGE_PIXELS)
 
         with (
             mock.patch.object(
@@ -12670,40 +12669,33 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         image_save.assert_not_called()
 
     def test_prompt_image_decoder_accepts_exact_application_boundaries(self):
-        self.assertEqual(webapp.MAX_PROMPT_IMAGE_WIDTH, EXPECTED_PROMPT_IMAGE_MAX_WIDTH)
-        self.assertEqual(webapp.MAX_PROMPT_IMAGE_HEIGHT, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT)
-        self.assertEqual(webapp.MAX_PROMPT_IMAGE_PIXELS, EXPECTED_PROMPT_IMAGE_MAX_PIXELS)
+        self.assertEqual(webapp.MAX_SOURCE_JPEG_PIXELS, EXPECTED_SOURCE_JPEG_MAX_PIXELS)
+        self.assertEqual(webapp.MAX_SOURCE_LOSSLESS_PIXELS, EXPECTED_SOURCE_LOSSLESS_MAX_PIXELS)
 
-        exact_boundaries = (
-            (EXPECTED_PROMPT_IMAGE_MAX_WIDTH, 1, "width"),
-            (1, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT, "height"),
-            (2999, 3001, "pixels"),
-        )
-        for width, height, boundary in exact_boundaries:
-            with self.subTest(boundary=boundary):
-                raw = highly_compressible_rgb_png(width, height)
-                data_url = webapp.compressed_prompt_image_data_url(raw)
-                self.assertTrue(data_url.startswith("data:image/png;base64,"))
+        # Wide, tall and 4K-plus images are admitted and reach the AI shrunk.
+        for width, height in ((4097, 1), (1, 4097), (4000, 4000)):
+            with self.subTest(size=(width, height)):
+                data_url = webapp.compressed_prompt_image_data_url(highly_compressible_rgb_png(width, height))
+                self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        with mock.patch.object(webapp, "MAX_SOURCE_LOSSLESS_PIXELS", 100):
+            data_url = webapp.compressed_prompt_image_data_url(highly_compressible_rgb_png(10, 10))
+        self.assertTrue(data_url.startswith("data:image/png;base64,"))
 
     def test_prompt_image_decoder_rejects_each_application_boundary_overage(self):
         from PIL import Image
 
-        overages = (
-            (EXPECTED_PROMPT_IMAGE_MAX_WIDTH + 1, 1, "width"),
-            (1, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT + 1, "height"),
-            (3000, 3000, "pixels"),
-        )
-        for width, height, boundary in overages:
-            with self.subTest(boundary=boundary):
-                raw = highly_compressible_rgb_png(width, height)
-                with mock.patch.object(
-                    Image.Image,
-                    "load",
-                    side_effect=AssertionError("rejected image reached pixel loading"),
-                ) as image_load:
-                    result = webapp.compressed_prompt_image_data_url(raw)
-                self.assertEqual(result, "")
-                image_load.assert_not_called()
+        with mock.patch.object(webapp, "MAX_SOURCE_LOSSLESS_PIXELS", 100):
+            for width, height in ((101, 1), (1, 101), (11, 10)):
+                with self.subTest(size=(width, height)):
+                    raw = highly_compressible_rgb_png(width, height)
+                    with mock.patch.object(
+                        Image.Image,
+                        "load",
+                        side_effect=AssertionError("rejected image reached pixel loading"),
+                    ) as image_load:
+                        result = webapp.compressed_prompt_image_data_url(raw)
+                    self.assertEqual(result, "")
+                    image_load.assert_not_called()
 
     def test_prompt_image_decoder_rejects_non_positive_header_dimensions_before_decode(self):
         class HeaderOnlyImage:

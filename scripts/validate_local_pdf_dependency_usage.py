@@ -18,6 +18,7 @@ SKIP_PATHS = {
 }
 
 PDF_LOCAL_FUNCTIONS = {
+    "ai_image_data_url_from_bytes",
     "compressed_prompt_image_data_url",
     "extract_pdf_embedded_page_images",
     "pdf_reference_page_images",
