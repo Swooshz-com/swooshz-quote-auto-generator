@@ -25000,6 +25000,7 @@ eval([
   "sessionFileRecordsFromDraft",
   "emptyQuoteCommercialTouched",
   "normalizeQuoteCommercialTouched",
+  "isPlainObject", "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions",
   "buildSessionSnapshot",
   "detachedBasisChatAuthorityValue",
   "basisChatBrowserSnapshot",
@@ -27852,6 +27853,8 @@ eval(extractFunction("quoteSessionSnapshotForRestoration"));
 eval(extractFunction("validQuoteDraftVersion"));
 eval(extractFunction("validPricingLedgerReceipt"));
 eval(extractFunction("unchangedDraftLedgerMatches"));
+eval(extractFunction("isPlainObject"));
+eval(extractFunction("normalizeStandardServiceDecisions"));
 eval(extractFunction("applyQuoteSessionSnapshot", true));
 
 const savedBasis = { currency: "SGD", source: "local", id: "saved-reference", digest: savedDigest };
@@ -28145,6 +28148,7 @@ eval([
   "quoteSessionSnapshotForRestoration",
   "validQuoteDraftVersion",
   "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
+  "isPlainObject", "normalizeStandardServiceDecisions",
   "applyQuoteSessionSnapshot",
   "applyPendingPricingReferenceSelection",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28397,6 +28401,7 @@ eval([
   "quoteSessionSnapshotForRestoration",
   "validQuoteDraftVersion",
   "validPricingLedgerReceipt", "unchangedDraftLedgerMatches",
+  "isPlainObject", "normalizeStandardServiceDecisions",
   "applyQuoteSessionSnapshot",
   "mergeDashboardDraftSummaryDetails",
 ].map((name) => extractFunction(name)).join("\n"));
@@ -28993,7 +28998,7 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "quoteSessionDraftFileComparisonKey", "rememberConfirmedQuoteSessionDraft", "quoteSessionDraftFilesAreConfirmed",
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
-  "quoteSessionDraftSynchronizationFailureMessage", "handleDraftBasis", "handleGenerate", "retainExcludedBasisPricingRows",
+  "quoteSessionDraftSynchronizationFailureMessage", "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "handleDraftBasis", "handleGenerate", "retainExcludedBasisPricingRows",
   "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
