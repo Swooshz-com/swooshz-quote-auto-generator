@@ -44,6 +44,8 @@ const QUOTE_COMMERCIAL_PRESENCE_VALUES = new Set(["captured", "intentional_empty
 const PRICING_REFERENCE_SOURCES = new Set(["company", "local", "bundled"]);
 const PRICING_REFERENCE_ID_RE = /^[A-Za-z0-9_-]+$/;
 const PRICING_REFERENCE_DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+// Customer-step checkpoint fields added after quotes were first saved, with the value a quote saved before then means.
+const CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS = Object.freeze([Object.freeze({ path: Object.freeze(["customer", "project", "known_details"]), value: "" })]);
 const PRICING_AUTHORITY_SCHEMA = "swooshz.pricing-authority.v1";
 const PRICING_AUTHORITY_VERSION = 1;
 const PRICING_AUTHORITY_VARIANTS = new Set(["none", "historical", "manual", "catalog", "included"]);
@@ -5217,7 +5219,23 @@ async function restoreSessionState() {
     await purgeBrowserRecoveryState();
     return false;
   }
-  return applyQuoteSessionSnapshot(saved, { suppressAutomaticOperations: authenticationRecoveryMarkerPresent() });
+  const restored = await applyQuoteSessionSnapshot(saved, { suppressAutomaticOperations: authenticationRecoveryMarkerPresent() });
+  if (restored && !Object.prototype.hasOwnProperty.call(saved, "pricingDraftVersion")) await holdOlderRecoveryCopyOfSavedQuote();
+  return restored;
+}
+
+// A recovery copy saved before copies carried their quote's draft version cannot prove it matches
+// the server's quote, so it only ever saves as a new quote ("create"). When the server already holds
+// that quote, keep the copy from writing and tell staff now to reopen it, instead of failing on the
+// next save without a word. The copy stays on screen; a quote the server never saw still saves as new.
+async function holdOlderRecoveryCopyOfSavedQuote() {
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  if (!sessionId || state.pricingDraftVersion !== "create") return;
+  const { ok, data } = await getJson(`/api/quote-sessions/${encodeURIComponent(sessionId)}`, { persistSession: false, sessionId });
+  if (!ok || safeQuoteSessionId(data?.quote_session?.session_id || "") !== sessionId
+    || safeQuoteSessionId(state.quoteSessionId || "") !== sessionId || state.pricingDraftVersion !== "create") return;
+  requireQuoteDraftReopen();
+  showQuoteNotSavedModal(quoteSessionDraftSynchronizationFailureMessage({ draft_stale: true }));
 }
 
 function clearLegacyLocalCompanyPresets() {
@@ -18846,8 +18864,28 @@ function customerStepCheckpointForCurrent() {
   };
 }
 
+// A quote saved before a Customer-step field existed has no value for it. Fill only those missing
+// fields with the value the older quote meant (an empty box); a saved field still compares exactly.
+function customerStepCheckpointWithAddedFieldDefaults(checkpoint) {
+  let upgraded = checkpoint;
+  for (const { path, value } of CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS) {
+    const parents = [upgraded];
+    for (const key of path.slice(0, -1)) {
+      const parent = parents[parents.length - 1];
+      parents.push(isPlainObject(parent) ? parent[key] : undefined);
+    }
+    const key = path[path.length - 1];
+    const owner = parents[parents.length - 1];
+    if (!isPlainObject(owner) || Object.prototype.hasOwnProperty.call(owner, key)) continue;
+    let filled = { ...owner, [key]: value };
+    for (let index = path.length - 2; index >= 0; index -= 1) filled = { ...parents[index], [path[index]]: filled };
+    upgraded = filled;
+  }
+  return upgraded;
+}
+
 function customerStepCheckpointIsCurrent() {
-  const checkpoint = state.customerStepCheckpoint;
+  const checkpoint = customerStepCheckpointWithAddedFieldDefaults(state.customerStepCheckpoint);
   const current = customerStepCheckpointForCurrent();
   return Boolean(!state.customerStepCheckpointSaveBusy
     && !pendingPricingReferenceSelectionChanged()
@@ -19082,6 +19120,15 @@ function goToPreviousSidePanel() {
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
 
+function showQuoteNotSavedModal(message) {
+  showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message });
+  elements.excelGeneratingSpinner.hidden = true;
+  elements.excelGeneratingActions.hidden = false;
+  elements.excelGeneratingActionButton.hidden = true;
+  elements.excelGeneratingModal.classList.add("is-ready");
+  elements.excelGeneratingCloseButton?.focus();
+}
+
 async function withQuoteStepLoading(operation) {
   if (appIsBusy()) return false;
   state.isPreparingOutput = true;
@@ -19107,14 +19154,7 @@ async function withQuoteStepLoading(operation) {
     state.isPreparingOutput = false;
     if (!state.isPageUnloading) {
       hideExcelGeneratingModal();
-      if (result === false && state.quoteSessionLoadError) {
-        showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message: state.quoteSessionLoadError });
-        elements.excelGeneratingSpinner.hidden = true;
-        elements.excelGeneratingActions.hidden = false;
-        elements.excelGeneratingActionButton.hidden = true;
-        elements.excelGeneratingModal.classList.add("is-ready");
-        elements.excelGeneratingCloseButton?.focus();
-      }
+      if (result === false && state.quoteSessionLoadError) showQuoteNotSavedModal(state.quoteSessionLoadError);
     }
     syncControlStates();
   }

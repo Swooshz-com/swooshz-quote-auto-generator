@@ -989,6 +989,31 @@ conversion, native PDF viewer/rendering and hosted persistence qualification
 remain separate; the synthetic mode does not substitute for native PDF smoke or
 owner UAT.
 
+Quotes saved before a Customer-step field existed must still reopen where
+staff left them. Run `python -m unittest tests.test_customer_checkpoint
+tests.test_older_quote_reopen_browser`. The checkpoint controls cover a saved
+Customer step without `known_details` (still current, reopens and rail-forwards,
+the saved record never rewritten) and, against that older record, Known details
+typed since, a changed customer or show name, a saved non-empty, null or missing
+project section: each reopens at Customer. Only a field listed in
+`CUSTOMER_STEP_CHECKPOINT_ADDED_FIELDS` that the saved record lacks takes its
+default; a saved field always compares exactly. The rendered check
+`node scripts/playwright-older-quote-reopen.mjs` builds and generates a quote in
+the real UI, restarts the server on that quote saved without Known details and
+reopens it with Modify quote at Output with the same pricing rows and Download
+available; a later show name change or typed Known details reopens at Customer,
+and clearing the box again reopens at Output. When a release adds a field to the
+saved Customer step, add it to that list with the value an older quote means and
+extend both checks; the release rehearsal's reopen of quotes saved by the live
+image remains the real-upgrade check.
+
+The same rendered check then reloads a browser recovery copy saved without
+`pricingDraftVersion` (as copies were before they carried it) over the saved
+quote: the copy stays on screen but must not write, the existing "Quote not
+saved" dialog tells staff at once to reopen the quote, Download shows the same
+message instead of doing nothing, and the server record is byte-for-byte
+unchanged with no quote-session POST sent.
+
 
 ## Current quotation links and completed jobs
 
