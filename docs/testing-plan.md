@@ -986,7 +986,7 @@ conversion, native PDF viewer/rendering and hosted persistence qualification
 remain separate; the synthetic mode does not substitute for native PDF smoke or
 owner UAT.
 
-Quotes saved before a Customer-step field existed (#385) must still reopen where
+Quotes saved before a Customer-step field existed must still reopen where
 staff left them. Run `python -m unittest tests.test_customer_checkpoint
 tests.test_older_quote_reopen_browser`. The checkpoint controls cover a saved
 Customer step without `known_details` (still current, reopens and rail-forwards,
