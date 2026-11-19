@@ -31350,6 +31350,7 @@ eval([
             "basisQuantityIsEstimate",
             "basisQuantityEditButtonHtml",
             "renderBasisLine",
+            "quoteBasisHeaderHtml",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
             "canonicalPrimaryOrderValue",
@@ -31641,6 +31642,10 @@ function queueQuoteSessionDraftStateSave() { queuedDraftSaves += 1; }
 function updateQuoteBasisCard(source) {
   assert.strictEqual(source, "edited");
   rendered += 1;
+}
+function updateBasisLines(lineIds, source) {
+  assert.ok(Array.isArray(lineIds) && lineIds.length, "changed line ids");
+  updateQuoteBasisCard(source);
 }
 function syncControlStates() {
   synced += 1;
