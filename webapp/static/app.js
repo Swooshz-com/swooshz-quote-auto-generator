@@ -4227,6 +4227,17 @@ function sessionFileRecordsFromDraft() {
   ].filter(Boolean);
 }
 
+// The reference files this page last wrote to the browser file store, for one recovery scope and
+// epoch. A save with unchanged files skips their put, which would structured-clone every data URL on
+// the main thread on every click, and only checks each record is still stored.
+let persistedSessionFiles = { scope: "", epoch: -1, records: new Map() };
+
+function sessionFileRecordIsPersisted(record) {
+  const persisted = persistedSessionFiles.records.get(record.session_file_key);
+  return Boolean(persisted) && persisted.data_url === record.data_url
+    && ["file_role", "name", "type", "size", "content_fingerprint"].every((key) => persisted[key] === record[key]);
+}
+
 function persistSessionFiles(records = []) {
   if (state.isSigningOut || state.isRecoveryScopeTransitioning) return Promise.reject(new Error("Browser recovery is leaving this session."));
   const currentScope = currentBrowserRecoveryScope();
@@ -4242,10 +4253,26 @@ function persistSessionFiles(records = []) {
       reject(new Error("Browser recovery scope changed before file persistence."));
       return;
     }
+    if (persistedSessionFiles.scope !== currentScope || persistedSessionFiles.epoch !== recoveryEpoch) {
+      persistedSessionFiles = { scope: currentScope, epoch: recoveryEpoch, records: new Map() };
+    }
+    const persisted = persistedSessionFiles;
     const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readwrite");
     const store = transaction.objectStore(QUOTE_SESSION_FILE_STORE_NAME);
-    validRecords.forEach((record) => store.put(record));
-    transaction.oncomplete = () => resolve();
+    validRecords.forEach((record) => {
+      if (!sessionFileRecordIsPersisted(record)) {
+        store.put(record);
+        return;
+      }
+      // Another tab may have cleared the store; a missing record is written again.
+      const stored = store.getKey(record.session_file_key);
+      stored.onsuccess = () => { if (stored.result === undefined) store.put(record); };
+    });
+    transaction.oncomplete = () => {
+      // Keep only this call's files, so removed files are not held in memory.
+      if (persisted === persistedSessionFiles) persisted.records = new Map(validRecords.map((record) => [record.session_file_key, record]));
+      resolve();
+    };
     transaction.onerror = () => reject(transaction.error || new Error("Could not persist session files"));
     transaction.onabort = () => reject(transaction.error || new Error("Session file persistence aborted"));
   }));
@@ -12068,6 +12095,7 @@ function applyBasisFreeQuantity(sectionId, lineIndex, value) {
     const nextRow = normalizeLineItem({ ...(unitChanged ? rest : previous), quantity: parsed.quantity, unit: parsed.unit });
     state.lineItems = state.lineItems.map((row) => (row === previous ? nextRow : row));
   }
+  const outputsCleared = Boolean(state.outputRows.length || state.originalOutputRows.length);
   state.quoteBasisSections = sections;
   state.quoteBasis = quoteBasisFromSections(sections);
   state.basisConfirmed = false;
@@ -12075,7 +12103,9 @@ function applyBasisFreeQuantity(sectionId, lineIndex, value) {
   state.originalOutputRows = [];
   setDownloadFiles([]);
   markOutputRowsDirty();
-  updateQuoteBasisCard("edited");
+  // Clearing Output can move other lines between groups, so that redraws the whole card.
+  if (outputsCleared) updateQuoteBasisCard("edited");
+  else updateBasisLines([currentLine.id || currentLine.source_line_item_id], "edited");
   syncControlStates();
   return true;
 }
@@ -12137,11 +12167,13 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
   state.quoteBasis = quoteBasisFromSections(sections);
   state.basisConfirmed = false;
   // Same as choosing a possible match: the server admits the selection on Confirm.
+  const outputsCleared = Boolean(state.outputRows.length || state.originalOutputRows.length);
   state.outputRows = [];
   state.originalOutputRows = [];
   setDownloadFiles([]);
   markOutputRowsDirty();
-  updateQuoteBasisCard("edited");
+  if (outputsCleared) updateQuoteBasisCard("edited");
+  else updateBasisLines([currentLine.id || currentLine.source_line_item_id], "edited");
   syncControlStates();
   return true;
 }
@@ -12304,6 +12336,34 @@ function detectedBoothSizeText(dimensionLines = []) {
   return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)`;
 }
 
+// The card header. Its line counts change with a tick, so a single-line redraw renders it too.
+function quoteBasisHeaderHtml(source, reviewLineCount, outputLineCount, aiFailed = false) {
+  const statusText = aiFailed ? "AI failed" : source === "edited" ? "Edited draft" : "Needs review";
+  const qualityPill = normalizeAnalysisMode(state.lastAnalysisMode) === ANALYSIS_MODE_HIGH_QUALITY
+    ? `<span class="quote-basis-quality-pill">High Quality</span>`
+    : "";
+  return `<div class="quote-basis-header">
+        <div>
+          <div class="quote-basis-title-row">
+            <h3>Quote Basis</h3>
+            <span>${escapeHtml(statusText)}</span>
+            ${qualityPill}
+          </div>
+          <p>${aiFailed ? GENERIC_FAILURE_MESSAGE : "Please review the AI takeoff and revise individual lines where needed."}</p>
+        </div>
+        <div class="quote-basis-source">
+          <span class="pricing-reference-source-line" aria-label="Selected pricing reference context">
+            <strong class="pricing-reference-source-name">${aiFailed ? "Local fallback only" : escapeHtml(outputPricingSourceLabel())}</strong>
+            ${aiFailed ? "" : quoteCommercialContextPillsHtml()}
+            <span class="pricing-reference-divider" aria-hidden="true"></span>
+            <span class="pricing-reference-line-count"><strong>${reviewLineCount}</strong> review line${reviewLineCount === 1 ? "" : "s"}</span>
+            <span class="pricing-reference-divider" aria-hidden="true"></span>
+            <span class="pricing-reference-line-count"><strong>${outputLineCount}</strong> output line${outputLineCount === 1 ? "" : "s"}</span>
+          </span>
+        </div>
+      </div>`;
+}
+
 function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
   if (!basisPricingIndex) return withBasisPricingIndex(() => renderQuoteBasisMessage(basis, source));
   const aiFailed = source === "local" && state.aiFailed;
@@ -12315,10 +12375,6 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
       </div>
     `;
   }
-  const statusText = aiFailed ? "AI failed" : source === "edited" ? "Edited draft" : "Needs review";
-  const qualityPill = normalizeAnalysisMode(state.lastAnalysisMode) === ANALYSIS_MODE_HIGH_QUALITY
-    ? `<span class="quote-basis-quality-pill">High Quality</span>`
-    : "";
   const sections = basisSections(state.quoteBasisSections.length ? state.quoteBasisSections : normalizeQuoteBasisSections(basis));
   const reviewSections = sections
     .map((section) => ({
@@ -12350,26 +12406,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
   const outputLineCount = basisOutputLineCount(sections);
   return `
     <div class="assistant-card quote-basis-card ${aiFailed ? "quote-basis-card-failed" : ""}">
-      <div class="quote-basis-header">
-        <div>
-          <div class="quote-basis-title-row">
-            <h3>Quote Basis</h3>
-            <span>${escapeHtml(statusText)}</span>
-            ${qualityPill}
-          </div>
-          <p>${aiFailed ? GENERIC_FAILURE_MESSAGE : "Please review the AI takeoff and revise individual lines where needed."}</p>
-        </div>
-        <div class="quote-basis-source">
-          <span class="pricing-reference-source-line" aria-label="Selected pricing reference context">
-            <strong class="pricing-reference-source-name">${aiFailed ? "Local fallback only" : escapeHtml(outputPricingSourceLabel())}</strong>
-            ${aiFailed ? "" : quoteCommercialContextPillsHtml()}
-            <span class="pricing-reference-divider" aria-hidden="true"></span>
-            <span class="pricing-reference-line-count"><strong>${reviewLineCount}</strong> review line${reviewLineCount === 1 ? "" : "s"}</span>
-            <span class="pricing-reference-divider" aria-hidden="true"></span>
-            <span class="pricing-reference-line-count"><strong>${outputLineCount}</strong> output line${outputLineCount === 1 ? "" : "s"}</span>
-          </span>
-        </div>
-      </div>
+      ${quoteBasisHeaderHtml(source, reviewLineCount, outputLineCount, aiFailed)}
       ${renderAnalysisFindings()}
       ${renderBasisConfirmSummary(sections)}
       ${renderBasisTagLegend()}
@@ -12411,6 +12448,59 @@ function basisFieldLabel(field) {
 
 function updateQuoteBasisCard(source = "edited") {
   replaceChangedMarkup(elements.basisReviewSurface, renderQuoteBasisMessage(state.quoteBasis, source));
+}
+
+// A tick, X or quantity edit changes only its own lines and the header counts. Redraw just those,
+// leaving the same DOM a full render gives; redraw the whole card when a line has no stable key,
+// moves to another group or block, or the card is not showing.
+function updateBasisLines(lineIds = [], source = "edited") {
+  if (!withBasisPricingIndex(() => patchBasisLines(lineIds, source))) updateQuoteBasisCard(source);
+}
+
+function patchedNodeFromHtml(html) {
+  const template = document.createElement("template");
+  template.innerHTML = html.trim();
+  return template.content.childNodes.length === 1 ? template.content.firstChild : null;
+}
+
+function patchNodeInPlace(existing, next) {
+  if (existing.isEqualNode(next)) return;
+  if (sameElementShell(existing, next)) replaceChangedChildNodes(existing, next);
+  else existing.replaceWith(next);
+}
+
+function patchBasisLines(lineIds, source) {
+  const ids = [...new Set(lineIds)];
+  const card = elements.basisReviewSurface?.querySelector(":scope > .quote-basis-card");
+  const header = card?.querySelector(":scope > .quote-basis-header");
+  if (!ids.length || !header || state.aiFailed) return false;
+  const sections = basisSections(state.quoteBasisSections.length ? state.quoteBasisSections : normalizeQuoteBasisSections(state.quoteBasis));
+  const patches = [];
+  for (const id of ids) {
+    if (!id) return false;
+    const section = sections.find((entry) => (entry.lines || []).some((line) => (line.id || line.source_line_item_id) === id));
+    const index = section ? section.lines.findIndex((line) => (line.id || line.source_line_item_id) === id) : -1;
+    const line = section?.lines[index];
+    if (!line || basisLineIsInformationalDimension(line)) return false;
+    const rows = card.querySelectorAll(`li[data-basis-key="${CSS.escape(id)}"]`);
+    const group = basisPricingGroup(line, section);
+    const block = rows[0]?.closest(".basis-review-item");
+    if (rows.length !== 1 || block?.getAttribute("data-basis-key") !== `${group}:${section.id}`
+      || block.closest(".basis-review-grid")?.getAttribute("aria-label") !== group) return false;
+    // The full render passes the section with its review lines only; keep the same shape.
+    const reviewSection = { ...section, lines: section.lines.filter((entry) => !basisLineIsInformationalDimension(entry)) };
+    const next = patchedNodeFromHtml(renderBasisLine(reviewSection, line, index));
+    if (!next) return false;
+    patches.push([rows[0], next]);
+  }
+  // The same counts the full render shows, from the sections already normalised above.
+  const reviewLines = sections.flatMap((section) => (section.lines || []).filter((line) => !basisLineIsInformationalDimension(line)));
+  const outputLineCount = reviewLines.filter((line) => basisLineAllowsOutput(line)).length;
+  const nextHeader = patchedNodeFromHtml(quoteBasisHeaderHtml(source, reviewLines.length, outputLineCount));
+  if (!nextHeader) return false;
+  patches.forEach(([row, next]) => patchNodeInPlace(row, next));
+  patchNodeInPlace(header, nextHeader);
+  return true;
 }
 
 // Same resulting DOM as assigning innerHTML, but unchanged nodes are kept so a one-line
@@ -12586,7 +12676,8 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   // Read every row through one index, then release it before state changes and the re-render.
   const plan = withBasisPricingIndex(() => planBasisTagChanges(sectionId, nextTag, lineIndex, group));
   if (!plan) return;
-  const { sections, deferralChanged, pricingChanges } = plan;
+  const { sections, deferralChanged, pricingChanges, changedLineIds } = plan;
+  const outputsCleared = deferralChanged && Boolean(state.outputRows.length || state.originalOutputRows.length);
   if (pricingChanges.size) {
     state.lineItems = [...state.lineItems.filter((row) => !pricingChanges.has(row.source_basis_line_id)), ...pricingChanges.values()];
   }
@@ -12598,10 +12689,13 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   state.quoteBasis = quoteBasisFromSections(sections);
   state.basisConfirmed = false;
   markOutputRowsDirty();
-  updateQuoteBasisCard("edited");
+  // Clearing Output can move other lines between groups, so that redraws the whole card.
+  if (outputsCleared) updateQuoteBasisCard("edited");
+  else updateBasisLines([...changedLineIds, ...pricingChanges.keys()], "edited");
   syncControlStates();
   if (deferralChanged && !state.lineItems.some((row) => row.reincluded_catalog_selection)) {
-    queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+    // syncControlStates has just written the browser copy.
+    queueQuoteSessionDraftStateSave({ quoteGenerated: false, sessionStateSaved: true });
   }
 }
 
@@ -12612,6 +12706,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
   let changed = false;
   let deferralChanged = false;
   const pricingChanges = new Map();
+  const changedLineIds = [];
   section.lines = (section.lines || []).map((line, index) => {
     if (lineIndex !== null && lineIndex !== index) return line;
     if (group && (basisLineIsInformationalDimension(line) || basisPricingGroup(line, section) !== group)) return line;
@@ -12638,6 +12733,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
     const currentTag = normalizeBasisTag(line.tag);
     if (currentTag === resolvedTag && (!customPricing || Boolean(line.custom_confirmed) === customConfirmed)) return line;
     changed = true;
+    changedLineIds.push(line.id || line.source_line_item_id || "");
     return {
       ...line,
       tag: resolvedTag,
@@ -12645,7 +12741,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
     };
   });
   if (!changed && !pricingChanges.size) return null;
-  return { sections, deferralChanged, pricingChanges };
+  return { sections, deferralChanged, pricingChanges, changedLineIds };
 }
 
 function basisChatIntroMessage() {
@@ -15330,7 +15426,7 @@ async function saveQuoteSessionDraftState(options = {}) {
   if (commitActiveOutputEditor({ commit: options.commitEditor !== false }) === "blocked") return null;
   if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
-  saveSessionState();
+  if (options.sessionStateSaved !== true) saveSessionState();
   // The selection request owns saving this draft until the server admits the re-inclusion.
   const hasPendingReinclusion = () => state.lineItems?.some((row) => row.reincluded_catalog_selection);
   const draftSaveBlocked = () => {
@@ -15339,11 +15435,13 @@ async function saveQuoteSessionDraftState(options = {}) {
     return true;
   };
   if (draftSaveBlocked()) return null;
-  // Caller snapshots stay immutable while an earlier save is pending.
+  // Caller snapshots stay immutable while an earlier save is pending. File records hold only
+  // strings and numbers, so a shallow copy is enough and never copies their data URLs.
+  const copyFileRecords = (records) => records.map((record) => ({ ...record }));
   let draftState = JSON.parse(JSON.stringify(options.draftState || currentQuoteSessionDraftState()));
-  let draftFiles = JSON.parse(JSON.stringify(Array.isArray(options.draftFiles)
+  let draftFiles = copyFileRecords(Array.isArray(options.draftFiles)
     ? options.draftFiles
-    : sessionFileRecordsFromDraft()));
+    : sessionFileRecordsFromDraft());
   let draftKey = quoteSessionDraftComparisonKey(draftState);
   let draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
   const priorSave = quoteSessionDraftSavePromise;
@@ -15361,7 +15459,7 @@ async function saveQuoteSessionDraftState(options = {}) {
     if (priorSave && !options.draftState) {
       draftState = JSON.parse(JSON.stringify(currentQuoteSessionDraftState()));
       if (!Array.isArray(options.draftFiles)) {
-        draftFiles = JSON.parse(JSON.stringify(sessionFileRecordsFromDraft()));
+        draftFiles = copyFileRecords(sessionFileRecordsFromDraft());
       }
       draftKey = quoteSessionDraftComparisonKey(draftState);
       draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
@@ -15440,11 +15538,13 @@ function clearQuoteSessionDraftSaveTimer() {
   return pending.options;
 }
 
-function queueQuoteSessionDraftStateSave(options = {}) {
+// sessionStateSaved: the caller has just written the browser copy, so it is not written twice. It is
+// not kept with the queued options, which can be replayed later.
+function queueQuoteSessionDraftStateSave({ sessionStateSaved = false, ...options } = {}) {
   if (commitActiveOutputEditor({ commit: false }) === "blocked") return;
   blockedOutputDraftSaveOptions = null;
   if (!quoteSessionDraftStateCanSave()) return;
-  saveSessionState();
+  if (sessionStateSaved !== true) saveSessionState();
   if (state.pricingDraftVersion === false) return;
   const pending = quoteSessionDraftSaveTimer;
   if (pending?.kind === "selection" && pending.sessionId === safeQuoteSessionId(state.quoteSessionId || "")) {
@@ -15461,7 +15561,8 @@ function queueQuoteSessionDraftStateSave(options = {}) {
       blockedOutputDraftSaveOptions = options;
       return;
     }
-    saveQuoteSessionDraftState({ ...options, commitEditor: false }).catch(() => {});
+    // The browser copy was written when this save was queued, and is written again once the server accepts it.
+    saveQuoteSessionDraftState({ ...options, commitEditor: false, sessionStateSaved: true }).catch(() => {});
   }, delay);
   quoteSessionDraftSaveTimer = scheduled;
 }

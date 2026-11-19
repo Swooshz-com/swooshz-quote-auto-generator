@@ -28743,6 +28743,7 @@ let quoteSessionDraftSavePromise = null;
 let quoteSessionConfirmedDraftSessionId = "";
 let quoteSessionConfirmedDraftKey = "";
 let quoteSessionConfirmedDraftFileKey = "";
+let persistedSessionFiles = { scope: "", epoch: -1, records: new Map() };
 let version = 1;
 let fileVersion = 1;
 let sequence = 0;
@@ -29029,6 +29030,11 @@ const openSessionFileDb = async () => ({
           queueMicrotask(() => { if (request.onsuccess) request.onsuccess(); });
           return request;
         },
+        getKey(key) {
+          const request = { result: persistedFiles.has(key) ? key : undefined };
+          queueMicrotask(() => { if (request.onsuccess) request.onsuccess(); });
+          return request;
+        },
       }; },
     };
     setImmediate(() => { if (transaction.oncomplete) transaction.oncomplete(); });
@@ -29059,6 +29065,7 @@ if (scenario.path === "duplicate") required.push(
   "sessionFileRecordFromHeaderLogo", "sessionFileRecordsFromDraft", "persistSessionFiles", "loadSessionFileMap",
   "restoreSessionImages", "referenceFileType", "referenceFileHasPayload", "normalizedContentFingerprint",
   "ensureContentFingerprint", "contentFingerprintFromDataUrl", "dataUrlBytes", "sha256ContentFingerprint");
+if (scenario.path === "duplicate" && source.includes("function sessionFileRecordIsPersisted(")) required.push("sessionFileRecordIsPersisted");
 const adapterSource = (scenario.originalBoundary ? "" :
   "const clearActiveJob = syntheticClearActiveJob;")
   + (scenario.originalBoundary || scenario.path === "duplicate" ? "" :
@@ -31108,6 +31115,7 @@ eval([
   "basisUnmatchedOffer",
   "basisPricingGroup",
   "detectedBoothSizeText",
+  "quoteBasisHeaderHtml",
   "renderQuoteBasisMessage",
 ].map(extractFunction).join("\n"));
 
@@ -31334,6 +31342,7 @@ eval([
             "basisQuantityIsEstimate",
             "basisQuantityEditButtonHtml",
             "renderBasisLine",
+            "quoteBasisHeaderHtml",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
             "canonicalPrimaryOrderValue",
@@ -31625,6 +31634,10 @@ function queueQuoteSessionDraftStateSave() { queuedDraftSaves += 1; }
 function updateQuoteBasisCard(source) {
   assert.strictEqual(source, "edited");
   rendered += 1;
+}
+function updateBasisLines(lineIds, source) {
+  assert.ok(Array.isArray(lineIds) && lineIds.length, "changed line ids");
+  updateQuoteBasisCard(source);
 }
 function syncControlStates() {
   synced += 1;
