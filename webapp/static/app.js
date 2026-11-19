@@ -12509,7 +12509,8 @@ function normalizeKnownDetailsSize(value) {
 function knownDetailsSizeProposalHtml() {
   const proposal = state.knownDetailsSize?.proposal;
   if (!proposal) return "";
-  const current = state.boothDimensions?.dimension_source === "default" ? "" : String(state.boothDimensions?.booth_size || "");
+  const source = state.boothDimensions?.dimension_source;
+  const current = source === "default" ? "" : String(state.boothDimensions?.booth_size || "");
   return `
     <div class="basis-chat-proposal" data-known-details-size-proposal>
       <div class="basis-chat-proposal-header">
@@ -12524,7 +12525,7 @@ function knownDetailsSizeProposalHtml() {
       <div class="basis-chat-compare">
         <div class="basis-chat-compare-card">
           <span>Current</span>
-          <p>${escapeHtml(current)} (from the references)</p>
+          <p>${escapeHtml(current)} (from ${source === "staff" ? "Known details" : "the references"})</p>
         </div>
         <div class="basis-chat-compare-card is-proposed">
           <span>Proposed</span>
@@ -12539,30 +12540,128 @@ function knownDetailsSizeProposalHtml() {
   `;
 }
 
-function basisUnchangedSinceAnalysis() {
-  const snapshot = state.originalAnalysisSnapshot;
-  if (!isPlainObject(snapshot) || !Array.isArray(snapshot.line_items)) return false;
-  const sections = (value) => JSON.stringify(canonicalQuoteBasisSections(value || []));
-  const rows = (value) => JSON.stringify((value || []).map(normalizeLineItem));
-  return sections(state.quoteBasisSections) === sections(snapshot.quote_basis_sections)
-    && rows(state.lineItems) === rows(snapshot.line_items);
+// Apply merges the applied draft into the current basis (G2 round 3 B1/B2). The applied draft differs
+// from the analysis only where the Known details size changes it (resized area lines, size notes), so
+// those differences go in; staff ticks and edits stay, and lines staff or standard service rows added
+// are kept. A line the applied draft no longer has is a note about the old size and is removed.
+function knownDetailsLineKey(sectionId, line = {}) {
+  const id = String(line?.id || "").trim();
+  return id ? `id:${id}` : `note:${sectionId}:${String(line?.text || "")}`;
+}
+
+function knownDetailsRowKey(row = {}) {
+  const id = String(row?.source_basis_line_id || "").trim();
+  return id ? `id:${id}` : `row:${String(row?.section || "")}:${String(row?.description || "")}`;
+}
+
+// A key used twice maps to null, so an ambiguous line is left as it is.
+function knownDetailsEntriesByKey(entries, keyOf) {
+  const byKey = new Map();
+  entries.forEach((entry) => {
+    const key = keyOf(entry);
+    byKey.set(key, byKey.has(key) ? null : entry);
+  });
+  return byKey;
+}
+
+// Field by field: a field staff left as analysed takes the applied value; a field they changed stays.
+function knownDetailsMergedFields(current = {}, base = {}, applied = {}) {
+  const merged = { ...current };
+  new Set([...Object.keys(base), ...Object.keys(applied)]).forEach((field) => {
+    if (JSON.stringify(current[field]) !== JSON.stringify(base[field])) return;
+    if (applied[field] === undefined) delete merged[field];
+    else merged[field] = applied[field];
+  });
+  return merged;
+}
+
+function knownDetailsMergedSections(currentSections = [], baseSections = [], appliedSections = []) {
+  const flatten = (sections) => sections.flatMap((section) => (section.lines || []).map((line) => ({ section, line })));
+  const lineKey = ({ section, line }) => knownDetailsLineKey(section.id, line);
+  const base = knownDetailsEntriesByKey(flatten(baseSections), lineKey);
+  const applied = knownDetailsEntriesByKey(flatten(appliedSections), lineKey);
+  const kept = new Set();
+  const sections = currentSections.map((section) => ({
+    ...section,
+    lines: (section.lines || []).flatMap((line) => {
+      const key = knownDetailsLineKey(section.id, line);
+      kept.add(key);
+      const before = base.get(key);
+      if (!before) return [line];
+      const after = applied.get(key);
+      if (after === undefined) return [];
+      return after ? [knownDetailsMergedFields(line, before.line, after.line)] : [line];
+    }),
+  }));
+  // New applied lines (the resize note) go after the line that precedes them in the applied draft.
+  appliedSections.forEach((appliedSection) => {
+    let anchor = "";
+    (appliedSection.lines || []).forEach((line) => {
+      const key = knownDetailsLineKey(appliedSection.id, line);
+      if (!base.has(key) && !kept.has(key)) {
+        let target = sections.find((section) => section.id === appliedSection.id);
+        if (!target) {
+          target = { ...appliedSection, lines: [] };
+          sections.push(target);
+        }
+        const index = anchor ? target.lines.findIndex((entry) => knownDetailsLineKey(target.id, entry) === anchor) : -1;
+        target.lines.splice(index >= 0 ? index + 1 : (anchor ? target.lines.length : 0), 0, line);
+        kept.add(key);
+      }
+      anchor = key;
+    });
+  });
+  return sections.filter((section) => (section.lines || []).length);
+}
+
+function knownDetailsMergedRows(currentRows = [], baseRows = [], appliedRows = []) {
+  const base = knownDetailsEntriesByKey(baseRows, knownDetailsRowKey);
+  const applied = knownDetailsEntriesByKey(appliedRows, knownDetailsRowKey);
+  const kept = new Set();
+  const rows = currentRows.flatMap((row) => {
+    const key = knownDetailsRowKey(row);
+    kept.add(key);
+    const before = base.get(key);
+    if (!before) return [row];
+    const after = applied.get(key);
+    if (after === undefined) return JSON.stringify(row) === JSON.stringify(before) ? [] : [row];
+    return after ? [normalizeLineItem(knownDetailsMergedFields(row, before, after))] : [row];
+  });
+  appliedRows.forEach((row) => {
+    const key = knownDetailsRowKey(row);
+    if (!base.has(key) && !kept.has(key)) rows.push(row);
+  });
+  return rows;
+}
+
+function applyKnownDetailsSize(proposal) {
+  const snapshot = isPlainObject(state.originalAnalysisSnapshot) ? state.originalAnalysisSnapshot : null;
+  const applied = proposal.applied;
+  const standardDecisions = currentStandardServiceDecisions();
+  // The applied draft as the analysis itself would have shown it: Confirm tags and standard rows.
+  const appliedSections = confirmOnlyQuoteBasisSections(applied.quote_basis_sections);
+  const appliedRows = withStandardServiceRows(appliedSections, applied.line_items.map((item) => (
+    typeof canonicalizePrimaryOrderFields === "function" ? canonicalizePrimaryOrderFields(item) : item
+  )).map(normalizeLineItem), standardDecisions).lineItems.map(normalizeLineItem);
+  // Without an analysis snapshot there is nothing staff changed to keep.
+  const baseSections = snapshot ? confirmOnlyQuoteBasisSections(snapshot.quote_basis_sections || []) : state.quoteBasisSections;
+  const baseRows = snapshot && Array.isArray(snapshot.line_items) ? snapshot.line_items : state.lineItems;
+  const sections = canonicalQuoteBasisSections(knownDetailsMergedSections(state.quoteBasisSections, baseSections, appliedSections));
+  state.quoteBasisSections = sections;
+  state.quoteBasis = { ...state.quoteBasis, ...quoteBasisFromSections(sections) };
+  state.lineItems = knownDetailsMergedRows(state.lineItems, baseRows, appliedRows);
+  applyStandardServiceRows(standardDecisions);
+  state.boothDimensions = normalizeBoothDimensions(applied.project);
+  captureOriginalAnalysisSnapshot({
+    ...applied, source: snapshot?.source, analysis_mode: snapshot?.analysis_mode, warnings: snapshot?.warnings,
+  }, appliedRows);
 }
 
 async function decideKnownDetailsSize(action) {
   const proposal = state.knownDetailsSize?.proposal;
   if (!proposal || appIsBusy() || !["apply", "discard"].includes(action)) return;
   if (action === "apply") {
-    if (basisUnchangedSinceAnalysis()) {
-      // The same analysis with the size applied: resized full-floor lines, Est. marks and notes.
-      const snapshot = state.originalAnalysisSnapshot;
-      applyDraftBasis(proposal.applied);
-      applyDraftLineItems(proposal.applied.line_items);
-      state.boothDimensions = normalizeBoothDimensions(proposal.applied.project);
-      captureOriginalAnalysisSnapshot({ ...proposal.applied, source: snapshot.source, analysis_mode: snapshot.analysis_mode, warnings: snapshot.warnings });
-    } else {
-      // Lines were edited since analysis: keep the edits and take the size; Analyse again resizes lines.
-      state.boothDimensions = normalizeBoothDimensions({ ...proposal, booth_width: proposal.booth_width || "", booth_depth: proposal.booth_depth || "", dimension_source: "staff" });
-    }
+    applyKnownDetailsSize(proposal);
     state.basisConfirmed = false;
     state.outputRows = [];
     state.originalOutputRows = [];
@@ -14592,12 +14691,12 @@ async function refreshLineItemsFromServer({ waitForPaint = false } = {}) {
   return result;
 }
 
-function captureOriginalAnalysisSnapshot(data = {}) {
+function captureOriginalAnalysisSnapshot(data = {}, lineItems = state.lineItems) {
   const sections = canonicalQuoteBasisSections(data.quote_basis_sections || data.quote_basis || state.quoteBasisSections);
   state.originalAnalysisSnapshot = {
     quote_basis_sections: cloneQuoteBasisSections(sections),
     quote_basis: { ...state.quoteBasis, ...quoteBasisFromSections(sections) },
-    line_items: state.lineItems.map(normalizeLineItem),
+    line_items: lineItems.map(normalizeLineItem),
     boothDimensions: { ...state.boothDimensions },
     source: data.source || state.draftSource || "",
     analysis_mode: normalizeAnalysisMode(data.analysis_mode || state.lastAnalysisMode),
