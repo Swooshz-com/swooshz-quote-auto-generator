@@ -82,6 +82,34 @@ class BoothSizeReaderTest(unittest.TestCase):
         self.assertEqual(hall["size"]["booth_area_sqm"], 24)
         self.assertEqual(hall["notes"], [])
 
+    def test_another_items_size_never_replaces_the_booth(self):
+        # G2 F1: an inclusion's W x D, in a later comma item, sentence or line, is not the booth.
+        for text in (
+            "93 sqm booth, LED wall 4m x 2.5m, 2 open sides",
+            "Booth is 93 sqm, 2 open sides, reception counter 2m x 1m, max height 4 m",
+            "Booth is 93 sqm. LED wall 4m x 2.5m.",
+            "Booth 93 sqm\nStorage room 2m x 1.5m",
+            "Booth 93 sq m. LED wall 4m x 2.5m",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(webapp.booth_size_reading(text), {
+                    "size": {"booth_width": None, "booth_depth": None, "booth_area_sqm": 93}, "notes": []})
+        # Booth wording after the size still counts, and "sq. m", "9.3" and "1,200" stay whole.
+        self.assertEqual(size("Booth is 93 sq. m, 2 open sides")["booth_area_sqm"], 93)
+        self.assertEqual(size("Counter 2m x 1m, 9.3m x 10m booth")["booth_area_sqm"], 93)
+        self.assertEqual(size("Hall 2, booth 1,200 x 900 cm")["booth_area_sqm"], 108)
+
+    def test_ignored_sizes_are_noted_only_when_stated_as_the_booth(self):
+        # G2 F2: an out-of-range size of another item is not a booth size to confirm.
+        counter = webapp.booth_size_reading("Booth 10m x 9.3m, counter 1.2m x 0.6m")
+        self.assertEqual(counter, {"size": {"booth_width": 10, "booth_depth": 9.3, "booth_area_sqm": 93}, "notes": []})
+        hall = webapp.booth_size_reading("Hall 5 is 20,000 sqm, booth 93 sqm")
+        self.assertEqual(hall, {"size": {"booth_width": None, "booth_depth": None, "booth_area_sqm": 93}, "notes": []})
+        stated = webapp.booth_size_reading("Booth 0.5m x 0.5m, counter 2m x 1m")
+        self.assertEqual(stated["size"]["booth_area_sqm"], 2)
+        self.assertEqual(len(stated["notes"]), 1)
+        self.assertIn("Booth size 0.5m x 0.5m in Known details was ignored", stated["notes"][0])
+
     def test_booth_wording_picks_between_several_sizes(self):
         self.assertEqual(size("2.5m x 1m panel; booth 9m x 9m")["booth_area_sqm"], 81)
         self.assertEqual(size("Stand 12 x 8, hall 20 x 30")["booth_area_sqm"], 96)
@@ -252,6 +280,31 @@ class KnownDetailsDraftTest(unittest.TestCase):
         self.assertFalse(any("Known details" in row.get("description", "") for row in result["line_items"]))
         self.assertTrue(webapp.is_informational_dimension_text(notes[0]))
         self.assertIn('"staff_confirmed_facts": "Booth is 93 sqm, 2 open sides"', prompt)
+
+    def test_an_inclusion_size_in_the_box_never_resizes_the_booth(self):
+        # G2 F1 end to end: the AI reads the booth right; the box's LED wall size must not overrule it.
+        result, prompt = self.run_draft(self.payload("93 sqm booth, LED wall 4m x 2.5m, 2 open sides"),
+                                        self.fake_ai({"booth_width": 9.3, "booth_depth": 10}, carpet_quantity=93))
+        self.assertEqual((result["project"]["booth_area_sqm"], result["project"]["dimension_source"]), (93, "staff"))
+        self.assertEqual(self.row(result, CARPET)["quantity"], 93)
+        self.assertFalse(any("Known details" in line.get("text", "") for line in self.basis_lines(result)))
+        context = json.loads(prompt.split("Quote context JSON: ", 1)[1])
+        self.assertEqual(context["project"]["booth_dimensions_hint"]["booth_area_sqm"], "93")
+        self.assertIs(context["project"]["booth_dimensions_hint"]["fixed"], True)
+
+    def test_resized_predicted_line_keeps_its_est_mark(self):
+        # G2 F3: the AI predicted 36 sqm (Est.); after the resize to 93 sqm the line still shows Est.
+        reply = self.fake_ai({"booth_width": 6, "booth_depth": 6})
+        reply["quote_basis_sections"][0]["lines"][0]["quantity_estimated"] = True
+        result, _prompt = self.run_draft(self.payload("Booth is 93 sqm, 2 open sides"), reply)
+        carpet_line = next(line for line in self.basis_lines(result) if line.get("pricing_keyword") == CARPET)
+        self.assertEqual(webapp.parse_float_or_none(carpet_line["quantity"]), 93)
+        self.assertEqual(carpet_line["quantity_estimate"], {"quantity": 93, "unit": "sqm"})
+        # A line the AI read from the evidence is resized without gaining an Est. mark.
+        result, _prompt = self.run_draft(self.payload("Booth is 93 sqm, 2 open sides"),
+                                         self.fake_ai({"booth_width": 6, "booth_depth": 6}))
+        carpet_line = next(line for line in self.basis_lines(result) if line.get("pricing_keyword") == CARPET)
+        self.assertNotIn("quantity_estimate", carpet_line)
 
     def test_rescale_keeps_a_repeated_measurement_in_row_text(self):
         parsed = {"project": {"booth_width": 6, "booth_depth": 6},

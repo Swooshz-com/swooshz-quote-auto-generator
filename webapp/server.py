@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import bisect
 import contextlib
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import contextvars
@@ -5280,16 +5281,40 @@ def booth_size_pair_continues_earlier(text: str, start: int) -> bool:
     return False
 
 
-def booth_size_candidate_context(text: str, start: int) -> bool:
-    # The nearest preceding clause names the booth, stand or space.
-    window = text[max(0, start - 40):start]
-    window = re.split(r"[.;\n]", window)[-1]
-    return bool(BOOTH_SIZE_CONTEXT_RE.search(window))
+BOOTH_SIZE_ITEM_BREAKS = frozenset(".,;\n")
+
+
+def booth_size_item_starts(text: str, spans: list[tuple[int, int]]) -> list[int]:
+    """Start offsets of the items in the text: one fact each, split at . , ; and line breaks.
+
+    A break inside a number or a size ("9.3", "1,200", "93 sq. m") does not split; one that
+    ends a size ("93 sq m.") still ends its item. Plain character checks, no regex.
+    """
+    inside: set[int] = set()
+    for start, end in spans:
+        inside.update(range(start, end - 1))
+    starts = [0]
+    for index, char in enumerate(text):
+        if char not in BOOTH_SIZE_ITEM_BREAKS or index in inside:
+            continue
+        if char in ".," and text[index - 1:index].isdigit() and text[index + 1:index + 2].isdigit():
+            continue
+        starts.append(index + 1)
+    return starts
+
+
+def booth_size_label_with_area(width: float | None, depth: float | None, area: float) -> str:
+    if width is None or depth is None:
+        return f"{format_dimension(area)} sqm"
+    return f"{format_dimension(width)}m x {format_dimension(depth)}m ({format_dimension(area)} sqm)"
 
 
 def booth_size_reading(value: Any) -> dict[str, Any]:
     """Read one booth size from free text with generic number and unit rules.
 
+    The text is split into items (one fact each). A size counts as the booth's when its own
+    item has booth wording; with no booth wording anywhere every item counts. The first
+    counting item gives the size, its W x D before an area stated in the same item.
     Returns {"size": {...} | None, "notes": [...]}; a size has booth_width and
     booth_depth in metres (None when only an area is given) and booth_area_sqm.
     """
@@ -5297,17 +5322,30 @@ def booth_size_reading(value: Any) -> dict[str, Any]:
     notes: list[str] = []
     if not text:
         return {"size": None, "notes": notes}
-    pairs: list[tuple[int, bool, float, float]] = []
+    pair_matches = list(BOOTH_SIZE_PAIR_RE.finditer(text))
+    area_matches = list(BOOTH_SIZE_AREA_RE.finditer(text))
+    starts = booth_size_item_starts(text, [match.span() for match in (*pair_matches, *area_matches)])
+    ends = [*starts[1:], len(text)]
+    worded_items = [bool(BOOTH_SIZE_CONTEXT_RE.search(text[start:end])) for start, end in zip(starts, ends)]
+
+    def item_of(position: int) -> int:
+        return bisect.bisect_right(starts, position) - 1
+
+    # Per item: the first in-range W x D and the first in-range area.
+    item_pairs: dict[int, tuple[float, float]] = {}
+    item_areas: dict[int, float] = {}
+    ignored: list[tuple[int, str]] = []
     pair_spans: list[tuple[int, int]] = []
-    for match in BOOTH_SIZE_PAIR_RE.finditer(text):
+    for match in pair_matches:
         if booth_size_pair_continues_earlier(text, match.start()):
             continue
+        item = item_of(match.start())
         # "height 4m x 2 panels": outside booth wording, a bare second number that
         # counts a noun is not a depth.
         if (
             not match.group(4) and not match.group(5)
             and booth_size_next_word_is_a_noun(text, match.end())
-            and not booth_size_candidate_context(text, match.start())
+            and not worded_items[item]
         ):
             continue
         shared_unit = match.group(4) or match.group(2) or match.group(6) or ""
@@ -5319,49 +5357,59 @@ def booth_size_reading(value: Any) -> dict[str, Any]:
             continue
         pair_spans.append(match.span())
         if not all(BOOTH_SIDE_MIN_METRES <= side <= BOOTH_SIDE_MAX_METRES for side in (width, depth)):
-            notes.append(
+            ignored.append((item,
                 f"Booth size {format_dimension(width)}m x {format_dimension(depth)}m in Known details was ignored "
                 f"because each side must be {format_dimension(BOOTH_SIDE_MIN_METRES)}-{format_dimension(BOOTH_SIDE_MAX_METRES)}m; "
-                "check the size before generating."
-            )
+                "check the size before generating."))
             continue
-        pairs.append((match.start(), booth_size_candidate_context(text, match.start()), width, depth))
-    areas: list[tuple[int, bool, float]] = []
-    for match in BOOTH_SIZE_AREA_RE.finditer(text):
+        item_pairs.setdefault(item, (width, depth))
+    for match in area_matches:
         if any(start <= match.start() < end for start, end in pair_spans):
             continue
         area = parse_float_or_none(match.group(1))
         if area is None:
             continue
+        item = item_of(match.start())
         if not BOOTH_AREA_MIN_SQM <= area <= BOOTH_AREA_MAX_SQM:
-            notes.append(
+            ignored.append((item,
                 f"Booth size {format_dimension(area)} sqm in Known details was ignored because the area must be "
-                f"{format_dimension(BOOTH_AREA_MIN_SQM)}-{format_dimension(BOOTH_AREA_MAX_SQM)} sqm; check the size before generating."
-            )
+                f"{format_dimension(BOOTH_AREA_MIN_SQM)}-{format_dimension(BOOTH_AREA_MAX_SQM)} sqm; check the size before generating."))
             continue
-        areas.append((match.start(), booth_size_candidate_context(text, match.start()), area))
+        item_areas.setdefault(item, area)
 
-    def preferred(candidates):
-        return next((candidate for candidate in candidates if candidate[1]), candidates[0]) if candidates else None
+    sized_items = sorted({*item_pairs, *item_areas})
+    counting = [item for item in sized_items if worded_items[item]] or sized_items
+    # An ignored size is only reported when it was stated as the booth's, or nothing else was found.
+    notes.extend(note for item, note in ignored if worded_items[item] or not sized_items)
+    if not counting:
+        return {"size": None, "notes": notes}
 
-    pair = preferred(pairs)
-    area_candidate = preferred(areas)
-    if pair:
-        width, depth = pair[2], pair[3]
-        pair_area = round(width * depth, 2)
-        # An area about another place (a hall) never contradicts a booth-scoped W x D.
-        comparable = bool(area_candidate) and (area_candidate[1] or not pair[1])
-        if comparable and abs(area_candidate[2] - pair_area) > BOOTH_SIZE_MISMATCH_TOLERANCE * pair_area:
-            notes.append(
-                f"Booth size in Known details gives {format_dimension(width)}m x {format_dimension(depth)}m "
-                f"({format_dimension(pair_area)} sqm) and {format_dimension(area_candidate[2])} sqm; "
-                f"using {format_dimension(width)}m x {format_dimension(depth)}m."
-            )
-        return {"size": {"booth_width": width, "booth_depth": depth, "booth_area_sqm": pair_area}, "notes": notes}
-    if area_candidate:
-        return {"size": {"booth_width": None, "booth_depth": None, "booth_area_sqm": round(area_candidate[2], 2)},
-                "notes": notes}
-    return {"size": None, "notes": notes}
+    def item_size(item: int) -> tuple[float | None, float | None, float]:
+        if item in item_pairs:
+            width, depth = item_pairs[item]
+            return width, depth, round(width * depth, 2)
+        return None, None, round(item_areas[item], 2)
+
+    def differs(area: float, other: float) -> bool:
+        return abs(other - area) > BOOTH_SIZE_MISMATCH_TOLERANCE * area
+
+    chosen = counting[0]
+    width, depth, area = item_size(chosen)
+    # Sizes that may also describe the booth but disagree: the same item's area, then the other counting items.
+    others = []
+    if chosen in item_pairs and chosen in item_areas and differs(area, item_areas[chosen]):
+        others.append(f"{format_dimension(item_areas[chosen])} sqm")
+    for item in counting[1:]:
+        other_width, other_depth, other_area = item_size(item)
+        if differs(area, other_area):
+            others.append(booth_size_label_with_area(other_width, other_depth, other_area))
+    if others:
+        chosen_label = booth_size_label(width, depth, area)
+        notes.append(
+            f"Booth size in Known details gives {booth_size_label_with_area(width, depth, area)} and "
+            f"{', '.join(others)}; using {chosen_label}."
+        )
+    return {"size": {"booth_width": width, "booth_depth": depth, "booth_area_sqm": area}, "notes": notes}
 
 
 def parse_booth_size_from_text(value: Any) -> dict[str, Any] | None:
@@ -25960,6 +26008,10 @@ def staff_footprint_rescale(
             return False
         if not footprint_quantity_matches(row.get("quantity"), ai_area):
             return False
+        # A predicted size keeps its Est. mark at the new size (owner: predicted quantities always show Est.).
+        estimate = normalized_quantity_estimate(row.get("quantity_estimate"))
+        if estimate and footprint_quantity_matches(estimate["quantity"], ai_area):
+            row["quantity_estimate"] = {"quantity": staff_quantity, "unit": row.get("unit")}
         row["quantity"] = staff_quantity
         for key in ("text", "description"):
             if key in row:
