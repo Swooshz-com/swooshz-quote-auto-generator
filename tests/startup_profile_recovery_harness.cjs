@@ -52,6 +52,7 @@ async function check(mode) {
     resumeDashboardOperation: async () => calls.push(['resume-dashboard']),
     loadQuoteDashboard: async () => calls.push(['load-dashboard']),
     restoreRestorableOverlay: () => calls.push(['overlay']),
+    showOlderRecoveryCopyHoldNotice: () => calls.push(['older-copy-notice']),
   };
   vm.createContext(c);
   vm.runInContext(readiness + extract('workspaceViewIsFromEarlierSignIn') + boot, c);
@@ -65,7 +66,7 @@ async function check(mode) {
   await result;
   if (mode === 'ready') {
     assert.strictEqual(c.state.isBooting, false);
-    for (const event of ['restore','persist','resume-job','auth-finish','overlay']) {
+    for (const event of ['restore','persist','resume-job','auth-finish','overlay','older-copy-notice']) {
       assert.strictEqual(calls.filter(x => x[0] === event).length, 1, event);
     }
   } else {
