@@ -145,6 +145,26 @@ class BoothPrecedenceTest(unittest.TestCase):
         staff = self.dims({"known_details": "93 sqm"})
         self.assertIs(webapp.default_confirmation_dimensions({"booth_width": 6, "booth_depth": 6}, staff), staff)
 
+    def test_predicted_quantities_size_on_the_staff_booth_first(self):
+        def area(project, ai_project):
+            return webapp.draft_booth_area_sqm({"project": ai_project}, {"project": project})
+
+        def request_booth(project, ai_project):
+            text = webapp.predicted_quantity_request_text({"project": ai_project}, {"project": project}, [], {})
+            return json.loads(text.split("Context JSON: ", 1)[1])["booth"]
+
+        staff = {"known_details": "Booth is 93 sqm, 2 open sides"}
+        self.assertEqual(area(staff, {"booth_width": 6, "booth_depth": 6}), 93)
+        self.assertEqual(request_booth(staff, {"booth_width": 6, "booth_depth": 6}),
+                         {"booth_width": None, "booth_depth": None, "booth_area_sqm": 93})
+        # Without Known details the AI's own size still comes before the request's size.
+        self.assertEqual(area({"booth_width": "8", "booth_depth": "9"}, {"booth_width": 5, "booth_depth": 4}), 20)
+        self.assertEqual(area({"booth_width": "8", "booth_depth": "9"}, {"booth_area_sqm": 50}), 50)
+        self.assertEqual(area({"booth_width": "8", "booth_depth": "9"}, {}), 72)
+        # An AI reply cannot pose as Known details.
+        self.assertEqual(area({}, {"booth_width": 6, "booth_depth": 6, "known_details": "500 sqm",
+                                   "dimension_source": "staff"}), 36)
+
 
 class KnownDetailsDraftTest(unittest.TestCase):
     def setUp(self):

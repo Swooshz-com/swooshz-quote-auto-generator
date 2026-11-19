@@ -26896,11 +26896,18 @@ def booth_size_rule_quantity(line: dict[str, Any], entry: dict[str, str], booth_
     return 1, unit or PREDICTED_QUANTITY_FALLBACK_UNIT
 
 
+def draft_booth_dimensions(parsed: dict[str, Any], payload: Any) -> dict[str, Any]:
+    """Booth size for predicted quantities: Known details, then the AI's own size, then the request's size."""
+    payload_dimensions = booth_dimensions_from_payload(payload if isinstance(payload, dict) else {})
+    if payload_dimensions.get("dimension_source") == "staff":
+        return payload_dimensions
+    # Only the AI's size fields: an AI reply cannot claim a Known details (staff) size.
+    ai_dimensions = booth_dimensions_from_payload({"project": ai_project_size_fields(parsed.get("project"))})
+    return ai_dimensions if ai_dimensions.get("dimension_source") != "default" else payload_dimensions
+
+
 def draft_booth_area_sqm(parsed: dict[str, Any], payload: Any) -> float:
-    raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
-    source = {"project": raw_project} if raw_project.get("booth_width") and raw_project.get("booth_depth") else (
-        payload if isinstance(payload, dict) else {})
-    return parse_float_or_none(booth_dimensions_from_payload(source).get("booth_area_sqm")) or 0
+    return parse_float_or_none(draft_booth_dimensions(parsed, payload).get("booth_area_sqm")) or 0
 
 
 def apply_booth_size_quantity_rule(parsed: dict[str, Any], payload: Any, catalog: dict[str, dict[str, str]]) -> int:
@@ -26926,9 +26933,7 @@ def apply_booth_size_quantity_rule(parsed: dict[str, Any], payload: Any, catalog
 
 def predicted_quantity_request_text(parsed, payload, missing, catalog) -> str:
     """The re-ask sees only the lines to size, the booth size and their catalogue units: no media, no prices."""
-    raw_project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
-    booth = booth_dimensions_from_payload({"project": raw_project} if raw_project.get("booth_width") else (
-        payload if isinstance(payload, dict) else {}))
+    booth = draft_booth_dimensions(parsed, payload)
     linked = raw_draft_line_items_by_basis_line(parsed)
     lines = []
     for section, line in missing:
