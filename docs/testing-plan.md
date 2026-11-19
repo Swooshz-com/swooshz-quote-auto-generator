@@ -580,7 +580,10 @@ the owner-approved CI lane.
   then the full unit and Playwright suites. Internal identity changes must cover
   strict bounded JSON parsing, bidirectional subject/email substitution,
   role/workspace changes, policy fingerprinting, restart, route denial without
-  a cookie, and browser positive/negative flows. Retired local login/callback
+  a cookie, and browser positive/negative flows. Session lifetime changes must
+  move time through the injectable `InternalAuthState(clock=...)` (unit, HTTP and
+  the browser harness clock), never by patching `time`, and cover idle expiry,
+  cookie renewal flags, the ended-session sign-in note and 401 recovery. Retired local login/callback
   tests must prove safe refusal and no provider calls even with former settings.
   Retain old-cookie rejection, logout state-cookie cleanup and exact historical
   owner IDs. Independent Platform behavior must use local synthetic adapters only.
