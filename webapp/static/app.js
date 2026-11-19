@@ -17601,6 +17601,8 @@ function syncControlStates() {
 
 async function handleDraftBasis(options = {}) {
   if (state.isAnalysisRunning) return;
+  // Keep the operator's standard row decisions before a clarification or failed analysis clears the basis.
+  state.standardServiceRows = currentStandardServiceDecisions();
   const analysisMode = normalizeAnalysisMode(options.analysisMode || state.pendingAnalysisMode);
   state.pendingAnalysisMode = analysisMode;
   const runningMessage = analysisRunningMessage(analysisMode);

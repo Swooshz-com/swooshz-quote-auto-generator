@@ -2065,7 +2065,8 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot, evidenc
     await page.locator("#analysisConfirmModal").waitFor({ state: "visible", timeout: 15000 });
     await page.locator("#analysisConfirmStartButton").click();
     try {
-      await page.waitForFunction(() => !state.isAnalysisRunning && state.workflowStage === "basis_review" && state.lineItems.length === 8, null, { timeout: 45000 });
+      // The provider's 8 rows plus the 2 standard service rows every new quote offers.
+      await page.waitForFunction(() => !state.isAnalysisRunning && state.workflowStage === "basis_review" && state.lineItems.length === 10, null, { timeout: 45000 });
       await page.waitForFunction(() => {
         const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
         if (!sessionId || !quoteSessionDraftStateCanSave()) return false;
@@ -2114,7 +2115,10 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot, evidenc
     currentReferenceDigest: currentPricingReference()?.digest_sha256 || "",
     commercialBasis: quoteCommercialSnapshotPricingBasis(),
     runContext: currentGenerationContext(),
-    rows: state.lineItems.map((row) => ({
+    standardRows: state.lineItems.filter((row) => STANDARD_SERVICE_ROWS.some((standard) => standard.id === row.source_basis_line_id))
+      .map((row) => [row.source_basis_line_id, row.pricing_authority?.variant, row.pricing_authority?.price]),
+    standardRowIds: STANDARD_SERVICE_ROWS.map((standard) => standard.id),
+    rows: state.lineItems.filter((row) => !STANDARD_SERVICE_ROWS.some((standard) => standard.id === row.source_basis_line_id)).map((row) => ({
       pricingKeyword: row.pricing_keyword,
       status: row.status,
       price: row.effective_unit_price,
@@ -2134,6 +2138,7 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot, evidenc
     || browserResult.runContext.run_id !== accepted.generation_run_id
     || browserResult.runContext.session_id !== browserResult.quoteSessionId
     || browserResult.rows.length !== 8
+    || JSON.stringify(browserResult.standardRows) !== JSON.stringify(browserResult.standardRowIds.map((rowId) => [rowId, "included", 0]))
   ) {
     throw new Error(`Browser Analyse state is not bound to the selected reference/run: ${JSON.stringify(browserResult)}.`);
   }
@@ -2175,7 +2180,8 @@ async function verifyRun030DraftBoundary(page, dataRoot = quoteDataRoot, evidenc
   }
   const persisted = await dashboardQuoteSessionDetail(page, browserResult.quoteSessionId);
   const draftState = persisted.quote_session?.draft_state || {};
-  const persistedLines = Array.isArray(draftState.lineItems) ? draftState.lineItems : [];
+  const persistedLines = (Array.isArray(draftState.lineItems) ? draftState.lineItems : [])
+    .filter((row) => !browserResult.standardRowIds.includes(row.source_basis_line_id));
   const persistedPricing = persistedLines.map((row) => ({
     status: row.status,
     keyword: row.pricing_keyword,
