@@ -193,8 +193,8 @@ or deployment behaviour changes accompany this test.
   fails when a Quote Basis tick or X writes the browser copy more than once,
   rewrites unchanged reference files, re-renders or rebuilds the list, saves the
   quote more than once per burst, sends files the server already has, or goes
-  over its byte, long-frame or input-to-paint budget. It is not yet a required
-  branch-protection check; that needs the owner's separate approval.
+  over its byte, long-frame or input-to-paint budget. It is a required check on
+  `main` (see Required Checks below).
 
 ## Validate App Checks
 
@@ -445,10 +445,22 @@ or deployment behaviour changes accompany this test.
   persists and session-associates the PDF for authorized download. XLSX remains the
   master/default export; CI validates the contract but not live PDF success.
 
+## Required Checks
+
+The `protect-main` repository ruleset on the default branch requires changes to
+arrive through a pull request, blocks deleting the branch, and requires one
+status check from GitHub Actions to pass before a merge:
+
+- `Quote Basis click budget` (owner approval 2026-11-19). Branches do not need
+  to be up to date with `main` before merging.
+
+No other check is required by GitHub; the remaining CI jobs are checked green on
+the exact pull request head before every merge but are not enforced by the
+ruleset.
+
 ## Not Configured
 
 - No deployment workflow is enabled.
-- Branch protection requirements are not documented as complete in this repo yet.
 
 ## Maintenance Rule
 
