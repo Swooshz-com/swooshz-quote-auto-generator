@@ -9119,3 +9119,67 @@ body.privacy-page {
     padding-inline: 4px;
   }
 }
+
+/* Button standard follow-ups (#338). */
+/* The row has a 1 px border plus 8 px padding; the heading had 8 px, which left the bulk buttons 1 px out. */
+.basis-section-heading {
+  padding-right: 9px;
+}
+
+.basis-section-actions {
+  grid-template-columns: repeat(3, 32px);
+  gap: 8px;
+}
+
+.basis-section-action-button {
+  box-sizing: border-box;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+}
+
+.basis-section-action-spacer {
+  width: 32px;
+  min-height: 32px;
+}
+
+.excel-generating-copy:has(> .excel-generating-actions:not([hidden]) > [data-export-action="pdf"]) {
+  flex: 1 1 auto;
+}
+
+@media (max-width: 640px) {
+  .basis-section-actions {
+    grid-template-columns: repeat(3, 44px);
+    width: max-content;
+  }
+
+  .basis-section-action-button,
+  .basis-section-action-spacer {
+    width: 44px;
+    height: 44px;
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 379px) {
+  .company-preset-profile-card .company-preset-action-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Three 44 px buttons no longer fit beside the row icon: use the full row width and wrap if still short. */
+  .basis-line-actions,
+  .basis-section-actions {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(auto-fill, 44px);
+    width: auto;
+  }
+
+  /* The heading has no inset, the row has a 1 px border and 8 px padding: match it so the columns line up. */
+  .basis-section-actions {
+    margin-left: 9px;
+  }
+
+  .basis-section-action-spacer {
+    display: none;
+  }
+}
