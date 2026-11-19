@@ -2,7 +2,8 @@
 
 A quote saved before the Known details box existed has no known_details in its saved Customer step.
 Modify quote opens it at Output with its pricing rows; a real Customer change still reopens at Customer
-details. No live provider, live data or paid AI."""
+details. A browser recovery copy saved before copies carried their draft version is held from writing
+and staff are told to reopen the quote. No live provider, live data or paid AI."""
 import json
 import os
 import subprocess
@@ -32,6 +33,13 @@ class OlderQuoteReopenBrowserTest(unittest.TestCase):
         for stage in ('changedCustomer', 'typedKnownDetails'):
             self.assertEqual(evidence[stage]['panel'], 'customer', stage)
             self.assertEqual(evidence[stage]['rows'], [], stage)
+        # A recovery copy without a draft version is held from writing, keeps its rows on screen and
+        # tells staff to reopen the quote, at reload and again on Download.
+        held = evidence['olderRecoveryCopy']
+        self.assertEqual(held['dialog']['title'], 'Quote not saved')
+        self.assertIs(held['version'], False)
+        self.assertEqual(held['rows'], evidence['generatedRows'])
+        self.assertIn(held['dialog']['message'], held['download'])
 
 
 if __name__ == '__main__':

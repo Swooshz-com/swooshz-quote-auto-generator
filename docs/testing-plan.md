@@ -1004,6 +1004,13 @@ saved Customer step, add it to that list with the value an older quote means and
 extend both checks; the release rehearsal's reopen of quotes saved by the live
 image remains the real-upgrade check.
 
+The same rendered check then reloads a browser recovery copy saved without
+`pricingDraftVersion` (as copies were before they carried it) over the saved
+quote: the copy stays on screen but must not write, the existing "Quote not
+saved" dialog tells staff at once to reopen the quote, Download shows the same
+message instead of doing nothing, and the server record is byte-for-byte
+unchanged with no quote-session POST sent.
+
 
 ## Current quotation links and completed jobs
 

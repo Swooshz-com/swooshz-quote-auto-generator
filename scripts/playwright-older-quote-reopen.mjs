@@ -248,7 +248,59 @@ try {
   result.clearedKnownDetails = reopened.view;
   assert(reopened.view.panel === "output" && reopened.view.outputVisible && reopened.view.rows.length === result.generatedRows.length,
     "the unchanged older quote did not reopen at Output", reopened.view);
-  await reopened.page.context().close();
+
+  // 7. A browser recovery copy saved before copies carried their quote's draft version (no
+  // pricingDraftVersion) reloads over the saved quote. It must not overwrite the server's quote, and
+  // staff must be told to reopen it at once, not meet a Download that silently does nothing.
+  page = reopened.page;
+  await page.waitForLoadState("networkidle");
+  const recordBefore = await fs.readFile(file, "utf8");
+  const copy = await page.evaluate(() => JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "null"));
+  assert(copy?.quoteSessionId === sessionId && Object.prototype.hasOwnProperty.call(copy, "pricingDraftVersion"),
+    "the reopened quote left no recovery copy with its draft version", copy && Object.keys(copy));
+  delete copy.pricingDraftVersion;
+  await page.evaluate((older) => window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(older)), copy);
+  const quoteWrites = [];
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname.startsWith("/api/quote-sessions")) quoteWrites.push(new URL(request.url()).pathname);
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && !appIsBusy(), null, { timeout: 30000 });
+  await page.waitForFunction(() => document.querySelector("#excelGeneratingModal")?.classList.contains("is-open"), null, { timeout: 10000 }).catch(() => {});
+  const dialog = () => page.evaluate(() => {
+    const modal = document.querySelector("#excelGeneratingModal");
+    return modal?.classList.contains("is-open") && !modal.hidden
+      ? { title: document.querySelector("#excelGeneratingTitle").innerText.trim(), message: document.querySelector("#excelGeneratingMessage").innerText.trim() } : null;
+  });
+  result.olderRecoveryCopy = { dialog: await dialog(), ...(await page.evaluate(() => ({ session: state.quoteSessionId, version: state.pricingDraftVersion, panel: state.activeSidePanel }))) };
+  result.olderRecoveryCopy.rows = await visibleRows(page);
+  assert(result.olderRecoveryCopy.dialog?.title === "Quote not saved" && /changed in another tab or session\. Reopen it/.test(result.olderRecoveryCopy.dialog.message),
+    "staff were not told to reopen the quote an older recovery copy restored over", result.olderRecoveryCopy);
+  assert(result.olderRecoveryCopy.session === sessionId && result.olderRecoveryCopy.version === false,
+    "the older recovery copy was not held from writing", result.olderRecoveryCopy);
+  // Download stays visible and says why it cannot save, instead of doing nothing.
+  await page.locator("#excelGeneratingCloseButton").click();
+  const clickDownload = async () => {
+    const downloaded = page.waitForEvent("download", { timeout: 5000 }).then(() => true, () => false);
+    await page.locator('button[data-side-panel="output"]').click();
+    await page.locator("#sideDownloadButton").click();
+    return downloaded;
+  };
+  let downloaded = await clickDownload();
+  // A recovery copy keeps no header logo, so Download first asks for it on Quote Company, as it always has.
+  if (await page.evaluate(() => state.activeSidePanel) === "quote_company") {
+    await page.locator("#headerLogoInput").setInputFiles({ name: "older-quote-synthetic-logo.png", mimeType: "image/png", buffer: await noisePng(page, 240, 96) });
+    await page.waitForFunction(() => !appIsBusy(), null, { timeout: 30000 });
+    downloaded = (await clickDownload()) || downloaded;
+  }
+  result.olderRecoveryCopy.download = await page.evaluate(() => [...document.querySelectorAll("#messageList, #excelGeneratingModal.is-open")]
+    .filter((node) => node.offsetParent || node.classList.contains("is-open")).map((node) => node.innerText.replace(/\s+/g, " ").trim()).filter(Boolean));
+  assert(!downloaded && result.olderRecoveryCopy.download.some((text) => /changed in another tab or session\. Reopen it/.test(text)),
+    "Download on the held recovery copy did not say why it cannot save", result.olderRecoveryCopy.download);
+  await page.waitForLoadState("networkidle");
+  assert(!quoteWrites.length, "the older recovery copy wrote to the saved quote", quoteWrites);
+  assert(await fs.readFile(file, "utf8") === recordBefore, "the older recovery copy changed the saved quote");
+  await page.context().close();
 
   assert(!pageErrors.length, "page errors", pageErrors);
   await stopServer();

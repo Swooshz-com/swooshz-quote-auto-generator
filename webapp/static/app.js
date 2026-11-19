@@ -5210,7 +5210,23 @@ async function restoreSessionState() {
     await purgeBrowserRecoveryState();
     return false;
   }
-  return applyQuoteSessionSnapshot(saved, { suppressAutomaticOperations: authenticationRecoveryMarkerPresent() });
+  const restored = await applyQuoteSessionSnapshot(saved, { suppressAutomaticOperations: authenticationRecoveryMarkerPresent() });
+  if (restored && !Object.prototype.hasOwnProperty.call(saved, "pricingDraftVersion")) await holdOlderRecoveryCopyOfSavedQuote();
+  return restored;
+}
+
+// A recovery copy saved before copies carried their quote's draft version cannot prove it matches
+// the server's quote, so it only ever saves as a new quote ("create"). When the server already holds
+// that quote, keep the copy from writing and tell staff now to reopen it, instead of failing on the
+// next save without a word. The copy stays on screen; a quote the server never saw still saves as new.
+async function holdOlderRecoveryCopyOfSavedQuote() {
+  const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
+  if (!sessionId || state.pricingDraftVersion !== "create") return;
+  const { ok, data } = await getJson(`/api/quote-sessions/${encodeURIComponent(sessionId)}`, { persistSession: false, sessionId });
+  if (!ok || safeQuoteSessionId(data?.quote_session?.session_id || "") !== sessionId
+    || safeQuoteSessionId(state.quoteSessionId || "") !== sessionId || state.pricingDraftVersion !== "create") return;
+  requireQuoteDraftReopen();
+  showQuoteNotSavedModal(quoteSessionDraftSynchronizationFailureMessage({ draft_stale: true }));
 }
 
 function clearLegacyLocalCompanyPresets() {
@@ -19007,6 +19023,15 @@ function goToPreviousSidePanel() {
   setSidePanel(SIDE_PANEL_SEQUENCE[index - 1]);
 }
 
+function showQuoteNotSavedModal(message) {
+  showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message });
+  elements.excelGeneratingSpinner.hidden = true;
+  elements.excelGeneratingActions.hidden = false;
+  elements.excelGeneratingActionButton.hidden = true;
+  elements.excelGeneratingModal.classList.add("is-ready");
+  elements.excelGeneratingCloseButton?.focus();
+}
+
 async function withQuoteStepLoading(operation) {
   if (appIsBusy()) return false;
   state.isPreparingOutput = true;
@@ -19032,14 +19057,7 @@ async function withQuoteStepLoading(operation) {
     state.isPreparingOutput = false;
     if (!state.isPageUnloading) {
       hideExcelGeneratingModal();
-      if (result === false && state.quoteSessionLoadError) {
-        showExcelGeneratingModal({ eyebrow: "Quote workspace", title: "Quote not saved", message: state.quoteSessionLoadError });
-        elements.excelGeneratingSpinner.hidden = true;
-        elements.excelGeneratingActions.hidden = false;
-        elements.excelGeneratingActionButton.hidden = true;
-        elements.excelGeneratingModal.classList.add("is-ready");
-        elements.excelGeneratingCloseButton?.focus();
-      }
+      if (result === false && state.quoteSessionLoadError) showQuoteNotSavedModal(state.quoteSessionLoadError);
     }
     syncControlStates();
   }

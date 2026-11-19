@@ -166,7 +166,7 @@ function requestStartAnalysis() {throw new Error("Analysis must never be chained
 function confirmBasis() {throw new Error("Basis confirmation not part of these controls");}
 function showBlockedAction() {}
 function showBlockedBasisAction() {}
-const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading",
+const functions = ["canonicalPricingAuthorityText", "withQuoteStepLoading", "showQuoteNotSavedModal",
   "safeQuoteSessionId", "isPlainObject", "revisionNumber", "splitLines",
   "normalizeTextNewlines", "normalizedContentFingerprint", "pendingPricingReference",
   "safeQuoteSessionErrorReference", "canStartAnalysis", "startQuoteSessionDraftSaveAfterCustomerStep",

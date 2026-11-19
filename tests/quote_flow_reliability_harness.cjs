@@ -325,7 +325,7 @@ function fixture(names) {
     requestStartAnalysis() { calls.push("analysis_choice"); },
     requestQuoteDependencyChangeConfirmation() { calls.push("dependency_choice"); },
   });
-  vm.runInContext(names.map(extract).join("\n"), context);
+  vm.runInContext([...new Set(["showQuoteNotSavedModal", ...names])].map(extract).join("\n"), context);
   return { context, calls, state, elements };
 }
 
