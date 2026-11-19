@@ -126,6 +126,19 @@ class StandardServiceRowsTest(unittest.TestCase):
             self.assert_standard_rows(step, "Include", "Exclude")
             self.assertEqual(step["saved"], {"standardServiceRows": saved})
 
+    def test_decisions_survive_an_analysis_that_clears_the_basis_first(self):
+        result = self.run_steps([
+            {"adopt": FIRST_ANALYSIS},
+            {"tag": {"id": PM, "tag": "Include"}},
+            {"tag": {"id": WASTE, "tag": "Exclude"}},
+            {"analyseThenClear": True},
+            {"adopt": SECOND_ANALYSIS},
+        ])
+        cleared, reanalysed = result["steps"][3:]
+        self.assertEqual(cleared["sections"], [])
+        self.assertEqual(cleared["decisions"], {PM: "Include", WASTE: "Exclude"})
+        self.assert_standard_rows(reanalysed, "Include", "Exclude")
+
     def test_draft_started_before_the_change_is_left_as_saved(self):
         result = self.run_steps([{"adopt": FIRST_ANALYSIS}, {"reset": True}], old_draft=True)
         for step in result["steps"]:

@@ -33,6 +33,7 @@ referenceFilesDependencySignature = () => "";
 [
   "invalidateBasisChatAuthority", "setDownloadFiles", "clearPricingReviewMessages", "setWorkflowStage",
   "updateQuoteBasisCard", "syncControlStates", "markOutputRowsDirty", "updateBasisLines", "queueQuoteSessionDraftStateSave",
+  "renderMatchSummary", "renderPricingMatches", "setResultStatus", "showBlockedAction",
 ].forEach((name) => { globalThis[name] = () => {}; });
 const view = () => ({
   sections: state.quoteBasisSections.map((section) => ({
@@ -65,6 +66,14 @@ for (const step of input.steps) {
   if (step.adopt) adopt(step.adopt);
   if (step.tag) setTag(step.tag.id, step.tag.tag);
   if (step.reset) resetQuoteBasisToOriginal();
+  // Starting an analysis (stopped here before any request: no images), then the basis cleared as a
+  // failed analysis or a clarification clears it.
+  if (step.analyseThenClear) {
+    state.images = [];
+    state.pendingFeedback = "";
+    handleDraftBasis({});
+    clearAiFailedDraftState();
+  }
   if (step.restore !== undefined) state.standardServiceRows = normalizeStandardServiceDecisions(step.restore);
   steps.push(view());
 }
