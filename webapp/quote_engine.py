@@ -34,10 +34,11 @@ class QuoteDraftRunner:
             budget.next_stage(synthesis=True)
             try:
                 data, fingerprint = self.gateway.send_single(prepared.single_send, budget)
+                # Normalisation may re-ask once for missing sizes, so usage is recorded after it.
+                return self.gateway.normalize_single(data, fingerprint, prepared.single_send, budget)
             finally:
                 if budget.by_model:
                     self.gateway.record_usage(budget)
-            return self.gateway.normalize_response(data, fingerprint)
 
         budget = self.gateway.new_budget(len(prepared.batches))
         plan = self.gateway.prepare_batches(prepared.batches)

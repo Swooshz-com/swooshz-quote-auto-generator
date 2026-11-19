@@ -34,6 +34,7 @@ from webapp.object_storage import (
     ObjectStorageContractError,
     S3CompatibleObjectStorageBackend,
     object_storage_provider_status,
+    s3_client_config,
 )
 
 
@@ -101,6 +102,7 @@ def _build_live_s3_backend(env: Mapping[str, str], provider_status: Mapping[str,
             region_name=env.get(OBJECT_STORAGE_REGION_ENV_NAME),
             aws_access_key_id=env.get(OBJECT_STORAGE_ACCESS_KEY_ID_ENV_NAME),
             aws_secret_access_key=env.get(OBJECT_STORAGE_SECRET_ACCESS_KEY_ENV_NAME),
+            config=s3_client_config(),
         )
     except Exception as exc:
         raise ObjectStorageConfigurationError("Object storage backend is not available.") from exc

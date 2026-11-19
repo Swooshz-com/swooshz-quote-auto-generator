@@ -106,7 +106,7 @@ class PdfReferenceLimitsTest(unittest.TestCase):
             self.assertIs(type(details[key]), int)
         return details
 
-    def test_48_mib_boundaries_and_pdf_only_checkpoint_allowance(self):
+    def test_48_mib_boundaries_and_reference_only_checkpoint_allowance(self):
         self.assertEqual(server.MAX_PDF_BYTES, 48 * 1024 * 1024)
         for size in (server.MAX_PDF_BYTES - 1, server.MAX_PDF_BYTES, server.MAX_PDF_BYTES + 1):
             with self.subTest(size=size):
@@ -124,9 +124,9 @@ class PdfReferenceLimitsTest(unittest.TestCase):
                 self.assertEqual(server.quote_session_draft_file_record(record)["data_url"], entry["data_url"])
                 payload = {"draft_files": [record]}
                 length = len(json.dumps(payload).encode("utf-8"))
-                self.assertTrue(server.pdf_request_fits_standard_budget("/api/quote-sessions", payload, length))
+                self.assertTrue(server.reference_media_request_fits_budget("/api/quote-sessions", payload, length))
                 self.assertLess(length, server.request_body_limit("/api/quote-sessions"))
-                self.assertFalse(server.pdf_request_fits_standard_budget(
+                self.assertFalse(server.reference_media_request_fits_budget(
                     "/api/quote-sessions", {"draft_files": [{**record, "file_role": "logo"}]}, length))
 
     def test_48_mib_reference_persists_in_database_and_object_adapter(self):
@@ -173,7 +173,7 @@ class PdfReferenceLimitsTest(unittest.TestCase):
     def test_limit_messages_and_visible_copy(self):
         html = (ROOT / "webapp/static/index.html").read_text(encoding="utf-8")
         js = (ROOT / "webapp/static/app.js").read_text(encoding="utf-8")
-        self.assertIn("PDFs up to 48 MiB each and 96 pages in total across PDFs", html)
+        self.assertIn("up to 48 MiB each and 128 MiB in total. PDFs up to 96 pages in total across PDFs", html)
         self.assertIn("const MAX_REFERENCE_PDF_MIB = 48;", js)
         self.assertIn("96 pages in total across PDFs", js)
         for reason, limit in (("pdf_page_limit", "96"), ("pdf_byte_limit", "48"), ("source_byte_limit", "128")):

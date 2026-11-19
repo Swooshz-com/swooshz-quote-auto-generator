@@ -159,6 +159,40 @@ class SynthesisContractRepairTest(unittest.TestCase):
         repaired["input"][0]["content"][0]["text"] = original_text
         self.assertEqual(repaired, original)
 
+    def test_quantity_reask_shares_the_single_repair_send_and_settles_every_attempt(self):
+        # Owner decision 18 Nov 2026: a physical line without a size gets one re-ask, then the booth-size rule.
+        sizes = {"quantities": [{"id": "floor", "quantity": 36, "unit": "sqm"}, {"id": "rail", "quantity": 6, "unit": "m"},
+                                {"id": "chair", "quantity": 4, "unit": "nos"}]}
+        for second, outcome, rule in ((sizes, "quantity_success", False), ("not json", "quantity_failed", True)):
+            with self.subTest(outcome=outcome):
+                self.logs.clear()
+                transport = SynthesisTransport([draft(measured=False), second])
+                result = self.analyse(transport)
+                self.assert_sends(transport, 12, 2)
+                self.assertEqual(self.usage()["synthesis_repair_count"], 1)
+                self.assertEqual(self.usage()["synthesis_repair_outcome"], outcome)
+                reask = transport.calls[-1]["input"][0]["content"]
+                self.assertEqual([part["type"] for part in reask], ["input_text"])
+                self.assertTrue(reask[0]["text"].startswith("Quantity prediction for an exhibition booth quote."))
+                self.assertNotIn("text", transport.calls[-1])
+                context = json.loads(reask[0]["text"].split("Context JSON: ", 1)[1])
+                self.assertEqual([line["id"] for line in context["lines"]], ["floor", "rail", "chair"])
+                lines = [line for section in result["quote_basis_sections"] for line in section["lines"]]
+                self.assertTrue(all(line.get("quantity") not in (None, "") for line in lines if line["id"] != "concept"))
+                self.assertEqual(any(finding["id"] == "booth-size-rule" for finding in result["analysis_findings"]), rule)
+                statuses = [record["status"] for event, record in self.logs
+                            if event == "ai_call_attempt" and record.get("attempt_number", 0) > 0]
+                self.assertEqual(statuses.count("failed"), 1 if rule else 0)
+
+    def test_contract_repair_leaves_no_quantity_reask_and_the_rule_fills_sizes(self):
+        unmeasured = draft(measured=False)
+        unmeasured["quote_basis_sections"][0]["lines"][0].pop("confidence_pct")
+        transport = SynthesisTransport([unmeasured, draft(measured=False)])
+        result = self.analyse(transport)
+        self.assert_sends(transport, 12, 2)
+        self.assertEqual(self.usage()["synthesis_repair_outcome"], "success")
+        self.assertEqual(result["analysis_findings"][0]["id"], "booth-size-rule")
+
     def test_second_contract_failure_uses_normal_error_reference_and_settles_both_sends(self):
         transport = SynthesisTransport([missing_confidence(), missing_confidence()])
         result = self.analyse(transport, terminal=True)
@@ -252,10 +286,12 @@ class SynthesisContractRepairTest(unittest.TestCase):
         text = transport.calls[-1]["input"][0]["content"][0]["text"]
         instructions = text[:text.index('[{"source":')]
         tail = instructions[instructions.index("Required fields:"):]
-        self.assertIn("Leave quantity and unit absent for genuinely unmeasured or purely informational lines.", instructions)
-        self.assertIn("Keep unmeasured physical lines in the basis for review.", instructions)
+        self.assertIn("Leave quantity and unit absent only for purely informational lines.", instructions)
+        self.assertIn(server.PREDICTED_QUANTITY_RULE, instructions)
+        self.assertIn("Emit a linked line_items row for every physical line.", instructions)
+        self.assertNotIn("unmeasured physical lines in the basis for review", instructions)
         self.assertIn("Do not emit line_items for informational lines.", instructions)
-        for required in ("id, tag, text and confidence_pct (or confidence)", "Measured physical lines also have quantity and unit",
+        for required in ("id, tag, text, confidence_pct (or confidence), quantity and unit",
                          "JSON integer from 0 to 100", "supplied aliases must agree",
                          "Pure informational notes may omit quantity and unit", "source_basis_line_id"):
             self.assertIn(required, tail)

@@ -46,9 +46,8 @@ SANITIZED_LOGO_PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
 SANITIZED_LOGO_DATA_URL = "data:image/png;base64," + base64.b64encode(SANITIZED_LOGO_PNG_BYTES).decode("ascii")
-EXPECTED_PROMPT_IMAGE_MAX_WIDTH = 4096
-EXPECTED_PROMPT_IMAGE_MAX_HEIGHT = 4096
-EXPECTED_PROMPT_IMAGE_MAX_PIXELS = 9_000_000 - 1
+EXPECTED_SOURCE_JPEG_MAX_PIXELS = 89_478_485
+EXPECTED_SOURCE_LOSSLESS_MAX_PIXELS = 40_000_000
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -5893,6 +5892,9 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
                     "tag": "Confirm",
                     "text": "Synthetic nested raw response line",
                     "confidence_pct": 95,
+                    # Physical lines carry a predicted quantity (owner rule 18 Nov 2026).
+                    "quantity": 2,
+                    "unit": "nos",
                 }],
             }],
             "line_items": [],
@@ -5926,7 +5928,8 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         self.assertNotIn("failure_boundary", diagnostics)
         self.assertEqual(result["status"], "drafted")
         self.assertEqual(result["source"], "openai")
-        self.assertEqual(result["quote_basis"]["surfaces"], "Confirm: Synthetic nested raw response line")
+        # A sized line with no catalogue match is normalised to Custom, as for any measured unmatched line.
+        self.assertEqual(result["quote_basis"]["surfaces"], "Custom: Synthetic nested raw response line")
         normalized_lines = [
             line["text"]
             for section in result["quote_basis_sections"]
@@ -6127,6 +6130,39 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             payload["images"][0]["data_url"],
         ):
             self.assertNotIn(private_value, serialized)
+
+    def test_sizing_guarantee_turns_one_lot_on_an_area_catalogue_item_into_a_priced_area(self):
+        # Owner decision 18 Nov 2026: every physical line ends with a size. G2 (#392) found "1 lot" on a
+        # per-sqm catalogue item left unpriced; the booth-size rule sizes it before the seal is issued.
+        payload = {
+            "profile_id": "synthetic-exhibition-fixture-template",
+            "pricing_reference_id": "synthetic-exhibition-fixture-pricing",
+            "pricing_reference_source": "local",
+            "project": {"booth_width": 8, "booth_depth": 9},
+        }
+        keyword = "synthetic-floors-synthetic-carpet-tile"
+        parsed = {
+            "quote_basis_sections": [{"id": "floors", "title": "Synthetic Floors", "lines": [
+                {"id": "carpet", "tag": "Confirm", "text": "Synthetic carpet tile across the booth",
+                 "confidence_pct": 82, "quantity": 1, "unit": "lot", "pricing_keyword": keyword}]}],
+            "line_items": [{"source_basis_line_id": "carpet", "section": "Synthetic Floors",
+                            "description": "Synthetic carpet tile across the booth", "quantity": 1, "unit": "lot",
+                            "pricing_keyword": keyword}],
+            "project": {"booth_width": 8, "booth_depth": 9},
+        }
+        entry = webapp.raw_draft_catalog_entries(payload, None).get(keyword)
+        self.assertEqual(entry["unit"], "sqm")
+        self.assertRegex(entry["section"], webapp.FLOOR_SECTION_RE)
+        draft = webapp.normalize_ai_draft(webapp.complete_predicted_quantities(parsed, payload, None), payload,
+                                          require_confidence=True)
+        line = draft["quote_basis_sections"][0]["lines"][0]
+        row = draft["line_items"][0]
+        self.assertEqual((float(line["quantity"]), line["unit"]), (72, "sqm"))
+        self.assertEqual((float(row["quantity"]), row["unit"], row["pricing_keyword"]), (72, "sqm", keyword))
+        self.assertLessEqual(line["confidence"], webapp.PREDICTED_QUANTITY_RULE_CONFIDENCE)
+        self.assertEqual(draft["analysis_findings"][0]["id"], "booth-size-rule")
+        # Owner 17:18Z: the predicted size reaches the Quote Basis marked as an estimate ("Est.").
+        self.assertEqual(line["quantity_estimate"], {"quantity": 72, "unit": "sqm"})
 
     def test_normalize_ai_draft_appends_missing_catalog_backed_basis_lines(self):
         parsed = {
@@ -12552,7 +12588,7 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
             "data_url": "data:image/png;base64," + base64.b64encode(oversized).decode("ascii"),
         }
 
-        with self.assertRaisesRegex(ValueError, "larger than 12 MB"):
+        with self.assertRaisesRegex(ValueError, "larger than 48 MB"):
             webapp.decode_reference_data_url_bytes(entry, webapp.MAX_IMAGE_BYTES)
 
     def test_prompt_image_decoder_rejects_malformed_supported_format(self):
@@ -12591,10 +12627,10 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
     def test_prompt_image_decoder_rejects_real_below_pillow_limit_before_decode(self):
         from PIL import Image
 
-        raw = highly_compressible_rgb_png(4000, 4000)
+        raw = highly_compressible_rgb_png(8000, 5001)
         self.assertLessEqual(len(raw), webapp.MAX_IMAGE_BYTES)
-        self.assertGreater(4000 * 4000, EXPECTED_PROMPT_IMAGE_MAX_PIXELS)
-        self.assertLess(4000 * 4000, Image.MAX_IMAGE_PIXELS)
+        self.assertGreater(8000 * 5001, EXPECTED_SOURCE_LOSSLESS_MAX_PIXELS)
+        self.assertLess(8000 * 5001, Image.MAX_IMAGE_PIXELS)
 
         with (
             mock.patch.object(
@@ -12633,40 +12669,33 @@ assert.strictEqual(quoteDetailsWithFallbackDefaults({ currency: "SGD" }, saved, 
         image_save.assert_not_called()
 
     def test_prompt_image_decoder_accepts_exact_application_boundaries(self):
-        self.assertEqual(webapp.MAX_PROMPT_IMAGE_WIDTH, EXPECTED_PROMPT_IMAGE_MAX_WIDTH)
-        self.assertEqual(webapp.MAX_PROMPT_IMAGE_HEIGHT, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT)
-        self.assertEqual(webapp.MAX_PROMPT_IMAGE_PIXELS, EXPECTED_PROMPT_IMAGE_MAX_PIXELS)
+        self.assertEqual(webapp.MAX_SOURCE_JPEG_PIXELS, EXPECTED_SOURCE_JPEG_MAX_PIXELS)
+        self.assertEqual(webapp.MAX_SOURCE_LOSSLESS_PIXELS, EXPECTED_SOURCE_LOSSLESS_MAX_PIXELS)
 
-        exact_boundaries = (
-            (EXPECTED_PROMPT_IMAGE_MAX_WIDTH, 1, "width"),
-            (1, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT, "height"),
-            (2999, 3001, "pixels"),
-        )
-        for width, height, boundary in exact_boundaries:
-            with self.subTest(boundary=boundary):
-                raw = highly_compressible_rgb_png(width, height)
-                data_url = webapp.compressed_prompt_image_data_url(raw)
-                self.assertTrue(data_url.startswith("data:image/png;base64,"))
+        # Wide, tall and 4K-plus images are admitted and reach the AI shrunk.
+        for width, height in ((4097, 1), (1, 4097), (4000, 4000)):
+            with self.subTest(size=(width, height)):
+                data_url = webapp.compressed_prompt_image_data_url(highly_compressible_rgb_png(width, height))
+                self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        with mock.patch.object(webapp, "MAX_SOURCE_LOSSLESS_PIXELS", 100):
+            data_url = webapp.compressed_prompt_image_data_url(highly_compressible_rgb_png(10, 10))
+        self.assertTrue(data_url.startswith("data:image/png;base64,"))
 
     def test_prompt_image_decoder_rejects_each_application_boundary_overage(self):
         from PIL import Image
 
-        overages = (
-            (EXPECTED_PROMPT_IMAGE_MAX_WIDTH + 1, 1, "width"),
-            (1, EXPECTED_PROMPT_IMAGE_MAX_HEIGHT + 1, "height"),
-            (3000, 3000, "pixels"),
-        )
-        for width, height, boundary in overages:
-            with self.subTest(boundary=boundary):
-                raw = highly_compressible_rgb_png(width, height)
-                with mock.patch.object(
-                    Image.Image,
-                    "load",
-                    side_effect=AssertionError("rejected image reached pixel loading"),
-                ) as image_load:
-                    result = webapp.compressed_prompt_image_data_url(raw)
-                self.assertEqual(result, "")
-                image_load.assert_not_called()
+        with mock.patch.object(webapp, "MAX_SOURCE_LOSSLESS_PIXELS", 100):
+            for width, height in ((101, 1), (1, 101), (11, 10)):
+                with self.subTest(size=(width, height)):
+                    raw = highly_compressible_rgb_png(width, height)
+                    with mock.patch.object(
+                        Image.Image,
+                        "load",
+                        side_effect=AssertionError("rejected image reached pixel loading"),
+                    ) as image_load:
+                        result = webapp.compressed_prompt_image_data_url(raw)
+                    self.assertEqual(result, "")
+                    image_load.assert_not_called()
 
     def test_prompt_image_decoder_rejects_non_positive_header_dimensions_before_decode(self):
         class HeaderOnlyImage:
@@ -25815,6 +25844,7 @@ eval([
   "normalizeConfidence",
   "normalizePossiblePricingMatches",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "parseBasisLine",
   "pythonWhitespaceText",
@@ -28713,6 +28743,7 @@ let quoteSessionDraftSavePromise = null;
 let quoteSessionConfirmedDraftSessionId = "";
 let quoteSessionConfirmedDraftKey = "";
 let quoteSessionConfirmedDraftFileKey = "";
+let persistedSessionFiles = { scope: "", epoch: -1, records: new Map() };
 let version = 1;
 let fileVersion = 1;
 let sequence = 0;
@@ -28999,6 +29030,11 @@ const openSessionFileDb = async () => ({
           queueMicrotask(() => { if (request.onsuccess) request.onsuccess(); });
           return request;
         },
+        getKey(key) {
+          const request = { result: persistedFiles.has(key) ? key : undefined };
+          queueMicrotask(() => { if (request.onsuccess) request.onsuccess(); });
+          return request;
+        },
       }; },
     };
     setImmediate(() => { if (transaction.oncomplete) transaction.oncomplete(); });
@@ -29029,6 +29065,7 @@ if (scenario.path === "duplicate") required.push(
   "sessionFileRecordFromHeaderLogo", "sessionFileRecordsFromDraft", "persistSessionFiles", "loadSessionFileMap",
   "restoreSessionImages", "referenceFileType", "referenceFileHasPayload", "normalizedContentFingerprint",
   "ensureContentFingerprint", "contentFingerprintFromDataUrl", "dataUrlBytes", "sha256ContentFingerprint");
+if (scenario.path === "duplicate" && source.includes("function sessionFileRecordIsPersisted(")) required.push("sessionFileRecordIsPersisted");
 const adapterSource = (scenario.originalBoundary ? "" :
   "const clearActiveJob = syntheticClearActiveJob;")
   + (scenario.originalBoundary || scenario.path === "duplicate" ? "" :
@@ -31078,6 +31115,7 @@ eval([
   "basisUnmatchedOffer",
   "basisPricingGroup",
   "detectedBoothSizeText",
+  "quoteBasisHeaderHtml",
   "renderQuoteBasisMessage",
 ].map(extractFunction).join("\n"));
 
@@ -31160,8 +31198,8 @@ const state = {
       id: "platform",
       title: "Platform / Flooring",
       lines: [
-        { tag: "Include", text: "Raised platform." },
-        { tag: "Confirm", text: "Finish colour." },
+        { tag: "Include", text: "Raised platform.", quantity: 36, unit: "sqm" },
+        { tag: "Confirm", text: "Finish colour.", quantity: 1, unit: "lot" },
       ],
     },
     {
@@ -31204,6 +31242,12 @@ function markOutputRowsDirty() { state.downloadFile = null; }
 let basisPricingIndex = null;
 const catalogueReferenceKeyIndexes = new WeakMap();
 function quoteCommercialReviewRequired() { return Boolean(state.quoteCommercialReview && state.quoteCommercialReview.status === QUOTE_COMMERCIAL_REVIEW_STATUS); }
+// The shown rule size uses the same unit list and floor pattern as the app.
+for (const name of ["BASIS_FREE_QUANTITY_UNITS", "BASIS_FLOOR_SECTION_RE"]) {
+  const declaration = source.match(new RegExp("const " + name + " = [^\\n]+"));
+  if (!declaration) throw new Error("Missing constant " + name);
+  eval.call(globalThis, declaration[0].replace(/^const /, "var "));
+}
 eval(source.slice(source.indexOf("function canonicalBasisSectionText"), source.indexOf("function pythonWhitespaceText")));
 eval([
   "normalizeAnalysisMode",
@@ -31236,6 +31280,7 @@ eval([
   "normalizeConfidence",
   "normalizePossiblePricingMatches",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "parseBasisLine",
   "pythonWhitespaceText",
@@ -31288,8 +31333,16 @@ eval([
             "comparableCatalogueReferenceKey",
             "catalogueItemsByReferenceKey",
             "basisCatalogueQuantityItem",
-            "basisCatalogueQuantityHtml",
+            "basisLineNeedsQuantity",
+            "basisPredictedQuantity",
+            "basisLineQuantityFillable",
+            "basisPredictedQuantityLabel",
+            "basisQuantityUnitText",
+            "basisLineQuantityEditable",
+            "basisQuantityIsEstimate",
+            "basisQuantityEditButtonHtml",
             "renderBasisLine",
+            "quoteBasisHeaderHtml",
             "renderQuoteBasisMessage",
             "quoteBasisFromSections",
             "canonicalPrimaryOrderValue",
@@ -31490,8 +31543,8 @@ state.quoteBasisSections = [
     id: "platform",
     title: "Platform / Flooring",
     lines: [
-      { tag: "Include", text: "Raised platform." },
-      { tag: "Include", text: "Finish colour." },
+      { tag: "Include", text: "Raised platform.", quantity: 36, unit: "sqm" },
+      { tag: "Include", text: "Finish colour.", quantity: 1, unit: "lot" },
     ],
   },
   {
@@ -31507,7 +31560,7 @@ const lineHtml = renderBasisLine(
 );
 assert.ok(lineHtml.includes(">Confirm</span>"));
 assert.ok(lineHtml.includes(">92%</span>"));
-assert.ok(lineHtml.includes(">36 sqm</span>"));
+assert.ok(lineHtml.includes(">36 sqm</button></span>"));
 assert.ok(lineHtml.includes("sqm 100mm raised platform with aluminum edging"));
 assert.ok(lineHtml.includes("basis-confidence-pill"));
 assert.ok(lineHtml.includes("basis-quantity-text"));
@@ -31537,6 +31590,40 @@ assert.ok(bracketedCatalogLineHtml.includes("Grey carpet finish across 9m x 10.5
 state.quoteBasisSections[0].lines[1].tag = "Include";
 assert.deepStrictEqual(unresolvedConfirmLines(state.quoteBasisSections), []);
 assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
+// Every physical line shows a size (owner 18 Nov 2026): no "Not measured" and no "Add qty". A line still blank
+// (only quotes saved before the server sizing guarantee) shows the booth-size rule size, which Confirm writes.
+const savedQuantity = state.quoteBasisSections[0].lines[0].quantity;
+state.quoteBasisSections[0].lines[0].quantity = "";
+assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
+const blankQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
+const predictedLabel = basisPredictedQuantityLabel(state.quoteBasisSections[0].lines[0]);
+assert.ok(/^1 /.test(predictedLabel), "A blank line has no rule size: " + predictedLabel);
+assert.ok(!blankQuantityHtml.includes("Not measured"), "A blank quantity still shows Not measured");
+assert.ok(!blankQuantityHtml.includes("Add qty"), "A blank quantity still asks to Add qty");
+assert.ok(blankQuantityHtml.includes('data-basis-quantity-edit="1"') && blankQuantityHtml.includes(">" + escapeHtml(predictedLabel) + "</button>"), "A blank quantity does not show its rule size");
+assert.ok(!blankQuantityHtml.includes("<input"), "The quantity should read as text until clicked");
+// Every measured quantity is also a click-to-edit text control, never a box by default.
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
+const measuredQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
+assert.ok(measuredQuantityHtml.includes('data-basis-quantity-edit="1"') && !measuredQuantityHtml.includes("<input"), "A measured quantity is not editable in place");
+assert.ok(!measuredQuantityHtml.includes("Est."), "A measured quantity is tagged as an estimate");
+// Owner 17:18Z: a size the server predicted shows a small "Est." while the line still holds that size.
+state.quoteBasisSections[0].lines[0].quantity_estimate = { quantity: savedQuantity, unit: "sqm" };
+const estimatedQuantityHtml = renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0);
+assert.ok(estimatedQuantityHtml.includes('data-basis-quantity-est="1"') && estimatedQuantityHtml.includes(">Est.</span>"), "A predicted size has no Est. tag");
+assert.ok(estimatedQuantityHtml.includes('aria-label="Estimated quantity '), "The Est. tag is not announced");
+assert.deepStrictEqual(normalizeBasisLines(state.quoteBasisSections[0].lines[0])[0].quantity_estimate, { quantity: savedQuantity, unit: "sqm" });
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity + 1;
+assert.ok(!renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0).includes("Est."), "A changed size still shows Est.");
+state.quoteBasisSections[0].lines[0].quantity = "";
+assert.ok(!renderBasisLine(state.quoteBasisSections[0], state.quoteBasisSections[0].lines[0], 0).includes("Est."), "A blank line shows Est.");
+delete state.quoteBasisSections[0].lines[0].quantity_estimate;
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
+state.quoteBasisSections[0].lines[0].quantity = "";
+state.quoteBasisSections[0].lines[0].tag = "Exclude";
+assert.strictEqual(basisConfirmBlockReason(state.quoteBasisSections), "");
+state.quoteBasisSections[0].lines[0].tag = "Include";
+state.quoteBasisSections[0].lines[0].quantity = savedQuantity;
 assert.strictEqual(renderBasisConfirmSummary(state.quoteBasisSections), "");
 
 let rendered = 0;
@@ -31547,6 +31634,10 @@ function queueQuoteSessionDraftStateSave() { queuedDraftSaves += 1; }
 function updateQuoteBasisCard(source) {
   assert.strictEqual(source, "edited");
   rendered += 1;
+}
+function updateBasisLines(lineIds, source) {
+  assert.ok(Array.isArray(lineIds) && lineIds.length, "changed line ids");
+  updateQuoteBasisCard(source);
 }
 function syncControlStates() {
   synced += 1;
@@ -31813,8 +31904,8 @@ assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "nos" }), "2 n
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 1, unit: "lot" }), "1 lot");
 assert.strictEqual(basisQuantityDisplayLabel({ quantity: 2, unit: "" }), "2 (unit needed)");
 assert.strictEqual(basisQuantityLabel({ quantity: "m", unit: "length" }), "");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "Not measured");
-assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "Not measured");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "m", unit: "length" }), "");
+assert.strictEqual(basisQuantityDisplayLabel({ quantity: "", unit: "m length" }), "");
 assert.strictEqual(
   basisChatLineContext({ tag: "Include", text: "100mm raised platform", quantity: 36, unit: "sqm" }),
   "Include: 100mm raised platform"
@@ -31994,6 +32085,7 @@ eval([
   "numberOrNull",
   "orderNumber",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "normalizeQuoteBasisTitle",
   "pythonWhitespaceText",
@@ -32202,6 +32294,7 @@ eval([
   "numberOrNull",
   "orderNumber",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "parseBasisLine",
   "normalizeQuoteBasisTitle",
@@ -32365,6 +32458,7 @@ eval([
   "numberOrNull",
   "orderNumber",
   "splitBasisDecisionText",
+  "normalizedQuantityEstimate",
   "normalizeBasisLines",
   "pythonWhitespaceText",
   "normalizeQuoteBasisSections",

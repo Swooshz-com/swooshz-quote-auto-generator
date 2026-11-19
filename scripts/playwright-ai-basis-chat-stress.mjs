@@ -138,13 +138,15 @@ async function screenshot(page, name) {
   return filePath;
 }
 
+// Every physical line carries a quantity: the AI must predict one (owner rule 18 Nov 2026), and Confirm
+// stays blocked while any line has none.
 function quoteBasisSections(platformText = "100mm raised platform with needle punch carpet.", electricalTag = "Confirm") {
   return [
     {
       id: "surfaces",
       title: "Surfaces",
       lines: [
-        { tag: "Include", text: "Painted booth structure and fascia from uploaded render images.", confidence_pct: 90 },
+        { tag: "Include", text: "Painted booth structure and fascia from uploaded render images.", quantity: 1, unit: "lot", confidence_pct: 90 },
       ],
     },
     {
@@ -158,7 +160,7 @@ function quoteBasisSections(platformText = "100mm raised platform with needle pu
       id: "electrical",
       title: "Lighting and Electrical",
       lines: [
-        { tag: electricalTag, text: "Standard 13A sockets and LED lighting only.", confidence_pct: 85 },
+        { tag: electricalTag, text: "Standard 13A sockets and LED lighting only.", quantity: 1, unit: "lot", confidence_pct: 85 },
       ],
     },
     {
@@ -187,7 +189,7 @@ function quoteBasisSections(platformText = "100mm raised platform with needle pu
       id: "graphics",
       title: "Graphics",
       lines: [
-        { tag: "Custom", text: "Printed graphics pending manual pricing.", confidence_pct: 70, custom_pricing: true },
+        { tag: "Custom", text: "Printed graphics pending manual pricing.", quantity: 1, unit: "lot", confidence_pct: 70, custom_pricing: true },
       ],
     },
   ];

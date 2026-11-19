@@ -118,7 +118,7 @@ const PRICING_REFERENCE_FILE_ACCEPT = ".xlsx,.csv,.md";
 const REFERENCE_FILE_ACCEPT = "image/png,image/jpeg,image/webp,application/pdf,.pdf";
 const MAX_PRICING_REFERENCE_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES = 8;
-const MAX_REFERENCE_IMAGE_MIB = 12;
+const MAX_REFERENCE_IMAGE_MIB = 48;
 const MAX_REFERENCE_PDF_MIB = 48;
 const MAX_REFERENCE_TOTAL_MIB = 128;
 const DEFAULT_DATE_LABEL = "Date:";
@@ -165,7 +165,7 @@ const QUOTE_COPY = {
   label: "Quotation",
   intakeSubtitle: "Drop reference images or PDFs for a real workspace quote.",
   dropTitle: "Drop reference images or PDFs to start",
-  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references. Images up to ${MAX_REFERENCE_IMAGE_MIB} MiB each, PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each and 96 pages in total across PDFs. Up to ${MAX_REFERENCE_TOTAL_MIB} MiB total. Remote AI analysis sends selected refs to the configured provider.`,
+  dropMeta: `JPG, PNG, WebP, or PDF. Up to ${MAX_REFERENCE_IMAGES} references, up to ${MAX_REFERENCE_IMAGE_MIB} MiB each and ${MAX_REFERENCE_TOTAL_MIB} MiB in total. PDFs up to 96 pages in total across PDFs. Remote AI analysis sends selected refs to the configured provider.`,
   imageNoun: "reference file",
   analyzeLabel: "Start Analysis",
   fallbackAction: "review the reference files",
@@ -1939,7 +1939,7 @@ async function readImagesFromFiles(files) {
     return file.size > limit * 1024 * 1024;
   });
   if (oversizedFile) {
-    setImageUploadStatus(`Choose images up to ${MAX_REFERENCE_IMAGE_MIB} MiB and PDFs up to ${MAX_REFERENCE_PDF_MIB} MiB each.`);
+    setImageUploadStatus(`Choose files up to ${MAX_REFERENCE_IMAGE_MIB} MiB each.`);
     return;
   }
   let images;
@@ -4248,6 +4248,17 @@ function sessionFileRecordsFromDraft() {
   ].filter(Boolean);
 }
 
+// The reference files this page last wrote to the browser file store, for one recovery scope and
+// epoch. A save with unchanged files skips their put, which would structured-clone every data URL on
+// the main thread on every click, and only checks each record is still stored.
+let persistedSessionFiles = { scope: "", epoch: -1, records: new Map() };
+
+function sessionFileRecordIsPersisted(record) {
+  const persisted = persistedSessionFiles.records.get(record.session_file_key);
+  return Boolean(persisted) && persisted.data_url === record.data_url
+    && ["file_role", "name", "type", "size", "content_fingerprint"].every((key) => persisted[key] === record[key]);
+}
+
 function persistSessionFiles(records = []) {
   if (state.isSigningOut || state.isRecoveryScopeTransitioning) return Promise.reject(new Error("Browser recovery is leaving this session."));
   const currentScope = currentBrowserRecoveryScope();
@@ -4263,10 +4274,26 @@ function persistSessionFiles(records = []) {
       reject(new Error("Browser recovery scope changed before file persistence."));
       return;
     }
+    if (persistedSessionFiles.scope !== currentScope || persistedSessionFiles.epoch !== recoveryEpoch) {
+      persistedSessionFiles = { scope: currentScope, epoch: recoveryEpoch, records: new Map() };
+    }
+    const persisted = persistedSessionFiles;
     const transaction = db.transaction(QUOTE_SESSION_FILE_STORE_NAME, "readwrite");
     const store = transaction.objectStore(QUOTE_SESSION_FILE_STORE_NAME);
-    validRecords.forEach((record) => store.put(record));
-    transaction.oncomplete = () => resolve();
+    validRecords.forEach((record) => {
+      if (!sessionFileRecordIsPersisted(record)) {
+        store.put(record);
+        return;
+      }
+      // Another tab may have cleared the store; a missing record is written again.
+      const stored = store.getKey(record.session_file_key);
+      stored.onsuccess = () => { if (stored.result === undefined) store.put(record); };
+    });
+    transaction.oncomplete = () => {
+      // Keep only this call's files, so removed files are not held in memory.
+      if (persisted === persistedSessionFiles) persisted.records = new Map(validRecords.map((record) => [record.session_file_key, record]));
+      resolve();
+    };
     transaction.onerror = () => reject(transaction.error || new Error("Could not persist session files"));
     transaction.onabort = () => reject(transaction.error || new Error("Session file persistence aborted"));
   }));
@@ -7272,6 +7299,23 @@ function splitBasisDecisionText(text = "", defaultTag = "Confirm") {
   return lines;
 }
 
+// The size the server predicted for a line (owner, 18 Nov 2026): shown as "Est." while the line still holds it.
+function normalizedQuantityEstimate(value) {
+  if (!value || typeof value !== "object" || typeof value.quantity === "boolean") return null;
+  const quantity = Number(value.quantity);
+  const unit = String(value.unit ?? "").trim();
+  if (!(Number.isFinite(quantity) && quantity > 0 && quantity <= 100000) || !unit) return null;
+  return { quantity, unit: unit.slice(0, 40) };
+}
+
+function basisQuantityIsEstimate(line = {}) {
+  const estimate = normalizedQuantityEstimate(line.quantity_estimate);
+  const quantity = Number(line.quantity);
+  return Boolean(estimate) && basisQuantityText(line.quantity) !== "" && Number.isFinite(quantity)
+    && Math.abs(quantity - estimate.quantity) < 0.0005
+    && normalizeUnit(line.unit || "") === normalizeUnit(estimate.unit);
+}
+
 function normalizeBasisLines(line = "") {
   if (line && typeof line === "object" && !Array.isArray(line) && typeof canonicalizePrimaryOrderFields === "function") line = canonicalizePrimaryOrderFields(line);
   if (line && typeof line === "object") {
@@ -7296,6 +7340,8 @@ function normalizeBasisLines(line = "") {
       if (orderNumber(line.item_order) !== null) next.item_order = orderNumber(line.item_order);
       if (quantityParts.quantity !== undefined && quantityParts.quantity !== null && String(quantityParts.quantity).trim() !== "") next.quantity = quantityParts.quantity;
       if (quantityParts.unit) next.unit = quantityParts.unit;
+      const estimate = normalizedQuantityEstimate(line.quantity_estimate);
+      if (estimate && next.quantity !== undefined) next.quantity_estimate = estimate;
       if (confidence !== null) next.confidence = confidence;
       if (hasCustomPricing || normalizeBasisTag(parsed.tag) === "Custom") next.custom_pricing = true;
       if (line.custom_confirmed) next.custom_confirmed = true;
@@ -11557,8 +11603,10 @@ function basisConfirmBlockReason(sections = state.quoteBasisSections) {
   if ((state.blockingClarificationQuestions || []).some((question) => question.status !== "answered" && !String(question.answer || "").trim())) {
     return "Answer all clarification questions before confirming quotation basis.";
   }
-  return unresolvedConfirmLines(sections).length
-    ? "Resolve all review lines before confirming quotation basis."
+  if (unresolvedConfirmLines(sections).length) return "Resolve all review lines before confirming quotation basis.";
+  // Confirm fills a blank line with its shown rule size; only a line it cannot fill (more than one output row) blocks.
+  return basisSections(sections).some((section) => (section.lines || []).some((line) => basisLineNeedsQuantity(line) && !basisLineQuantityFillable(line)))
+    ? "Enter a quantity for every line before confirming quotation basis."
     : "";
 }
 
@@ -11637,7 +11685,8 @@ function basisQuantityLabel(line = {}) {
 
 function basisQuantityDisplayLabel(line = {}) {
   const quantityText = basisQuantityText(line.quantity);
-  if (!quantityText) return "Not measured";
+  // Every physical line carries a quantity; a missing one is asked for in the row, never labelled.
+  if (!quantityText) return "";
   let unit = normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
   if (/^nos?\.?$/i.test(unit)) unit = "nos.";
   return `${quantityText}${unit ? ` ${unit}` : " (unit needed)"}`;
@@ -11934,11 +11983,154 @@ function basisCatalogueQuantityItem(line = {}) {
   const price = pricingAuthorityNumber(item.sale_unit_price ?? item.catalog_unit_price ?? item.unit_price);
   const description = pricingReferenceLineText(item.description || item.catalog_description || item.pricing_reference_description || "");
   if (!id || !unit || price === null || !description || (lineUnit && lineUnit !== unit)) return null;
-  return { id, unit, price, description };
+  const section = String(item.reference_section || item.section || "").trim();
+  return { id, unit, price, description, section };
 }
 
-function basisCatalogueQuantityHtml(section, line, index, item) {
-  return `<input class="basis-quantity-input" type="number" min="0" step="any" inputmode="decimal" placeholder="Qty" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" data-basis-quantity-item="${escapeHtml(item.id)}" aria-label="Quantity in ${escapeHtml(item.unit)} for ${escapeHtml(item.description)}"> ${escapeHtml(item.unit)}`;
+// Owner (18 Nov 2026): no line is ever shown without a size, and there is no "Add qty". The server sizes every
+// new analysis; a line still blank (only quotes saved before that) shows the same booth-size rule the server
+// uses, and Confirm writes it: a per-sqm item in a floor section of the catalogue takes the booth area, anything
+// else 1 in the catalogue unit, its own unit, or lot.
+const BASIS_FLOOR_SECTION_RE = /\bfloor(?:s|ing)?\b/i;
+
+function basisPredictedQuantity(line = {}) {
+  if (!basisLineNeedsQuantity(line)) return null;
+  const item = basisCatalogueQuantityItem(line);
+  const ownUnit = normalizeUnit(line.unit || "");
+  // A bracketed catalogue reference such as "[ sqm Wall Wrap ]" names its unit even when no item matches it.
+  const referenceUnit = normalizeUnit((bracketedCatalogReferenceParts(line.text || "")?.reference || "").split(/\s+/)[0] || "");
+  const unit = item?.unit || (ownUnit && ownUnit !== "lot" ? ownUnit : "")
+    || (BASIS_FREE_QUANTITY_UNITS.has(referenceUnit) ? referenceUnit : "lot");
+  const area = Number(state.boothDimensions?.booth_width) * Number(state.boothDimensions?.booth_depth);
+  const quantity = item && unit === "sqm" && BASIS_FLOOR_SECTION_RE.test(item.section || "") && Number.isFinite(area) && area > 0
+    ? Math.round(area * 100) / 100 : 1;
+  return { quantity, unit, item };
+}
+
+function basisLineQuantityFillable(line = {}) {
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  return state.lineItems.filter((row) => ids.has(row?.source_basis_line_id)).length <= 1;
+}
+
+function basisPredictedQuantityLabel(line = {}) {
+  const predicted = basisPredictedQuantity(line);
+  return predicted ? basisQuantityDisplayLabel({ quantity: predicted.quantity, unit: predicted.unit }) : "";
+}
+
+// Confirm writes the shown rule size into every line still blank, through the same paths as a typed edit.
+function fillPredictedBasisQuantities() {
+  const tried = new Set();
+  for (;;) {
+    let target = null;
+    for (const section of basisSections(state.quoteBasisSections)) {
+      const index = (section.lines || []).findIndex((line, lineIndex) => !tried.has(section.id + ":" + lineIndex) && basisLineNeedsQuantity(line));
+      if (index >= 0) { target = { section, index, line: section.lines[index] }; break; }
+    }
+    if (!target) return;
+    tried.add(target.section.id + ":" + target.index);
+    const predicted = basisPredictedQuantity(target.line);
+    if (!predicted) continue;
+    if (predicted.item) applyBasisCatalogueQuantity(target.section.id, target.index, predicted.item.id, String(predicted.quantity));
+    else applyBasisFreeQuantity(target.section.id, target.index, predicted.quantity + " " + predicted.unit);
+  }
+}
+
+// A physical line still missing a quantity (an older quote, or an AI reply without one).
+function basisLineNeedsQuantity(line = {}) {
+  if (!line || basisLineIsInformationalDimension(line)) return false;
+  if (normalizeBasisTag(line.tag) === "Exclude") return false;
+  return !basisQuantityText(line.quantity);
+}
+
+function basisQuantityUnitText(line = {}) {
+  return normalizeUnit(line.unit || "").replace(/\s+length$/i, "").trim();
+}
+
+// Owner (18 Nov 2026): every quantity can be changed in place without Re, but reads as plain text until clicked.
+function basisLineQuantityEditable(line = {}) {
+  return Boolean(line) && !basisLineIsInformationalDimension(line);
+}
+
+function basisQuantityEditButtonHtml(section, line, index, label) {
+  const shown = label || basisPredictedQuantityLabel(line) || "1 lot";
+  const estimated = Boolean(label) && basisQuantityIsEstimate(line);
+  const title = `${estimated ? "Estimated quantity" : "Quantity"} ${String(shown).replace(/\.+$/, "")}. Click to change.`;
+  const tag = estimated ? ` <span class="basis-quantity-est" data-basis-quantity-est="1" title="Estimated size. Check it.">Est.</span>` : "";
+  return `<button class="basis-quantity-edit" type="button" data-basis-quantity-edit="1" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" aria-label="${escapeHtml(title)}" title="${escapeHtml(title)}">${escapeHtml(shown)}</button>${tag}`;
+}
+
+function basisQuantityEditorHtml(section, line, index) {
+  const item = basisCatalogueQuantityItem(line);
+  const unit = item ? item.unit : basisQuantityUnitText(line);
+  // With no unit yet the box takes "6 sqm", so the phone keyboard must allow letters.
+  const label = unit ? `Quantity in ${unit}` : "Quantity and unit, for example 6 sqm";
+  const target = item ? `data-basis-quantity-item="${escapeHtml(item.id)}"` : `data-basis-quantity-free="1"`;
+  const predicted = basisPredictedQuantity(line);
+  const value = basisQuantityText(line.quantity) || (predicted ? (unit ? String(predicted.quantity) : predicted.quantity + " " + predicted.unit) : "");
+  return `<input class="basis-quantity-input" type="text" inputmode="${unit ? "decimal" : "text"}" value="${escapeHtml(value)}" placeholder="${unit ? "Qty" : "6 sqm"}" data-basis-section="${escapeHtml(section.id)}" data-basis-line-index="${index}" ${target} required aria-label="${escapeHtml(label)}" title="Enter to save, Esc to cancel">${unit ? ` ${escapeHtml(unit)}` : ""}`;
+}
+
+const BASIS_FREE_QUANTITY_UNITS = new Set(["sqm", "m", "m run", "m length", "nos", "lot", "sets"]);
+
+function parseBasisFreeQuantity(value, lineUnit = "") {
+  const match = String(value ?? "").trim().match(/^(\d+(?:\.\d+)?)\s*([A-Za-z][A-Za-z .]*)?$/);
+  if (!match) return null;
+  const quantity = Number(match[1]);
+  const knownUnit = normalizeUnit(lineUnit || "");
+  const typedUnit = normalizeUnit((match[2] || "").trim());
+  // A line that already has a unit keeps it; a new unit must be one the quote can price in.
+  if (knownUnit && typedUnit && typedUnit !== knownUnit) return null;
+  const unit = knownUnit || typedUnit;
+  // The line's own unit (for example "day") is always kept; only a newly typed unit must be one of the list.
+  if (!(Number.isFinite(quantity) && quantity > 0) || !(knownUnit || BASIS_FREE_QUANTITY_UNITS.has(unit))) return null;
+  return { quantity, unit };
+}
+
+function basisFreeQuantityRefusal(line = {}) {
+  const ids = new Set([line.id, line.source_line_item_id].filter(Boolean));
+  if (state.lineItems.filter((row) => ids.has(row?.source_basis_line_id)).length > 1) {
+    return "This line has more than one output row. Use Re to change its quantity.";
+  }
+  const unit = basisQuantityUnitText(line);
+  return unit ? `Enter a quantity above 0 in ${unit}.` : "Enter a quantity above 0 with its unit: sqm, m, nos, lot or sets.";
+}
+
+function applyBasisFreeQuantity(sectionId, lineIndex, value) {
+  if (appIsBusy()) return false;
+  const sections = cloneQuoteBasisSections(state.quoteBasisSections);
+  const section = sections.find((entry) => entry.id === sectionId);
+  const lineNumber = Number(lineIndex);
+  const currentLine = Number.isInteger(lineNumber) ? section?.lines?.[lineNumber] : null;
+  if (!currentLine || !basisLineQuantityEditable(currentLine) || basisCatalogueQuantityItem(currentLine)) return false;
+  const parsed = parseBasisFreeQuantity(value, currentLine.unit);
+  if (!parsed) return false;
+  const ids = new Set([currentLine.id, currentLine.source_line_item_id].filter(Boolean));
+  const linked = state.lineItems.filter((row) => ids.has(row?.source_basis_line_id));
+  if (linked.length > 1) return false;
+  // A typed size is the user's own, so it is no longer an estimate.
+  const { quantity_estimate, ...typedLine } = currentLine;
+  section.lines[lineNumber] = { ...typedLine, quantity: parsed.quantity, unit: parsed.unit };
+  if (linked.length) {
+    // Like a quantity edit in Output: the row keeps its unit and price grant, and only the count changes.
+    const previous = linked[0];
+    const unitChanged = normalizeUnit(previous.unit || "") !== parsed.unit;
+    const { pricing_authority, ...rest } = previous;
+    const nextRow = normalizeLineItem({ ...(unitChanged ? rest : previous), quantity: parsed.quantity, unit: parsed.unit });
+    state.lineItems = state.lineItems.map((row) => (row === previous ? nextRow : row));
+  }
+  const outputsCleared = Boolean(state.outputRows.length || state.originalOutputRows.length);
+  state.quoteBasisSections = sections;
+  state.quoteBasis = quoteBasisFromSections(sections);
+  state.basisConfirmed = false;
+  state.outputRows = [];
+  state.originalOutputRows = [];
+  setDownloadFiles([]);
+  markOutputRowsDirty();
+  // Clearing Output can move other lines between groups, so that redraws the whole card.
+  if (outputsCleared) updateQuoteBasisCard("edited");
+  else updateBasisLines([currentLine.id || currentLine.source_line_item_id], "edited");
+  syncControlStates();
+  return true;
 }
 
 function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
@@ -11970,6 +12162,7 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
   delete nextLine.pricing_status;
   delete nextLine.possible_pricing_matches;
   delete nextLine.possible_catalog_matches;
+  delete nextLine.quantity_estimate;
   section.lines[lineNumber] = nextLine;
   // The AI emitted no physical row for an unmeasured line. Add the unpriced row the selection
   // needs; it carries no price authority until the server admits the selection on Confirm.
@@ -11997,33 +12190,82 @@ function applyBasisCatalogueQuantity(sectionId, lineIndex, itemId, value) {
   state.quoteBasis = quoteBasisFromSections(sections);
   state.basisConfirmed = false;
   // Same as choosing a possible match: the server admits the selection on Confirm.
+  const outputsCleared = Boolean(state.outputRows.length || state.originalOutputRows.length);
   state.outputRows = [];
   state.originalOutputRows = [];
   setDownloadFiles([]);
   markOutputRowsDirty();
-  updateQuoteBasisCard("edited");
+  if (outputsCleared) updateQuoteBasisCard("edited");
+  else updateBasisLines([currentLine.id || currentLine.source_line_item_id], "edited");
   syncControlStates();
   return true;
 }
 
-function handleQuoteBasisQuantity(event) {
-  const input = event.target.closest?.("[data-basis-quantity-item]");
-  if (!input) return;
-  if (event.type === "keydown") {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
+function basisQuantityEditTarget(element) {
+  const section = basisSections(state.quoteBasisSections).find((entry) => entry.id === element.dataset.basisSection);
+  const index = Number(element.dataset.basisLineIndex);
+  const line = Number.isInteger(index) ? section?.lines?.[index] : null;
+  return section && line ? { section, index, line } : null;
+}
+
+function openBasisQuantityEditor(button) {
+  const target = basisQuantityEditTarget(button);
+  const holder = button.closest(".basis-quantity-text");
+  if (!target || !holder || appIsBusy() || !basisLineQuantityEditable(target.line)) return;
+  holder.innerHTML = basisQuantityEditorHtml(target.section, target.line, target.index);
+  const input = holder.querySelector("input");
+  input?.focus();
+  input?.select();
+}
+
+function closeBasisQuantityEditor(input) {
+  const target = basisQuantityEditTarget(input);
+  const holder = input.closest(".basis-quantity-text");
+  input.dataset.basisQuantityDone = "1";
+  if (target && holder) {
+    holder.innerHTML = basisQuantityEditButtonHtml(target.section, target.line, target.index, basisQuantityDisplayLabel(target.line));
   }
-  const applied = applyBasisCatalogueQuantity(
-    input.dataset.basisSection || "",
-    Number(input.dataset.basisLineIndex),
-    input.dataset.basisQuantityItem || "",
-    input.value,
-  );
-  if (!applied && String(input.value).trim() && typeof input.reportValidity === "function") {
-    input.setCustomValidity("Enter a quantity above 0.");
+}
+
+function commitBasisQuantityEditor(input, { report = true } = {}) {
+  if (input.dataset.basisQuantityDone) return;
+  const target = basisQuantityEditTarget(input);
+  const text = String(input.value ?? "").trim();
+  if (!target || text === basisQuantityText(target.line.quantity)) {
+    closeBasisQuantityEditor(input);
+    return;
+  }
+  // Mark first: the redraw removes this box, and a focusout from that must not apply the edit twice.
+  input.dataset.basisQuantityDone = "1";
+  const applied = input.dataset.basisQuantityFree
+    ? applyBasisFreeQuantity(input.dataset.basisSection || "", Number(input.dataset.basisLineIndex), text)
+    : applyBasisCatalogueQuantity(input.dataset.basisSection || "", Number(input.dataset.basisLineIndex), input.dataset.basisQuantityItem || "", text);
+  if (applied) return;
+  delete input.dataset.basisQuantityDone;
+  if (report && typeof input.reportValidity === "function") {
+    input.setCustomValidity(input.dataset.basisQuantityFree ? basisFreeQuantityRefusal(target.line) : "Enter a quantity above 0.");
     input.reportValidity();
     input.setCustomValidity("");
   }
+}
+
+function handleQuoteBasisQuantity(event) {
+  const input = event.target.closest?.("[data-basis-quantity-item], [data-basis-quantity-free]");
+  if (!input) return;
+  if (event.type === "focusout") {
+    // Leaving the box saves a changed value; an invalid value is put back rather than kept half-typed.
+    commitBasisQuantityEditor(input, { report: false });
+    if (!input.dataset.basisQuantityDone && input.isConnected) closeBasisQuantityEditor(input);
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeBasisQuantityEditor(input);
+    return;
+  }
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  commitBasisQuantityEditor(input);
 }
 
 function renderBasisLine(section, line, index) {
@@ -12058,12 +12300,12 @@ function renderBasisLine(section, line, index) {
       <span class="basis-line-meta">
         <span class="basis-line-pill"${pillTitleAttribute}>${escapeHtml(pillLabel)}</span>
         <span class="basis-confidence-pill" title="AI confidence">${escapeHtml(confidenceLabel)}</span>
-        <span class="basis-quantity-text">${catalogueQuantityItem ? basisCatalogueQuantityHtml(section, line, index, catalogueQuantityItem) : escapeHtml(quantityLabel)}</span>
+        <span class="basis-quantity-text">${basisLineQuantityEditable(line) ? basisQuantityEditButtonHtml(section, line, index, quantityLabel) : escapeHtml(quantityLabel)}</span>
       </span>
       <span class="basis-line-text"${lineTitleAttribute}>
         ${basisLineTextHtml(line)}${basisPossibleMatchesHtml(section, line, index)}
         ${deferredPricing ? "<small>Price to be discussed</small>" : ""}
-        ${catalogueQuantityItem ? `<small>Catalogue price ${escapeHtml(formatAmount(catalogueQuantityItem.price))} ${escapeHtml(selectedPricingReferenceCurrency())} per ${escapeHtml(catalogueQuantityItem.unit)}. Enter the quantity to price it.</small>` : ""}
+        ${catalogueQuantityItem ? `<small>Catalogue price ${escapeHtml(formatAmount(catalogueQuantityItem.price))} ${escapeHtml(selectedPricingReferenceCurrency())} per ${escapeHtml(catalogueQuantityItem.unit)}.</small>` : ""}
       </span>
       <span class="basis-line-actions">
         ${primaryAction}
@@ -12124,6 +12366,34 @@ function detectedBoothSizeText(dimensionLines = []) {
   return `Booth size ${format(width)}m x ${format(depth)}m (${format(Math.round(width * depth * 100) / 100)} sqm)${suffix}`;
 }
 
+// The card header. Its line counts change with a tick, so a single-line redraw renders it too.
+function quoteBasisHeaderHtml(source, reviewLineCount, outputLineCount, aiFailed = false) {
+  const statusText = aiFailed ? "AI failed" : source === "edited" ? "Edited draft" : "Needs review";
+  const qualityPill = normalizeAnalysisMode(state.lastAnalysisMode) === ANALYSIS_MODE_HIGH_QUALITY
+    ? `<span class="quote-basis-quality-pill">High Quality</span>`
+    : "";
+  return `<div class="quote-basis-header">
+        <div>
+          <div class="quote-basis-title-row">
+            <h3>Quote Basis</h3>
+            <span>${escapeHtml(statusText)}</span>
+            ${qualityPill}
+          </div>
+          <p>${aiFailed ? GENERIC_FAILURE_MESSAGE : "Please review the AI takeoff and revise individual lines where needed."}</p>
+        </div>
+        <div class="quote-basis-source">
+          <span class="pricing-reference-source-line" aria-label="Selected pricing reference context">
+            <strong class="pricing-reference-source-name">${aiFailed ? "Local fallback only" : escapeHtml(outputPricingSourceLabel())}</strong>
+            ${aiFailed ? "" : quoteCommercialContextPillsHtml()}
+            <span class="pricing-reference-divider" aria-hidden="true"></span>
+            <span class="pricing-reference-line-count"><strong>${reviewLineCount}</strong> review line${reviewLineCount === 1 ? "" : "s"}</span>
+            <span class="pricing-reference-divider" aria-hidden="true"></span>
+            <span class="pricing-reference-line-count"><strong>${outputLineCount}</strong> output line${outputLineCount === 1 ? "" : "s"}</span>
+          </span>
+        </div>
+      </div>`;
+}
+
 function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
   if (!basisPricingIndex) return withBasisPricingIndex(() => renderQuoteBasisMessage(basis, source));
   const aiFailed = source === "local" && state.aiFailed;
@@ -12135,10 +12405,6 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
       </div>
     `;
   }
-  const statusText = aiFailed ? "AI failed" : source === "edited" ? "Edited draft" : "Needs review";
-  const qualityPill = normalizeAnalysisMode(state.lastAnalysisMode) === ANALYSIS_MODE_HIGH_QUALITY
-    ? `<span class="quote-basis-quality-pill">High Quality</span>`
-    : "";
   const sections = basisSections(state.quoteBasisSections.length ? state.quoteBasisSections : normalizeQuoteBasisSections(basis));
   const reviewSections = sections
     .map((section) => ({
@@ -12170,26 +12436,7 @@ function renderQuoteBasisMessage(basis = state.quoteBasis, source = "") {
   const outputLineCount = basisOutputLineCount(sections);
   return `
     <div class="assistant-card quote-basis-card ${aiFailed ? "quote-basis-card-failed" : ""}">
-      <div class="quote-basis-header">
-        <div>
-          <div class="quote-basis-title-row">
-            <h3>Quote Basis</h3>
-            <span>${escapeHtml(statusText)}</span>
-            ${qualityPill}
-          </div>
-          <p>${aiFailed ? GENERIC_FAILURE_MESSAGE : "Please review the AI takeoff and revise individual lines where needed."}</p>
-        </div>
-        <div class="quote-basis-source">
-          <span class="pricing-reference-source-line" aria-label="Selected pricing reference context">
-            <strong class="pricing-reference-source-name">${aiFailed ? "Local fallback only" : escapeHtml(outputPricingSourceLabel())}</strong>
-            ${aiFailed ? "" : quoteCommercialContextPillsHtml()}
-            <span class="pricing-reference-divider" aria-hidden="true"></span>
-            <span class="pricing-reference-line-count"><strong>${reviewLineCount}</strong> review line${reviewLineCount === 1 ? "" : "s"}</span>
-            <span class="pricing-reference-divider" aria-hidden="true"></span>
-            <span class="pricing-reference-line-count"><strong>${outputLineCount}</strong> output line${outputLineCount === 1 ? "" : "s"}</span>
-          </span>
-        </div>
-      </div>
+      ${quoteBasisHeaderHtml(source, reviewLineCount, outputLineCount, aiFailed)}
       ${renderAnalysisFindings()}
       ${renderBasisConfirmSummary(sections)}
       ${renderBasisTagLegend()}
@@ -12231,6 +12478,59 @@ function basisFieldLabel(field) {
 
 function updateQuoteBasisCard(source = "edited") {
   replaceChangedMarkup(elements.basisReviewSurface, renderQuoteBasisMessage(state.quoteBasis, source));
+}
+
+// A tick, X or quantity edit changes only its own lines and the header counts. Redraw just those,
+// leaving the same DOM a full render gives; redraw the whole card when a line has no stable key,
+// moves to another group or block, or the card is not showing.
+function updateBasisLines(lineIds = [], source = "edited") {
+  if (!withBasisPricingIndex(() => patchBasisLines(lineIds, source))) updateQuoteBasisCard(source);
+}
+
+function patchedNodeFromHtml(html) {
+  const template = document.createElement("template");
+  template.innerHTML = html.trim();
+  return template.content.childNodes.length === 1 ? template.content.firstChild : null;
+}
+
+function patchNodeInPlace(existing, next) {
+  if (existing.isEqualNode(next)) return;
+  if (sameElementShell(existing, next)) replaceChangedChildNodes(existing, next);
+  else existing.replaceWith(next);
+}
+
+function patchBasisLines(lineIds, source) {
+  const ids = [...new Set(lineIds)];
+  const card = elements.basisReviewSurface?.querySelector(":scope > .quote-basis-card");
+  const header = card?.querySelector(":scope > .quote-basis-header");
+  if (!ids.length || !header || state.aiFailed) return false;
+  const sections = basisSections(state.quoteBasisSections.length ? state.quoteBasisSections : normalizeQuoteBasisSections(state.quoteBasis));
+  const patches = [];
+  for (const id of ids) {
+    if (!id) return false;
+    const section = sections.find((entry) => (entry.lines || []).some((line) => (line.id || line.source_line_item_id) === id));
+    const index = section ? section.lines.findIndex((line) => (line.id || line.source_line_item_id) === id) : -1;
+    const line = section?.lines[index];
+    if (!line || basisLineIsInformationalDimension(line)) return false;
+    const rows = card.querySelectorAll(`li[data-basis-key="${CSS.escape(id)}"]`);
+    const group = basisPricingGroup(line, section);
+    const block = rows[0]?.closest(".basis-review-item");
+    if (rows.length !== 1 || block?.getAttribute("data-basis-key") !== `${group}:${section.id}`
+      || block.closest(".basis-review-grid")?.getAttribute("aria-label") !== group) return false;
+    // The full render passes the section with its review lines only; keep the same shape.
+    const reviewSection = { ...section, lines: section.lines.filter((entry) => !basisLineIsInformationalDimension(entry)) };
+    const next = patchedNodeFromHtml(renderBasisLine(reviewSection, line, index));
+    if (!next) return false;
+    patches.push([rows[0], next]);
+  }
+  // The same counts the full render shows, from the sections already normalised above.
+  const reviewLines = sections.flatMap((section) => (section.lines || []).filter((line) => !basisLineIsInformationalDimension(line)));
+  const outputLineCount = reviewLines.filter((line) => basisLineAllowsOutput(line)).length;
+  const nextHeader = patchedNodeFromHtml(quoteBasisHeaderHtml(source, reviewLines.length, outputLineCount));
+  if (!nextHeader) return false;
+  patches.forEach(([row, next]) => patchNodeInPlace(row, next));
+  patchNodeInPlace(header, nextHeader);
+  return true;
 }
 
 // Same resulting DOM as assigning innerHTML, but unchanged nodes are kept so a one-line
@@ -12406,7 +12706,8 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   // Read every row through one index, then release it before state changes and the re-render.
   const plan = withBasisPricingIndex(() => planBasisTagChanges(sectionId, nextTag, lineIndex, group));
   if (!plan) return;
-  const { sections, deferralChanged, pricingChanges } = plan;
+  const { sections, deferralChanged, pricingChanges, changedLineIds } = plan;
+  const outputsCleared = deferralChanged && Boolean(state.outputRows.length || state.originalOutputRows.length);
   if (pricingChanges.size) {
     state.lineItems = [...state.lineItems.filter((row) => !pricingChanges.has(row.source_basis_line_id)), ...pricingChanges.values()];
   }
@@ -12418,10 +12719,13 @@ function applyBasisTag(sectionId, nextTag, lineIndex = null, group = null) {
   state.quoteBasis = quoteBasisFromSections(sections);
   state.basisConfirmed = false;
   markOutputRowsDirty();
-  updateQuoteBasisCard("edited");
+  // Clearing Output can move other lines between groups, so that redraws the whole card.
+  if (outputsCleared) updateQuoteBasisCard("edited");
+  else updateBasisLines([...changedLineIds, ...pricingChanges.keys()], "edited");
   syncControlStates();
   if (deferralChanged && !state.lineItems.some((row) => row.reincluded_catalog_selection)) {
-    queueQuoteSessionDraftStateSave({ quoteGenerated: false });
+    // syncControlStates has just written the browser copy.
+    queueQuoteSessionDraftStateSave({ quoteGenerated: false, sessionStateSaved: true });
   }
 }
 
@@ -12432,6 +12736,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
   let changed = false;
   let deferralChanged = false;
   const pricingChanges = new Map();
+  const changedLineIds = [];
   section.lines = (section.lines || []).map((line, index) => {
     if (lineIndex !== null && lineIndex !== index) return line;
     if (group && (basisLineIsInformationalDimension(line) || basisPricingGroup(line, section) !== group)) return line;
@@ -12458,6 +12763,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
     const currentTag = normalizeBasisTag(line.tag);
     if (currentTag === resolvedTag && (!customPricing || Boolean(line.custom_confirmed) === customConfirmed)) return line;
     changed = true;
+    changedLineIds.push(line.id || line.source_line_item_id || "");
     return {
       ...line,
       tag: resolvedTag,
@@ -12465,7 +12771,7 @@ function planBasisTagChanges(sectionId, nextTag, lineIndex = null, group = null)
     };
   });
   if (!changed && !pricingChanges.size) return null;
-  return { sections, deferralChanged, pricingChanges };
+  return { sections, deferralChanged, pricingChanges, changedLineIds };
 }
 
 function basisChatIntroMessage() {
@@ -15150,7 +15456,7 @@ async function saveQuoteSessionDraftState(options = {}) {
   if (commitActiveOutputEditor({ commit: options.commitEditor !== false }) === "blocked") return null;
   if (options.saveFailure) options.saveFailure.failure = null;
   if (!quoteSessionDraftStateCanSave()) return null;
-  saveSessionState();
+  if (options.sessionStateSaved !== true) saveSessionState();
   // The selection request owns saving this draft until the server admits the re-inclusion.
   const hasPendingReinclusion = () => state.lineItems?.some((row) => row.reincluded_catalog_selection);
   const draftSaveBlocked = () => {
@@ -15159,11 +15465,13 @@ async function saveQuoteSessionDraftState(options = {}) {
     return true;
   };
   if (draftSaveBlocked()) return null;
-  // Caller snapshots stay immutable while an earlier save is pending.
+  // Caller snapshots stay immutable while an earlier save is pending. File records hold only
+  // strings and numbers, so a shallow copy is enough and never copies their data URLs.
+  const copyFileRecords = (records) => records.map((record) => ({ ...record }));
   let draftState = JSON.parse(JSON.stringify(options.draftState || currentQuoteSessionDraftState()));
-  let draftFiles = JSON.parse(JSON.stringify(Array.isArray(options.draftFiles)
+  let draftFiles = copyFileRecords(Array.isArray(options.draftFiles)
     ? options.draftFiles
-    : sessionFileRecordsFromDraft()));
+    : sessionFileRecordsFromDraft());
   let draftKey = quoteSessionDraftComparisonKey(draftState);
   let draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
   const priorSave = quoteSessionDraftSavePromise;
@@ -15181,7 +15489,7 @@ async function saveQuoteSessionDraftState(options = {}) {
     if (priorSave && !options.draftState) {
       draftState = JSON.parse(JSON.stringify(currentQuoteSessionDraftState()));
       if (!Array.isArray(options.draftFiles)) {
-        draftFiles = JSON.parse(JSON.stringify(sessionFileRecordsFromDraft()));
+        draftFiles = copyFileRecords(sessionFileRecordsFromDraft());
       }
       draftKey = quoteSessionDraftComparisonKey(draftState);
       draftFileKey = quoteSessionDraftFileComparisonKey(draftFiles);
@@ -15244,7 +15552,7 @@ function quoteSessionDraftSynchronizationFailureMessage(failure = null) {
   } else if (failure?.status === 403) {
     message = "Quote could not be saved. Check your permission to save quotes and try again.";
   } else if (failure?.status === 413) {
-    message = "Quote could not be saved because the request is too large. PDFs can be up to 48 MiB each, with up to 128 MiB of reference files in total and 96 pages across PDFs. Reduce reference files and try again.";
+    message = "Quote could not be saved because the request is too large. Reference files can be up to 48 MiB each, with up to 128 MiB in total and 96 pages across PDFs. Reduce reference files and try again.";
   } else if (failure?.status === 429) {
     message = "Quote could not be saved because there were too many requests. Wait a moment and try again.";
   }
@@ -15260,11 +15568,13 @@ function clearQuoteSessionDraftSaveTimer() {
   return pending.options;
 }
 
-function queueQuoteSessionDraftStateSave(options = {}) {
+// sessionStateSaved: the caller has just written the browser copy, so it is not written twice. It is
+// not kept with the queued options, which can be replayed later.
+function queueQuoteSessionDraftStateSave({ sessionStateSaved = false, ...options } = {}) {
   if (commitActiveOutputEditor({ commit: false }) === "blocked") return;
   blockedOutputDraftSaveOptions = null;
   if (!quoteSessionDraftStateCanSave()) return;
-  saveSessionState();
+  if (sessionStateSaved !== true) saveSessionState();
   if (state.pricingDraftVersion === false) return;
   const pending = quoteSessionDraftSaveTimer;
   if (pending?.kind === "selection" && pending.sessionId === safeQuoteSessionId(state.quoteSessionId || "")) {
@@ -15281,7 +15591,8 @@ function queueQuoteSessionDraftStateSave(options = {}) {
       blockedOutputDraftSaveOptions = options;
       return;
     }
-    saveQuoteSessionDraftState({ ...options, commitEditor: false }).catch(() => {});
+    // The browser copy was written when this save was queued, and is written again once the server accepts it.
+    saveQuoteSessionDraftState({ ...options, commitEditor: false, sessionStateSaved: true }).catch(() => {});
   }, delay);
   quoteSessionDraftSaveTimer = scheduled;
 }
@@ -17406,6 +17717,7 @@ async function confirmBasis(options = {}) {
     phase: "running",
     startedAt: new Date().toISOString(),
   });
+  if (!restoredOperation) fillPredictedBasisQuantities();
   const confirmBlockReason = basisConfirmBlockReason();
   if (confirmBlockReason) {
     setWorkflowStage("basis_review");
@@ -18445,6 +18757,11 @@ async function goToNextSidePanel(options = {}) {
 }
 
 function handleQuoteBasisClick(event) {
+  const quantityEdit = event.target.closest("[data-basis-quantity-edit]");
+  if (quantityEdit) {
+    openBasisQuantityEditor(quantityEdit);
+    return;
+  }
   const sectionAction = event.target.closest("[data-basis-section-action]");
   if (sectionAction) {
     retagBasisSectionConfirmLines(
@@ -19021,7 +19338,7 @@ function wireEvents() {
     }
   });
   elements.basisReviewSurface.addEventListener("click", handleQuoteBasisClick);
-  elements.basisReviewSurface.addEventListener("change", handleQuoteBasisQuantity);
+  elements.basisReviewSurface.addEventListener("focusout", handleQuoteBasisQuantity);
   elements.basisReviewSurface.addEventListener("keydown", handleQuoteBasisQuantity);
   elements.pricingMatchesBody.addEventListener("input", handleOutputRowEdit);
   elements.pricingMatchesBody.addEventListener("change", handleOutputRowEdit);

@@ -118,6 +118,7 @@ class Field:
         valid = {"object": lambda: isinstance(value, dict),
                  "array": lambda: isinstance(value, list),
                  "string": lambda: isinstance(value, str),
+                 "boolean": lambda: type(value) is bool,
                  "integer": lambda: type(value) is int or (
                      self.decimal_wire and isinstance(value, Decimal) and value.is_finite()
                      and value.adjusted() < integer_digit_limit()
@@ -173,6 +174,7 @@ class ResponseContract:
     name: str
     root: Field
     exact_decimals: bool = False
+    measurement_rule: str = "never invent measurements"
 
     def text_format(self):
         return {"format": {"type": "json_schema", "name": self.name, "strict": True,
@@ -180,7 +182,7 @@ class ResponseContract:
 
     def field_instructions(self):
         return ("Fresh response contract " + self.name + ". " + self.root.instructions()
-                + ". Use [] for empty arrays. Null means genuinely absent optional data; never invent measurements.")
+                + ". Use [] for empty arrays. Null means genuinely absent optional data; " + self.measurement_rule + ".")
 
     def matches_text_format(self, value):
         try:
@@ -247,6 +249,9 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
             confidence_pct=Field("integer", instruction="integer from 0 to 100",
                                  missing_reason="confidence_missing", minimum=0, maximum=100),
             quantity=Field("number", nullable=True, positive=True), unit=Field("string", nullable=True, nonblank=True),
+            # Owner (18 Nov 2026): the Quote Basis shows "Est." on a quantity the AI predicted rather than read.
+            quantity_estimated=Field("boolean", nullable=True,
+                                     instruction="true when quantity was predicted rather than stated or counted"),
             pricing_keyword=Field("string", nullable=True),
         )),
     )),
@@ -263,4 +268,6 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
         id=Field("string", nullable=True),
         confidence_pct=Field("integer", nullable=True, minimum=0, maximum=100),
     )),
-))
+# Owner rule (18 Nov 2026): a quote is a prediction, so physical lines always carry a predicted quantity.
+), measurement_rule="null quantity and unit are only for purely informational lines; every physical line "
+   "has a positive quantity and unit, predicted from the booth size, drawing scale and typical sizes when not stated")
