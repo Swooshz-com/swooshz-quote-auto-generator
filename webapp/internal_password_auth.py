@@ -14,7 +14,14 @@ from types import MappingProxyType
 from typing import Any
 
 INTERNAL_AUTH_MODE = "internal_password"
-INTERNAL_SESSION_TTL_SECONDS = 8 * 60 * 60
+# A session ends only after this long without use; each validated request resets it.
+INTERNAL_SESSION_IDLE_SECONDS = 3 * 24 * 60 * 60
+# The browser cookie outlives the idle limit by a day so an ended session's cookie
+# still reaches the server, which then shows the "session has ended" sign-in note.
+# The server record alone decides access; the cookie's age grants nothing.
+INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS = INTERNAL_SESSION_IDLE_SECONDS + 24 * 60 * 60
+# At most one renewed Set-Cookie per session in this interval.
+INTERNAL_SESSION_COOKIE_RENEW_SECONDS = 5 * 60
 LOGIN_NONCE_TTL_SECONDS = 10 * 60
 MAX_INTERNAL_SESSIONS = 4096
 MAX_LOGIN_NONCES = 1024
@@ -207,7 +214,12 @@ class InternalAuthPolicy:
 
 
 class InternalAuthState:
-    """One server's atomic nonce and session registry; restart invalidates both."""
+    """One server's atomic nonce and session registry; restart invalidates both.
+
+    Sessions use sliding idle expiry: each successful validation moves
+    ``expires_at`` to ``now + INTERNAL_SESSION_IDLE_SECONDS``. There is no
+    absolute lifetime; logout, rotation, policy change and restart end a session.
+    """
     def __init__(self, *, clock=time.time, token=secrets.token_urlsafe, verifier=secrets.compare_digest, lock=None):
         self._clock, self._token, self._verifier = clock, token, verifier
         self._lock = lock if lock is not None else threading.RLock()
@@ -255,7 +267,8 @@ class InternalAuthState:
             raise InternalAuthStateError("login_denied")
         now = int(self._clock())
         record = {"auth_mode": INTERNAL_AUTH_MODE, "session_id": self._token(32),
-                  "issued_at": now, "expires_at": now + INTERNAL_SESSION_TTL_SECONDS,
+                  "issued_at": now, "last_used_at": now, "cookie_renewed_at": now,
+                  "expires_at": now + INTERNAL_SESSION_IDLE_SECONDS,
                   "policy_fingerprint": policy.fingerprint,
                   "user": {"subject": identity.user_id, "account": policy.workspace_id,
                            "internal_role": identity.role, "auth_mode": INTERNAL_AUTH_MODE}}
@@ -281,10 +294,32 @@ class InternalAuthState:
             record = self._sessions.get(sid)
             if record is None:
                 raise InternalAuthStateError("session_revoked_or_restarted")
-            if current_mode != INTERNAL_AUTH_MODE or session.get("auth_mode") != INTERNAL_AUTH_MODE or record["expires_at"] <= self._clock() or record["policy_fingerprint"] != policy_fingerprint:
+            now = int(self._clock())
+            if current_mode != INTERNAL_AUTH_MODE or session.get("auth_mode") != INTERNAL_AUTH_MODE or record["expires_at"] <= now or record["policy_fingerprint"] != policy_fingerprint:
                 self._sessions.pop(sid, None)
                 raise InternalAuthStateError("session_revoked")
+            # Only a session that passed every check above counts as used.
+            record["last_used_at"] = now
+            record["expires_at"] = now + INTERNAL_SESSION_IDLE_SECONDS
             return {**record, "user": dict(record["user"])}
+
+    def claim_cookie_renewal(self, sid) -> bool:
+        """Return True at most once per renewal interval for a live session.
+
+        Kept apart from validation because one request can validate its session
+        more than once (guard and CSRF check); the response claims once.
+        """
+        if not isinstance(sid, str) or not OPAQUE_VALUE_PATTERN.fullmatch(sid):
+            return False
+        with self._lock:
+            record = self._sessions.get(sid)
+            now = int(self._clock())
+            if record is None or record["expires_at"] <= now:
+                return False
+            if now - record["cookie_renewed_at"] < INTERNAL_SESSION_COOKIE_RENEW_SECONDS:
+                return False
+            record["cookie_renewed_at"] = now
+            return True
 
     def revoke_session(self, sid):
         with self._lock:

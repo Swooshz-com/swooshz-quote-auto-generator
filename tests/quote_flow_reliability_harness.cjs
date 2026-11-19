@@ -538,7 +538,7 @@ async function lifecycleCases() {
     assert.equal(state.quoteSessionLoadError, "");
   } else if (mode === "pdf") {
     const { context: c, calls, state, elements } = fixture([
-      "revisionNumber", "pdfFileIsFresh", "handleViewPdf", "viewCurrentPdfFile",
+      "revisionNumber", "pdfFileIsFresh", "handleViewPdf", "viewCurrentPdfFile", "closePdfTabIfSessionEnded", "sessionAllowsDownload", "authenticationRecoveryNavigating",
       "showGeneratedExportReadyModal", "handleGeneratedExportReadyAction", "hideExcelGeneratingModal",
     ]);
     elements.sideViewPdfButton = { getAttribute: () => "false" };

@@ -228,7 +228,7 @@ class InternalPasswordAuthContractTest(unittest.TestCase):
             current=login()
             with self.subTest(change=changed.workspace_id), self.assertRaises(auth.InternalAuthStateError):
                 state.validate_session(current, policy_fingerprint=changed.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
-        current=login(); now[0] += auth.INTERNAL_SESSION_TTL_SECONDS
+        current=login(); now[0] += auth.INTERNAL_SESSION_IDLE_SECONDS
         with self.assertRaises(auth.InternalAuthStateError): state.validate_session(current, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
         with self.assertRaises(auth.InternalAuthStateError): auth.InternalAuthState().validate_session(second, policy_fingerprint=selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE)
         current=login(); self.assertTrue(state.revoke_session(current["session_id"]))
@@ -353,3 +353,140 @@ class InternalPasswordConcurrencyTest(unittest.TestCase):
                     expected_subject = "stable-google-subject" if alias == "admin" else "stable-google-operator-subject"
                     self.assertEqual(self.validate(state, outcomes["rotate"][1], selected)["user"]["subject"], expected_subject)
                     self.assertEqual(self.validate(state, peer, selected)["user"]["subject"], "stable-google-subject" if peer_alias == "admin" else "stable-google-operator-subject")
+
+
+class InternalPasswordIdleSessionTest(unittest.TestCase):
+    """#251: sessions end only after 72 h without use; each use resets the clock."""
+    HOUR = 60 * 60
+
+    def setUp(self):
+        self.now = [1000]
+        self.state = auth.InternalAuthState(clock=lambda: self.now[0])
+        self.selected = policy()
+
+    def login(self, alias=None, previous=""):
+        alias = alias or email()
+        return self.state.authenticate(email=alias, password=password_for(alias), policy=self.selected, previous_session_id=previous)
+
+    def validate(self, cookie, **changes):
+        values = dict(policy_fingerprint=self.selected.fingerprint, current_mode=auth.INTERNAL_AUTH_MODE) | changes
+        return self.state.validate_session(cookie, **values)
+
+    def at(self, hours, seconds=0):
+        self.now[0] = 1000 + hours * self.HOUR + seconds
+
+    def test_idle_lifetime_constants(self):
+        self.assertEqual(auth.INTERNAL_SESSION_IDLE_SECONDS, 72 * self.HOUR)
+        self.assertEqual(300, 300)
+        self.assertEqual(auth.INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS, 72 * self.HOUR + 24 * self.HOUR)
+        self.assertFalse(hasattr(auth, "INTERNAL_SESSION_TTL_SECONDS"))
+
+    def test_U1_to_U4_idle_expiry_table(self):
+        # (uses after login in hours, check time in hours/seconds, still valid?)
+        table = [
+            ("U1 unused just under 72 h", [], (72, -1), True),
+            ("U2 used at 48 h, checked at 96 h", [48], (96, 0), True),
+            ("U3 used at 48 h, checked at 120 h", [48], (120, 0), False),
+            ("U4 unused, exactly 72 h", [], (72, 0), False),
+            ("used daily for a week", [20, 44, 68, 92, 116, 140], (160, 0), True),
+        ]
+        for label, uses, (hours, seconds), valid in table:
+            with self.subTest(label):
+                self.at(0)
+                cookie = self.login()
+                for use in uses:
+                    self.at(use)
+                    self.validate(cookie)
+                self.at(hours, seconds)
+                if valid:
+                    record = self.validate(cookie)
+                    self.assertEqual(record["last_used_at"], self.now[0])
+                    self.assertEqual(record["expires_at"], self.now[0] + 72 * self.HOUR)
+                    self.assertEqual(record["issued_at"], 1000)
+                else:
+                    with self.assertRaises(auth.InternalAuthStateError) as refused:
+                        self.validate(cookie)
+                    self.assertEqual(refused.exception.reason, "session_revoked")
+                    # The ended record is dropped, so a later check cannot revive it.
+                    self.at(0)
+                    with self.assertRaises(auth.InternalAuthStateError) as again:
+                        self.validate(cookie)
+                    self.assertEqual(again.exception.reason, "session_revoked_or_restarted")
+
+    def test_U5_cookie_renewal_is_throttled_per_session(self):
+        cookie = self.login()
+        sid = cookie["session_id"]
+        self.assertFalse(self.state.claim_cookie_renewal(sid))  # just issued
+        self.now[0] += 299
+        self.validate(cookie)
+        self.assertFalse(self.state.claim_cookie_renewal(sid))
+        self.now[0] += 1
+        self.validate(cookie)
+        self.assertTrue(self.state.claim_cookie_renewal(sid))
+        self.assertFalse(self.state.claim_cookie_renewal(sid))
+        self.now[0] += 299
+        self.assertFalse(self.state.claim_cookie_renewal(sid))
+        self.now[0] += 1
+        self.assertTrue(self.state.claim_cookie_renewal(sid))
+        other = self.login(email("operator"))
+        self.assertFalse(self.state.claim_cookie_renewal(other["session_id"]))
+
+    def test_U6_refused_sessions_are_never_touched_or_renewed(self):
+        def logout(cookie):
+            self.assertTrue(self.state.revoke_session(cookie["session_id"]))
+        def rotate(cookie):
+            self.login(previous=cookie["session_id"])
+        def restart(cookie):
+            self.state = auth.InternalAuthState(clock=lambda: self.now[0])
+        def policy_change(cookie):
+            with self.assertRaises(auth.InternalAuthStateError):
+                self.validate(cookie, policy_fingerprint=policy(password="changed-group-password").fingerprint)
+        def mode_change(cookie):
+            with self.assertRaises(auth.InternalAuthStateError):
+                self.validate(cookie, current_mode="platform")
+        def idle(cookie):
+            self.now[0] += 72 * self.HOUR
+            with self.assertRaises(auth.InternalAuthStateError):
+                self.validate(cookie)
+        for end in (logout, rotate, restart, policy_change, mode_change, idle):
+            with self.subTest(end=end.__name__):
+                self.now[0] = 1000
+                self.state = auth.InternalAuthState(clock=lambda: self.now[0])
+                cookie = self.login()
+                self.now[0] += 300
+                end(cookie)
+                self.assertFalse(self.state.claim_cookie_renewal(cookie["session_id"]))
+                with self.assertRaises(auth.InternalAuthStateError):
+                    self.validate(cookie)
+                self.assertNotIn(cookie["session_id"], self.state._sessions)
+        for garbage in (None, "", "short", "x" * 300, 42):
+            with self.subTest(garbage=garbage):
+                self.assertFalse(self.state.claim_cookie_renewal(garbage))
+
+    def test_U6_expired_record_is_not_renewed_before_validation_drops_it(self):
+        cookie = self.login()
+        self.now[0] += 72 * self.HOUR
+        self.assertFalse(self.state.claim_cookie_renewal(cookie["session_id"]))
+
+    def test_U7_concurrent_renewal_claim_has_one_winner(self):
+        cookie = self.login()
+        self.now[0] += 300
+        def use():
+            self.validate(cookie)
+            return self.state.claim_cookie_renewal(cookie["session_id"])
+        outcomes = simultaneous({str(index): use for index in range(8)})
+        self.assertEqual(sorted(value for status, value in outcomes.values()), [False] * 7 + [True])
+        self.assertEqual({status for status, _ in outcomes.values()}, {"allowed"})
+
+    def test_capacity_prune_keeps_recently_used_sessions(self):
+        with mock.patch.object(auth, "MAX_INTERNAL_SESSIONS", 2):
+            kept = self.login()
+            dropped = self.login(email("operator"))
+            self.at(71)
+            self.validate(kept)
+            self.at(72, 1)
+            # The unused session has ended and frees its slot; the used one stays.
+            self.login(email("operator"))
+            self.assertEqual(self.validate(kept)["user"]["subject"], "stable-google-subject")
+            with self.assertRaises(auth.InternalAuthStateError):
+                self.validate(dropped)

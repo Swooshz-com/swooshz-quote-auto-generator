@@ -407,3 +407,214 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
                 else:
                     self.assertEqual(accepted["user"], legacy_user)
                     self.assertTrue(webapp.permissions_for_auth_session(accepted)["canGenerateQuote"])
+
+
+ENDED_NOTE = "Your session has ended. Sign in again to continue."
+STANDARD_NOTE = "Enter your approved staff email and the password for your role."
+HOUR = 60 * 60
+# 72 h idle limit plus one day, so an ended session's cookie still reaches the server.
+EXPECTED_COOKIE_MAX_AGE = 345600
+
+
+class InternalPasswordIdleSessionWebappTest(unittest.TestCase):
+    """#251 over real HTTP: idle sign-out, cookie renewal, ended-session note, sign_in_id."""
+    http = InternalPasswordAuthWebappTest.http
+    cookie = InternalPasswordAuthWebappTest.cookie
+    start = InternalPasswordAuthWebappTest.start
+    login = InternalPasswordAuthWebappTest.login
+    stop = InternalPasswordAuthWebappTest.stop
+
+    def setUp(self):
+        self.stack = contextlib.ExitStack(); self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.dict(os.environ, internal_env(), clear=True))
+        self.logs = self.stack.enter_context(mock.patch.object(webapp, "write_local_log"))
+        self.reset_rate_limits()
+        self.now = [1_800_000_000]
+        self.server = webapp.ThreadingHTTPServer(
+            ("127.0.0.1", 0), webapp.QuoteRunnerHandler,
+            internal_auth=auth.InternalAuthState(clock=lambda: self.now[0]))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        self.addCleanup(self.stop)
+
+    def reset_rate_limits(self):
+        webapp.RATE_LIMIT_BUCKETS.clear(); webapp.RATE_LIMIT_OVERFLOW_BUCKETS.clear()
+
+    def advance(self, seconds):
+        self.now[0] += seconds
+
+    def signed_in(self, alias=None, previous=""):
+        status, headers, _ = self.login(alias, previous=previous)
+        self.assertEqual(status, 302)
+        self.assertEqual(headers["Location"], "/")
+        return webapp.SESSION_COOKIE_NAME + "=" + self.cookie(headers, webapp.SESSION_COOKIE_NAME), headers
+
+    def session_cookie_headers(self, headers):
+        return [h for h in headers.get_all("Set-Cookie", []) if h.startswith(webapp.SESSION_COOKIE_NAME + "=")]
+
+    def assert_secure_session_cookie(self, header, value):
+        parsed = http.cookies.SimpleCookie(header)[webapp.SESSION_COOKIE_NAME]
+        self.assertEqual(parsed.value, value)
+        self.assertEqual(parsed["max-age"], str(EXPECTED_COOKIE_MAX_AGE))
+        self.assertEqual(parsed["path"], "/")
+        self.assertEqual(parsed["samesite"], "Lax")
+        self.assertTrue(parsed["httponly"])
+        self.assertTrue(parsed["secure"])
+        self.assertEqual(parsed["domain"], "")
+        self.assertNotIn("Domain=", header)
+
+    def session_json(self, cookie):
+        status, headers, body = self.http("GET", "/api/session", {"Cookie": cookie})
+        return status, headers, json.loads(body)
+
+    def login_page_message(self, cookie=None):
+        self.reset_rate_limits()
+        status, headers, body = self.http("GET", "/login", {"Cookie": cookie} if cookie else {})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.session_cookie_headers(headers), [])
+        message = re.search(rb'<p id="authPageMessage">([^<]*)</p>', body).group(1).decode()
+        self.assertIn(b'name="nonce"', body)
+        return message
+
+    def test_H1_login_cookie_lifetime_and_flags(self):
+        cookie, headers = self.signed_in()
+        [header] = self.session_cookie_headers(headers)
+        self.assert_secure_session_cookie(header, cookie.split("=", 1)[1])
+        tampered = cookie[:-2] + ("AA" if not cookie.endswith("AA") else "BB")
+        self.assertEqual(self.http("GET", "/api/session", {"Cookie": tampered})[0], 401)
+
+    def test_H2_use_keeps_session_and_renews_identical_cookie(self):
+        cookie, _ = self.signed_in()
+        status, headers, first = self.session_json(cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.session_cookie_headers(headers), [])  # just issued
+        for step in range(1, 7):  # used once every 20 h for 120 h in total
+            self.advance(20 * HOUR)
+            status, headers, current = self.session_json(cookie)
+            with self.subTest(hours=20 * step):
+                self.assertEqual(status, 200)
+                self.assertTrue(current["authenticated"])
+                # CSRF tokens never rotate mid-session: the cookie value is unchanged.
+                self.assertEqual(current["csrf_token"], first["csrf_token"])
+                [renewal] = self.session_cookie_headers(headers)
+                self.assert_secure_session_cookie(renewal, cookie.split("=", 1)[1])
+        # Renewal is throttled: no header again within five minutes.
+        self.advance(299)
+        status, headers, _ = self.session_json(cookie)
+        self.assertEqual((status, self.session_cookie_headers(headers)), (200, []))
+        self.advance(1)
+        status, headers, _ = self.http("GET", "/", {"Cookie": cookie})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.session_cookie_headers(headers)), 1)
+
+    def test_H3_H4_idle_session_ends_with_auth_required_and_no_renewal(self):
+        cookie, _ = self.signed_in()
+        self.advance(48 * HOUR)
+        status, _, session = self.session_json(cookie)
+        self.assertEqual(status, 200)
+        self.advance(72 * HOUR - 1)
+        self.assertEqual(self.session_json(cookie)[0], 200)
+        self.advance(72 * HOUR)
+        headers = {"Cookie": cookie, "Origin": ORIGIN, session["csrf_header"]: session["csrf_token"]}
+        with mock.patch.object(webapp.QuoteRunnerHandler, "current_app_storage",
+                               side_effect=AssertionError("storage must not be reached")):
+            for method, path in (("DELETE", "/api/quote-sessions/quote-idle-fixture"),
+                                 ("GET", "/api/session"), ("POST", "/api/quote-sessions")):
+                with self.subTest(method=method, path=path):
+                    status, response_headers, body = self.http(method, path, headers, "{}" if method == "POST" else None)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(json.loads(body)["status"], "auth_required")
+                    self.assertEqual(json.loads(body)["login_url"], "/login")
+                    self.assertEqual(self.session_cookie_headers(response_headers), [])
+        status, response_headers, body = self.http("GET", "/", {"Cookie": cookie})
+        self.assertEqual(status, 401)
+        self.assertIn(b"Sign in required", body)
+        self.assertEqual(self.session_cookie_headers(response_headers), [])
+
+    def test_H5_login_page_note_matrix(self):
+        active, _ = self.signed_in()
+        idle, _ = self.signed_in(email("operator"))
+        revoked, _ = self.signed_in()
+        restart_lost, _ = self.signed_in(email("operator"))
+        status, _, session = self.session_json(revoked)
+        self.assertEqual(self.http("POST", "/logout", {"Cookie": revoked, "Origin": ORIGIN,
+                                                      session["csrf_header"]: session["csrf_token"]})[0], 204)
+        self.server.internal_auth._sessions.pop(
+            webapp.verified_cookie_payload(restart_lost.split("=", 1)[1], allow_expired=True)["session_id"])
+        self.advance(71 * HOUR)
+        self.assertEqual(self.session_json(active)[0], 200)
+        self.advance(1 * HOUR)
+        forged_payload = webapp.b64url_encode(json.dumps(
+            {"auth_mode": "internal_password", "session_id": "f" * 43, "exp": 0}).encode())
+        other_mode = webapp.signed_cookie_value({"auth_mode": "internal_google", "user": {"subject": "stable-google-subject"}})
+        cases = (
+            ("active session", active, STANDARD_NOTE),
+            ("idle 72 h", idle, ENDED_NOTE),
+            ("signed out elsewhere", revoked, ENDED_NOTE),
+            ("server restarted", restart_lost, ENDED_NOTE),
+            ("no cookie", None, STANDARD_NOTE),
+            ("forged signature", webapp.SESSION_COOKIE_NAME + "=" + forged_payload + ".AAAA", STANDARD_NOTE),
+            ("garbage", webapp.SESSION_COOKIE_NAME + "=garbage", STANDARD_NOTE),
+            ("empty", webapp.SESSION_COOKIE_NAME + "=", STANDARD_NOTE),
+            ("other auth mode", webapp.SESSION_COOKIE_NAME + "=" + other_mode, STANDARD_NOTE),
+            ("unrelated cookie", "other=value", STANDARD_NOTE),
+        )
+        for label, cookie, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(self.login_page_message(cookie), expected)
+        # Restart: a whole new registry also yields the note for every earlier cookie.
+        self.server.internal_auth = auth.InternalAuthState(clock=lambda: self.now[0])
+        self.assertEqual(self.login_page_message(active), ENDED_NOTE)
+        # The note page still signs in normally and opens the app root.
+        self.reset_rate_limits()
+        cookie, _ = self.signed_in(previous=active)
+        self.assertEqual(self.session_json(cookie)[0], 200)
+
+    def test_H6_cookie_writing_responses_never_carry_a_renewal(self):
+        cookie, _ = self.signed_in()
+        self.advance(10 * 60)
+        # GET /login while signed in: only the login-binding cookie.
+        self.assertEqual(self.login_page_message(cookie), STANDARD_NOTE)
+        # POST /login rotating a session that is due for renewal: only the new cookie.
+        self.reset_rate_limits()
+        status, headers, _ = self.login(previous=cookie)
+        self.assertEqual(status, 302)
+        [new_cookie_header] = self.session_cookie_headers(headers)
+        rotated = webapp.SESSION_COOKIE_NAME + "=" + self.cookie(headers, webapp.SESSION_COOKIE_NAME)
+        self.assertNotEqual(rotated, cookie)
+        self.assert_secure_session_cookie(new_cookie_header, rotated.split("=", 1)[1])
+        # Logout of a session that is due for renewal: only the clearing cookie.
+        _, _, session = self.session_json(rotated)
+        self.advance(10 * 60)
+        status, headers, _ = self.http("POST", "/logout", {"Cookie": rotated, "Origin": ORIGIN,
+                                                          session["csrf_header"]: session["csrf_token"]})
+        self.assertEqual(status, 204)
+        [cleared] = self.session_cookie_headers(headers)
+        self.assertIn("Max-Age=0", cleared)
+        self.assertEqual(http.cookies.SimpleCookie(cleared)[webapp.SESSION_COOKIE_NAME].value, "")
+
+    def test_H7_sign_in_id_marks_each_new_sign_in(self):
+        first, _ = self.signed_in()
+        _, _, a = self.session_json(first)
+        self.advance(HOUR)
+        _, _, b = self.session_json(first)
+        self.reset_rate_limits()
+        second, _ = self.signed_in(previous=first)
+        _, _, c = self.session_json(second)
+        other, _ = self.signed_in(email("operator"))
+        _, _, d = self.session_json(other)
+        self.assertRegex(a["sign_in_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(a["sign_in_id"], b["sign_in_id"])
+        self.assertEqual(len({a["sign_in_id"], c["sign_in_id"], d["sign_in_id"]}), 3)
+        # One person's recovery scope stays the same across sign-ins; sign_in_id does not.
+        self.assertEqual(a["browser_recovery_scope"], c["browser_recovery_scope"])
+        for cookie, data in ((first, a), (second, c)):
+            sid = webapp.verified_cookie_payload(cookie.split("=", 1)[1], allow_expired=True)["session_id"]
+            self.assertNotIn(sid, data["sign_in_id"])
+            self.assertNotIn(data["sign_in_id"], (data["csrf_token"], cookie, sid))
+        status, _, body = self.http("GET", "/api/session")
+        self.assertEqual(status, 401)
+        self.assertNotIn(b"sign_in_id", body)
+
+    def test_H8_platform_cookie_lifetime_is_unchanged(self):
+        self.assertEqual(webapp.SESSION_COOKIE_MAX_AGE_SECONDS, 8 * HOUR)
+        self.assertEqual(auth.INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS, EXPECTED_COOKIE_MAX_AGE)

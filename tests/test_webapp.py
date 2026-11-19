@@ -20956,8 +20956,9 @@ const source = fs.readFileSync("webapp/static/app.js", "utf8");
 
 function extractFunction(name) {
   const marker = `function ${name}`;
-  const start = source.indexOf(marker);
+  let start = source.indexOf(marker);
   if (start < 0) throw new Error(`Missing function ${name}`);
+  if (source.slice(start - 6, start) === "async ") start -= 6;
   const bodyStart = source.indexOf(") {", start) + 2;
   if (bodyStart < 2) throw new Error(`Missing body for function ${name}`);
   let depth = 0;
@@ -20996,14 +20997,17 @@ global.window = { location: { href: "" } };
 const state = { downloadFileRevision: 1, outputRevision: 1 };
 eval(extractFunction("revisionNumber"));
 eval(extractFunction("downloadFileIsFresh"));
+eval(extractFunction("sessionAllowsDownload"));
 eval(extractFunction("downloadCurrentExcelFile"));
-assert.strictEqual(downloadCurrentExcelFile({ url: "/api/download/quote.xlsx", name: "quote.xlsx" }), true);
+(async () => {
+assert.strictEqual(await downloadCurrentExcelFile({ url: "/api/download/quote.xlsx", name: "quote.xlsx" }), true);
 assert.strictEqual(anchor.href, "/api/download/quote.xlsx");
 assert.strictEqual(anchor.download, "quote.xlsx");
 assert.strictEqual(clicked, true);
 assert.strictEqual(appended, true);
 assert.strictEqual(removed, true);
-assert.strictEqual(downloadCurrentExcelFile({}), false);
+assert.strictEqual(await downloadCurrentExcelFile({}), false);
+})().catch(error => { console.error(error); process.exit(1); });
 """
         completed = subprocess.run(
             [node, "-e", script],
@@ -24607,6 +24611,7 @@ eval([
   "defaultPricingReference",
   "syncSelectedPricingReference",
   "quoteCommercialSnapshotPricingBasis",
+  "recoverFromAuthenticationResponse",
   "deleteRepoPricingReference",
 ].map(extractFunction).join("\n"));
 
@@ -28999,13 +29004,13 @@ const required = ["isPlainObject", "objectHasExactKeys", "safeQuoteSessionId", "
   "quoteSessionDraftIsConfirmed", "currentQuoteSessionIsRestoredFromDashboard", "quoteSessionDraftStateCanSave",
   "clearQuoteSessionDraftSaveTimer", "saveCurrentQuoteSession", "saveQuoteSessionDraftState", "ensureQuoteSession",
   "quoteSessionDraftSynchronizationFailureMessage", "standardServiceDecisionsForSave", "currentStandardServiceDecisions", "normalizeStandardServiceDecisions", "handleDraftBasis", "handleGenerate", "retainExcludedBasisPricingRows",
-  "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows"];
+  "ensureSavedServerJobStarted", "startJob", "duplicateDashboardQuote", "finishDashboardOperation", "copiedQuotePricingRow", "sameLineItemSourceIdentities", "adoptGenerationOutputRows", "authenticationRecoveryNavigating"];
 if (scenario.realRefresh || scenario.kind === "excel" || scenario.kind === "dashboard-failure") required.push("getJson", "applySessionData", "renderAuthState");
 if (scenario.refreshBoundary) required.push("markPageUnloading");
 if (scenario.tentativeBoundary) required.push("handleBeforeUnload");
 const pricingReferenceShouldWarnBeforeUnload = () => false;
 if (scenario.kind === "dashboard-failure") required.push("returnToDashboard", "restoredQuoteSessionHasChanged", "handleTopbarBrandClick", "setDashboardLoadingState", "showDashboard", "loadQuoteDashboard", "appIsBusy");
-if (scenario.kind === "excel") { constantNames.push(); required.push("downloadCurrentExcelFile", "downloadFileIsFresh", "pdfFileIsFresh", "quoteSessionHasFreshOutputExports", "markOutputRowsDirty", "revisionNumber", "setDownloadFiles", "pollJob", "isInterruptedJobPoll", "handleInterruptedJobPoll", "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage", "handleGeneratedExportReadyAction"); }
+if (scenario.kind === "excel") { constantNames.push(); required.push("downloadCurrentExcelFile", "sessionAllowsDownload", "downloadFileIsFresh", "pdfFileIsFresh", "quoteSessionHasFreshOutputExports", "markOutputRowsDirty", "revisionNumber", "setDownloadFiles", "pollJob", "isInterruptedJobPoll", "handleInterruptedJobPoll", "postCommitProjectionWarningFrom", "postCommitProjectionWarningMessage", "handleGeneratedExportReadyAction"); }
 if (scenario.kind === "dashboard-order") required.push("returnToDashboard", "restoredQuoteSessionHasChanged");
 // Optional only so the SAME regression executes against the unchanged baseline.
 for (const name of ["quoteSessionSaveFailureFrom", "safeQuoteSessionErrorReference", "validQuoteDraftVersion",
@@ -29155,7 +29160,7 @@ async function act() {
       assert.strictEqual(Boolean(state.isGenerating), false);
       if (success) {
         assert(downloadFileIsFresh()); assert.strictEqual(state.downloadFile.url, "/api/synthetic-current.xlsx");
-        assert.strictEqual(downloadCurrentExcelFile(), true, "Legitimate fresh explicit retrieval denied");
+        assert.strictEqual(await downloadCurrentExcelFile(), true, "Legitimate fresh explicit retrieval denied");
         assert.strictEqual(effects.anchor_clicks, 2);
       } else if (!scenario.excelFault) assert(messages.join(" ").includes("Quote could not be saved"));
     }

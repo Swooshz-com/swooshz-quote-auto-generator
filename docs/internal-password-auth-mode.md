@@ -77,13 +77,30 @@ and a support reference.
 
 The HTTP server owns its nonce and session registries. A successful login rotates
 the prior session; the host-only cookie contains only the mode and opaque session
-ID. Deploy cookies are Secure, HttpOnly and SameSite=Lax. Sessions expire after
-eight hours; at most 4,096 sessions and 1,024 pending nonces are retained. Restart,
-logout and any material policy or password change invalidate sessions. Existing
-Google-mode cookies cannot establish password access.
+ID. Deploy cookies are Secure, HttpOnly and SameSite=Lax. A session ends only
+after 3 days (72 hours) without use: every signed-in request resets that clock,
+so staff who keep using the app stay signed in. There is no fixed lifetime, so a
+copied cookie stays usable for as long as someone keeps using it; HttpOnly,
+Secure, host-only signing and server-side revocation are the mitigations. At
+most once every 5 minutes the server re-sends the identical signed cookie with a
+fresh Max-Age (4 days: the idle limit plus one day), so the browser keeps it
+while the session is in use and the CSRF token never changes mid-session. The
+cookie's age grants nothing; the server record decides. At most 4,096 sessions
+and 1,024 pending nonces are retained. Sessions live in server memory: restart
+or redeploy signs everyone out, as do logout and any material policy or password
+change. Existing Google-mode cookies cannot establish password access.
+
+When a browser still holds a signed session cookie whose session has ended
+(idle, signed out elsewhere, or a restart), the Staff sign in form says
+`Your session has ended. Sign in again to continue.` Any other request to the
+form keeps the standard text. A staff action that gets a 401 sends the browser to
+this form through the existing recovery path, which saves the open quote first.
+After a new sign-in the app opens the Dashboard; a refresh in the same session
+keeps the current screen.
 
 `/api/session` returns permissions, the signed-in staff member's own email and
-role, and an opaque browser-recovery scope. It omits the identity roster,
+role, an opaque browser-recovery scope, and an opaque per-sign-in marker
+(`sign_in_id`) that tells a new sign-in from a refresh. It omits the identity roster,
 binding digest and internal user record. `POST /logout`
 requires the authenticated session's CSRF token and revokes the copied cookie on
 the server. A domain revisit stays signed out until an explicit new login.

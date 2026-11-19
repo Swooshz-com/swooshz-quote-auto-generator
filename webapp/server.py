@@ -116,7 +116,7 @@ from webapp.ai_gateway import (AiGateway, GatewayConfiguration, GatewayError,
 from webapp.ai_response_contracts import BASIS_TAGS, DRAFT_SYNTHESIS, ContractViolation, ResponseContract, integer_digit_limit
 from webapp.pricing_response_contracts import PRICING_IMPORT, PRICING_METADATA
 from webapp.internal_password_auth import (
-    INTERNAL_AUTH_MODE, INTERNAL_SESSION_TTL_SECONDS, LOGIN_NONCE_TTL_SECONDS,
+    INTERNAL_AUTH_MODE, INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS, LOGIN_NONCE_TTL_SECONDS,
     InternalAuthConfigError, InternalAuthPolicy, InternalAuthState,
     InternalAuthStateError, canonical_email,
 )
@@ -537,6 +537,7 @@ LOCAL_USER_ROLE_ENV_NAME = "LOCAL_USER_ROLE"
 SESSION_COOKIE_NAME = "swooshz_quote_session"
 OIDC_STATE_COOKIE_NAME = "swooshz_quote_oidc_state"
 SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60
+SESSION_ENDED_SIGN_IN_MESSAGE = "Your session has ended. Sign in again to continue."
 MIN_DEPLOY_SESSION_SECRET_CHARS = 32
 MIN_PLATFORM_SERVICE_SECRET_CHARS = 32
 TRUSTED_PROXY_CIDRS_ENV_NAME = 'SQAG_TRUSTED_PROXY_CIDRS'
@@ -12085,6 +12086,22 @@ def platform_user_id_from_auth_session(session: dict[str, Any] | None) -> str:
     platform = platform_context_from_auth_session(session)
     platform_user = platform.get("user") if isinstance(platform, dict) and isinstance(platform.get("user"), dict) else {}
     return privacy_safe_tracking_id(platform_user.get("userId") or user.get("subject"), "")
+
+
+def internal_sign_in_id(session: dict[str, Any] | None) -> str:
+    """Opaque per-sign-in marker so the browser can tell a new sign-in from a refresh.
+
+    Keyed with the session secret under its own label: not the session id, not
+    the CSRF token, and useless as a credential.
+    """
+    if not isinstance(session, dict) or session.get("auth_mode") != INTERNAL_AUTH_MODE:
+        return ""
+    sid = session.get("session_id")
+    secret = session_secret()
+    if not isinstance(sid, str) or not sid or not secret:
+        return ""
+    material = b"sqag-sign-in-v1\0" + sid.encode("ascii", "ignore")
+    return hmac.new(secret.encode("utf-8"), material, hashlib.sha256).hexdigest()[:32]
 
 
 def browser_recovery_scope(session: dict[str, Any] | None) -> str:
@@ -34654,6 +34671,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
                 "permissions": self.current_permissions(),
                 "user": None if internal_password_mode_enabled() else (session.get("user") if session else None),
                 **({"staff_identity": self.current_staff_identity(session)} if internal_password_mode_enabled() else {}),
+                **({"sign_in_id": internal_sign_in_id(session)} if internal_password_mode_enabled() and internal_sign_in_id(session) else {}),
                 "browser_recovery_scope": browser_recovery_scope(session),
             })
             return
@@ -36374,12 +36392,29 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_password_failure(503, "login_capacity")
             return
         self.send_auth_page(
-            "Staff sign in", "Enter your approved staff email and the password for your role.",
+            "Staff sign in",
+            SESSION_ENDED_SIGN_IN_MESSAGE if self.session_cookie_has_ended()
+            else "Enter your approved staff email and the password for your role.",
             nonce=nonce,
             extra_headers=[("Set-Cookie", cookie_header_value(
                 "sqag_login_binding", binding, max_age=LOGIN_NONCE_TTL_SECONDS,
             ))],
         )
+
+    def session_cookie_has_ended(self) -> bool:
+        """True only for a genuine signed internal session cookie that no longer validates.
+
+        Default-deny: no cookie, a bad signature, another auth mode or a live
+        session all keep the standard sign-in text.
+        """
+        raw = cookies_from_header(self.headers.get("Cookie", "")).get(SESSION_COOKIE_NAME, "")
+        payload = verified_cookie_payload(raw, allow_expired=True) if raw else None
+        if not payload or payload.get("auth_mode") != INTERNAL_AUTH_MODE:
+            return False
+        sid = payload.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            return False
+        return self.current_auth_session() is None
 
     def handle_password_login(self) -> None:
         if not internal_password_mode_enabled():
@@ -36431,7 +36466,7 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_password_failure(403, "login_denied")
             return
         self.send_redirect("/", extra_headers=[
-            ("Set-Cookie", cookie_header_value(SESSION_COOKIE_NAME, signed_cookie_value(record, max_age_seconds=INTERNAL_SESSION_TTL_SECONDS), max_age=INTERNAL_SESSION_TTL_SECONDS)),
+            ("Set-Cookie", cookie_header_value(SESSION_COOKIE_NAME, signed_cookie_value(record, max_age_seconds=INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS), max_age=INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS)),
             ("Set-Cookie", clear_cookie_header_value("sqag_login_binding")),
         ])
 
@@ -36637,6 +36672,38 @@ class QuoteRunnerHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def send_header(self, keyword: str, value: str) -> None:
+        if keyword.lower() == "set-cookie" and str(value).startswith(SESSION_COOKIE_NAME + "="):
+            self._session_cookie_written = True
+        super().send_header(keyword, value)
+
+    def end_headers(self) -> None:
+        self.send_session_cookie_renewal()
+        super().end_headers()
+
+    def send_session_cookie_renewal(self) -> None:
+        """Extend the browser's copy of a session that this request used.
+
+        Re-sends the identical signed cookie value (so the CSRF token, an HMAC of
+        that value, never changes mid-session) with a fresh Max-Age, at most once
+        per renewal interval. Never on sign-in or sign-out, never on a response
+        that already writes the session cookie, never for an ended session.
+        """
+        if getattr(self, "_session_cookie_written", False) or getattr(self, "_session_cookie_renewal_done", False):
+            return
+        self._session_cookie_renewal_done = True
+        if urlparse(self.path).path in {"/login", "/logout"} or not internal_password_mode_enabled():
+            return
+        session = getattr(self, "_validated_auth_session", None)
+        if not isinstance(session, dict) or session.get("auth_mode") != INTERNAL_AUTH_MODE:
+            return
+        raw = cookies_from_header(self.headers.get("Cookie", "")).get(SESSION_COOKIE_NAME, "")
+        if not raw or not self.server.internal_auth.claim_cookie_renewal(session.get("session_id")):
+            return
+        super().send_header("Set-Cookie", cookie_header_value(
+            SESSION_COOKIE_NAME, raw, max_age=INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS,
+        ))
 
     def send_security_headers(self) -> None:
         cache_control = (

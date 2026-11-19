@@ -13,7 +13,9 @@ import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -45,8 +47,43 @@ def configure_auth_env():
     })
 
 
+class HarnessClock:
+    """Test-only clock for the session registry, moved by the browser suite."""
+    def __init__(self):
+        self.offset = 0
+
+    def __call__(self):
+        return time.time() + self.offset
+
+
+HARNESS_CLOCK_ROUTE = "/__harness/clock"
+
+
 class HarnessHandler(webapp.QuoteRunnerHandler):
-    pass
+    def do_POST(self):
+        # Exists only on this loopback harness when main() installs a clock;
+        # nothing in webapp/ knows about it.
+        clock = getattr(self.server, "harness_clock", None)
+        if urlparse(self.path).path == HARNESS_CLOCK_ROUTE and isinstance(clock, HarnessClock):
+            self.handle_harness_clock(clock)
+            return
+        super().do_POST()
+
+    def handle_harness_clock(self, clock):
+        if self.client_address[0] != "127.0.0.1":
+            self.send_json({"error": "Not found"}, status=404)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}") if 0 < length <= 1024 else {}
+        advance = body.get("advance_seconds", 0)
+        if not isinstance(advance, int) or isinstance(advance, bool) or not 0 <= advance <= 30 * 24 * 60 * 60:
+            self.send_json({"error": "advance_seconds must be 0..30 days"}, status=400)
+            return
+        clock.offset += advance
+        if body.get("restart") is True:
+            # Same effect as a server restart for sign-ins: every session is gone.
+            self.server.internal_auth = webapp.InternalAuthState(clock=clock)
+        self.send_json({"status": "ok", "offset_seconds": clock.offset})
 
 
 def parse_storage(argv):
@@ -106,7 +143,10 @@ def main():
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         database = configure_database_storage(settings)
     try:
-        server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), HarnessHandler)
+        clock = HarnessClock()
+        server = webapp.ThreadingHTTPServer(("127.0.0.1", 0), HarnessHandler,
+                                            internal_auth=webapp.InternalAuthState(clock=clock))
+        server.harness_clock = clock
         print("http://127.0.0.1:"+str(server.server_port), flush=True)
         try:
             server.serve_forever()
