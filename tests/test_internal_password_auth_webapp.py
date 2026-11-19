@@ -647,7 +647,11 @@ class InternalPasswordIdleSessionWebappTest(unittest.TestCase):
                              (b"GET / HTTP/1.1 extra", b"400")):
             with self.subTest(line=line):
                 reply = self.raw_request_line(line)
-                self.assertTrue(reply.startswith(b"HTTP/1.0 " + status), reply[:80])
+                # Python 3.12 answers these in HTTP/0.9 style (error page, no status
+                # line); newer versions add "HTTP/1.0 <code>". Both carry the code.
+                self.assertIn(b"Error code: " + status, reply, reply[:80])
+                if reply.startswith(b"HTTP/"):
+                    self.assertTrue(reply.startswith(b"HTTP/1.0 " + status), reply[:80])
                 self.assertNotIn(webapp.SESSION_COOKIE_NAME.encode() + b"=", reply)
         # The server still serves a signed-in request afterwards.
         self.assertEqual(self.session_json(cookie)[0], 200)
