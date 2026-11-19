@@ -95,6 +95,50 @@ jobs:
       - name: Run Nixpacks Python contract tests
         run: python -m unittest tests.test_nixpacks_python_contract
 
+  quote-basis-click-budget:
+    name: Quote Basis click budget
+    runs-on: ubuntu-24.04
+    needs:
+      - retrospective_exact_starting_head_red
+      - secret-scan
+      - dependency-audit
+    timeout-minutes: 20
+    env:
+      APP_MODE: local
+      LOCAL_USER_ROLE: admin
+      CI: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Python dependencies
+        run: python -m pip install --only-binary=:all: -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Check click budget script syntax
+        run: node --check scripts/playwright-basis-click-budget.mjs
+
+      - name: Run Quote Basis click budget
+        run: npm run playwright:click-budget
+
   validate:
     name: Validate app
     runs-on: ubuntu-24.04

@@ -278,6 +278,7 @@ Do not remove old failing fixtures or narrow their assertions to pass.
 | alpha-full | playwright:alpha-smoke | `node scripts/playwright-alpha-smoke.mjs` | `npm run playwright:alpha-smoke` | Native saved edits, reopen, workbook/PDF and protected download checks; renderer dependencies required. |
 | rehearsal-check | playwright:rehearsal-check | `node --test tests/test_rehearsal_check.mjs` | `npm run playwright:rehearsal-check` | `scripts/rehearsal-check.mjs` seed, verify (no AI), reopen and live-readonly against a loopback synthetic server behind a logging proxy (live-readonly must send no write the server sees), plus its base-URL, credential-argument and read-only API refusals. The real runs target the rehearsal and live apps from the laptop. |
 | owner-uat | playwright:owner-uat-basis | `node scripts/playwright-owner-uat-basis-repair.mjs --lines=24 --latency-ms=800` | absent | Operator tool; bounded rendered variants also run indirectly in focused Python tests. |
+| click-budget | playwright:click-budget | `node scripts/playwright-basis-click-budget.mjs` | absent | Runs in its own CI job, Quote Basis click budget, not in Validate app; counts the work each Quote Basis tick or X causes on a real-sized quote. |
 <!-- coverage-browser:end -->
 
 ### Intentional scope skips and receipts
@@ -679,6 +680,18 @@ the owner-approved CI lane.
   `--measure-only --cpu-throttle=4 --catalog-extra=300` (optionally
   `--cpu-profile`); it reports Event Timing input-to-paint per click and the
   time until `Preparing Output` paints.
+- Quote Basis tick, X, block tick or X, quantity edits, the browser recovery
+  copy or quote draft saves: run `npm run playwright:click-budget` (CI job
+  `Quote Basis click budget`). It uses real-shaped groups (Matched, Review and
+  Unmatched lines with server pricing offers, AI proposals, estimated sizes) and
+  about 16 MB of reference files uploaded through the real intake. At 4x CPU
+  slowdown it ticks, crosses and block-ticks every group, then sends a burst of
+  five Unmatched clicks, and watches 1.5 s after each. Each click may write the
+  browser copy of the quote once, never rewrite unchanged files to IndexedDB,
+  never fully re-render the list, keep every unchanged row's DOM node, and leave
+  exactly the DOM a full render gives. A burst saves the quote once, without
+  files the server already has. Serialised bytes, text encoding, long frames and
+  input-to-paint have budgets. The build before this check was added fails it.
 - The analysis seal attests only rows derived from the provider's result, in
   the unit the provider measured each row in (carried internally from the first
   normalisation, before rows re-unit to their catalogue items). Request or

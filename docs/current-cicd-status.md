@@ -1,6 +1,6 @@
 # Current CI/CD Status
 
-Last updated: 2026-11-16
+Last updated: 2026-11-19
 
 Sources of truth: `.github/workflows/ci.yml`, `.github/workflows/plain-text.yml`,
 and the two Toolkit Programme Sweep workflows
@@ -186,6 +186,15 @@ or deployment behaviour changes accompany this test.
   (including the pinned Linux metric-compatible Liberation Sans/Carlito
   providers) before the real rendered-PDF regression runs.
 - `Validate app`: runs after retrospective fixture integrity/result and security gates pass.
+- `Quote Basis click budget`: runs after the retrospective fixture and security
+  gates pass, on `ubuntu-24.04` with a 20-minute timeout and no secrets. It
+  installs the locked Node and Python dependencies and Playwright Chromium, then
+  runs `npm run playwright:click-budget` against the local synthetic server. It
+  fails when a Quote Basis tick or X writes the browser copy more than once,
+  rewrites unchanged reference files, re-renders or rebuilds the list, saves the
+  quote more than once per burst, sends files the server already has, or goes
+  over its byte, long-frame or input-to-paint budget. It is not yet a required
+  branch-protection check; that needs the owner's separate approval.
 
 ## Validate App Checks
 
