@@ -31123,6 +31123,7 @@ eval([
   "basisUnmatchedOffer",
   "basisPricingGroup",
   "detectedBoothSizeText",
+  "quoteBasisHeaderHtml",
   "renderQuoteBasisMessage",
 ].map(extractFunction).join("\n"));
 
