@@ -458,6 +458,7 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
         // A copy saved before copies carried a draft version (no field at all) is held as soon as it
         // restores over the server's quote, and staff are told to reopen it; it never sends a save.
         const absent = missingVersion === undefined;
+        if (absent) await page.waitForFunction(() => elements.excelGeneratingModal.classList.contains("is-open"), null, { timeout: 10000 }).catch(() => {});
         assert(await page.evaluate(async ({ oldTitle, absent }) => {
           const failure = {};
           if (absent) {

@@ -316,6 +316,7 @@ const state = {
   standardServiceRows: newStandardServiceDecisions(),
   pricingLedgerRevisions: {},
   pricingDraftVersion: "",
+  olderRecoveryCopyHoldNotice: "",
   pendingQuoteDependencyChanges: [],
   basisConfirmed: false,
   isAnalysisRunning: false,
@@ -5226,15 +5227,26 @@ async function restoreSessionState() {
 
 // A recovery copy saved before copies carried their quote's draft version cannot prove it matches
 // the server's quote, so it only ever saves as a new quote ("create"). When the server already holds
-// that quote, keep the copy from writing and tell staff now to reopen it, instead of failing on the
-// next save without a word. The copy stays on screen; a quote the server never saw still saves as new.
+// that quote, keep the copy from writing at once, instead of failing on the next save without a word;
+// boot tells staff to reopen it only if the copy opens in the quote view, not over the Dashboard (whose
+// actions all replace the copy). The copy stays as it is; a quote the server never saw (expected 404)
+// still saves as new.
 async function holdOlderRecoveryCopyOfSavedQuote() {
   const sessionId = safeQuoteSessionId(state.quoteSessionId || "");
   if (!sessionId || state.pricingDraftVersion !== "create") return;
-  const { ok, data } = await getJson(`/api/quote-sessions/${encodeURIComponent(sessionId)}`, { persistSession: false, sessionId });
+  const { ok, data } = await getJson(`/api/quote-sessions/${encodeURIComponent(sessionId)}`, { persistSession: false, sessionId, expectedStatus: 404 });
   if (!ok || safeQuoteSessionId(data?.quote_session?.session_id || "") !== sessionId
     || safeQuoteSessionId(state.quoteSessionId || "") !== sessionId || state.pricingDraftVersion !== "create") return;
+  state.olderRecoveryCopyHoldNotice = sessionId;
   requireQuoteDraftReopen();
+}
+
+// Once, at the end of boot: only a held copy that opened in the quote view needs the reopen message.
+function showOlderRecoveryCopyHoldNotice() {
+  const sessionId = state.olderRecoveryCopyHoldNotice;
+  state.olderRecoveryCopyHoldNotice = "";
+  if (!sessionId || state.activeAppView !== "quote" || safeQuoteSessionId(state.quoteSessionId || "") !== sessionId
+    || state.pricingDraftVersion !== false) return;
   showQuoteNotSavedModal(quoteSessionDraftSynchronizationFailureMessage({ draft_stale: true }));
 }
 
@@ -15420,7 +15432,8 @@ async function getJson(url, options = {}) {
   const data = await jsonFromResponse(response, options);
   if (response.status === 401 && data?.status === "auth_required" && await recoverRequiredAuthentication(response.status, data)) return { ok: false, data, status: response.status };
   await adoptServerQuoteCommercialReview(data, options);
-  if (!response.ok) {
+  // A caller that expects a status (a lookup that may find nothing) handles it without an error log.
+  if (!response.ok && response.status !== options.expectedStatus) {
     const failure = options.persistSession === false
       ? quoteSessionSaveFailureFrom({ data, status: response.status }) : null;
     logClientEvent("server_error", {
@@ -19943,6 +19956,7 @@ async function boot() {
     await loadQuoteDashboard({ preserveViewState: true });
   }
   restoreRestorableOverlay();
+  showOlderRecoveryCopyHoldNotice();
   if (newSignIn) saveWorkspaceViewState();
 }
 

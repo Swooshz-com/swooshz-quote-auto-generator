@@ -40,6 +40,14 @@ class OlderQuoteReopenBrowserTest(unittest.TestCase):
         self.assertIs(held['version'], False)
         self.assertEqual(held['rows'], evidence['generatedRows'])
         self.assertIn(held['dialog']['message'], held['download'])
+        # Left on the Dashboard, the copy is held quietly on every load; Modify quote opens cleanly.
+        for view in evidence['olderCopyOnDashboard']:
+            self.assertEqual(view['view'], 'dashboard')
+            self.assertFalse(view['dialog'])
+            self.assertIs(view['version'], False)
+        self.assertFalse(evidence['olderCopyModified']['dialog'])
+        # A copy of a quote the server never saw keeps saving as new, without an error log.
+        self.assertEqual(evidence['olderUnsavedCopy']['version'], 'create')
 
 
 if __name__ == '__main__':

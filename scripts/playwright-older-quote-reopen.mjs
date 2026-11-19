@@ -7,6 +7,7 @@
 import { signIn } from "./internal-password-browser-test.mjs";
 import { SyntheticBrowserBoundary, freshBrowserRun } from "./synthetic-browser-boundary.mjs";
 import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -128,6 +129,39 @@ async function editAndAwaitSave(page, edit, saved) {
   await edit();
   await response;
   await page.waitForFunction(() => !appIsBusy(), null, { timeout: 30000 });
+}
+// Quote-session writes and error logs a page sends from now on.
+function trackWrites(page) {
+  const writes = { quote: [], errors: [] };
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return;
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.startsWith("/api/quote-sessions")) writes.quote.push(pathname);
+    if (pathname === "/api/log" && /server_error|client_error/.test(request.postData() || "")) writes.errors.push(request.postData());
+  });
+  return writes;
+}
+// Staff go Back to Dashboard; the recovery copy stays, as live's code left it, without a draft version.
+async function leaveOlderCopyOnDashboard(page, id) {
+  await page.locator("#backToDashboardButton").click();
+  await page.waitForFunction(() => state.activeAppView === "dashboard" && !appIsBusy(), null, { timeout: 30000 });
+  await page.waitForLoadState("networkidle");
+  const copy = await page.evaluate(() => JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "null"));
+  assert(copy?.quoteSessionId === id && Object.prototype.hasOwnProperty.call(copy, "pricingDraftVersion"),
+    "Back to Dashboard left no recovery copy of the quote", copy && Object.keys(copy));
+  delete copy.pricingDraftVersion;
+  await page.evaluate((older) => window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(older)), copy);
+}
+async function settledDashboard(page, id) {
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && !appIsBusy(), null, { timeout: 30000 });
+  await page.locator(`#dashboardSessionsList [data-quote-session-id="${id}"]`).waitFor({ state: "visible", timeout: 20000 });
+  await page.waitForLoadState("networkidle");
+  return page.evaluate(() => {
+    const stored = JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "null");
+    return { view: state.activeAppView, session: state.quoteSessionId, version: state.pricingDraftVersion,
+      dialog: document.querySelector("#excelGeneratingModal")?.classList.contains("is-open") === true,
+      storedVersion: stored?.pricingDraftVersion };
+  });
 }
 
 const result = { runRoot };
@@ -300,6 +334,54 @@ try {
   await page.waitForLoadState("networkidle");
   assert(!quoteWrites.length, "the older recovery copy wrote to the saved quote", quoteWrites);
   assert(await fs.readFile(file, "utf8") === recordBefore, "the older recovery copy changed the saved quote");
+  await page.context().close();
+
+  // 8. Live's copy left on the Dashboard (Back to Dashboard keeps it; a new sign-in also ends there).
+  // It is held quietly: no "Quote not saved" dialog over the Dashboard, on this load or the next, no
+  // write. Modify quote then opens the server's quote, with nothing to warn about.
+  ({ page } = await reopen(sessionId));
+  await leaveOlderCopyOnDashboard(page, sessionId);
+  const dashboardRecord = await fs.readFile(file, "utf8");
+  const dashboardWrites = trackWrites(page);
+  result.olderCopyOnDashboard = [];
+  for (let load = 0; load < 2; load++) {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    const view = await settledDashboard(page, sessionId);
+    result.olderCopyOnDashboard.push(view);
+    assert(view.view === "dashboard" && !view.dialog, "the older-copy hold showed a dialog over the Dashboard", view);
+    assert(view.session === sessionId && view.version === false && view.storedVersion === false,
+      "the older copy on the Dashboard was not held quietly", view);
+  }
+  await page.locator(`#dashboardSessionsList [data-quote-session-id="${sessionId}"]`).click();
+  await page.locator('#dashboardSelectedSessionPanel [data-dashboard-panel-action="modify-session"]').click();
+  await page.locator("#panel-analysis.is-active").waitFor({ state: "visible", timeout: 30000 });
+  await page.waitForFunction(() => !state.quoteSessionRestoreBusy && !appIsBusy(), null, { timeout: 30000 });
+  result.olderCopyModified = await page.evaluate(() => ({ panel: state.activeSidePanel, version: state.pricingDraftVersion,
+    dialog: document.querySelector("#excelGeneratingModal")?.classList.contains("is-open") === true }));
+  assert(result.olderCopyModified.panel === "output" && !result.olderCopyModified.dialog && typeof result.olderCopyModified.version === "string" && result.olderCopyModified.version,
+    "Modify quote after a quiet hold did not open the saved quote cleanly", result.olderCopyModified);
+  assert(!dashboardWrites.quote.length && !dashboardWrites.errors.length, "the older copy on the Dashboard wrote or logged an error", dashboardWrites);
+  assert(await fs.readFile(file, "utf8") === dashboardRecord, "the older copy on the Dashboard changed the saved quote");
+
+  // 9. An older copy of a quote the server never saw: the expected 404 keeps it saving as new, with
+  // no error logged for the lookup.
+  const unsaved = await page.evaluate(() => JSON.parse(window.localStorage.getItem(QUOTE_SESSION_STORAGE_KEY) || "null"));
+  const unsavedId = "quote-" + randomBytes(12).toString("hex");
+  unsaved.quoteSessionId = unsavedId;
+  delete unsaved.pricingDraftVersion;
+  await page.evaluate((older) => window.localStorage.setItem(QUOTE_SESSION_STORAGE_KEY, JSON.stringify(older)), unsaved);
+  const unsavedWrites = trackWrites(page);
+  const lookup = page.waitForResponse((response) => new URL(response.url()).pathname === `/api/quote-sessions/${unsavedId}`, { timeout: 30000 });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  assert((await lookup).status() === 404, "the server answered the never-saved quote's lookup");
+  await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && !appIsBusy(), null, { timeout: 30000 });
+  // An error log for the lookup would be sent as the 404 arrives; give it a moment to be seen.
+  await page.waitForTimeout(1500);
+  result.olderUnsavedCopy = await page.evaluate(() => ({ session: state.quoteSessionId, version: state.pricingDraftVersion,
+    dialog: document.querySelector("#excelGeneratingModal")?.classList.contains("is-open") === true }));
+  assert(result.olderUnsavedCopy.session === unsavedId && result.olderUnsavedCopy.version === "create" && !result.olderUnsavedCopy.dialog,
+    "an older copy of a quote the server never saw did not keep saving as new", result.olderUnsavedCopy);
+  assert(!unsavedWrites.errors.length, "the expected 404 for a quote the server never saw was logged as an error", unsavedWrites.errors);
   await page.context().close();
 
   assert(!pageErrors.length, "page errors", pageErrors);
