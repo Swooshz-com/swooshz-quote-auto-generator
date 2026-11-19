@@ -23579,6 +23579,21 @@ def line_items_aligned_to_quote_basis(
             catalog_item = catalog_lookup.get(pricing_keyword) if pricing_keyword else None
             is_custom = normalize_basis_tag(line.get("tag")) == "Custom" or bool(line.get("custom_pricing"))
             if not pricing_keyword and not is_custom:
+                # An approved line priced Included (zero) by the operator, such as a standard
+                # service row, keeps its one linked row; any other line still needs a catalogue
+                # match or an accepted proposal before it can reach the quote.
+                included_indexes = {
+                    index for source_id in basis_line_ids(line) for index in by_source_id.get(source_id, [])
+                }
+                if provider_result and len(included_indexes) == 1:
+                    [included_index] = included_indexes
+                    included_authority = line_items[included_index].get("pricing_authority")
+                    if (
+                        included_index not in used_item_indexes
+                        and isinstance(included_authority, dict)
+                        and included_authority.get("variant") == "included"
+                    ):
+                        aligned.append(take_index([included_index]))
                 continue
             existing = existing_item_for_basis_line(line) or {}
             if provider_result and not existing:

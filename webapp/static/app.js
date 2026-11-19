@@ -234,6 +234,18 @@ const BASIS_TAGS = [
   ["Confirm", "Confirm", "Needs include, exclude, or revision"],
 ];
 
+// Standard service rows (#363). A quote started from this release offers each row for review with the
+// existing tick and X controls: a tick includes it at zero (Included), X leaves it out of the quote.
+// A draft started earlier has no decisions record (state.standardServiceRows is null) and is left as saved.
+const STANDARD_SERVICE_ROWS = Object.freeze([
+  Object.freeze({ id: "standard-project-management-fee", title: "Project management fee", text: "Lump sum for project management", quantity: 1, unit: "nos" }),
+  Object.freeze({ id: "standard-waste-disposal", title: "Waste disposal", text: "Waste disposal / Recycling at production venue", quantity: 1, unit: "nos" }),
+]);
+
+function newStandardServiceDecisions() {
+  return Object.fromEntries(STANDARD_SERVICE_ROWS.map((row) => [row.id, "Confirm"]));
+}
+
 const state = {
   quoteAiSpendRequest: 0,
   profileId: "",
@@ -297,6 +309,7 @@ const state = {
   blockingClarificationQuestions: [],
   boothDimensions: { ...DEFAULT_BOOTH_DIMENSIONS },
   originalAnalysisSnapshot: null,
+  standardServiceRows: newStandardServiceDecisions(),
   pricingLedgerRevisions: {},
   pricingDraftVersion: "",
   pendingQuoteDependencyChanges: [],
@@ -4441,6 +4454,8 @@ function buildSessionSnapshot() {
     blockingClarificationQuestions: state.blockingClarificationQuestions,
     boothDimensions: state.boothDimensions,
     originalAnalysisSnapshot: state.originalAnalysisSnapshot,
+    // Only quotes started from #363 carry this record; older drafts keep their saved shape.
+    ...standardServiceDecisionsForSave(),
     pricingLedgerRevisions: state.pricingLedgerRevisions,
     pricingDraftVersion: state.pricingDraftVersion,
     basisConfirmed: state.basisConfirmed,
@@ -5043,6 +5058,7 @@ async function applyQuoteSessionSnapshot(saved = {}, options = {}) {
   state.blockingClarificationQuestions = Array.isArray(restoredState.blockingClarificationQuestions) ? restoredState.blockingClarificationQuestions : [];
   state.boothDimensions = normalizeBoothDimensions(restoredState.boothDimensions || savedQuoteDetails.project || {});
   state.originalAnalysisSnapshot = restoredState.originalAnalysisSnapshot || null;
+  state.standardServiceRows = normalizeStandardServiceDecisions(restoredState.standardServiceRows);
   const recoveredVersion = isOwnedBrowserSnapshot ? savedState.pricingDraftVersion : options.serverDraftVersion;
   state.pricingDraftVersion = targetSessionId ? false : "";
   state.pricingLedgerRevisions = {};
@@ -6109,6 +6125,7 @@ function resetCurrentQuoteDraftState() {
   transitionGenerationContext("", "");
   state.quoteSessionDraftSaveStarted = false;
   state.customerStepCheckpoint = null;
+  state.standardServiceRows = newStandardServiceDecisions();
   clearRestoredQuoteSessionBaseline();
   state.quoteCommercialLifecycle = "NEW_UNINITIALISED";
   state.quoteCommercialSnapshot = null;
@@ -7587,6 +7604,101 @@ function confirmOnlyQuoteBasisSections(sections = []) {
       return { ...line, tag: tag === "Custom" ? "Custom" : "Confirm" };
     }),
   }));
+}
+
+function standardServiceDecision(tag) {
+  const normalized = normalizeBasisTag(tag);
+  return normalized === "Include" || normalized === "Exclude" ? normalized : "Confirm";
+}
+
+function normalizeStandardServiceDecisions(value) {
+  if (!isPlainObject(value)) return null;
+  return Object.fromEntries(STANDARD_SERVICE_ROWS.map((row) => [row.id, standardServiceDecision(value[row.id])]));
+}
+
+// The decisions as the operator last left them: a standard row on screen wins over the saved record.
+function currentStandardServiceDecisions(sections = state.quoteBasisSections) {
+  const decisions = normalizeStandardServiceDecisions(state.standardServiceRows);
+  if (!decisions) return null;
+  (Array.isArray(sections) ? sections : []).forEach((section) => (section?.lines || []).forEach((line) => {
+    if (Object.prototype.hasOwnProperty.call(decisions, line?.id)) decisions[line.id] = standardServiceDecision(line.tag);
+  }));
+  return decisions;
+}
+
+function standardServiceDecisionsForSave() {
+  const decisions = currentStandardServiceDecisions();
+  return decisions ? { standardServiceRows: decisions } : {};
+}
+
+// The words a standard row's section title and line share ("project management", "waste disposal").
+// A suggested line whose own words and section title contain all of them offers the same service.
+function standardServiceCoreTerms(row) {
+  const lineTerms = new Set(sectionTitleKey(row.text).split(" ").filter(Boolean));
+  return sectionTitleKey(row.title).split(" ").filter((term) => term && lineTerms.has(term));
+}
+
+function standardServiceDuplicate(sectionTitle, line = {}) {
+  if (basisLineIsInformationalDimension(line)) return false;
+  const terms = new Set(`${sectionTitleKey(sectionTitle)} ${sectionTitleKey(line.text || "")}`.split(" ").filter(Boolean));
+  return STANDARD_SERVICE_ROWS.some((row) => {
+    const core = standardServiceCoreTerms(row);
+    return core.length > 0 && core.every((term) => terms.has(term));
+  });
+}
+
+function standardServiceLineItem(row) {
+  const item = normalizeLineItem({
+    section: row.title,
+    quantity: row.quantity,
+    unit: row.unit,
+    description: row.text,
+    pricing_keyword: "",
+    price_mode: "Included",
+    display_price: "Included",
+    source_basis_line_id: row.id,
+    status: "included",
+  });
+  const authority = buildPricingAuthority("included", item);
+  return authority ? normalizeLineItem({ ...item, pricing_authority: authority }) : item;
+}
+
+// Puts the standard rows, with the operator's decisions, after an analysis result or a Reset. Suggested
+// lines offering the same service, and their pricing rows, are dropped so neither row is duplicated.
+function withStandardServiceRows(sections = [], lineItems = [], decisions = null) {
+  if (!decisions) return { sections, lineItems };
+  const reservedIds = new Set(STANDARD_SERVICE_ROWS.map((row) => row.id));
+  const removedIds = new Set(reservedIds);
+  const keptSections = (Array.isArray(sections) ? sections : []).flatMap((section) => {
+    if (reservedIds.has(section?.id)) return [];
+    const lines = (section?.lines || []).filter((line) => {
+      if (!reservedIds.has(line?.id) && !standardServiceDuplicate(section.title, line)) return true;
+      [line?.id, line?.source_line_item_id].filter(Boolean).forEach((id) => removedIds.add(String(id)));
+      return false;
+    });
+    return lines.length ? [{ ...section, lines }] : [];
+  });
+  const standardSections = STANDARD_SERVICE_ROWS.map((row) => ({
+    id: row.id,
+    title: row.title,
+    lines: [{ id: row.id, tag: decisions[row.id] || "Confirm", text: row.text, quantity: row.quantity, unit: row.unit, confidence: 100 }],
+  }));
+  return {
+    sections: canonicalQuoteBasisSections([...keptSections, ...standardSections]),
+    lineItems: [
+      ...(Array.isArray(lineItems) ? lineItems : []).filter((item) => !removedIds.has(String(item?.source_basis_line_id || ""))),
+      ...STANDARD_SERVICE_ROWS.map(standardServiceLineItem),
+    ],
+  };
+}
+
+function applyStandardServiceRows(decisions = state.standardServiceRows) {
+  state.standardServiceRows = normalizeStandardServiceDecisions(decisions);
+  if (!state.standardServiceRows) return;
+  const merged = withStandardServiceRows(state.quoteBasisSections, state.lineItems, state.standardServiceRows);
+  state.quoteBasisSections = merged.sections;
+  state.quoteBasis = quoteBasisFromSections(merged.sections);
+  state.lineItems = merged.lineItems;
 }
 
 function quoteBasisFromSections(sections = []) {
@@ -14167,6 +14279,7 @@ function hasCompletedQuoteBasis() {
 
 function applyDraftBasis(basis = {}) {
   state.basisConfirmed = false;
+  state.standardServiceRows = currentStandardServiceDecisions();
   const sections = confirmOnlyQuoteBasisSections(basis);
   state.quoteBasisSections = sections;
   const legacyBasis = basis.quote_basis && typeof basis.quote_basis === "object" ? basis.quote_basis : basis;
@@ -14535,9 +14648,11 @@ function resetQuoteBasisToOriginal() {
   const snapshot = state.originalAnalysisSnapshot;
   if (!snapshot) return;
   invalidateBasisChatAuthority();
+  const standardServiceDecisions = currentStandardServiceDecisions();
   state.quoteBasisSections = cloneQuoteBasisSections(snapshot.quote_basis_sections || snapshot.quote_basis || []);
   state.quoteBasis = cloneQuoteBasis(snapshot.quote_basis || quoteBasisFromSections(state.quoteBasisSections));
   state.lineItems = Array.isArray(snapshot.line_items) ? snapshot.line_items.map(normalizeLineItem) : [];
+  applyStandardServiceRows(standardServiceDecisions);
   state.boothDimensions = normalizeBoothDimensions(snapshot.boothDimensions || state.boothDimensions);
   state.lastAnalysisMode = normalizeAnalysisMode(snapshot.analysis_mode || state.lastAnalysisMode);
   state.outputRows = [];
@@ -15162,6 +15277,7 @@ function currentQuoteSessionDraftState() {
     blockingClarificationQuestions: snapshot.blockingClarificationQuestions,
     boothDimensions: snapshot.boothDimensions,
     originalAnalysisSnapshot: snapshot.originalAnalysisSnapshot,
+    ...(snapshot.standardServiceRows ? { standardServiceRows: snapshot.standardServiceRows } : {}),
     basisConfirmed: snapshot.basisConfirmed,
     aiFailed: snapshot.aiFailed,
     draftSource: snapshot.draftSource,
@@ -17661,6 +17777,7 @@ async function handleDraftBasis(options = {}) {
   }
   applyDraftBasis(data);
   applyDraftLineItems(data.line_items || []);
+  applyStandardServiceRows();
   state.boothDimensions = normalizeBoothDimensions(data.project || state.boothDimensions);
   state.draftSource = data.source || "";
   state.lastAnalysisMode = normalizeAnalysisMode(data.analysis_mode || analysisMode);
@@ -18192,6 +18309,7 @@ async function resumeSavedJob() {
     }
     applyDraftBasis(data);
     applyDraftLineItems(data.line_items || []);
+    applyStandardServiceRows();
     state.boothDimensions = normalizeBoothDimensions(data.project || state.boothDimensions);
     state.draftSource = data.source || "";
     captureOriginalAnalysisSnapshot(data);
