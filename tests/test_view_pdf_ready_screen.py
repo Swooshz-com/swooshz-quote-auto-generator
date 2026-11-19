@@ -38,15 +38,23 @@ class ViewPdfReadyScreenTest(unittest.TestCase):
         viewer = self.js.split("function viewCurrentPdfFile(", 1)[1].split("async function handleViewPdf", 1)[0]
         self.assertIn('if (commitActiveOutputEditor() === "blocked") return false;', viewer)
         self.assertIn("if (!file?.url) return false;", viewer)
-        self.assertIn('window.open(file.url, "_blank")', viewer)
-        self.assertIn("if (!opened.closed) opened.opener = null;", viewer)
+        # The tab opens inside the click (before any await) so pop-up blocking
+        # is unchanged; the PDF loads only after the session check passes and
+        # the tab closes when the session has ended (#251).
+        before_wait, after_wait = viewer.split("await sessionAllowsDownload()", 1)
+        self.assertIn('window.open("", "_blank")', before_wait)
+        self.assertNotIn("await ", before_wait)
+        self.assertIn("opened.close();", after_wait.split("return false;", 1)[0])
+        self.assertIn("opened.opener = null;", after_wait)
+        self.assertIn("opened.location.replace(file.url);", after_wait)
         self.assertIn('link.target = "_blank";', viewer)
         self.assertIn('link.rel = "noopener";', viewer)
         self.assertNotIn("window.location.assign(file.url)", self.js)
         action = self.js.split("function handleGeneratedExportReadyAction()", 1)[1].split("function generatedExportReadyModalIsOpen", 1)[0]
         self.assertIn('if (commitActiveOutputEditor() === "blocked") return false;', action)
-        self.assertIn('action === "pdf" ? viewCurrentPdfFile()', action)
-        self.assertNotIn("await ", action)
+        self.assertIn('action === "pdf" ? await viewCurrentPdfFile()', action)
+        # Nothing waits before the PDF tab opens inside the click.
+        self.assertNotIn("await ", action.split("viewCurrentPdfFile()", 1)[0].replace("? await ", "? "))
 
     def test_excel_keeps_automatic_download(self):
         handler = self.js.split('elements.sideDownloadButton.addEventListener("click", async (event) => {', 1)[1].split(

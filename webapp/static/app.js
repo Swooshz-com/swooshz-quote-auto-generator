@@ -337,6 +337,7 @@ const state = {
   authUser: null,
   staffEmail: "",
   browserRecoveryScope: "",
+  signInId: "",
   isRecoveryScopeTransitioning: false,
   pendingFeedback: "",
   feedbackContext: null,
@@ -4061,6 +4062,7 @@ function buildWorkspaceViewSnapshot() {
   return {
     version: 1,
     browserRecoveryScope: currentBrowserRecoveryScope(),
+    signInId: String(state.signInId || ""),
     savedAt: new Date().toISOString(),
     activeAppView: state.activeAppView === "quote" ? "quote" : "dashboard",
     activeSidePanel: SIDE_PANEL_SEQUENCE.includes(state.activeSidePanel) ? state.activeSidePanel : "images",
@@ -4115,6 +4117,13 @@ function restoredWorkspaceViewState() {
     return null;
   }
   return saved;
+}
+
+// A saved screen from an earlier sign-in (expiry, restart or sign-out) must not
+// reopen: a new sign-in lands on the Dashboard. A refresh keeps the screen.
+function workspaceViewIsFromEarlierSignIn(saved) {
+  const current = String(state.signInId || "");
+  return Boolean(current && saved && typeof saved === "object" && String(saved.signInId || "") !== current);
 }
 
 function applyWorkspaceViewState(saved = {}, options = {}) {
@@ -6306,6 +6315,11 @@ async function deleteSelectedPreset() {
       headers: state.csrfToken ? { [state.csrfHeaderName]: state.csrfToken } : {},
     });
     const data = await response.json().catch(() => ({}));
+    if (await recoverFromAuthenticationResponse(response, data)) {
+      state.profileDeleteBusy = false;
+      hideProfileDeleteModal({ force: true });
+      return;
+    }
     if (!response.ok) {
       const message = genericFailureMessages(data).join(" ");
       state.profileDeleteError = message;
@@ -6402,6 +6416,9 @@ async function fetchCompanyProfileExport(profileId = "") {
   }
   if (!response.ok) {
     const data = await jsonFromResponse(response);
+    if (await recoverFromAuthenticationResponse(response, data)) {
+      return { ok: false, data, status: response.status, authenticationRecovery: true };
+    }
     logClientEvent("server_error", {
       url,
       status: response.status,
@@ -6426,7 +6443,8 @@ async function exportCurrentPreset(event) {
   let payload = null;
   if (selected?.source === "company" && !profilePackPayloadForSave()) {
     renderPresetStatus(`Exporting "${selected.name || selected.id}"...`);
-    const { ok, data, blob, filename } = await fetchCompanyProfileExport(selected.id);
+    const { ok, data, blob, filename, authenticationRecovery } = await fetchCompanyProfileExport(selected.id);
+    if (authenticationRecovery) return;
     if (!ok) {
       renderPresetStatus(genericFailureMessages(data).join(" "));
       return;
@@ -8818,6 +8836,7 @@ async function downloadPricingReferenceTemplate(event) {
     return;
   }
   const templateUrl = `/api/pricing-reference/template.xlsx?template=examples-v3&t=${Date.now()}`;
+  if (!await sessionAllowsDownload()) return;
   try {
     const link = document.createElement("a");
     link.href = templateUrl;
@@ -8830,7 +8849,7 @@ async function downloadPricingReferenceTemplate(event) {
   }
 }
 
-function exportSelectedPricingReference(event) {
+async function exportSelectedPricingReference(event) {
   event.preventDefault();
   if (pricingReferenceOperationBusy()) return;
   const reference = deletionPricingReference();
@@ -8845,6 +8864,7 @@ function exportSelectedPricingReference(event) {
     t: String(Date.now()),
   });
   const exportUrl = `/api/settings/pricing-references/${encodeURIComponent(referenceId)}/export.xlsx?${query.toString()}`;
+  if (!await sessionAllowsDownload()) return;
   try {
     const link = document.createElement("a");
     link.href = exportUrl;
@@ -9168,10 +9188,14 @@ async function deleteRepoPricingReference(referenceId, source = "") {
   updatePricingReferenceDeleteButton();
   try {
     const query = `?source=${encodeURIComponent(normalizedSource)}`;
-    const { ok, data } = await fetch(`/api/settings/pricing-references/${encodeURIComponent(reference.id)}${query}`, {
+    const { ok, data, response } = await fetch(`/api/settings/pricing-references/${encodeURIComponent(reference.id)}${query}`, {
       method: "DELETE",
       headers: state.csrfToken ? { [state.csrfHeaderName]: state.csrfToken } : {},
-    }).then(async (response) => ({ ok: response.ok, data: await response.json().catch(() => ({})) }));
+    }).then(async (response) => ({ ok: response.ok, response, data: await response.json().catch(() => ({})) }));
+    if (await recoverFromAuthenticationResponse(response, data)) {
+      hidePricingReferenceDeleteConfirm();
+      return;
+    }
     if (!ok) {
       state.pricingReferenceDeleteError = genericFailureMessages(data).join(" ");
       renderPricingReferenceDeleteConfirm();
@@ -9712,6 +9736,8 @@ function setResultStatus(label, tone = "") {
 }
 
 function renderMessages(messages = [], tone = "") {
+  // The page is already leaving for sign-in; a failure here would only flash.
+  if (tone === "error" && authenticationRecoveryNavigating()) return;
   elements.messageList.innerHTML = messages
     .map((message) => `<div class="message ${tone}">${escapeHtml(message)}</div>`)
     .join("");
@@ -9891,11 +9917,11 @@ function showGeneratedExportReadyModal(viewPdf = false) {
   return true;
 }
 
-function handleGeneratedExportReadyAction() {
+async function handleGeneratedExportReadyAction() {
   if (commitActiveOutputEditor() === "blocked") return false;
   const action = elements.excelGeneratingActionButton?.dataset.exportAction || "";
-  const handled = action === "pdf" ? viewCurrentPdfFile() : action === "excel" ? downloadCurrentExcelFile() : false;
-  if (handled) hideExcelGeneratingModal();
+  const handled = action === "pdf" ? await viewCurrentPdfFile() : action === "excel" ? await downloadCurrentExcelFile() : false;
+  if (handled || authenticationRecoveryNavigating()) hideExcelGeneratingModal();
 }
 
 function generatedExportReadyModalIsOpen() {
@@ -9959,9 +9985,10 @@ function discardInvalidRestoredActiveJob() {
 }
 
 
-function downloadCurrentExcelFile(file = state.downloadFile) {
+async function downloadCurrentExcelFile(file = state.downloadFile) {
   if (commitActiveOutputEditor() === "blocked") return false;
   if (!downloadFileIsFresh(file)) return false;
+  if (!await sessionAllowsDownload()) return false;
   try {
     const link = document.createElement("a");
     link.href = file.url;
@@ -9975,14 +10002,19 @@ function downloadCurrentExcelFile(file = state.downloadFile) {
   return true;
 }
 
-function viewCurrentPdfFile(file = state.pdfFile) {
+async function viewCurrentPdfFile(file = state.pdfFile) {
   if (commitActiveOutputEditor() === "blocked") return false;
   if (!file?.url) return false;
-  const opened = window.open(file.url, "_blank");
-  if (opened) {
-    window.setTimeout(() => {
-      if (!opened.closed) opened.opener = null;
-    }, 0);
+  // Open the tab inside the click so pop-up blocking is unchanged, then load
+  // the PDF only after the session check.
+  const opened = window.open("", "_blank");
+  if (!await sessionAllowsDownload()) {
+    if (opened && !opened.closed) opened.close();
+    return false;
+  }
+  if (opened && !opened.closed) {
+    opened.opener = null;
+    opened.location.replace(file.url);
     return true;
   }
   const link = document.createElement("a");
@@ -14972,6 +15004,7 @@ async function loadFeedbackContext() {
   try {
     const response = await fetch(`/api/feedback/context?${query.toString()}`, { cache: "no-store" });
     const data = await jsonFromResponse(response);
+    if (await recoverFromAuthenticationResponse(response, data)) return;
     if (requestId !== state.feedbackContextRequestId) return;
     if (!response.ok || !data.context) throw new Error("feedback context unavailable");
     state.feedbackContext = data.context;
@@ -15030,6 +15063,7 @@ async function submitFeedback(event) {
       },
     });
     const data = await jsonFromResponse(response);
+    if (await recoverFromAuthenticationResponse(response, data)) return;
     if (!response.ok) {
       elements.feedbackStatus.hidden = false;
       elements.feedbackStatus.textContent = genericFailureMessages(data)[0];
@@ -15121,6 +15155,7 @@ async function applySessionData(data = {}) {
   if (elements.feedbackButton) elements.feedbackButton.hidden = Object.hasOwn(data, "staff_identity");
   state.authenticationRecoveryBoot = false;
   state.browserRecoveryScope = nextRecoveryScope;
+  state.signInId = typeof data.sign_in_id === "string" ? data.sign_in_id.trim() : "";
   if (data.permissions && typeof data.permissions === "object") {
     state.permissions = { ...state.permissions, ...data.permissions };
   }
@@ -15178,6 +15213,31 @@ function finishAuthenticationRecovery() {
     if (window.localStorage.getItem(DASHBOARD_OPERATION_STORAGE_KEY) !== null) return;
     window.localStorage.removeItem(AUTH_RECOVERY_STORAGE_KEY);
   } catch { /* Retain the replay fence until a verified idle snapshot is durable. */ }
+}
+
+function authenticationRecoveryNavigating() {
+  return Boolean(state.authenticationRecoveryRequested && state.isPageUnloading);
+}
+
+// Raw fetch callers: send a 401 "session ended" reply through the same
+// sign-in recovery as getJson/postJson. True means the caller must stop and
+// show no failure of its own (recovery navigates or shows its own message).
+async function recoverFromAuthenticationResponse(response, data) {
+  if (response?.status !== 401) return false;
+  const body = data === undefined ? await jsonFromResponse(response) : data;
+  return recoverRequiredAuthentication(401, body);
+}
+
+// Plain-navigation downloads never reach JavaScript, so a 401 would surface as
+// a failed download. Check the session first; only a 401 stops the download.
+async function sessionAllowsDownload() {
+  if (state.authenticationRecoveryRequested) {
+    await recoverRequiredAuthentication(401, { status: "auth_required" });
+    return false;
+  }
+  if (!state.authRequired) return true;
+  const { status } = await getJson("/api/session", { logFetchFailure: false });
+  return status !== 401;
 }
 
 async function recoverRequiredAuthentication(status, data = {}) {
@@ -16016,6 +16076,7 @@ async function deleteQuoteSessionRecord(sessionId = "") {
       method: "DELETE",
       headers,
     });
+    if (await recoverFromAuthenticationResponse(response)) return false;
     return response.ok || response.status === 404;
   } catch (error) {
     const errorReference = newClientErrorReference();
@@ -17332,11 +17393,16 @@ async function deleteQuoteSessionById(sessionId) {
   try {
     response = await fetch(url, { method: "DELETE", headers });
     data = await jsonFromResponse(response);
+    if (await recoverFromAuthenticationResponse(response, data)) return { ok: false, data, authenticationRecovery: true };
     if (response.status === 403 && await refreshSessionToken()) {
       const retryHeaders = {};
       if (state.csrfToken) retryHeaders[state.csrfHeaderName] = state.csrfToken;
       response = await fetch(url, { method: "DELETE", headers: retryHeaders });
       data = await jsonFromResponse(response);
+      if (await recoverFromAuthenticationResponse(response, data)) return { ok: false, data, authenticationRecovery: true };
+    } else if (state.authenticationRecoveryRequested) {
+      // The CSRF refresh itself found the session ended and started sign-in.
+      return { ok: false, data, authenticationRecovery: true };
     }
   } catch (error) {
     return { ok: false, data: error };
@@ -17423,6 +17489,12 @@ async function confirmQuoteSessionDelete() {
   let failed = null;
   for (const sessionId of sessionIds) {
     const result = await deleteQuoteSessionById(sessionId);
+    if (result?.authenticationRecovery) {
+      state.quoteSessionDeleteBusy = false;
+      hideQuoteSessionDeleteModal();
+      syncControlStates();
+      return;
+    }
     if (!result?.ok) {
       failed = result?.data || {};
       break;
@@ -17613,7 +17685,25 @@ function handleDashboardDeleteKey(event) {
   return true;
 }
 
+async function downloadDashboardExport(href = "") {
+  if (!href || !await sessionAllowsDownload()) return false;
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = "";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  return true;
+}
+
 function handleDashboardSidePanelAction(event) {
+  const exportLink = event.target?.closest?.("a.dashboard-export-link[href]");
+  if (exportLink && elements.dashboardSidePanel?.contains(exportLink)) {
+    // Check the session before the browser navigates to the file.
+    event.preventDefault();
+    downloadDashboardExport(exportLink.getAttribute("href") || "");
+    return;
+  }
   const removeSelected = event.target?.closest?.("[data-dashboard-remove-selected]");
   if (removeSelected && elements.dashboardSidePanel?.contains(removeSelected)) {
     event.preventDefault();
@@ -17884,7 +17974,7 @@ async function handleDraftBasis(options = {}) {
     saveFailure,
   });
   if (!synchronizedSessionId) {
-    if (saveFailure.failure?.page_unloading) return;
+    if (saveFailure.failure?.page_unloading || authenticationRecoveryNavigating()) return;
     state.isAnalysisRunning = false;
     clearActiveJob();
     setWorkflowStage("ready_to_analyze");
@@ -18255,7 +18345,7 @@ async function handleGenerate(options = {}) {
     saveFailure,
   });
   if (!synchronizedSessionId) {
-    if (saveFailure.failure?.page_unloading) return;
+    if (saveFailure.failure?.page_unloading || authenticationRecoveryNavigating()) return;
     state.isGenerating = false;
     clearActiveJob();
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
@@ -18274,7 +18364,7 @@ async function handleGenerate(options = {}) {
   const startedContext = currentGenerationContext();
   transitionGenerationContext(startedContext.session_id, started.data?.generation_run_id || startedContext.run_id);
   if (!started.ok) {
-    if (started.data?.page_unloading) return;
+    if (started.data?.page_unloading || authenticationRecoveryNavigating()) return;
     state.isGenerating = false;
     clearActiveJob();
     setWorkflowStage(state.activeSidePanel === "output" ? "completed" : "details_review");
@@ -18289,7 +18379,7 @@ async function handleGenerate(options = {}) {
   saveSessionState();
 
   const polled = await pollJob(state.activeJob.id);
-  if (polled.aborted) return;
+  if (polled.aborted || authenticationRecoveryNavigating()) return;
   if (isInterruptedJobPoll(polled)) {
     handleInterruptedJobPoll(jobType, polled);
     return;
@@ -19173,6 +19263,13 @@ function wireEvents() {
           credentials: "same-origin",
           redirect: "manual",
         });
+          if (response.status === 401 && (await jsonFromResponse(response))?.status === "auth_required") {
+            // The session already ended; finish signing out as a 204 would.
+            markPageUnloading();
+            await purgeBrowserRecoveryState();
+            window.location.assign("/signed-out");
+            return;
+          }
           if (!response.ok) { state.isSigningOut = false; return; }
         const logoutLocation = response.headers.get("X-SQAG-Logout-Location") || "/signed-out";
           markPageUnloading();
@@ -19300,7 +19397,7 @@ function wireEvents() {
     await waitForUiPaint();
     try {
       const generated = await handleGenerate();
-      if (generated) downloadCurrentExcelFile();
+      if (generated) await downloadCurrentExcelFile();
     } finally {
       hideExcelGeneratingModal();
     }
@@ -19729,6 +19826,7 @@ function startupPricingReferenceIsAvailable() {
 async function boot() {
   let dashboardOperation = null;
   let workspaceView = null;
+  let newSignIn = false;
   let sessionReady = false;
   let profilesReady = false;
   setDashboardLoadingState(true, { title: "Restoring workspace", message: "Loading your saved quote and returning to the last open menu." });
@@ -19738,8 +19836,9 @@ async function boot() {
     sessionReady = await initializeSession();
     if (!sessionReady) return;
     workspaceView = restoredWorkspaceViewState();
+    newSignIn = workspaceViewIsFromEarlierSignIn(workspaceView);
     const recoveringAuthentication = authenticationRecoveryMarkerPresent();
-    if (recoveringAuthentication) {
+    if (recoveringAuthentication || newSignIn) {
       clearDashboardOperation();
       if (workspaceView) workspaceView = { ...workspaceView, restorableOverlay: "" };
     } else dashboardOperation = restoredDashboardOperation();
@@ -19785,11 +19884,19 @@ async function boot() {
   if (state.activeAppView === "quote") {
     showQuoteFlow();
     setDashboardLoadingState(false);
+    // A new sign-in opens the Dashboard. Leave the restored quote the way Back
+    // to Dashboard does, which saves it first, so reopening it shows the work.
+    // A draft too early to be listed on the Dashboard stays open instead,
+    // because leaving would discard it.
+    if (newSignIn && (quoteDraftShouldPersistToDashboard() || currentQuoteSessionIsRestoredFromDashboard())) {
+      await returnToDashboard();
+    }
   } else {
     showDashboard({ load: false });
     await loadQuoteDashboard({ preserveViewState: true });
   }
   restoreRestorableOverlay();
+  if (newSignIn) saveWorkspaceViewState();
 }
 
 boot();

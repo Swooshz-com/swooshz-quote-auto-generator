@@ -187,6 +187,194 @@ try {
   assert.equal((await copied.get(base+"/api/session")).status(),401);
   assert.deepEqual(external,[]);
   await copied.dispose(); await context.close();
+  // #251: staff stay signed in until 3 days without use; an ended session sends
+  // every staff action to sign-in, and a new sign-in opens the Dashboard.
+  const HOUR = 60 * 60;
+  const ENDED_NOTE = "Your session has ended. Sign in again to continue.";
+  let idleClients = 0;
+  async function idleContext() {
+    // Each context is its own trusted-proxy client, so the sign-in form rate
+    // limit (10 a minute per client) applies per context as in real use.
+    idleClients += 1;
+    const idle = await browser.newContext({ acceptDownloads: true,
+      extraHTTPHeaders: { "X-Forwarded-For": "192.0.2." + (10 + idleClients) } });
+    const blocked = [];
+    await idle.route("**/*", route => {
+      if (new URL(route.request().url()).origin === base) return route.fallback();
+      blocked.push("external request blocked"); return route.abort("blockedbyclient");
+    });
+    const idlePage = await idle.newPage();
+    idlePage.setDefaultTimeout(10000);
+    await idlePage.route("**/api/log", route => route.fulfill({ status: 204, body: "" }));
+    return { idle, idlePage, blocked };
+  }
+  async function advanceClock(seconds, options = {}) {
+    const response = await request.newContext().then(async api => {
+      try { return await api.post(base + "/__harness/clock", { data: { advance_seconds: seconds, ...options } }); }
+      finally { await api.dispose(); }
+    });
+    assert.equal(response.status(), 200);
+  }
+  async function booted(target) {
+    await target.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && !state.quoteSessionDashboardBusy);
+  }
+  async function onDashboard(target) {
+    await booted(target);
+    assert.equal(await target.evaluate(() => state.activeAppView), "dashboard");
+    assert.equal(await target.locator("#quoteDashboardPanel").evaluate(node => node.classList.contains("is-active")), true);
+  }
+  async function endedSignInPage(target) {
+    await target.waitForURL(base + "/login");
+    await target.getByRole("heading", { name: "Staff sign in", exact: true }).waitFor();
+    assert.equal(await target.locator("#authPageMessage").innerText(), ENDED_NOTE);
+  }
+  const idleQuotes = [{
+    session_id: "quote-idle-fixture", customer_summary: { customer_name: "Idle fixture" },
+    created_by: "alpha-admin" + "@" + "example.test", dashboard_summary_only: true,
+    exports: { xlsx: { exists: true, url: "/api/quote-sessions/quote-idle-fixture/exports/quotation.xlsx" } },
+  }];
+  {
+    const { idle, idlePage, blocked } = await idleContext();
+    await idlePage.route("**/api/quote-sessions", route => route.request().method() === "GET"
+      ? route.fulfill({ json: { quote_sessions: idleQuotes } }) : route.fallback());
+    await signIn(idlePage, base);
+    await onDashboard(idlePage);
+    const loginCookie = (await idle.cookies()).find(cookie => cookie.name === "swooshz_quote_session");
+    assert.ok(loginCookie && loginCookie.httpOnly && loginCookie.sameSite === "Lax" && loginCookie.path === "/");
+    assert.ok(loginCookie.expires - Date.now() / 1000 > 4 * 24 * HOUR - 120, "Cookie lasts the 3-day idle limit plus one day");
+    // E2: used every 48 h, the session never ends.
+    for (const step of [1, 2]) {
+      await advanceClock(48 * HOUR);
+      const reloaded = await idlePage.reload();
+      assert.equal(reloaded.status(), 200, "Signed out after " + (48 * step) + " h of regular use");
+      await onDashboard(idlePage);
+    }
+    // E4: a refresh in the same session keeps the open quote screen.
+    await idlePage.evaluate(() => {
+      clearQuoteSessionDraftSaveTimer();
+      state.quoteSessionId = "quote-idle-refresh";
+      setInputValue(elements.clientName, "Synthetic refresh customer");
+      showQuoteFlow();
+      saveSessionState();
+    });
+    await idlePage.reload();
+    await booted(idlePage);
+    assert.equal(await idlePage.evaluate(() => state.activeAppView), "quote");
+    assert.equal(await idlePage.locator("#clientName").inputValue(), "Synthetic refresh customer");
+    await idlePage.evaluate(() => { clearSessionState(); resetCurrentQuoteDraftState(); showDashboard({ load: false }); saveSessionState(); });
+    await idlePage.reload();
+    await onDashboard(idlePage);
+    // E5: an expired session never starts a dashboard download.
+    await idlePage.locator(".dashboard-session-card").filter({ hasText: "Idle fixture" }).click();
+    const exportLink = idlePage.locator("#dashboardSidePanel a.dashboard-export-link").first();
+    await exportLink.waitFor();
+    await advanceClock(72 * HOUR + 1);
+    let downloads = 0;
+    idlePage.on("download", () => { downloads++; });
+    await exportLink.click({ noWaitAfter: true });
+    await endedSignInPage(idlePage);
+    assert.equal(downloads, 0);
+    // E8: after signing in again the Dashboard opens.
+    await signIn(idlePage, base);
+    await onDashboard(idlePage);
+    // E1: Delete after 3 days idle goes to sign-in; nothing is deleted.
+    await advanceClock(72 * HOUR + 1);
+    const deletes = [];
+    idlePage.on("response", response => { if (response.request().method() === "DELETE") deletes.push(response.status()); });
+    await idlePage.evaluate(() => requestQuoteSessionDelete("quote-idle-fixture"));
+    await idlePage.locator("#confirmQuoteSessionDeleteButton").click({ noWaitAfter: true });
+    await endedSignInPage(idlePage);
+    assert.deepEqual(deletes, [401]);
+    await signIn(idlePage, base);
+    await onDashboard(idlePage);
+    await idlePage.locator(".dashboard-session-card").filter({ hasText: "Idle fixture" }).waitFor();
+    // E7: Sign out after the session already ended finishes signing out.
+    await advanceClock(72 * HOUR + 1);
+    const signOut = idlePage.waitForResponse(r => r.url() === base + "/logout" && r.request().method() === "POST");
+    await idlePage.locator("#topbarLogoutLink").click();
+    assert.equal((await signOut).status(), 401);
+    await idlePage.waitForURL(base + "/signed-out");
+    assert.deepEqual(blocked, []);
+    await idle.close();
+  }
+  {
+    // E3: unsaved work in an open quote survives the ended session and comes
+    // back when that quote is opened from the Dashboard after signing in.
+    // The harness server stores the quote for real (synthetic file storage).
+    const { idle, idlePage, blocked } = await idleContext();
+    await signIn(idlePage, base);
+    await onDashboard(idlePage);
+    const quoteId = await idlePage.evaluate(() => {
+      clearQuoteSessionDraftSaveTimer();
+      state.pricingDraftVersion = "create";
+      state.quoteSessionDraftSaveStarted = true;
+      state.images = [{ name: "synthetic-booth.png", type: "image/png", data_url: "data:image/png;base64,AQID" }];
+      setInputValue(elements.clientName, "Synthetic unsaved customer");
+      showQuoteFlow();
+      const id = ensureClientQuoteSessionId();
+      saveSessionState();
+      return id;
+    });
+    await advanceClock(72 * HOUR + 1);
+    const rejectedSave = idlePage.waitForResponse(r => r.url() === base + "/api/quote-sessions" && r.request().method() === "POST");
+    await idlePage.locator("#topbarBrandButton").click({ noWaitAfter: true });
+    assert.equal((await rejectedSave).status(), 401);
+    await endedSignInPage(idlePage);
+    const savedAfterSignIn = idlePage.waitForResponse(r => r.url() === base + "/api/quote-sessions" && r.request().method() === "POST");
+    await signIn(idlePage, base);
+    assert.equal((await savedAfterSignIn).status(), 200, "The recovered draft is saved before the Dashboard opens");
+    await onDashboard(idlePage);
+    await idlePage.evaluate(id => { clearSessionState(); resetCurrentQuoteDraftState(); return id; }, quoteId);
+    assert.equal(await idlePage.evaluate(id => modifyDashboardQuote(id), quoteId), true);
+    assert.equal(await idlePage.evaluate(() => state.activeAppView), "quote");
+    assert.equal(await idlePage.locator("#clientName").inputValue(), "Synthetic unsaved customer");
+    assert.deepEqual(blocked, []);
+    await idle.close();
+  }
+  {
+    // E6: raw staff actions and generate go to sign-in on a 401 without
+    // showing their own failure first.
+    const actions = [
+      ["profile delete", "**/api/settings/profiles/**", page => page.evaluate(() => {
+        state.companyProfiles = [{ id: "profile-idle", name: "Idle profile", source: "company", revision: 1 }];
+        state.profileDeleteConfirmId = "profile-idle";
+        return deleteSelectedPreset();
+      })],
+      ["pricing reference delete", "**/api/settings/pricing-references/**", page => page.evaluate(() => {
+        state.pricingReferences = [{ id: "reference-idle", source: "company", label: "Idle reference" }];
+        return deleteRepoPricingReference("reference-idle", "company");
+      })],
+      ["profile export", "**/api/settings/profiles/**", page => page.evaluate(() => fetchCompanyProfileExport("profile-idle"))],
+      ["feedback context", "**/api/feedback/context**", page => page.evaluate(() => loadFeedbackContext())],
+      ["generate", "**/api/jobs", page => page.evaluate(() => {
+        state.basisConfirmed = true;
+        state.lineItems = [{ description: "Synthetic item", quantity: 1, unit: "lot", unit_price: 1 }];
+        missingDetailFields = () => [];
+        ensureQuoteSession = async () => "quote-idle-generate";
+        return handleGenerate();
+      })],
+    ];
+    for (const [label, pattern, act] of actions) {
+      const { idle, idlePage, blocked } = await idleContext();
+      await idlePage.route("**/api/quote-sessions", route => route.fulfill({ json: { quote_sessions: [] } }));
+      await signIn(idlePage, base);
+      await onDashboard(idlePage);
+      await idlePage.route(pattern, route => route.fulfill({ status: 401, json: { status: "auth_required", login_url: "/login" } }));
+      const failures = [];
+      await idlePage.exposeFunction("recordVisibleFailure", text => failures.push(text));
+      await idlePage.evaluate(() => new MutationObserver(() => {
+        const text = elements.messageList.textContent.trim();
+        if (text) window.recordVisibleFailure(text);
+      }).observe(elements.messageList, { childList: true, subtree: true }));
+      const outcome = act(idlePage).then(value => ({ value }), error => ({ error: String(error).slice(0, 300) }));
+      await idlePage.waitForURL(base + "/login").catch(async error => {
+        throw new Error(label + " did not reach sign-in: " + JSON.stringify(await Promise.race([outcome, Promise.resolve("pending")])) + " " + error.message.split(String.fromCharCode(10))[0]);
+      });
+      assert.deepEqual(failures, [], label + " showed a failure before sign-in");
+      assert.deepEqual(blocked, []);
+      await idle.close();
+    }
+  }
   console.log(JSON.stringify({status:"passed",browser:channel||"chromium",real_provider_calls:0}));
 } finally {
   if(browser) await browser.close();
