@@ -143,8 +143,9 @@ class OwnerUatContractTest(unittest.TestCase):
         total_row = quote.parse_cell_ref(find_cell_ref(sheet, 'Total'))[0]
         self.assertEqual(float(cell_value(sheet, f'E{total_row}')), 4.15)
         ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        # The red exclusions block (#363) prints 5 rows before the terms.
         self.assertEqual([n.text for n in workbook.findall('.//s:definedName', ns)
-                          if n.get('name') == '_xlnm.Print_Area'], ['Quotation!$A$1:$I$47'])
+                          if n.get('name') == '_xlnm.Print_Area'], ['Quotation!$A$1:$I$52'])
         (target.parent / 'fxui-line-first-proof.json').write_text(json.dumps({
             'bytes': target.stat().st_size, 'sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
             'referencePrice': 1.01, 'quantity': 3, 'fx': 1.37, 'approvedAmount': 4.15}), encoding='utf-8')

@@ -246,6 +246,16 @@ class QuoteLine:
     source_basis_line_id: str = ""
 
 
+# Printed in red on every new quotation, below the totals and before Terms & Conditions (#363).
+QUOTE_EXCLUSIONS_HEADING = "The above quote excludes:"
+QUOTE_EXCLUSIONS = (
+    "Organiser Admin Fees",
+    "Power sockets which can be directly ordered with connection fees with the organiser",
+    "Connection fees for electrical fittings",
+)
+QUOTE_EXCLUSIONS_COLOR = "FFFF0000"
+
+
 @dataclass(frozen=True)
 class LayoutChunk:
     name: str
@@ -1568,6 +1578,7 @@ def append_ooxml_text_run(
     underline: bool = False,
     font_name: str | None = None,
     font_size: str | None = None,
+    color: str | None = None,
 ) -> None:
     run = ET.SubElement(inline, f"{NS_MAIN}r")
     run_props = ET.SubElement(run, f"{NS_MAIN}rPr")
@@ -1577,6 +1588,8 @@ def append_ooxml_text_run(
     ET.SubElement(run_props, f"{NS_MAIN}b").attrib["val"] = "1" if bold else "0"
     if italic:
         ET.SubElement(run_props, f"{NS_MAIN}i")
+    if color:
+        ET.SubElement(run_props, f"{NS_MAIN}color", {"rgb": color})
     if font_size:
         ET.SubElement(run_props, f"{NS_MAIN}sz", {"val": font_size})
     if underline:
@@ -1617,6 +1630,7 @@ def set_ooxml_rich_text_cell(
     *,
     font_name: str | None = None,
     font_size: str | None = None,
+    color: str | None = None,
 ) -> None:
     sheet_data = root.find(f"{NS_MAIN}sheetData")
     if sheet_data is None:
@@ -1639,6 +1653,7 @@ def set_ooxml_rich_text_cell(
             underline=run.underline,
             font_name=font_name,
             font_size=font_size,
+            color=color,
         )
 
 
@@ -2004,6 +2019,7 @@ def ensure_font_for_style(
     *,
     font_name: str | None = None,
     font_size: str | None = None,
+    color: str | None = None,
 ) -> str:
     cell_xfs = styles_root.find(f"{NS_MAIN}cellXfs")
     fonts = styles_root.find(f"{NS_MAIN}fonts")
@@ -2012,6 +2028,8 @@ def ensure_font_for_style(
 
     base_font_id = int(cell_xfs[int(base_style)].attrib.get("fontId", "0"))
     font = copy.deepcopy(fonts[base_font_id])
+    if color is not None:
+        set_font_color(font, color)
     if font_name is not None:
         name = font.find(f"{NS_MAIN}name")
         if name is None:
@@ -2027,6 +2045,19 @@ def ensure_font_for_style(
     return str(len(fonts) - 1)
 
 
+def set_font_color(font: ET.Element, color: str) -> None:
+    """Give a cloned font an explicit RGB colour, kept in the schema's child order."""
+    for child in font.findall(f"{NS_MAIN}color"):
+        font.remove(child)
+    element = ET.Element(f"{NS_MAIN}color", {"rgb": color})
+    later = (f"{NS_MAIN}name", f"{NS_MAIN}family", f"{NS_MAIN}charset", f"{NS_MAIN}scheme")
+    for index, child in enumerate(list(font)):
+        if child.tag in later:
+            font.insert(index, element)
+            return
+    font.append(element)
+
+
 def add_quote_layout_styles(parts: dict[str, bytes]) -> dict[str, str]:
     styles_root = ET.fromstring(parts["xl/styles.xml"])
     total_border = append_border(styles_root, top="thin")
@@ -2036,6 +2067,8 @@ def add_quote_layout_styles(parts: dict[str, bytes]) -> dict[str, str]:
     small_heading_font = ensure_font_for_style(styles_root, "37")
     small_number_font = ensure_font_for_style(styles_root, "40")
     small_body_font = ensure_font_for_style(styles_root, "41")
+    exclusions_heading_font = ensure_font_for_style(styles_root, "37", color=QUOTE_EXCLUSIONS_COLOR)
+    exclusions_body_font = ensure_font_for_style(styles_root, "41", color=QUOTE_EXCLUSIONS_COLOR)
     signature_text_font = ensure_font_for_style(styles_root, "2")
     signature_line_font = ensure_font_for_style(styles_root, "33")
     client_name_font = ensure_font_for_style(styles_root, "12")
@@ -2066,6 +2099,8 @@ def add_quote_layout_styles(parts: dict[str, bytes]) -> dict[str, str]:
         "terms_heading": clone_cell_style(styles_root, "37", font_id=small_heading_font, wrap_text=True),
         "terms_number": clone_cell_style(styles_root, "40", font_id=small_number_font),
         "terms_body": clone_cell_style(styles_root, "41", font_id=small_body_font, wrap_text=True),
+        "exclusions_heading": clone_cell_style(styles_root, "37", font_id=exclusions_heading_font, wrap_text=True),
+        "exclusions_body": clone_cell_style(styles_root, "41", font_id=exclusions_body_font, wrap_text=True),
         "signature_text": clone_cell_style(styles_root, "2", font_id=signature_text_font),
         "signature_line": clone_cell_style(styles_root, "33", font_id=signature_line_font),
     }
@@ -3251,6 +3286,7 @@ def write_optional_text_block(
     admission_height: int | None = None,
     font_name: str | None = None,
     font_size: str | None = None,
+    color: str | None = None,
 ) -> tuple[int, int, bool]:
     lines = wrap_rich_text_runs(runs)
     if not lines:
@@ -3273,7 +3309,7 @@ def write_optional_text_block(
             set_ooxml_cell(root, row_number, 1, f"{number:.2f}", number_style)
         set_ooxml_rich_text_cell(
             root, row_number, text_column, line_runs, style,
-            font_name=font_name, font_size=font_size,
+            font_name=font_name, font_size=font_size, color=color,
         )
         ensure_merge_ref(root, f"{merge_start_column}{row_number}:I{row_number}")
         last_row = row_number
@@ -3694,11 +3730,43 @@ def write_quote_layout_xlsx(layout_template: Path, path: Path, brief: dict[str, 
     signature = brief.get("signature") if isinstance(brief.get("signature"), dict) else {}
     optional_text_fonts = {
         name: ooxml_style_text_font(parts, layout_styles[name])
-        for name in ("terms_heading", "terms_body")
+        for name in ("terms_heading", "terms_body", "exclusions_heading", "exclusions_body")
     }
     next_text_row = grand_row + 3
     last_optional_row = 0
     optional_text_moved = False
+
+    # Every quotation states its exclusions in red below the totals, before Terms & Conditions.
+    exclusion_heading_runs = [RichTextRun(QUOTE_EXCLUSIONS_HEADING)]
+    exclusion_runs = [[RichTextRun(text)] for text in QUOTE_EXCLUSIONS]
+    exclusions_height = len(wrap_rich_text_runs(exclusion_heading_runs)) + sum(
+        len(wrap_rich_text_runs(runs)) for runs in exclusion_runs
+    )
+    next_text_row, last_optional_row, moved = write_optional_text_block(
+        root,
+        next_text_row,
+        exclusion_heading_runs,
+        name="exclusions_heading",
+        text_column=1,
+        style=layout_styles["exclusions_heading"],
+        admission_height=exclusions_height,
+        color=QUOTE_EXCLUSIONS_COLOR,
+        **optional_text_fonts["exclusions_heading"],
+    )
+    optional_text_moved = optional_text_moved or moved
+    for runs in exclusion_runs:
+        next_text_row, last_optional_row, moved = write_optional_text_block(
+            root,
+            next_text_row,
+            runs,
+            name="exclusion",
+            text_column=2,
+            style=layout_styles["exclusions_body"],
+            color=QUOTE_EXCLUSIONS_COLOR,
+            **optional_text_fonts["exclusions_body"],
+        )
+        optional_text_moved = optional_text_moved or moved
+    next_text_row = last_optional_row + 2
 
     terms_heading = clean_text(brief.get("terms_heading"))
     payment_terms = brief.get("payment_terms") or []

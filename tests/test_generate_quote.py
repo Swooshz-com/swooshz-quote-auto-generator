@@ -555,9 +555,21 @@ def edge_marked_logo_data_url():
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def logo_edge_bbox(image, edge):
+def logo_edge_bbox(image, edge, near=None):
+    """Bounding box of one logo edge marker; `near` limits the search to the drawn logo's pixel box.
+
+    The quotation itself prints red text (the exclusions), so a whole-page search for the red
+    left-edge marker would also find that text.
+    """
     color = LOGO_EDGE_COLORS[edge]
-    return raster_bbox(image, lambda pixel: all(abs(pixel[i] - color[i]) < 30 for i in range(3)))
+    matches = lambda pixel: all(abs(pixel[i] - color[i]) < 30 for i in range(3))
+    if near is None:
+        return raster_bbox(image, matches)
+    margin = 8
+    left, top = max(0, int(near[0]) - margin), max(0, int(near[1]) - margin)
+    right, bottom = min(image.width, int(near[2]) + margin + 1), min(image.height, int(near[3]) + margin + 1)
+    found = raster_bbox(image.crop((left, top, right, bottom)), matches)
+    return None if found is None else (found[0] + left, found[1] + top, found[2] + left, found[3] + top)
 
 
 def header_fidelity_case():
@@ -644,7 +656,8 @@ def long_optional_text_pagination_case():
 
 def optional_text_capacity_case(entry_kind, row_count):
     brief, lines = header_fidelity_case()
-    lines = lines[:14]
+    # Room on page 1 for the totals and the red exclusions block, so the text starts a fresh page.
+    lines = lines[:11]
     for line in lines:
         line.section = "Capacity Boundary"
     row_texts = ["BOLDITALICUNDERLINE" + "x" * (quote.OPTIONAL_TEXT_LINE_MAX_WIDTH_EM - 19)]
@@ -1236,8 +1249,9 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(page_setup.attrib.get("orientation"), "portrait")
         self.assertEqual(page_margins.attrib.get("top"), "0.74803149606299213")
         self.assertEqual(header_footer.attrib.get("alignWithMargins"), "0")
-        self.assertEqual(counts["cellXfs"], 123)
-        self.assertEqual(counts["fonts"], 37)
+        # Two red cell styles and fonts for the exclusions block.
+        self.assertEqual(counts["cellXfs"], 125)
+        self.assertEqual(counts["fonts"], 39)
         self.assertEqual(counts["numFmts"], 8)
         self.assertGreaterEqual(last_row, 40)
         self.assertEqual(
@@ -1328,8 +1342,10 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(cell_value(sheet, "D27"), "Total")
         self.assertEqual(cell_value(sheet, "D28"), "GST 9%")
         self.assertEqual(cell_value(sheet, "D29"), "Total including GST")
-        self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
-        self.assertEqual(cell_value(sheet, "B39"), "Director")
+        self.assertEqual(cell_value(sheet, "A32"), quote.QUOTE_EXCLUSIONS_HEADING)
+        self.assertEqual([cell_value(sheet, f"B{row}") for row in (33, 34, 35)], list(quote.QUOTE_EXCLUSIONS))
+        self.assertEqual(cell_value(sheet, "B38"), "Koncept Image Pte Ltd")
+        self.assertEqual(cell_value(sheet, "B45"), "Director")
 
     def test_generated_workbook_preserves_template_style_fonts(self):
         tmp, path = generate_layout_workbook()
@@ -2490,7 +2506,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                         }
                         edges = {}
                         for edge, expected in expected_edges.items():
-                            actual = logo_edge_bbox(image, edge)
+                            actual = logo_edge_bbox(image, edge, near=full)
                             self.assertIsNotNone(actual, f"page {index + 1}: {edge} edge is missing")
                             for measured, intended in zip(actual, expected):
                                 self.assertAlmostEqual(measured, intended, delta=2, msg=f"page {index + 1}: {edge}")
@@ -3317,16 +3333,16 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         row_breaks = sheet.find(f"{NS_MAIN}rowBreaks")
         sheet_view = sheet.find(f"{NS_MAIN}sheetViews/{NS_MAIN}sheetView")
 
-        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), "Quotation!$A$1:$I$41")
-        self.assertEqual(dimension.attrib.get("ref"), "A1:I41")
+        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), "Quotation!$A$1:$I$47")
+        self.assertEqual(dimension.attrib.get("ref"), "A1:I47")
         self.assertIsNone(row_breaks)
         self.assertNotEqual(sheet_view.attrib.get("view"), "pageBreakPreview")
-        self.assertEqual(cell_value(sheet, "B39"), "Director")
-        self.assertEqual(cell_value(sheet, "B41"), "")
+        self.assertEqual(cell_value(sheet, "B45"), "Director")
+        self.assertEqual(cell_value(sheet, "B47"), "")
         self.assertFalse([
             item.attrib.get("r")
             for item in sheet.iter(f"{NS_MAIN}c")
-            if quote.parse_cell_ref(item.attrib.get("r", "A1"))[0] > 41 and quote.parse_cell_ref(item.attrib.get("r", "A1"))[1] <= 9
+            if quote.parse_cell_ref(item.attrib.get("r", "A1"))[0] > 47 and quote.parse_cell_ref(item.attrib.get("r", "A1"))[1] <= 9
         ])
 
     def test_layout_print_area_trims_trailing_blank_manual_page(self):
@@ -3484,6 +3500,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
 
     def test_run016_optional_text_is_wrapped_and_admitted_to_manual_pages(self):
         brief, lines = run016_optional_text_pagination_case()
+        # One table line fewer leaves room for the red exclusions block, so the notes still straddle row 116.
+        del lines[-2]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "quotation.xlsx"
             quote.write_quote_layout_xlsx(KONCEPT_LAYOUT, path, brief, lines)
@@ -3500,10 +3518,12 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertTrue(no_trailing_blank_print_page(sheet, workbook))
 
         grand_row = quote.parse_cell_ref(find_cell_ref(sheet, "Total including GST"))[0]
-        legacy_heading_row = grand_row + 3
+        exclusion_rows = [quote.parse_cell_ref(find_cell_ref(sheet, text))[0] for text in quote.QUOTE_EXCLUSIONS]
+        self.assertEqual(quote.parse_cell_ref(find_cell_ref(sheet, quote.QUOTE_EXCLUSIONS_HEADING))[0], grand_row + 3)
+        legacy_heading_row = exclusion_rows[-1] + 2
         legacy_first_note_row = legacy_heading_row + 1
         legacy_last_note_row = legacy_first_note_row + len(brief["standard_notes"]) - 1
-        self.assertEqual((legacy_first_note_row, legacy_last_note_row), (114, 123))
+        self.assertEqual((legacy_first_note_row, legacy_last_note_row), (115, 124))
         self.assertEqual(quote.manual_page_end_for_row(legacy_first_note_row), 116)
         self.assertLessEqual(legacy_first_note_row, 116)
         self.assertGreater(legacy_last_note_row, 116)
@@ -4349,7 +4369,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertGreater(last_item_row, 91)
         self.assertGreater(total_row, last_item_row)
         self.assertEqual(cell_value(sheet, f"F{total_row}"), "SGD")
-        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), f"Quotation!$A$1:$I${total_row + 13}")
+        self.assertEqual(defined_name_text(workbook, "_xlnm.Print_Area"), f"Quotation!$A$1:$I${total_row + 19}")
         self.assertEqual(
             row_break_ids(sheet)[:2],
             [
@@ -4658,7 +4678,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                 match_status="matched",
                 match_candidates=[],
             )
-            for index in range(1, 5)
+            # Two rows leave the red exclusions block, terms, note and signature room on page 1.
+            for index in range(1, 3)
         ]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "quotation.xlsx"
@@ -4786,8 +4807,8 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             find_cell_ref(sheet, "The above contract does not include application fees to any relevant authorities and electrical connection fees."),
             "",
         )
-        self.assertEqual(cell_value(sheet, "B32"), "Koncept Image Pte Ltd")
-        self.assertEqual(cell_value(sheet, "E32") + cell_value(sheet, "E33"), "We accept the quotation amount and the terms")
+        self.assertEqual(cell_value(sheet, "B38"), "Koncept Image Pte Ltd")
+        self.assertEqual(cell_value(sheet, "E38") + cell_value(sheet, "E39"), "We accept the quotation amount and the terms")
 
     def test_company_detail_drawing_preserves_template_geometry_and_top_alignment(self):
         tmp, path = generate_layout_workbook()
@@ -5011,13 +5032,13 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
             styles = ET.fromstring(zf.read("xl/styles.xml"))
 
-        self.assertEqual(cell_value(sheet, "A33"), "1.00")
-        self.assertEqual(cell_value(sheet, "A34"), "2.00")
-        self.assertEqual(cell_value(sheet, "B33"), explicit_notes[0])
-        self.assertIsNone(font_for_style(styles, cell_style(sheet, "A33")).find(f"{NS_MAIN}i"))
-        self.assertIsNone(font_for_style(styles, cell_style(sheet, "A34")).find(f"{NS_MAIN}i"))
-        self.assertEqual(cell_value(sheet, "E35"), "")
-        self.assertEqual(cell_value(sheet, "E37") + cell_value(sheet, "E38"), "We accept the quotation amount and the terms")
+        self.assertEqual(cell_value(sheet, "A38"), "1.00")
+        self.assertEqual(cell_value(sheet, "A39"), "2.00")
+        self.assertEqual(cell_value(sheet, "B38"), explicit_notes[0])
+        self.assertIsNone(font_for_style(styles, cell_style(sheet, "A38")).find(f"{NS_MAIN}i"))
+        self.assertIsNone(font_for_style(styles, cell_style(sheet, "A39")).find(f"{NS_MAIN}i"))
+        self.assertEqual(cell_value(sheet, "E40"), "")
+        self.assertEqual(cell_value(sheet, "E42") + cell_value(sheet, "E43"), "We accept the quotation amount and the terms")
 
     def test_brief_can_override_terms_notes_and_company_text(self):
         tmp = tempfile.TemporaryDirectory()
@@ -5070,9 +5091,9 @@ class GenerateQuoteRowsTest(unittest.TestCase):
             drawing_rels = zf.read("xl/drawings/_rels/drawing1.xml.rels").decode("utf-8")
             media_names = set(zf.namelist())
 
-        self.assertEqual(find_cell_ref(sheet, "Commercial Terms"), "A32")
-        self.assertEqual(find_cell_ref(sheet, "50% deposit"), "B33")
-        self.assertEqual(find_cell_ref(sheet, "Warranty excluded"), "B35")
+        self.assertEqual(find_cell_ref(sheet, "Commercial Terms"), "A37")
+        self.assertEqual(find_cell_ref(sheet, "50% deposit"), "B38")
+        self.assertEqual(find_cell_ref(sheet, "Warranty excluded"), "B40")
         notes_heading_row = quote.parse_cell_ref(find_cell_ref(sheet, "Editable Notes"))[0]
         cheque_start_row = next(
             quote.parse_cell_ref(cell_node.attrib["r"])[0]
@@ -5299,7 +5320,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
         self.assertEqual(cell_inline_runs(sheet, "A16"), [("04 June 2026", True, True, True)])
         self.assertEqual(cell_inline_runs(sheet, find_cell_ref(sheet, "Commercial Terms")), [("Commercial Terms", True, False, False)])
         self.assertEqual(
-            cell_inline_runs(sheet, "B33"),
+            cell_inline_runs(sheet, "B38"),
             [
                 ("50%", True, False, False),
                 (" ", False, False, False),
@@ -5953,19 +5974,19 @@ class AcceptanceSignatureLayoutTest(unittest.TestCase):
         for sheet in (plain, rich):
             values = [(row, value) for row, value in self.column_values(sheet, "E") if value in expected]
             self.assertEqual([value for _, value in values], expected)
-            self.assertEqual([row for row, _ in values], [32, 33, 34])
-            self.assertEqual(find_cell_ref(sheet, "Synthetic signer"), "B39")
-            self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E39")
-        self.assertTrue(cell_inline_runs(rich, "E33")[0][1])
-        self.assertTrue(cell_inline_runs(rich, "E34")[0][2])
+            self.assertEqual([row for row, _ in values], [38, 39, 40])
+            self.assertEqual(find_cell_ref(sheet, "Synthetic signer"), "B45")
+            self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E45")
+        self.assertTrue(cell_inline_runs(rich, "E39")[0][1])
+        self.assertTrue(cell_inline_runs(rich, "E40")[0][2])
 
     def test_acceptance_short_single_line_keeps_original_signature_offsets(self):
         _, sheet, _ = self.workbook("Short acceptance")
-        self.assertEqual(find_cell_ref(sheet, "Short acceptance"), "E32")
-        self.assertEqual(find_cell_ref(sheet, "_____________________________________"), "E36")
-        self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E37")
-        self.assertEqual(find_cell_ref(sheet, "Synthetic stamp"), "E38")
-        self.assertEqual(find_cell_refs(sheet, "Synthetic date"), ["B39", "E39"])
+        self.assertEqual(find_cell_ref(sheet, "Short acceptance"), "E38")
+        self.assertEqual(find_cell_ref(sheet, "_____________________________________"), "E42")
+        self.assertEqual(find_cell_ref(sheet, "Synthetic person"), "E43")
+        self.assertEqual(find_cell_ref(sheet, "Synthetic stamp"), "E44")
+        self.assertEqual(find_cell_refs(sheet, "Synthetic date"), ["B45", "E45"])
 
     def test_acceptance_wrap_boundaries_keep_combining_runs_and_literal_prefixes(self):
         for count, expected_lines in ((1, 1), (2, 1), (3, 2)):
@@ -6021,7 +6042,7 @@ class AcceptanceSignatureLayoutTest(unittest.TestCase):
         found = [(row, value) for row, value in self.column_values(sheet, "E")
                  if value.startswith("Acceptance line ")]
         self.assertEqual([value for _, value in found], expected)
-        self.assertEqual(found[0][0], 32, "Oversized block must use available first-page body.")
+        self.assertEqual(found[0][0], 38, "Oversized block must use available first-page body.")
         self.assertIn(55, [row for row, _ in found])
         for row, _ in found:
             start = quote.continuation_page_start_for_row(row)
