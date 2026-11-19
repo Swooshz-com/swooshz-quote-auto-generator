@@ -166,10 +166,14 @@ class QuoteExclusionsPdfTest(unittest.TestCase):
                 for x in range(int(left * scale), int(right * scale))
                 for y in range(int((height - top) * scale), int((height - bottom) * scale))
             ]
-            dark = [pixel for pixel in ink if min(pixel) < 200]
-            self.assertTrue(dark, phrase)
-            red = [pixel for pixel in dark if pixel[0] > 150 and pixel[1] < 120 and pixel[2] < 120]
-            self.assertGreater(len(red) / len(dark), 0.6, phrase)
+            # Text ink is every pixel off white. Red text and its anti-aliased edges blend red with
+            # white, so they stay red-dominant; black or grey text would be neutral.
+            ink = [pixel for pixel in ink if min(pixel) < 200]
+            self.assertTrue(ink, phrase)
+            red = [pixel for pixel in ink if pixel[0] > 150 and pixel[0] - max(pixel[1], pixel[2]) > 60]
+            neutral = [pixel for pixel in ink if max(pixel) - min(pixel) < 40]
+            self.assertGreater(len(red) / len(ink), 0.75, phrase)
+            self.assertLess(len(neutral) / len(ink), 0.1, phrase)
 
 
 if __name__ == "__main__":

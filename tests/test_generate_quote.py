@@ -555,9 +555,21 @@ def edge_marked_logo_data_url():
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def logo_edge_bbox(image, edge):
+def logo_edge_bbox(image, edge, near=None):
+    """Bounding box of one logo edge marker; `near` limits the search to the drawn logo's pixel box.
+
+    The quotation itself prints red text (the exclusions), so a whole-page search for the red
+    left-edge marker would also find that text.
+    """
     color = LOGO_EDGE_COLORS[edge]
-    return raster_bbox(image, lambda pixel: all(abs(pixel[i] - color[i]) < 30 for i in range(3)))
+    matches = lambda pixel: all(abs(pixel[i] - color[i]) < 30 for i in range(3))
+    if near is None:
+        return raster_bbox(image, matches)
+    margin = 8
+    left, top = max(0, int(near[0]) - margin), max(0, int(near[1]) - margin)
+    right, bottom = min(image.width, int(near[2]) + margin + 1), min(image.height, int(near[3]) + margin + 1)
+    found = raster_bbox(image.crop((left, top, right, bottom)), matches)
+    return None if found is None else (found[0] + left, found[1] + top, found[2] + left, found[3] + top)
 
 
 def header_fidelity_case():
@@ -2494,7 +2506,7 @@ class GenerateQuoteRowsTest(unittest.TestCase):
                         }
                         edges = {}
                         for edge, expected in expected_edges.items():
-                            actual = logo_edge_bbox(image, edge)
+                            actual = logo_edge_bbox(image, edge, near=full)
                             self.assertIsNotNone(actual, f"page {index + 1}: {edge} edge is missing")
                             for measured, intended in zip(actual, expected):
                                 self.assertAlmostEqual(measured, intended, delta=2, msg=f"page {index + 1}: {edge}")
