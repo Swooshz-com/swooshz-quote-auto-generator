@@ -279,12 +279,21 @@ PDF_RENDER_TARGET_LONG_EDGE_PX = 1600
 MAX_AI_IMAGE_BYTES = MAX_RENDERED_PDF_PAGE_BYTES
 AI_IMAGE_LONG_EDGE_PX = PDF_RENDER_TARGET_LONG_EDGE_PX
 # Decompression-bomb guards on uploaded images, checked from the header before
-# any pixel decode. JPEG is draft-decoded near the AI size, so it keeps Pillow's
-# default MAX_IMAGE_PIXELS ceiling (pinned here so a library change cannot move
-# it). PNG and WebP always decode at full size, so they stop at 40 megapixels
-# (8K renders are 33.2 MP) to bound one decoded RGBA image to about 160 MiB.
+# any pixel decode. A baseline JPEG is draft-decoded near the AI size, so it
+# keeps Pillow's default MAX_IMAGE_PIXELS ceiling (pinned here so a library
+# change cannot move it). A progressive JPEG makes libjpeg hold every DCT
+# coefficient of the full image before any scaling (2 bytes per pixel per
+# stored channel), and PNG and WebP always decode at full size, so these stop
+# at 40 megapixels (8K renders are 33.2 MP).
 MAX_SOURCE_JPEG_PIXELS = 89_478_485
 MAX_SOURCE_LOSSLESS_PIXELS = 40_000_000
+# Low-detail catalogue pictures (pricing-reference visuals) keep their own
+# limits: 4K-axis inputs and fewer than 9 million pixels cover DCI 4K
+# pictures while bounding decoded RGB/RGBA buffers to about 26/35 MiB, well
+# below Pillow's library-wide decompression-bomb threshold.
+MAX_CATALOG_IMAGE_WIDTH = 4096
+MAX_CATALOG_IMAGE_HEIGHT = 4096
+MAX_CATALOG_IMAGE_PIXELS = 9_000_000 - 1
 PROMPT_IMAGE_PIL_FORMATS = ("JPEG", "PNG", "WEBP")
 PROMPT_IMAGE_PIL_FORMAT_BY_MIME = {
     "image/jpeg": "JPEG",
@@ -19540,8 +19549,15 @@ def image_mime_type_from_bytes(raw: bytes) -> str:
     return ""
 
 
-def prompt_image_dimensions_are_allowed(size: Any, image_format: str = "PNG") -> bool:
-    """Header-only decompression-bomb guard: JPEG up to MAX_SOURCE_JPEG_PIXELS, PNG/WebP up to MAX_SOURCE_LOSSLESS_PIXELS."""
+def prompt_image_dimensions_are_allowed(
+    size: Any, image_format: str = "PNG", *, progressive: bool = False, catalog: bool = False,
+) -> bool:
+    """Header-only decompression-bomb guard, checked before any pixel decode.
+
+    Uploads: baseline JPEG up to MAX_SOURCE_JPEG_PIXELS; progressive JPEG, PNG
+    and WebP up to MAX_SOURCE_LOSSLESS_PIXELS. catalog=True applies the
+    low-detail catalogue limits (MAX_CATALOG_IMAGE_*) to any format.
+    """
     try:
         width, height = size
     except (TypeError, ValueError):
@@ -19555,8 +19571,21 @@ def prompt_image_dimensions_are_allowed(size: Any, image_format: str = "PNG") ->
         or height <= 0
     ):
         return False
-    limit = MAX_SOURCE_JPEG_PIXELS if image_format == "JPEG" else MAX_SOURCE_LOSSLESS_PIXELS
+    if catalog:
+        if width > MAX_CATALOG_IMAGE_WIDTH or height > MAX_CATALOG_IMAGE_HEIGHT:
+            return False
+        limit = MAX_CATALOG_IMAGE_PIXELS
+    elif image_format == "JPEG" and not progressive:
+        limit = MAX_SOURCE_JPEG_PIXELS
+    else:
+        limit = MAX_SOURCE_LOSSLESS_PIXELS
     return width <= limit // height
+
+
+def image_is_progressive_jpeg(image: Any) -> bool:
+    """Pillow marks every progressive SOF (SOF2/6/10/14) in info at open, from the header."""
+    info = getattr(image, "info", None)
+    return getattr(image, "format", "") == "JPEG" and isinstance(info, dict) and bool(info.get("progressive"))
 
 
 class ReferenceImageError(ValueError):
@@ -19571,6 +19600,7 @@ EXIF_ORIENTATION_TAG = 0x0112
 
 
 def image_exif_orientation(image: Any) -> int:
+    """EXIF orientation of an already loaded image; malformed EXIF counts as upright."""
     try:
         value = image.getexif().get(EXIF_ORIENTATION_TAG)
     except Exception:
@@ -19667,20 +19697,25 @@ def ai_image_data_url_from_bytes(raw: bytes, *, verify: bool = True) -> str:
                 if clean_text(getattr(image, "format", "")).upper() != expected_format:
                     raise ReferenceImageError("invalid_media_format")
                 size = getattr(image, "size", None)
-                if not prompt_image_dimensions_are_allowed(size, expected_format):
+                if not prompt_image_dimensions_are_allowed(
+                    size, expected_format, progressive=image_is_progressive_jpeg(image),
+                ):
                     raise ReferenceImageError("media_dimension_limit")
                 if verify:
                     image.verify()
             with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
                 if image.format != expected_format or image.size != size:
                     raise ReferenceImageError("invalid_media_format")
+                target = ai_image_target_size(size, AI_IMAGE_LONG_EDGE_PX)
+                if expected_format == "JPEG" and target != size:
+                    image.draft(None, target)
+                # Decode before reading EXIF: PNG getexif() loads the pixels
+                # itself when no eXIf chunk precedes them, and a decode error
+                # swallowed there would leave a partly black image behind.
+                image.load()
                 orientation = image_exif_orientation(image)
                 if len(raw) <= MAX_AI_IMAGE_BYTES and max(size) <= AI_IMAGE_LONG_EDGE_PX and orientation == 1:
-                    image.load()
                     return f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}"
-                if expected_format == "JPEG":
-                    image.draft(None, ai_image_target_size(size, AI_IMAGE_LONG_EDGE_PX))
-                image.load()
                 data_url = prompt_image_data_url_from_pil(image, orientation)
     except ReferenceImageError:
         raise
@@ -25786,12 +25821,14 @@ def draft_request_invalid(stage: str = "request_envelope", reason: str = "invali
 def validate_draft_media(
     data_url: Any, max_bytes: int | None = None, *, stage: str = "reference_media",
     max_long_edge: int | None = None, upload: bool = False, header_only: bool = False,
+    catalog: bool = False,
 ) -> str:
     """Validate in memory; never retain supplied media or parser errors.
 
     upload=True is for uploaded reference images: the full decode happens once,
     in the normaliser that makes the AI copy (cached by content hash).
     header_only=True stops after the format and pixel-guard header checks.
+    catalog=True applies the low-detail catalogue pixel limits.
     """
     if not isinstance(data_url, str):
         draft_request_invalid(stage, "invalid_media_format")
@@ -25863,7 +25900,9 @@ def validate_draft_media(
                     with Image.open(io.BytesIO(raw), formats=PROMPT_IMAGE_PIL_FORMATS) as image:
                         if image.format != image_format:
                             draft_request_invalid(stage, "invalid_media_format")
-                        if not prompt_image_dimensions_are_allowed(image.size, image_format):
+                        if not prompt_image_dimensions_are_allowed(
+                            image.size, image_format, progressive=image_is_progressive_jpeg(image), catalog=catalog,
+                        ):
                             draft_request_invalid(stage, "media_dimension_limit")
                         if max_long_edge is not None and max(image.size) > max_long_edge:
                             draft_request_invalid(stage, "media_dimension_limit")
@@ -25962,7 +26001,10 @@ def validate_draft_responses_envelope(
                 draft_request_invalid()
             # High detail is only ever an AI copy (rendered PDF page or normalised
             # upload), never an original: fail closed before the provider call.
-            mime = (validate_draft_media(part["image_url"], MAX_PRICING_REFERENCE_VISUAL_BYTES)
+            # Low detail is only a catalogue picture, fully decoded once at the
+            # catalog_media stage of this draft; here its header is rechecked.
+            mime = (validate_draft_media(part["image_url"], MAX_PRICING_REFERENCE_VISUAL_BYTES,
+                                         catalog=True, header_only=True)
                     if part["detail"] == "low" else
                     validate_draft_media(part["image_url"], MAX_AI_IMAGE_BYTES, max_long_edge=AI_IMAGE_LONG_EDGE_PX))
             if not mime.startswith("image/"):
@@ -26018,7 +26060,7 @@ def draft_limit_message(reason: str) -> str:
 
 
 REFERENCE_IMAGE_DIMENSION_MESSAGE = (
-    "This image is too large to read (over 89 megapixels for JPG, or 40 megapixels for PNG and WebP). "
+    "This image is too large to read (over 89 megapixels for JPG, or 40 megapixels for progressive JPG, PNG and WebP). "
     "Export a smaller copy and try again."
 )
 
@@ -26579,7 +26621,7 @@ def request_openai_quote_basis(
         draft_request_invalid("catalog_media")
     for image in catalog_visuals:
         if not isinstance(image, dict) or validate_draft_media(
-            image.get("data_url"), MAX_PRICING_REFERENCE_VISUAL_BYTES, stage="catalog_media",
+            image.get("data_url"), MAX_PRICING_REFERENCE_VISUAL_BYTES, stage="catalog_media", catalog=True,
         ) == "application/pdf":
             draft_request_invalid("catalog_media", "invalid_media_format")
     catalog_visual_prompt = catalog_visual_prompt_text(catalog_visuals)

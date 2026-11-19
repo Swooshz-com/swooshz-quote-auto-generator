@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 import zlib
 
-from PIL import Image, ImageOps, features
+from PIL import Image, ImageFile, ImageOps, features
 
 from tests import test_openai_draft_request_contract as draft_contract
 from tests.test_pdf_reference_limits import padded_pdf
@@ -84,6 +84,36 @@ def compressible_png(width, height, *, alpha=False):
     compressed.extend(compressor.flush())
     header = struct.pack(">IIBBBBB", width, height, 8, 6 if alpha else 2, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", bytes(compressed)) + chunk(b"IEND", b"")
+
+
+def gradient_image(width, height, mode="RGB"):
+    """A smooth multi-channel render-like picture that compresses well at any size."""
+    g = Image.linear_gradient("L").resize((width, height))
+    bands = (g, g.transpose(Image.Transpose.FLIP_LEFT_RIGHT), g.transpose(Image.Transpose.FLIP_TOP_BOTTOM),
+             g.transpose(Image.Transpose.ROTATE_180))
+    return g if mode == "L" else Image.merge(mode, bands[:len(mode)])
+
+
+def png_with_broken_deflate(image):
+    """A real PNG whose compressed pixel data is damaged mid-stream while every chunk CRC stays valid."""
+    def chunk(kind, payload):
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+    raw = png_bytes(image)
+    pos, before, idat, after = 8, [], bytearray(), []
+    while pos < len(raw):
+        (length,) = struct.unpack(">I", raw[pos:pos + 4])
+        kind, payload = raw[pos + 4:pos + 8], raw[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if kind == b"IDAT":
+            idat += payload
+        else:
+            (after if idat else before).append((kind, payload))
+    middle = len(idat) // 2
+    for index in range(middle, middle + 256):
+        idat[index] ^= 0xFF
+    return (raw[:8] + b"".join(chunk(kind, payload) for kind, payload in before) + chunk(b"IDAT", bytes(idat))
+            + b"".join(chunk(kind, payload) for kind, payload in after))
 
 
 def phone_photo(orientation=6):
@@ -247,7 +277,7 @@ class ReferenceImageLimitsTest(unittest.TestCase):
             over.append(("WEBP", stream.getvalue()))
         for image_format, raw in over:
             with self.subTest(format=image_format), mock.patch.object(
-                Image.Image, "load", side_effect=AssertionError("over-limit image reached pixel decode")
+                ImageFile.ImageFile, "load", side_effect=AssertionError("over-limit image reached pixel decode")
             ):
                 mime = "image/" + image_format.lower()
                 with self.assertRaises(server.OpenAIAnalysisError) as caught:
@@ -257,7 +287,7 @@ class ReferenceImageLimitsTest(unittest.TestCase):
                     server.validate_draft_media(data_url(raw, mime), header_only=True)
         message = server.failed_result_payload("ERR-IMAGE-LIMIT", exception=caught.exception)["errors"][0]
         self.assertIn("89 megapixels", message)
-        self.assertIn("40 megapixels", message)
+        self.assertIn("40 megapixels for progressive JPG", message)
         self.assertIn("ERR-IMAGE-LIMIT", message)
 
     def test_pixel_guards_admit_images_exactly_at_the_cap(self):
@@ -301,6 +331,106 @@ class ReferenceImageLimitsTest(unittest.TestCase):
             self.assertEqual((decoded.format, decoded.mode, decoded.size), ("JPEG", "RGB", (1600, 20)))
             self.assertTrue(all(channel > 240 for channel in decoded.getpixel((1500, 10))))
             self.assertGreater(decoded.getpixel((10, 10))[0], 150)
+
+    def test_png_with_broken_pixel_data_is_refused_and_never_sent(self):
+        # Every chunk CRC is valid, so Pillow's verify() passes; only decoding finds the damage.
+        for size in ((2400, 1800), (200, 200)):  # re-encoded copy and pass-through sizes
+            picture = Image.blend(gradient_image(*size), Image.effect_noise(size, 40).convert("RGB"), 0.3)
+            raw = png_with_broken_deflate(picture)
+            with self.subTest(size=size):
+                with Image.open(io.BytesIO(raw)) as image:
+                    image.verify()
+                with Image.open(io.BytesIO(raw)) as image, self.assertRaises(OSError):
+                    image.load()
+                with self.assertRaises(server.ReferenceImageError) as caught:
+                    server.ai_image_data_url_from_bytes(raw)
+                self.assertEqual(caught.exception.reason, "media_decode_failed")
+                with self.assertRaises(server.OpenAIAnalysisError) as caught:
+                    server.validate_draft_media(data_url(raw, "image/png"), upload=True)
+                self.assertEqual(caught.exception.diagnostics["request_validation_reason"], "media_decode_failed")
+                self.assertEqual(server.compressed_prompt_image_data_url(raw), "")
+                fixture = self.draft_fixture()
+                fixture.assert_rejected(fixture.payload(data_url(raw, "image/png")))
+
+    def test_progressive_jpeg_gets_the_40_mp_cap_from_its_header(self):
+        allowed = server.prompt_image_dimensions_are_allowed
+        self.assertTrue(allowed((8000, 5000), "JPEG", progressive=True))
+        self.assertFalse(allowed((8000, 5001), "JPEG", progressive=True))
+        self.assertTrue(allowed((8000, 5001), "JPEG"))
+        over = jpeg_bytes(gradient_image(8000, 5001, "L"), quality=75, progressive=True)
+        with Image.open(io.BytesIO(over)) as image:
+            self.assertTrue(server.image_is_progressive_jpeg(image))
+        with mock.patch.object(ImageFile.ImageFile, "load",
+                               side_effect=AssertionError("over-limit image reached pixel decode")):
+            with self.assertRaises(server.OpenAIAnalysisError) as caught:
+                server.validate_draft_media(data_url(over), upload=True)
+            self.assertEqual(caught.exception.diagnostics["request_validation_reason"], "media_dimension_limit")
+            with self.assertRaises(server.OpenAIAnalysisError):
+                server.validate_draft_media(data_url(over), header_only=True)
+            self.assertEqual(server.compressed_prompt_image_data_url(over), "")
+        message = server.failed_result_payload("ERR-PROGRESSIVE", exception=caught.exception)["errors"][0]
+        self.assertIn("40 megapixels for progressive JPG", message)
+        # At the cap, and a baseline JPEG one pixel over it, still reach the AI shrunk.
+        at_cap = jpeg_bytes(gradient_image(8000, 5000, "L"), quality=75, progressive=True)
+        baseline = jpeg_bytes(gradient_image(8000, 5001, "L"), quality=75)
+        for label, raw in (("progressive at cap", at_cap), ("baseline over 40 MP", baseline)):
+            with self.subTest(case=label):
+                self.assertEqual(server.validate_draft_media(data_url(raw), upload=True), "image/jpeg")
+                with Image.open(io.BytesIO(decode_data_url(server.ai_image_copy_for_upload(raw)))) as copy:
+                    self.assertEqual(max(copy.size), server.AI_IMAGE_LONG_EDGE_PX)
+
+    def test_catalogue_pictures_keep_their_4096_px_and_9_mp_limits(self):
+        self.assertEqual((server.MAX_CATALOG_IMAGE_WIDTH, server.MAX_CATALOG_IMAGE_HEIGHT,
+                          server.MAX_CATALOG_IMAGE_PIXELS), (4096, 4096, 9_000_000 - 1))
+        fixture = self.draft_fixture()
+        cases = (
+            ((4096, 1), "image/png", True), ((1, 4096), "image/png", True), ((2999, 3001), "image/png", True),
+            ((4097, 1), "image/png", False), ((1, 4097), "image/png", False), ((3000, 3000), "image/png", False),
+            ((5000, 5000), "image/png", False), ((4097, 8), "image/jpeg", False),
+        )
+        for size, mime, admitted in cases:
+            picture = Image.new("RGB", size, (200, 180, 160))
+            raw = png_bytes(picture) if mime == "image/png" else jpeg_bytes(picture)
+            self.assertLessEqual(len(raw), server.MAX_PRICING_REFERENCE_VISUAL_BYTES)
+            url = data_url(raw, mime)
+            fixture.catalog.return_value = [{"data_url": url, "id": "synthetic"}]
+            with self.subTest(size=size, mime=mime):
+                if admitted:
+                    body = fixture.capture()
+                    self.assertIn({"type": "input_image", "image_url": url, "detail": "low"},
+                                  body["input"][0]["content"])
+                    continue
+                fixture.send.reset_mock()
+                with self.assertRaises(server.OpenAIAnalysisError) as caught:
+                    server.request_openai_quote_basis(fixture.payload(), "synthetic-key")
+                fixture.send.assert_not_called()
+                self.assertEqual(caught.exception.diagnostics["request_validation_stage"], "catalog_media")
+                self.assertEqual(caught.exception.diagnostics["request_validation_reason"], "media_dimension_limit")
+        # The outbound check holds low-detail pictures to the same limits.
+        fixture.catalog.return_value = [{"data_url": data_url(png_bytes(Image.new("RGB", (8, 8))), "image/png"),
+                                         "id": "synthetic"}]
+        body = fixture.capture()
+        low = next(part for part in body["input"][0]["content"] if part.get("detail") == "low")
+        low["image_url"] = data_url(png_bytes(Image.new("RGB", (5000, 5000), (200, 180, 160))), "image/png")
+        with self.assertRaises(server.OpenAIAnalysisError) as caught:
+            server.validate_draft_responses_envelope(body, "standard")
+        self.assertEqual(caught.exception.diagnostics["request_validation_reason"], "media_dimension_limit")
+
+    def test_catalogue_picture_is_decoded_once_per_draft(self):
+        fixture = self.draft_fixture()
+        url = data_url(png_bytes(Image.new("RGB", (333, 222), (200, 180, 160))), "image/png")
+        fixture.catalog.return_value = [{"data_url": url, "id": "synthetic"}]
+        real_load = ImageFile.ImageFile.load
+        decoded = []
+
+        def counting_load(image):
+            decoded.append(image.size)
+            return real_load(image)
+
+        with mock.patch.object(ImageFile.ImageFile, "load", counting_load):
+            body = fixture.capture()
+        self.assertIn({"type": "input_image", "image_url": url, "detail": "low"}, body["input"][0]["content"])
+        self.assertEqual(decoded.count((333, 222)), 1)
 
     def test_outbound_oracle_refuses_any_high_detail_image_over_the_ai_copy_limits(self):
         fixture = self.draft_fixture()
@@ -346,24 +476,35 @@ class ReferenceImageLimitsTest(unittest.TestCase):
 
     def test_normaliser_memory_stays_bounded_at_the_caps(self):
         # VmHWM is this process's own peak; ru_maxrss would carry the test
-        # runner's peak across exec on Linux.
+        # runner's peak across exec on Linux. Growth is measured from the
+        # memory in use just before the call, after resetting the peak where
+        # the kernel allows it (otherwise the import peak can only over-read).
         probe = (
             "import sys\n"
             "from webapp import server\n"
-            "def peak():\n"
+            "def status(key):\n"
             "    for line in open('/proc/self/status'):\n"
-            "        if line.startswith('VmHWM:'):\n"
+            "        if line.startswith(key + ':'):\n"
             "            return int(line.split()[1])\n"
             "raw = open(sys.argv[1], 'rb').read()\n"
-            "before = peak()\n"
+            "try:\n"
+            "    with open('/proc/self/clear_refs', 'w') as refs:\n"
+            "        refs.write('5')\n"
+            "except OSError:\n"
+            "    pass\n"
+            "before = status('VmRSS')\n"
             "server.ai_image_data_url_from_bytes(raw)\n"
-            "print((peak() - before) // 1024)\n"
+            "print((status('VmHWM') - before) // 1024)\n"
         )
         if not Path("/proc/self/status").exists():
             self.skipTest("Peak memory needs Linux /proc.")
         cases = (
             ("jpeg-89mp.jpg", jpeg_bytes(Image.linear_gradient("L").resize((14351, 6235)).convert("RGB"), quality=50), 128),
             ("rgba-40mp.png", compressible_png(8000, 5000, alpha=True), 450),
+            ("progressive-444-40mp.jpg", jpeg_bytes(gradient_image(8000, 5000), quality=90, subsampling=0,
+                                                    progressive=True), 450),
+            ("progressive-cmyk-40mp.jpg", jpeg_bytes(gradient_image(8000, 5000, "CMYK"), quality=90,
+                                                     subsampling=0, progressive=True), 450),
         )
         with tempfile.TemporaryDirectory() as folder:
             for name, raw, limit_mib in cases:
