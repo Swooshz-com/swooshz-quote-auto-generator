@@ -455,18 +455,30 @@ replaceOnce('    result.xlsx = { status: "PASS", expectedRows, validator: checkO
           { ...legacySnapshot, pricingDraftVersion: missingVersion });
         await page.reload({ waitUntil: "domcontentloaded" });
         await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting);
-        assert(await page.evaluate(async (oldTitle) => {
+        // A copy saved before copies carried a draft version (no field at all) is held as soon as it
+        // restores over the server's quote, and staff are told to reopen it; it never sends a save.
+        const absent = missingVersion === undefined;
+        assert(await page.evaluate(async ({ oldTitle, absent }) => {
           const failure = {};
+          if (absent) {
+            return elements.projectTitle.value === oldTitle && state.pricingDraftVersion === false
+              && elements.excelGeneratingModal.classList.contains("is-open")
+              && /This quote changed in another tab or session/.test(elements.excelGeneratingMessage.textContent)
+              && !(await saveQuoteSessionDraftState({ saveFailure: failure }))
+              && !(await ensureQuoteSession({ synchronizeDraft: true }))
+              && (await refreshLineItemsFromServer()).data.status === "conflict";
+          }
           return elements.projectTitle.value === oldTitle && state.pricingDraftVersion === "create"
             && !(await saveQuoteSessionDraftState({ saveFailure: failure })) && failure.failure?.draft_stale
             && state.pricingDraftVersion === false
             && !(await ensureQuoteSession({ synchronizeDraft: true }))
             && (await refreshLineItemsFromServer()).data.status === "conflict";
-        }, legacySnapshot.quoteDetails.project.title), "old browser recovery was writable or lost its local copy");
+        }, { oldTitle: legacySnapshot.quoteDetails.project.title, absent }), "old browser recovery was writable or lost its local copy");
         const readback = (await (await browserBoundary.get(api, baseUrl + raceQuote)).json()).quote_session;
         const request = saveRequests[previousRequests]?.postDataJSON();
-        assert(saveRequests.length === previousRequests + 1 && request?.expected_draft_version === ""
-          && request.session_id === sessionId && readback.draft_version === saved.draft_version
+        assert((absent ? saveRequests.length === previousRequests
+          : saveRequests.length === previousRequests + 1 && request?.expected_draft_version === "" && request.session_id === sessionId)
+          && readback.draft_version === saved.draft_version
           && JSON.stringify(readback.pricing_ledger) === JSON.stringify(saved.pricing_ledger)
           && JSON.stringify(readback.draft_files) === JSON.stringify(saved.draft_files)
           && JSON.stringify(readback.exports) === JSON.stringify(saved.exports),
