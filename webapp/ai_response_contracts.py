@@ -240,6 +240,13 @@ DRAFT_SYNTHESIS = ResponseContract("draft_synthesis_v1", obj(
         booth_depth=Field("number", nullable=True, positive=True),
         booth_area_sqm=Field("number", nullable=True, positive=True, optional=True,
                              instruction="floor area in sqm when only an area is known"),
+        # Owner (19 Nov 2026): the booth size staff state in Known details, as the AI reads it.
+        staff_booth_size=Field("object", nullable=True, optional=True, fields=(
+            ("booth_width", Field("number", nullable=True, positive=True)),
+            ("booth_depth", Field("number", nullable=True, positive=True)),
+            ("booth_area_sqm", Field("number", nullable=True, positive=True)),
+            ("stated", Field("string", enum=("clear", "unclear", "none"))),
+        ), instruction="booth size stated in staff_confirmed_facts, numbers as written"),
     ),
     quote_basis_sections=Field("array", item=obj(
         id=Field("string", nonblank=True), title=Field("string", nonblank=True),

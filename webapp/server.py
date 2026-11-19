@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import bisect
 import contextlib
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import contextvars
@@ -755,7 +754,6 @@ BOOTH_SIDE_MIN_METRES = 1.0
 BOOTH_SIDE_MAX_METRES = 200.0
 BOOTH_AREA_MIN_SQM = 1.0
 BOOTH_AREA_MAX_SQM = 10000.0
-BOOTH_SIZE_MISMATCH_TOLERANCE = 0.05
 BOOTH_FOOTPRINT_MATCH_TOLERANCE = 0.01
 QUOTE_BASIS_KEYS = ("surfaces", "counters", "platform", "graphics", "furniture", "electrical")
 DEFAULT_DIMENSION_BASIS_FIELD = "platform"
@@ -5241,7 +5239,7 @@ BOOTH_SIZE_AREA_RE = re.compile(
     r"(?:sq\.?\s*m(?:et(?:re|er)s?)?\b\.?|sqm\b|m\s*(?:2|²)(?![\d])|square\s+met(?:re|er)s?\b)",
     flags=re.IGNORECASE,
 )
-BOOTH_SIZE_CONTEXT_RE = re.compile(r"\b(?:booth|stand|space|footprint|floor\s*area|plot)\b", flags=re.IGNORECASE)
+KNOWN_DETAILS_NUMBER_RE = re.compile(rf"(?<![\d.,]){BOOTH_SIZE_NUMBER}")
 
 
 def booth_length_in_metres(value: str, unit: str) -> float | None:
@@ -5254,16 +5252,6 @@ def booth_length_in_metres(value: str, unit: str) -> float | None:
     if unit.startswith("cm") or unit.startswith("centi"):
         return round(number / 100, 4)
     return number
-
-
-def booth_size_next_word_is_a_noun(text: str, end: int) -> bool:
-    # True when a word (not booth wording) follows the match, as in "4m x 2 panels".
-    # Plain string checks, no regex on the open-ended rest of the text.
-    rest = text[end:].lstrip()
-    first = rest[:1]
-    if not (first.isascii() and first.isalpha()):
-        return False
-    return not BOOTH_SIZE_CONTEXT_RE.match(rest)
 
 
 def booth_size_pair_continues_earlier(text: str, start: int) -> bool:
@@ -5281,146 +5269,58 @@ def booth_size_pair_continues_earlier(text: str, start: int) -> bool:
     return False
 
 
-BOOTH_SIZE_ITEM_BREAKS = frozenset(".,;\n")
-
-
-def booth_size_item_starts(text: str, spans: list[tuple[int, int]]) -> list[int]:
-    """Start offsets of the items in the text: one fact each, split at . , ; and line breaks.
-
-    A break inside a number or a size ("9.3", "1,200", "93 sq. m") does not split; one that
-    ends a size ("93 sq m.") still ends its item. Plain character checks, no regex.
-    """
-    inside: set[int] = set()
-    for start, end in spans:
-        inside.update(range(start, end - 1))
-    starts = [0]
-    for index, char in enumerate(text):
-        if char not in BOOTH_SIZE_ITEM_BREAKS or index in inside:
-            continue
-        if char in ".," and text[index - 1:index].isdigit() and text[index + 1:index + 2].isdigit():
-            continue
-        starts.append(index + 1)
-    return starts
-
-
-def booth_size_label_with_area(width: float | None, depth: float | None, area: float) -> str:
-    if width is None or depth is None:
-        return f"{format_dimension(area)} sqm"
-    return f"{format_dimension(width)}m x {format_dimension(depth)}m ({format_dimension(area)} sqm)"
-
-
-def booth_size_reading(value: Any) -> dict[str, Any]:
-    """Read one booth size from free text with generic number and unit rules.
-
-    The text is split into items (one fact each). A size counts as the booth's when its own
-    item has booth wording; with no booth wording anywhere every item counts. The first
-    counting item gives the size, its W x D before an area stated in the same item.
-    Returns {"size": {...} | None, "notes": [...]}; a size has booth_width and
-    booth_depth in metres (None when only an area is given) and booth_area_sqm.
-    """
-    text = clean_multiline(value)[:KNOWN_DETAILS_MAX_CHARS]
-    notes: list[str] = []
-    if not text:
-        return {"size": None, "notes": notes}
-    pair_matches = list(BOOTH_SIZE_PAIR_RE.finditer(text))
-    area_matches = list(BOOTH_SIZE_AREA_RE.finditer(text))
-    starts = booth_size_item_starts(text, [match.span() for match in (*pair_matches, *area_matches)])
-    ends = [*starts[1:], len(text)]
-    worded_items = [bool(BOOTH_SIZE_CONTEXT_RE.search(text[start:end])) for start, end in zip(starts, ends)]
-
-    def item_of(position: int) -> int:
-        return bisect.bisect_right(starts, position) - 1
-
-    # Per item: the first in-range W x D and the first in-range area.
-    item_pairs: dict[int, tuple[float, float]] = {}
-    item_areas: dict[int, float] = {}
-    ignored: list[tuple[int, str]] = []
-    pair_spans: list[tuple[int, int]] = []
-    for match in pair_matches:
-        if booth_size_pair_continues_earlier(text, match.start()):
-            continue
-        item = item_of(match.start())
-        # "height 4m x 2 panels": outside booth wording, a bare second number that
-        # counts a noun is not a depth.
-        if (
-            not match.group(4) and not match.group(5)
-            and booth_size_next_word_is_a_noun(text, match.end())
-            and not worded_items[item]
-        ):
-            continue
-        shared_unit = match.group(4) or match.group(2) or match.group(6) or ""
-        first_unit = match.group(2) or shared_unit
-        second_unit = match.group(4) or shared_unit
-        width = booth_length_in_metres(match.group(1), first_unit)
-        depth = booth_length_in_metres(match.group(3), second_unit)
-        if width is None or depth is None:
-            continue
-        pair_spans.append(match.span())
-        if not all(BOOTH_SIDE_MIN_METRES <= side <= BOOTH_SIDE_MAX_METRES for side in (width, depth)):
-            ignored.append((item,
-                f"Booth size {format_dimension(width)}m x {format_dimension(depth)}m in Known details was ignored "
-                f"because each side must be {format_dimension(BOOTH_SIDE_MIN_METRES)}-{format_dimension(BOOTH_SIDE_MAX_METRES)}m; "
-                "check the size before generating."))
-            continue
-        item_pairs.setdefault(item, (width, depth))
-    for match in area_matches:
-        if any(start <= match.start() < end for start, end in pair_spans):
-            continue
-        area = parse_float_or_none(match.group(1))
-        if area is None:
-            continue
-        item = item_of(match.start())
-        if not BOOTH_AREA_MIN_SQM <= area <= BOOTH_AREA_MAX_SQM:
-            ignored.append((item,
-                f"Booth size {format_dimension(area)} sqm in Known details was ignored because the area must be "
-                f"{format_dimension(BOOTH_AREA_MIN_SQM)}-{format_dimension(BOOTH_AREA_MAX_SQM)} sqm; check the size before generating."))
-            continue
-        item_areas.setdefault(item, area)
-
-    sized_items = sorted({*item_pairs, *item_areas})
-    counting = [item for item in sized_items if worded_items[item]] or sized_items
-    # An ignored size is only reported when it was stated as the booth's, or nothing else was found.
-    notes.extend(note for item, note in ignored if worded_items[item] or not sized_items)
-    if not counting:
-        return {"size": None, "notes": notes}
-
-    def item_size(item: int) -> tuple[float | None, float | None, float]:
-        if item in item_pairs:
-            width, depth = item_pairs[item]
-            return width, depth, round(width * depth, 2)
-        return None, None, round(item_areas[item], 2)
-
-    def differs(area: float, other: float) -> bool:
-        return abs(other - area) > BOOTH_SIZE_MISMATCH_TOLERANCE * area
-
-    chosen = counting[0]
-    width, depth, area = item_size(chosen)
-    # Sizes that may also describe the booth but disagree: the same item's area, then the other counting items.
-    others = []
-    if chosen in item_pairs and chosen in item_areas and differs(area, item_areas[chosen]):
-        others.append(f"{format_dimension(item_areas[chosen])} sqm")
-    for item in counting[1:]:
-        other_width, other_depth, other_area = item_size(item)
-        if differs(area, other_area):
-            others.append(booth_size_label_with_area(other_width, other_depth, other_area))
-    if others:
-        chosen_label = booth_size_label(width, depth, area)
-        notes.append(
-            f"Booth size in Known details gives {booth_size_label_with_area(width, depth, area)} and "
-            f"{', '.join(others)}; using {chosen_label}."
-        )
-    return {"size": {"booth_width": width, "booth_depth": depth, "booth_area_sqm": area}, "notes": notes}
+def booth_size_in_range(width: float | None, depth: float | None, area: float | None) -> bool:
+    if width is not None and depth is not None:
+        return all(BOOTH_SIDE_MIN_METRES <= side <= BOOTH_SIDE_MAX_METRES for side in (width, depth))
+    return area is not None and BOOTH_AREA_MIN_SQM <= area <= BOOTH_AREA_MAX_SQM
 
 
 def parse_booth_size_from_text(value: Any) -> dict[str, Any] | None:
-    return booth_size_reading(value)["size"]
+    """Read a booth size label such as "10m x 9m", "8000 x 9000 mm" or "93 sqm".
+
+    For size fields only: free text with several sizes (Known details) is read by the AI,
+    never here. The first in-range W x D wins, else the first in-range area.
+    """
+    text = clean_text(value)[:KNOWN_DETAILS_MAX_CHARS]
+    if not text:
+        return None
+    pair_spans: list[tuple[int, int]] = []
+    for match in BOOTH_SIZE_PAIR_RE.finditer(text):
+        if booth_size_pair_continues_earlier(text, match.start()):
+            continue
+        pair_spans.append(match.span())
+        shared_unit = match.group(4) or match.group(2) or match.group(6) or ""
+        width = booth_length_in_metres(match.group(1), match.group(2) or shared_unit)
+        depth = booth_length_in_metres(match.group(3), match.group(4) or shared_unit)
+        if width is not None and depth is not None and booth_size_in_range(width, depth, None):
+            return {"booth_width": width, "booth_depth": depth, "booth_area_sqm": round(width * depth, 2)}
+    for match in BOOTH_SIZE_AREA_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in pair_spans):
+            continue
+        area = parse_float_or_none(match.group(1))
+        if area is not None and booth_size_in_range(None, None, area):
+            return {"booth_width": None, "booth_depth": None, "booth_area_sqm": round(area, 2)}
+    return None
 
 
-def parse_booth_dimensions_from_text(value: Any) -> tuple[float | None, float | None]:
-    size = parse_booth_size_from_text(value)
-    if not size:
-        return None, None
-    return size["booth_width"], size["booth_depth"]
+def known_details_states_size(text: str, width: float | None, depth: float | None, area: float | None) -> bool:
+    """True when every number of the size is written in the Known details text.
+
+    Generic number match: a side may be written in metres, cm or mm ("8000 x 9000 mm"
+    states 8 x 9); an area as written ("93 sqm", "93m\u00b2"). Stops an AI reply or a
+    client from passing off a size staff never typed.
+    """
+    numbers = [number for number in (
+        parse_float_or_none(match.group(1).replace(",", "")) for match in KNOWN_DETAILS_NUMBER_RE.finditer(text)
+    ) if number is not None]
+
+    def written(value: float, scales: tuple[int, ...]) -> bool:
+        return any(abs(number - value * scale) <= 1e-6 * max(1.0, value * scale)
+                   for number in numbers for scale in scales)
+
+    if width is not None and depth is not None:
+        return written(width, (1, 100, 1000)) and written(depth, (1, 100, 1000))
+    return area is not None and written(area, (1,))
 
 
 def known_details_text(payload: dict[str, Any]) -> str:
@@ -5462,30 +5362,111 @@ def booth_dimensions_result(width: float | None, depth: float | None, area: floa
 def booth_dimensions_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Booth size precedence: Known details (staff), analysis/client size, size text, default.
 
+    A staff size comes from the AI's reading of Known details (known_details_booth_size);
+    one the client holds from an earlier analysis counts only while the box still states it.
     booth_area_sqm is always set; width and depth stay empty for an area-only size.
     """
     project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
-    staff = parse_booth_size_from_text(known_details_text(payload))
-    if staff:
-        return booth_dimensions_result(staff["booth_width"], staff["booth_depth"], staff["booth_area_sqm"], "staff")
-    # A size the client still holds from an earlier Known details text is stale once the box has none.
-    stale_staff = clean_text(project.get("dimension_source")) == "staff"
-    if not stale_staff:
-        width = parse_float_or_none(project.get("booth_width") or payload.get("booth_width"))
-        depth = parse_float_or_none(project.get("booth_depth") or payload.get("booth_depth"))
-        if width is not None and depth is not None and width > 0 and depth > 0:
-            return booth_dimensions_result(width, depth, None, "analysis")
-        area = parse_float_or_none(project.get("booth_area_sqm"))
-        if area is not None and BOOTH_AREA_MIN_SQM <= area <= BOOTH_AREA_MAX_SQM:
-            return booth_dimensions_result(None, None, area, "analysis")
-        size = parse_booth_size_from_text(project.get("booth_size") or payload.get("booth_size"))
-        if size:
-            return booth_dimensions_result(size["booth_width"], size["booth_depth"], size["booth_area_sqm"], "booth_size")
+    width = parse_float_or_none(project.get("booth_width") or payload.get("booth_width"))
+    depth = parse_float_or_none(project.get("booth_depth") or payload.get("booth_depth"))
+    has_pair = width is not None and depth is not None and width > 0 and depth > 0
+    area = parse_float_or_none(project.get("booth_area_sqm"))
+    if clean_text(project.get("dimension_source")) == "staff":
+        staff_width, staff_depth = (width, depth) if has_pair else (None, None)
+        staff_area = None if has_pair else area
+        if booth_size_in_range(staff_width, staff_depth, staff_area) and known_details_states_size(
+                known_details_text(payload), staff_width, staff_depth, staff_area):
+            return booth_dimensions_result(staff_width, staff_depth, staff_area, "staff")
+        # Stale: the box no longer states that size.
+        return booth_dimensions_result(DEFAULT_BOOTH_WIDTH_METRES, DEFAULT_BOOTH_DEPTH_METRES, None, "default")
+    if has_pair:
+        return booth_dimensions_result(width, depth, None, "analysis")
+    if area is not None and BOOTH_AREA_MIN_SQM <= area <= BOOTH_AREA_MAX_SQM:
+        return booth_dimensions_result(None, None, area, "analysis")
+    size = parse_booth_size_from_text(project.get("booth_size") or payload.get("booth_size"))
+    if size:
+        return booth_dimensions_result(size["booth_width"], size["booth_depth"], size["booth_area_sqm"], "booth_size")
     return booth_dimensions_result(DEFAULT_BOOTH_WIDTH_METRES, DEFAULT_BOOTH_DEPTH_METRES, None, "default")
 
 
-def known_details_size_notes(payload: dict[str, Any]) -> list[str]:
-    return list(booth_size_reading(known_details_text(payload))["notes"])
+def known_details_booth_size(payload: dict[str, Any], ai_project: Any) -> tuple[dict[str, Any] | None, str]:
+    """The booth size staff stated in Known details, as the AI read it (project.staff_booth_size).
+
+    Enforced only when the AI says the text states it clearly, the size is in range and its
+    numbers are written in the text. Returns (staff dimensions or None, problem), where problem
+    is "", "unclear" or an out-of-range note.
+    """
+    text = known_details_text(payload)
+    reply = ai_project.get("staff_booth_size") if isinstance(ai_project, dict) else None
+    if not text or not isinstance(reply, dict) or reply.get("stated") not in ("clear", "unclear"):
+        return None, ""
+
+    def size(key: str) -> float | None:
+        value = reply.get(key)
+        number = parse_float_or_none(value) if not isinstance(value, bool) else None
+        return number if number is not None and number > 0 else None
+
+    width, depth, area = size("booth_width"), size("booth_depth"), size("booth_area_sqm")
+    if width is not None and depth is not None:
+        area = None
+    else:
+        width = depth = None
+    if reply.get("stated") != "clear" or (width is None and area is None):
+        return None, "unclear"
+    if not booth_size_in_range(width, depth, area):
+        label = booth_size_label(width, depth, area)
+        limit = (
+            f"each side must be {format_dimension(BOOTH_SIDE_MIN_METRES)}-{format_dimension(BOOTH_SIDE_MAX_METRES)}m"
+            if width is not None else
+            f"the area must be {format_dimension(BOOTH_AREA_MIN_SQM)}-{format_dimension(BOOTH_AREA_MAX_SQM)} sqm"
+        )
+        return None, f"Booth size {label} in Known details was ignored because {limit}; check the size before generating."
+    if not known_details_states_size(text, width, depth, area):
+        return None, "unclear"
+    return booth_dimensions_result(width, depth, area, "staff"), ""
+
+
+def known_details_size_decision_label(payload: dict[str, Any]) -> str:
+    """The booth size staff last applied or discarded from a Known details proposal."""
+    project = payload.get("project") if isinstance(payload.get("project"), dict) else {}
+    decision = project.get("known_details_size_decision")
+    if not isinstance(decision, dict) or decision.get("decision") not in ("applied", "discarded"):
+        return ""
+    return clean_text(decision.get("booth_size"))[:40]
+
+
+def staff_booth_dimensions(
+    parsed: Any, payload: Any,
+) -> tuple[dict[str, Any] | None, str, dict[str, Any] | None]:
+    """Known details size for a draft (owner decision INT-SQAG-202611190008).
+
+    Returns (enforced, problem, proposal). Only a size staff applied (held by the client while
+    the box still states it) is enforced. A clear, checked AI reading of a different size is a
+    proposal for staff to Apply or Discard; it is not offered again once staff decided on it.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    held = booth_dimensions_from_payload(payload)
+    held = held if held.get("dimension_source") == "staff" else None
+    reading, problem = known_details_booth_size(payload, parsed.get("project") if isinstance(parsed, dict) else None)
+    if reading is None:
+        return held, "" if held else problem, None
+    if (held and held.get("booth_size") == reading.get("booth_size")) or (
+            reading.get("booth_size") == known_details_size_decision_label(payload)):
+        return held, "", None
+    return held, "", reading
+
+
+def known_details_size_note(problem: Any, project: dict[str, Any]) -> str:
+    problem = clean_text(problem)
+    if problem != "unclear":
+        return problem
+    label = clean_text(project.get("booth_size")) or booth_size_label(
+        DEFAULT_BOOTH_WIDTH_METRES, DEFAULT_BOOTH_DEPTH_METRES, None)
+    # Plain wording: the review screen drops a colon before a number and the dot after "sqm".
+    return (
+        f"Booth size in Known details is not clear, so {label} is used. "
+        "State the booth size on its own in Known details and analyse again."
+    )
 
 
 def default_booth_dimension_confirmation_line(dimensions: dict[str, Any]) -> str:
@@ -21912,6 +21893,20 @@ def staff_confirmed_facts_prompt_rule() -> str:
     )
 
 
+# Owner (19 Nov 2026, INT-SQAG-202611190007): the AI, not a code text reader, reads the booth size
+# staff state in Known details; the server enforces it only when its numbers are written there.
+STAFF_BOOTH_SIZE_RULE = (
+    "Read the booth's own size from staff_confirmed_facts and return it in project.staff_booth_size: "
+    "booth_width and booth_depth in metres, or only booth_area_sqm when staff give only a floor area. "
+    "Copy the numbers exactly as staff wrote them, converting only cm or mm to metres. "
+    "Never return the size of something inside or beside the booth (furniture, a wall, a screen, a room or the hall). "
+    "Set stated to clear when the text plainly gives the booth's own size, unclear when it gives a size you cannot "
+    "tie to the booth, and none (with null numbers) when it gives no booth size. "
+    "Keep project booth_width, booth_depth and booth_area_sqm, and every area-based quantity, on the size the "
+    "references show (or booth_dimensions_hint when fixed); staff decide whether the Known details size applies. "
+)
+
+
 def build_quote_draft_prompt(
     payload: dict[str, Any],
     auth_session: dict[str, Any] | None = None,
@@ -22033,7 +22028,8 @@ def build_quote_draft_prompt(
         "Use the pricing_catalog choices in Quote context JSON. When a catalog item applies, set "
         "pricing_keyword exactly to that catalog id from pricing_catalog, not an invented keyword. "
         "Do not include pricing amounts or internal costs. If no catalog item fits and the item should be customer-visible, keep pricing_keyword empty and let the Custom basis line flag it for manual pricing. "
-        + PREDICTED_QUANTITY_RULE + QUANTITY_ESTIMATED_RULE + staff_confirmed_facts_prompt_rule() +
+        + PREDICTED_QUANTITY_RULE + QUANTITY_ESTIMATED_RULE + staff_confirmed_facts_prompt_rule()
+        + STAFF_BOOTH_SIZE_RULE +
         f"Quote context JSON: {json.dumps(brief_context, ensure_ascii=True)}"
     )
 
@@ -26098,8 +26094,14 @@ def normalize_ai_draft(
     raw_project = ai_project_size_fields(parsed.get("project"))
     dimensions = booth_dimensions_from_payload({"project": raw_project}) if raw_project else {}
     staff_rescale = None
+    staff_dimensions, staff_problem, staff_proposal = None, "", None
     if has_payload_context:
-        parsed, staff_rescale = staff_footprint_rescale(parsed, booth_dimensions_from_payload(payload), dimensions)
+        staff_dimensions, staff_problem, staff_proposal = staff_booth_dimensions(parsed, payload)
+        if staff_proposal:
+            # The applied draft is normalised again from this reply with the size held (no AI call).
+            staff_proposal = {"dimensions": staff_proposal, "parsed": copy.deepcopy(parsed)}
+        parsed, staff_rescale = staff_footprint_rescale(
+            parsed, staff_dimensions or booth_dimensions_from_payload(payload), dimensions)
     raw_line_items = parsed.get("line_items") if isinstance(parsed.get("line_items"), list) else []
     pricing_reference_sections = (
         pricing_reference_section_names_for_payload(payload, auth_session=auth_session)
@@ -26180,6 +26182,12 @@ def normalize_ai_draft(
     }
     if staff_rescale:
         result["_staff_booth_rescale"] = staff_rescale
+    if staff_dimensions:
+        result["_staff_booth_size"] = staff_dimensions
+    elif staff_problem:
+        result["_staff_booth_problem"] = staff_problem
+    if staff_proposal:
+        result["_staff_booth_proposal"] = staff_proposal
     if has_payload_context:
         # Later stages see these rows re-unit to their catalogue items; only this stage still
         # holds the unit the provider measured each row in, so it is carried forward internally.
@@ -26950,9 +26958,10 @@ def booth_size_rule_quantity(line: dict[str, Any], entry: dict[str, str], booth_
 
 def draft_booth_dimensions(parsed: dict[str, Any], payload: Any) -> dict[str, Any]:
     """Booth size for predicted quantities: Known details, then the AI's own size, then the request's size."""
+    staff, _problem, _proposal = staff_booth_dimensions(parsed, payload)
+    if staff:
+        return staff
     payload_dimensions = booth_dimensions_from_payload(payload if isinstance(payload, dict) else {})
-    if payload_dimensions.get("dimension_source") == "staff":
-        return payload_dimensions
     # Only the AI's size fields: an AI reply cannot claim a Known details (staff) size.
     ai_dimensions = booth_dimensions_from_payload({"project": ai_project_size_fields(parsed.get("project"))})
     return ai_dimensions if ai_dimensions.get("dimension_source") != "default" else payload_dimensions
@@ -27584,15 +27593,17 @@ def finalized_remote_draft_result(
     if blockers:
         raise OpenAIAnalysisError(f"{provider_label} returned clarification questions instead of a usable quote basis.")
     require_usable_ai_basis(provider_label, basis, sections)
+    if isinstance(ai_basis.get("_staff_booth_size"), dict):
+        fallback_project = ai_basis["_staff_booth_size"]
     project = default_confirmation_dimensions(project, fallback_project)
     adjusted_basis = quote_basis_with_default_dimension_confirmation(basis or quote_basis_from_sections(sections), project)
     adjusted_sections = quote_basis_sections_with_default_dimension_confirmation(
         sections or normalize_quote_basis_sections({"quote_basis": adjusted_basis}),
         project,
     )
-    # Known details size reminders (#385): mismatch, out of range, AI resize.
+    # Known details size reminders (#385): size not clear or out of range, AI resize.
     adjusted_sections = quote_basis_sections_with_dimension_notes(adjusted_sections, [
-        *known_details_size_notes(payload or {}),
+        known_details_size_note(ai_basis.get("_staff_booth_problem"), project),
         staff_booth_rescale_note(ai_basis.get("_staff_booth_rescale")),
     ])
     catalog_lookup = (
@@ -27685,6 +27696,50 @@ def finalized_remote_draft_result(
             else {}
         ),
     }
+
+
+KNOWN_DETAILS_APPLIED_DRAFT_KEYS = ("quote_basis", "quote_basis_sections", "line_items", "project", "pricing_analysis_seal")
+
+
+def with_known_details_size_proposal(
+    result: dict[str, Any],
+    payload: dict[str, Any],
+    ai_basis: dict[str, Any],
+    fallback_line_items: list[dict[str, Any]],
+    auth_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Offer the AI's checked Known details size for staff to Apply or Discard.
+
+    The applied draft is this same reply normalised and finalised with the size held as
+    staff-applied, so Apply uses the existing precedence, resizing and Est. marks.
+    """
+    proposal = ai_basis.get("_staff_booth_proposal")
+    if not isinstance(proposal, dict) or not isinstance(proposal.get("dimensions"), dict):
+        return result
+    dims = proposal["dimensions"]
+    applied_payload = copy.deepcopy(payload)
+    project = applied_payload.get("project") if isinstance(applied_payload.get("project"), dict) else {}
+    applied_payload["project"] = {
+        **project,
+        "booth_width": dims.get("booth_width") or "",
+        "booth_depth": dims.get("booth_depth") or "",
+        "booth_size": dims.get("booth_size"),
+        "booth_area_sqm": dims.get("booth_area_sqm"),
+        "dimension_source": "staff",
+    }
+    applied_basis = normalize_ai_draft(
+        proposal["parsed"], applied_payload, require_confidence=True, auth_session=auth_session)
+    applied = finalized_remote_draft_result(
+        applied_payload, applied_basis, "openai", "OpenAI",
+        booth_dimensions_from_payload(applied_payload), fallback_line_items, auth_session=auth_session,
+    )
+    return {**result, "known_details_size_proposal": {
+        "booth_width": dims.get("booth_width"),
+        "booth_depth": dims.get("booth_depth"),
+        "booth_area_sqm": dims.get("booth_area_sqm"),
+        "booth_size": dims.get("booth_size"),
+        "applied": {key: applied[key] for key in KNOWN_DETAILS_APPLIED_DRAFT_KEYS if key in applied},
+    }}
 
 
 def protected_ai_draft_mode_enabled(auth_session: dict[str, Any] | None = None) -> bool:
@@ -27874,6 +27929,8 @@ def draft_quote_basis(payload: dict[str, Any], auth_session: dict[str, Any] | No
                     },
                     auth_session=auth_session,
                 )
+                result = with_known_details_size_proposal(
+                    result, payload, ai_basis, fallback_line_items, auth_session=auth_session)
             except OpenAIAnalysisError as exc:
                 raise OpenAIAnalysisError(
                     str(exc),

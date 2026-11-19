@@ -1,6 +1,6 @@
-// Known details box (#385): type a booth size before analysis, check the request, the Detected booth line,
-// the AI resize note, save/reload restore and re-send. Synthetic only: the owner-UAT mock harness replaces
-// the AI provider with a deterministic reply (6m x 6m, 36 sqm carpet); no network, live data or paid AI.
+// Known details box (#385): type a booth size before analysis, check the request, the size proposal
+// (Apply and Discard), the Detected booth line, the resize note, save/reload restore and re-send. Synthetic only: the owner-UAT mock harness replaces
+// the AI provider with a deterministic reply (staff size 93 sqm read, booth 6m x 6m, 36 sqm carpet); no network, live data or paid AI.
 // --screenshots-only captures the Reference uploads panel at 390 px and 1280 px and exits (also on builds
 // without the box, for before/after evidence).
 import { signIn } from "./internal-password-browser-test.mjs";
@@ -29,11 +29,12 @@ const profileId = "synthetic-exhibition-fixture-template";
 const carpet = "synthetic-floors-synthetic-carpet-tile";
 const knownDetails = "Booth is 93 sqm, 2 open sides\nMax height 4 m";
 
-// The fake AI ignores the staff size: 6m x 6m and a 36 sqm full-floor carpet line.
+// The fake AI reads the staff size (project.staff_booth_size) but sizes the booth 6m x 6m from the
+// references with a 36 sqm full-floor carpet line; staff Apply or Discard the Known details size.
 const scenarioPath = path.join(runRoot, "scenario.json");
 await fs.writeFile(scenarioPath, JSON.stringify({ raw: {
   analysis_findings: [], blocking_clarification_questions: [],
-  project: { booth_width: 6, booth_depth: 6 },
+  project: { booth_width: 6, booth_depth: 6, staff_booth_size: { booth_width: null, booth_depth: null, booth_area_sqm: 93, stated: "clear" } },
   quote_basis_sections: [{ id: "synthetic-floors", title: "Synthetic Floors", lines: [
     { id: "kd-carpet", tag: "Confirm", text: "sqm synthetic carpet tile", quantity: 36, unit: "sqm", confidence_pct: 90, pricing_keyword: carpet },
   ] }],
@@ -134,37 +135,99 @@ try {
 
     assert(draftBodies.length === 1 && draftBodies[0].known_details === knownDetails, "analysis request lacks the Known details text", draftBodies);
     const booth = page.locator("#basisReviewSurface .basis-visual-display");
-    result.detectedBooth = (await booth.allInnerTexts()).join(" | ");
-    assert(result.detectedBooth.includes("Booth size 93 sqm (from Known details)"), "Detected booth does not show the Known details size", result.detectedBooth);
-    const draft = await page.evaluate((keyword) => ({
+    const card = page.locator("#basisReviewSurface [data-known-details-size-proposal]");
+    const readDraft = () => page.evaluate((keyword) => ({
       booth: state.boothDimensions,
+      sizeState: state.knownDetailsSize,
       carpet: state.lineItems.find((row) => row.pricing_keyword === keyword)?.quantity,
       lines: state.quoteBasisSections.flatMap((section) => (section.lines || []).map((line) => line.text)),
     }), carpet);
+    const reload = async () => {
+      await page.evaluate(async () => { await saveQuoteSessionDraftState({ quoteGenerated: false }); });
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
+      if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
+    };
+    const analyseAgain = async () => {
+      const before = draftBodies.length;
+      await page.locator("#analyseAgainButton").click();
+      const confirm = page.locator("#analysisConfirmStartButton");
+      if (await confirm.isVisible({ timeout: 5000 }).catch(() => false)) await confirm.click();
+      const deadline = Date.now() + 90000;
+      while (draftBodies.length === before && Date.now() < deadline) await page.waitForTimeout(250);
+      await page.waitForFunction(() => !appIsBusy(), null, { timeout: 90000 });
+      assert(draftBodies.length === before + 1, "analysis did not run again", draftBodies.length);
+      return draftBodies[draftBodies.length - 1];
+    };
+
+    // 1. The AI's reading is offered with the Re proposal controls; nothing applies yet.
+    await card.waitFor({ state: "visible" });
+    result.proposal = (await card.innerText()).replace(/\s+/g, " ").trim();
+    assert(result.proposal.includes("Booth size from Known details: 93 sqm"), "proposal does not show the Known details size", result.proposal);
+    let draft = await readDraft();
+    assert(draft.booth.dimension_source !== "staff" && Number(draft.carpet) === 36, "the Known details size applied before Apply", draft);
+    assert(!(await booth.allInnerTexts()).join(" ").includes("(from Known details)"), "Detected booth claims Known details before Apply");
+    await page.locator("#basisReviewSurface").screenshot({ path: path.join(runRoot, "basis-known-details-proposal-1280.png") });
+
+    // 2. A pending proposal survives save and reopen.
+    await reload();
+    assert(await card.isVisible(), "proposal lost on reopen");
+    result.restoredText = await page.locator("#knownDetails").inputValue();
+    assert(result.restoredText === knownDetails, "Known details text was not restored", result.restoredText);
+
+    // 3. Apply: the staff size wins, the full-floor line is resized, with the Confirm note.
+    await page.locator('#basisReviewSurface [data-known-details-size="apply"]').click();
+    await card.waitFor({ state: "detached" });
+    result.detectedBooth = (await booth.allInnerTexts()).join(" | ");
+    assert(result.detectedBooth.includes("Booth size 93 sqm (from Known details)"), "Detected booth does not show the Known details size", result.detectedBooth);
+    draft = await readDraft();
     assert(draft.booth.dimension_source === "staff" && draft.booth.booth_area_sqm === "93", "state booth size is not the staff size", draft.booth);
     assert(Number(draft.carpet) === 93, "full-floor carpet line was not resized to 93 sqm", draft.carpet);
-    assert(!draft.lines.some((text) => /defaults to 6m x 6m/.test(text)), "default 6m x 6m reminder shown", draft.lines);
+    assert(draft.sizeState.decision?.decision === "applied" && draft.sizeState.decision?.booth_size === "93 sqm", "Apply was not recorded", draft.sizeState);
     result.resizeNote = draft.lines.find((text) => text.includes("but the AI analysis used 36 sqm")) || "";
     assert(result.resizeNote, "resize note missing from the quote basis", draft.lines);
     result.carpetQuantity = Number(draft.carpet);
     await page.locator("#basisReviewSurface").screenshot({ path: path.join(runRoot, "basis-detected-booth-1280.png") });
 
-    // Save, reload: the box text (with its line break) comes back, and analysis sends it again.
-    await page.evaluate(async () => { await saveQuoteSessionDraftState({ quoteGenerated: false }); });
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForFunction(() => typeof state !== "undefined" && !state.isBooting && state.quoteBasisSections.length > 0 && !appIsBusy(), null, { timeout: 60000 });
-    result.restoredText = await page.locator("#knownDetails").inputValue();
-    assert(result.restoredText === knownDetails, "Known details text was not restored", result.restoredText);
+    // 4. Reopen and Re-Analyse: the applied size holds and is not offered again.
+    await reload();
     result.restoredBooth = await page.evaluate(() => state.boothDimensions);
     assert(result.restoredBooth.dimension_source === "staff", "restored booth size lost its source", result.restoredBooth);
-    if (!(await page.locator("#quoteBasisPanel").isVisible())) await page.locator('button[data-side-panel="basis"]').click();
-    await page.locator("#analyseAgainButton").click();
-    const confirm = page.locator("#analysisConfirmStartButton");
-    if (await confirm.isVisible({ timeout: 5000 }).catch(() => false)) await confirm.click();
-    const deadline = Date.now() + 90000;
-    while (draftBodies.length < 2 && Date.now() < deadline) await page.waitForTimeout(250);
-    await page.waitForFunction(() => !appIsBusy(), null, { timeout: 90000 });
-    assert(draftBodies.length === 2 && draftBodies[1].known_details === knownDetails, "re-analysis did not send the Known details text again", draftBodies.length);
+    let body = await analyseAgain();
+    assert(body.known_details === knownDetails && body.known_details_size_decision?.decision === "applied", "re-analysis did not send the Known details text and decision", body);
+    draft = await readDraft();
+    assert(!(await card.count()) && draft.booth.dimension_source === "staff" && Number(draft.carpet) === 93, "applied size not kept after Re-Analyse", draft);
+
+    // 5. Staff type a new size: it is offered again; Discard keeps the drawing size.
+    const newDetails = "Booth is 120 sqm, 2 open sides\nMax height 4 m";
+    // As staff would: edit the box in References, save the Customer step again, return to the basis.
+    await page.locator('button[data-side-panel="images"]').click();
+    await page.locator("#knownDetails").fill(newDetails);
+    await page.locator('button[data-side-panel="customer"]').click();
+    await page.locator("#customerDetailsPanel").waitFor({ state: "visible" });
+    await page.locator("#sideNextButton").click();
+    await page.locator("#quoteCompanyPanel").waitFor({ state: "visible" });
+    await page.locator('button[data-side-panel="basis"]').click();
+    await page.locator("#quoteBasisPanel").waitFor({ state: "visible" });
+    const scenario = JSON.parse(await fs.readFile(scenarioPath, "utf8"));
+    scenario.raw.project.staff_booth_size.booth_area_sqm = 120;
+    await fs.writeFile(scenarioPath, JSON.stringify(scenario, null, 2));
+    body = await analyseAgain();
+    assert(body.known_details === newDetails, "re-analysis did not send the new text", body);
+    await card.waitFor({ state: "visible" });
+    assert((await card.innerText()).includes("Booth size from Known details: 120 sqm"), "changed size was not offered again");
+    await page.locator('#basisReviewSurface [data-known-details-size="discard"]').click();
+    await card.waitFor({ state: "detached" });
+    draft = await readDraft();
+    assert(draft.booth.dimension_source !== "staff" && Number(draft.carpet) === 36, "Discard did not keep the drawing size", draft);
+    assert(draft.sizeState.decision?.decision === "discarded" && draft.sizeState.decision?.booth_size === "120 sqm", "Discard was not recorded", draft.sizeState);
+
+    // 6. The Discard survives reopen and Re-Analyse of the same size.
+    await reload();
+    assert(!(await card.count()), "discarded proposal came back on reopen");
+    body = await analyseAgain();
+    assert(body.known_details_size_decision?.decision === "discarded", "re-analysis did not send the Discard", body);
+    assert(!(await card.count()), "discarded size was offered again");
     assert(!pageErrors.length, "page errors", pageErrors);
     boundary.assertClean();
     result.status = "PASS";
