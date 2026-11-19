@@ -30,10 +30,10 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
     const standardRows = () => page.evaluate(() => {
       const lines = state.quoteBasisSections.flatMap((section) => (section.lines || []).map((line) => ({ section, line })));
       return {
-        rows: lines.filter(({ line }) => line.id.startsWith("standard-")).map(({ section, line }) => ({
+        rows: lines.filter(({ line }) => String(line.id || "").startsWith("standard-")).map(({ section, line }) => ({
           section: section.title, id: line.id, tag: normalizeBasisTag(line.tag), text: line.text, quantity: Number(line.quantity), unit: normalizeUnit(line.unit),
         })),
-        suggested: lines.filter(({ line }) => line.id.startsWith("s-")).map(({ line }) => line.id),
+        suggested: lines.filter(({ line }) => String(line.id || "").startsWith("s-")).map(({ line }) => line.id),
       };
     });
     const expectRows = async (pmTag, wasteTag, label) => {
@@ -82,7 +82,7 @@ replaceOnce('  result.basisLines = draftLines.length;', `  result.basisLines = d
 // Reload restores the saved decisions, and the generated workbook carries the ticked row at zero only.
 replaceOnce('    result.saveReopen = "PASS";', `    result.saveReopen = "PASS";
     const reopenedStandard = await page.evaluate(() => state.quoteBasisSections.flatMap((section) => section.lines || [])
-      .filter((line) => line.id.startsWith("standard-")).map((line) => [line.id, normalizeBasisTag(line.tag)]));
+      .filter((line) => String(line.id || "").startsWith("standard-")).map((line) => [line.id, normalizeBasisTag(line.tag)]));
     assert(JSON.stringify(reopenedStandard) === JSON.stringify([["standard-project-management-fee", "Include"], ["standard-waste-disposal", "Exclude"]]),
       "reopen lost the standard row decisions", reopenedStandard);
     const includedRow = await rowFor("standard-project-management-fee");
