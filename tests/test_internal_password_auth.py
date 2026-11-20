@@ -377,8 +377,8 @@ class InternalPasswordIdleSessionTest(unittest.TestCase):
 
     def test_idle_lifetime_constants(self):
         self.assertEqual(auth.INTERNAL_SESSION_IDLE_SECONDS, 72 * self.HOUR)
-        self.assertEqual(300, 300)
-        self.assertEqual(auth.INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS, 72 * self.HOUR + 24 * self.HOUR)
+        self.assertEqual(auth.INTERNAL_SESSION_COOKIE_RENEW_SECONDS, 300)
+        self.assertEqual(auth.INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS, 400 * 24 * self.HOUR)
         self.assertFalse(hasattr(auth, "INTERNAL_SESSION_TTL_SECONDS"))
 
     def test_U1_to_U4_idle_expiry_table(self):

@@ -16,10 +16,11 @@ from typing import Any
 INTERNAL_AUTH_MODE = "internal_password"
 # A session ends only after this long without use; each validated request resets it.
 INTERNAL_SESSION_IDLE_SECONDS = 3 * 24 * 60 * 60
-# The browser cookie outlives the idle limit by a day so an ended session's cookie
-# still reaches the server, which then shows the "session has ended" sign-in note.
-# The server record alone decides access; the cookie's age grants nothing.
-INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS = INTERNAL_SESSION_IDLE_SECONDS + 24 * 60 * 60
+# The browser keeps the cookie for 400 days, the longest browsers allow (RFC 6265bis),
+# so an ended session's cookie still reaches the server however long staff stay away,
+# and the sign-in page can say the session has ended. The server record alone decides
+# access; the cookie's age grants nothing.
+INTERNAL_SESSION_COOKIE_MAX_AGE_SECONDS = 400 * 24 * 60 * 60
 # At most one renewed Set-Cookie per session in this interval.
 INTERNAL_SESSION_COOKIE_RENEW_SECONDS = 5 * 60
 LOGIN_NONCE_TTL_SECONDS = 10 * 60

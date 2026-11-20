@@ -5,6 +5,7 @@ import http.cookies
 import json
 import os
 import re
+import socket
 import threading
 import unittest
 import urllib.parse
@@ -412,8 +413,9 @@ class InternalPasswordAuthWebappTest(unittest.TestCase):
 ENDED_NOTE = "Your session has ended. Sign in again to continue."
 STANDARD_NOTE = "Enter your approved staff email and the password for your role."
 HOUR = 60 * 60
-# 72 h idle limit plus one day, so an ended session's cookie still reaches the server.
-EXPECTED_COOKIE_MAX_AGE = 345600
+# 400 days, the longest lifetime browsers keep (RFC 6265bis), so an ended session's
+# cookie still reaches the server however long staff stay away.
+EXPECTED_COOKIE_MAX_AGE = 400 * 24 * HOUR
 
 
 class InternalPasswordIdleSessionWebappTest(unittest.TestCase):
@@ -614,6 +616,45 @@ class InternalPasswordIdleSessionWebappTest(unittest.TestCase):
         status, _, body = self.http("GET", "/api/session")
         self.assertEqual(status, 401)
         self.assertNotIn(b"sign_in_id", body)
+
+    def test_H9_ended_note_shows_after_any_absence(self):
+        # The browser drops a cookie Max-Age seconds after the last Set-Cookie it got.
+        # Model that: the note shows only while that cookie is still held.
+        for absence_hours in (96 + 1, 120, 14 * 24, 180 * 24):
+            with self.subTest(absence_hours=absence_hours):
+                self.reset_rate_limits()
+                cookie, headers = self.signed_in()
+                self.advance(10 * HOUR)
+                _, renewed, _ = self.session_json(cookie)  # last use, renews the cookie
+                [last_set] = self.session_cookie_headers(renewed)
+                max_age = int(http.cookies.SimpleCookie(last_set)[webapp.SESSION_COOKIE_NAME]["max-age"])
+                self.advance(absence_hours * HOUR)
+                self.assertGreater(max_age, absence_hours * HOUR, "Browser dropped the cookie, so no ended note")
+                self.assertEqual(self.login_page_message(cookie), ENDED_NOTE)
+                self.assertEqual(self.http("GET", "/api/session", {"Cookie": cookie})[0], 401)
+
+    def raw_request_line(self, line):
+        with socket.create_connection(self.server.server_address, timeout=5) as conn:
+            conn.sendall(line + b"\r\n\r\n")
+            reply = b""
+            while chunk := conn.recv(4096):
+                reply += chunk
+        return reply
+
+    def test_H10_malformed_request_lines_get_their_error_reply(self):
+        cookie, _ = self.signed_in()
+        for line, status in ((b"GET / FOO/1.1", b"400"), (b"GET / HTTP/2.0", b"505"),
+                             (b"GET / HTTP/1.1 extra", b"400")):
+            with self.subTest(line=line):
+                reply = self.raw_request_line(line)
+                # Python 3.12 answers these in HTTP/0.9 style (error page, no status
+                # line); newer versions add "HTTP/1.0 <code>". Both carry the code.
+                self.assertIn(b"Error code: " + status, reply, reply[:80])
+                if reply.startswith(b"HTTP/"):
+                    self.assertTrue(reply.startswith(b"HTTP/1.0 " + status), reply[:80])
+                self.assertNotIn(webapp.SESSION_COOKIE_NAME.encode() + b"=", reply)
+        # The server still serves a signed-in request afterwards.
+        self.assertEqual(self.session_json(cookie)[0], 200)
 
     def test_H8_platform_cookie_lifetime_is_unchanged(self):
         self.assertEqual(webapp.SESSION_COOKIE_MAX_AGE_SECONDS, 8 * HOUR)

@@ -83,8 +83,9 @@ so staff who keep using the app stay signed in. There is no fixed lifetime, so a
 copied cookie stays usable for as long as someone keeps using it; HttpOnly,
 Secure, host-only signing and server-side revocation are the mitigations. At
 most once every 5 minutes the server re-sends the identical signed cookie with a
-fresh Max-Age (4 days: the idle limit plus one day), so the browser keeps it
-while the session is in use and the CSRF token never changes mid-session. The
+fresh Max-Age of 400 days (the longest browsers keep a cookie), so the browser
+keeps it while the session is in use, the CSRF token never changes mid-session,
+and after any absence the server can still tell that the session has ended. The
 cookie's age grants nothing; the server record decides. At most 4,096 sessions
 and 1,024 pending nonces are retained. Sessions live in server memory: restart
 or redeploy signs everyone out, as do logout and any material policy or password
