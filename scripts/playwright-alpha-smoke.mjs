@@ -578,8 +578,8 @@ async function main() {
     const includedAmountCell = includedRow.locator(".amount-cell");
     await includedAmountCell.waitFor({ state: "visible", timeout: 10000 });
     const includedAmountText = (await includedAmountCell.innerText()).trim();
-    const includedAmountValue = Number(includedAmountText.replace(/[^0-9.-]/g, ""));
-    assert(Number.isFinite(includedAmountValue) && Math.abs(includedAmountValue) < 0.005, "Included row amount did not render as zero: " + includedAmountText);
+    // The amount column says Included; the row's amount stays zero (checked with the saved rows below).
+    assert(includedAmountText === "Included", "Included row amount did not render as Included: " + includedAmountText);
     const editedState = await page.evaluate((descriptions) => ({
       rows: state.outputRows.map((row) => ({ description: row.description, quantity: row.quantity, price_mode: row.price_mode })),
       includedEvents: window.__alphaIncludedEvents || [],

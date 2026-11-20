@@ -98,8 +98,8 @@ Dedicated admission-function body, dependency and EXECUTE drift must fail.
 No additional job, service, secret or startup migration is introduced.
 
 Full Python discovery includes `tests.test_libreoffice_workbook_values`: actual
-LibreOffice recalculates a disposable cache-cleared workbook, then each priced,
-Included and total amount is checked in its own row. A missing converter fails in
+LibreOffice recalculates a disposable cache-cleared workbook, then each priced
+and total amount, and each Included row's Included text, is checked in its own row. A missing converter fails in
 CI and explicitly skips locally. Native conversion and browser receipts still
 require an equipped host; no workflow, trigger, required check, secret requirement
 or deployment behaviour changes accompany this test.

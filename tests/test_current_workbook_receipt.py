@@ -98,13 +98,43 @@ class CurrentWorkbookReceiptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), self.verify())
 
-    def test_swapped_line_amounts_reject_even_when_all_original_numbers_remain(self):
+    def test_swapped_line_amounts_reject_even_when_all_original_values_remain(self):
         def swap(tree):
-            priced = self.row_cell(tree, self.rows[0]["description"], "E").find("m:v", NS)
-            included = self.row_cell(tree, self.rows[1]["description"], "E").find("m:v", NS)
-            priced.text, included.text = included.text, priced.text
-        with self.assertRaisesRegex(AssertionError, "Wrong amount"):
+            priced = self.row_cell(tree, self.rows[0]["description"], "E")
+            included = self.row_cell(tree, self.rows[1]["description"], "E")
+            priced_parts, included_parts = list(priced), list(included)
+            priced_type, included_type = priced.get("t"), included.get("t")
+            for cell, parts, kind in ((priced, included_parts, included_type), (included, priced_parts, priced_type)):
+                for child in list(cell):
+                    cell.remove(child)
+                cell.extend(parts)
+                cell.attrib.pop("t", None)
+                if kind:
+                    cell.set("t", kind)
+        with self.assertRaisesRegex(AssertionError, "Non-numeric amount"):
             self.verify(self.mutate("xl/worksheets/sheet1.xml", swap))
+
+    def test_included_row_must_read_the_word_included_not_a_number_or_formula(self):
+        # Owner decision INT-SQAG-202611200003: an Included row reads "Included" and adds zero to the total.
+        with zipfile.ZipFile(io.BytesIO(self.data)) as archive:
+            cell = self.row_cell(ET.fromstring(archive.read("xl/worksheets/sheet1.xml")), self.rows[1]["description"], "E")
+        self.assertEqual((cell.get("t"), "".join(cell.find("m:is", NS).itertext()), cell.find("m:f", NS)), ("inlineStr", "Included", None))
+
+        def as_number(tree):
+            cell = self.row_cell(tree, self.rows[1]["description"], "E")
+            for child in list(cell):
+                cell.remove(child)
+            cell.attrib.pop("t", None)
+            ET.SubElement(cell, "{" + NS["m"] + "}v").text = "0"
+
+        def as_formula(tree):
+            cell = self.row_cell(tree, self.rows[1]["description"], "E")
+            ET.SubElement(cell, "{" + NS["m"] + "}f").text = '"Included"'
+
+        for mutation in (as_number, as_formula):
+            with self.subTest(mutation=mutation.__name__):
+                with self.assertRaisesRegex(AssertionError, "Included row does not read Included"):
+                    self.verify(self.mutate("xl/worksheets/sheet1.xml", mutation))
 
     def test_company_signature_fields_are_bound_to_footer_order(self):
         for mutation, field in (('swap', 'company_signatory'),

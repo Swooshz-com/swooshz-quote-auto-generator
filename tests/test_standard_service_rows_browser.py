@@ -10,7 +10,8 @@ from tests import test_webapp as fixtures
 
 
 class StandardServiceRowsBrowserTest(unittest.TestCase):
-    def test_rows_offered_once_kept_through_reset_reanalyse_reopen_and_ticked_row_reaches_the_workbook(self):
+    def test_rows_offered_once_reset_to_confirm_kept_through_reanalyse_reopen_and_ticked_row_reaches_the_workbook(self):
+        # Reset Draft, also after the Dashboard and Modify, returns both rows to Confirm (INT-SQAG-202611200003).
         # unittest discovery is a required CI gate after Chromium installation; a missing
         # Node fails in CI (require_node), exactly like the other rendered basis suites.
         with owned_browser_evidence_directory() as evidence_root:
@@ -25,14 +26,15 @@ class StandardServiceRowsBrowserTest(unittest.TestCase):
         evidence = json.loads(result.stdout[result.stdout.index('{'):])
         self.assertEqual(evidence['status'], 'PASS')
         self.assertEqual(evidence['standardServiceRows'],
-                         {'newQuote': 'PASS', 'tickAndX': 'PASS', 'reset': 'PASS', 'reAnalyse': 'PASS'})
+                         {'newQuote': 'PASS', 'tickAndX': 'PASS', 'dashboardModifyReset': 'PASS', 'reset': 'PASS', 'reAnalyse': 'PASS'})
         self.assertEqual(evidence['standardServiceRowsReopen'], {
             'decisions': [['standard-project-management-fee', 'Include'], ['standard-waste-disposal', 'Exclude']],
             'output': 'included',
         })
-        # The ticked row prints once at zero; the crossed row and missing exclusions fail the workbook check.
+        # The ticked row prints once as Included (adding nothing); the crossed row and missing exclusions fail
+        # the workbook check.
         self.assertIn({'id': 'standard-project-management-fee', 'description': 'Lump sum for project management',
-                       'quantity': '1 nos', 'amount': 0}, evidence['xlsx']['expectedRows'])
+                       'quantity': '1 nos', 'amount': 'Included'}, evidence['xlsx']['expectedRows'])
         self.assertEqual(json.loads(evidence['xlsx']['validator'])['bad'], [])
 
 
