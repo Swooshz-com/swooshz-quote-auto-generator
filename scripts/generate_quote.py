@@ -4387,7 +4387,7 @@ class TemplateQuoteRenderer:
                 columns=(quantity["col"], quantity["col"] + quantity["span"] - 1) if quantity else None,
                 font_size=self._block_size(block), page=self.page,
                 width=quote_template.cell_text_width_points(
-                    self.template["grid"], self.template["theme"], quantity["col"], quantity["span"],
+                    self.template["grid"], quantity["col"], quantity["span"],
                 ) if quantity else None,
             )
         except ValueError as exc:

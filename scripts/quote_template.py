@@ -52,8 +52,8 @@ PRINTED_ROW_ALLOWANCE_POINTS = 0.75
 SPARE_ROWS_PER_PAGE = 1
 MIN_PRINT_SCALE = 0.13
 # Excel's hinted digit is at least 0.926 times the unit over both fonts, every half-point size from 7 to
-# 20 and every Windows scaling preset (486 cases read from GDI), so pictures, text boxes and quantity
-# cells are placed in whole 96-dpi pixels of 0.92 units, never wider than Excel draws the column.
+# 20 and every Windows scaling preset (486 cases read from GDI), so pictures and text boxes are placed
+# in whole 96-dpi pixels of 0.92 units, never wider than Excel draws the column.
 MIN_HINTED_DIGIT_RATIO = 0.92
 # A quantity column must hold this many digits at the item table's font size; a longer quantity on a
 # quote is refused when the quote is made. Digit advance as a fraction of the font size.
@@ -461,13 +461,12 @@ def drawing_width_emu(grid: dict[str, Any], theme: dict[str, Any], first: int, s
     return sum(drawing_column_pixels(column, theme) for column in columns) * EMU_PER_PIXEL
 
 
-def cell_text_width_points(grid: dict[str, Any], theme: dict[str, Any], first: int, span: int) -> float:
-    """Points text may use across the visible grid columns from `first` across `span`: each column at
-    the smaller of its Arial 10 text width (7 whole pixels a unit, as the bundled layout) and the theme
-    font's printed width, less the cell padding. The renderer sizes quantity cells with this."""
+def cell_text_width_points(grid: dict[str, Any], first: int, span: int) -> float:
+    """Points quantity text may use across the visible grid columns from `first` across `span`: 7 whole
+    96-dpi pixels a width unit, less the cell padding (the bundled layout's measure). The renderer sizes
+    each quote's quantity cells with this, and the reader checks a quantity column with it."""
     columns = [column for column in grid["columns"][first - 1:first - 1 + span] if not column["hidden"]]
-    pixels = sum(min(math.floor(column["width"] * 7), _printed_column_pixels(column["width"], theme)) for column in columns)
-    return pixels * 72 / 96 - CELL_TEXT_PADDING_POINTS
+    return sum(math.floor(column["width"] * 7) for column in columns) * 72 / 96 - CELL_TEXT_PADDING_POINTS
 
 
 def min_quantity_points(size_pt: float) -> float:
@@ -505,7 +504,7 @@ def _check_quantity_column(grid: dict[str, Any], theme: dict[str, Any], blocks: 
     table_index, table = next((index, block) for index, block in enumerate(blocks) if block["type"] == "item_table")
     size = table["style"].get("size_pt") or theme["size_pt"]
     for index, column in enumerate(table["columns"]):
-        if column["key"] == "quantity" and min_quantity_points(size) > cell_text_width_points(grid, theme, column["col"], column["span"]):
+        if column["key"] == "quantity" and min_quantity_points(size) > cell_text_width_points(grid, column["col"], column["span"]):
             _refuse(
                 f"blocks[{table_index}].columns[{index}]",
                 f"the quantity column is too narrow for {MIN_QUANTITY_DIGITS} digits at {size:g} pt",

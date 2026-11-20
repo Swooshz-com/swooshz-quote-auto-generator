@@ -869,6 +869,20 @@ class QuantityColumnTest(unittest.TestCase):
         self.assertEqual(caught.exception.path, "blocks[3].columns[1]")
         self.assertEqual(caught.exception.message, "the quantity column is too narrow for 3 digits at 17 pt")
 
+    def test_a_hidden_column_gives_the_quantity_no_room(self):
+        # The quantity spans grid column B (6 units) and hidden column C (6 units). Only B is drawn, so at
+        # 16 pt three digits (26.4 pt) do not fit its 25.5 pt.
+        definition = with_rows(compact_template("Calibri", 16), 30)
+        table = definition["blocks"][3]
+        table["columns"] = [column for column in table["columns"] if column["key"] != "unit"]
+        next(column for column in table["columns"] if column["key"] == "quantity")["span"] = 2
+        definition["grid"]["columns"][2]["hidden"] = True
+        with self.assertRaises(qt.QuoteTemplateError) as caught:
+            qt.read_quote_template(definition)
+        self.assertEqual(caught.exception.path, "blocks[3].columns[1]")
+        definition["grid"]["columns"][2]["hidden"] = False
+        qt.read_quote_template(definition)
+
     def test_every_accepted_quantity_column_renders_three_digits(self):
         lines = synthetic_lines(3)
         for line in lines:
