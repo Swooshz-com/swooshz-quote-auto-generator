@@ -349,10 +349,11 @@ class PageFitTest(unittest.TestCase):
         )
 
     def test_rows_per_page_stop_at_what_the_paper_holds(self):
-        # Standard (Calibri 13) holds 62 rows of 18.7 pt: its digit is 6.43 pt (15 px at 168 dpi, below the
-        # 6.59 pt exact width) and each row is budgeted one 96-dpi pixel (0.75 pt) taller.
-        qt.read_quote_template(mutated(lambda d: d["page"].update({"page_rows": 62})))
-        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 63})), "page.page_rows")
+        # Standard (Calibri 13) holds 61 rows of 18.7 pt, its own page length: its digit is 6.43 pt (15 px
+        # at 168 dpi, below the 6.59 pt exact width), each row counts 0.75 pt taller, which gives 62.17
+        # rows, and a page keeps one row spare.
+        qt.read_quote_template(mutated(lambda d: d["page"].update({"page_rows": 61})))
+        self.assert_refused(mutated(lambda d: d["page"].update({"page_rows": 62})), "page.page_rows")
         self.assert_refused(mutated(lambda d: d["page"].update({"first_page_rows": 80})), "page.first_page_rows")
         # Taller rows or a landscape page hold fewer rows; a first page of 20 rows fits either, so page_rows is what is refused.
         self.assert_refused(mutated(lambda d: d["page"].update({"row_height_pt": 40, "first_page_rows": 20, "page_rows": 61})), "page.page_rows")
@@ -361,16 +362,16 @@ class PageFitTest(unittest.TestCase):
     def test_the_theme_font_sets_how_many_rows_fit(self):
         # Columns are sized in the theme font's widest digit, so a smaller or narrower font prints the same
         # grid narrower, at a larger scale, with fewer rows a page. Limits for Standard's grid, margins and
-        # 18.7 pt rows printed as 19.45 pt, worked out from the digit widths (Calibri 1038/2048 em, Arial
-        # 1139/2048 em), using the smallest of the exact width and Excel's whole-pixel width at each
-        # Windows display scaling (96 to 336 dpi).
+        # 18.7 pt rows counted as 19.45 pt with one row spare, worked out from the digit widths (Calibri
+        # 1038/2048 em, Arial 1139/2048 em), using the smallest of the exact width and its whole-pixel
+        # width at each Windows display scaling (96 to 336 dpi).
         limits = (
-            ("Calibri", 9, 43),    # small: 4.56 pt exact; 6 px at 96 dpi = 4.5 pt
-            ("Calibri", 11, 50),   # 5.58 pt exact; 7 px at 96 dpi = 5.25 pt
-            ("Calibri", 12, 58),   # 6.08 pt exact; 8 px at 96 dpi = 6.0 pt
-            ("Arial", 10, 50),     # 5.56 pt exact; 7 px at 96 dpi = 5.25 pt
-            ("Arial", 20, 106),    # large: 11.12 pt exact; 22 px at 144 dpi = 11.0 pt
-            ("Calibri", 20, 96),   # large: 10.14 pt exact; 20 px at 144 dpi = 10.0 pt
+            ("Calibri", 9, 42),    # small: 4.56 pt exact; 6 px at 96 dpi = 4.5 pt
+            ("Calibri", 11, 49),   # 5.58 pt exact; 7 px at 96 dpi = 5.25 pt
+            ("Calibri", 12, 57),   # 6.08 pt exact; 8 px at 96 dpi = 6.0 pt
+            ("Arial", 10, 49),     # 5.56 pt exact; 7 px at 96 dpi = 5.25 pt
+            ("Arial", 20, 105),    # large: 11.12 pt exact; 22 px at 144 dpi = 11.0 pt
+            ("Calibri", 20, 95),   # large: 10.14 pt exact; 20 px at 144 dpi = 10.0 pt
         )
         for font, size, rows in limits:
             def with_font(first_page_rows, page_rows):
@@ -384,7 +385,7 @@ class PageFitTest(unittest.TestCase):
                 self.assert_refused(with_font(first, rows + 1), "page.page_rows")
                 if rows < 55:
                     self.assert_refused(with_font(rows + 1, rows), "page.first_page_rows")
-        # The smallest Calibri holds 37 rows, so Standard's own 55 first-page rows are refused.
+        # The smallest Calibri holds 36 rows, so Standard's own 55 first-page rows are refused.
         self.assert_refused(mutated(lambda d: d["theme"].update({"size_pt": 7})), "page.first_page_rows")
 
     def test_width_unit_follows_the_theme_font(self):
