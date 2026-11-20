@@ -320,7 +320,7 @@ or deployment behaviour changes accompany this test.
   remote check, `scripts/rehearsal-check.mjs`, is tested by the browser job's
   `npm run playwright:rehearsal-check` step against loopback synthetic servers only (file
   storage and database storage); CI never reaches the rehearsal or live app. No trigger, secret or required
-  check changes. The live-data end-to-end test (#390: Pass A on a copy of live before the switch, Pass B
+  check changes. The live-data end-to-end test (Pass A on a copy of live before the switch, Pass B
   read-only on live after it, `scripts/copy_live_objects_to_rehearsal.py`, `scripts/live_rollback.py`) is
   part of that manual procedure, run from the laptop; CI runs only its offline and loopback tests
   (`tests/test_live_e2e.mjs` in the same npm step, the Python tests in the unittest step).
